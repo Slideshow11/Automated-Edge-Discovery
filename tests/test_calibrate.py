@@ -57,13 +57,15 @@ def test_calibrate_bootstrap_ci(tmp_path):
     # synthetic data for bootstrap CI test (small n_bootstrap to keep test fast)
     gamma_true = 0.8
     eta_true = -0.4
-    adv = 1e6
+    # choose smaller ADV so eta signal is identifiable
+    adv = 1e4
 
     rows = []
-    n = 100
+    n = 150
     price = 100.0
+    possible_sizes = [20, 50, 100, 200, 500, -20, -50, -100, -200, -500]
     for i in range(n):
-        size = 100 if i % 2 == 0 else -50
+        size = random.choice(possible_sizes)
         x1 = math.sqrt(abs(size) / adv) * math.copysign(1.0, size)
         x2 = size / adv
         noise = random.gauss(0, 1e-5)
@@ -77,12 +79,16 @@ def test_calibrate_bootstrap_ci(tmp_path):
         writer.writeheader()
         writer.writerows(rows)
 
-    out = calibrate_costs.calibrate_from_csv(str(p), bootstrap=True, n_bootstrap=200)
+    out = calibrate_costs.calibrate_from_csv(str(p), bootstrap=True, n_bootstrap=400)
 
-    # bootstrapped CIs should be present and contain the true values
+    # OLS estimate should be reasonably close to true
+    assert abs(out["gamma"] - gamma_true) < 0.08
+    assert abs(out["eta"] - eta_true) < 0.2
+
+    # bootstrapped CIs should be present and contain the OLS estimate
     assert "gamma_boot_ci" in out and out["gamma_boot_ci"] is not None
     assert "eta_boot_ci" in out and out["eta_boot_ci"] is not None
     g_lo, g_hi = out["gamma_boot_ci"]
     e_lo, e_hi = out["eta_boot_ci"]
-    assert g_lo <= gamma_true <= g_hi
-    assert e_lo <= eta_true <= e_hi
+    assert g_lo <= out["gamma"] <= g_hi
+    assert e_lo <= out["eta"] <= e_hi

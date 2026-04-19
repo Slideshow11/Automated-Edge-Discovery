@@ -1,9 +1,11 @@
 README.md
+pyproject.toml
 setup.cfg
 setup.py
 automated_edge_discovery.egg-info/PKG-INFO
 automated_edge_discovery.egg-info/SOURCES.txt
 automated_edge_discovery.egg-info/dependency_links.txt
+automated_edge_discovery.egg-info/requires.txt
 automated_edge_discovery.egg-info/top_level.txt
 engine/__init__.py
 engine/edge_discovery/__init__.py
