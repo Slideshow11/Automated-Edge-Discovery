@@ -1,0 +1,37 @@
+name: WFA Nightly
+
+on:
+  schedule:
+    - cron: '0 3 * * *'  # daily at 03:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  run-wfa:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m venv venv
+          . venv/bin/activate
+          pip install -r requirements.txt || true
+
+      - name: Run WFA smoke
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          . venv/bin/activate || true
+          python -c "from engine.edge_discovery.runner import run_wfa_cpcv; print(run_wfa_cpcv(['buy_hold'], n_splits=2, out_dir='.wfa/output'))"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wfa-output
+          path: .wfa/output/

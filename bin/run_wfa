@@ -1,0 +1,84 @@
+#!/usr/bin/env python3
+"""CLI wrapper for WFA/CPCV runner.
+
+Usage:
+    bin/run_wfa --strategies=strat1,strat2 --n-splits=3 --purge=0.01 \\
+                --cost-model=almgren_chriss --out-dir=/tmp/wfa
+
+The script is idempotent: multiple runs with the same out_dir will produce
+timestamped output files without overwriting previous results.
+"""
+import argparse
+import json
+import sys
+from pathlib import Path
+
+# Ensure the project root is on the path so engine.* imports resolve
+if "__file__" in globals():
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+else:
+    PROJECT_ROOT = Path.cwd().resolve().parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from engine.edge_discovery.runner import run_wfa_cpcv
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run WFA/CPCV across strategies.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--strategies",
+        required=True,
+        help="Comma-separated list of strategy identifiers",
+    )
+    parser.add_argument(
+        "--n-splits",
+        type=int,
+        default=2,
+        help="Number of CPCV splits (default: 2)",
+    )
+    parser.add_argument(
+        "--purge",
+        type=float,
+        default=0.01,
+        help="Purge fraction for CPCV (default: 0.01)",
+    )
+    parser.add_argument(
+        "--cost-model",
+        default=None,
+        help="Cost model identifier to pass to backtester (default: None)",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help="Output directory for JSON files (default: .wfa/output/)",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    strategies = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    if not strategies:
+        print("Error: at least one strategy is required", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Running WFA/CPCV for strategies={strategies}, n_splits={args.n_splits}, purge={args.purge}")
+
+    result = run_wfa_cpcv(
+        strategies=strategies,
+        n_splits=args.n_splits,
+        purge=args.purge,
+        cost_model=args.cost_model,
+        out_dir=args.out_dir,
+    )
+
+    print(json.dumps(result, indent=2, default=str))
+    print(f"\nOutputs written to: {args.out_dir or '.wfa/output/'}")
+
+
+if __name__ == "__main__":
+    main()
