@@ -1,6 +1,6 @@
-"""Calibration routines for AlmgrenChriss cost parameters.
+"""Calibration routines for Almgren–Chriss cost parameters.
 
-This module implements a regression-based estimator for the AlmgrenChriss
+This module implements a regression-based estimator for the Almgren–Chriss
 temporary impact (gamma) and permanent impact (eta) parameters, together with
 simple estimates for volatility (sigma) and an ADV/volume scaling proxy.
 
@@ -15,31 +15,19 @@ Where:
 - adv_i is average daily volume for the instrument (per-trade column)
 - y_i is the observed realized cost per share (signed in price units)
 
-Input CSV:
-- Required columns: size, price OR cost. adv is recommended (if missing a
-  constant average ADV is used).
-- If a "cost" column exists it will be used as y. Otherwise y is approximated
-  as sign(size) * (price - prev_price) where prev_price is the previous row's
-  price (simple proxy).
-
-Calibration function:
-- calibrate_from_csv(path, robust=False, alpha=0.05)
-  performs ordinary least squares to estimate gamma and eta. If ``robust`` is
-  True and scikit-learn is available the function will also compute robust
-  coefficients using HuberRegressor (returned alongside OLS estimates).
-- The function returns estimates and approximate confidence intervals for the
-  OLS estimates using a normal approximation.
-
-Assumptions and limitations:
-- The implementation is intentionally compact and uses simple heuristics for
-  volatility and ADV-scaling. It expects per-trade data and small datasets for
-  unit tests.
-- Confidence intervals use a Normal (z ~ 1.96 for 95%%) approximation rather
-  than exact Student-t inversion to avoid adding scipy as a dependency.
+The calibrator provides both OLS estimates and an optional bootstrap-based
+confidence interval for small-sample robustness. If scikit-learn is installed
+and --robust is passed to the CLI, HuberRegressor is used to compute robust
+coefficients (returned alongside OLS estimates).
 
 CLI:
-- A small command-line interface is provided to read a CSV and emit JSON with
-  parameter estimates and confidence intervals.
+- calibrate_costs.py input.csv --output params.json --bootstrap --n-bootstrap 500
+
+Notes:
+- If the CSV includes a "cost" column, that is used as y. Otherwise, a
+  simple per-trade proxy: sign(size) * (price - prev_price) is used.
+- Bootstrap uses resampling of rows with replacement and recomputes OLS.
+  Use n_bootstrap small in unit tests (e.g., 200) and larger in real runs.
 
 """
 from __future__ import annotations
@@ -47,16 +35,16 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import math
 import statistics
 
 try:
     import numpy as np
-except Exception:  # pragma: no cover - numpy should be available in CI/tests
+except Exception:  # pragma: no cover - numpy required
     raise
 
 
@@ -66,14 +54,18 @@ class CalibrateResult:
     eta: float
     gamma_se: float
     eta_se: float
-    gamma_ci: tuple
-    eta_ci: tuple
+    gamma_ci: Tuple[float, float]
+    eta_ci: Tuple[float, float]
     r2: float
     sigma_price: float
     adv_scale: float
+    gamma_boot_ci: Optional[Tuple[float, float]] = None
+    eta_boot_ci: Optional[Tuple[float, float]] = None
+    gamma_robust: Optional[float] = None
+    eta_robust: Optional[float] = None
 
     def to_dict(self) -> Dict:
-        return {
+        out = {
             "gamma": self.gamma,
             "eta": self.eta,
             "gamma_se": self.gamma_se,
@@ -84,6 +76,15 @@ class CalibrateResult:
             "sigma_price": self.sigma_price,
             "adv_scale": self.adv_scale,
         }
+        if self.gamma_boot_ci is not None:
+            out["gamma_boot_ci"] = [self.gamma_boot_ci[0], self.gamma_boot_ci[1]]
+        if self.eta_boot_ci is not None:
+            out["eta_boot_ci"] = [self.eta_boot_ci[0], self.eta_boot_ci[1]]
+        if self.gamma_robust is not None:
+            out["gamma_robust"] = self.gamma_robust
+        if self.eta_robust is not None:
+            out["eta_robust"] = self.eta_robust
+        return out
 
 
 def _read_csv(path: str):
@@ -125,7 +126,6 @@ def _construct_obs(rows):
             if price is not None and prev_price is not None:
                 cost = math.copysign((price - prev_price), size)
             else:
-                # cannot compute cost for this row
                 prev_price = price
                 continue
 
@@ -139,20 +139,93 @@ def _construct_obs(rows):
     return sizes, prices, advs, costs
 
 
-def calibrate_from_csv(path: str, robust: bool = False, alpha: float = 0.05) -> Dict:
-    """Calibrate AlmgrenChriss impact parameters from a CSV file.
+def _ols_estimate(X_with_int: np.ndarray, y: np.ndarray):
+    # OLS via lstsq
+    beta, *_ = np.linalg.lstsq(X_with_int, y, rcond=None)
+    intercept = float(beta[0])
+    gamma = float(beta[1])
+    eta = float(beta[2])
+
+    # residuals
+    y_pred = X_with_int @ beta
+    resid = y - y_pred
+    dof = max(1, len(y) - X_with_int.shape[1])
+    sigma2 = float((resid ** 2).sum() / dof)
+
+    xtx = X_with_int.T @ X_with_int
+    xtx_inv = np.linalg.pinv(xtx)
+    var_beta = sigma2 * xtx_inv
+    se = np.sqrt(np.maximum(np.diag(var_beta), 0.0))
+
+    intercept_se = float(se[0])
+    gamma_se = float(se[1])
+    eta_se = float(se[2])
+
+    ss_res = float((resid ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    return {
+        "intercept": intercept,
+        "gamma": gamma,
+        "eta": eta,
+        "intercept_se": intercept_se,
+        "gamma_se": gamma_se,
+        "eta_se": eta_se,
+        "r2": r2,
+        "resid": resid,
+        "sigma2": sigma2,
+    }
+
+
+def _bootstrap_ci(X_with_int: np.ndarray, y: np.ndarray, n_bootstrap: int = 200, alpha: float = 0.05) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Compute bootstrap percentile CIs for gamma and eta by resampling rows.
+
+    Fast, simple implementation using numpy. n_bootstrap should be kept small in tests.
+    Returns (gamma_ci, eta_ci).
+    """
+    n = X_with_int.shape[0]
+    coefs = np.zeros((n_bootstrap, 3), dtype=float)
+    rng = np.random.default_rng(seed=0)
+    for i in range(n_bootstrap):
+        idx = rng.integers(0, n, size=n)
+        Xb = X_with_int[idx, :]
+        yb = y[idx]
+        try:
+            beta, *_ = np.linalg.lstsq(Xb, yb, rcond=None)
+            coefs[i, :] = beta
+        except Exception:
+            coefs[i, :] = np.nan
+
+    # remove any nan rows
+    coefs = coefs[~np.isnan(coefs).any(axis=1)]
+    if coefs.shape[0] == 0:
+        return (None, None), (None, None)
+
+    # percentiles for gamma (index 1) and eta (index 2)
+    lower = 100.0 * (alpha / 2.0)
+    upper = 100.0 * (1.0 - alpha / 2.0)
+    gamma_ci = (float(np.percentile(coefs[:, 1], lower)), float(np.percentile(coefs[:, 1], upper)))
+    eta_ci = (float(np.percentile(coefs[:, 2], lower)), float(np.percentile(coefs[:, 2], upper)))
+    return gamma_ci, eta_ci
+
+
+def calibrate_from_csv(path: str, robust: bool = False, alpha: float = 0.05, bootstrap: bool = False, n_bootstrap: int = 200) -> Dict:
+    """Calibrate Almgren–Chriss impact parameters from a CSV file.
 
     Parameters
     - path: path to CSV with columns at least 'size' and either 'cost' or 'price'.
-    - robust: if True and scikit-learn is installed, also compute robust
-      coefficient estimates using HuberRegressor (returned under keys
-      'gamma_robust' and 'eta_robust').
+    - robust: if True and scikit-learn is installed, compute HuberRegressor robust
+      coefficient estimates (returned as gamma_robust, eta_robust).
     - alpha: significance level for confidence intervals (default 0.05 for 95%% CI)
+    - bootstrap: if True compute bootstrap percentile confidence intervals (n_bootstrap)
+    - n_bootstrap: number of bootstrap resamples (default 200; increase for real runs)
 
     Returns a dictionary with keys:
     - gamma, eta: OLS coefficient estimates
-    - gamma_se, eta_se: standard errors
-    - gamma_ci, eta_ci: approximate confidence intervals (normal approx)
+    - gamma_se, eta_se: standard errors (OLS)
+    - gamma_ci, eta_ci: approximate normal-theory confidence intervals (OLS)
+    - gamma_boot_ci, eta_boot_ci: optional bootstrap percentile CIs
     - r2: coefficient of determination
     - sigma_price: simple volatility estimate (std of price diffs)
     - adv_scale: mean(adv) / mean(|size|) proxy
@@ -168,70 +241,41 @@ def calibrate_from_csv(path: str, robust: bool = False, alpha: float = 0.05) -> 
     advs = np.asarray(advs, dtype=float)
     costs = np.asarray(costs, dtype=float)
 
-    # If adv is zero for a row, replace with mean adv (avoid div by zero)
     mean_adv = float(np.mean(advs[advs > 0]) if np.any(advs > 0) else 1.0)
     advs = np.where(advs <= 0, mean_adv, advs)
 
-    # Design matrix: [sqrt(|size|/adv) * sign(size), size/adv]
     x1 = np.sqrt(np.abs(sizes) / advs) * np.sign(sizes)
     x2 = sizes / advs
     X = np.column_stack([x1, x2])
     y = costs
 
-    # Add intercept
     X_with_int = np.column_stack([np.ones(len(X)), X])
 
-    # OLS via lstsq
-    beta, *_ = np.linalg.lstsq(X_with_int, y, rcond=None)
-    intercept = float(beta[0])
-    gamma = float(beta[1])
-    eta = float(beta[2])
+    ols = _ols_estimate(X_with_int, y)
 
-    # residuals and sigma^2
-    y_pred = X_with_int @ beta
-    resid = y - y_pred
-    dof = max(1, len(y) - X_with_int.shape[1])
-    sigma2 = float((resid ** 2).sum() / dof)
+    gamma = float(ols["gamma"])
+    eta = float(ols["eta"])
+    gamma_se = float(ols["gamma_se"])
+    eta_se = float(ols["eta_se"])
+    r2 = float(ols["r2"])
 
-    # variance-covariance of beta: sigma2 * (X'X)^{-1}
-    # use pseudo-inverse for numerical stability on tiny / rank-deficient data
-    xtx = X_with_int.T @ X_with_int
-    xtx_inv = np.linalg.pinv(xtx)
-    var_beta = sigma2 * xtx_inv
-    se = np.sqrt(np.maximum(np.diag(var_beta), 0.0))
-
-    intercept_se = float(se[0])
-    gamma_se = float(se[1])
-    eta_se = float(se[2])
-
-    # R^2
-    ss_tot = float(((y - y.mean()) ** 2).sum())
-    ss_res = float((resid ** 2).sum())
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-
-    # CI using normal approx (z)
-    # two-sided z for alpha
-    try:
-        # approximate z using inverse error function if numpy has it
-        from math import erfcinv
-
-        z = abs( np.sqrt(2) * (-math.erf(1) if False else 0) )  # fallback unused
-        # fallback to 1.96
-        z = 1.96
-    except Exception:
-        z = 1.96
-
+    # normal approx CIs
+    z = 1.96
     gamma_ci = (gamma - z * gamma_se, gamma + z * gamma_se)
     eta_ci = (eta - z * eta_se, eta + z * eta_se)
 
-    # simple volatility: std of price diffs
+    # bootstrap CI
+    gamma_boot_ci = None
+    eta_boot_ci = None
+    if bootstrap:
+        gamma_boot_ci, eta_boot_ci = _bootstrap_ci(X_with_int, y, n_bootstrap=n_bootstrap, alpha=alpha)
+
+    # volatility / adv scale proxies
     price_diffs = np.diff(np.asarray([p for p in prices if p is not None], dtype=float))
     sigma_price = float(np.std(price_diffs)) if price_diffs.size > 0 else 0.0
-
-    # adv scaling proxy
     adv_scale = float(np.mean(advs) / (np.mean(np.abs(sizes)) + 1e-12))
 
-    result = CalibrateResult(
+    out = CalibrateResult(
         gamma=gamma,
         eta=eta,
         gamma_se=gamma_se,
@@ -241,24 +285,24 @@ def calibrate_from_csv(path: str, robust: bool = False, alpha: float = 0.05) -> 
         r2=r2,
         sigma_price=sigma_price,
         adv_scale=adv_scale,
+        gamma_boot_ci=gamma_boot_ci,
+        eta_boot_ci=eta_boot_ci,
     )
 
-    out = result.to_dict()
+    res = out.to_dict()
 
-    # Robust fallback: HuberRegressor if requested
     if robust:
         try:
             from sklearn.linear_model import HuberRegressor
 
             huber = HuberRegressor().fit(X, y)
-            out["gamma_robust"] = float(huber.coef_[0])
-            out["eta_robust"] = float(huber.coef_[1])
+            res["gamma_robust"] = float(huber.coef_[0])
+            res["eta_robust"] = float(huber.coef_[1])
         except Exception:
-            # sklearn not installed or failed; ignore
-            out["gamma_robust"] = None
-            out["eta_robust"] = None
+            res["gamma_robust"] = None
+            res["eta_robust"] = None
 
-    return out
+    return res
 
 
 def _cli():
@@ -266,9 +310,11 @@ def _cli():
     parser.add_argument("input_csv", help="Path to CSV file with trades")
     parser.add_argument("--output", "-o", help="Output JSON file (default stdout)")
     parser.add_argument("--robust", action="store_true", help="Compute robust estimates if sklearn is available")
+    parser.add_argument("--bootstrap", action="store_true", help="Compute bootstrap percentile CIs")
+    parser.add_argument("--n-bootstrap", type=int, default=200, help="Number of bootstrap resamples (default 200)")
     args = parser.parse_args()
 
-    params = calibrate_from_csv(args.input_csv, robust=args.robust)
+    params = calibrate_from_csv(args.input_csv, robust=args.robust, bootstrap=args.bootstrap, n_bootstrap=args.n_bootstrap)
     out = json.dumps(params, indent=2)
     if args.output:
         Path(args.output).write_text(out)

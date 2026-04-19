@@ -48,3 +48,25 @@ Notes
   synthetic data.
 - If you add heavy dependencies (pandas) they are only required for specific
   tests and are installed in CI/test venv as needed.
+
+CLI examples (calibration)
+--------------------------
+
+1) Basic calibration using a CSV with a "cost" column:
+
+   python -m engine.edge_discovery.calibrate_costs examples/trades.csv --output params.json
+
+2) Compute bootstrap percentile CIs (fast example with small n_bootstrap):
+
+   python -m engine.edge_discovery.calibrate_costs examples/trades.csv --bootstrap --n-bootstrap 200 --output params_boot.json
+
+3) Use robust regression (if scikit-learn installed):
+
+   python -m engine.edge_discovery.calibrate_costs examples/trades.csv --robust --output params_robust.json
+
+CI and Codecov
+--------------
+
+The GitHub Actions workflow runs tests on Python 3.10 and 3.11, lints with ruff,
+and runs pytest. If you want codecov uploads enable the repository secret
+CODECOV_TOKEN in Settings -> Secrets and the workflow will upload coverage.

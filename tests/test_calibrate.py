@@ -51,3 +51,38 @@ def test_calibrate_recovers_parameters(tmp_path):
     # recovered parameters should be close to true values
     assert abs(out["gamma"] - gamma_true) < 0.05
     assert abs(out["eta"] - eta_true) < 0.05
+
+
+def test_calibrate_bootstrap_ci(tmp_path):
+    # synthetic data for bootstrap CI test (small n_bootstrap to keep test fast)
+    gamma_true = 0.8
+    eta_true = -0.4
+    adv = 1e6
+
+    rows = []
+    n = 100
+    price = 100.0
+    for i in range(n):
+        size = 100 if i % 2 == 0 else -50
+        x1 = math.sqrt(abs(size) / adv) * math.copysign(1.0, size)
+        x2 = size / adv
+        noise = random.gauss(0, 1e-5)
+        cost = gamma_true * x1 + eta_true * x2 + noise
+        rows.append({"timestamp": f"t{i}", "size": str(size), "price": str(price), "adv": str(adv), "cost": str(cost)})
+        price += 0.00005
+
+    p = tmp_path / "synth_boot.csv"
+    with p.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["timestamp", "size", "price", "adv", "cost"])
+        writer.writeheader()
+        writer.writerows(rows)
+
+    out = calibrate_costs.calibrate_from_csv(str(p), bootstrap=True, n_bootstrap=200)
+
+    # bootstrapped CIs should be present and contain the true values
+    assert "gamma_boot_ci" in out and out["gamma_boot_ci"] is not None
+    assert "eta_boot_ci" in out and out["eta_boot_ci"] is not None
+    g_lo, g_hi = out["gamma_boot_ci"]
+    e_lo, e_hi = out["eta_boot_ci"]
+    assert g_lo <= gamma_true <= g_hi
+    assert e_lo <= eta_true <= e_hi

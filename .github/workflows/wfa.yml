@@ -39,9 +39,10 @@ jobs:
           ruff --version || true
           ruff check . --quiet || true
 
-      - name: Run tests (pytest)
+      - name: Run tests (pytest + coverage)
         run: |
-          pytest -q
+          pip install pytest pytest-cov
+          pytest -q --cov=engine --cov-report=xml
 
       - name: Upload pytest cache
         uses: actions/upload-artifact@v4
@@ -49,6 +50,9 @@ jobs:
           name: pytest-cache
           path: .pytest_cache/
 
-      - name: Codecov placeholder
-        run: |
-          echo "Codecov upload would happen here (placeholder)."
+      - name: Upload coverage to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ./coverage.xml
