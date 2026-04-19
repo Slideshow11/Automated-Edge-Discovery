@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
 from typing import List, Dict, Any, Optional
@@ -122,7 +122,8 @@ def run_wfa_cpcv(strategies: List[str], n_splits: int = 2, purge: float = 0.01, 
     Returns a summary dict and writes a JSON summary file to out_dir.
     """
     out_path = _ensure_out_dir(out_dir)
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    # Use timezone-aware UTC timestamp to avoid DeprecationWarning
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
     per_split_results = []
 
