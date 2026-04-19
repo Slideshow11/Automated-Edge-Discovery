@@ -17,21 +17,21 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Create venv and install package
         run: |
           python -m venv venv
           . venv/bin/activate
-          pip install -r requirements.txt || true
+          pip install -e .
+          # install minimal test deps
+          pip install pytest pandas || true
 
-      - name: Run WFA smoke
-        env:
-          PYTHONPATH: ${{ github.workspace }}
+      - name: Run tests (fast smoke)
         run: |
-          . venv/bin/activate || true
-          python -c "from engine.edge_discovery.runner import run_wfa_cpcv; print(run_wfa_cpcv(['buy_hold'], n_splits=2, out_dir='.wfa/output'))"
+          . venv/bin/activate
+          make test
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: wfa-output
-          path: .wfa/output/
+          name: pytest-cache
+          path: .pytest_cache/
