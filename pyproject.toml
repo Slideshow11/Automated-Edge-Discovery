@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "automated_edge_discovery"
+version = "0.1.0"
+description = "Tools for automated edge discovery / Almgren-Chriss calibration"
+authors = [ { name = "Slideshow11" } ]
+readme = "README.md"
+license = { text = "MIT" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = ["tests"]
+
+[project.optional-dependencies]
+test = ["pytest", "numpy"]
