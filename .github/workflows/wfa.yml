@@ -39,6 +39,11 @@ jobs:
           ruff --version || true
           ruff check . --quiet || true
 
+      - name: Run demo (smoke)
+        run: |
+          # Run calibrator demo headless (no plotting). Fails CI if demo errors.
+          make demo-ci
+
       - name: Run tests (pytest + coverage)
         run: |
           pip install pytest pytest-cov
