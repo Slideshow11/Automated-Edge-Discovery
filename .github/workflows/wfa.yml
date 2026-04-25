@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest ruff numpy
+          pip install pytest ruff numpy pandas statsmodels patsy matplotlib
 
       - name: Lint (ruff)
         run: |
@@ -43,6 +43,23 @@ jobs:
         run: |
           # Run calibrator demo headless (no plotting). Fails CI if demo errors.
           make demo-ci
+
+      - name: Run v2 demo (smoke)
+        run: |
+          # Run the v2 calibrator demo (headless). Keep n_bootstrap small in CI.
+          python examples/calibrate_ac_v2_demo.py
+
+      - name: Upload v2 demo artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibrate-ac-v2-demo
+          path: examples/calibrate_ac_v2_demo.json
+
+      - name: Upload v2 diagnostics artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: calibrate-ac-v2-diagnostics
+          path: examples/diagnostics/
 
       - name: Run tests (pytest + coverage)
         run: |
