@@ -20,7 +20,7 @@ BOOTSTRAP_N_DEFAULT = 1000
 BOOTSTRAP_SEED_DEFAULT = 42
 
 # Default deflation method for PBO computation.
-DEFLATION_METHOD_DEFAULT = 'cv'
+DEFLATION_METHOD_DEFAULT = 'lopez'
 
 # Default audit output directory.
 AUDIT_OUTDIR_DEFAULT = 'audit_reports'

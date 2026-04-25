@@ -1,4 +1,6 @@
 import importlib
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -54,3 +56,30 @@ def test_aggregate_wfa_metrics_handles_bad_input():
     per_split = [{'sharpe': np.nan}, {}, {'sharpe': 1.0}]
     agg = auditor.aggregate_wfa_metrics(per_split)
     assert isinstance(agg, dict)
+
+
+def test_save_audit_report_falls_back_to_local_when_boto3_missing(monkeypatch, tmp_path):
+    """When EDGE_DISCOVERY_AUDIT_S3_BUCKET is set but boto3 is not installed,
+    save_audit_report must fall back to local disk instead of propagating the
+    ImportError."""
+    import sys
+
+    # Set the S3 bucket env var so the function attempts S3 first
+    monkeypatch.setenv('EDGE_DISCOVERY_AUDIT_S3_BUCKET', 'test-bucket')
+
+    # Block boto3 from being importable by caching None in sys.modules
+    # (Python returns the cached value even if None, which triggers AttributeError
+    # when the code tries to use it — that is caught by the outer Exception handler)
+    monkeypatch.setitem(sys.modules, 'boto3', None)
+
+    report = {'pass': True, 'pbo': 0.03, 'deflated_sharpe': [1.2]}
+    result = auditor.save_audit_report(report, run_id='test-run-001', out_dir=str(tmp_path))
+
+    # Must have fallen back to local disk
+    assert isinstance(result, (str, Path)), f"expected local path, got {type(result)}"
+    path = Path(result)
+    assert path.exists(), f"expected local file to exist at {path}"
+    assert path.name == 'test-run-001.json'
+
+    # Clean up env
+    monkeypatch.delenv('EDGE_DISCOVERY_AUDIT_S3_BUCKET', raising=False)
