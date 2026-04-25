@@ -1,164 +1,103 @@
-"""WFA/CPCV runner wrapper.
+"""Minimal runner for Edge Discovery backtests used for integration and tests.
 
-This module provides run_wfa_cpcv which orchestrates CPCV splits and calls the
-backtester for each split. For the purposes of fast unit tests we provide a
-separable helper `_run_backtest_for_split` which can be patched/mocked.
-
-Assumptions:
-- The real backtester may expose a programmatic `run_backtest(...)` entrypoint.
-  We attempt to import and call it; if not available we fall back to invoking a
-  CLI via subprocess. Unit tests should mock `_run_backtest_for_split` to avoid
-  expensive computation.
+This runner is intentionally small: it exposes run_backtest(Y, per_split_metrics)
+which runs a lightweight "backtest" (placeholder) and then invokes the auditor
+if enabled in config. The goal is to provide a safe integration point for the
+auditor and a testable API.
 """
-from __future__ import annotations
-
-import json
-import os
+from typing import Any, Dict, List, Optional
+import logging
 import time
-from datetime import datetime, timezone
-from pathlib import Path
-import subprocess
-from typing import List, Dict, Any, Optional
 
-DEFAULT_OUT_DIR = Path(".wfa/output").resolve()
+from . import config as ed_config
+from . import auditor
 
 
-def _ensure_out_dir(out_dir: Optional[str]) -> Path:
-    if out_dir:
-        p = Path(out_dir)
-    else:
-        p = DEFAULT_OUT_DIR
-    p.mkdir(parents=True, exist_ok=True)
-    return p
+try:
+    from . import metrics
+except Exception:
+    metrics = None
+
+logger = logging.getLogger(__name__)
 
 
-def _run_backtest_for_split(strategy: str, split_idx: int, n_splits: int, purge: float, cost_model: Optional[str]) -> Dict[str, Any]:
-    """Run the backtester for a single CPCV split.
-
-    This helper tries to call a programmatic API if available, otherwise it
-    shells out to a CLI. It returns a dict of metrics. For unit tests this
-    function should be patched to return a fast synthetic result.
-    """
-    start = time.time()
-
-    # Attempt to import a programmatic entrypoint
-    try:
-        # module path from task description; may not exist in this repo; import
-        # only if available.
-        from engine.src.earnings_research.backtest.options_backtest_v1 import run_backtest
-
-        # Example call signature -- adapt as needed by the real backtester.
-        metrics = run_backtest(strategy=strategy, split_index=split_idx, n_splits=n_splits, purge=purge, cost_model=cost_model)
-    except Exception:
-        # Fall back to CLI invocation; expect the backtester can accept a
-        # --json-output option or print JSON to stdout. This is a best-effort
-        # fallback used in real runs; unit tests should mock the helper.
-        cmd = [
-            "python",
-            "-m",
-            "engine.src.earnings_research.backtest.options_backtest_v1",
-            "--strategy",
-            strategy,
-            "--split-index",
-            str(split_idx),
-            "--n-splits",
-            str(n_splits),
-            "--purge",
-            str(purge),
-        ]
-        if cost_model:
-            cmd += ["--cost-model", cost_model]
-
-        # Run and capture stdout
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if proc.returncode != 0:
-            # In case of failure return a minimal metrics object with error info.
-            metrics = {
-                "returns": None,
-                "pbo_estimate": None,
-                "sharpe": None,
-                "max_drawdown": None,
-                "trades": 0,
-                "error": proc.stderr.strip(),
-            }
-        else:
-            try:
-                metrics = json.loads(proc.stdout)
-            except Exception:
-                # If stdout is not JSON, include raw text
-                metrics = {"raw_stdout": proc.stdout.strip()}
-
-    elapsed = time.time() - start
-    # Normalize: prefer total_return as canonical key; backtester may emit returns.
-    raw = metrics or {}
-    if "returns" in raw and "total_return" not in raw:
-        raw["total_return"] = raw["returns"]
-    metrics_out = {
-        "strategy": strategy,
-        "split_idx": split_idx,
-        "n_splits": n_splits,
-        "purge": purge,
-        "cost_model": cost_model,
-        "execution_time_seconds": elapsed,
-        "total_return": raw.get("total_return"),
-        "sharpe": raw.get("sharpe"),
-        "max_drawdown": raw.get("max_drawdown"),
-        "trades": raw.get("trades"),
-        "pnl_series": raw.get("pnl_series"),  # optional
-    }
-    return metrics_out
-
-
-def run_wfa_cpcv(strategies: List[str], n_splits: int = 2, purge: float = 0.01, cost_model: Optional[str] = None, out_dir: Optional[str] = None) -> Dict[str, Any]:
-    """Run CPCV/WFA across strategies and collect per-split metrics.
+def run_backtest(Y: Optional[Any], per_split_metrics: Optional[List[Dict[str, Any]]] = None, audit_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Run a minimal backtest and optionally run the audit.
 
     Parameters
-    - strategies: list of strategy identifiers (strings) to evaluate
-    - n_splits: number of CPCV splits (default 2)
-    - purge: purge fraction for CPCV
-    - cost_model: optional cost model identifier
-    - out_dir: directory to write outputs; default is .wfa/output/
+    - Y: candidate x split performance matrix (or None)
+    - per_split_metrics: list of per-split metric dicts
 
-    Returns a summary dict and writes a JSON summary file to out_dir.
+    Returns a result dict with keys:
+    - 'result': placeholder metrics
+    - 'audit_report': present if audit ran (may be None)
+    - 'audit_error': present if audit errored
+    - audit_config: optional dict with overrides for pbo_threshold / sharpe_min keys
     """
-    out_path = _ensure_out_dir(out_dir)
-    # Use timezone-aware UTC timestamp to avoid DeprecationWarning
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    per_split_results = []
-
-    for strategy in strategies:
-        for split_idx in range(n_splits):
-            metrics = _run_backtest_for_split(strategy=strategy, split_idx=split_idx, n_splits=n_splits, purge=purge, cost_model=cost_model)
-            per_split_results.append(metrics)
-
-    # Save raw per-split outputs
-    raw_out_file = out_path / f"{timestamp}_wfa_splits.json"
-    with raw_out_file.open("w") as f:
-        json.dump(per_split_results, f, indent=2, default=str)
-
-    # Aggregate using auditor helper
-    try:
-        from engine.edge_discovery.auditor import aggregate_wfa_metrics, estimate_pbo
-
-        summary = aggregate_wfa_metrics(per_split_results)
-        # Inject DSR-style PBO estimate
-        returns = [r.get("total_return") for r in per_split_results if r.get("total_return") is not None]
-        if returns:
-            summary["pbo_estimate"] = estimate_pbo(returns)
-    except Exception:
-        # Fallback simple aggregator
-        returns = [r.get("total_return") for r in per_split_results if r.get("total_return") is not None]
-        summary = {
-            "n_splits": n_splits,
-            "n_results": len(per_split_results),
-            "mean_return": None if not returns else sum(returns) / len(returns),
-            "median_return": None,
-            "pbo": None,
+    # Placeholder backtest result
+    result: Dict[str, Any] = {
+        'result': {
+            'n_candidates': int(Y.shape[0]) if hasattr(Y, 'shape') else None,
+            'n_splits': int(Y.shape[1]) if hasattr(Y, 'shape') else None,
         }
+    }
 
-    summary_out_file = out_path / f"{timestamp}_wfa_summary.json"
-    with summary_out_file.open("w") as f:
-        json.dump({"summary": summary, "raw_splits_file": str(raw_out_file)}, f, indent=2, default=str)
+    audit_report = None
+    audit_error = None
 
-    return {"summary": summary, "raw_splits_file": str(raw_out_file), "summary_file": str(summary_out_file)}
+    audit_start_time = time.time()
+
+    if ed_config.AUDIT_ENABLED:
+        try:
+            report = auditor.run_backtest_audit(
+                Y=Y,
+                per_split_metrics=per_split_metrics,
+                pbo_threshold=audit_config.get('pbo_threshold') if audit_config else ed_config.PBO_THRESHOLD_DEFAULT,
+                sharpe_min=audit_config.get('sharpe_min') if audit_config else ed_config.SHARPE_MIN_DEFAULT,
+            )
+            audit_report = report
+            result['audit_report'] = report
+            # If configured to block on fail, raise
+            if not report.get('pass', False) and ed_config.AUDIT_ON_FAIL == 'block':
+                reason = report.get('reason', 'audit failure')
+                raise RuntimeError(f'Audit failed: {reason}')
+        except Exception as e:
+            logger.exception('Audit failed')
+            audit_error = str(e)
+            result['audit_error'] = audit_error
+
+    audit_duration = time.time() - audit_start_time
+
+    # Persist audit report to disk when available
+    if audit_report is not None:
+        try:
+            run_id = result.get('result', {}).get('run_id') or str(int(time.time() * 1000))
+            saved = auditor.save_audit_report(audit_report, run_id=run_id)
+            result['audit_report_path'] = str(saved)
+        except Exception as e:
+            logger.exception('Failed to save audit report')
+            result['audit_save_error'] = str(e)
+
+    # Structured audit summary logging
+    try:
+        audit_summary = {
+            'run_id': result.get('result', {}).get('run_id', run_id),
+            'pass': bool(result.get('audit_report', {}).get('pass', False)),
+            'pbo': result.get('audit_report', {}).get('pbo'),
+            'pbo_std': result.get('audit_report', {}).get('pbo_std'),
+            'max_deflated_sharpe': (max(result.get('audit_report', {}).get('deflated_sharpe', []))
+                                    if result.get('audit_report', {}).get('deflated_sharpe') else None),
+            'audit_report_path': result.get('audit_report_path')
+        }
+        logger.info('audit_summary: %s', audit_summary)
+    except Exception:
+        logger.exception('Failed to log audit summary')
+
+    # Record metrics
+    try:
+        if metrics is not None and audit_report is not None:
+            metrics.record_audit(run_id=run_id, passed=bool(audit_report.get('pass', False)), duration_seconds=audit_duration)
+    except Exception:
+        logger.exception('Failed to record metrics')
+
+    return result
