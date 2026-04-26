@@ -177,8 +177,10 @@ def run_wfa_cpcv(
             output_artifacts=_ledger_output_artifacts,
             metrics_summary=_ledger_metrics,
         )
+        cfg = ed_config.get_config()
+        ledger_path = cfg.get("ledger_path", ed_config.LEDGER_PATH_DEFAULT)
         try:
-            ledger_module.Ledger(path=ed_config.LEDGER_PATH_DEFAULT).write(entry)
+            ledger_module.Ledger(path=ledger_path).write(entry)
         except Exception:
             # Ledger failure must never mask or alter the function result
             logger.exception("Failed to write experiment ledger entry")

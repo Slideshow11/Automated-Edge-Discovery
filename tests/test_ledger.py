@@ -1,5 +1,6 @@
 """Tests for the experiment ledger and its integration with run_wfa_cpcv."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -150,3 +151,40 @@ def test_run_wfa_cpcv_writes_error_ledger_entry_then_raises(tmp_path, monkeypatc
     assert record["run_id"] is not None
     assert record["started_at"] != ""
     assert record["completed_at"] != ""
+
+
+
+# ---------------------------------------------------------------------------
+# C. Ledger path configuration via EDGE_DISCOVERY_LEDGER_PATH
+# ---------------------------------------------------------------------------;
+
+def test_ledger_path_respects_env_override(tmp_path, monkeypatch):
+    # Prepare a fake backtest result
+    def fake_run(strategy, split_idx, n_splits, purge, cost_model):
+        return {"strategy": strategy, "total_return": 0.1, "sharpe": 0.8, "trades": 5}
+
+    monkeypatch.setattr(runner, "_run_backtest_for_split", fake_run)
+
+
+    # Point ledger to a temp path via env var
+    ledger_path = str(tmp_path / "custom_ledger.jsonl")
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", ledger_path)
+
+    out_dir = tmp_path / "wfa_out"
+    res = runner.run_wfa_cpcv(
+        ["stratA"], n_splits=2, purge=0.01, cost_model=None, out_dir=str(out_dir)
+    )
+    assert "raw_splits_file" in res
+
+    # Ledger must be written to the custom path
+    assert Path(ledger_path).exists(), f"ledger not found at env-specified path: {ledger_path}"
+    lines = [ln.strip() for ln in Path(ledger_path).read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["run_type"] == "wfa_cpcv"
+    assert record["status"] == "success"
+
+
+    # Default path must NOT be created in the working area
+    default_path = tmp_path / ".wfa" / "ledger.jsonl"
+    assert not default_path.exists(), "default ledger path should not be created when env override is set"
