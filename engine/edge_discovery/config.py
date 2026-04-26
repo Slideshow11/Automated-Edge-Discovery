@@ -25,6 +25,9 @@ DEFLATION_METHOD_DEFAULT = 'lopez'
 # Default audit output directory.
 AUDIT_OUTDIR_DEFAULT = 'audit_reports'
 
+# Default path for the experiment ledger (JSON Lines format).
+LEDGER_PATH_DEFAULT = '.wfa/ledger.jsonl'
+
 
 def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
     """Return configuration dict merged from defaults and environment overrides.
@@ -39,7 +42,7 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
     Returns:
         Dict with keys: ``audit_enabled``, ``pbo_threshold``, ``sharpe_min``,
         ``audit_on_fail``, ``bootstrap_n``, ``bootstrap_seed``,
-        ``deflation_method``, ``audit_outdir``.
+        ``deflation_method``, ``audit_outdir``, ``ledger_path``.
 
     Examples:
         >>> # Use defaults
@@ -62,6 +65,7 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
         'bootstrap_seed': BOOTSTRAP_SEED_DEFAULT,
         'deflation_method': DEFLATION_METHOD_DEFAULT,
         'audit_outdir': AUDIT_OUTDIR_DEFAULT,
+        'ledger_path': LEDGER_PATH_DEFAULT,
     }
 
     env_mappings: dict[str, tuple[str, type]] = {
@@ -73,6 +77,7 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
         'bootstrap_seed': ('BOOTSTRAP_SEED', int),
         'deflation_method': ('DEFLATION_METHOD', str),
         'audit_outdir': ('AUDIT_OUTDIR', str),
+        'ledger_path': ('LEDGER_PATH', str),
     }
 
     result = dict(defaults)
