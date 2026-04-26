@@ -14,6 +14,7 @@ import time
 
 from . import config as ed_config
 from . import auditor
+from . import ledger as ledger_module
 
 
 try:
@@ -58,79 +59,131 @@ def run_wfa_cpcv(
     - 'summary': summary dict with n_splits and pbo_estimate
     - 'raw_splits_file': path to JSON file containing per-split results
     - 'summary_file': path to JSON file containing the summary
+
+    A JSONL ledger entry is appended to the configured ledger path (see
+    ``ed_config.LEDGER_PATH_DEFAULT``) on every invocation.
     """
+    started_at = ledger_module.now_utc()
+    run_id = str(int(time.time() * 1000))
+
     if out_dir is None:
         out_dir = ".wfa/output"
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
-    # Collect all split results
-    raw_splits: List[Dict[str, Any]] = []
-    for strategy in strategies:
-        for split_idx in range(n_splits):
-            split_result = _run_backtest_for_split(
-                strategy=strategy,
-                split_idx=split_idx,
-                n_splits=n_splits,
-                purge=purge,
-                cost_model=cost_model,
-            )
-            raw_splits.append(split_result)
+    # Collect run configuration for the ledger entry's config_hash
+    run_config = {
+        "strategies": strategies,
+        "n_splits": n_splits,
+        "purge": purge,
+        "cost_model": cost_model,
+        "out_dir": out_dir,
+    }
 
-    # Write raw splits file
-    run_id = str(int(time.time() * 1000))
-    raw_splits_file = out_path / f"raw_splits_{run_id}.json"
-    with raw_splits_file.open("w") as f:
-        json.dump(raw_splits, f)
+    # Build output-artifacts and metrics in a dict so the finally block
+    # can capture them regardless of how the function exits.
+    _ledger_output_artifacts: Dict[str, str] = {}
+    _ledger_metrics: Dict[str, Any] = {}
+    _ledger_error: Optional[str] = None
+    _result: Dict[str, Any] = {}
 
-    # Compute summary with pbo_estimate and aggregate stats
-    import numpy as np
-
-    # Build Y matrix: rows=strategies, cols=splits
-    # Handle both 'total_return' (integration tests) and 'returns' (unit tests)
-    def _get_return(s):
-        return s.get("total_return", s.get("returns", 0.0))
-
-    Y = np.array([
-        [_get_return(s) for s in raw_splits if s["strategy"] == strat]
-        for strat in strategies
-    ], dtype=float)
-
-    pbo_estimate = None
-    pbo_std = None
     try:
-        pbo_estimate, pbo_std = auditor.estimate_pbo(Y)
-    except Exception:
-        pass
+        # Collect all split results
+        raw_splits: List[Dict[str, Any]] = []
+        for strategy in strategies:
+            for split_idx in range(n_splits):
+                split_result = _run_backtest_for_split(
+                    strategy=strategy,
+                    split_idx=split_idx,
+                    n_splits=n_splits,
+                    purge=purge,
+                    cost_model=cost_model,
+                )
+                raw_splits.append(split_result)
 
-    # Aggregate per-split metrics; handle both field name variants
-    def _get_field(s, key, default):
-        return s.get(key, default)
+        # Write raw splits file
+        raw_splits_file = out_path / f"raw_splits_{run_id}.json"
+        with raw_splits_file.open("w") as f:
+            json.dump(raw_splits, f)
 
-    all_returns = [_get_return(s) for s in raw_splits]
-    all_sharpe = [s.get("sharpe", 0.0) for s in raw_splits]
-    all_mdd = [s.get("max_drawdown", 0.0) for s in raw_splits]
-    all_trades = [s.get("trades", 0) for s in raw_splits]
+        # Compute summary with pbo_estimate and aggregate stats
+        import numpy as np
 
-    summary_data = {
-        "n_splits": len(raw_splits),
-        "pbo_estimate": pbo_estimate,
-        "pbo_std": pbo_std,
-        "mean_return": float(np.mean(all_returns)) if all_returns else None,
-        "median_return": float(np.median(all_returns)) if all_returns else None,
-        "mean_sharpe": float(np.mean(all_sharpe)) if all_sharpe else None,
-        "mean_max_drawdown": float(np.mean(all_mdd)) if all_mdd else None,
-        "total_trades": sum(all_trades) if all_trades else 0,
-    }
-    summary_file = out_path / f"summary_{run_id}.json"
-    with summary_file.open("w") as f:
-        json.dump({"summary": summary_data}, f)
+        # Build Y matrix: rows=strategies, cols=splits
+        # Handle both 'total_return' (integration tests) and 'returns' (unit tests)
+        def _get_return(s):
+            return s.get("total_return", s.get("returns", 0.0))
 
-    return {
-        "summary": summary_data,
-        "raw_splits_file": str(raw_splits_file),
-        "summary_file": str(summary_file),
-    }
+        Y = np.array([
+            [_get_return(s) for s in raw_splits if s["strategy"] == strat]
+            for strat in strategies
+        ], dtype=float)
+
+        pbo_estimate = None
+        pbo_std = None
+        try:
+            pbo_estimate, pbo_std = auditor.estimate_pbo(Y)
+        except Exception:
+            pass
+
+        # Aggregate per-split metrics; handle both field name variants
+        def _get_field(s, key, default):
+            return s.get(key, default)
+
+        all_returns = [_get_return(s) for s in raw_splits]
+        all_sharpe = [s.get("sharpe", 0.0) for s in raw_splits]
+        all_mdd = [s.get("max_drawdown", 0.0) for s in raw_splits]
+        all_trades = [s.get("trades", 0) for s in raw_splits]
+
+        summary_data = {
+            "n_splits": len(raw_splits),
+            "pbo_estimate": pbo_estimate,
+            "pbo_std": pbo_std,
+            "mean_return": float(np.mean(all_returns)) if all_returns else None,
+            "median_return": float(np.median(all_returns)) if all_returns else None,
+            "mean_sharpe": float(np.mean(all_sharpe)) if all_sharpe else None,
+            "mean_max_drawdown": float(np.mean(all_mdd)) if all_mdd else None,
+            "total_trades": sum(all_trades) if all_trades else 0,
+        }
+        summary_file = out_path / f"summary_{run_id}.json"
+        with summary_file.open("w") as f:
+            json.dump({"summary": summary_data}, f)
+
+        _ledger_output_artifacts = {
+            "raw_splits": str(raw_splits_file),
+            "summary": str(summary_file),
+        }
+        _ledger_metrics = summary_data
+        _result = {
+            "summary": summary_data,
+            "raw_splits_file": str(raw_splits_file),
+            "summary_file": str(summary_file),
+        }
+    except Exception as e:
+        _ledger_error = str(e)
+        raise
+    finally:
+        completed_at = ledger_module.now_utc()
+        entry = ledger_module.LedgerEntry(
+            run_id=run_id,
+            run_type="wfa_cpcv",
+            started_at=started_at,
+            completed_at=completed_at,
+            status="error" if _ledger_error else "success",
+            config_hash=ledger_module.config_hash(run_config),
+            git_commit=ledger_module.git_commit(),
+            error=_ledger_error,
+            input_artifacts={},
+            output_artifacts=_ledger_output_artifacts,
+            metrics_summary=_ledger_metrics,
+        )
+        try:
+            ledger_module.Ledger(path=ed_config.LEDGER_PATH_DEFAULT).write(entry)
+        except Exception:
+            # Ledger failure must never mask or alter the function result
+            logger.exception("Failed to write experiment ledger entry")
+
+    return _result
 
 
 def run_backtest(Y: Optional[Any], per_split_metrics: Optional[List[Dict[str, Any]]] = None, audit_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
