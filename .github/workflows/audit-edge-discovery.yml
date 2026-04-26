@@ -24,7 +24,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt || true
+          python -m pip install -e ".[test]"
       - name: Run edge_discovery tests
         run: |
           chmod +x scripts/ci/audit_edge_discovery.sh

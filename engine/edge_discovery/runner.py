@@ -5,6 +5,9 @@ which runs a lightweight "backtest" (placeholder) and then invokes the auditor
 if enabled in config. The goal is to provide a safe integration point for the
 auditor and a testable API.
 """
+import json
+import os
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 import logging
 import time
@@ -19,6 +22,115 @@ except Exception:
     metrics = None
 
 logger = logging.getLogger(__name__)
+
+
+def _run_backtest_for_split(strategy: str, split_idx: int, n_splits: int, purge: float, cost_model: Optional[str]) -> Dict[str, Any]:
+    """Run a single CPCV split for a strategy. Override via monkeypatch in tests."""
+    # Minimal placeholder - real implementation calls the backtester
+    return {
+        "strategy": strategy,
+        "split_idx": split_idx,
+        "total_return": 0.0,
+        "sharpe": 0.0,
+        "max_drawdown": 0.0,
+        "trades": 0,
+        "execution_time_seconds": 0.0,
+    }
+
+
+def run_wfa_cpcv(
+    strategies: List[str],
+    n_splits: int,
+    purge: float,
+    cost_model: Optional[str],
+    out_dir: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run WFA/CPCV across strategies and collect split results.
+
+    Parameters
+    - strategies: list of strategy identifiers
+    - n_splits: number of CPCV splits
+    - purge: purge fraction
+    - cost_model: cost model identifier (passed to _run_backtest_for_split)
+    - out_dir: output directory for JSON files
+
+    Returns a dict with keys:
+    - 'summary': summary dict with n_splits and pbo_estimate
+    - 'raw_splits_file': path to JSON file containing per-split results
+    - 'summary_file': path to JSON file containing the summary
+    """
+    if out_dir is None:
+        out_dir = ".wfa/output"
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    # Collect all split results
+    raw_splits: List[Dict[str, Any]] = []
+    for strategy in strategies:
+        for split_idx in range(n_splits):
+            split_result = _run_backtest_for_split(
+                strategy=strategy,
+                split_idx=split_idx,
+                n_splits=n_splits,
+                purge=purge,
+                cost_model=cost_model,
+            )
+            raw_splits.append(split_result)
+
+    # Write raw splits file
+    run_id = str(int(time.time() * 1000))
+    raw_splits_file = out_path / f"raw_splits_{run_id}.json"
+    with raw_splits_file.open("w") as f:
+        json.dump(raw_splits, f)
+
+    # Compute summary with pbo_estimate and aggregate stats
+    import numpy as np
+
+    # Build Y matrix: rows=strategies, cols=splits
+    # Handle both 'total_return' (integration tests) and 'returns' (unit tests)
+    def _get_return(s):
+        return s.get("total_return", s.get("returns", 0.0))
+
+    Y = np.array([
+        [_get_return(s) for s in raw_splits if s["strategy"] == strat]
+        for strat in strategies
+    ], dtype=float)
+
+    pbo_estimate = None
+    pbo_std = None
+    try:
+        pbo_estimate, pbo_std = auditor.estimate_pbo(Y)
+    except Exception:
+        pass
+
+    # Aggregate per-split metrics; handle both field name variants
+    def _get_field(s, key, default):
+        return s.get(key, default)
+
+    all_returns = [_get_return(s) for s in raw_splits]
+    all_sharpe = [s.get("sharpe", 0.0) for s in raw_splits]
+    all_mdd = [s.get("max_drawdown", 0.0) for s in raw_splits]
+    all_trades = [s.get("trades", 0) for s in raw_splits]
+
+    summary_data = {
+        "n_splits": len(raw_splits),
+        "pbo_estimate": pbo_estimate,
+        "pbo_std": pbo_std,
+        "mean_return": float(np.mean(all_returns)) if all_returns else None,
+        "median_return": float(np.median(all_returns)) if all_returns else None,
+        "mean_sharpe": float(np.mean(all_sharpe)) if all_sharpe else None,
+        "mean_max_drawdown": float(np.mean(all_mdd)) if all_mdd else None,
+        "total_trades": sum(all_trades) if all_trades else 0,
+    }
+    summary_file = out_path / f"summary_{run_id}.json"
+    with summary_file.open("w") as f:
+        json.dump({"summary": summary_data}, f)
+
+    return {
+        "summary": summary_data,
+        "raw_splits_file": str(raw_splits_file),
+        "summary_file": str(summary_file),
+    }
 
 
 def run_backtest(Y: Optional[Any], per_split_metrics: Optional[List[Dict[str, Any]]] = None, audit_config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

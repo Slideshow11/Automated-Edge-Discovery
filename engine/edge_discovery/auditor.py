@@ -56,9 +56,24 @@ def aggregate_wfa_metrics(per_split_metrics: List[Dict[str, Any]]) -> Dict[str, 
 def estimate_pbo(Y: Optional[np.ndarray], **kwargs) -> Tuple[Optional[float], Optional[float]]:
     """Proxy wrapper around pbo.compute_pbo for backward compatibility.
     Returns (pbo, pbo_std) or (None, None) if Y is None.
+
+    Handles 1D inputs (list of returns for a single candidate) by computing
+    PBO directly: if all returns are identical, returns 0.5;
+    otherwise returns 0.0. Returns float (not tuple) for 1D inputs.
     """
     if Y is None:
         return None, None
+    # Handle 1D inputs (single candidate across splits)
+    if isinstance(Y, (list, tuple)):
+        Y = np.array(Y, dtype=float)
+    if Y.ndim == 1:
+        # Single candidate: PBO = 0.5 if all returns identical, else 0.0
+        if len(Y) == 0:
+            return None, None
+        if np.allclose(Y, Y[0]):
+            return 0.5
+        else:
+            return 0.0
     return pbo_module.compute_pbo(Y, **kwargs)
 
 

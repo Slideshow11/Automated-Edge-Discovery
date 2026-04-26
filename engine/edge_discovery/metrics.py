@@ -1,6 +1,6 @@
 """Prometheus metrics for audit runs."""
 
-from prometheus_client import Counter, Histogram, start_http_server
+from prometheus_client import Counter, Histogram, start_http_server as _prom_start_http_server
 
 # Total number of audit runs.
 audit_runs_total = Counter(
@@ -44,7 +44,7 @@ def start_http_server(port: int = 8000) -> None:
     Args:
         port: Port number to listen on (default: 8000).
     """
-    start_http_server(port)
+    _prom_start_http_server(port)
 
 
 if __name__ == '__main__':

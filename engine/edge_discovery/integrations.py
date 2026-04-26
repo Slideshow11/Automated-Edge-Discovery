@@ -55,14 +55,17 @@ def audit_wrapper(*, pbo_threshold: Optional[float] = None, sharpe_min: Optional
 
             try:
                 cfg = ed_config.get_config() if hasattr(ed_config, 'get_config') else {}
-                if not cfg.get('AUDIT_ENABLED', getattr(ed_config, 'AUDIT_ENABLED', True)):
+                if not cfg.get('audit_enabled', getattr(ed_config, 'AUDIT_ENABLED', True)):
                     return result
 
                 # Extract inputs for audit
                 Y = None
                 per_split_metrics = None
                 if isinstance(result, dict):
-                    Y = result.get('Y') or result.get('result', {}).get('Y')
+                    if "Y" in result:
+                        Y = result["Y"]
+                    elif isinstance(result.get("result"), dict) and "Y" in result["result"]:
+                        Y = result["result"]["Y"]
                     per_split_metrics = result.get('per_split_metrics')
 
                 # Allow explicit kwargs to override
@@ -75,8 +78,8 @@ def audit_wrapper(*, pbo_threshold: Optional[float] = None, sharpe_min: Optional
                     return result
 
                 # Resolve thresholds
-                pbo_t = pbo_threshold if pbo_threshold is not None else cfg.get('PBO_THRESHOLD_DEFAULT', getattr(ed_config, 'PBO_THRESHOLD_DEFAULT', 0.05))
-                sharpe_m = sharpe_min if sharpe_min is not None else cfg.get('SHARPE_MIN_DEFAULT', getattr(ed_config, 'SHARPE_MIN_DEFAULT', 1.0))
+                pbo_t = pbo_threshold if pbo_threshold is not None else cfg.get('pbo_threshold', getattr(ed_config, 'PBO_THRESHOLD_DEFAULT', 0.05))
+                sharpe_m = sharpe_min if sharpe_min is not None else cfg.get('sharpe_min', getattr(ed_config, 'SHARPE_MIN_DEFAULT', 1.0))
 
                 report = auditor.run_backtest_audit(Y=Y, per_split_metrics=per_split_metrics, pbo_threshold=pbo_t, sharpe_min=sharpe_m)
                 if isinstance(result, dict):
