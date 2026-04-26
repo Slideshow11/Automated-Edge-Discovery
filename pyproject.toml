@@ -16,3 +16,4 @@ exclude = ["tests"]
 
 [project.optional-dependencies]
 test = ["pytest", "numpy"]
+dev = ["pytest", "numpy", "pandas", "statsmodels", "patsy", "matplotlib"]
