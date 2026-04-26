@@ -15,6 +15,7 @@ try:
     import matplotlib.pyplot as plt
     HAS_MPL = True
 except Exception:
+    plt = None
     HAS_MPL = False
 
 import statsmodels.formula.api as smf
