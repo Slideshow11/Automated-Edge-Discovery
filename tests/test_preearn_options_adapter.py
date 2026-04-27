@@ -160,8 +160,10 @@ def test_build_command_basic(tmp_path):
     cmd = build_command(spec, out_csv)
 
     assert cmd[0] == sys.executable
-    assert "scripts" in cmd
-    assert "run_options_backtest_v1.py" in cmd
+    # Script must be a single path token ending with scripts/run_options_backtest_v1.py
+    script_token = cmd[1]
+    assert script_token.endswith("scripts/run_options_backtest_v1.py"), script_token
+    assert "scripts" not in cmd[2:], cmd  # no separate "scripts" token
     assert "--options-db" in cmd
     assert "/data/options.sqlite" in cmd
     assert "--entry-dpe" in cmd

@@ -218,8 +218,7 @@ def build_command(spec: CandidateSpec, output_csv_path: str) -> List[str]:
     """
     return [
         sys.executable,
-        "scripts",
-        "run_options_backtest_v1.py",
+        str(Path(spec.preearn_repo_path) / "scripts" / "run_options_backtest_v1.py"),
         "--options-db",
         spec.options_db_path,
         "--run-id",
