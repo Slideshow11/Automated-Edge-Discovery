@@ -8,6 +8,9 @@ def test_run_wfa_cpcv_uses_backtest_helper(tmp_path, monkeypatch):
     def fake_run(strategy, split_idx, n_splits, purge, cost_model):
         return {"strategy": strategy, "total_return": 0.1 + 0.01 * split_idx, "sharpe": 0.8, "trades": 5}
 
+    # Prevent ledger from being written to repo root during the test
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(tmp_path / "ledger.jsonl"))
+
     monkeypatch.setattr(runner, "_run_backtest_for_split", fake_run)
 
     out = tmp_path / "wfa_out"
