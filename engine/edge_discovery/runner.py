@@ -61,7 +61,7 @@ def run_wfa_cpcv(
     - 'summary_file': path to JSON file containing the summary
 
     A JSONL ledger entry is appended to the configured ledger path (see
-    ``ed_config.LEDGER_PATH_DEFAULT``) on every invocation.
+    ``ed_config.get_config()["ledger_path"]``) on every invocation.
     """
     started_at = ledger_module.now_utc()
     run_id = str(int(time.time() * 1000))
@@ -178,7 +178,8 @@ def run_wfa_cpcv(
             metrics_summary=_ledger_metrics,
         )
         try:
-            ledger_module.Ledger(path=ed_config.LEDGER_PATH_DEFAULT).write(entry)
+            ledger_path = ed_config.get_config()["ledger_path"]
+            ledger_module.Ledger(path=ledger_path).write(entry)
         except Exception:
             # Ledger failure must never mask or alter the function result
             logger.exception("Failed to write experiment ledger entry")
