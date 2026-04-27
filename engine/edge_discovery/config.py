@@ -28,6 +28,9 @@ AUDIT_OUTDIR_DEFAULT = 'audit_reports'
 # Default path for the experiment ledger (JSON Lines format).
 LEDGER_PATH_DEFAULT = '.wfa/ledger.jsonl'
 
+# Default path for the hypothesis registry (JSON Lines format).
+HYPOTHESIS_REGISTRY_PATH_DEFAULT = '.wfa/hypotheses.jsonl'
+
 
 def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
     """Return configuration dict merged from defaults and environment overrides.
@@ -42,7 +45,8 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
     Returns:
         Dict with keys: ``audit_enabled``, ``pbo_threshold``, ``sharpe_min``,
         ``audit_on_fail``, ``bootstrap_n``, ``bootstrap_seed``,
-        ``deflation_method``, ``audit_outdir``, ``ledger_path``.
+        ``deflation_method``, ``audit_outdir``, ``ledger_path``,
+        ``hypothesis_registry_path``.
 
     Examples:
         >>> # Use defaults
@@ -66,6 +70,7 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
         'deflation_method': DEFLATION_METHOD_DEFAULT,
         'audit_outdir': AUDIT_OUTDIR_DEFAULT,
         'ledger_path': LEDGER_PATH_DEFAULT,
+        'hypothesis_registry_path': HYPOTHESIS_REGISTRY_PATH_DEFAULT,
     }
 
     env_mappings: dict[str, tuple[str, type]] = {
@@ -78,6 +83,7 @@ def get_config(prefix: str = 'EDGE_DISCOVERY') -> dict[str, Any]:
         'deflation_method': ('DEFLATION_METHOD', str),
         'audit_outdir': ('AUDIT_OUTDIR', str),
         'ledger_path': ('LEDGER_PATH', str),
+        'hypothesis_registry_path': ('HYPOTHESIS_REGISTRY_PATH', str),
     }
 
     result = dict(defaults)
