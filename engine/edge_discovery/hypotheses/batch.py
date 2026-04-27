@@ -1,15 +1,16 @@
 """Pre-earnings candidate batch runner.
 
 Orchestrates HypothesisSpec -> CandidateSpec generation -> execution via
-the existing preearn_options adapter -> batch summary JSON artifact.
+the existing preearn_options adapter -> batch summary JSON artifact and
+AED ledger entry (run_type="preearn_candidate_batch").
 
-This module is stateful but not persistent — it coordinates the execution
-path without writing its own ledger entries (per-candidate entries are
-written by the adapter).
+Per-candidate ledger entries are written by the adapter itself.
+This module writes one parent batch-level ledger entry per call.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 import uuid
@@ -21,9 +22,11 @@ from ..adapters.preearn_options import (
     CandidateSpec,
     PreearnResult,
     candidate_id,
-    config_hash,
+    get_git_commit,
     run_preearn_backtest,
 )
+from ..config import get_config
+from ..ledger import Ledger, LedgerEntry
 from .generate import generate_candidates
 from .spec import HypothesisSpec
 
@@ -141,10 +144,11 @@ def run_candidate_batch(
        each selected candidate, catching exceptions and synthesising error
        results for failures.
     6. Write a batch summary JSON to ``{output_dir}/batch_{batch_id}.json``.
-    7. Return a ``BatchResult``.
+    7. Write one parent batch-level ``LedgerEntry`` (``run_type="preearn_candidate_batch``).
+    8. Return a ``BatchResult``.
 
     Per-candidate ledger entries are written by the adapter itself.
-    This function does not write a batch-level ledger entry.
+    The batch-level entry is written by this function.
 
     Parameters
     ----------
@@ -155,8 +159,8 @@ def run_candidate_batch(
     preearn_repo_path : str
         Required. Path to the pre-earnings engine checkout.
     ledger_path : str | None
-        Passed to each ``run_preearn_backtest`` call.
-        None uses the adapter's default (via ``get_config``).
+        Path for the AED ledger (both batch-level and per-candidate entries).
+        None uses the default ``ledger_path`` from ``get_config()``.
     output_dir : str
         Directory for batch summary JSON. Created if it does not exist.
     max_candidates : int | None
@@ -183,6 +187,10 @@ def run_candidate_batch(
     """
     started_at = now_utc()
     batch_id = f"batch_{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+
+    # Resolve ledger_path from config if not provided
+    if ledger_path is None:
+        ledger_path = get_config().get("ledger_path", ".wfa/ledger.jsonl")
 
     # ── Step 1: generate candidates ──────────────────────────────────────
     try:
@@ -212,7 +220,22 @@ def run_candidate_batch(
             completed_at=completed_at,
         )
         _write_summary(result, output_dir)
-        return result
+        result.output_artifacts["batch_summary_json"] = str(
+            Path(output_dir) / f"batch_{batch_id}.json"
+        )
+        _write_batch_ledger_entry(
+            result,
+            ledger_path,
+            hypothesis,
+            options_db_path=options_db_path,
+            preearn_repo_path=preearn_repo_path,
+            max_candidates=max_candidates,
+            dry_run=dry_run,
+            fill_policy=fill_policy,
+            spread_penalty_k=spread_penalty_k,
+            contract_multiplier=contract_multiplier,
+        )
+        raise
 
     n_generated = len(all_candidates)
 
@@ -240,6 +263,18 @@ def run_candidate_batch(
         _write_summary(result, output_dir)
         result.output_artifacts["batch_summary_json"] = str(
             Path(output_dir) / f"batch_{batch_id}.json"
+        )
+        _write_batch_ledger_entry(
+            result,
+            ledger_path,
+            hypothesis,
+            options_db_path=options_db_path,
+            preearn_repo_path=preearn_repo_path,
+            max_candidates=max_candidates,
+            dry_run=dry_run,
+            fill_policy=fill_policy,
+            spread_penalty_k=spread_penalty_k,
+            contract_multiplier=contract_multiplier,
         )
         return result
 
@@ -302,6 +337,18 @@ def run_candidate_batch(
     result.output_artifacts["batch_summary_json"] = str(
         Path(output_dir) / f"batch_{batch_id}.json"
     )
+    _write_batch_ledger_entry(
+        result,
+        ledger_path,
+        hypothesis,
+        options_db_path=options_db_path,
+        preearn_repo_path=preearn_repo_path,
+        max_candidates=max_candidates,
+        dry_run=dry_run,
+        fill_policy=fill_policy,
+        spread_penalty_k=spread_penalty_k,
+        contract_multiplier=contract_multiplier,
+    )
     return result
 
 
@@ -316,3 +363,76 @@ def _write_summary(result: BatchResult, output_dir: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     summary_path = path / f"batch_{result.batch_id}.json"
     summary_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+
+
+def _config_hash_for_batch(
+    hypothesis: HypothesisSpec,
+    options_db_path: str,
+    preearn_repo_path: str,
+    max_candidates: int | None,
+    dry_run: bool,
+    fill_policy: str,
+    spread_penalty_k: float,
+    contract_multiplier: float,
+) -> str:
+    """Return a short SHA-256 hash of the batch configuration."""
+    fields = {
+        "hypothesis_id": hypothesis.hypothesis_id,
+        "options_db_path": options_db_path,
+        "preearn_repo_path": preearn_repo_path,
+        "max_candidates": max_candidates,
+        "dry_run": dry_run,
+        "fill_policy": fill_policy,
+        "spread_penalty_k": spread_penalty_k,
+        "contract_multiplier": contract_multiplier,
+    }
+    return hashlib.sha256(
+        json.dumps(fields, sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+def _write_batch_ledger_entry(
+    result: BatchResult,
+    ledger_path: str,
+    hypothesis: HypothesisSpec,
+    options_db_path: str,
+    preearn_repo_path: str,
+    max_candidates: int | None,
+    dry_run: bool,
+    fill_policy: str,
+    spread_penalty_k: float,
+    contract_multiplier: float,
+) -> None:
+    """Write one batch-level LedgerEntry. Nonfatal."""
+    try:
+        entry = LedgerEntry(
+            run_id=result.batch_id,
+            run_type="preearn_candidate_batch",
+            started_at=result.started_at,
+            completed_at=result.completed_at,
+            status=result.status,
+            config_hash=_config_hash_for_batch(
+                hypothesis,
+                options_db_path,
+                preearn_repo_path,
+                max_candidates,
+                dry_run,
+                fill_policy,
+                spread_penalty_k,
+                contract_multiplier,
+            ),
+            git_commit=get_git_commit("."),
+            error=result.error,
+            input_artifacts={"hypothesis_id": hypothesis.hypothesis_id},
+            output_artifacts=result.output_artifacts,
+            metrics_summary={
+                "n_candidates_generated": result.n_candidates_generated,
+                "n_candidates_selected": result.n_candidates_selected,
+                "n_success": result.n_success,
+                "n_error": result.n_error,
+            },
+        )
+        Ledger(ledger_path).write(entry)
+    except Exception:
+        # Nonfatal — do not obscure the batch result
+        pass
