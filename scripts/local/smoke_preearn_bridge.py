@@ -6,6 +6,9 @@ Usage: see docs/preearn_bridge_smoke.md
 Defaults to dry-run. Real run requires --real-run and will invoke a local
 pre-earnings repository via the adapter. The script writes all outputs under
 output_dir and will write a batch-level ledger entry if ledger_path is given.
+
+After the batch run, the script evaluates the BatchResult and prints the
+evaluation label and reason for human review readiness.
 """
 from __future__ import annotations
 
@@ -14,13 +17,10 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from engine.edge_discovery.hypotheses.spec import (
-    HypothesisSpec,
-    ParameterConstraint,
-    ValidationPlan,
-    SourceType,
-    AssetClass,
-    StrategyFamily,
+from engine.edge_discovery.evaluation import (
+    EvaluationLabel,
+    EvaluationResult,
+    evaluate_batch_result,
 )
 from engine.edge_discovery.hypotheses.batch import run_candidate_batch, BatchResult
 
@@ -37,7 +37,9 @@ def parse_args(argv: Optional[list[str]] = None):
     p.add_argument("--max-candidates", type=int, default=1)
     group = p.add_mutually_exclusive_group()
     group.add_argument("--dry-run", dest="dry_run", action="store_true", help="Dry run (default)")
-    group.add_argument("--real-run", dest="dry_run", action="store_false", help="Invoke local pre-earnings repo (must be explicit)")
+    group.add_argument(
+        "--real-run", dest="dry_run", action="store_false", help="Invoke local pre-earnings repo (must be explicit)"
+    )
     p.set_defaults(dry_run=True)
     p.add_argument("--timeout", type=float, default=60.0)
     return p.parse_args(argv)
@@ -49,6 +51,15 @@ def make_smoke_hypothesis() -> HypothesisSpec:
     Requirements per PR: strategy_family preearn_options, asset_class equity_options,
     required_data contains options_db and preearn_repo, and candidate constraints as specified.
     """
+    from engine.edge_discovery.hypotheses.spec import (
+        HypothesisSpec,
+        ParameterConstraint,
+        ValidationPlan,
+        SourceType,
+        AssetClass,
+        StrategyFamily,
+    )
+
     hc = (
         ParameterConstraint(name="entry_dpe", values=(2,)),
         ParameterConstraint(name="delta_target", values=(0.5,)),
@@ -75,60 +86,40 @@ def make_smoke_hypothesis() -> HypothesisSpec:
     return hs
 
 
-def run_smoke(
-    preearn_repo_path: str,
-    options_db_path: str,
-    output_dir: str = DEFAULT_OUTPUT,
-    ledger_path: Optional[str] = None,
-    max_candidates: int = 1,
-    dry_run: bool = True,
-    timeout: float = 60.0,
-) -> BatchResult:
-    """Execute the smoke path and return the BatchResult.
-
-    This function is safe for dry-run mode; in real-run mode it will invoke
-    the local pre-earnings adapter via run_candidate_batch.
-    """
-    hypothesis = make_smoke_hypothesis()
-
-    result = run_candidate_batch(
-        hypothesis,
-        options_db_path=str(options_db_path),
-        preearn_repo_path=str(preearn_repo_path),
-        ledger_path=ledger_path,
-        output_dir=output_dir,
-        max_candidates=max_candidates,
-        dry_run=dry_run,
-        timeout=timeout,
-    )
-    return result
-
-
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
     if not args.dry_run:
-        print("WARNING: --real-run specified. This will invoke the local pre-earnings repo via the adapter.")
-        print("Ensure you know what the adapter will execute.")
+        print(
+            "WARNING: --real-run specified. This will invoke the local pre-earnings repo via the adapter.",
+            file=sys.stderr,
+        )
+        print("Ensure you know what the adapter will execute.", file=sys.stderr)
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    hypothesis = make_smoke_hypothesis()
+
     try:
-        result = run_smoke(
-            preearn_repo_path=args.preearn_repo_path,
-            options_db_path=args.options_db_path,
-            output_dir=str(out_dir),
+        result = run_candidate_batch(
+            hypothesis,
+            options_db_path=str(args.options_db_path),
+            preearn_repo_path=str(args.preearn_repo_path),
             ledger_path=args.ledger_path,
+            output_dir=str(out_dir),
             max_candidates=args.max_candidates,
             dry_run=args.dry_run,
             timeout=args.timeout,
         )
     except Exception as exc:
-        print("Smoke run failed:", exc, file=sys.stderr)
+        print(f"Smoke run failed: {exc}", file=sys.stderr)
         return 2
 
-    # Print summary
+    # Evaluate the batch result for review-readiness
+    eval_result = evaluate_batch_result(result)
+
+    # Print batch summary
     print(f"batch_id: {result.batch_id}")
     print(f"status: {result.status}")
     print(f"n_candidates_generated: {result.n_candidates_generated}")
@@ -141,7 +132,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.ledger_path:
         print(f"ledger_path: {args.ledger_path}")
 
+    # Print evaluation
+    print()
+    _print_evaluation(eval_result)
+
     return 0
+
+
+def _print_evaluation(eval_result: EvaluationResult) -> None:
+    """Print evaluation label and reason."""
+    print(f"evaluation_label: {eval_result.label.value}")
+    print(f"evaluation_reason: {eval_result.reason}")
+    if eval_result.warnings:
+        print("evaluation_warnings:")
+        for w in eval_result.warnings:
+            print(f"  - {w}")
 
 
 if __name__ == "__main__":
