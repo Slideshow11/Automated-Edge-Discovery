@@ -1,0 +1,27 @@
+{
+  "hypothesis_id": "preearn-delta-grid-basic-v1",
+  "version": "1.0.0",
+  "source_type": "empirical_observation",
+  "source_reference": "internal",
+  "market_mechanism": "A delta-neutral long-gamma pre-earnings position profits from realized volatility exceeding implied volatility, scaled across entry DPE and moneyness.",
+  "expected_effect": "Net PnL is positive when realized vol exceeds IV paid, with entry timing and moneyness as levers.",
+  "asset_class": "equity_options",
+  "strategy_family": "preearn_options",
+  "required_data": ["options_db", "preearn_repo"],
+  "candidate_constraints": [
+    {"name": "entry_dpe", "values": [2, 3]},
+    {"name": "delta_target", "values": [0.3, 0.5]},
+    {"name": "expiry_rank", "values": [0]}
+  ],
+  "validation_plan": {
+    "methods": ["cpcv"],
+    "holdout_required": true,
+    "min_trades": 30,
+    "min_years": 1,
+    "notes": "Delta grid across DPE and moneyness."
+  },
+  "failure_modes": ["low_volume_filter", "wide_spread_filter", "gap_risk"],
+  "kill_criteria": [],
+  "status": "draft",
+  "notes": "Deterministic fixture. Not a trading recommendation."
+}
