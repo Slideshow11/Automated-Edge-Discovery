@@ -1,10 +1,11 @@
 """Hypothesis declaration layer for AED.
 
 This package provides the theory-first hypothesis schema: HypothesisSpec
-and its supporting types. It is purely declarative — no execution,
-no candidate generation, no registry logic lives here.
+and its supporting types, a JSONL registry, and a deterministic
+candidate generator.
 """
 
+from .generate import generate_candidates
 from .spec import (
     AssetClass,
     HypothesisSpec,
@@ -25,4 +26,5 @@ __all__ = [
     "SourceType",
     "StrategyFamily",
     "ValidationPlan",
+    "generate_candidates",
 ]
