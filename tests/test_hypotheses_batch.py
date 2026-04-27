@@ -106,6 +106,7 @@ class TestDryRun:
             hyp,
             options_db_path="/tmp/does_not_exist.db",
             preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=str(tmp_path / "ledger.jsonl"),
             output_dir=outdir,
             dry_run=True,
         )
@@ -118,6 +119,7 @@ class TestDryRun:
             hyp,
             options_db_path="/tmp/does_not_exist.db",
             preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=str(tmp_path / "ledger.jsonl"),
             output_dir=outdir,
             dry_run=True,
         )
@@ -136,6 +138,7 @@ class TestDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=True,
             )
@@ -148,6 +151,7 @@ class TestDryRun:
             hyp,
             options_db_path="/tmp/does_not_exist.db",
             preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=str(tmp_path / "ledger.jsonl"),
             output_dir=outdir,
             max_candidates=2,
             dry_run=True,
@@ -185,6 +189,7 @@ class TestNonDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=False,
             )
@@ -218,6 +223,7 @@ class TestNonDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 timeout=300.0,
                 dry_run=False,
@@ -299,6 +305,7 @@ class TestNonDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=False,
             )
@@ -335,6 +342,7 @@ class TestNonDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=False,
             )
@@ -343,7 +351,7 @@ class TestNonDryRun:
         assert result.n_error == 0
 
     def test_unsupported_strategy_raises_from_generator(self, tmp_path):
-        """Unsupported strategy family propagates as BatchResult status='error'."""
+        """Unsupported strategy family re-raises ValueError after writing ledger entry."""
         hyp = HypothesisSpec(
             hypothesis_id="hyp_bad",
             version="1.0",
@@ -361,15 +369,15 @@ class TestNonDryRun:
             failure_modes=(),
             kill_criteria=(),
         )
-        result = run_candidate_batch(
-            hyp,
-            options_db_path="/tmp/does_not_exist.db",
-            preearn_repo_path="/tmp/does_not_exist",
-            output_dir=str(tmp_path / "out"),
-            dry_run=False,
-        )
-        assert result.status == "error"
-        assert "Unsupported strategy family" in (result.error or "")
+        with pytest.raises(ValueError, match="Unsupported strategy family"):
+            run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
+                output_dir=str(tmp_path / "out"),
+                dry_run=False,
+            )
 
     def test_no_subprocess_in_tests(self, tmp_path):
         """Meta-test: ensure no real subprocess calls leak into test environment."""
@@ -400,6 +408,7 @@ class TestNonDryRun:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=False,
             )
@@ -413,6 +422,7 @@ class TestBatchSummaryJson:
             hyp,
             options_db_path="/tmp/does_not_exist.db",
             preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=str(tmp_path / "ledger.jsonl"),
             output_dir=outdir,
             dry_run=True,
         )
@@ -426,6 +436,7 @@ class TestBatchSummaryJson:
             hyp,
             options_db_path="/tmp/does_not_exist.db",
             preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=str(tmp_path / "ledger.jsonl"),
             output_dir=outdir,
             dry_run=True,
         )
@@ -476,6 +487,7 @@ class TestBatchSummaryJson:
                 hyp,
                 options_db_path="/tmp/does_not_exist.db",
                 preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
                 output_dir=outdir,
                 dry_run=False,
             )
@@ -484,3 +496,284 @@ class TestBatchSummaryJson:
         data = json.loads(summary_path.read_text())
         assert data["status"] == "success"
         assert len(data["results"]) == 1
+
+
+# --------------------------------------------------------------------------
+# Batch ledger entry tests
+# --------------------------------------------------------------------------
+
+
+class TestBatchLedgerEntry:
+    """Tests for the batch-level LedgerEntry written by run_candidate_batch."""
+
+    def test_batch_ledger_entry_written_on_dry_run(self, tmp_path):
+        """dry_run=True writes one batch-level ledger entry."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis()
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        result = run_candidate_batch(
+            hyp,
+            options_db_path="/tmp/does_not_exist.db",
+            preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=ledger_path,
+            output_dir=str(tmp_path / "batch"),
+            dry_run=True,
+        )
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert len(batch_entries) == 1
+        assert batch_entries[0].run_id == result.batch_id
+        assert batch_entries[0].status == "dry_run"
+
+    def test_batch_ledger_entry_written_on_success(self, tmp_path):
+        """success writes batch ledger entry with status='success'."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2,)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        mock_result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd1234",
+            git_commit=None,
+            command="",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={},
+        )
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            return_value=mock_result,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=ledger_path,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=False,
+            )
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert len(batch_entries) == 1
+        assert batch_entries[0].run_id == result.batch_id
+        assert batch_entries[0].status == "success"
+
+    def test_batch_ledger_entry_written_on_partial(self, tmp_path):
+        """partial status is recorded in the ledger entry."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2, 3)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        success_result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd",
+            git_commit=None,
+            command="",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={},
+        )
+
+        def _mock_run(spec, **kwargs):
+            if not hasattr(_mock_run, "_called"):
+                _mock_run._called = True
+                return success_result
+            raise RuntimeError("subprocess failed")
+
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            side_effect=_mock_run,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=ledger_path,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=False,
+            )
+        assert result.status == "partial"
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert batch_entries[0].status == "partial"
+
+    def test_batch_ledger_entry_written_on_all_error(self, tmp_path):
+        """all-error status is recorded in the ledger entry."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2,)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        ledger_path = str(tmp_path / "ledger.jsonl")
+
+        def _mock_run(spec, **kwargs):
+            raise RuntimeError("subprocess failed")
+
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            side_effect=_mock_run,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=ledger_path,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=False,
+            )
+        assert result.status == "error"
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert batch_entries[0].status == "error"
+
+    def test_batch_ledger_entry_has_correct_fields(self, tmp_path):
+        """Ledger entry has all required fields populated correctly."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis()
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        result = run_candidate_batch(
+            hyp,
+            options_db_path="/tmp/does_not_exist.db",
+            preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=ledger_path,
+            output_dir=str(tmp_path / "batch"),
+            dry_run=True,
+        )
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        e = batch_entries[0]
+        assert e.run_id == result.batch_id
+        assert e.run_type == "preearn_candidate_batch"
+        assert e.status == "dry_run"
+        assert e.config_hash != ""
+        assert e.input_artifacts.get("hypothesis_id") == hyp.hypothesis_id
+        assert "batch_summary_json" in e.output_artifacts
+        assert e.metrics_summary.get("n_candidates_generated") == 4
+        assert e.metrics_summary.get("n_candidates_selected") == 4
+        assert e.metrics_summary.get("n_success") == 0
+        assert e.metrics_summary.get("n_error") == 0
+
+    def test_batch_ledger_entry_honors_custom_ledger_path(self, tmp_path):
+        """Custom ledger_path is used for the batch ledger entry."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis()
+        custom_ledger = str(tmp_path / "custom.jsonl")
+        run_candidate_batch(
+            hyp,
+            options_db_path="/tmp/does_not_exist.db",
+            preearn_repo_path="/tmp/does_not_exist",
+            ledger_path=custom_ledger,
+            output_dir=str(tmp_path / "batch"),
+            dry_run=True,
+        )
+        entries = Ledger(custom_ledger).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert len(batch_entries) == 1
+
+    def test_batch_ledger_failure_is_nonfatal(self, tmp_path):
+        """Ledger write failure does not prevent BatchResult from being returned."""
+        hyp = _make_preearn_hypothesis()
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.Ledger.write",
+            side_effect=RuntimeError("disk full"),
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=ledger_path,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=True,
+            )
+        assert result.status == "dry_run"
+        assert result.batch_id != ""
+
+    def test_batch_ledger_entry_written_on_generation_failure_then_reraises(self, tmp_path):
+        """Generation failure writes error ledger entry, then re-raises."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = HypothesisSpec(
+            hypothesis_id="hyp_bad",
+            version="1.0",
+            source_type=SourceType.empirical_observation,
+            source_reference="test",
+            market_mechanism="test",
+            expected_effect="test",
+            asset_class=AssetClass.equity,
+            strategy_family=StrategyFamily.momentum,
+            required_data=("returns",),
+            candidate_constraints=(
+                ParameterConstraint(name="window", values=(20,)),
+            ),
+            validation_plan=ValidationPlan(methods=("t Test",)),
+            failure_modes=(),
+            kill_criteria=(),
+        )
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        with pytest.raises(ValueError, match="Unsupported strategy family"):
+            run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=ledger_path,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=False,
+            )
+        # Ledger entry was written despite the re-raise
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert len(batch_entries) == 1
+        assert batch_entries[0].status == "error"
+        assert "Unsupported" in (batch_entries[0].error or "")
+
+    def test_batch_ledger_entry_uses_ledger_path_not_hypothesis_registry_path(self, tmp_path):
+        """Batch ledger is written to ledger_path, not hypothesis_registry_path."""
+        from engine.edge_discovery.ledger import Ledger
+
+        hyp = _make_preearn_hypothesis()
+        ledger_path = str(tmp_path / "ledger.jsonl")
+        # Explicitly pass ledger_path=None to exercise the config fallback
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.get_config",
+            return_value={
+                "ledger_path": ledger_path,
+                "hypothesis_registry_path": str(tmp_path / "hypotheses.jsonl"),
+            },
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=None,
+                output_dir=str(tmp_path / "batch"),
+                dry_run=True,
+            )
+        entries = Ledger(ledger_path).read()
+        batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
+        assert len(batch_entries) == 1
+        # Hypotheses file should not exist
+        assert not Path(tmp_path / "hypotheses.jsonl").exists()
