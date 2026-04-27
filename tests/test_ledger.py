@@ -1,5 +1,6 @@
 """Tests for the experiment ledger and its integration with run_wfa_cpcv."""
 import json
+from pathlib import Path
 
 import pytest
 
@@ -77,7 +78,7 @@ def test_config_hash_different_inputs_different_hash():
 
 def test_run_wfa_cpcv_writes_success_ledger_entry(tmp_path, monkeypatch):
     ledger_file = tmp_path / "ledger.jsonl"
-    monkeypatch.setattr(ed_config, "LEDGER_PATH_DEFAULT", str(ledger_file))
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
 
     def fake_split(strategy, split_idx, n_splits, purge, cost_model):
         return {
@@ -125,7 +126,7 @@ def test_run_wfa_cpcv_writes_success_ledger_entry(tmp_path, monkeypatch):
 
 def test_run_wfa_cpcv_writes_error_ledger_entry_then_raises(tmp_path, monkeypatch):
     ledger_file = tmp_path / "ledger.jsonl"
-    monkeypatch.setattr(ed_config, "LEDGER_PATH_DEFAULT", str(ledger_file))
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
 
     def failing_split(strategy, split_idx, n_splits, purge, cost_model):
         raise RuntimeError("boom")
@@ -150,3 +151,48 @@ def test_run_wfa_cpcv_writes_error_ledger_entry_then_raises(tmp_path, monkeypatc
     assert record["run_id"] is not None
     assert record["started_at"] != ""
     assert record["completed_at"] != ""
+
+
+# --------------------------------------------------------------------------/
+# D. EDGE_DISCOVERY_LEDGER_PATH env var is honored
+# --------------------------------------------------------------------------/
+
+def test_ledger_path_env_var_is_honored(tmp_path, monkeypatch):
+    """Setting EDGE_DISCOVERY_LEDGER_PATH must direct the ledger there."""
+    ledger_file = tmp_path / "custom" / "ledger.jsonl"
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
+
+    def fake_split(strategy, split_idx, n_splits, purge, cost_model):
+        return {
+            "strategy": strategy,
+            "split_idx": split_idx,
+            "total_return": 0.05,
+            "sharpe": 0.6,
+            "max_drawdown": 0.03,
+            "trades": 3,
+        }
+
+    monkeypatch.setattr(runner, "_run_backtest_for_split", fake_split)
+
+    out_dir = tmp_path / "wfa_out"
+    res = runner.run_wfa_cpcv(
+        ["stratX"], n_splits=1, purge=0.01, cost_model=None, out_dir=str(out_dir)
+    )
+
+    # Ledger must be at the env-var path, not the default
+    assert ledger_file.exists(), f"ledger not at env-var path {ledger_file}"
+
+    # Default path must not be created in the test root
+    default_path = Path(".wfa/ledger.jsonl")
+    assert not default_path.exists(), "default ledger path was created despite env var"
+
+    lines = [ln.strip() for ln in ledger_file.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["status"] == "success"
+    assert record["run_type"] == "wfa_cpcv"
+
+    # Return value unchanged
+    assert "summary" in res
+    assert "raw_splits_file" in res
+    assert "summary_file" in res
