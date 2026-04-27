@@ -162,6 +162,10 @@ def test_ledger_path_env_var_is_honored(tmp_path, monkeypatch):
     ledger_file = tmp_path / "custom" / "ledger.jsonl"
     monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
 
+    # Ensure the test runs in an isolated working directory so default .wfa
+    # paths, if created, live under tmp_path rather than the repo root.
+    monkeypatch.chdir(tmp_path)
+
     def fake_split(strategy, split_idx, n_splits, purge, cost_model):
         return {
             "strategy": strategy,
@@ -182,7 +186,8 @@ def test_ledger_path_env_var_is_honored(tmp_path, monkeypatch):
     # Ledger must be at the env-var path, not the default
     assert ledger_file.exists(), f"ledger not at env-var path {ledger_file}"
 
-    # Default path must not be created in the test root
+    # Default path must not be created in the test root (and because we chdir,
+    # any default-created .wfa would be under tmp_path)
     default_path = Path(".wfa/ledger.jsonl")
     assert not default_path.exists(), "default ledger path was created despite env var"
 
