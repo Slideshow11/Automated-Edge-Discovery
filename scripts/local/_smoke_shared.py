@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
 
 from engine.edge_discovery.data_manifest import (
     DatasetRole,
