@@ -139,7 +139,7 @@ Manual decision rules
 Examples
 --------
 
-Example A: Pre-earnings options IV ramp
+Example A: pre-earnings options IV ramp
 - Idea: observed IV expansion in front-month options before earnings.
 - Mechanism (TheorySketch): Market makers and traders reprice event uncertainty into front-month options before earnings.
 - HypothesisSpec highlights:
