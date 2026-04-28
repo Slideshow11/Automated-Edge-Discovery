@@ -11,55 +11,31 @@ Exit codes: 0 = evaluated, 1 = error (not found, duplicate, etc.)
 """
 from __future__ import annotations
 
-import argparse
 import json
 import sys
 from typing import Optional
 
 from engine.edge_discovery.evaluation import evaluate_ledger_entry
-from engine.edge_discovery.ledger import Ledger
+
+from scripts.local._ledger_review_shared import (
+    evaluation_to_dict,
+    find_ledger_entry,
+)
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="Evaluate a single ledger entry by run_id and print the review result."
-    )
-    p.add_argument(
-        "--ledger-path",
-        required=True,
-        help="Path to the ledger JSONL file.",
-    )
-    p.add_argument(
-        "--run-id",
-        required=True,
-        help="Exact run_id to look up.",
-    )
-    return p.parse_args(argv)
+def parse_args(argv: Optional[list[str]] = None):
+    from scripts.local._ledger_review_shared import build_parser
+
+    return build_parser(
+        "Evaluate a single ledger entry by run_id and print the review result.",
+        ledger_required=True,
+    ).parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
-    ledger = Ledger(args.ledger_path)
-    all_entries = ledger.read()
-
-    matches = [e for e in all_entries if e.run_id == args.run_id]
-
-    if len(matches) == 0:
-        print(
-            f"ERROR: no ledger entry found for run_id {args.run_id!r}",
-            file=sys.stderr,
-        )
-        return 1
-
-    if len(matches) > 1:
-        print(
-            f"ERROR: multiple entries found for run_id {args.run_id!r} ({len(matches)} matches)",
-            file=sys.stderr,
-        )
-        return 1
-
-    entry = matches[0]
+    entry = find_ledger_entry(args.ledger_path, args.run_id)
     result = evaluate_ledger_entry(entry)
 
     output = {
