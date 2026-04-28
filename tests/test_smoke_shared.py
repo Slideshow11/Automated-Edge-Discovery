@@ -7,9 +7,11 @@ from unittest import mock
 
 import pytest
 
+from engine.edge_discovery.data_manifest import DatasetRole
 from scripts.local._smoke_shared import (
     ensure_output_dir,
     print_batch_summary,
+    resolve_path_from_manifest,
     warn_real_run,
 )
 
@@ -105,3 +107,47 @@ class TestPrintBatchSummary:
         )
         out = capsys.readouterr().out
         assert all(line.startswith("  ") for line in out.splitlines())
+
+
+_EXAMPLES_DIR = (
+    Path(__file__).resolve().parents[1] / "examples" / "data_manifests"
+)
+
+
+class TestResolvePathFromManifest:
+    def test_options_db_manifest_returns_path(self):
+        path = _EXAMPLES_DIR / "preearn_options_2021_local.json"
+        result = resolve_path_from_manifest(str(path), "options_backtest_db")
+        # The real manifest path - validation passes since the path exists on this machine
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_preearn_repo_manifest_returns_path(self):
+        path = _EXAMPLES_DIR / "preearn_repo_local.json"
+        result = resolve_path_from_manifest(str(path), "preearn_repo")
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+    def test_wrong_role_exits(self, capsys):
+        path = _EXAMPLES_DIR / "preearn_options_2021_local.json"
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest(str(path), "preearn_repo")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "is required" in err
+
+    def test_missing_file_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest("/CI_DOES_NOT_EXIST/manifest.json", "options_backtest_db")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "not found" in err
+
+    def test_invalid_json_exits(self, capsys, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{ not json }", encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest(str(bad), "options_backtest_db")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "failed to parse" in err

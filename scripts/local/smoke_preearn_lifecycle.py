@@ -29,8 +29,10 @@ from engine.edge_discovery.hypotheses.lifecycle import (
     LifecycleResult,
     register_and_run_batch,
 )
+from engine.edge_discovery.data_manifest import DatasetRole
 from scripts.local._smoke_shared import (
     ensure_output_dir,
+    resolve_path_from_manifest,
     warn_real_run,
 )
 
@@ -48,8 +50,22 @@ def parse_args(argv: Optional[list[str]] = None):
         choices=["basic", "coarse"],
         help="Example hypothesis to load.",
     )
-    p.add_argument("--preearn-repo-path", required=True)
-    p.add_argument("--options-db-path", required=True)
+    p.add_argument("--preearn-repo-path", default=None)
+    p.add_argument(
+        "--preearn-repo-manifest",
+        default=None,
+        help="Path to a DataManifest JSON for the pre-earnings repo. "
+        "May be used alone or alongside --preearn-repo-path; "
+        "explicit --preearn-repo-path takes precedence.",
+    )
+    p.add_argument("--options-db-path", default=None)
+    p.add_argument(
+        "--options-db-manifest",
+        default=None,
+        help="Path to a DataManifest JSON for the options DB. "
+        "May be used alone or alongside --options-db-path; "
+        "explicit --options-db-path takes precedence.",
+    )
     p.add_argument(
         "--registry-path",
         default=None,
@@ -99,6 +115,35 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     out_dir = ensure_output_dir(args.output_dir)
 
+    # Resolve effective paths: explicit arg > manifest-derived path
+    options_db_path: str
+    if args.options_db_path:
+        options_db_path = args.options_db_path
+    elif args.options_db_manifest:
+        options_db_path = resolve_path_from_manifest(
+            args.options_db_manifest, DatasetRole.options_backtest_db
+        )
+    else:
+        print(
+            "ERROR: either --options-db-path or --options-db-manifest is required",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    preearn_repo_path: str
+    if args.preearn_repo_path:
+        preearn_repo_path = args.preearn_repo_path
+    elif args.preearn_repo_manifest:
+        preearn_repo_path = resolve_path_from_manifest(
+            args.preearn_repo_manifest, DatasetRole.preearn_repo
+        )
+    else:
+        print(
+            "ERROR: either --preearn-repo-path or --preearn-repo-manifest is required",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
     # Step 1: Load example
     spec = load_preearn_example(args.example)
 
@@ -106,8 +151,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     lifecycle_result = register_and_run_batch(
         hypothesis=spec,
         registry_path=args.registry_path,
-        options_db_path=args.options_db_path,
-        preearn_repo_path=args.preearn_repo_path,
+        options_db_path=options_db_path,
+        preearn_repo_path=preearn_repo_path,
         ledger_path=args.ledger_path,
         output_dir=str(out_dir),
         max_candidates=args.max_candidates,

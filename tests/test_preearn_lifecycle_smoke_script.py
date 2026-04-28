@@ -436,6 +436,166 @@ class TestRealRunSafety:
 
 
 # ---------------------------------------------------------------------------
+# Test --options-db-manifest and --preearn-repo-manifest
+# ---------------------------------------------------------------------------
+
+_EXAMPLES_DIR = (
+    Path(__file__).resolve().parents[1] / "examples" / "data_manifests"
+)
+
+
+class TestManifestPathResolution:
+    def test_options_db_manifest_arg_is_accepted(self):
+        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
+        args = parse_args([
+            "--example", "basic",
+            "--preearn-repo-path", "/fake/repo",
+            "--options-db-manifest", manifest,
+        ])
+        assert args.options_db_manifest == manifest
+        assert args.options_db_path is None
+
+    def test_preearn_repo_manifest_arg_is_accepted(self):
+        manifest = str(_EXAMPLES_DIR / "preearn_repo_local.json")
+        args = parse_args([
+            "--example", "basic",
+            "--preearn-repo-path", "/fake/repo",
+            "--options-db-path", "/fake/db",
+            "--preearn-repo-manifest", manifest,
+        ])
+        assert args.preearn_repo_manifest == manifest
+        assert args.preearn_repo_path == "/fake/repo"
+
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
+    def test_manifest_options_db_path_resolved_to_register(
+        self, mock_load, mock_register, mock_eval, capsys
+    ):
+        spec = _make_spec()
+        mock_load.return_value = spec
+        mock_batch = _make_batch_result()
+        mock_lifecycle = LifecycleResult(
+            hypothesis_id=spec.hypothesis_id,
+            initial_status="draft",
+            final_status="registered",
+            batch_result=mock_batch,
+            registry_path="/tmp/fake",
+            error=None,
+        )
+        mock_register.return_value = mock_lifecycle
+        mock_eval.return_value = _make_evaluation()
+
+        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
+        lifecycle_main([
+            "--example", "basic",
+            "--preearn-repo-path", "/fake/repo",
+            "--options-db-manifest", manifest,
+            "--dry-run",
+        ])
+
+        call_kwargs = mock_register.call_args.kwargs
+        # Manifest declares a path; resolve_path_from_manifest extracts it
+        assert call_kwargs["options_db_path"] is not None
+        assert isinstance(call_kwargs["options_db_path"], str)
+
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
+    def test_manifest_preearn_repo_path_resolved_to_register(
+        self, mock_load, mock_register, mock_eval, capsys
+    ):
+        spec = _make_spec()
+        mock_load.return_value = spec
+        mock_batch = _make_batch_result()
+        mock_lifecycle = LifecycleResult(
+            hypothesis_id=spec.hypothesis_id,
+            initial_status="draft",
+            final_status="registered",
+            batch_result=mock_batch,
+            registry_path="/tmp/fake",
+            error=None,
+        )
+        mock_register.return_value = mock_lifecycle
+        mock_eval.return_value = _make_evaluation()
+
+        manifest = str(_EXAMPLES_DIR / "preearn_repo_local.json")
+        lifecycle_main([
+            "--example", "basic",
+            "--preearn-repo-manifest", manifest,
+            "--options-db-path", "/fake/db",
+            "--dry-run",
+        ])
+
+        call_kwargs = mock_register.call_args.kwargs
+        assert call_kwargs["preearn_repo_path"] is not None
+        assert isinstance(call_kwargs["preearn_repo_path"], str)
+
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
+    def test_explicit_path_overrides_manifest(
+        self, mock_load, mock_register, mock_eval, capsys
+    ):
+        spec = _make_spec()
+        mock_load.return_value = spec
+        mock_batch = _make_batch_result()
+        mock_lifecycle = LifecycleResult(
+            hypothesis_id=spec.hypothesis_id,
+            initial_status="draft",
+            final_status="registered",
+            batch_result=mock_batch,
+            registry_path="/tmp/fake",
+            error=None,
+        )
+        mock_register.return_value = mock_lifecycle
+        mock_eval.return_value = _make_evaluation()
+
+        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
+        lifecycle_main([
+            "--example", "basic",
+            "--preearn-repo-path", "/fake/repo",
+            "--options-db-path", "/my/explicit/db.sqlite",
+            "--options-db-manifest", manifest,
+            "--dry-run",
+        ])
+
+        call_kwargs = mock_register.call_args.kwargs
+        assert call_kwargs["options_db_path"] == "/my/explicit/db.sqlite"
+
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
+    @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
+    def test_wrong_role_manifest_exits_with_error(
+        self, mock_load, mock_register, mock_eval, capsys
+    ):
+        spec = _make_spec()
+        mock_load.return_value = spec
+        mock_batch = _make_batch_result()
+        mock_lifecycle = LifecycleResult(
+            hypothesis_id=spec.hypothesis_id,
+            initial_status="draft",
+            final_status="registered",
+            batch_result=mock_batch,
+            registry_path="/tmp/fake",
+            error=None,
+        )
+        mock_register.return_value = mock_lifecycle
+        mock_eval.return_value = _make_evaluation()
+
+        # preearn_options manifest has role options_backtest_db, not preearn_repo
+        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
+        # Omit --preearn-repo-path so the manifest path resolution is triggered
+        with pytest.raises(SystemExit):
+            lifecycle_main([
+                "--example", "basic",
+                "--options-db-path", "/fake/db",
+                "--preearn-repo-manifest", manifest,
+                "--dry-run",
+            ])
+
+
+# ---------------------------------------------------------------------------
 # Test no subprocess calls (generate_candidates is pure — no mock needed)
 # ---------------------------------------------------------------------------
 # register_and_run_batch is mocked, so run_candidate_batch is never called.
