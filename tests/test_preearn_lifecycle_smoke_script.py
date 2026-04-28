@@ -444,6 +444,12 @@ _EXAMPLES_DIR = (
 )
 
 
+def _load_example_manifest(filename: str):
+    from engine.edge_discovery.data_manifest import load_dataset_manifest
+
+    return load_dataset_manifest(str(_EXAMPLES_DIR / filename))
+
+
 class TestManifestPathResolution:
     def test_options_db_manifest_arg_is_accepted(self):
         manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
@@ -470,8 +476,15 @@ class TestManifestPathResolution:
     @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
     @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
     def test_manifest_options_db_path_resolved_to_register(
-        self, mock_load, mock_register, mock_eval, capsys
+        self, mock_load, mock_register, mock_eval, capsys, tmp_path: Path
     ):
+        import json
+
+        from engine.edge_discovery.data_manifest import (
+            dataset_manifest_from_dict,
+            dataset_manifest_to_dict,
+        )
+
         spec = _make_spec()
         mock_load.return_value = spec
         mock_batch = _make_batch_result()
@@ -486,25 +499,38 @@ class TestManifestPathResolution:
         mock_register.return_value = mock_lifecycle
         mock_eval.return_value = _make_evaluation()
 
-        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
+        # Build a portable tmp manifest: load example, rewrite path to tmp file
+        example_manifest = _load_example_manifest("preearn_options_2021_local.json")
+        sqlite_file = tmp_path / "options_2021_lane_0.sqlite"
+        sqlite_file.touch()
+        d = dataset_manifest_to_dict(example_manifest)
+        d["path"] = str(sqlite_file)
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(d), encoding="utf-8")
+
         lifecycle_main([
             "--example", "basic",
             "--preearn-repo-path", "/fake/repo",
-            "--options-db-manifest", manifest,
+            "--options-db-manifest", str(manifest_file),
             "--dry-run",
         ])
 
         call_kwargs = mock_register.call_args.kwargs
-        # Manifest declares a path; resolve_path_from_manifest extracts it
-        assert call_kwargs["options_db_path"] is not None
-        assert isinstance(call_kwargs["options_db_path"], str)
+        assert call_kwargs["options_db_path"] == str(sqlite_file)
 
     @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
     @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
     @mock.patch("scripts.local.smoke_preearn_lifecycle.load_preearn_example")
     def test_manifest_preearn_repo_path_resolved_to_register(
-        self, mock_load, mock_register, mock_eval, capsys
+        self, mock_load, mock_register, mock_eval, capsys, tmp_path: Path
     ):
+        import json
+
+        from engine.edge_discovery.data_manifest import (
+            dataset_manifest_from_dict,
+            dataset_manifest_to_dict,
+        )
+
         spec = _make_spec()
         mock_load.return_value = spec
         mock_batch = _make_batch_result()
@@ -519,17 +545,23 @@ class TestManifestPathResolution:
         mock_register.return_value = mock_lifecycle
         mock_eval.return_value = _make_evaluation()
 
-        manifest = str(_EXAMPLES_DIR / "preearn_repo_local.json")
+        example_manifest = _load_example_manifest("preearn_repo_local.json")
+        repo_dir = tmp_path / "engine_linux_main"
+        repo_dir.mkdir()
+        d = dataset_manifest_to_dict(example_manifest)
+        d["path"] = str(repo_dir)
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(d), encoding="utf-8")
+
         lifecycle_main([
             "--example", "basic",
-            "--preearn-repo-manifest", manifest,
+            "--preearn-repo-manifest", str(manifest_file),
             "--options-db-path", "/fake/db",
             "--dry-run",
         ])
 
         call_kwargs = mock_register.call_args.kwargs
-        assert call_kwargs["preearn_repo_path"] is not None
-        assert isinstance(call_kwargs["preearn_repo_path"], str)
+        assert call_kwargs["preearn_repo_path"] == str(repo_dir)
 
     @mock.patch("scripts.local.smoke_preearn_lifecycle.evaluate_batch_result")
     @mock.patch("scripts.local.smoke_preearn_lifecycle.register_and_run_batch")
@@ -551,12 +583,11 @@ class TestManifestPathResolution:
         mock_register.return_value = mock_lifecycle
         mock_eval.return_value = _make_evaluation()
 
-        manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
         lifecycle_main([
             "--example", "basic",
             "--preearn-repo-path", "/fake/repo",
             "--options-db-path", "/my/explicit/db.sqlite",
-            "--options-db-manifest", manifest,
+            "--options-db-manifest", str(_EXAMPLES_DIR / "preearn_options_2021_local.json"),
             "--dry-run",
         ])
 
@@ -585,7 +616,6 @@ class TestManifestPathResolution:
 
         # preearn_options manifest has role options_backtest_db, not preearn_repo
         manifest = str(_EXAMPLES_DIR / "preearn_options_2021_local.json")
-        # Omit --preearn-repo-path so the manifest path resolution is triggered
         with pytest.raises(SystemExit):
             lifecycle_main([
                 "--example", "basic",

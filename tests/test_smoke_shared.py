@@ -114,19 +114,55 @@ _EXAMPLES_DIR = (
 )
 
 
-class TestResolvePathFromManifest:
-    def test_options_db_manifest_returns_path(self):
-        path = _EXAMPLES_DIR / "preearn_options_2021_local.json"
-        result = resolve_path_from_manifest(str(path), "options_backtest_db")
-        # The real manifest path - validation passes since the path exists on this machine
-        assert isinstance(result, str)
-        assert len(result) > 0
+def _load_example_manifest(filename: str) -> "DatasetManifest":
+    from engine.edge_discovery.data_manifest import load_dataset_manifest
 
-    def test_preearn_repo_manifest_returns_path(self):
-        path = _EXAMPLES_DIR / "preearn_repo_local.json"
-        result = resolve_path_from_manifest(str(path), "preearn_repo")
-        assert isinstance(result, str)
-        assert len(result) > 0
+    return load_dataset_manifest(str(_EXAMPLES_DIR / filename))
+
+
+def _rewrite_manifest_path(manifest: "DatasetManifest", new_path: str) -> dict:
+    from engine.edge_discovery.data_manifest import dataset_manifest_to_dict
+
+    d = dataset_manifest_to_dict(manifest)
+    d["path"] = new_path
+    return d
+
+
+class TestResolvePathFromManifest:
+    def test_options_db_manifest_returns_path(self, tmp_path: Path):
+        import json
+
+        from engine.edge_discovery.data_manifest import dataset_manifest_from_dict
+
+        m = _load_example_manifest("preearn_options_2021_local.json")
+        sqlite_file = tmp_path / "options_2021_lane_0.sqlite"
+        sqlite_file.touch()
+        rewritten = _rewrite_manifest_path(m, str(sqlite_file))
+        # Write to tmp_path so resolve_path_from_manifest can load it
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(rewritten), encoding="utf-8")
+
+        from scripts.local._smoke_shared import resolve_path_from_manifest
+
+        result = resolve_path_from_manifest(str(manifest_file), "options_backtest_db")
+        assert result == str(sqlite_file)
+
+    def test_preearn_repo_manifest_returns_path(self, tmp_path: Path):
+        import json
+
+        from engine.edge_discovery.data_manifest import dataset_manifest_from_dict
+
+        m = _load_example_manifest("preearn_repo_local.json")
+        repo_dir = tmp_path / "engine_linux_main"
+        repo_dir.mkdir()
+        rewritten = _rewrite_manifest_path(m, str(repo_dir))
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(rewritten), encoding="utf-8")
+
+        from scripts.local._smoke_shared import resolve_path_from_manifest
+
+        result = resolve_path_from_manifest(str(manifest_file), "preearn_repo")
+        assert result == str(repo_dir)
 
     def test_wrong_role_exits(self, capsys):
         path = _EXAMPLES_DIR / "preearn_options_2021_local.json"
