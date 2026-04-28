@@ -1,0 +1,17 @@
+{
+  "dataset_id": "preearn_options_2021_lane_0",
+  "role": "options_backtest_db",
+  "source_kind": "local_sqlite",
+  "path": "/home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite",
+  "format": "sqlite",
+  "schema_version": "preearn_options_sqlite_v1",
+  "source_name": "local_cleaned_options_pipeline",
+  "date_range_start": "2021-01-01",
+  "date_range_end": "2021-12-31",
+  "symbols": [],
+  "provenance_notes": "Pre-provisioned local SQLite database. AED does not download, generate, or modify this dataset. Data acquisition is upstream and optional.",
+  "quality_flags": [
+    "local_cleaned",
+    "externally_provisioned"
+  ]
+}

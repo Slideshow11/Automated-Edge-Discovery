@@ -1,0 +1,14 @@
+{
+  "dataset_id": "preearn_repo_local",
+  "role": "preearn_repo",
+  "source_kind": "external_cli",
+  "path": "/home/max/engine_linux_main",
+  "format": "directory",
+  "schema_version": "preearn_cli_v1",
+  "source_name": "local_preearn_repo",
+  "provenance_notes": "External local repository. AED calls its script interface only and does not import or modify any repo internals.",
+  "quality_flags": [
+    "external_system",
+    "script_interface_only"
+  ]
+}
