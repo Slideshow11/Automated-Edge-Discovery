@@ -31,7 +31,6 @@ from engine.edge_discovery.hypotheses.lifecycle import (
 )
 from scripts.local._smoke_shared import (
     ensure_output_dir,
-    print_batch_summary,
     warn_real_run,
 )
 
