@@ -14,6 +14,18 @@ Research object lifecycle
 ------------------------
 AED research objects move through an explicit lifecycle. Each step has required metadata and constraints.
 
+Research workflow
+-----------------
+Idea
+ LiteratureClaim (optional)
+ TheorySketch or ExploratoryAnomalySpec
+ HypothesisSpec (if mechanism exists)
+ CandidateSpec
+ ValidationPlan
+ BacktestRun
+ ReviewPacket
+ ManualDecision
+
 1. Idea
    - A rough research intuition, observation, user note, or literature-derived possibility.
 
@@ -59,16 +71,49 @@ AED research objects move through an explicit lifecycle. Each step has required 
    - Human-review artifact which combines HypothesisSpec, CandidateSpec, BacktestRun outputs, diagnostics, and required metadata.
    - ReviewPacket must not mutate registry state. ManualDecision happens after human review.
 
+Exploratory anomaly lane
+------------------------
+AED supports an explicit exploratory lane for anomalous, technical-analysis-style, or otherwise weakly-mechanized observations. The exploratory lane allows empirical probes that are explicitly labeled exploratory but does not permit acceptance, promotion, or automation without a mechanism and stronger validation.
+
+Key principles
+- AED may test ideas without a strong mechanism when the test is explicitly labeled exploratory.
+- This lane is intended for TA patterns, seasonality, calendar effects, volatility behavior, flow proxies, microstructure quirks, and other observations where the mechanism is weak or unknown.
+- Exploratory tests must be recorded as an ExploratoryAnomalySpec rather than a HypothesisSpec.
+
+ExploratoryAnomalySpec (required fields)
+- anomaly_id
+- observation
+- source
+- pattern_definition
+- initial_scope
+- reason_unknown
+- candidate_mechanisms
+- baseline_comparisons
+- trial_budget
+- required_null_tests
+- data_snooping_risk
+- cost_sensitivity_required
+- regime_sensitivity_required
+- promotion_locked
+- mechanism_required_before_acceptance
+
+Behavior and restrictions
+- ExploratoryAnomalySpec may produce BacktestRun(s) and a ReviewPacket for inspection.
+- ExploratoryAnomalySpec may not trigger accepted strategy status, automated promotion, production status, or autonomous search expansion.
+- An ExploratoryAnomalySpec can graduate into a HypothesisSpec only after a plausible mechanism, a candidate mechanism set, or a robust empirical rationale is written and documented in a TheorySketch.
+- TA-style rules and pattern definitions must still be precise (entry/exit, sizing, holding period, and cost assumptions) before running exploratory tests.
+- Baseline comparisons should include simple momentum, random entry with the same holding period, shuffled-dates tests where applicable, cost sensitivity, liquidity sensitivity, and regime splits.
+
 Core rules (theory-first guardrails)
 -----------------------------------
 - Backtests are evidence against bad hypotheses, not proof of good hypotheses.
 - No strategy acceptance from backtest alone.
-- Every candidate must tie back to a theory or mechanism.
-- Every broad search must report all trials.
+- Every candidate must tie back to a theory or mechanism. "Every candidate must tie back to a theory or mechanism".
+- Every broad search must report all trials (report all trials).
 - CandidateSpec must not precede HypothesisSpec.
 - LiteratureClaim must not become CandidateSpec directly.
 - ML may help discover variables, but a human-readable mechanism must exist before promotion.
-- A good backtest with no mechanism is not enough for acceptance.
+- A good backtest with no mechanism is not sufficient for acceptance.
 - A plausible mechanism with failed tests must be revised or rejected.
 - Manual review remains mandatory before any registry mutation.
 - Automated promotion remains locked.
@@ -109,6 +154,12 @@ Example B: Return predictability claim
 - HypothesisSpec highlights:
   - Required baseline diagnostics: autocorrelation, variance ratio, horizon sensitivity, regime sensitivity.
   - ValidationPlan must show these diagnostics and sampling-power analysis.
+
+Example C: TA moving average crossover as exploratory anomaly
+- Idea: a simple moving average crossover appears to correlate with short-term returns in some universes.
+- Mechanism: unknown or weak; several candidate_mechanisms (trend-following, microstructure inertia) may be hypothesized.
+- Protocol: run ExploratoryAnomalySpec with precise pattern_definition and trial_budget; require baselines (simple momentum, random entry with same holding period) and cost-sensitivity before any further review.
+- Promotion: locked until a plausible mechanism or robust empirical rationale is documented.
 
 Failure modes and red flags
 ---------------------------
