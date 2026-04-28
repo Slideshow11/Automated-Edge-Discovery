@@ -4,6 +4,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from engine.edge_discovery.data_manifest import (
+    DatasetRole,
+    load_dataset_manifest,
+    validate_dataset_manifest,
+)
+
 
 def ensure_output_dir(output_dir: str) -> Path:
     """Create output directory, returning the Path object."""
@@ -44,3 +50,57 @@ def print_batch_summary(
             print(f"{indent}  {k}: {v}")
     if ledger_path:
         print(f"{indent}ledger_path: {ledger_path}")
+
+
+def resolve_path_from_manifest(
+    manifest_path: str,
+    expected_role: DatasetRole | str,
+) -> str:
+    """Load a DatasetManifest, validate it, and return its local path.
+
+    Parameters
+    ----------
+    manifest_path : str
+        Path to the JSON manifest file.
+    expected_role : DatasetRole | str
+        Role the manifest must declare (e.g. options_backtest_db or preearn_repo).
+        String values are converted to DatasetRole enum members.
+
+    Returns
+    -------
+    str
+        The declared local path from the manifest.
+
+    Raises
+    ------
+    SystemExit
+        If the manifest file cannot be loaded, cannot be parsed, or declares a
+        role that does not match the expected role.
+    """
+    if isinstance(expected_role, str):
+        expected_role = DatasetRole(expected_role)
+
+    try:
+        manifest = load_dataset_manifest(manifest_path)
+    except FileNotFoundError:
+        print(f"ERROR: manifest file not found: {manifest_path}", file=sys.stderr)
+        raise SystemExit(1)
+    except Exception as e:
+        print(f"ERROR: failed to parse manifest {manifest_path}: {e}", file=sys.stderr)
+        raise SystemExit(1)
+
+    if manifest.role != expected_role:
+        print(
+            f"ERROR: manifest {manifest_path} declares role {manifest.role.value!r} "
+            f"but {expected_role.value!r} is required",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    validation = validate_dataset_manifest(manifest)
+    if not validation.ok:
+        for err in validation.errors:
+            print(f"ERROR: manifest validation failed: {err}", file=sys.stderr)
+        raise SystemExit(1)
+
+    return manifest.path

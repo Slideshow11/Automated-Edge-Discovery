@@ -7,9 +7,11 @@ from unittest import mock
 
 import pytest
 
+from engine.edge_discovery.data_manifest import DatasetRole
 from scripts.local._smoke_shared import (
     ensure_output_dir,
     print_batch_summary,
+    resolve_path_from_manifest,
     warn_real_run,
 )
 
@@ -105,3 +107,83 @@ class TestPrintBatchSummary:
         )
         out = capsys.readouterr().out
         assert all(line.startswith("  ") for line in out.splitlines())
+
+
+_EXAMPLES_DIR = (
+    Path(__file__).resolve().parents[1] / "examples" / "data_manifests"
+)
+
+
+def _load_example_manifest(filename: str) -> "DatasetManifest":
+    from engine.edge_discovery.data_manifest import load_dataset_manifest
+
+    return load_dataset_manifest(str(_EXAMPLES_DIR / filename))
+
+
+def _rewrite_manifest_path(manifest: "DatasetManifest", new_path: str) -> dict:
+    from engine.edge_discovery.data_manifest import dataset_manifest_to_dict
+
+    d = dataset_manifest_to_dict(manifest)
+    d["path"] = new_path
+    return d
+
+
+class TestResolvePathFromManifest:
+    def test_options_db_manifest_returns_path(self, tmp_path: Path):
+        import json
+
+        from engine.edge_discovery.data_manifest import dataset_manifest_from_dict
+
+        m = _load_example_manifest("preearn_options_2021_local.json")
+        sqlite_file = tmp_path / "options_2021_lane_0.sqlite"
+        sqlite_file.touch()
+        rewritten = _rewrite_manifest_path(m, str(sqlite_file))
+        # Write to tmp_path so resolve_path_from_manifest can load it
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(rewritten), encoding="utf-8")
+
+        from scripts.local._smoke_shared import resolve_path_from_manifest
+
+        result = resolve_path_from_manifest(str(manifest_file), "options_backtest_db")
+        assert result == str(sqlite_file)
+
+    def test_preearn_repo_manifest_returns_path(self, tmp_path: Path):
+        import json
+
+        from engine.edge_discovery.data_manifest import dataset_manifest_from_dict
+
+        m = _load_example_manifest("preearn_repo_local.json")
+        repo_dir = tmp_path / "engine_linux_main"
+        repo_dir.mkdir()
+        rewritten = _rewrite_manifest_path(m, str(repo_dir))
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps(rewritten), encoding="utf-8")
+
+        from scripts.local._smoke_shared import resolve_path_from_manifest
+
+        result = resolve_path_from_manifest(str(manifest_file), "preearn_repo")
+        assert result == str(repo_dir)
+
+    def test_wrong_role_exits(self, capsys):
+        path = _EXAMPLES_DIR / "preearn_options_2021_local.json"
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest(str(path), "preearn_repo")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "is required" in err
+
+    def test_missing_file_exits(self, capsys):
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest("/CI_DOES_NOT_EXIST/manifest.json", "options_backtest_db")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "not found" in err
+
+    def test_invalid_json_exits(self, capsys, tmp_path):
+        bad = tmp_path / "bad.json"
+        bad.write_text("{ not json }", encoding="utf-8")
+        with pytest.raises(SystemExit) as exc:
+            resolve_path_from_manifest(str(bad), "options_backtest_db")
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert "failed to parse" in err
