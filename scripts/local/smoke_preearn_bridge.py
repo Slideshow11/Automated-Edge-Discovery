@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Optional
 
 from engine.edge_discovery.evaluation import (
@@ -23,6 +22,11 @@ from engine.edge_discovery.evaluation import (
     evaluate_batch_result,
 )
 from engine.edge_discovery.hypotheses.batch import run_candidate_batch, BatchResult
+from scripts.local._smoke_shared import (
+    ensure_output_dir,
+    print_batch_summary,
+    warn_real_run,
+)
 
 
 DEFAULT_OUTPUT = ".wfa/preearn_bridge_smoke"
@@ -90,14 +94,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
     if not args.dry_run:
-        print(
-            "WARNING: --real-run specified. This will invoke the local pre-earnings repo via the adapter.",
-            file=sys.stderr,
-        )
+        warn_real_run("invoke the local pre-earnings repo via the adapter.")
         print("Ensure you know what the adapter will execute.", file=sys.stderr)
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_output_dir(args.output_dir)
 
     hypothesis = make_smoke_hypothesis()
 
@@ -120,17 +120,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     eval_result = evaluate_batch_result(result)
 
     # Print batch summary
-    print(f"batch_id: {result.batch_id}")
-    print(f"status: {result.status}")
-    print(f"n_candidates_generated: {result.n_candidates_generated}")
-    print(f"n_candidates_selected: {result.n_candidates_selected}")
-    print(f"n_success: {result.n_success}")
-    print(f"n_error: {result.n_error}")
-    print("output_artifacts:")
-    for k, v in result.output_artifacts.items():
-        print(f"  {k}: {v}")
-    if args.ledger_path:
-        print(f"ledger_path: {args.ledger_path}")
+    print_batch_summary(
+        batch_id=result.batch_id,
+        status=result.status,
+        n_candidates_generated=result.n_candidates_generated,
+        n_candidates_selected=result.n_candidates_selected,
+        n_success=result.n_success,
+        n_error=result.n_error,
+        output_artifacts=result.output_artifacts,
+        ledger_path=args.ledger_path,
+    )
 
     # Print evaluation
     print()
