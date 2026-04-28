@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Validate docs/edge_hypothesis_registry.csv
+"""Validate docs/edge_hypothesis_registry.csv and docs/edge_hypothesis_registry_v1.md
 
-Checks:
-- required columns exist
-- hypothesis_id format AED-HYP-0001
-- status and evidence_stage values in allowed sets
-- no duplicate hypothesis_id values
-
-Exits with non-zero on failure.
+This script resolves the repository root from its own file location so it works
+regardless of the current working directory. It performs lightweight CSV checks
+and ensures the registry doc exists.
 """
 import csv
 import re
 import sys
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-CSV_PATH = REPO_ROOT / "docs" / "edge_hypothesis_registry.csv"
+# Resolve script path absolutely and compute repo root reliably
+SCRIPT_PATH = Path(__file__).resolve()
+# scripts/local -> scripts -> <repo-root>
+REPO_ROOT = SCRIPT_PATH.parents[2]
+if not (REPO_ROOT / "docs").is_dir():
+    sys.exit(f"could not resolve repo root from {SCRIPT_PATH}; expected {REPO_ROOT}/docs to exist")
+
+REGISTRY_CSV = REPO_ROOT / "docs" / "edge_hypothesis_registry.csv"
+REGISTRY_DOC = REPO_ROOT / "docs" / "edge_hypothesis_registry_v1.md"
+
+if not REGISTRY_CSV.exists():
+    sys.exit(f"Registry CSV not found at {REGISTRY_CSV}")
+if not REGISTRY_DOC.exists():
+    sys.exit(f"Registry doc not found at {REGISTRY_DOC}")
 
 REQUIRED_COLS = [
     "hypothesis_id",
@@ -53,10 +61,7 @@ def fail(msg: str) -> None:
     sys.exit(2)
 
 
-if not CSV_PATH.exists():
-    fail(f"Registry CSV not found at {CSV_PATH}")
-
-with CSV_PATH.open(newline="") as f:
+with REGISTRY_CSV.open(newline="") as f:
     reader = csv.DictReader(f)
     cols = reader.fieldnames or []
     missing = [c for c in REQUIRED_COLS if c not in cols]
@@ -83,3 +88,4 @@ with CSV_PATH.open(newline="") as f:
             fail(f"Row {i}: evidence_stage '{ev}' not in allowed set {sorted(EVIDENCE_ALLOWED)}")
 
 print("edge_hypothesis_registry.csv validation OK")
+print(f"registry doc present: {REGISTRY_DOC}")
