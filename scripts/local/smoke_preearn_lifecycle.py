@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 from typing import Optional
 
 from engine.edge_discovery.evaluation import (
@@ -29,6 +28,10 @@ from engine.edge_discovery.examples import load_preearn_example
 from engine.edge_discovery.hypotheses.lifecycle import (
     LifecycleResult,
     register_and_run_batch,
+)
+from scripts.local._smoke_shared import (
+    ensure_output_dir,
+    warn_real_run,
 )
 
 
@@ -92,14 +95,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
     if not args.dry_run:
-        print(
-            "WARNING: --real-run specified. This will run the pre-earnings backtest "
-            "adapter for real. Ensure you know what will be executed.",
-            file=sys.stderr,
-        )
+        warn_real_run("run the pre-earnings backtest adapter for real. Ensure you know what will be executed.")
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = ensure_output_dir(args.output_dir)
 
     # Step 1: Load example
     spec = load_preearn_example(args.example)
