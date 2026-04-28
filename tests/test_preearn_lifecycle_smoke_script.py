@@ -290,7 +290,7 @@ class TestDryRunFlow:
 
         out = capsys.readouterr().out
         assert "evaluation_label:" in out
-        assert "NEEDS_MORE_DATA" in out
+        assert "needs_more_data" in out
         assert "evaluation_reason:" in out
         assert "Dry-run" in out
 
