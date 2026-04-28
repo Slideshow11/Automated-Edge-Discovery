@@ -35,7 +35,19 @@ def parse_args(argv: Optional[list[str]] = None):
 def main(argv: Optional[list[str]] = None) -> int:
     args = parse_args(argv)
 
-    entry = find_ledger_entry(args.ledger_path, args.run_id)
+    try:
+        entry = find_ledger_entry(args.ledger_path, args.run_id)
+    except SystemExit as exc:
+        # find_ledger_entry prints an error message to stderr and raises
+        # SystemExit(code). Preserve that stderr output and return the
+        # corresponding code so programmatic callers receive the same
+        # integer exit status as before the refactor.
+        code = exc.code
+        try:
+            return int(code) if code is not None else 1
+        except Exception:
+            return 1
+
     result = evaluate_ledger_entry(entry)
 
     output = {
