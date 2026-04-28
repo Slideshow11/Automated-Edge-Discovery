@@ -121,7 +121,13 @@ Troubleshooting
 ---------------
 - Missing run_id: ensure you used the `batch_id` printed by the smoke script and that you specified the correct `--ledger-path`.
 - Duplicate run_id: inspect the ledger file for multiple lines with the same `run_id` — this indicates repeated records; open them and compare timestamps/metrics.
-- Empty ledger: ensure the ledger path points to the ledger JSONL file and not an output directory.
+- Empty ledger: ensure the ledger path points to the ledger JSONL file and not an output directory.- Invalid manifest role: the manifest contains a `role` field which must match the CLI argument being used. For example:
+  - `--options-db-manifest` expects a manifest whose role is `options_backtest_db`.
+  - `--preearn-repo-manifest` expects a manifest whose role is `preearn_repo`.
+  If the role is incorrect, either copy the appropriate example manifest and adjust its fields to match your dataset, or use the direct path arguments (`--options-db-path`, `--preearn-repo-path`) instead.
+- Missing manifest path: ensure the manifest file path exists and is readable. Also validate that the local dataset path declared inside the manifest (e.g. the filesystem path to the options DB or repo) exists and is accessible. Check the manifest path, verify the JSON `path` field(s), or fallback to direct path arguments if the manifest cannot be validated.
+
+
 - Manifest portability: example manifests contain machine-specific absolute paths. For portable tests, copy and rewrite manifest paths under `tmp_path` in pytest.
 
 Cleanup
