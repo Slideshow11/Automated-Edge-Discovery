@@ -68,4 +68,4 @@ The CSV file adjacent to this document contains example placeholder rows. These 
 
 Revision history
 
-v1 — initial RFC-style registry and validator (docs-only)
+v1 — initial RFC-style registry (docs-only). A local validator may be added in a later tooling PR.
