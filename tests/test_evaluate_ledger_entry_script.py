@@ -163,7 +163,7 @@ class TestEvaluation:
 
 
 class TestNotFound:
-    def test_missing_run_id_exits_1(self, tmp_path: Path):
+    def test_missing_run_id_exits_1(self, tmp_path: Path, capsys):
         ledger_path = tmp_path / "ledger.jsonl"
         _write_ledger(ledger_path, [_entry("run_001")])
 
@@ -174,7 +174,8 @@ class TestNotFound:
         ledger_path = tmp_path / "ledger.jsonl"
         _write_ledger(ledger_path, [_entry("run_001")])
 
-        main(["--ledger-path", str(ledger_path), "--run-id", "nonexistent_run"])
+        ret = main(["--ledger-path", str(ledger_path), "--run-id", "nonexistent_run"])
+        assert ret == 1
         err = capsys.readouterr().err
         assert "nonexistent_run" in err
         assert "no ledger entry found" in err
@@ -186,7 +187,7 @@ class TestNotFound:
 
 
 class TestDuplicate:
-    def test_duplicate_run_id_exits_1(self, tmp_path: Path):
+    def test_duplicate_run_id_exits_1(self, tmp_path: Path, capsys):
         ledger_path = tmp_path / "ledger.jsonl"
         _write_ledger(ledger_path, [_entry("run_001"), _entry("run_001")])
 
@@ -197,7 +198,8 @@ class TestDuplicate:
         ledger_path = tmp_path / "ledger.jsonl"
         _write_ledger(ledger_path, [_entry("run_001"), _entry("run_001")])
 
-        main(["--ledger-path", str(ledger_path), "--run-id", "run_001"])
+        ret = main(["--ledger-path", str(ledger_path), "--run-id", "run_001"])
+        assert ret == 1
         err = capsys.readouterr().err
         assert "multiple entries found" in err
 
@@ -208,7 +210,7 @@ class TestDuplicate:
 
 
 class TestEmptyLedger:
-    def test_empty_ledger_exits_1(self, tmp_path: Path):
+    def test_empty_ledger_exits_1(self, tmp_path: Path, capsys):
         ledger_path = tmp_path / "ledger.jsonl"
         ledger_path.touch()
 
