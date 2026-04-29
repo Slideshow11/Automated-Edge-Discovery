@@ -67,3 +67,18 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - JumpRiskReport
 - ReviewPacket
 - ManualDecision
+
+## Current Event/Options milestone
+
+- Event/Options schema planning is complete.
+- Event/Options contract spec v1 is present.
+- Contract invariant fix is merged.
+- Event/Options contract fixtures v1 are present.
+- Registry CSV remains manual v1 only.
+- Validators and JSON schemas remain deferred.
+
+See the following canonical docs and fixtures for more details:
+
+- docs/event_options_schema_planning_v1.md
+- docs/event_options_contract_spec_v1.md
+- fixtures/event_options_contract_v1/README.md

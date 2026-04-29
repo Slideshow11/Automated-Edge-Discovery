@@ -22,6 +22,13 @@ The project is not yet a live trading or production system.
 - PR #37 manual edge hypothesis registry v1 docs plus canonical CSV
 - PR #38 post-governance implementation roadmap
 - PR #39 TrialLedger and SearchSpaceManifest v1 design
+- PR #41 MechanismDiscoveryReport / PostHocTheoryNote v1
+- PR #42 EdgeHypothesisRegistry JSONL/YAML v1 design
+- PR #43 ModelAssessmentSpec v1
+- PR #44 EventStudySpec / OptionsEventRiskSpec schema planning
+- PR #45 Event/Options contract spec v1
+- PR #47 Event/Options contract spec invariant fix
+- PR #46 Event/Options contract fixtures v1
 
 ## Current stop rules
 
@@ -58,3 +65,14 @@ The project is not yet a live trading or production system.
 - duplicate helper files may exist outside the repo under /home/max and should not be treated as repo files
 - do not remove files outside the repo during normal PR work
 - registry CSV is manual v1 only
+
+## Event/Options current state
+
+- Decision-time anti-lookahead invariant is corrected.
+- event_id is required for OptionsObservationSpec event-cohort research.
+- event identity is the canonical cohort and join key.
+- Fixture examples exist for valid and invalid event/options records.
+- Event/Options validators and JSON schemas are deferred.
+- Event/Options contract validator deferred.
+- EventStudySpec and OptionsEventRiskSpec JSON schemas deferred.
+- Next new PR likely #48.
