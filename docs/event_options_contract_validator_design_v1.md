@@ -37,6 +37,24 @@ State and constraints:
 - v1 validator SHOULD accept CSV fixtures first (fixtures above). JSONL/YAML support is deferred.
 - Registry mutation and automated promotion are out of scope for v1 validator design.
 
+### Validation profiles
+
+To avoid forcing current fixtures to conform immediately to the full canonical contract, the design distinguishes two validation profiles:
+
+- strict_contract_profile:
+  - Future full contract validation.
+  - Expects canonical field names exactly as defined in docs/event_options_contract_spec_v1.md.
+  - Intended for full production records and formal JSON Schema validation.
+
+- minimal_fixture_profile:
+  - Current fixture compatibility profile.
+  - Used for fixtures/event_options_contract_v1/*_minimal.csv to validate the intentionally small fixture set.
+  - May normalize fixture header aliases (see Fixture alias mapping) before applying semantic checks.
+
+Notes:
+- Implementations SHOULD support minimal_fixture_profile to validate existing fixtures. The strict_contract_profile represents the eventual canonical enforcement.
+- Registry mutation and automated promotion remain out of scope.
+
 ## 4. Event record validation
 
 Required EventRecord checks (v1):
@@ -55,7 +73,7 @@ Required EventRecord checks (v1):
 Allowed event_session values (explicit):
 - BMO
 - AMC
-- INTRADAY
+- INTRA
 - UNKNOWN
 
 Allowed event_timestamp_quality values:
@@ -200,22 +218,41 @@ State:
 
 ## 11. Fixture mapping
 
-How existing fixtures map to expected validator outcomes:
+How existing fixtures map to expected validator outcomes (profiles and aliasing):
+
+Minimal fixture compatibility profile (minimal_fixture_profile):
 
 - fixtures/event_options_contract_v1/valid_events_minimal.csv
-  - should pass EventRecord validation checks
+  - should pass minimal_fixture_profile EventRecord validation after normalization (see alias mapping below)
+  - valid_events_minimal.csv should pass minimal_fixture_profile
 
 - fixtures/event_options_contract_v1/valid_options_observations_minimal.csv
-  - should pass OptionsObservationSpec validation and link correctly to event_id in valid_events_minimal.csv
+  - should pass minimal_fixture_profile OptionsObservationSpec validation and event_id linkage after normalization
+  - valid_options_observations_minimal.csv should pass minimal_fixture_profile
 
 - fixtures/event_options_contract_v1/invalid_events_examples.csv
-  - should fail EventRecord checks (missing fields, bad timestamps, invalid enums)
+  - should fail minimal_fixture_profile EventRecord checks (missing fields, bad timestamps, invalid enums)
 
 - fixtures/event_options_contract_v1/invalid_options_observations_examples.csv
-  - should fail OptionsObservationSpec checks (missing event_id, invalid event link, unknown gap_exposure, unknown event_hold, timestamp anomalies)
+  - should fail minimal_fixture_profile OptionsObservationSpec checks (missing event_id, invalid event link, unknown gap_exposure, unknown event_hold, timestamp anomalies)
 
 State:
 - This PR does NOT edit fixtures. Future fixture PRs may add more edge cases. Fixtures must remain deterministic for tests.
+
+### Fixture alias mapping (minimal_fixture_profile)
+
+To accommodate the current, intentionally-small fixture headers, the minimal_fixture_profile MAY apply a deterministic header alias mapping before running semantic checks. Alias mapping is for fixture compatibility only; canonical records should use the contract names from docs/event_options_contract_spec_v1.md.
+
+Example alias mappings (apply in normalization step):
+
+- event_time -> event_time_utc
+- option_symbol -> option_contract_symbol
+- observation_date -> option_observation_date
+
+Notes:
+- Alias mapping is ONLY for fixture compatibility under minimal_fixture_profile.
+- strict_contract_profile requires canonical field names; normalization is not applied under strict profile.
+- The current PR does not edit fixtures; future fixture expansion should add full canonical examples when available.
 
 ## 12. Future validator execution plan (CLI design, illustrative only)
 
