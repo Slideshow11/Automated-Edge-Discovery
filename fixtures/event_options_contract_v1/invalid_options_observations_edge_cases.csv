@@ -1,0 +1,8 @@
+event_id,symbol,option_id,option_symbol,observation_date,event_hold_flag,gap_exposure,feature_timestamp,decision_timestamp,data_cutoff_timestamp
+
+,EDGE,opt-001,EDGE-OPT-1,2026-05-01,full_event_hold,none,2026-05-01T08:00:00Z,2026-05-01T09:00:00Z,2026-05-01T08:00:00Z
+EV-9999,EDGE,opt-002,EDGE-OPT-2,2026-05-01,no_event_hold,none,2026-05-01T08:00:00Z,2026-05-01T09:00:00Z,2026-05-01T08:00:00Z
+EV-EDGE-001,EDGE,opt-003,EDGE-OPT-3,2026-05-02,unknown_event_hold,none,2026-05-02T08:00:00Z,2026-05-02T09:00:00Z,2026-05-02T08:00:00Z
+EV-EDGE-001,EDGE,opt-004,EDGE-OPT-4,2026-05-02,full_event_hold,unknown,2026-05-02T08:00:00Z,2026-05-02T09:00:00Z,2026-05-02T08:00:00Z
+EV-0001,EDGE,opt-005,EDGE-OPT-5,2026-05-03,full_event_hold,none,2026-05-04T08:00:00Z,2026-05-03T09:00:00Z,2026-05-03T08:00:00Z
+EV-EDGE-001,EDGE,opt-006,EDGE-OPT-6,2026-05-03,full_event_hold,none,2026-05-03T08:00:00Z,2026-05-03T09:00:00Z,2026-05-04T08:00:00Z
