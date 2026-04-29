@@ -27,8 +27,9 @@ The project is not yet a live trading or production system.
 - PR #43 ModelAssessmentSpec v1
 - PR #44 EventStudySpec / OptionsEventRiskSpec schema planning
 - PR #45 Event/Options contract spec v1
-- PR #47 Event/Options contract spec invariant fix
 - PR #46 Event/Options contract fixtures v1
+- PR #47 Event/Options contract spec invariant fix
+- PR #48 AED status update after Event/Options contract work
 
 ## Current stop rules
 
@@ -40,24 +41,22 @@ The project is not yet a live trading or production system.
 - No live trading
 - No production execution
 
-## Known deferred items
+## Known deferred implementation items
 
+- ModelAssessmentSpec JSON schema deferred
+- ModelAssessmentSpec validator deferred
+- MechanismDiscoveryReport JSON schema deferred
+- PostHocTheoryNote JSON schema deferred
+- EventStudySpec JSON schema deferred
+- OptionsEventRiskSpec JSON schema deferred
+- Event/Options contract validator deferred
+- TrialLedger / SearchSpaceManifest validators deferred
+- EdgeHypothesisRegistry JSON schema and validator deferred
 - registry validator deferred
-- schema validators deferred
-- EdgeHypothesisRegistry JSONL/YAML migration deferred
-- ModelAssessmentSpec deferred
-- MechanismDiscoveryReport / PostHocTheoryNote deferred
-- EventStudySpec schema deferred
-- OptionsEventRiskSpec schema deferred
-- JumpRiskReport deferred
 
 ## Next planned PRs
 
-- PR #41 MechanismDiscoveryReport / PostHocTheoryNote v1
-- PR #42 EdgeHypothesisRegistry JSONL/YAML v1
-- PR #43 ModelAssessmentSpec v1
-- PR #44 EventStudySpec / OptionsEventRiskSpec schema planning
-- PR #45 validator/tooling cleanup
+Next new PR likely #49: choose between Event/Options contract validator design, MechanismDiscoveryReport JSON schema, EdgeHypothesisRegistry JSON schema and validator, or TrialLedger/SearchSpaceManifest validator design.
 
 ## Operational notes
 
@@ -75,4 +74,4 @@ The project is not yet a live trading or production system.
 - Event/Options validators and JSON schemas are deferred.
 - Event/Options contract validator deferred.
 - EventStudySpec and OptionsEventRiskSpec JSON schemas deferred.
-- Next new PR likely #48.
+- Next new PR likely #49.
