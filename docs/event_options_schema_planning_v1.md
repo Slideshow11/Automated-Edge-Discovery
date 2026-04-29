@@ -3,11 +3,7 @@
 ## 1. Purpose
 
 EventStudySpec and OptionsEventRiskSpec exist as conceptual protocols in the
-repository. This planning document converts those protocols into schema-ready
-field definitions, invariants, required diagnostics, and relationships to
-TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, ReviewPacket, and the
-EdgeHypothesisRegistry. This PR is docs-only: no schemas, validators, or code
-are created here.
+repository. This planning document converts those protocols into schema-ready field definitions, invariants, required diagnostics, and relationships to TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, ReviewPacket, and the EdgeHypothesisRegistry. This PR is docs-only: no schemas, validators, or code are created here. (schema-ready field definitions)
 
 Event-driven and options-event research require stricter timing and risk
 metadata than generic signal tests; this doc captures those requirements for
