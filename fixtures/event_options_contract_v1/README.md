@@ -28,6 +28,8 @@ Notes
 - These are fixtures only and are NOT production data. They are intentionally small, synthetic, and hand-crafted.
 - No validator is implemented in this PR. Use these fixtures as the authoritative examples for writing validators in a future PR.
 
+These fixtures exercise event identity semantics: each option observation is linked to event identity (event_id), and cohorts are selected by event identity or event date.
+
 Provenance
 
 Derived from docs/event_options_contract_spec_v1.md and docs/event_options_schema_planning_v1.md.
