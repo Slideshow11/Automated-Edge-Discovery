@@ -68,10 +68,11 @@ Required fields:
 Canonical join keys separate event identity from observation rows to avoid lookahead and cohort selection mistakes.
 
 - event join key: (event_id) 
+  - the canonical event join key: the unique event identifier. Implementers may augment with (event_ticker, event_time_utc) for convenience but event_id is canonical.
 - observation join key to event: (event_id) present on OptionsObservationSpec v1 rows to indicate the observation belongs to the event cohort.
 - option contract canonical key: (option_contract_symbol, expiry_date) and optionally (underlying_ticker) for disambiguation.
 
-Research cohorts and filters must be defined by event identity or event date, never by raw option observation date alone. See Time semantics below.
+Research cohorts and filters must be defined by event identity or event date. Cohorts are selected by event identity or event date; cohorts are selected by event identity, not by raw option observation date alone. See Time semantics below.
 
 7. Time semantics and anti lookahead rules
 
@@ -179,7 +180,7 @@ Invalid because missing canonical join key:
 
 This PR documents invariants that future validators must enforce (but does not implement them):
 - event_id uniqueness
-- event_time_utc ordering: event_time_utc must be <= any decision-time feature timestamps attached to that event
+- Decision-time feature timestamps must be <= the applicable decision timestamp (e.g., event_time_utc when event_time_utc is the decision timestamp). Future validators must reject any feature whose timestamp is after the applicable decision timestamp.
 - option_observation_date timezone-aware and <= decision time for features
 - implied_volatility and delta bounds as specified
 - canonical mapping of option_contract_symbol to expiry_date
