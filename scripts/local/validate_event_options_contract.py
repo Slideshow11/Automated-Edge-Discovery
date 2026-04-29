@@ -21,6 +21,8 @@ ALIAS_MAP = {
     "event_time": "event_time_utc",
     "option_symbol": "option_contract_symbol",
     "observation_date": "option_observation_date",
+    "option_id": "option_observation_id",
+    "symbol": "event_ticker",
 }
 
 @dataclass
@@ -87,7 +89,7 @@ def validate(events_rows: List[Dict[str, str]], options_rows: List[Dict[str, str
     blockers: List[Problem] = []
     warnings: List[Problem] = []
 
-    required_events_minimal = ["event_id", "event_type", "event_date", "event_time_utc", "event_session"]
+    required_events_minimal = ["event_id", "event_date", "event_time_utc"]
     required_events_strict = required_events_minimal + ["event_timestamp_quality", "calendar_id", "timezone", "event_source", "point_in_time_policy"]
     required_events = required_events_minimal if profile == "minimal_fixture_profile" else required_events_strict
 
