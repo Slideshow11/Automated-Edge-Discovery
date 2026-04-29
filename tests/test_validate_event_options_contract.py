@@ -1,0 +1,127 @@
+import json
+import subprocess
+from pathlib import Path
+import sys
+import tempfile
+
+REPO = Path('.')
+SCRIPTS = REPO / 'scripts' / 'local' / 'validate_event_options_contract.py'
+FIXTURES = REPO / 'fixtures' / 'event_options_contract_v1'
+
+
+def run_cli(args):
+    cmd = [sys.executable, str(SCRIPTS)] + args
+    res = subprocess.run(cmd, capture_output=True, text=True)
+    return res
+
+
+def test_valid_minimal_fixtures_text():
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_minimal.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'text',
+    ])
+    assert res.returncode == 0
+    assert 'events_count' in res.stdout
+
+
+def test_invalid_fixtures_json():
+    res = run_cli([
+        '--events', str(FIXTURES / 'invalid_events_examples.csv'),
+        '--options', str(FIXTURES / 'invalid_options_observations_examples.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    assert 'blockers' in out
+    assert isinstance(out['blockers'], list)
+
+
+def test_intra_vs_intraday():
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+        f.write('event_id,symbol,event_date,event_time,event_session,event_timezone\n')
+        f.write('E1,A,2026-01-01,2026-01-01T09:30:00Z,INTRA,UTC\n')
+        f.write('E2,B,2026-01-02,2026-01-02T09:30:00Z,INTRADAY,UTC\n')
+        tmp_events = Path(f.name)
+
+    res = run_cli([
+        '--events', str(tmp_events),
+        '--options', str(FIXTURES / 'valid_options_observations_minimal.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'invalid_enum' in codes
+
+
+def test_missing_event_id_in_option():
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+        f.write('event_id,option_id,option_symbol,observation_date\n')
+        f.write(',O1,OPT1,2026-01-01T09:30:00Z\n')
+        tmp_opts = Path(f.name)
+
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(tmp_opts),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'missing_event_link' in codes or 'missing_required_field' in codes
+
+
+def test_unknown_event_link():
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+        f.write('event_id,option_id,option_symbol,observation_date\n')
+        f.write('UNKNOWN_EVT,O1,OPT1,2026-01-01T09:30:00Z\n')
+        tmp_opts = Path(f.name)
+
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(tmp_opts),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'invalid_event_link' in codes
+
+
+def test_json_output_contains_arrays():
+    res = run_cli([
+        '--events', str(FIXTURES / 'invalid_events_examples.csv'),
+        '--options', str(FIXTURES / 'invalid_options_observations_examples.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    assert isinstance(out.get('blockers'), list)
+    assert isinstance(out.get('warnings'), list)
+
+
+def test_strict_profile_requires_more_fields():
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_minimal.csv'),
+        '--profile', 'strict_contract_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'missing_required_field' in codes
+
+
+def test_no_forbidden_runtime_imports():
+    text = Path(SCRIPTS).read_text()
+    forbidden = ['pandas', 'pyarrow', 'sqlite3', 'requests', 'httpx', 'urllib', 'subprocess', 'os.system', 'Popen']
+    for f in forbidden:
+        assert f not in text
