@@ -125,3 +125,38 @@ def test_no_forbidden_runtime_imports():
     forbidden = ['pandas', 'pyarrow', 'sqlite3', 'requests', 'httpx', 'urllib', 'subprocess', 'os.system', 'Popen']
     for f in forbidden:
         assert f not in text
+
+# New tests for edge-case fixtures
+
+def test_invalid_event_edge_cases_emit_expected_blockers():
+    res = run_cli([
+        '--events', str(FIXTURES / 'invalid_events_edge_cases.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_minimal.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    expected = {'missing_required_field','duplicate_event_id','invalid_enum','unknown_event_session','invalid_timestamp'}
+    assert expected.intersection(codes)
+
+
+def test_invalid_option_edge_cases_emit_expected_blockers():
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(FIXTURES / 'invalid_options_observations_edge_cases.csv'),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    expected = {'missing_event_link','invalid_event_link','unknown_event_hold','unknown_gap_exposure','future_feature_timestamp'}
+    assert expected.intersection(codes)
+
+
+def test_edge_case_fixtures_are_documented_in_readme():
+    text = Path(FIXTURES / 'README.md').read_text()
+    assert 'invalid_events_edge_cases.csv' in text
+    assert 'invalid_options_observations_edge_cases.csv' in text

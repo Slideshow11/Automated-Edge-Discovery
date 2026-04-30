@@ -23,6 +23,8 @@ ALIAS_MAP = {
     "observation_date": "option_observation_date",
     "option_id": "option_observation_id",
     "symbol": "event_ticker",
+    "feature_timestamp": "quote_timestamp",
+    "decision_timestamp": "event_time_utc",
 }
 
 @dataclass
@@ -155,6 +157,15 @@ def validate(events_rows: List[Dict[str, str]], options_rows: List[Dict[str, str
                 dts = parse_iso_datetime(decision_ts)
                 if fts > dts:
                     blockers.append(Problem("future_feature_timestamp", "options", rownum, "feature_timestamp", "feature timestamp after decision timestamp"))
+            except Exception:
+                pass
+
+        cutoff_ts = orow.get("data_cutoff_timestamp")
+        if cutoff_ts and decision_ts:
+            try:
+                cts = parse_iso_datetime(cutoff_ts)
+                if cts > dts:
+                    blockers.append(Problem("future_feature_timestamp", "options", rownum, "data_cutoff_timestamp", "data cutoff timestamp after decision timestamp"))
             except Exception:
                 pass
 

@@ -14,6 +14,8 @@ Files included
 - valid_options_observations_minimal.csv: Minimal, valid option observation rows linked to the valid events.
 - invalid_events_examples.csv: Small set of invalid event rows with an invalid_reason column explaining why each row is invalid.
 - invalid_options_observations_examples.csv: Small set of invalid option observation rows with invalid_reason explaining the failure mode.
+- invalid_events_edge_cases.csv: Edge-case invalid events designed to trigger validators for missing, duplicate, enum, and timestamp failures.
+- invalid_options_observations_edge_cases.csv: Edge-case invalid option observations designed to trigger missing link, invalid link, unknown hold/gap, and future-timestamp blockers.
 
 Expected future validator behavior
 
@@ -26,10 +28,11 @@ Future validators (NOT included in this PR) are expected to:
 Notes
 
 - These are fixtures only and are NOT production data. They are intentionally small, synthetic, and hand-crafted.
-- No validator is implemented in this PR. Use these fixtures as the authoritative examples for writing validators in a future PR.
+- The edge-case fixtures exercise explicit blocker categories for the validator and are intentionally invalid.
+- Human review remains required; fixtures do not imply registry lifecycle actions (accepted/rejected/killed).
 
 These fixtures exercise event identity semantics: each option observation is linked to event identity (event_id), and cohorts are selected by event identity or event date.
 
 Provenance
 
-Derived from docs/event_options_contract_spec_v1.md and docs/event_options_schema_planning_v1.md.
+Derived from docs/event_options_contract_spec_v1.md and docs/event_options_contract_validator_design_v1.md.
