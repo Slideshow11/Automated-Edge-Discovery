@@ -16,6 +16,10 @@ Files included
 - invalid_options_observations_examples.csv: Small set of invalid option observation rows with invalid_reason explaining the failure mode.
 - invalid_events_edge_cases.csv: Edge-case invalid events designed to trigger validators for missing, duplicate, enum, and timestamp failures.
 - invalid_options_observations_edge_cases.csv: Edge-case invalid option observations designed to trigger missing link, invalid link, unknown hold/gap, and future-timestamp blockers.
+- valid_events_strict.csv: Valid event rows with all strict_contract_profile required fields (event_timestamp_quality, calendar_id, timezone, event_source, point_in_time_policy). Session must be BMO, AMC, or INTRA — not UNKNOWN.
+- valid_options_observations_strict.csv: Valid option observation rows with all strict_contract_profile required fields (option_type, option_expiry, expiry_covers_event, event_hold_flag, gap_exposure, fill_model, stale_quote_policy, spread_metric, liquidity_metric).
+- invalid_events_strict.csv: Invalid event rows with strict required fields present but UNKNOWN event_session — triggers unknown_event_session under strict_contract_profile.
+- invalid_options_observations_strict.csv: Invalid option observation rows with minimal required fields present but all strict-only required fields missing — triggers missing_required_field for each absent strict field.
 
 Expected future validator behavior
 

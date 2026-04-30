@@ -162,6 +162,82 @@ def test_edge_case_fixtures_are_documented_in_readme():
     assert 'invalid_options_observations_edge_cases.csv' in text
 
 
+# Tests for strict_contract_profile fixture coverage
+
+def test_valid_strict_fixtures_pass_under_strict_profile():
+    """Valid strict fixtures (with all strict-only required fields) must pass
+    strict_contract_profile without blockers."""
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_strict.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_strict.csv'),
+        '--profile', 'strict_contract_profile',
+    ])
+    assert res.returncode == 0, f"expected strict fixtures to pass, got stdout: {res.stdout}"
+    assert 'blockers_count: 0' in res.stdout
+
+
+def test_minimal_fixtures_fail_under_strict_profile():
+    """Minimal fixtures must fail strict_contract_profile because they lack
+    all strict-only required fields (event_timestamp_quality, calendar_id,
+    timezone, point_in_time_policy, option_type, option_expiry, etc.)."""
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_minimal.csv'),
+        '--profile', 'strict_contract_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'missing_required_field' in codes
+
+
+def test_strict_unknown_session_rejected():
+    """UNKNOWN event_session is blocked under strict_contract_profile
+    (unknown_event_session), even when all other strict fields are present."""
+    res = run_cli([
+        '--events', str(FIXTURES / 'invalid_events_strict.csv'),
+        '--options', str(FIXTURES / 'valid_options_observations_strict.csv'),
+        '--profile', 'strict_contract_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'unknown_event_session' in codes
+
+
+def test_strict_missing_option_fields_rejected():
+    """Rows missing strict-only option fields (option_type, option_expiry,
+    expiry_covers_event, event_hold_flag, gap_exposure, fill_model,
+    stale_quote_policy, spread_metric, liquidity_metric) must fail
+    strict_contract_profile with missing_required_field for each absent field."""
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_strict.csv'),
+        '--options', str(FIXTURES / 'invalid_options_observations_strict.csv'),
+        '--profile', 'strict_contract_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    missing = {b['field'] for b in out['blockers'] if b['code'] == 'missing_required_field'}
+    strict_fields = {
+        'option_type', 'option_expiry', 'expiry_covers_event',
+        'event_hold_flag', 'gap_exposure', 'fill_model',
+        'stale_quote_policy', 'spread_metric', 'liquidity_metric',
+    }
+    assert strict_fields.issubset(missing), f"expected all strict fields missing, got {missing}"
+
+
+def test_strict_fixtures_documented_in_readme():
+    text = Path(FIXTURES / 'README.md').read_text()
+    assert 'valid_events_strict.csv' in text
+    assert 'valid_options_observations_strict.csv' in text
+    assert 'invalid_events_strict.csv' in text
+    assert 'invalid_options_observations_strict.csv' in text
+
+
 # Regression tests for data_cutoff_timestamp independent parse (Codex finding)
 
 def test_cutoff_future_timestamp_when_feature_timestamp_missing():

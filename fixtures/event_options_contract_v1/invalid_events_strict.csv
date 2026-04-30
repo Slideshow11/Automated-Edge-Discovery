@@ -1,0 +1,3 @@
+event_id,event_date,event_time_utc,event_session,event_timestamp_quality,calendar_id,timezone,event_source,point_in_time_policy
+
+EVT-STR-003,2026-05-17,2026-05-17T09:30:00Z,UNKNOWN,exchange_closing_time,SAMPLE,PIT_SAMPLE,earnings_feed,strict
