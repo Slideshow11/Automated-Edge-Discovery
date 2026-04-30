@@ -10,9 +10,9 @@ AED currently uses a governance-first research workflow. The document map helps 
 
 - governance/intake layer v1 complete at PR #37
 - post-governance implementation roadmap merged at PR #38
-- TrialLedger/SearchSpaceManifest v1 design merged at PR #39
-- next planned work is MechanismDiscoveryReport / PostHocTheoryNote v1
-- autonomous search remains locked
+- Event/Options contract validator complete (PRs #50–#55)
+- TrialLedger/SearchSpaceManifest v1 design complete (PR #56)
+- next planned work is TrialLedger JSON schema + local validator
 
 ## Document groups
 
@@ -27,7 +27,9 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/edge_hypothesis_registry_v1.md | RegistryLayer | Defines the manual edge hypothesis registry v1 and lifecycle constraints. | Active |
 | docs/edge_hypothesis_registry.csv | RegistryLayer | Manual v1 registry CSV using the canonical hypothesis registry columns. | Manual v1 |
 | docs/post_governance_implementation_roadmap.md | RoadmapLayer | Locks the post-governance pivot toward enforcement, schema-backed artifacts, and trial accounting. | Active |
-| docs/trial_ledger_search_space_manifest_v1.md | EnforcementLayer | Defines TrialLedger, SearchSpaceManifest, TrialBudget, SearchRun, ParameterHash, and trial burden rules. | Design v1 |
+| docs/trial_ledger_v1_design.md | EnforcementLayer | Defines TrialLedger v1: append-only trial record, identity fields, source lanes, promotion rules, and governance states. | Active v1 design |
+| docs/search_space_manifest_v1_design.md | EnforcementLayer | Defines SearchSpaceManifest v1: pre-declared search boundaries, budget, constraints, forbidden modes, and burden accounting. | Active v1 design |
+| docs/trial_ledger_search_space_manifest_v1.md | EnforcementLayer | **Historical combined design note (PR #39).** For v1 authoritative references, use `docs/trial_ledger_v1_design.md` and `docs/search_space_manifest_v1_design.md`. | Historical |
 
 ## Local tooling map
 
@@ -35,6 +37,8 @@ AED currently uses a governance-first research workflow. The document map helps 
 |---|---|---|
 | scripts/local/pr_readiness_report.py | Produces local branch, diff, changed-file, untracked-file, recent-commit, and optional PR metadata reports. | Read-only |
 | scripts/local/validate_edge_hypothesis_card.py | Validates required content and guardrails in the edge hypothesis card doc. | Read-only |
+| scripts/local/validate_event_options_contract.py | Validates Event/Options contract CSV fixtures against minimal_fixture_profile and strict_contract_profile. | Read-only |
+| scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the validator across all fixture profiles and pytest. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |
@@ -46,9 +50,12 @@ If a script listed above is not present in a checkout, treat it as "not present 
 
 ## Deferred tooling
 
-- registry validator is deferred to a later tooling PR
-- schema validators are deferred
-- TrialLedger/SearchSpaceManifest validators are deferred
+- Event/Options contract validator **complete** (CI job in `.github/workflows/ci.yml`)
+- TrialLedger / SearchSpaceManifest validators **not yet implemented** (design complete, PR #56)
+- Event/Options JSON schemas deferred
+- EventStudySpec / OptionsEventRiskSpec schemas deferred
+- MechanismDiscoveryReport schema deferred
+- registry validator deferred
 - autonomous search and optimization tooling are locked until trial accounting exists
 
 ## Canonical terms
@@ -72,13 +79,15 @@ If a script listed above is not present in a checkout, treat it as "not present 
 
 - Event/Options schema planning is complete.
 - Event/Options contract spec v1 is present.
+- Event/Options contract validator is **complete** (PRs #50–#55): local validator, CI job, edge-case fixtures, strict_contract_profile.
 - Contract invariant fix is merged.
 - Event/Options contract fixtures v1 are present.
 - Registry CSV remains manual v1 only.
-- Validators and JSON schemas remain deferred.
+- Event/Options JSON schemas deferred.
 
-See the following canonical docs and fixtures for more details:
+See the following canonical docs and fixtures:
 
 - docs/event_options_schema_planning_v1.md
 - docs/event_options_contract_spec_v1.md
+- docs/event_options_contract_validator_design_v1.md
 - fixtures/event_options_contract_v1/README.md
