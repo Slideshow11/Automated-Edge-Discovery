@@ -160,3 +160,56 @@ def test_edge_case_fixtures_are_documented_in_readme():
     text = Path(FIXTURES / 'README.md').read_text()
     assert 'invalid_events_edge_cases.csv' in text
     assert 'invalid_options_observations_edge_cases.csv' in text
+
+
+# Regression tests for data_cutoff_timestamp independent parse (Codex finding)
+
+def test_cutoff_future_timestamp_when_feature_timestamp_missing():
+    """data_cutoff_timestamp > decision_ts must emit future_feature_timestamp
+    even when feature_timestamp is absent from the row.
+
+    This is a regression test: previously the cutoff check reused the dts
+    variable set inside the feature_ts block, so it silently skipped when
+    feature_timestamp was missing.
+    """
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+        f.write('event_id,option_id,option_symbol,observation_date,event_hold_flag,gap_exposure,feature_timestamp,decision_timestamp,data_cutoff_timestamp\n')
+        # feature_timestamp is absent; data_cutoff is after decision_ts
+        f.write('EV-0001,opt-X,EDGE-OPT-X,2026-05-04,full_event_hold,none,,2026-05-04T09:00:00Z,2026-05-05T08:00:00Z\n')
+        tmp_opts = Path(f.name)
+
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(tmp_opts),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'future_feature_timestamp' in codes, f"expected future_feature_timestamp, got {codes}"
+
+
+def test_cutoff_future_timestamp_when_feature_timestamp_unparsable():
+    """data_cutoff_timestamp > decision_ts must emit future_feature_timestamp
+    even when feature_timestamp is present but unparsable.
+
+    This verifies the cutoff check does not depend on feature_timestamp being
+    successfully parsed.
+    """
+    with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.csv') as f:
+        f.write('event_id,option_id,option_symbol,observation_date,event_hold_flag,gap_exposure,feature_timestamp,decision_timestamp,data_cutoff_timestamp\n')
+        # feature_timestamp is unparsable; data_cutoff is after decision_ts
+        f.write('EV-0001,opt-Y,EDGE-OPT-Y,2026-05-04,full_event_hold,none,not-a-timestamp,2026-05-04T09:00:00Z,2026-05-05T08:00:00Z\n')
+        tmp_opts = Path(f.name)
+
+    res = run_cli([
+        '--events', str(FIXTURES / 'valid_events_minimal.csv'),
+        '--options', str(tmp_opts),
+        '--profile', 'minimal_fixture_profile',
+        '--format', 'json',
+    ])
+    assert res.returncode == 1
+    out = json.loads(res.stdout)
+    codes = {b['code'] for b in out['blockers']}
+    assert 'future_feature_timestamp' in codes, f"expected future_feature_timestamp, got {codes}"

@@ -149,21 +149,26 @@ def validate(events_rows: List[Dict[str, str]], options_rows: List[Dict[str, str
         if ge == "unknown":
             blockers.append(Problem("unknown_gap_exposure", "options", rownum, "gap_exposure", "unknown gap_exposure blocks promotion or advancement"))
 
+        # future_feature_timestamp: feature_timestamp vs decision_timestamp
         feature_ts = orow.get("quote_timestamp") or orow.get("option_observation_date")
-        decision_ts = orow.get("event_time_utc") or None
-        if feature_ts and decision_ts:
+        decision_ts_raw = orow.get("event_time_utc")
+        if feature_ts and decision_ts_raw:
             try:
                 fts = parse_iso_datetime(feature_ts)
-                dts = parse_iso_datetime(decision_ts)
+                dts = parse_iso_datetime(decision_ts_raw)
                 if fts > dts:
                     blockers.append(Problem("future_feature_timestamp", "options", rownum, "feature_timestamp", "feature timestamp after decision timestamp"))
             except Exception:
                 pass
 
+        # future_feature_timestamp: data_cutoff_timestamp vs decision_timestamp
+        # Parse decision_ts independently so this check does not depend on feature_timestamp
         cutoff_ts = orow.get("data_cutoff_timestamp")
-        if cutoff_ts and decision_ts:
+        decision_ts_for_cutoff = orow.get("event_time_utc")
+        if cutoff_ts and decision_ts_for_cutoff:
             try:
                 cts = parse_iso_datetime(cutoff_ts)
+                dts = parse_iso_datetime(decision_ts_for_cutoff)
                 if cts > dts:
                     blockers.append(Problem("future_feature_timestamp", "options", rownum, "data_cutoff_timestamp", "data cutoff timestamp after decision timestamp"))
             except Exception:
