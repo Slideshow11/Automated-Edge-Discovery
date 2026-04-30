@@ -1,0 +1,4 @@
+event_id,event_date,event_time_utc,event_session,event_timestamp_quality,calendar_id,timezone,event_source,point_in_time_policy
+
+EVT-STR-001,2026-05-15,2026-05-15T09:30:00Z,BMO,exchange_closing_time,SAMPLE,PIT_SAMPLE,earnings_feed,strict
+EVT-STR-002,2026-05-16,2026-05-16T16:00:00Z,AMC,exchange_closing_time,SAMPLE,PIT_SAMPLE,earnings_feed,strict

@@ -1,0 +1,5 @@
+event_id,option_observation_id,option_contract_symbol,option_observation_date,event_time_utc,option_type,option_expiry,expiry_covers_event,event_hold_flag,gap_exposure,fill_model,stale_quote_policy,spread_metric,liquidity_metric
+
+EVT-STR-001,OBS-STR-001,STRIKE-EVTSTR001-20260620-C-150,2026-05-14T16:00:00Z,2026-05-15T09:30:00Z,C,2026-06-20,yes,no_event_hold,none,last_trade,no_stale,mid,full
+EVT-STR-001,OBS-STR-002,STRIKE-EVTSTR001-20260620-P-150,2026-05-14T16:00:00Z,2026-05-15T09:30:00Z,P,2026-06-20,yes,no_event_hold,none,last_trade,no_stale,mid,full
+EVT-STR-002,OBS-STR-003,STRIKE-EVTSTR002-20260620-C-200,2026-05-15T16:00:00Z,2026-05-16T16:00:00Z,C,2026-06-20,yes,no_event_hold,none,last_trade,no_stale,mid,full
