@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design has started with TrialLedger/SearchSpaceManifest.
+The enforcement-layer design is complete for TrialLedger and SearchSpaceManifest (PR #56). Implementation of their validators and schemas is next.
 
 The project is not yet an autonomous discovery engine.
 
@@ -30,6 +30,13 @@ The project is not yet a live trading or production system.
 - PR #46 Event/Options contract fixtures v1
 - PR #47 Event/Options contract spec invariant fix
 - PR #48 AED status update after Event/Options contract work
+- PR #50 Event/Options validator design v1
+- PR #51 local Event/Options validator implementation
+- PR #52 Event/Options edge-case fixtures
+- PR #53 Event/Options data_cutoff_timestamp independent parse fix
+- PR #54 Event/Options strict_contract_profile fixtures
+- PR #55 Event/Options validator CI wiring
+- PR #56 TrialLedger and SearchSpaceManifest v1 design (split docs)
 
 ## Current stop rules
 
@@ -40,6 +47,7 @@ The project is not yet a live trading or production system.
 - No automated promotion
 - No live trading
 - No production execution
+- No GCRU integration into AED yet
 
 ## Known deferred implementation items
 
@@ -49,14 +57,20 @@ The project is not yet a live trading or production system.
 - PostHocTheoryNote JSON schema deferred
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
-- Event/Options contract validator deferred
-- TrialLedger / SearchSpaceManifest validators deferred
+- Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
+- TrialLedger / SearchSpaceManifest **design complete** (PR #56); schemas and validators not yet implemented
 - EdgeHypothesisRegistry JSON schema and validator deferred
 - registry validator deferred
 
 ## Next planned PRs
 
-Next new PR likely #49: choose between Event/Options contract validator design, MechanismDiscoveryReport JSON schema, EdgeHypothesisRegistry JSON schema and validator, or TrialLedger/SearchSpaceManifest validator design.
+Next PR #57: update AED status docs after validator milestone (this PR).
+
+After that, the recommended next work is:
+- TrialLedger JSON schema + local validator
+- SearchSpaceManifest JSON schema + local validator
+
+MechanismDiscoveryReport, EdgeHypothesisRegistry JSONL migration, EventStudySpec, and OptionsEventRiskSpec schemas remain deferred until trial accounting is operational.
 
 ## Operational notes
 
@@ -67,11 +81,22 @@ Next new PR likely #49: choose between Event/Options contract validator design, 
 
 ## Event/Options current state
 
-- Decision-time anti-lookahead invariant is corrected.
-- event_id is required for OptionsObservationSpec event-cohort research.
-- event identity is the canonical cohort and join key.
-- Fixture examples exist for valid and invalid event/options records.
-- Event/Options validators and JSON schemas are deferred.
-- Event/Options contract validator deferred.
-- EventStudySpec and OptionsEventRiskSpec JSON schemas deferred.
-- Next new PR likely #49.
+**Event/Options contract validator is complete (PRs #50–#55):**
+
+- Local validator implemented (`scripts/local/validate_event_options_contract.py`)
+- Edge-case invalid fixtures added (PR #52)
+- data_cutoff_timestamp parsed independently of feature_timestamp (PR #53)
+- strict_contract_profile fixtures and tests added (PR #54)
+- Validator CI job wired into `.github/workflows/ci.yml` (PR #55)
+- Decision-time anti-lookahead invariant confirmed
+- event_id required for OptionsObservationSpec event-cohort research
+- event identity is the canonical cohort and join key
+- Fixture examples exist for valid and invalid event/options records
+
+**Still deferred:**
+
+- Event/Options JSON schemas
+- EventStudySpec JSON schema
+- OptionsEventRiskSpec JSON schema
+
+## Operational notes
