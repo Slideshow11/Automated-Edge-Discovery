@@ -38,7 +38,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/pr_readiness_report.py | Produces local branch, diff, changed-file, untracked-file, recent-commit, and optional PR metadata reports. | Read-only |
 | scripts/local/validate_edge_hypothesis_card.py | Validates required content and guardrails in the edge hypothesis card doc. | Read-only |
 | scripts/local/validate_event_options_contract.py | Validates Event/Options contract CSV fixtures against minimal_fixture_profile and strict_contract_profile. | Read-only |
-| scripts/local/validate_event_options_contract.sh | CI helper wrapper that runs the validator across all fixture profiles and pytest. | CI helper |
+| scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the validator across all fixture profiles and pytest. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |
