@@ -81,7 +81,7 @@ def validate(path):
 
     # Required fields
     for field in required_fields:
-        if field not in entry:
+        if field not in entry or entry.get(field) is None:
             blockers.append(Blocker("missing_required_field", "search_space_manifest_entry", field, f"{field} is required"))
 
     # ID format
@@ -137,6 +137,8 @@ def validate(path):
     if budget is not None:
         if not isinstance(budget, dict):
             blockers.append(Blocker("invalid_object", "search_space_manifest_entry", "budget", "budget must be an object"))
+        elif "max_trials" not in budget:
+            blockers.append(Blocker("missing_required_field", "search_space_manifest_entry", "budget.max_trials", "max_trials is required"))
         else:
             mt = budget.get("max_trials")
             if mt is not None:

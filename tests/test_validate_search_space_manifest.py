@@ -507,6 +507,87 @@ def test_allowed_labels_not_list():
         Path(path).unlink()
 
 
+# ----- required field null-value regression tests -----
+
+def test_required_field_null_search_space_id():
+    entry = {
+        "search_space_id": None,
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "missing_required_field" in codes
+    finally:
+        Path(path).unlink()
+
+
+def test_required_field_null_budget():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": None,
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "missing_required_field" in codes
+    finally:
+        Path(path).unlink()
+
+
+# ----- empty budget object regression test -----
+
+def test_budget_missing_max_trials():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "missing_required_field" in codes
+        fields = [b["field"] for b in data["blockers"]]
+        assert "budget.max_trials" in fields
+    finally:
+        Path(path).unlink()
+
+
 # ----- multiple blockers in one entry -----
 
 def test_multiple_blockers():
