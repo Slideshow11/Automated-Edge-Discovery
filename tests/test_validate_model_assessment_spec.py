@@ -876,3 +876,169 @@ def test_accepted_with_bool_dsr_in_metrics():
         assert "invalid_metric" in codes
     finally:
         tmp.unlink()
+
+
+# ─── Regression: non-string ID values must not raise TypeError ───────────────────────
+
+
+def test_assessment_id_non_string_int():
+    """assessment_id as integer must emit invalid_id_format, not TypeError."""
+    entry = {
+        "assessment_id": 1234,
+        "hypothesis_id": "EHH-2026-0001",
+        "trial_id": "TRL-2026-0031",
+        "search_space_id": "SSM-2026-0031",
+        "assessment_status": "draft",
+        "metrics": {},
+        "required_checks": {
+            "sample_size_gate_passed": False,
+            "leakage_check_passed": False,
+            "pbo_check_passed": False,
+            "dsr_check_passed": False,
+            "confirmatory_evidence_present": False,
+        },
+        "reviewer": {"reviewer_id": "human-001"},
+        "created_at": "2026-04-30T12:00:00Z",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, out, _ = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"Expected 1, got {code}: {out}"
+        data = json.loads(out)
+        codes = {b["code"] for b in data["blockers"]}
+        assert "invalid_id_format" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_trial_id_non_string_int():
+    """trial_id as integer must emit invalid_id_format, not TypeError."""
+    entry = {
+        "assessment_id": "MAS-2026-0032",
+        "hypothesis_id": "EHH-2026-0001",
+        "trial_id": 1234,
+        "search_space_id": "SSM-2026-0032",
+        "assessment_status": "draft",
+        "metrics": {},
+        "required_checks": {
+            "sample_size_gate_passed": False,
+            "leakage_check_passed": False,
+            "pbo_check_passed": False,
+            "dsr_check_passed": False,
+            "confirmatory_evidence_present": False,
+        },
+        "reviewer": {"reviewer_id": "human-001"},
+        "created_at": "2026-04-30T12:00:00Z",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, out, _ = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"Expected 1, got {code}: {out}"
+        data = json.loads(out)
+        codes = {b["code"] for b in data["blockers"]}
+        assert "invalid_id_format" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_search_space_id_non_string_int():
+    """search_space_id as integer must emit invalid_id_format, not TypeError."""
+    entry = {
+        "assessment_id": "MAS-2026-0033",
+        "hypothesis_id": "EHH-2026-0001",
+        "trial_id": "TRL-2026-0033",
+        "search_space_id": 1234,
+        "assessment_status": "draft",
+        "metrics": {},
+        "required_checks": {
+            "sample_size_gate_passed": False,
+            "leakage_check_passed": False,
+            "pbo_check_passed": False,
+            "dsr_check_passed": False,
+            "confirmatory_evidence_present": False,
+        },
+        "reviewer": {"reviewer_id": "human-001"},
+        "created_at": "2026-04-30T12:00:00Z",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, out, _ = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"Expected 1, got {code}: {out}"
+        data = json.loads(out)
+        codes = {b["code"] for b in data["blockers"]}
+        assert "invalid_id_format" in codes
+    finally:
+        tmp.unlink()
+
+
+# ─── Regression: non-string assessment_status must not raise TypeError ───────────────────────
+
+
+def test_assessment_status_non_string_dict():
+    """assessment_status as dict must emit invalid_enum, not TypeError."""
+    entry = {
+        "assessment_id": "MAS-2026-0034",
+        "hypothesis_id": "EHH-2026-0001",
+        "trial_id": "TRL-2026-0034",
+        "search_space_id": "SSM-2026-0034",
+        "assessment_status": {"status": "accepted"},
+        "metrics": {},
+        "required_checks": {
+            "sample_size_gate_passed": False,
+            "leakage_check_passed": False,
+            "pbo_check_passed": False,
+            "dsr_check_passed": False,
+            "confirmatory_evidence_present": False,
+        },
+        "reviewer": {"reviewer_id": "human-001"},
+        "created_at": "2026-04-30T12:00:00Z",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, out, _ = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"Expected 1, got {code}: {out}"
+        data = json.loads(out)
+        codes = {b["code"] for b in data["blockers"]}
+        assert "invalid_enum" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_assessment_status_non_string_list():
+    """assessment_status as list must emit invalid_enum, not TypeError."""
+    entry = {
+        "assessment_id": "MAS-2026-0035",
+        "hypothesis_id": "EHH-2026-0001",
+        "trial_id": "TRL-2026-0035",
+        "search_space_id": "SSM-2026-0035",
+        "assessment_status": ["accepted"],
+        "metrics": {},
+        "required_checks": {
+            "sample_size_gate_passed": False,
+            "leakage_check_passed": False,
+            "pbo_check_passed": False,
+            "dsr_check_passed": False,
+            "confirmatory_evidence_present": False,
+        },
+        "reviewer": {"reviewer_id": "human-001"},
+        "created_at": "2026-04-30T12:00:00Z",
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, out, _ = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"Expected 1, got {code}: {out}"
+        data = json.loads(out)
+        codes = {b["code"] for b in data["blockers"]}
+        assert "invalid_enum" in codes
+    finally:
+        tmp.unlink()

@@ -103,7 +103,14 @@ def validate(entry):
 
     # 2. assessment_id format (MAS-YYYY-NNNN)
     assessment_id = entry.get("assessment_id", "")
-    if not ID_PATTERN_MAS.match(assessment_id):
+    if not isinstance(assessment_id, str):
+        blockers.append(Blocker(
+            "invalid_id_format",
+            "model_assessment_spec_entry",
+            "assessment_id",
+            "assessment_id must be a string matching MAS-YYYY-NNNN format"
+        ))
+    elif not ID_PATTERN_MAS.match(assessment_id):
         blockers.append(Blocker(
             "invalid_id_format",
             "model_assessment_spec_entry",
@@ -113,7 +120,14 @@ def validate(entry):
 
     # 3. trial_id format (TRL-YYYY-NNNN)
     trial_id = entry.get("trial_id", "")
-    if not ID_PATTERN_TRL.match(trial_id):
+    if not isinstance(trial_id, str):
+        blockers.append(Blocker(
+            "invalid_id_format",
+            "model_assessment_spec_entry",
+            "trial_id",
+            "trial_id must be a string matching TRL-YYYY-NNNN format"
+        ))
+    elif not ID_PATTERN_TRL.match(trial_id):
         blockers.append(Blocker(
             "invalid_id_format",
             "model_assessment_spec_entry",
@@ -123,7 +137,14 @@ def validate(entry):
 
     # 4. search_space_id format (SSM-YYYY-NNNN)
     search_space_id = entry.get("search_space_id", "")
-    if not ID_PATTERN_SSM.match(search_space_id):
+    if not isinstance(search_space_id, str):
+        blockers.append(Blocker(
+            "invalid_id_format",
+            "model_assessment_spec_entry",
+            "search_space_id",
+            "search_space_id must be a string matching SSM-YYYY-NNNN format"
+        ))
+    elif not ID_PATTERN_SSM.match(search_space_id):
         blockers.append(Blocker(
             "invalid_id_format",
             "model_assessment_spec_entry",
@@ -133,7 +154,14 @@ def validate(entry):
 
     # 5. assessment_status enum
     assessment_status = entry.get("assessment_status", "")
-    if assessment_status and assessment_status not in ASSESSMENT_STATUSES:
+    if not isinstance(assessment_status, str):
+        blockers.append(Blocker(
+            "invalid_enum",
+            "model_assessment_spec_entry",
+            "assessment_status",
+            f"assessment_status must be a string, got {type(assessment_status).__name__}"
+        ))
+    elif assessment_status and assessment_status not in ASSESSMENT_STATUSES:
         blockers.append(Blocker(
             "invalid_enum",
             "model_assessment_spec_entry",
