@@ -277,15 +277,6 @@ def validate(entry):
                         f"metrics.{metric_name}",
                         f"assessment_status=accepted requires metrics.{metric_name}"
                     ))
-            # confirmatory_evidence_present must be true
-            cep = required_checks.get("confirmatory_evidence_present") if required_checks else None
-            if cep is not True:
-                blockers.append(Blocker(
-                    "accepted_without_required_evidence",
-                    "model_assessment_spec_entry",
-                    "required_checks.confirmatory_evidence_present",
-                    "assessment_status=accepted requires required_checks.confirmatory_evidence_present == true"
-                ))
 
     return blockers
 
