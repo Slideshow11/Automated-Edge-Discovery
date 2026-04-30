@@ -1,0 +1,23 @@
+{
+  "assessment_id": "MAS-2026-0004",
+  "hypothesis_id": "EHH-2026-0001",
+  "trial_id": "TRL-2026-0001",
+  "search_space_id": "SSM-2026-0001",
+  "assessment_status": "accepted",
+  "metrics": {
+    "sample_size": 500,
+    "pbo": 0.03,
+    "dsr": 1.4
+  },
+  "required_checks": {
+    "sample_size_gate_passed": false,
+    "leakage_check_passed": false,
+    "pbo_check_passed": false,
+    "dsr_check_passed": false,
+    "confirmatory_evidence_present": false
+  },
+  "reviewer": {
+    "reviewer_id": "human-001"
+  },
+  "created_at": "2026-04-30T12:00:00Z"
+}
