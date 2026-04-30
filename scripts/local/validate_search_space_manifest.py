@@ -127,7 +127,9 @@ def validate(path):
         else:
             for key in FORBIDDEN_MODE_KEYS:
                 val = fm.get(key)
-                if val is True:
+                if val is not None and not isinstance(val, bool):
+                    blockers.append(Blocker("invalid_forbidden_mode", "search_space_manifest_entry", key, f"{key} must be a boolean"))
+                elif val is True:
                     blockers.append(Blocker("forbidden_mode_enabled", "search_space_manifest_entry", key, f"{key} is forbidden and must not be enabled"))
 
     # budget
@@ -138,16 +140,18 @@ def validate(path):
         else:
             mt = budget.get("max_trials")
             if mt is not None:
-                if not isinstance(mt, int) or mt <= 0:
+                if not isinstance(mt, bool) and isinstance(mt, int) and mt > 0:
+                    pass  # valid
+                else:
                     blockers.append(Blocker("invalid_budget", "search_space_manifest_entry", "budget.max_trials", "max_trials must be an integer > 0"))
             mpc = budget.get("max_parameter_combinations")
-            if mpc is not None and (not isinstance(mpc, int) or mpc <= 0):
+            if mpc is not None and (isinstance(mpc, bool) or not isinstance(mpc, int) or mpc <= 0):
                 blockers.append(Blocker("invalid_budget", "search_space_manifest_entry", "budget.max_parameter_combinations", "max_parameter_combinations must be an integer > 0"))
             mrt = budget.get("max_runtime_minutes")
-            if mrt is not None and (not isinstance(mrt, int) or mrt <= 0):
+            if mrt is not None and (isinstance(mrt, bool) or not isinstance(mrt, int) or mrt <= 0):
                 blockers.append(Blocker("invalid_budget", "search_space_manifest_entry", "budget.max_runtime_minutes", "max_runtime_minutes must be an integer > 0"))
             map_ = budget.get("max_agent_proposals")
-            if map_ is not None and (not isinstance(map_, int) or map_ < 0):
+            if map_ is not None and (isinstance(map_, bool) or not isinstance(map_, int) or map_ < 0):
                 blockers.append(Blocker("invalid_budget", "search_space_manifest_entry", "budget.max_agent_proposals", "max_agent_proposals must be an integer >= 0"))
 
     return blockers

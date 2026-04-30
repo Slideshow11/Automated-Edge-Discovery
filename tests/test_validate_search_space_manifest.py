@@ -329,6 +329,184 @@ def test_search_space_id_wrong_format():
         Path(path).unlink()
 
 
+# ----- budget boolean trap tests -----
+
+def test_max_trials_bool_true():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": True},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_budget" in codes
+    finally:
+        Path(path).unlink()
+
+def test_max_trials_bool_false():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": False},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_budget" in codes
+    finally:
+        Path(path).unlink()
+
+def test_max_agent_proposals_bool_false():
+    # False >= 0 numerically, but must be integer, not bool
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100, "max_agent_proposals": False},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_budget" in codes
+    finally:
+        Path(path).unlink()
+
+
+# ----- forbidden modes non-boolean tests -----
+
+def test_forbidden_mode_string_value():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100},
+        "forbidden_modes": {"autonomous_search": "true"},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_forbidden_mode" in codes
+    finally:
+        Path(path).unlink()
+
+def test_forbidden_mode_integer_value():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100},
+        "forbidden_modes": {"live_trading": 1},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_forbidden_mode" in codes
+    finally:
+        Path(path).unlink()
+
+
+# ----- allowed_features / allowed_labels non-list tests -----
+
+def test_allowed_features_not_list():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": "feature_a",
+        "allowed_labels": [],
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_list" in codes
+    finally:
+        Path(path).unlink()
+
+def test_allowed_labels_not_list():
+    entry = {
+        "search_space_id": "SSM-2026-0018",
+        "search_mode": "manual_grid",
+        "allowed_data_manifests": ["DM-1"],
+        "allowed_features": [],
+        "allowed_labels": "label_a",
+        "allowed_parameter_ranges": {},
+        "validation_scheme": "purged_cpcv",
+        "budget": {"max_trials": 100},
+        "forbidden_modes": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", path])
+        assert code == 1
+        data = json.loads(out)
+        codes = [b["code"] for b in data["blockers"]]
+        assert "invalid_list" in codes
+    finally:
+        Path(path).unlink()
+
+
 # ----- multiple blockers in one entry -----
 
 def test_multiple_blockers():
