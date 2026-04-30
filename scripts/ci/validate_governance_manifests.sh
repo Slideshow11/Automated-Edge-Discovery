@@ -45,12 +45,33 @@ do
   fi
 done
 
+# --- ModelAssessmentSpec v1 fixture checks ---
+
+echo "=== ModelAssessmentSpec valid fixture ==="
+python3 scripts/local/validate_model_assessment_spec.py \
+  fixtures/model_assessment_spec_v1/valid_model_assessment_spec.json
+
+echo "=== ModelAssessmentSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/model_assessment_spec_v1/invalid_missing_assessment_id.json \
+  fixtures/model_assessment_spec_v1/invalid_bad_status.json \
+  fixtures/model_assessment_spec_v1/invalid_missing_required_checks.json \
+  fixtures/model_assessment_spec_v1/invalid_accepted_without_required_evidence.json \
+  fixtures/model_assessment_spec_v1/invalid_bad_metric_value.json
+do
+  if python3 scripts/local/validate_model_assessment_spec.py "$f"; then
+    echo "BLOCKER: invalid ModelAssessmentSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
 python3 -m pytest \
   tests/test_validate_trial_ledger.py \
   tests/test_validate_search_space_manifest.py \
+  tests/test_validate_model_assessment_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
