@@ -289,3 +289,181 @@ def test_status_enum_rejected():
         assert code == 0
     finally:
         tmp.unlink()
+
+
+# ─── Regression: non-object root ─────────────────────────────────────────────
+
+
+def test_non_object_root_list():
+    """JSON root is a list, not an object — must return invalid_object, exit 1."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump([], f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_object" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_non_object_root_number():
+    """JSON root is a number, not an object — must return invalid_object, exit 1."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(123, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_object" in codes
+    finally:
+        tmp.unlink()
+
+
+# ─── Regression: data_scope object validation ──────────────────────────────────
+
+
+def test_data_scope_not_object():
+    """data_scope present but not an object — must return invalid_object."""
+    entry = {
+        "trial_id": "TRL-2026-0014",
+        "search_space_id": "SSM-2026-0017",
+        "hypothesis_id": "EHH-2026-0012",
+        "source_lane": "theory_first",
+        "promotion_status": "raw_result",
+        "status": "completed",
+        "data_scope": "not-an-object",  # wrong type
+        "execution_scope": {"runner_id": "runner-local-v1"},
+        "results": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_object" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_data_scope_is_list():
+    """data_scope is a list, not an object — must return invalid_object."""
+    entry = {
+        "trial_id": "TRL-2026-0015",
+        "search_space_id": "SSM-2026-0017",
+        "hypothesis_id": "EHH-2026-0012",
+        "source_lane": "theory_first",
+        "promotion_status": "raw_result",
+        "status": "completed",
+        "data_scope": ["ds-1", "ds-2"],  # wrong type
+        "execution_scope": {"runner_id": "runner-local-v1"},
+        "results": {},
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_object" in codes
+    finally:
+        tmp.unlink()
+
+
+# ─── Regression: confirmatory_data_scope object validation ───────────────────
+
+
+def test_confirmatory_data_scope_not_object():
+    """accepted with confirmatory_data_scope as string — must return invalid_confirmatory_link."""
+    entry = {
+        "trial_id": "TRL-2026-0016",
+        "search_space_id": "SSM-2026-0017",
+        "hypothesis_id": "EHH-2026-0012",
+        "source_lane": "exploratory_anomaly",
+        "promotion_status": "accepted",
+        "status": "completed",
+        "data_scope": {"dataset_id": "DS-2026-Q1"},
+        "execution_scope": {"runner_id": "runner-local-v1"},
+        "results": {},
+        "confirmatory_trial_id": "TRL-2026-0017",
+        "confirmatory_source_lane": "confirmatory",
+        "confirmatory_data_scope": "not-an-object",  # wrong type
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_confirmatory_link" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_confirmatory_data_scope_is_list():
+    """accepted with confirmatory_data_scope as list — must return invalid_confirmatory_link."""
+    entry = {
+        "trial_id": "TRL-2026-0018",
+        "search_space_id": "SSM-2026-0017",
+        "hypothesis_id": "EHH-2026-0012",
+        "source_lane": "exploratory_anomaly",
+        "promotion_status": "accepted",
+        "status": "completed",
+        "data_scope": {"dataset_id": "DS-2026-Q1"},
+        "execution_scope": {"runner_id": "runner-local-v1"},
+        "results": {},
+        "confirmatory_trial_id": "TRL-2026-0019",
+        "confirmatory_source_lane": "confirmatory",
+        "confirmatory_data_scope": [{"dataset_id": "DS-2026-Q2"}],  # wrong type
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "invalid_confirmatory_link" in codes
+    finally:
+        tmp.unlink()
+
+
+def test_confirmatory_data_scope_missing_still_missing_confirmatory_link():
+    """accepted with confirmatory_data_scope absent — must still return missing_confirmatory_link."""
+    entry = {
+        "trial_id": "TRL-2026-0020",
+        "search_space_id": "SSM-2026-0017",
+        "hypothesis_id": "EHH-2026-0012",
+        "source_lane": "exploratory_anomaly",
+        "promotion_status": "accepted",
+        "status": "completed",
+        "data_scope": {"dataset_id": "DS-2026-Q1"},
+        "execution_scope": {"runner_id": "runner-local-v1"},
+        "results": {},
+        "confirmatory_trial_id": "TRL-2026-0021",
+        "confirmatory_source_lane": "confirmatory",
+        # confirmatory_data_scope absent
+    }
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(entry, f)
+        tmp = Path(f.name)
+    try:
+        code, stdout, stderr = run_validator(["--format", "json", str(tmp)])
+        assert code == 1, f"expected 1, got {code}: {stdout}"
+        out = json.loads(stdout)
+        codes = {b["code"] for b in out["blockers"]}
+        assert "missing_confirmatory_link" in codes
+    finally:
+        tmp.unlink()

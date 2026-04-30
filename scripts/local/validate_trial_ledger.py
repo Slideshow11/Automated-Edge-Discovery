@@ -64,6 +64,16 @@ def parse_args():
 def validate(entry: Dict[str, Any]) -> List[Blocker]:
     blockers: List[Blocker] = []
 
+    # 0. Root must be an object
+    if not isinstance(entry, dict):
+        blockers.append(Blocker(
+            "invalid_object",
+            "trial_ledger",
+            "$",
+            "TrialLedger entry must be a JSON object"
+        ))
+        return blockers
+
     # 1. Required top-level fields
     for field in REQUIRED_TOP_LEVEL:
         if field not in entry or entry.get(field) is None or entry.get(field) == "":
@@ -127,7 +137,7 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
             "status " + repr(status) + " not in allowed set"
         ))
 
-    # 7. data_scope required fields
+    # 7. data_scope — must be present, must be an object, must have dataset_id
     ds = entry.get("data_scope")
     if ds is None:
         blockers.append(Blocker(
@@ -136,7 +146,14 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
             "data_scope",
             "data_scope is required"
         ))
-    elif isinstance(ds, dict):
+    elif not isinstance(ds, dict):
+        blockers.append(Blocker(
+            "invalid_object",
+            "trial_ledger_entry",
+            "data_scope",
+            "data_scope must be an object"
+        ))
+    else:
         for field in DATA_SCOPE_REQUIRED:
             if not ds.get(field):
                 blockers.append(Blocker(
@@ -146,7 +163,7 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
                     field + " is required within data_scope"
                 ))
 
-    # 8. execution_scope required (presence check)
+    # 8. execution_scope — must be present
     es = entry.get("execution_scope")
     if es is None:
         blockers.append(Blocker(
@@ -156,7 +173,7 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
             "execution_scope is required"
         ))
 
-    # 9. results required (presence check)
+    # 9. results — must be present
     res = entry.get("results")
     if res is None:
         blockers.append(Blocker(
@@ -181,6 +198,8 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
         ctri = entry.get("confirmatory_trial_id")
         clane = entry.get("confirmatory_source_lane")
         cscope = entry.get("confirmatory_data_scope")
+
+        # Check for missing fields first
         missing_links: List[str] = []
         if not ctri:
             missing_links.append("confirmatory_trial_id")
@@ -188,6 +207,7 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
             missing_links.append("confirmatory_source_lane")
         if not cscope:
             missing_links.append("confirmatory_data_scope")
+
         if missing_links:
             links_str = ", ".join(missing_links)
             blockers.append(Blocker(
@@ -197,15 +217,25 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
                 "promotion_status=accepted requires: " + links_str
             ))
         else:
-            if clane != "confirmatory":
+            # All fields present — check types and values
+            if not isinstance(clane, str) or clane != "confirmatory":
                 blockers.append(Blocker(
                     "invalid_confirmatory_link",
                     "trial_ledger_entry",
                     "confirmatory_source_lane",
                     "confirmatory_source_lane must be 'confirmatory', got " + repr(clane)
                 ))
-            # Governance rule: confirmatory_data_scope must not be identical to data_scope
-            if isinstance(cscope, dict) and isinstance(ds, dict):
+
+            # confirmatory_data_scope must be an object
+            if not isinstance(cscope, dict):
+                blockers.append(Blocker(
+                    "invalid_confirmatory_link",
+                    "trial_ledger_entry",
+                    "confirmatory_data_scope",
+                    "confirmatory_data_scope must be an object"
+                ))
+            elif isinstance(ds, dict):
+                # confirmatory_data_scope must not be identical to data_scope
                 if cscope == ds:
                     blockers.append(Blocker(
                         "confirmatory_data_scope_reused",
