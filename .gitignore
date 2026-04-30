@@ -8,4 +8,7 @@ dist/
 build/
 *.pyc
 
+# Local WFA / workflow state
+.wfa/
+
 audit_reports/
