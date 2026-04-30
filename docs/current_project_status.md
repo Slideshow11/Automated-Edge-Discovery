@@ -39,6 +39,7 @@ The project is not yet a live trading or production system.
 - PR #56 TrialLedger and SearchSpaceManifest v1 design (split docs)
 - PR #57 AED status docs update
 - PR #58 TrialLedger v1 validator: local validator, JSON schema, fixtures, pytest coverage
+- PR #59 SearchSpaceManifest v1 validator: local validator, JSON schema, fixtures, pytest coverage
 
 ## Current stop rules
 
@@ -60,16 +61,16 @@ The project is not yet a live trading or production system.
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
-- TrialLedger / SearchSpaceManifest validators: TrialLedger validator implemented (PR #58); SearchSpaceManifest validator not yet implemented
+- TrialLedger / SearchSpaceManifest validators: both **complete** (PRs #58 and #59)
 - EdgeHypothesisRegistry JSON schema and validator deferred
 - registry validator deferred
 
 ## Next planned PRs
 
-Next PR #59: SearchSpaceManifest JSON schema and local validator.
+Next PR #60: wire TrialLedger and SearchSpaceManifest validators into CI.
 
 Recommended future work:
-- SearchSpaceManifest JSON schema + local validator
+- CI wiring for TrialLedger and SearchSpaceManifest validators
 - EdgeHypothesisRegistry JSONL migration
 - EventStudySpec / OptionsEventRiskSpec schemas
 
@@ -95,8 +96,8 @@ Recommended future work:
 - Fixture examples exist for valid and invalid event/options records
 
 **Still deferred:**
-
-- Event/Options JSON schemas
+- SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
+- Event/Options JSON schemas deferred
 - EventStudySpec JSON schema
 - OptionsEventRiskSpec JSON schema
 

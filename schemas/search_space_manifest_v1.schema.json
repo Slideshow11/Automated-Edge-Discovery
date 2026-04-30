@@ -1,0 +1,104 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "SearchSpaceManifest v1",
+  "description": "Pre-declared boundary of what a search is allowed to test.",
+  "type": "object",
+  "required": [
+    "search_space_id",
+    "search_mode",
+    "allowed_data_manifests",
+    "allowed_features",
+    "allowed_labels",
+    "allowed_parameter_ranges",
+    "validation_scheme",
+    "budget",
+    "forbidden_modes"
+  ],
+  "properties": {
+    "search_space_id": {
+      "type": "string",
+      "pattern": "^SSM-[0-9]{4}-[0-9]{4}$",
+      "description": "Stable unique identifier"
+    },
+    "search_mode": {
+      "type": "string",
+      "enum": [
+        "manual_grid",
+        "fixed_sweep",
+        "literature_replication",
+        "ablation",
+        "falsification",
+        "exploratory_agent_assisted"
+      ]
+    },
+    "allowed_data_manifests": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "allowed_features": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_labels": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "allowed_parameter_ranges": {
+      "type": "object"
+    },
+    "validation_scheme": {
+      "type": "string"
+    },
+    "budget": {
+      "type": "object",
+      "properties": {
+        "max_trials": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_parameter_combinations": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_runtime_minutes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_agent_proposals": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "max_trials"
+      ]
+    },
+    "forbidden_modes": {
+      "type": "object",
+      "properties": {
+        "autonomous_search": {
+          "type": "boolean"
+        },
+        "bayesian_optimization": {
+          "type": "boolean"
+        },
+        "genetic_programming": {
+          "type": "boolean"
+        },
+        "automated_promotion": {
+          "type": "boolean"
+        },
+        "live_trading": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}
