@@ -204,13 +204,14 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
                     "confirmatory_source_lane",
                     "confirmatory_source_lane must be 'confirmatory', got " + repr(clane)
                 ))
+            # Governance rule: confirmatory_data_scope must not be identical to data_scope
             if isinstance(cscope, dict) and isinstance(ds, dict):
-                if cscope.get("dataset_id") == ds.get("dataset_id"):
+                if cscope == ds:
                     blockers.append(Blocker(
                         "confirmatory_data_scope_reused",
                         "trial_ledger_entry",
                         "confirmatory_data_scope",
-                        "confirmatory data_scope dataset_id must differ from exploratory dataset_id"
+                        "confirmatory_data_scope must not be identical to data_scope"
                     ))
 
     return blockers
