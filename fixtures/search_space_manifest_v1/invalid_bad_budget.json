@@ -1,0 +1,38 @@
+{
+  "search_space_id": "SSM-2026-0018",
+  "search_mode": "manual_grid",
+  "allowed_data_manifests": [
+    "MAN-OPTIONS-2021-LANE0"
+  ],
+  "allowed_features": [
+    "iv",
+    "implied_vol_slope",
+    "underlying_return"
+  ],
+  "allowed_labels": [
+    "next_day_iv_change"
+  ],
+  "allowed_parameter_ranges": {
+    "lookback": [
+      5,
+      10,
+      20
+    ],
+    "threshold": [
+      0.01,
+      0.03,
+      0.05
+    ]
+  },
+  "validation_scheme": "purged_cpcv",
+  "budget": {
+    "max_trials": -5
+  },
+  "forbidden_modes": {
+    "autonomous_search": false,
+    "bayesian_optimization": false,
+    "genetic_programming": false,
+    "automated_promotion": false,
+    "live_trading": false
+  }
+}
