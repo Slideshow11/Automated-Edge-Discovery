@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design is complete for TrialLedger and SearchSpaceManifest (PR #56). Implementation of their validators and schemas is next.
+The enforcement-layer design and implementation is complete. All three governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec) are implemented, tested, and CI-wired. The governance validator milestone is complete.
 
 The project is not yet an autonomous discovery engine.
 
@@ -40,6 +40,11 @@ The project is not yet a live trading or production system.
 - PR #57 AED status docs update
 - PR #58 TrialLedger v1 validator: local validator, JSON schema, fixtures, pytest coverage
 - PR #59 SearchSpaceManifest v1 validator: local validator, JSON schema, fixtures, pytest coverage
+- PR #60 Governance validators CI-wired: governance-validators job runs TRL, SSM, MAS validators
+- PR #61 AED status docs update
+- PR #62 Gitignore WFA state cleanup
+- PR #63 ModelAssessmentSpec v1 validator: schema, fixtures, tests
+- PR #64 ModelAssessmentSpec CI wiring: MAS validator added to governance helper
 
 ## Current stop rules
 
@@ -54,26 +59,30 @@ The project is not yet a live trading or production system.
 
 ## Known deferred implementation items
 
-- ModelAssessmentSpec JSON schema deferred
-- ModelAssessmentSpec validator deferred
+- ModelAssessmentSpec validator **complete** (PRs #63, #64): schema, fixtures, tests, CI wired
 - MechanismDiscoveryReport JSON schema deferred
 - PostHocTheoryNote JSON schema deferred
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
-- TrialLedger / SearchSpaceManifest validators: both **complete** (PRs #58 and #59)
-- Governance validators CI-wired **complete** (PR #60)
-- EdgeHypothesisRegistry JSON schema and validator deferred
+- TrialLedger validator **complete** (PR #58): schema, fixtures, tests, CI wired
+- SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
+- Governance validators CI-wired **complete** (PRs #60, #64)
+- EdgeHypothesisRegistry JSONL migration deferred
 - registry validator deferred
 
 ## Next planned PRs
 
-PR #61: ModelAssessmentSpec JSON schema and local validator.
+Conservative next steps:
+- docs and repo hygiene cleanup (current PR)
+- EdgeHypothesisRegistry JSONL / YAML migration design
+- EventStudySpec JSON schema
+- OptionsEventRiskSpec JSON schema
 
-Recommended future work:
-- ModelAssessmentSpec JSON schema and local validator
-- EdgeHypothesisRegistry JSONL migration
-- EventStudySpec / OptionsEventRiskSpec schemas
+Longer-horizon deferred work:
+- MechanismDiscoveryReport schema
+- PostHocTheoryNote schema
+- registry validator
 
 ## Operational notes
 
@@ -97,9 +106,18 @@ Recommended future work:
 - Fixture examples exist for valid and invalid event/options records
 
 **Still deferred:**
-- SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
 - Event/Options JSON schemas deferred
 - EventStudySpec JSON schema
 - OptionsEventRiskSpec JSON schema
+
+## Governance validators
+
+All three governance validators are implemented, tested, and CI-wired:
+
+- **TrialLedger** (PR #58): `scripts/local/validate_trial_ledger.py`, schema, 5 fixtures, 21 tests. CI: `governance-validators` job.
+- **SearchSpaceManifest** (PR #59): `scripts/local/validate_search_space_manifest.py`, schema, 6 fixtures, 29 tests. CI: `governance-validators` job.
+- **ModelAssessmentSpec** (PR #63, #64): `scripts/local/validate_model_assessment_spec.py`, schema, 6 fixtures, 38 tests. CI: `governance-validators` job.
+
+Total CI-enforced validator tests: 106 (18 Event/Options via `validator` job + 88 governance via `governance-validators` job).
 
 ## Operational notes

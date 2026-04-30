@@ -15,7 +15,8 @@ AED currently uses a governance-first research workflow. The document map helps 
 - TrialLedger validator complete (PR #58)
 - SearchSpaceManifest validator complete (PR #59)
 - Governance validators CI-wired (PR #60)
-- next planned work is ModelAssessmentSpec JSON schema + local validator
+- ModelAssessmentSpec v1 schema, validator, fixtures, and CI wiring complete (PRs #63, #64)
+- Governance validator milestone complete: all three manifests (TRL, SSM, MAS) enforced in CI
 
 ## Document groups
 
@@ -44,7 +45,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_event_options_contract.py | Validates event and options observation CSV against the Event/Options contract spec. | Read-only |
 | scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the Event/Options validator across all fixture profiles and pytest. | CI helper |
-| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger and SearchSpaceManifest validators and their pytest suites. | CI helper |
+| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger, SearchSpaceManifest, and ModelAssessmentSpec validators and their pytest suites. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |
@@ -59,10 +60,12 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - Event/Options contract validator **complete** (CI job in `.github/workflows/ci.yml`)
 - TrialLedger validator **complete** (PR #58): local validator, JSON schema, fixtures
 - SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
+- ModelAssessmentSpec validator **complete** (PRs #63, #64): local validator, JSON schema, fixtures, CI wired
 - Event/Options JSON schemas deferred
 - EventStudySpec / OptionsEventRiskSpec schemas deferred
 - MechanismDiscoveryReport schema deferred
 - registry validator deferred
+- EdgeHypothesisRegistry JSONL migration deferred
 - autonomous search and optimization tooling are locked until trial accounting exists
 
 ## Canonical terms
