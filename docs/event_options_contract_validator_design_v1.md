@@ -4,6 +4,8 @@
 
 This document is a design-only specification for the Event/Options contract validator v1. It is intentionally docs-only: it defines the future validator's behavior, invariants, validation phases, expected fixture coverage, error categories, and a test strategy — but it does not implement any code, JSON schemas, runtime artifacts, tests, or fixture edits.
 
+> **Status note (post-PRs #50–#55):** Implementation now exists. The validator is at `scripts/local/validate_event_options_contract.py` and is wired into CI via `scripts/ci/validate_event_options_contract.sh` (PRs #50–#55). The design doc below is retained as historical context for the rationale behind the validator's behavior. All historical design-PR-only language about not yet implementing a validator was accurate at the time and is now superseded.
+
 The validator design targets records described by docs/event_options_contract_spec_v1.md and references fixtures under fixtures/event_options_contract_v1 as canonical test inputs. The design supports future schema and validator work while preserving manual review, non-production status, and the AED stop-rules.
 
 ## 2. Source documents and fixtures
@@ -288,10 +290,12 @@ Note: the filename validate_event_options_contract.py is referenced here as the 
 - EdgeHypothesisRegistry:
   - Registry advancement remains manual and should reference validation artifacts (reports, warnings, and blockers) when available.
 
-## 14. Invariants (hard rules)
+## 14. Invariants (hard rules — all still apply)
 
-- No validator implementation in this PR.
-- No JSON schema in this PR.
+> The following were invariants defined by the design PR. "No validator implementation" language was accurate for the design PR only — validator was implemented in PRs #50–#55.
+
+- Validator implementation completed in PRs #50–#55; invariant rules below remain in force.
+- No JSON schema in this design PR.
 - No fixture edits in this PR.
 - event_id is required for OptionsObservationSpec event-cohort research.
 - event identity is the canonical cohort and join key.
@@ -308,12 +312,14 @@ Note: the filename validate_event_options_contract.py is referenced here as the 
 - No production execution.
 - Human review remains required.
 
-## 15. Non-goals
+## 15. Non-goals (design PR scope — historical)
 
-- No code implementation in this PR.
-- No validator added yet.
-- No JSON schema added yet.
-- No fixture edits in this PR.
+> These were the non-goals of the design PR (#50). Implementation now exists at `scripts/local/validate_event_options_contract.py`.
+
+- No code implementation in this design PR.
+- Validator implemented in PRs #50–#55.
+- No JSON schema for Event/Options contract (deferred).
+- No fixture edits in this design PR.
 - No runtime behavior changes.
 - No registry mutation or automated promotion.
 - No accepted/rejected/killed automation.

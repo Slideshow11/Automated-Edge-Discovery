@@ -11,8 +11,11 @@ AED currently uses a governance-first research workflow. The document map helps 
 - governance/intake layer v1 complete at PR #37
 - post-governance implementation roadmap merged at PR #38
 - Event/Options contract validator complete (PRs #50–#55)
-- TrialLedger/SearchSpaceManifest v1 design complete (PR #56)
-- next planned work is TrialLedger JSON schema + local validator
+- TrialLedger and SearchSpaceManifest v1 design complete (PR #56)
+- TrialLedger validator complete (PR #58)
+- SearchSpaceManifest validator complete (PR #59)
+- Governance validators CI-wired (PR #60)
+- next planned work is ModelAssessmentSpec JSON schema + local validator
 
 ## Document groups
 
@@ -39,8 +42,9 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/validate_edge_hypothesis_card.py | Validates required content and guardrails in the edge hypothesis card doc. | Read-only |
 | scripts/local/validate_search_space_manifest.py | Validates a single SearchSpaceManifest v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
-| scripts/local/validate_event_options_contract.py | Valida...[truncated]
-| scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the validator across all fixture profiles and pytest. | CI helper |
+| scripts/local/validate_event_options_contract.py | Validates event and options observation CSV against the Event/Options contract spec. | Read-only |
+| scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the Event/Options validator across all fixture profiles and pytest. | CI helper |
+| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger and SearchSpaceManifest validators and their pytest suites. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |

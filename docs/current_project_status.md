@@ -62,15 +62,16 @@ The project is not yet a live trading or production system.
 - OptionsEventRiskSpec JSON schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
 - TrialLedger / SearchSpaceManifest validators: both **complete** (PRs #58 and #59)
+- Governance validators CI-wired **complete** (PR #60)
 - EdgeHypothesisRegistry JSON schema and validator deferred
 - registry validator deferred
 
 ## Next planned PRs
 
-Next PR #60: wire TrialLedger and SearchSpaceManifest validators into CI.
+PR #61: ModelAssessmentSpec JSON schema and local validator.
 
 Recommended future work:
-- CI wiring for TrialLedger and SearchSpaceManifest validators
+- ModelAssessmentSpec JSON schema and local validator
 - EdgeHypothesisRegistry JSONL migration
 - EventStudySpec / OptionsEventRiskSpec schemas
 
