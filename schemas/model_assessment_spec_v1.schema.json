@@ -1,0 +1,90 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ModelAssessmentSpec v1",
+  "description": "Structured assessment plan for evaluating a CandidateSpec, signal, model, anomaly, or BacktestRun.",
+  "type": "object",
+  "required": [
+    "assessment_id",
+    "hypothesis_id",
+    "trial_id",
+    "search_space_id",
+    "assessment_status",
+    "metrics",
+    "required_checks",
+    "reviewer",
+    "created_at"
+  ],
+  "properties": {
+    "assessment_id": {
+      "description": "Stable unique identifier.",
+      "type": "string",
+      "pattern": "^MAS-[0-9]{4}-[0-9]{4}$"
+    },
+    "hypothesis_id": {
+      "description": "Reference to the hypothesis under assessment.",
+      "type": "string"
+    },
+    "trial_id": {
+      "description": "Reference to the TrialLedger entry.",
+      "type": "string",
+      "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+    },
+    "search_space_id": {
+      "description": "Reference to the SearchSpaceManifest.",
+      "type": "string",
+      "pattern": "^SSM-[0-9]{4}-[0-9]{4}$"
+    },
+    "assessment_status": {
+      "description": "Current assessment governance state.",
+      "type": "string",
+      "enum": [
+        "draft",
+        "reviewed",
+        "rejected",
+        "provisional",
+        "accepted",
+        "killed"
+      ]
+    },
+    "metrics": {
+      "description": "Performance and diagnostic metrics.",
+      "type": "object"
+    },
+    "required_checks": {
+      "description": "Governance checks that must all pass for accepted status.",
+      "type": "object",
+      "properties": {
+        "sample_size_gate_passed": {
+          "type": "boolean"
+        },
+        "leakage_check_passed": {
+          "type": "boolean"
+        },
+        "pbo_check_passed": {
+          "type": "boolean"
+        },
+        "dsr_check_passed": {
+          "type": "boolean"
+        },
+        "confirmatory_evidence_present": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "sample_size_gate_passed",
+        "leakage_check_passed",
+        "pbo_check_passed",
+        "dsr_check_passed",
+        "confirmatory_evidence_present"
+      ]
+    },
+    "reviewer": {
+      "description": "Reviewer identity and metadata.",
+      "type": "object"
+    },
+    "created_at": {
+      "description": "ISO-8601 creation timestamp.",
+      "type": "string"
+    }
+  }
+}
