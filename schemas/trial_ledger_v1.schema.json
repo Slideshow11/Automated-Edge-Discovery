@@ -1,0 +1,164 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "TrialLedger v1",
+  "description": "Append-only record of a research trial attempt.",
+  "type": "object",
+  "required": [
+    "trial_id",
+    "search_space_id",
+    "source_lane",
+    "promotion_status",
+    "status",
+    "hypothesis_id",
+    "data_scope",
+    "execution_scope",
+    "results"
+  ],
+  "properties": {
+    "trial_id": {
+      "description": "Deterministic trial identifier.",
+      "type": "string",
+      "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+    },
+    "search_space_id": {
+      "description": "Reference to the SearchSpaceManifest in effect for this trial.",
+      "type": "string",
+      "pattern": "^SSM-[0-9]{4}-[0-9]{4}$"
+    },
+    "hypothesis_id": {
+      "description": "Reference to the hypothesis under test.",
+      "type": "string"
+    },
+    "source_lane": {
+      "description": "The evidence lane in which this trial was conducted.",
+      "type": "string",
+      "enum": [
+        "theory_first",
+        "exploratory_anomaly",
+        "post_hoc_theory",
+        "confirmatory"
+      ]
+    },
+    "promotion_status": {
+      "description": "Current governance promotion state.",
+      "type": "string",
+      "enum": [
+        "raw_result",
+        "reviewed",
+        "rejected",
+        "provisional",
+        "accepted",
+        "killed",
+        "promoted_to_confirmatory"
+      ]
+    },
+    "status": {
+      "description": "Operational trial status.",
+      "type": "string",
+      "enum": [
+        "planned",
+        "running",
+        "completed",
+        "failed",
+        "abandoned",
+        "invalidated"
+      ]
+    },
+    "data_scope": {
+      "description": "Data boundaries for this trial.",
+      "type": "object",
+      "required": [
+        "dataset_id"
+      ],
+      "properties": {
+        "dataset_id": {
+          "type": "string"
+        },
+        "manifest_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sample_start": {
+          "type": "string"
+        },
+        "sample_end": {
+          "type": "string"
+        },
+        "universe": {
+          "type": "string"
+        },
+        "leakage_notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "execution_scope": {
+      "description": "Execution context for this trial.",
+      "type": "object",
+      "properties": {
+        "runner_id": {
+          "type": "string"
+        },
+        "config_hash": {
+          "type": "string"
+        },
+        "git_commit": {
+          "type": "string"
+        },
+        "environment_fingerprint": {
+          "type": "string"
+        },
+        "random_seed": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "validation_scheme": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "results": {
+      "description": "Trial outputs.",
+      "type": "object",
+      "properties": {
+        "metrics_summary": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "artifact_paths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "evaluator_label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "confirmatory_trial_id": {
+      "description": "Linked confirmatory trial ID. Required when promotion_status is accepted.",
+      "type": "string",
+      "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+    },
+    "confirmatory_source_lane": {
+      "description": "Must be 'confirmatory' when present.",
+      "type": "string",
+      "enum": [
+        "confirmatory"
+      ]
+    },
+    "confirmatory_data_scope": {
+      "description": "Data scope of the linked confirmatory trial.",
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "trial_id": "TRL-2026-0002",
+  "search_space_id": "SSM-2026-0017",
+  "hypothesis_id": "EHH-2026-0012",
+  "source_lane": "autonomous_search",
+  "promotion_status": "raw_result",
+  "status": "completed",
+  "data_scope": {
+    "dataset_id": "DS-2026-Q1"
+  },
+  "execution_scope": {
+    "runner_id": "runner-local-v1"
+  },
+  "results": {}
+}

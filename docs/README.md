@@ -37,6 +37,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 |---|---|---|
 | scripts/local/pr_readiness_report.py | Produces local branch, diff, changed-file, untracked-file, recent-commit, and optional PR metadata reports. | Read-only |
 | scripts/local/validate_edge_hypothesis_card.py | Validates required content and guardrails in the edge hypothesis card doc. | Read-only |
+| scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_event_options_contract.py | Validates Event/Options contract CSV fixtures against minimal_fixture_profile and strict_contract_profile. | Read-only |
 | scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the validator across all fixture profiles and pytest. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
@@ -51,7 +52,8 @@ If a script listed above is not present in a checkout, treat it as "not present 
 ## Deferred tooling
 
 - Event/Options contract validator **complete** (CI job in `.github/workflows/ci.yml`)
-- TrialLedger / SearchSpaceManifest validators **not yet implemented** (design complete, PR #56)
+- TrialLedger validator **complete** (PR #58): local validator, JSON schema, fixtures
+- SearchSpaceManifest validator **not yet implemented**
 - Event/Options JSON schemas deferred
 - EventStudySpec / OptionsEventRiskSpec schemas deferred
 - MechanismDiscoveryReport schema deferred
