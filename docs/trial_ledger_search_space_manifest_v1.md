@@ -1,5 +1,9 @@
 # TrialLedger and SearchSpaceManifest v1 — Design
 
+> **Status:** Historical combined design note (PR #39). For current v1 authoritative references, use:
+> - [`docs/trial_ledger_v1_design.md`](./trial_ledger_v1_design.md) — authoritative TrialLedger v1 design
+> - [`docs/search_space_manifest_v1_design.md`](./search_space_manifest_v1_design.md) — authoritative SearchSpaceManifest v1 design
+
 Purpose
 -------
 TrialLedger and SearchSpaceManifest are the first enforcement-layer artifacts
