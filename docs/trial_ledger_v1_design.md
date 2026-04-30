@@ -258,7 +258,7 @@ These attach to TrialLedger entries as follows:
   "hypothesis_id": "AED-HYP-0017",
   "anomaly_id": null,
   "candidate_id": "CAND-017-003",
-  "search_space_id": "SSM-2026-017",
+  "search_space_id": "SSM-2026-0017",
   "parent_trial_id": null,
   "trial_sequence_number": 3,
   "trial_type": "grid_search",
@@ -334,7 +334,7 @@ These attach to TrialLedger entries as follows:
 ### Promotion transition rules
 - `raw_result` → `reviewed` is always allowed
 - `reviewed` → `rejected` or `provisional` is allowed
-- `provisional` → `accepted` requires a confirmatory `trial_id` in `promoted_to_confirmatory` lane on record
+- `provisional` → `accepted` requires an explicitly linked confirmatory trial with `source_lane=confirmatory` on untouched data. The linkage is recorded through `confirmatory_trial_id` or an equivalent field on the exploratory trial. `promoted_to_confirmatory` is a `promotion_status`, not a `source_lane`.
 - `provisional` → `rejected` is always allowed
 - `accepted` → `killed` is allowed (reversal)
 
