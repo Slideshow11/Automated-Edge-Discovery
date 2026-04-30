@@ -61,3 +61,20 @@ jobs:
 
       - name: Run Event/Options validator checks
         run: bash scripts/ci/validate_event_options_contract.sh
+
+  governance-validators:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run governance manifests validator checks
+        run: bash scripts/ci/validate_governance_manifests.sh
