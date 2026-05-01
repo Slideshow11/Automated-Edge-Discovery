@@ -116,6 +116,82 @@ For each selected variant, either a Deflated Sharpe Ratio estimate or an explici
 - **Validator rule:** Selected variants with `performance_return != null` must have one of `dsr_estimate` or `dsr_not_applicable_reason`
 - **Legitimate not-applicable reasons:** `non_return_based_metric`, `insufficient_sample_for_sharpe`, `regime_switching_unstable`
 
+### 3i. Bailey, Borwein, López de Prado, Zhu — PBO Mathematical Foundations
+
+This paper provides the mathematical framework underlying Probability of Backtest Overfitting (PBO). It demonstrates that when a strategy is selected from a large combinatorial space of variants based on backtest performance, the probability that its apparent performance is entirely due to overfitting rather than true signal is close to 1 for reasonable sample sizes. The combinatorial enumeration approach requires that all tried variants be preserved in the trial ledger for a complete PBO computation.
+
+| Requirement | Type | AED Artifact | Rationale |
+|-------------|------|---------------|-----------|
+| `trial_family_id` | string | TrialLedger | PBO is computed over the combinatorial space of all variants in a trial family; all must share this ID |
+| `all_variants_preserved` | boolean | TrialLedger | true = all n_tried variants are present in ledger with governance_state preserved; false = some were deleted (PBO enumeration is incomplete) |
+| `n_tried` | integer >= 1 | ExperimentSpec / TrialLedger | total number of variants enumerated; required for PBO combinatorial base |
+| `selected_variant_id` | string | TrialLedger | which variant was selected from the family |
+| `pbo_estimate` | float [0, 1] | TrialLedger | probability of backtest overfitting for selected variant |
+| `pbo_method` | enum {combinatorial_enumeration, mc_simulation, cscv, not_applicable} | TrialLedger | method used to compute pbo_estimate |
+| `pbo_not_applicable_reason` | string | TrialLedger | required if pbo_estimate is absent; legitimate values: insufficient_sample, non_combinatorial_search, confirmatory_no_multiple_testing, method_not_implemented |
+| `sample_length` | integer >= 2 | TrialLedger / ModelAssessmentSpec | number of in-sample periods used in PBO computation |
+| `number_of_trials` | integer >= 1 | TrialLedger | total number of trials in the backtest (synonym for n_tried in combinatorial context) |
+| `sample_to_trial_ratio` | float | TrialLedger | sample_length / n_tried; warning if < threshold (e.g., < 20) indicating underpowered search |
+| `degrees_of_freedom_warning` | boolean | TrialLedger | true if sample_length < n_tried (negative degrees of freedom) |
+| `cscv_n_bags` | integer >= 2 | TrialLedger | number of CSCV bags if method is cscv |
+| `cscv_prob_s_overfit` | float [0, 1] | TrialLedger | CSCV probability of selecting an overfit model |
+
+### 3j. Rej, Seager, Bouchaud — Overfit Discount and Haircut Method
+
+This paper introduces the "overfit discount" or "haircut" methodology for adjusting reported backtest performance to account for selection bias and multiple testing. Rather than computing a formal PBO, it proposes applying a multiplicative haircut to the backtest PnL based on the number of trials conducted, the accepted threshold metric, and the tightness of the selection criterion. The haircut provides a practical, defensible adjustment that can be applied even when a full combinatorial PBO enumeration is infeasible.
+
+| Requirement | Type | AED Artifact | Rationale |
+|-------------|------|---------------|-----------|
+| `backtest_pnl_haircut` | float [0, 1] | ModelAssessmentSpec | fraction of backtest PnL to discount to account for overfitting; 0.7 = haircut 30% |
+| `overfit_discount_factor` | float [0, 1] | ModelAssessmentSpec | synonym for backtest_pnl_haircut; preference is to use backtest_pnl_haircut as canonical |
+| `overfit_freedom_score` | float [0, 1] | TrialLedger | ratio of live edge to backtest edge (higher = less overfit); also called tweak_freedom_score |
+| `tweak_freedom_score` | float [0, 1] | TrialLedger | alias for overfit_freedom_score |
+| `accepted_threshold_metric` | enum {sharpe_ratio, sortino_ratio, calmar_ratio, total_return, information_ratio, custom} | ModelAssessmentSpec | which metric is used as the selection criterion |
+| `accepted_threshold_value` | float | ModelAssessmentSpec | the cutoff value of accepted_threshold_metric |
+| `original_strategy_ref` | string | ModelAssessmentSpec | reference to the strategy as originally specified before parameter tuning |
+| `modified_strategy_ref` | string | ModelAssessmentSpec | reference to the strategy after parameter tuning (has same logical strategy, different parameters) |
+| `strategy_correlation_to_original` | float [-1, 1] | ModelAssessmentSpec | correlation between original and modified strategy returns; low correlation indicates the tuning substantially changed behavior |
+| `overfit_assumption_note` | string | ModelAssessmentSpec | free-text disclosure of what assumptions underlie the haircut estimate |
+| `haircut_method` | string | ModelAssessmentSpec | description of method used to compute haircut (e.g., "Wiggle Room method", "minimum investment horizon adjustment") |
+| `haircut_not_applicable_reason` | string | ModelAssessmentSpec | required if backtest_pnl_haircut is absent |
+
+### 3k. Witzany — Bayesian Approach to Backtest Overfitting
+
+This paper applies Bayesian inference to the problem of backtest overfitting, treating strategy selection as a model selection problem with a prior over the space of possible strategies. It computes a posterior probability that a strategy is a false discovery (i.e., has no real out-of-sample edge) by combining a prior on strategy quality with the likelihood of the observed backtest performance. The approach yields an adjusted expected out-of-sample Sharpe ratio and a posterior probability of loss that directly incorporate multiple testing corrections.
+
+| Requirement | Type | AED Artifact | Rationale |
+|-------------|------|---------------|-----------|
+| `adjusted_expected_oos_sharpe` | float | ModelAssessmentSpec | Sharpe ratio adjusted for selection bias and multiple testing |
+| `probability_of_loss` | float [0, 1] | ModelAssessmentSpec | Bayesian posterior probability that the strategy loses money out-of-sample |
+| `expected_oos_rank` | float [0, 1] | ModelAssessmentSpec | expected rank of the strategy's OOS performance relative to a benchmark distribution |
+| `false_discovery_rate_estimate` | float [0, 1] | ModelAssessmentSpec | FDR-adjusted probability that the strategy is a false discovery |
+| `adjusted_p_value` | float [0, 1] | ModelAssessmentSpec | p-value adjusted for multiple testing (Bonferroni, Benjamini-Hochberg, or other) |
+| `overfit_adjustment_method` | string | ModelAssessmentSpec | name of adjustment method used (e.g., "Bayesian hierarchical model", "Benjamini-Hochberg FDR", "Bonferroni") |
+| `bootstrap_method` | string | ModelAssessmentSpec | bootstrap method used for uncertainty quantification (e.g., "stationary bootstrap", "block bootstrap", "pair bootstrap") |
+| `stationary_bootstrap_block_parameter` | float > 0 | ModelAssessmentSpec | block length parameter for Politis-Romano stationary bootstrap; required if bootstrap_method is stationary |
+| `bayesian_overfit_model` | string | ModelAssessmentSpec | name of Bayesian model used (e.g., "normal with conjugate prior", "hierarchical mixture model"); required for probability_of_loss computation |
+| `oos_performance_distribution_ref` | string | ModelAssessmentSpec | artifact reference to stored OOS performance distribution (for reproducibility) |
+
+### 3l. Suhonen, Lennkh, Perez — Backtest/Live Split Analysis
+
+This paper analyzes the empirical relationship between backtest performance and live trading results by comparing strategy performance before and after a defined backtest/live split date. It introduces metrics such as realized Sharpe haircut (the ratio of live Sharpe to backtest Sharpe) and factor exposure stability checks to detect whether factor loadings have drifted between the backtest period and live period. The methodology provides a practical framework for assessing the credibility of backtest results based on forward performance.
+
+| Requirement | Type | AED Artifact | Rationale |
+|-------------|------|---------------|-----------|
+| `backtest_live_split_date` | ISO 8601 date | TrialLedger / ModelAssessmentSpec | date separating backtest period from live/forward period |
+| `backtest_period_length` | integer >= 1 | TrialLedger / ModelAssessmentSpec | number of calendar days or bars in the backtest period |
+| `live_period_length` | integer >= 1 | TrialLedger / ModelAssessmentSpec | number of calendar days or bars in the live/forward period since split date |
+| `live_performance_required` | boolean | TrialLedger / ModelAssessmentSpec | true = live performance must be reported; false = live period not yet available |
+| `realized_sharpe_haircut` | float | ModelAssessmentSpec | ratio of realized Sharpe to backtest Sharpe (analogous to overfit_freedom_score but for Sharpe metric) |
+| `strategy_complexity_score` | float >= 0 | ModelAssessmentSpec | measure of strategy complexity (number of parameters, signals, or rule count normalized) |
+| `number_of_signals` | integer >= 0 | ModelAssessmentSpec | count of distinct signals used in the strategy |
+| `number_of_parameters` | integer >= 0 | ModelAssessmentSpec | total count of tunable parameters in the strategy |
+| `rule_count` | integer >= 0 | ModelAssessmentSpec | count of if-then rules or decision rules in the strategy |
+| `factor_exposure_stability_check` | boolean | ModelAssessmentSpec | true = factor exposures were tested for stability between backtest and live periods |
+| `factor_loading_backtest` | object | ModelAssessmentSpec | factor loadings computed on backtest period |
+| `factor_loading_live` | object | ModelAssessmentSpec | factor loadings computed on live period |
+| `factor_exposure_drift_flag` | boolean | ModelAssessmentSpec | true = factor loadings differ significantly between backtest and live; requires disclosure |
+
 ---
 
 ## 4. Financial ML Validation Requirements
@@ -428,6 +504,28 @@ OutcomeSpec v1 will declare the outcome labeling scheme, windows, and purged/emb
 | `bootstrap_not_applicable_reason` | string | Statistical inference §7b |
 | `robustness_checks_passed` | boolean | Statistical inference §7e |
 | `robustness_methods_tried` | array of strings | Statistical inference §7e |
+| `sample_length` | integer >= 2 | Backtest overfitting §3i |
+| `number_of_trials` | integer >= 1 | Backtest overfitting §3i |
+| `sample_to_trial_ratio` | float | Backtest overfitting §3i |
+| `degrees_of_freedom_warning` | boolean | Backtest overfitting §3i |
+| `backtest_pnl_haircut` | float [0, 1] | Backtest overfitting §3j |
+| `overfit_discount_factor` | float [0, 1] | Backtest overfitting §3j |
+| `haircut_method` | string | Backtest overfitting §3j |
+| `haircut_not_applicable_reason` | string | Backtest overfitting §3j |
+| `adjusted_expected_oos_sharpe` | float | Backtest overfitting §3k |
+| `probability_of_loss` | float [0, 1] | Backtest overfitting §3k |
+| `expected_oos_rank` | float [0, 1] | Backtest overfitting §3k |
+| `false_discovery_rate_estimate` | float [0, 1] | Backtest overfitting §3k |
+| `adjusted_p_value` | float [0, 1] | Backtest overfitting §3k |
+| `overfit_adjustment_method` | string | Backtest overfitting §3k |
+| `backtest_live_split_date` | ISO 8601 date | Backtest overfitting §3l |
+| `backtest_period_length` | integer >= 1 | Backtest overfitting §3l |
+| `live_period_length` | integer >= 1 | Backtest overfitting §3l |
+| `live_performance_required` | boolean | Backtest overfitting §3l |
+| `realized_sharpe_haircut` | float | Backtest overfitting §3l |
+| `strategy_complexity_score` | float >= 0 | Backtest overfitting §3l |
+| `factor_exposure_stability_check` | boolean | Backtest overfitting §3l |
+| `factor_exposure_drift_flag` | boolean | Backtest overfitting §3l |
 
 ### 8c. InstrumentUniverseSpec (new, deferred)
 
@@ -624,6 +722,15 @@ Priority fields: `labeling_scheme`, `labeling_horizon_days`, `outcome_window_sta
 
 Design sequence: OutcomeSpec v1 design doc → JSON schema → fixtures → local validator → pytest → CI wiring.
 
+**Extension points for futureOutcomeSpec extensions (informed by Sections 3i–3l):**
+
+- **OOS distribution artifact references:** Fields referencing stored out-of-sample performance distributions (`oos_performance_distribution_ref`) for reproducibility and Bayesian posterior computations (§3k)
+- **Live/backtest split descriptors:** Fields for `backtest_live_split_date`, `backtest_period_length`, `live_period_length`, `live_performance_required`, and `realized_sharpe_haircut` to support the Suhonen et al. backtest/live split framework (§3l)
+- **Overfit risk output fields:** Fields for `backtest_pnl_haircut`, `overfit_discount_factor`, `adjusted_expected_oos_sharpe`, `probability_of_loss`, `false_discovery_rate_estimate`, and `adjusted_p_value` to support multiple overfit adjustment methodologies (§3j, §3k)
+- **Uncertainty estimate fields:** Fields for `bootstrap_method`, `stationary_bootstrap_block_parameter`, `bootstrap_ci_method`, and `equity_curve_ci_lower/upper` arrays to support bootstrap-based uncertainty quantification (§3k, §7d)
+- **Factor exposure stability fields:** Fields for `factor_exposure_stability_check`, `factor_loading_backtest`, `factor_loading_live`, and `factor_exposure_drift_flag` to support factor loading drift detection between backtest and live periods (§3l)
+- **Strategy complexity fields:** Fields for `strategy_complexity_score`, `number_of_signals`, `number_of_parameters`, and `rule_count` to support complexity-adjusted overfit risk assessment (§3l)
+
 ### 10b. InstrumentUniverseSpec v1
 
 InstrumentUniverseSpec v1 should follow OutcomeSpec. Its primary job is declaring tradable instruments and their eligibility constraints, with fields for liquidity filters and market impact models from §6i.
@@ -674,6 +781,19 @@ The following stop rules are explicitly preserved from prior AED governance deci
 | No `live_trading` — no runner may submit live orders | PR #65 | Active |
 | No `production_execution` — runner may not execute in live accounts | PR #65 | Active |
 | No GCRU integration until separately designed and approved | PR #65 | Active |
+
+---
+
+## 13. Uploaded Source Packet Summary
+
+The following table summarizes the four uploaded backtest-overfitting papers that were used to derive additional AED requirements. These papers were uploaded as source material and their requirements have been incorporated into Sections 3i–3l above.
+
+| Source | Core Mechanism | AED Risk | Concrete Requirement Count | Future Artifact |
+|--------|----------------|----------|----------------------------|-----------------|
+| Bailey, Borwein, López de Prado, Zhu — PBO Mathematical | Combinatorial enumeration of PBO over all tried variants; CSCV approximation | False discovery from underpowered search; PBO enumeration incomplete if variants deleted | 13 | TrialLedger PBO fields, CSCV bagging fields |
+| Rej, Seager, Bouchaud — Overfit Discount/Haircut | Multiplicative haircut to backtest PnL based on trial count and selection threshold | Backtest PnL inflation from selection bias | 12 | ModelAssessmentSpec haircut fields |
+| Witzany — Bayesian Approach | Bayesian posterior probability of loss; FDR-adjusted p-values; bootstrap-based uncertainty | Overestimates of OOS Sharpe from selection bias | 10 | ModelAssessmentSpec Bayesian fields |
+| Suhonen, Lennkh, Perez — Backtest/Live Split | Backtest/live split date analysis; factor exposure stability; realized Sharpe haircut | Factor loading drift; live performance divergence from backtest | 14 | TrialLedger/ModelAssessmentSpec split fields |
 
 ---
 
