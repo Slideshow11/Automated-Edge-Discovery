@@ -1,0 +1,363 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OutcomeSpec v1",
+  "description": "Domain-neutral outcome measurement contract: declares what is measured, over what window, against what benchmark, and with what evidence requirements.",
+  "type": "object",
+  "required": [
+    "outcome_spec_id",
+    "outcome_version",
+    "outcome_family",
+    "metric_name",
+    "metric_direction",
+    "outcome_window",
+    "window_start_policy",
+    "window_end_policy",
+    "window_role",
+    "labeling_scheme",
+    "return_basis",
+    "benchmark_policy",
+    "observation_count_policy",
+    "evidence_role_requirements",
+    "purge_embargo_policy",
+    "created_at",
+    "reviewer"
+  ],
+  "properties": {
+    "outcome_spec_id": {
+      "description": "Canonical outcome specification identifier. Format: OUT-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^OUT-[0-9]{4}-[0-9]{4}$"
+    },
+    "outcome_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "outcome_family": {
+      "description": "Human-readable family label for grouping related outcome specifications.",
+      "type": "string"
+    },
+    "metric_name": {
+      "description": "Name of the metric being measured.",
+      "type": "string"
+    },
+    "metric_direction": {
+      "description": "Direction of the optimization objective.",
+      "type": "string",
+      "enum": [
+        "maximize",
+        "minimize",
+        "target_range"
+      ]
+    },
+    "outcome_window": {
+      "description": "Measurement window definition.",
+      "type": "object",
+      "required": [
+        "anchor",
+        "start_offset",
+        "end_offset",
+        "window_unit"
+      ],
+      "properties": {
+        "anchor": {
+          "description": "Reference point or event that anchors the measurement window.",
+          "type": "string"
+        },
+        "start_offset": {
+          "description": "Offset from the anchor to the start of the measurement window.",
+          "type": "integer"
+        },
+        "end_offset": {
+          "description": "Offset from the anchor to the end of the measurement window.",
+          "type": "integer"
+        },
+        "window_unit": {
+          "description": "Unit of the window offsets and embargo.",
+          "type": "string",
+          "enum": [
+            "days",
+            "observations",
+            "periods"
+          ]
+        }
+      }
+    },
+    "window_start_policy": {
+      "description": "Policy for determining the start of the measurement window.",
+      "type": "string"
+    },
+    "window_end_policy": {
+      "description": "Policy for determining the end of the measurement window.",
+      "type": "string"
+    },
+    "window_role": {
+      "description": "Role of this measurement window in the validation lifecycle.",
+      "type": "string",
+      "enum": [
+        "in_sample",
+        "validation",
+        "out_of_sample",
+        "pseudo_live",
+        "live",
+        "holdout",
+        "stress"
+      ]
+    },
+    "labeling_scheme": {
+      "description": "How observations within the window are labeled.",
+      "type": "string",
+      "enum": [
+        "forward_return",
+        "event_window_return",
+        "drawdown",
+        "volatility",
+        "hit_rate",
+        "sharpe_like",
+        "information_ratio_like",
+        "option_pnl",
+        "custom"
+      ]
+    },
+    "return_basis": {
+      "description": "Mathematical definition of the return being computed.",
+      "type": "string",
+      "enum": [
+        "simple_return",
+        "log_return",
+        "excess_return",
+        "pnl",
+        "risk_adjusted_return",
+        "custom"
+      ]
+    },
+    "benchmark_policy": {
+      "description": "Policy for selecting or constructing the benchmark.",
+      "type": "string",
+      "enum": [
+        "none",
+        "static_benchmark",
+        "dynamic_benchmark",
+        "matched_universe",
+        "factor_model",
+        "custom"
+      ]
+    },
+    "benchmark_ref": {
+      "description": "Reference to an external benchmark specification.",
+      "type": "string"
+    },
+    "benchmark_inline": {
+      "description": "Inline benchmark definition.",
+      "type": "object"
+    },
+    "observation_count_policy": {
+      "description": "Policy for counting observations in the measurement window.",
+      "type": "object",
+      "properties": {
+        "min_observations": {
+          "description": "Minimum observations required for a valid window.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_observations": {
+          "description": "Maximum observations in the window. 0 means unlimited.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_overlap_fraction": {
+          "description": "Maximum fraction of overlapping observations [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "requires_min_observations": {
+          "description": "Whether the measurement window must meet the minimum observation count.",
+          "type": "boolean"
+        }
+      }
+    },
+    "evidence_role_requirements": {
+      "description": "Evidence requirements for this outcome specification.",
+      "type": "object",
+      "required": [
+        "requires_oos",
+        "requires_live",
+        "requires_uncertainty",
+        "requires_benchmark",
+        "requires_stress_period",
+        "requires_purge_embargo",
+        "requires_min_observations"
+      ],
+      "properties": {
+        "requires_oos": {
+          "description": "Requires out-of-sample evidence.",
+          "type": "boolean"
+        },
+        "requires_live": {
+          "description": "Requires live or pseudo-live evidence.",
+          "type": "boolean"
+        },
+        "requires_uncertainty": {
+          "description": "Requires uncertainty or confidence interval evidence.",
+          "type": "boolean"
+        },
+        "requires_benchmark": {
+          "description": "Requires comparison against a benchmark.",
+          "type": "boolean"
+        },
+        "requires_stress_period": {
+          "description": "Requires stress-test or adverse-condition evidence.",
+          "type": "boolean"
+        },
+        "requires_purge_embargo": {
+          "description": "Requires purge and embargo gap application.",
+          "type": "boolean"
+        },
+        "requires_min_observations": {
+          "description": "Requires minimum observation count to be satisfied.",
+          "type": "boolean"
+        }
+      }
+    },
+    "purge_embargo_policy": {
+      "description": "Purge and embargo policy to prevent look-ahead bias.",
+      "type": "object",
+      "required": [
+        "purge_gap_days",
+        "embargo_fraction",
+        "embargo_units",
+        "overlap_policy"
+      ],
+      "properties": {
+        "purge_gap_days": {
+          "description": "Purge gap in days between training and measurement windows. Integer >= 0.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "embargo_fraction": {
+          "description": "Embargo as a fraction of the measurement window [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "embargo_units": {
+          "description": "Unit of the embargo specification.",
+          "type": "string",
+          "enum": [
+            "fraction",
+            "days",
+            "observations"
+          ]
+        },
+        "overlap_policy": {
+          "description": "Policy for handling overlapping observations between windows.",
+          "type": "string"
+        }
+      }
+    },
+    "event_alignment_policy": {
+      "description": "Policy for aligning events within the measurement window.",
+      "type": "string"
+    },
+    "sample_start_policy": {
+      "description": "Policy for determining the start of the sample period.",
+      "type": "string"
+    },
+    "sample_end_policy": {
+      "description": "Policy for determining the end of the sample period.",
+      "type": "string"
+    },
+    "min_observation_count": {
+      "description": "Alias for observation_count_policy.min_observations.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_overlap_fraction": {
+      "description": "Alias for observation_count_policy.max_overlap_fraction.",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "uncertainty_required": {
+      "description": "Whether uncertainty quantification is required for this outcome.",
+      "type": "boolean"
+    },
+    "model_assessment_refs": {
+      "description": "References to ModelAssessmentSpec records that evaluated this outcome.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^MAS-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "runner_output_refs": {
+      "description": "References to runner outputs computed against this outcome.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "trial_ledger_refs": {
+      "description": "References to TrialLedger entries associated with this outcome.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "review_packet_refs": {
+      "description": "References to ReviewPacket records that reviewed this outcome.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extension_hooks": {
+      "description": "Reserved for future artifact references only. Must not contain computed statistics.",
+      "type": "object",
+      "properties": {
+        "model_assessment_extension_refs": {
+          "description": "Extended references to ModelAssessmentSpec records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runner_output_extension_refs": {
+          "description": "Extended references to runner outputs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_packet_extension_refs": {
+          "description": "Extended references to ReviewPacket records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domain_profile_refs": {
+          "description": "References to domain profile specifications.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "notes": {
+      "description": "Additional human-readable notes or context.",
+      "type": "string"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp of outcome specification declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer metadata for this outcome specification. Must be an object with at minimum a name field.",
+      "type": "object"
+    }
+  }
+}
