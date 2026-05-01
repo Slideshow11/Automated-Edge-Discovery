@@ -1,0 +1,40 @@
+{
+  "outcome_spec_id": "OUT-2026-0001",
+  "outcome_version": 1,
+  "outcome_family": "equity_calendar_anomalies",
+  "metric_name": "monthly_return",
+  "metric_direction": "maximize",
+  "outcome_window": {
+    "anchor": "calendar_month_start",
+    "window_start_days": 1,
+    "window_end_days": 21,
+    "window_unit": "observations"
+  },
+  "window_start_policy": "data_start",
+  "window_end_policy": "fixed_horizon",
+  "window_role": "out_of_sample",
+  "labeling_scheme": "forward_return",
+  "return_basis": "simple_return",
+  "benchmark_policy": "static_benchmark",
+  "observation_count_policy": {
+    "min_observations": 60,
+    "requires_min_observations": true
+  },
+  "evidence_role_requirements": {
+    "requires_oos": true,
+    "requires_live": false,
+    "requires_uncertainty": true,
+    "requires_benchmark": true,
+    "requires_stress_period": false,
+    "requires_purge_embargo": true,
+    "requires_min_observations": true
+  },
+  "purge_embargo_policy": {
+    "purge_gap_days": 1,
+    "embargo_fraction": 0.1,
+    "embargo_units": "fraction",
+    "overlap_policy": "non-overlapping monthly windows"
+  },
+  "created_at": "2026-04-15T00:00:00Z",
+  "reviewer": "dr_elliot_review_2026"
+}
