@@ -35,16 +35,20 @@ These are **not** interchangeable. `allowed_trial_lanes` must always use the Tri
 | `invalid_trial_generation_mode.json` | `trial_generation_mode` is `mechanism_discovery`, outside the allowed enum | **Yes** — JSON Schema `enum` |
 | `invalid_allowed_trial_lane.json` | `allowed_trial_lanes` contains `manual_grid`, which is a generation-mode value — not a TrialLedger `source_lane` | **Yes** — JSON Schema `enum` on array items |
 | `invalid_prohibited_mode_true.json` | `prohibited_modes.live_trading` is `true` — stop-rule violation | **Yes** — JSON Schema `enum: [false]` |
+| `invalid_missing_prohibited_mode_field.json` | `prohibited_modes.gcru_integration` is missing — all eight nested stop-rule fields are required | **Yes** — JSON Schema nested `required` |
 | `invalid_data_manifest_refs_empty.json` | `data_manifest_refs` is empty array — violates `minItems: 1` | **Yes** — JSON Schema `minItems` |
 | `invalid_model_assessment_ref.json` | `model_assessment_ref` is `MAS-PA-0001`, non-canonical format | **Yes** — JSON Schema `pattern` |
-| `invalid_preearnings_core_field.json` | Contains pre-earnings-specific fields `entry_dpe` and `delta_target`. ExperimentSpec is domain-neutral; these fields must not appear. | **No** — JSON Schema allows `additionalProperties: true` by default. Enforced only by the future Python validator. |
+| `invalid_preearnings_core_field.json` | Contains pre-earnings-specific fields `entry_dpe` and `delta_target`. ExperimentSpec is domain-neutral; these fields must not appear. | **No** — JSON Schema allows `additionalProperties: true` by default. Enforced only by the Python validator. |
 
 ---
 
 ## Schema Enforcement Summary
 
-**Schema-enforceable now (10 fixtures):**
-All invalid fixtures except `invalid_preearnings_core_field.json` are enforceable via JSON Schema Draft-07 against `schemas/experiment_spec_v1.schema.json`.
+**Schema-enforceable now (11 fixtures):**
+All invalid fixtures except `invalid_preearnings_core_field.json` and `invalid_missing_prohibited_mode_field.json` are enforceable via JSON Schema Draft-07 against `schemas/experiment_spec_v1.schema.json`.
 
-**Future validator-only (1 fixture):**
-`invalid_preearnings_core_field.json` — requires the Python validator to check for domain-neutrality (absence of pre-earnings-specific fields like `entry_dpe`, `delta_target`, `event_date`, `earnings_window`, etc.). This check is out of scope for JSON Schema alone.
+**Schema-enforceable now — nested prohibited_modes (1 fixture):**
+`invalid_missing_prohibited_mode_field.json` — the schema now requires all eight nested stop-rule fields via a nested `required` array inside `prohibited_modes`. Enforced by both JSON Schema and Python validator.
+
+**Python-validator-only (1 fixture):**
+`invalid_preearnings_core_field.json` — requires the Python validator to check for domain-neutrality (absence of pre-earnings-specific fields). JSON Schema allows `additionalProperties: true` by default.

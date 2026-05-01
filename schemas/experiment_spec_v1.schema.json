@@ -170,39 +170,49 @@
       "minItems": 1
     },
     "prohibited_modes": {
-      "description": "Stop-rule enforcement object. Each field must be absent or false. If a field is present, it must be false.",
+      "description": "Stop-rule enforcement object. All eight governance fields must be present and set to false. There is no omit-and-default — every ExperimentSpec must affirmatively declare its stop rules.",
       "type": "object",
+      "required": [
+        "autonomous_search",
+        "bayesian_optimization",
+        "genetic_programming",
+        "automated_promotion",
+        "automated_registry_mutation",
+        "live_trading",
+        "production_execution",
+        "gcru_integration"
+      ],
       "properties": {
         "autonomous_search": {
-          "description": "Must be absent or false. No automated exploration of the strategy space without pre-declared SearchSpaceManifest and human review.",
+          "description": "No automated exploration of the strategy space without pre-declared SearchSpaceManifest and human review. Must be false.",
           "enum": [false]
         },
         "bayesian_optimization": {
-          "description": "Must be absent or false. No automated hyperparameter optimization.",
+          "description": "No automated hyperparameter optimization. Must be false.",
           "enum": [false]
         },
         "genetic_programming": {
-          "description": "Must be absent or false. No evolutionary algorithm-driven strategy generation.",
+          "description": "No evolutionary algorithm-driven strategy generation. Must be false.",
           "enum": [false]
         },
         "automated_promotion": {
-          "description": "Must be absent or false. No automatic advancement of hypotheses to next stage.",
+          "description": "No automatic advancement of hypotheses to next stage. Must be false.",
           "enum": [false]
         },
         "automated_registry_mutation": {
-          "description": "Must be absent or false. No automatic changes to EdgeHypothesisRegistry records.",
+          "description": "No automatic changes to EdgeHypothesisRegistry records. Must be false.",
           "enum": [false]
         },
         "live_trading": {
-          "description": "Must be absent or false. No real-money execution under any circumstances.",
+          "description": "No real-money execution under any circumstances. Must be false.",
           "enum": [false]
         },
         "production_execution": {
-          "description": "Must be absent or false. No simulated production with real market impact.",
+          "description": "No simulated production with real market impact. Must be false.",
           "enum": [false]
         },
         "gcru_integration": {
-          "description": "Must be absent or false. No connection to live market data feeds, execution systems, or risk management without a separate governance design.",
+          "description": "No connection to live market data feeds, execution systems, or risk management without a separate governance design. Must be false.",
           "enum": [false]
         }
       }
