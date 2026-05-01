@@ -865,6 +865,64 @@ def test_prohibited_mode_empty_string_fails():
         path.unlink()
 
 
+def test_prohibited_mode_nested_field_missing():
+    """
+    All eight prohibited_modes nested stop-rule fields are required.
+    Each must be present and exactly False.
+    Omitting any one (gcru_integration in this case) fails validation.
+    """
+    path = _tmp_json(prohibited_modes={
+        "autonomous_search": False,
+        "bayesian_optimization": False,
+        "genetic_programming": False,
+        "automated_promotion": False,
+        "automated_registry_mutation": False,
+        "live_trading": False,
+        "production_execution": False,
+        # gcru_integration deliberately omitted
+    })
+    try:
+        code, out, _ = run_validator(["--format", "json", str(path)])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "forbidden_governance_field" in codes
+        # Confirm the missing field is reported
+        field_names = {b["field"] for b in _blockers_for_path(data, path)}
+        assert any("gcru_integration" in f for f in field_names), f"Expected gcru_integration in fields, got {field_names}"
+    finally:
+        path.unlink()
+
+
+def test_prohibited_mode_all_eight_fields_required():
+    """
+    Parameterized across all eight prohibited_modes nested fields.
+    Each must be present and exactly False — omitting any one fails.
+    """
+    all_fields = [
+        "autonomous_search",
+        "bayesian_optimization",
+        "genetic_programming",
+        "automated_promotion",
+        "automated_registry_mutation",
+        "live_trading",
+        "production_execution",
+        "gcru_integration",
+    ]
+    for missing_field in all_fields:
+        present = {f: False for f in all_fields}
+        del present[missing_field]
+        path = _tmp_json(prohibited_modes=present)
+        try:
+            code, out, _ = run_validator(["--format", "json", str(path)])
+            assert code == 1, f"Expected failure when {missing_field} is missing"
+            data = json.loads(out)
+            codes = {b["code"] for b in _blockers_for_path(data, path)}
+            assert "forbidden_governance_field" in codes, f"Expected forbidden_governance_field when {missing_field} missing"
+        finally:
+            path.unlink()
+
+
 # ----- domain-neutrality violations -----
 
 _PREEARNS_FIELDS = [

@@ -367,7 +367,7 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                         f"taxonomy (theory_first, exploratory_anomaly, post_hoc_theory, confirmatory)"
                     ))
 
-    # 13. prohibited_modes must be an object; each governance field must be absent or false
+    # 13. prohibited_modes must be an object; all eight nested stop-rule fields must be present and exactly false
     pm = entry.get("prohibited_modes")
     if pm is not None:
         if not isinstance(pm, dict):
@@ -380,12 +380,13 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
         else:
             for field in GOVERNANCE_STOP_RULE_FIELDS:
                 val = pm.get(field)
-                if val is not None and val is not False:
+                # Field must be present (None = missing) and must be exactly False
+                if val is None or val is not False:
                     blockers.append(Blocker(
                         "forbidden_governance_field",
                         "experiment_spec",
                         f"prohibited_modes.{field}",
-                        f"prohibited_modes.{field} must be absent or false"
+                        f"prohibited_modes.{field} must be present and exactly false"
                     ))
 
     # 14. reviewer must be an object
