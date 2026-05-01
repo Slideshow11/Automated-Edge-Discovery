@@ -20,6 +20,16 @@
   "allowed_trial_lanes": [
     "theory_first"
   ],
+  "prohibited_modes": {
+    "autonomous_search": false,
+    "bayesian_optimization": false,
+    "genetic_programming": false,
+    "automated_promotion": false,
+    "automated_registry_mutation": false,
+    "live_trading": false,
+    "production_execution": false,
+    "gcru_integration": false
+  },
   "created_at": "2026-04-15T00:00:00Z",
   "reviewer": {
     "name": "dr_elliot_review_2026",
