@@ -165,14 +165,18 @@ State:
 
 ## 9. JSONL example (pre-earnings options IV ramp)
 
+> **ID format note:** These examples use canonical `HYP-YYYY-NNNN` format per Section 4a. Legacy IDs from older CSV or doc entries (e.g. `HYP-0001`, `HYP-PA-0001`) are grandfathered for read-only migration/reference only. New machine-readable v1 records must use `HYP-YYYY-NNNN`.
+
 ```jsonl
-{"hypothesis_id":"HYP-PA-0001","registry_version":"edge_registry_v1","title":"Pre-earnings options IV ramp","status":"specified","evidence_stage":"exploratory","source_lane":"exploratory_anomaly","theory_timing":"post_discovery","mechanism_summary":"dealer hedging and temporary uncertainty demand around earnings","promotion_restrictions":["requires_fresh_event_cohorts"],"hypothesis_card_ref":"card://edge_hypothesis_card_v1/HYP-PA-0001","trial_ledger_refs":["TRL-2026-0007","TRL-2026-0008"],"search_space_refs":["SSM-PA-0001"],"mechanism_report_refs":["MDR-0003"],"lifecycle_events":[{"event_id":"EV-1","event_type":"created","event_timestamp":"2026-04-29T12:00:00Z","actor":"alice","from_status":null,"to_status":"specified","manual_review_required":true}],"created_at":"2026-04-29T12:00:00Z"}
+{"hypothesis_id":"HYP-2026-0001","registry_version":"edge_registry_v1","title":"Pre-earnings options IV ramp","status":"specified","evidence_stage":"exploratory","source_lane":"exploratory_anomaly","theory_timing":"post_discovery","mechanism_summary":"dealer hedging and temporary uncertainty demand around earnings","promotion_restrictions":["requires_fresh_event_cohorts"],"hypothesis_card_ref":"card://edge_hypothesis_card_v1/HYP-2026-0001","trial_ledger_refs":["TRL-2026-0007","TRL-2026-0008"],"search_space_refs":["SSM-2026-0001"],"mechanism_report_refs":["MDR-0003"],"lifecycle_events":[{"event_id":"EV-1","event_type":"created","event_timestamp":"2026-04-29T12:00:00Z","actor":"alice","from_status":null,"to_status":"specified","manual_review_required":true}],"created_at":"2026-04-29T12:00:00Z"}
 ```
 
 ## 10. YAML example (moving average crossover)
 
+> **ID format note:** These examples use canonical `HYP-YYYY-NNNN` format per Section 4a. Legacy IDs from older CSV or doc entries (e.g. `HYP-0001`, `HYP-PA-0001`) are grandfathered for read-only migration/reference only. New machine-readable v1 records must use `HYP-YYYY-NNNN`.
+
 ```yaml
-hypothesis_id: HYP-MA-0002
+hypothesis_id: HYP-2026-0002
 registry_version: edge_registry_v1
 title: Moving average crossover exploratory anomaly
 status: testing
@@ -186,7 +190,7 @@ posthoc_theory_note_refs:
 trial_ledger_refs:
   - TRL-2026-0042
 search_space_refs:
-  - SSM-MA-0002
+  - SSM-2026-0002
 promotion_restrictions:
   - requires_fresh_holdout
   - no_promotion_without_confirmatory_evidence
