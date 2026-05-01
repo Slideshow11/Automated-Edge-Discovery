@@ -51,12 +51,12 @@
       ]
     },
     "outcome_window": {
-      "description": "Measurement window definition.",
+      "description": "Measurement window definition. window_start_days and window_end_days are expressed in window_unit terms.",
       "type": "object",
       "required": [
         "anchor",
-        "start_offset",
-        "end_offset",
+        "window_start_days",
+        "window_end_days",
         "window_unit"
       ],
       "properties": {
@@ -64,12 +64,12 @@
           "description": "Reference point or event that anchors the measurement window.",
           "type": "string"
         },
-        "start_offset": {
-          "description": "Offset from the anchor to the start of the measurement window.",
+        "window_start_days": {
+          "description": "Offset from the anchor to the start of the measurement window, expressed in window_unit terms.",
           "type": "integer"
         },
-        "end_offset": {
-          "description": "Offset from the anchor to the end of the measurement window.",
+        "window_end_days": {
+          "description": "Offset from the anchor to the end of the measurement window, expressed in window_unit terms.",
           "type": "integer"
         },
         "window_unit": {
@@ -85,11 +85,23 @@
     },
     "window_start_policy": {
       "description": "Policy for determining the start of the measurement window.",
-      "type": "string"
+      "type": "string",
+      "enum": [
+        "absolute_date",
+        "relative_event",
+        "data_start",
+        "lookback_start"
+      ]
     },
     "window_end_policy": {
       "description": "Policy for determining the end of the measurement window.",
-      "type": "string"
+      "type": "string",
+      "enum": [
+        "absolute_date",
+        "relative_event",
+        "data_end",
+        "fixed_horizon"
+      ]
     },
     "window_role": {
       "description": "Role of this measurement window in the validation lifecycle.",
