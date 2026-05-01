@@ -95,11 +95,18 @@ Conservative next steps:
 Longer-horizon deferred work:
 - MechanismDiscoveryReport schema
 - PostHocTheoryNote schema
-- PreEarningsProfile v1 as a domain-specific research module (AED core remains domain-neutral)
+- PreEarningsProfile v1 as a domain-specific research module
 
 ## AED architecture note
 
 AED core is domain-neutral. It enforces governance, provenance, and trial accounting without assuming any specific asset class, strategy type, or research domain. PreEarningsProfile v1 is one supported domain-specific research module — it is not the identity of the system.
+
+See [docs/domain_neutral_aed_architecture.md](./domain_neutral_aed_architecture.md) for the full architecture design note covering:
+- Core AED concepts and their generalized abstractions
+- Domain modules and profiles (PreEarningsProfile, SeasonalityProfile, MacroRegimeProfile, etc.)
+- Boundary rule for core vs. domain-specific fields
+- Agent and tooling layer (Hermes, OpenClaw as suggestion engines)
+- Stop rules and manual review rule
 
 ## Operational notes
 
