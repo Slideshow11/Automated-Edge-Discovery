@@ -44,8 +44,10 @@ The trial generation budget and search constraints must be declared in a SearchS
 ```
 ExperimentSpec.search_space_id → SearchSpaceManifest.search_space_id
 ExperimentSpec.trial_generation_mode → bounded by SearchSpaceManifest.search_mode
-ExperimentSpec.allowed_trial_lanes → constrained by SearchSpaceManifest.allowed_data_manifests
+ExperimentSpec.allowed_trial_lanes → must be a non-empty subset of TrialLedger.source_lane enum {theory_first, exploratory_anomaly, post_hoc_theory, confirmatory}
 ```
+
+**Note:** `trial_generation_mode` and `allowed_trial_lanes` are separate concepts. `trial_generation_mode` describes *how* trials are generated (manual_grid, fixed_sweep, etc.) — it is bounded by `SearchSpaceManifest.search_mode`. `allowed_trial_lanes` describes *which hypothesis source taxonomy lanes* may be used for trials produced under this experiment — it must match the `source_lane` enum in `TrialLedger` (theory_first, exploratory_anomaly, post_hoc_theory, confirmatory). These two fields are independent and must not be conflated.
 
 ### 2c. TrialLedger
 
@@ -144,7 +146,7 @@ Every status change in the EdgeHypothesisRegistry requires a ReviewPacket with h
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `trial_generation_mode` | enum | Yes | How trials are generated. Values: `manual_grid`, `fixed_sweep`, `literature_replication`, `ablation`, `falsification`, `exploratory_agent_assisted`. |
-| `allowed_trial_lanes` | array[string] | Yes | List of permitted `source_lane` values for TrialLedger entries generated under this experiment. Must be a subset of lanes declared in the referenced SearchSpaceManifest. |
+| `allowed_trial_lanes` | array[string] | Yes | List of permitted `source_lane` values for TrialLedger entries generated under this experiment. Must be a non-empty subset of {theory_first, exploratory_anomaly, post_hoc_theory, confirmatory}. Corresponds to TrialLedger.source_lane enum, not trial_generation_mode. |
 | `prohibited_modes` | array[enum] | No | Explicitly prohibited modes. Values: `autonomous_search`, `bayesian_optimization`, `genetic_programming`. If omitted, defaults to prohibiting all three. |
 
 ---
