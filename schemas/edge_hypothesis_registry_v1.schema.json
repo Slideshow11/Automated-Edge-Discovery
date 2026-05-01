@@ -217,7 +217,7 @@
           },
           "registry_mutation_mode": {
             "description": "Must be manual. Automated mutation is not permitted.",
-            "type": "string"
+            "enum": ["manual"]
           }
         }
       }
