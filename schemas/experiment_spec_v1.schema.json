@@ -155,18 +155,15 @@
       ]
     },
     "allowed_trial_lanes": {
-      "description": "Permitted source_lane values for TrialLedger entries generated under this experiment. Must be a non-empty subset of the lanes declared in the referenced SearchSpaceManifest.",
+      "description": "Permitted source_lane values for TrialLedger entries generated under this experiment. Must be a non-empty subset of {theory_first, exploratory_anomaly, post_hoc_theory, confirmatory}.",
       "type": "array",
       "items": {
         "type": "string",
         "enum": [
-          "manual_grid",
-          "fixed_sweep",
-          "literature_replication",
-          "ablation",
-          "falsification",
-          "exploratory_agent_assisted",
-          "mechanism_discovery"
+          "theory_first",
+          "exploratory_anomaly",
+          "post_hoc_theory",
+          "confirmatory"
         ]
       },
       "minItems": 1
