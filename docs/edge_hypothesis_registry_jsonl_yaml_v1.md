@@ -217,11 +217,12 @@ notes: |
 
 ## 12. Relationship to future validators and schemas
 
-- JSON schema is deferred. (JSON schema is deferred)
-- YAML schema is deferred.
-- registry validator is deferred. (registry validator is deferred)
-- migration tooling is deferred.
-- CI enforcement is deferred.
+EHR v1 implementation is **complete**:
+- JSON schema: `schemas/edge_hypothesis_registry_v1.schema.json` (PR #68)
+- Fixtures: `fixtures/edge_hypothesis_registry_v1/` (PR #71)
+- Local validator: `scripts/local/validate_edge_hypothesis_registry.py` (PR #72)
+- Pytest suite: `tests/test_validate_edge_hypothesis_registry.py` (PR #73)
+- CI wiring: EHR validator runs in `governance-validators` job (PR #74)
 
 Future validators should check:
 - required field presence
@@ -254,25 +255,22 @@ Registry entries must reflect and enforce point-in-time integrity standards from
 - Records with `evidence_stage: exploratory` that later become `specified` without a corresponding TheoryBefore discovery trail must include a PostHocTheoryNote ref
 - The registry does not store optimized hyperparameter sets or in-sample fit artifacts as evidence
 
-- No code implementation.
-- No JSON schema yet. (JSON schema is deferred)
-- No YAML schema yet.
-- No validator yet. (registry validator is deferred)
-- No migration yet. (No migration happens in this PR)
-- No automated registry mutation. (No automated registry mutation)
-- No automated promotion. (No automated promotion)
 - No live trading. (No live trading)
 - No production execution. (No production execution)
 - No autonomous search. (No autonomous search)
 - No Bayesian optimization. (No Bayesian optimization)
 - No genetic programming. (No genetic programming)
 
-## 14. Implementation roadmap (recommended follow-ups)
+## 14. Implementation roadmap (completed)
 
 - PR #43: ModelAssessmentSpec v1 ✅ (completed PRs #63, #64)
-- PR #44: EventStudySpec / OptionsEventRiskSpec schema planning
-- PR #45: validator/tooling cleanup
-- PR #46: MechanismDiscoveryReport JSON schema
-- PR #47: EdgeHypothesisRegistry JSON schema and validator — **this PR** (design refresh, PR #66)
-- PR #66: EdgeHypothesisRegistry v1 design refresh: add MAS linkage, ID format, anti-overfit/anti-lookahead governance
+- PR #44: EventStudySpec / OptionsEventRiskSpec schema planning — deferred
+- PR #45: validator/tooling cleanup — deferred
+- PR #46: MechanismDiscoveryReport JSON schema — deferred
+- PR #66: EdgeHypothesisRegistry v1 design refresh: add MAS linkage, ID format, anti-overfit/anti-lookahead governance ✅
+- PR #68: EdgeHypothesisRegistry v1 JSON schema ✅
+- PR #71: EdgeHypothesisRegistry v1 fixtures ✅
+- PR #72: EdgeHypothesisRegistry v1 local validator ✅
+- PR #73: EdgeHypothesisRegistry v1 pytest suite ✅
+- PR #74: EdgeHypothesisRegistry v1 CI wiring ✅
 

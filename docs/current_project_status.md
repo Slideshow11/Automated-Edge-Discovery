@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design and implementation is complete. All three governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec) are implemented, tested, and CI-wired. The governance validator milestone is complete.
+The enforcement-layer design and implementation is complete. All four governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry) are implemented, tested, and CI-wired. The governance validator milestone is complete.
 
 The project is not yet an autonomous discovery engine.
 
@@ -45,6 +45,16 @@ The project is not yet a live trading or production system.
 - PR #62 Gitignore WFA state cleanup
 - PR #63 ModelAssessmentSpec v1 validator: schema, fixtures, tests
 - PR #64 ModelAssessmentSpec CI wiring: MAS validator added to governance helper
+- PR #65 AED status update after governance validator milestone
+- PR #66 EdgeHypothesisRegistry v1 design refresh: MAS linkage, ID format, anti-overfit governance
+- PR #67 docs: align EHR v1 ID examples with canonical HYP-YYYY-NNNN format
+- PR #68 EdgeHypothesisRegistry v1 JSON schema
+- PR #69 fix(schema): enforce manual-only registry_mutation_mode in lifecycle events
+- PR #70 fix(schema): close governance prose enforcement gaps
+- PR #71 EdgeHypothesisRegistry v1 fixtures and README
+- PR #72 EdgeHypothesisRegistry v1 local validator
+- PR #73 EdgeHypothesisRegistry v1 validator pytest suite
+- PR #74 EdgeHypothesisRegistry v1 CI wiring: governance-validators job now runs EHR validator
 
 ## Current stop rules
 
@@ -64,25 +74,32 @@ The project is not yet a live trading or production system.
 - PostHocTheoryNote JSON schema deferred
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
+- ExperimentSpec JSON schema deferred
+- OutcomeSpec JSON schema deferred
+- InstrumentUniverseSpec JSON schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
 - TrialLedger validator **complete** (PR #58): schema, fixtures, tests, CI wired
 - SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
-- Governance validators CI-wired **complete** (PRs #60, #64)
-- EdgeHypothesisRegistry JSONL migration deferred
-- registry validator deferred
+- Governance validators CI-wired **complete** (PRs #60, #64, #74)
+- EdgeHypothesisRegistry v1 **complete** (PRs #66, #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
 
 ## Next planned PRs
 
 Conservative next steps:
-- docs and repo hygiene cleanup (current PR)
-- EdgeHypothesisRegistry JSONL / YAML migration design
+- ExperimentSpec v1 schema and validator design
+- OutcomeSpec v1 schema and validator design
+- InstrumentUniverseSpec v1 schema and validator design
 - EventStudySpec JSON schema
 - OptionsEventRiskSpec JSON schema
 
 Longer-horizon deferred work:
 - MechanismDiscoveryReport schema
 - PostHocTheoryNote schema
-- registry validator
+- PreEarningsProfile v1 as a domain-specific research module (AED core remains domain-neutral)
+
+## AED architecture note
+
+AED core is domain-neutral. It enforces governance, provenance, and trial accounting without assuming any specific asset class, strategy type, or research domain. PreEarningsProfile v1 is one supported domain-specific research module — it is not the identity of the system.
 
 ## Operational notes
 
@@ -112,12 +129,13 @@ Longer-horizon deferred work:
 
 ## Governance validators
 
-All three governance validators are implemented, tested, and CI-wired:
+All four governance validators are implemented, tested, and CI-wired:
 
 - **TrialLedger** (PR #58): `scripts/local/validate_trial_ledger.py`, schema, 5 fixtures, 21 tests. CI: `governance-validators` job.
 - **SearchSpaceManifest** (PR #59): `scripts/local/validate_search_space_manifest.py`, schema, 6 fixtures, 29 tests. CI: `governance-validators` job.
 - **ModelAssessmentSpec** (PR #63, #64): `scripts/local/validate_model_assessment_spec.py`, schema, 6 fixtures, 38 tests. CI: `governance-validators` job.
+- **EdgeHypothesisRegistry** (PRs #68, #71, #72, #73, #74): `scripts/local/validate_edge_hypothesis_registry.py`, schema, 10 fixtures, 27 tests. CI: `governance-validators` job.
 
-Total CI-enforced validator tests: 106 (18 Event/Options via `validator` job + 88 governance via `governance-validators` job).
+Total CI-enforced validator tests: 151 (18 Event/Options via `validator` job + 133 governance via `governance-validators` job).
 
 ## Operational notes
