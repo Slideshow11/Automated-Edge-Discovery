@@ -1,0 +1,258 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EdgeHypothesisRegistry v1",
+  "description": "Append-only machine-readable registry of edge hypotheses, linking to SearchSpaceManifest, TrialLedger, and ModelAssessmentSpec entries.",
+  "type": "object",
+  "required": [
+    "hypothesis_id",
+    "registry_version",
+    "title",
+    "status",
+    "status_reason",
+    "evidence_stage",
+    "source_type",
+    "source_lane",
+    "theory_timing",
+    "manual_review_required",
+    "created_at"
+  ],
+  "properties": {
+    "hypothesis_id": {
+      "description": "Stable hypothesis identifier. New records must use HYP-YYYY-NNNN format.",
+      "type": "string",
+      "pattern": "^HYP-[0-9]{4}-[0-9]{4}$"
+    },
+    "registry_version": {
+      "description": "Must be edge_registry_v1 for all new records.",
+      "type": "string",
+      "const": "edge_registry_v1"
+    },
+    "title": {
+      "description": "Short human-readable hypothesis title.",
+      "type": "string"
+    },
+    "status": {
+      "description": "Current governance status of this hypothesis.",
+      "type": "string",
+      "enum": [
+        "proposed",
+        "specified",
+        "testing",
+        "parked",
+        "falsified",
+        "review_ready",
+        "approved_for_next_stage",
+        "superseded"
+      ]
+    },
+    "status_reason": {
+      "description": "Human-readable explanation of current status.",
+      "type": "string"
+    },
+    "evidence_stage": {
+      "description": "Evidence accumulation stage.",
+      "type": "string",
+      "enum": [
+        "exploratory",
+        "confirmatory",
+        "ablated"
+      ]
+    },
+    "source_type": {
+      "description": "Nature of the hypothesis source.",
+      "type": "string",
+      "enum": [
+        "theory_first",
+        "exploratory_anomaly",
+        "post_hoc_theory"
+      ]
+    },
+    "source_lane": {
+      "description": "Evidence lane of origin.",
+      "type": "string",
+      "enum": [
+        "theory_first",
+        "exploratory_anomaly",
+        "post_hoc_theory",
+        "confirmatory"
+      ]
+    },
+    "theory_timing": {
+      "description": "Timing of hypothesis formation relative to data.",
+      "type": "string",
+      "enum": [
+        "pre_registration",
+        "post_discovery"
+      ]
+    },
+    "mechanism_summary": {
+      "description": "Brief mechanistic or statistical explanation of the hypothesized effect.",
+      "type": "string"
+    },
+    "promotion_restrictions": {
+      "description": "List of conditions that must be satisfied before promotion.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "hypothesis_card_ref": {
+      "description": "Reference to the HypothesisCard that spawned this hypothesis.",
+      "type": "string"
+    },
+    "trial_ledger_refs": {
+      "description": "References to TrialLedger entries linked to this hypothesis.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "search_space_refs": {
+      "description": "References to SearchSpaceManifest entries linked to this hypothesis.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^SSM-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "model_assessment_refs": {
+      "description": "References to ModelAssessmentSpec entries linked to this hypothesis.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^MAS-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "mechanism_report_refs": {
+      "description": "References to MechanismDiscoveryReport entries.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "posthoc_theory_note_refs": {
+      "description": "References to PostHocTheoryNote entries.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "review_packet_refs": {
+      "description": "References to ReviewPacket entries.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "manual_decision_refs": {
+      "description": "References to ManualDecision entries.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "data_manifest_refs": {
+      "description": "References to DataManifest entries.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "lifecycle_events": {
+      "description": "Append-only audit trail of status changes and other governance events.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "event_id",
+          "event_type",
+          "event_timestamp",
+          "actor",
+          "to_status",
+          "manual_review_required"
+        ],
+        "properties": {
+          "event_id": {
+            "description": "Unique event identifier within this record.",
+            "type": "string"
+          },
+          "event_type": {
+            "description": "Type of lifecycle event.",
+            "type": "string"
+          },
+          "event_timestamp": {
+            "description": "ISO-8601 timestamp of the event.",
+            "type": "string"
+          },
+          "actor": {
+            "description": "Human actor who performed or approved the action.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Human-readable reason for the event.",
+            "type": "string"
+          },
+          "from_status": {
+            "description": "Status before this event.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_status": {
+            "description": "Status after this event.",
+            "type": "string"
+          },
+          "related_artifacts": {
+            "description": "URIs or IDs of artifacts related to this event.",
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "manual_review_required": {
+            "description": "Whether this event required manual review.",
+            "type": "boolean"
+          },
+          "registry_mutation_mode": {
+            "description": "Must be manual. Automated mutation is not permitted.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "notes": {
+      "description": "Free-form human notes.",
+      "type": "string"
+    },
+    "manual_review_required": {
+      "description": "Whether this hypothesis requires manual review before any status change.",
+      "type": "boolean"
+    },
+    "automated_promotion_allowed": {
+      "description": "Must be absent or false. Automated promotion is not permitted.",
+      "enum": [false]
+    },
+    "live_trading_allowed": {
+      "description": "Must be absent or false. Live trading is not permitted.",
+      "enum": [false]
+    },
+    "production_execution_allowed": {
+      "description": "Must be absent or false. Production execution is not permitted.",
+      "enum": [false]
+    },
+    "automated_registry_mutation_allowed": {
+      "description": "Must be absent or false. Automated registry mutation is not permitted.",
+      "enum": [false]
+    },
+    "created_at": {
+      "description": "ISO-8601 creation timestamp.",
+      "type": "string"
+    },
+    "updated_at": {
+      "description": "ISO-8601 last-update timestamp.",
+      "type": "string"
+    }
+  }
+}
