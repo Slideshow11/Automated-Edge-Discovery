@@ -490,15 +490,14 @@ OutcomeSpec v1 declares the outcome labeling scheme, window boundaries, purged/e
 || `cv_fold_definitions` | array | Financial ML §4e |
 || `sample_overlap_warning` | string or null | Financial ML §4h |
 || `overlapping_experiments` | array of experiment IDs | Financial ML §4h |
-|| `event_window_spec` object | object | Hypothesis taxonomy §6h |
-|| `null_model_name` | string | Statistical inference §7f |
-|| `null_model_performance` | float | Statistical inference §7f |
-|| `performance_vs_null` | float | Statistical inference §7f |
-|| `is_oos_required` | boolean | Evidence role declaration |
-|| `is_live_required` | boolean | Evidence role declaration |
-|| `uncertainty_required` | boolean | Evidence role declaration |
-|| `model_assessment_ref` | string (ref) | Links to ModelAssessmentSpec providing evidence |
-|| `runner_output_refs` | array of strings (refs) | Links to runner outputs with computed metrics |
+| `event_window_spec` object | object | Hypothesis taxonomy §6h |
+| `is_oos_required` | boolean | Evidence role declaration |
+| `is_live_required` | boolean | Evidence role declaration |
+| `uncertainty_required` | boolean | Evidence role declaration |
+| `model_assessment_refs` | array of strings (refs) | Links to ModelAssessmentSpec artifacts providing evidence |
+| `runner_output_refs` | array of strings (refs) | Links to runner output artifacts with computed metrics |
+
+Note: OutcomeSpec may require that a null model or benchmark comparison exists via `null_model_name`, but the computed metrics `null_model_performance` and `performance_vs_null` are owned by ModelAssessmentSpec (assessment output), and the raw null model artifact may be owned by Runner Outputs.
 
 ### 8c. InstrumentUniverseSpec (new, deferred)
 
@@ -644,9 +643,9 @@ The runner produces intermediate artifacts consumed by validators and ReviewPack
 
 The uploaded literature packet (§3i-§3l) is a requirements backlog, not a mandate to add every listed field to OutcomeSpec v1. Each field belongs to exactly one owning artifact based on whether it is a declaration (owned by OutcomeSpec, ExperimentSpec, SearchSpaceManifest), a recorded trial fact (owned by TrialLedger), an assessment output (owned by ModelAssessmentSpec), a computed intermediate artifact (owned by Runner Outputs), an aggregated review conclusion (owned by ReviewPacket), or a search-space declaration (owned by SearchSpaceManifest).
 
-|| Artifact | Owns | Does NOT Own |
-||----------|------|--------------|
-| **OutcomeSpec** | outcome_id, experiment_id, labeling_scheme, labeling_horizon_days, outcome_window_start, outcome_window_end, purge_gap_days, embargo_fraction, embargo_days, walk_forward_type, n_splits, cv_n_folds, cv_fold_definitions, sample_overlap_warning, overlapping_experiments, event_window_spec, is_oos_required, is_live_required, uncertainty_required, model_assessment_refs, runner_output_refs | pbo_estimate, backtest_pnl_haircut, Sharpe haircut, complexity score, probability_of_loss, factor exposure stability results, bootstrap distributions, CSCV outputs |
+| Artifact | Owns | Does NOT Own |
+|----------|------|--------------|
+| **OutcomeSpec** | outcome_id, experiment_id, labeling_scheme, labeling_horizon_days, outcome_window_start, outcome_window_end, purge_gap_days, embargo_fraction, embargo_days, walk_forward_type, n_splits, cv_n_folds, cv_fold_definitions, sample_overlap_warning, overlapping_experiments, event_window_spec, is_oos_required, is_live_required, uncertainty_required, model_assessment_refs, runner_output_refs | pbo_estimate, backtest_pnl_haircut, Sharpe haircut, complexity score, probability_of_loss, factor exposure stability results, bootstrap distributions, CSCV outputs, null_model_performance, performance_vs_null |
 | **TrialLedger** | trial_family_id, all_variants_preserved, n_tried, selected_variant_id, pbo_estimate, pbo_method, pbo_not_applicable_reason, sample_length, number_of_trials, sample_to_trial_ratio, degrees_of_freedom_warning, cscv_n_bags, cscv_prob_s_overfit, backtest_live_split_date, backtest_period_length, live_period_length, live_performance_required, overfit_freedom_score, tweak_freedom_score | outcome window declarations, labeling schemes |
 | **ModelAssessmentSpec** | pbo_estimate, pbo_method, pbo_not_applicable_reason, backtest_pnl_haircut, overfit_discount_factor, haircut_method, haircut_not_applicable_reason, accepted_threshold_metric, accepted_threshold_value, original_strategy_ref, modified_strategy_ref, strategy_correlation_to_original, overfit_assumption_note, adjusted_expected_oos_sharpe, probability_of_loss, expected_oos_rank, false_discovery_rate_estimate, adjusted_p_value, overfit_adjustment_method, bootstrap_method, stationary_bootstrap_block_parameter, bayesian_overfit_model, realized_sharpe_haircut, strategy_complexity_score, number_of_signals, number_of_parameters, rule_count, factor_exposure_stability_check, factor_loading_backtest, factor_loading_live, factor_exposure_drift_flag, feature_importance_sample, ensemble_diversity_score, expected_return_decomposition, null_model_description, null_model_performance, performance_vs_null, return_point_estimate, return_ci_lower, return_ci_upper, ci_coverage_level, cv_generalization_error, cv_n_folds, bootstrap_n_iterations, bootstrap_ci_level, robustness_checks_passed, robustness_methods_tried, fragility_identified, fragility_description | outcome window declarations, labeling schemes, trial family identity |
 | **SearchSpaceManifest** | search_space_id, search_budget, max_variants_per_family, trial_family_scope, search_mode, forbidden_modes | trial accounting, assessment outputs |
@@ -707,7 +706,7 @@ OutcomeSpec v1 should be the next schema designed. Its core job is declaring the
 
 **The literature packet is a requirements backlog. OutcomeSpec v1 should NOT attempt to absorb all 49 new fields from §3i-§3l. Priority for OutcomeSpec v1: window semantics, labeling scheme, purge/embargo config, and required evidence role declarations only. All overfit statistics, search pressure metrics, Sharpe haircuts, Bayesian adjusted estimates, complexity scores, and factor exposure results belong in ModelAssessmentSpec extensions or TrialLedger — not OutcomeSpec.**
 
-Priority fields: `labeling_scheme`, `labeling_horizon_days`, `outcome_window_start/end`, `purge_gap_days`, `embargo_fraction`, `walk_forward_type`, `n_splits`, `cv_n_folds`, `cv_fold_definitions`, `is_oos_required`, `is_live_required`, `uncertainty_required`, `model_assessment_ref`, `runner_output_refs`.
+Priority fields: `labeling_scheme`, `labeling_horizon_days`, `outcome_window_start/end`, `purge_gap_days`, `embargo_fraction`, `walk_forward_type`, `n_splits`, `cv_n_folds`, `cv_fold_definitions`, `is_oos_required`, `is_live_required`, `uncertainty_required`, `model_assessment_refs`, `runner_output_refs`.
 
 Design sequence: OutcomeSpec v1 design doc → JSON schema → fixtures → local validator → pytest → CI wiring.
 
