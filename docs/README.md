@@ -18,6 +18,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - ModelAssessmentSpec v1 schema, validator, fixtures, and CI wiring complete (PRs #63, #64)
 - Governance validator milestone complete: all three manifests (TRL, SSM, MAS) enforced in CI
 - EdgeHypothesisRegistry v1 schema, fixtures, local validator, pytest, and CI wiring complete (PRs #66, #68, #71, #72, #73, #74)
+- ExperimentSpec v1 design complete (PR #78): domain-neutral experiment declaration schema, entry/exit rule abstractions, trial generation modes, stop rules
 
 ## Document groups
 
@@ -34,6 +35,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/post_governance_implementation_roadmap.md | RoadmapLayer | Locks the post-governance pivot toward enforcement, schema-backed artifacts, and trial accounting. | Active |
 | docs/domain_neutral_aed_architecture.md | ArchitectureLayer | Defines AED core as domain-neutral: generalized abstractions, domain modules, agent tooling, and stop rules. | Active |
 | docs/domain_neutral_modularity_audit.md | ArchitectureLayer | Audit of existing codebase for pre-earnings/event/options coupling. Identifies governance layer as clean; engine/ as expected domain coupling. | Active |
+| docs/experiment_spec_v1_design.md | ArchitectureLayer | Domain-neutral experiment declaration schema: entry/exit rule abstractions, study types, trial generation modes, prohibited modes, stop rules, agent tooling constraints. | Active v1 design |
 | docs/trial_ledger_v1_design.md | EnforcementLayer | Defines TrialLedger v1: append-only trial record, identity fields, source lanes, promotion rules, and governance states. | Active v1 design |
 | docs/search_space_manifest_v1_design.md | EnforcementLayer | Defines SearchSpaceManifest v1: pre-declared search boundaries, budget, constraints, forbidden modes, and burden accounting. | Active v1 design |
 | docs/trial_ledger_search_space_manifest_v1.md | EnforcementLayer | **Historical combined design note (PR #39).** For v1 authoritative references, use `docs/trial_ledger_v1_design.md` and `docs/search_space_manifest_v1_design.md`. | Historical |
@@ -65,10 +67,11 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
 - ModelAssessmentSpec validator **complete** (PRs #63, #64): local validator, JSON schema, fixtures, CI wired
 - EdgeHypothesisRegistry v1 validator **complete** (PRs #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
+- ExperimentSpec v1 **design complete** (PR #78): schema, fixtures, validator, pytest, CI wiring deferred
 - Event/Options JSON schemas deferred
 - EventStudySpec / OptionsEventRiskSpec schemas deferred
 - MechanismDiscoveryReport schema deferred
-- ExperimentSpec schema deferred
+- ExperimentSpec schema deferred (design complete PR #78)
 - OutcomeSpec schema deferred
 - InstrumentUniverseSpec schema deferred
 - autonomous search and optimization tooling are locked until trial accounting exists
@@ -84,6 +87,7 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - MechanismDiscoveryReport
 - PostHocTheoryNote
 - ModelAssessmentSpec
+- ExperimentSpec
 - EventStudySpec
 - OptionsEventRiskSpec
 - JumpRiskReport

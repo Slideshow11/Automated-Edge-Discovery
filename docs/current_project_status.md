@@ -74,7 +74,7 @@ The project is not yet a live trading or production system.
 - PostHocTheoryNote JSON schema deferred
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
-- ExperimentSpec JSON schema deferred
+- ExperimentSpec v1 **design complete** (PR #78): schema deferred
 - OutcomeSpec JSON schema deferred
 - InstrumentUniverseSpec JSON schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
@@ -85,8 +85,8 @@ The project is not yet a live trading or production system.
 
 ## Next planned PRs
 
-Conservative next steps:
-- ExperimentSpec v1 schema and validator design
+- PR #77 Domain-neutral modularity audit: governance layer clean, engine/ expected coupling documented, design implications for ExperimentSpec v1 identified
+- PR #78 ExperimentSpec v1 design: domain-neutral experiment declaration schema, entry/exit rule abstractions, trial generation modes, stop rules
 - OutcomeSpec v1 schema and validator design
 - InstrumentUniverseSpec v1 schema and validator design
 - EventStudySpec JSON schema
