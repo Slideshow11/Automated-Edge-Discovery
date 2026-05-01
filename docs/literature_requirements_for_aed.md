@@ -471,61 +471,34 @@ ExperimentSpec v1 is largely complete for required identity fields, study type, 
 
 ### 8b. OutcomeSpec (new, deferred)
 
-OutcomeSpec v1 will declare the outcome labeling scheme, windows, and purged/embargo configuration.
+OutcomeSpec v1 declares the outcome labeling scheme, window boundaries, purged/embargo configuration, and required evidence roles. It defines what the measurement target is, when the window starts and ends, how labels are assigned, and what evidence (OOS, live, uncertainty quantification) must be provided by ModelAssessmentSpec or runner outputs. It does NOT own computed statistics — those belong to ModelAssessmentSpec or TrialLedger.
 
-| Field | Type | Source Requirement |
-|-------|------|--------------------|
-| `outcome_id` | string | Core identity |
-| `experiment_id` | string (ref) | Core identity |
-| `labeling_scheme` | enum {triple_barrier, fixed_horizon, return_threshold, custom} | Financial ML §4g |
-| `labeling_horizon_days` | integer | Financial ML §4g |
-| `outcome_window_start` | ISO 8601 | Financial ML §4g |
-| `outcome_window_end` | ISO 8601 | Financial ML §4g |
-| `purge_gap_days` | integer >= 0 | Financial ML §4a |
-| `embargo_fraction` | float [0, 1] | Financial ML §4b |
-| `embargo_days` | integer (computed) | Financial ML §4b |
-| `walk_forward_type` | enum {expanding, rolling} | Financial ML §4c |
-| `n_splits` | integer >= 1 | Financial ML §4c |
-| `cv_n_folds` | integer | Financial ML §4e |
-| `cv_fold_definitions` | array | Financial ML §4e |
-| `sample_overlap_warning` | string or null | Financial ML §4h |
-| `overlapping_experiments` | array of experiment IDs | Financial ML §4h |
-| `event_window_spec` object | object | Hypothesis taxonomy §6h |
-| `null_model_name` | string | Statistical inference §7f |
-| `null_model_performance` | float | Statistical inference §7f |
-| `performance_vs_null` | float | Statistical inference §7f |
-| `return_point_estimate` | float | Statistical inference §7a |
-| `return_ci_lower` | float | Statistical inference §7a |
-| `return_ci_upper` | float | Statistical inference §7a |
-| `ci_coverage_level` | float | Statistical inference §7a |
-| `bootstrap_n_iterations` | integer >= 100 | Statistical inference §7b |
-| `bootstrap_ci_level` | float 0.9–0.99 | Statistical inference §7b |
-| `bootstrap_ci_method` | enum | Statistical inference §7b |
-| `bootstrap_not_applicable_reason` | string | Statistical inference §7b |
-| `robustness_checks_passed` | boolean | Statistical inference §7e |
-| `robustness_methods_tried` | array of strings | Statistical inference §7e |
-| `sample_length` | integer >= 2 | Backtest overfitting §3i |
-| `number_of_trials` | integer >= 1 | Backtest overfitting §3i |
-| `sample_to_trial_ratio` | float | Backtest overfitting §3i |
-| `degrees_of_freedom_warning` | boolean | Backtest overfitting §3i |
-| `backtest_pnl_haircut` | float [0, 1] | Backtest overfitting §3j |
-| `overfit_discount_factor` | float [0, 1] | Backtest overfitting §3j |
-| `haircut_method` | string | Backtest overfitting §3j |
-| `haircut_not_applicable_reason` | string | Backtest overfitting §3j |
-| `adjusted_expected_oos_sharpe` | float | Backtest overfitting §3k |
-| `probability_of_loss` | float [0, 1] | Backtest overfitting §3k |
-| `expected_oos_rank` | float [0, 1] | Backtest overfitting §3k |
-| `false_discovery_rate_estimate` | float [0, 1] | Backtest overfitting §3k |
-| `adjusted_p_value` | float [0, 1] | Backtest overfitting §3k |
-| `overfit_adjustment_method` | string | Backtest overfitting §3k |
-| `backtest_live_split_date` | ISO 8601 date | Backtest overfitting §3l |
-| `backtest_period_length` | integer >= 1 | Backtest overfitting §3l |
-| `live_period_length` | integer >= 1 | Backtest overfitting §3l |
-| `live_performance_required` | boolean | Backtest overfitting §3l |
-| `realized_sharpe_haircut` | float | Backtest overfitting §3l |
-| `strategy_complexity_score` | float >= 0 | Backtest overfitting §3l |
-| `factor_exposure_stability_check` | boolean | Backtest overfitting §3l |
-| `factor_exposure_drift_flag` | boolean | Backtest overfitting §3l |
+|| Field | Type | Source Requirement |
+||-------|------|--------------------|
+|| `outcome_id` | string | Core identity |
+|| `experiment_id` | string (ref) | Core identity |
+|| `labeling_scheme` | enum {triple_barrier, fixed_horizon, return_threshold, custom} | Financial ML §4g |
+|| `labeling_horizon_days` | integer | Financial ML §4g |
+|| `outcome_window_start` | ISO 8601 | Financial ML §4g |
+|| `outcome_window_end` | ISO 8601 | Financial ML §4g |
+|| `purge_gap_days` | integer >= 0 | Financial ML §4a |
+|| `embargo_fraction` | float [0, 1] | Financial ML §4b |
+|| `embargo_days` | integer (computed) | Financial ML §4b |
+|| `walk_forward_type` | enum {expanding, rolling} | Financial ML §4c |
+|| `n_splits` | integer >= 1 | Financial ML §4c |
+|| `cv_n_folds` | integer | Financial ML §4e |
+|| `cv_fold_definitions` | array | Financial ML §4e |
+|| `sample_overlap_warning` | string or null | Financial ML §4h |
+|| `overlapping_experiments` | array of experiment IDs | Financial ML §4h |
+|| `event_window_spec` object | object | Hypothesis taxonomy §6h |
+|| `null_model_name` | string | Statistical inference §7f |
+|| `null_model_performance` | float | Statistical inference §7f |
+|| `performance_vs_null` | float | Statistical inference §7f |
+|| `is_oos_required` | boolean | Evidence role declaration |
+|| `is_live_required` | boolean | Evidence role declaration |
+|| `uncertainty_required` | boolean | Evidence role declaration |
+|| `model_assessment_ref` | string (ref) | Links to ModelAssessmentSpec providing evidence |
+|| `runner_output_refs` | array of strings (refs) | Links to runner outputs with computed metrics |
 
 ### 8c. InstrumentUniverseSpec (new, deferred)
 
@@ -667,6 +640,20 @@ The runner produces intermediate artifacts consumed by validators and ReviewPack
 | Bootstrap distribution | Must store `bootstrap_artifact_ref` if `bootstrap_n_iterations >= 100` | Statistical inference §7b |
 | Null model baseline | Must produce and store null model performance before variant selection | Statistical inference §7f |
 
+### 8j. Artifact Ownership Clarification
+
+The uploaded literature packet (§3i-§3l) is a requirements backlog, not a mandate to add every listed field to OutcomeSpec v1. Each field belongs to exactly one owning artifact based on whether it is a declaration (owned by OutcomeSpec, ExperimentSpec, SearchSpaceManifest), a recorded trial fact (owned by TrialLedger), an assessment output (owned by ModelAssessmentSpec), a computed intermediate artifact (owned by Runner Outputs), an aggregated review conclusion (owned by ReviewPacket), or a search-space declaration (owned by SearchSpaceManifest).
+
+|| Artifact | Owns | Does NOT Own |
+||----------|------|--------------|
+| **OutcomeSpec** | outcome_id, experiment_id, labeling_scheme, labeling_horizon_days, outcome_window_start, outcome_window_end, purge_gap_days, embargo_fraction, embargo_days, walk_forward_type, n_splits, cv_n_folds, cv_fold_definitions, sample_overlap_warning, overlapping_experiments, event_window_spec, is_oos_required, is_live_required, uncertainty_required, model_assessment_refs, runner_output_refs | pbo_estimate, backtest_pnl_haircut, Sharpe haircut, complexity score, probability_of_loss, factor exposure stability results, bootstrap distributions, CSCV outputs |
+| **TrialLedger** | trial_family_id, all_variants_preserved, n_tried, selected_variant_id, pbo_estimate, pbo_method, pbo_not_applicable_reason, sample_length, number_of_trials, sample_to_trial_ratio, degrees_of_freedom_warning, cscv_n_bags, cscv_prob_s_overfit, backtest_live_split_date, backtest_period_length, live_period_length, live_performance_required, overfit_freedom_score, tweak_freedom_score | outcome window declarations, labeling schemes |
+| **ModelAssessmentSpec** | pbo_estimate, pbo_method, pbo_not_applicable_reason, backtest_pnl_haircut, overfit_discount_factor, haircut_method, haircut_not_applicable_reason, accepted_threshold_metric, accepted_threshold_value, original_strategy_ref, modified_strategy_ref, strategy_correlation_to_original, overfit_assumption_note, adjusted_expected_oos_sharpe, probability_of_loss, expected_oos_rank, false_discovery_rate_estimate, adjusted_p_value, overfit_adjustment_method, bootstrap_method, stationary_bootstrap_block_parameter, bayesian_overfit_model, realized_sharpe_haircut, strategy_complexity_score, number_of_signals, number_of_parameters, rule_count, factor_exposure_stability_check, factor_loading_backtest, factor_loading_live, factor_exposure_drift_flag, feature_importance_sample, ensemble_diversity_score, expected_return_decomposition, null_model_description, null_model_performance, performance_vs_null, return_point_estimate, return_ci_lower, return_ci_upper, ci_coverage_level, cv_generalization_error, cv_n_folds, bootstrap_n_iterations, bootstrap_ci_level, robustness_checks_passed, robustness_methods_tried, fragility_identified, fragility_description | outcome window declarations, labeling schemes, trial family identity |
+| **SearchSpaceManifest** | search_space_id, search_budget, max_variants_per_family, trial_family_scope, search_mode, forbidden_modes | trial accounting, assessment outputs |
+| **ExperimentSpec** | experiment_id, hypothesis_ref, search_space_ref, data_manifest_refs, trial_generation_mode, prohibited_modes, feature_cutoff_policy, decision_timestamp_policy, trial_family_id (link), n_tried (link) | computed PBO, haircut outputs, live performance |
+| **Runner Outputs** | equity_curve arrays, bootstrap distributions, CSCV bag results, walk-forward per-split metrics, null model baseline performance, factor regression outputs, OOS performance distribution artifact | outcome declarations, trial accounting |
+| **ReviewPacket** | selection_bias_analysis, robustness_analysis, pbo_findings, dsr_findings, replication_analysis, interaction_analysis, null_model_comparison, recommended_action, review_rationale | trial accounting, assessment computations |
+
 ---
 
 ## 9. Agent Requirements
@@ -718,18 +705,11 @@ The requirements in this document directly guide the next batch of AED design an
 
 OutcomeSpec v1 should be the next schema designed. Its core job is declaring the outcome labeling scheme and implementing the financial ML validation requirements from §4 and the statistical inference requirements from §7.
 
-Priority fields: `labeling_scheme`, `labeling_horizon_days`, `outcome_window_start/end`, `purge_gap_days`, `embargo_fraction`, `walk_forward_type`, `n_splits`, `null_model_name`, `null_model_performance`, `performance_vs_null`, `return_point_estimate`, `return_ci_lower/upper`, `ci_coverage_level`.
+**The literature packet is a requirements backlog. OutcomeSpec v1 should NOT attempt to absorb all 49 new fields from §3i-§3l. Priority for OutcomeSpec v1: window semantics, labeling scheme, purge/embargo config, and required evidence role declarations only. All overfit statistics, search pressure metrics, Sharpe haircuts, Bayesian adjusted estimates, complexity scores, and factor exposure results belong in ModelAssessmentSpec extensions or TrialLedger — not OutcomeSpec.**
+
+Priority fields: `labeling_scheme`, `labeling_horizon_days`, `outcome_window_start/end`, `purge_gap_days`, `embargo_fraction`, `walk_forward_type`, `n_splits`, `cv_n_folds`, `cv_fold_definitions`, `is_oos_required`, `is_live_required`, `uncertainty_required`, `model_assessment_ref`, `runner_output_refs`.
 
 Design sequence: OutcomeSpec v1 design doc → JSON schema → fixtures → local validator → pytest → CI wiring.
-
-**Extension points for futureOutcomeSpec extensions (informed by Sections 3i–3l):**
-
-- **OOS distribution artifact references:** Fields referencing stored out-of-sample performance distributions (`oos_performance_distribution_ref`) for reproducibility and Bayesian posterior computations (§3k)
-- **Live/backtest split descriptors:** Fields for `backtest_live_split_date`, `backtest_period_length`, `live_period_length`, `live_performance_required`, and `realized_sharpe_haircut` to support the Suhonen et al. backtest/live split framework (§3l)
-- **Overfit risk output fields:** Fields for `backtest_pnl_haircut`, `overfit_discount_factor`, `adjusted_expected_oos_sharpe`, `probability_of_loss`, `false_discovery_rate_estimate`, and `adjusted_p_value` to support multiple overfit adjustment methodologies (§3j, §3k)
-- **Uncertainty estimate fields:** Fields for `bootstrap_method`, `stationary_bootstrap_block_parameter`, `bootstrap_ci_method`, and `equity_curve_ci_lower/upper` arrays to support bootstrap-based uncertainty quantification (§3k, §7d)
-- **Factor exposure stability fields:** Fields for `factor_exposure_stability_check`, `factor_loading_backtest`, `factor_loading_live`, and `factor_exposure_drift_flag` to support factor loading drift detection between backtest and live periods (§3l)
-- **Strategy complexity fields:** Fields for `strategy_complexity_score`, `number_of_signals`, `number_of_parameters`, and `rule_count` to support complexity-adjusted overfit risk assessment (§3l)
 
 ### 10b. InstrumentUniverseSpec v1
 
