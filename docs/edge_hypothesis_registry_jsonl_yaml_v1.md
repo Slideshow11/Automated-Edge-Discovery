@@ -63,7 +63,21 @@ Recommended stance:
   as a human-authoring/export format. YAML may be accepted as a review export.
 - CSV remains manual v1 and historical.
 
-## 4. EdgeHypothesisRecord v1 required fields
+## 4a. Hypothesis ID format
+
+The hypothesis_id format is `HYP-YYYY-NNNN`:
+
+- `HYP-` prefix (uppercase, fixed)
+- `YYYY` = four-digit year
+- `NNNN` = four-digit zero-padded sequential number within the year
+
+Examples: `HYP-2026-0001`, `HYP-2026-0042`, `HYP-2025-0099`
+
+Sequential numbers are assigned manually at creation. There is no automated ID generation.
+
+Legacy IDs from the CSV registry (e.g. `HYP-0001`, `HYP-0002`) are preserved as-is for backward compatibility. New records must use the `HYP-YYYY-NNNN` format.
+
+Version field: `registry_version` must be set to `edge_registry_v1` for all new records.
 
 Each EdgeHypothesisRecord (JSON object or YAML document) SHOULD include:
 
@@ -79,7 +93,7 @@ Each EdgeHypothesisRecord (JSON object or YAML document) SHOULD include:
 
 (see full doc for complete field list)
 
-Key reference fields (must exist as ids/refs): hypothesis_card_ref, trial_ledger_refs, search_space_refs, mechanism_report_refs, posthoc_theory_note_refs, review_packet_refs, manual_decision_refs
+Key reference fields (must exist as ids/refs): hypothesis_card_ref, trial_ledger_refs, search_space_refs, model_assessment_refs, mechanism_report_refs, posthoc_theory_note_refs, review_packet_refs, manual_decision_refs
 
 ## 5. Status model
 
@@ -117,11 +131,12 @@ State:
 
 ## 7. Links to other AED artifacts
 
-Fields linking to other artifacts:
+Fields linking to other AED artifacts:
 
 - hypothesis_card_ref (HypothesisCard)
 - trial_ledger_refs (TrialLedger)
 - search_space_refs (SearchSpaceManifest)
+- model_assessment_refs (ModelAssessmentSpec) — added after MAS validator milestone (PRs #63, #64)
 - mechanism_report_refs (MechanismDiscoveryReport)
 - posthoc_theory_note_refs (PostHocTheoryNote)
 - review_packet_refs (ReviewPacket)
@@ -132,6 +147,7 @@ State & rules:
 - theory-after records must link MechanismDiscoveryReport or PostHocTheoryNote
 - trial accounting must be linked before any broad search advancement
 - SearchSpaceManifest refs are required before broad search
+- ModelAssessmentSpec refs are required before hypothesis can move to approved_for_next_stage
 
 ## 8. Migration from CSV v1 (phased)
 
@@ -206,11 +222,33 @@ notes: |
 Future validators should check:
 - required field presence
 - allowed status values
-- lifecycle event integrity
-- link integrity
+- hypothesis_id format: HYP-YYYY-NNNN (legacy IDs grandfathered)
+- lifecycle event integrity (append-only)
+- link integrity: trial_ledger_refs, search_space_refs, model_assessment_refs must reference valid IDs with correct format (TRL-YYYY-NNNN, SSM-YYYY-NNNN, MAS-YYYY-NNNN)
 - stop-rule restrictions
+- no ex-post hypothesis formation without PostHocTheoryNote
 
-## 13. Non-goals
+## 13. Anti-overfit and anti-lookahead governance
+
+Registry entries must reflect and enforce point-in-time integrity standards from the AED governance framework:
+
+**Data freshness constraints:**
+- hypothesis_card entries must record the data_cutoff_timestamp and feature_timestamp used to form the hypothesis
+- Any record linking to TrialLedger or SearchSpaceManifest must reference entries that respect decision-time anti-lookahead (feature_timestamp / data_cutoff_timestamp ≤ decision_timestamp_utc)
+
+**Prohibition on ex-post rationalization:**
+- The hypothesis statement must be recorded before seeing the target test result
+- The registry record must include the pre-specified primary metric and null result definition
+- Post-hoc explanations must be flagged via `theory_timing: post_discovery` and linked to a MechanismDiscoveryReport or PostHocTheoryNote
+
+**Multiple testing controls:**
+- Broad exploratory searches that produce multiple TrialLedger entries must be reflected in the registry via `trial_ledger_refs`
+- FWER or DSR adjustments applied to trials must be documented in the lifecycle event or notes field
+- Registry validator (deferred) should warn when a hypothesis has more than N trial refs without a confirmatory assessment
+
+**No ex-post hypothesis formation:**
+- Records with `evidence_stage: exploratory` that later become `specified` without a corresponding TheoryBefore discovery trail must include a PostHocTheoryNote ref
+- The registry does not store optimized hyperparameter sets or in-sample fit artifacts as evidence
 
 - No code implementation.
 - No JSON schema yet. (JSON schema is deferred)
@@ -227,9 +265,10 @@ Future validators should check:
 
 ## 14. Implementation roadmap (recommended follow-ups)
 
-- PR #43: ModelAssessmentSpec v1
+- PR #43: ModelAssessmentSpec v1 ✅ (completed PRs #63, #64)
 - PR #44: EventStudySpec / OptionsEventRiskSpec schema planning
 - PR #45: validator/tooling cleanup
 - PR #46: MechanismDiscoveryReport JSON schema
-- PR #47: EdgeHypothesisRegistry JSON schema and validator
+- PR #47: EdgeHypothesisRegistry JSON schema and validator — **this PR** (design refresh, PR #66)
+- PR #66: EdgeHypothesisRegistry v1 design refresh: add MAS linkage, ID format, anti-overfit/anti-lookahead governance
 
