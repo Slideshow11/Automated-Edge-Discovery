@@ -108,6 +108,13 @@ See [docs/domain_neutral_aed_architecture.md](./domain_neutral_aed_architecture.
 - Agent and tooling layer (Hermes, OpenClaw as suggestion engines)
 - Stop rules and manual review rule
 
+See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.md) for the modularity audit covering:
+- Governance layer is clean and domain-neutral (schemas, validators, fixtures, CI helpers)
+- engine/ contains expected pre-earnings backtest orchestration coupling
+- Event/Options validator is intentionally domain-specific
+- Design implications for ExperimentSpec v1 (boundary rule, generalized abstractions)
+- Recommended next PRs: ExperimentSpec → OutcomeSpec → InstrumentUniverseSpec → EventStudySpec → OptionsEventRiskSpec → PreEarningsProfile
+
 ## Operational notes
 
 - run commands from /home/max/aed_audit_clean or use git -C /home/max/aed_audit_clean
