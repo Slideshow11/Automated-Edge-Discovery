@@ -117,7 +117,7 @@ Every status change in the EdgeHypothesisRegistry requires a ReviewPacket with h
 | `hypothesis_id` | string | Yes | Reference to EdgeHypothesisRegistry.hypothesis_id. Format: `HYP-YYYY-NNNN`. |
 | `search_space_id` | string | Yes | Reference to SearchSpaceManifest.search_space_id. Format: `SSM-YYYY-NNNN`. |
 | `created_at` | ISO8601 | Yes | Timestamp of experiment declaration. |
-| `reviewer` | string | Yes | Human reviewer who approved this experiment declaration. |
+| `reviewer` | object | Yes | Human reviewer metadata for this experiment declaration. Must be an object. At minimum, a `name` field is expected. |
 
 ### 3b. Data Scope Fields
 
@@ -147,7 +147,7 @@ Every status change in the EdgeHypothesisRegistry requires a ReviewPacket with h
 |-------|------|----------|-------------|
 | `trial_generation_mode` | enum | Yes | How trials are generated. Values: `manual_grid`, `fixed_sweep`, `literature_replication`, `ablation`, `falsification`, `exploratory_agent_assisted`. |
 | `allowed_trial_lanes` | array[string] | Yes | List of permitted `source_lane` values for TrialLedger entries generated under this experiment. Must be a non-empty subset of {theory_first, exploratory_anomaly, post_hoc_theory, confirmatory}. Corresponds to TrialLedger.source_lane enum, not trial_generation_mode. |
-| `prohibited_modes` | array[enum] | No | Explicitly prohibited modes. Values: `autonomous_search`, `bayesian_optimization`, `genetic_programming`. If omitted, defaults to prohibiting all three. |
+| `prohibited_modes` | object | Yes | Explicit stop-rule declaration. All eight AED governance fields must be present and set to `false`. There is no omit-and-default — every ExperimentSpec must affirmatively declare its stop rules. |
 
 ---
 
