@@ -1,0 +1,221 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ExperimentSpec v1",
+  "description": "Domain-neutral parent experiment contract: reproducible experiment plan bridging governance intake to execution layer.",
+  "type": "object",
+  "required": [
+    "experiment_id",
+    "experiment_version",
+    "hypothesis_id",
+    "search_space_id",
+    "data_manifest_refs",
+    "study_type",
+    "decision_timestamp_policy",
+    "feature_cutoff_policy",
+    "trial_generation_mode",
+    "allowed_trial_lanes",
+    "created_at",
+    "reviewer"
+  ],
+  "properties": {
+    "experiment_id": {
+      "description": "Canonical experiment identifier. Format: EXP-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^EXP-[0-9]{4}-[0-9]{4}$"
+    },
+    "experiment_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "hypothesis_id": {
+      "description": "Reference to EdgeHypothesisRegistry.hypothesis_id. Hypothesis must exist with status proposed or approved_for_next_stage.",
+      "type": "string",
+      "pattern": "^HYP-[0-9]{4}-[0-9]{4}$"
+    },
+    "search_space_id": {
+      "description": "Reference to SearchSpaceManifest.search_space_id.",
+      "type": "string",
+      "pattern": "^SSM-[0-9]{4}-[0-9]{4}$"
+    },
+    "data_manifest_refs": {
+      "description": "List of DataManifest.data_manifest_id values in scope for this experiment.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "study_type": {
+      "description": "Class of study methodology.",
+      "type": "string",
+      "enum": [
+        "event_study",
+        "calendar_seasonality",
+        "regime_conditioned_signal",
+        "cross_sectional_ranking",
+        "time_series_momentum",
+        "literature_replication",
+        "options_event_risk",
+        "custom"
+      ]
+    },
+    "experiment_family": {
+      "description": "Human-readable family label for grouping related experiments.",
+      "type": "string"
+    },
+    "model_assessment_ref": {
+      "description": "Reference to a ModelAssessmentSpec by ID. Optional in ExperimentSpec v1. The ModelAssessmentSpec remains the canonical assessment artifact; ExperimentSpec may reference an expected or planned assessment but does not approve or finalize it.",
+      "type": "string",
+      "pattern": "^MAS-[0-9]{4}-[0-9]{4}$"
+    },
+    "model_assessment_inline": {
+      "description": "Inline ModelAssessmentSpec content. Optional in ExperimentSpec v1. Same constraints as model_assessment_ref.",
+      "type": "object"
+    },
+    "decision_timestamp_policy": {
+      "description": "Policy for determining the primary decision timestamp. Controls anti-lookahead boundary.",
+      "type": "object",
+      "properties": {
+        "timestamp_ref": {
+          "description": "Reference to the timestamp field used as the decision point.",
+          "type": "string"
+        },
+        "description": {
+          "description": "Human-readable description of the policy.",
+          "type": "string"
+        }
+      }
+    },
+    "feature_cutoff_policy": {
+      "description": "Policy for determining the feature/data cutoff timestamp.",
+      "type": "object",
+      "properties": {
+        "timestamp_ref": {
+          "description": "Reference to the timestamp field used as the cutoff.",
+          "type": "string"
+        },
+        "offset_direction": {
+          "description": "Direction of offset relative to the decision timestamp.",
+          "type": "string",
+          "enum": ["before", "after"]
+        },
+        "offset_unit": {
+          "description": "Unit of the offset value.",
+          "type": "string"
+        },
+        "offset_value": {
+          "description": "Numeric offset value.",
+          "type": "number"
+        },
+        "description": {
+          "description": "Human-readable description of the policy.",
+          "type": "string"
+        }
+      }
+    },
+    "entry_rule_ref": {
+      "description": "Reference URI to the entry rule definition. Abstract — resolved by domain profile.",
+      "type": "string"
+    },
+    "exit_rule_ref": {
+      "description": "Reference URI to the exit rule definition. Abstract — resolved by domain profile.",
+      "type": "string"
+    },
+    "outcome_spec_ref": {
+      "description": "Reference to OutcomeSpec (future). Reserved for forward compatibility.",
+      "type": "string"
+    },
+    "outcome_spec_inline": {
+      "description": "Inline OutcomeSpec content. Reserved for forward compatibility.",
+      "type": "object"
+    },
+    "instrument_universe_ref": {
+      "description": "Reference to InstrumentUniverseSpec (future). Reserved for forward compatibility.",
+      "type": "string"
+    },
+    "instrument_universe_inline": {
+      "description": "Inline InstrumentUniverseSpec content. Reserved for forward compatibility.",
+      "type": "object"
+    },
+    "risk_profile_ref": {
+      "description": "Reference URI to the risk profile. Abstract — resolved by domain profile.",
+      "type": "string"
+    },
+    "trial_generation_mode": {
+      "description": "How trials are generated under this experiment.",
+      "type": "string",
+      "enum": [
+        "manual_grid",
+        "fixed_sweep",
+        "literature_replication",
+        "ablation",
+        "falsification",
+        "exploratory_agent_assisted"
+      ]
+    },
+    "allowed_trial_lanes": {
+      "description": "Permitted source_lane values for TrialLedger entries generated under this experiment. Must be a non-empty subset of the lanes declared in the referenced SearchSpaceManifest.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "manual_grid",
+          "fixed_sweep",
+          "literature_replication",
+          "ablation",
+          "falsification",
+          "exploratory_agent_assisted",
+          "mechanism_discovery"
+        ]
+      },
+      "minItems": 1
+    },
+    "prohibited_modes": {
+      "description": "Stop-rule enforcement object. Each field must be absent or false. If a field is present, it must be false.",
+      "type": "object",
+      "properties": {
+        "autonomous_search": {
+          "description": "Must be absent or false. No automated exploration of the strategy space without pre-declared SearchSpaceManifest and human review.",
+          "enum": [false]
+        },
+        "bayesian_optimization": {
+          "description": "Must be absent or false. No automated hyperparameter optimization.",
+          "enum": [false]
+        },
+        "genetic_programming": {
+          "description": "Must be absent or false. No evolutionary algorithm-driven strategy generation.",
+          "enum": [false]
+        },
+        "automated_promotion": {
+          "description": "Must be absent or false. No automatic advancement of hypotheses to next stage.",
+          "enum": [false]
+        },
+        "automated_registry_mutation": {
+          "description": "Must be absent or false. No automatic changes to EdgeHypothesisRegistry records.",
+          "enum": [false]
+        },
+        "live_trading": {
+          "description": "Must be absent or false. No real-money execution under any circumstances.",
+          "enum": [false]
+        },
+        "production_execution": {
+          "description": "Must be absent or false. No simulated production with real market impact.",
+          "enum": [false]
+        },
+        "gcru_integration": {
+          "description": "Must be absent or false. No connection to live market data feeds, execution systems, or risk management without a separate governance design.",
+          "enum": [false]
+        }
+      }
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp of experiment declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer who approved this experiment declaration.",
+      "type": "string"
+    }
+  }
+}
