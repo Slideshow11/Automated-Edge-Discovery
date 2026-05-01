@@ -55,6 +55,13 @@ The project is not yet a live trading or production system.
 - PR #72 EdgeHypothesisRegistry v1 local validator
 - PR #73 EdgeHypothesisRegistry v1 validator pytest suite
 - PR #74 EdgeHypothesisRegistry v1 CI wiring: governance-validators job now runs EHR validator
+- PR #75 AED status update after EHR validator milestone
+- PR #76 Domain-neutral AED architecture design note: core/domain boundary, agent tooling layer, stop rules
+- PR #77 Domain-neutral modularity audit: governance layer clean, engine/ expected coupling documented
+- PR #78 ExperimentSpec v1 design: domain-neutral experiment declaration schema, entry/exit rule abstractions, trial generation modes, stop rules
+- PR #79 docs: fix three Codex review issues in ExperimentSpec v1 design
+- PR #80 ExperimentSpec v1 JSON schema: domain-neutral schema with required fields, enums, prohibited modes, stop rules
+- PR #81 Literature requirements for AED: requirements extraction from Bailey/Borwein/López de Prado/Zhu PBO, López de Prado AFML, Montgomery DOE, Ilmanen Expected Returns, Efron & Hastie CASI; artifact implications for OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, ModelAssessmentSpec extensions, ReviewPacket
 
 ## Current stop rules
 
