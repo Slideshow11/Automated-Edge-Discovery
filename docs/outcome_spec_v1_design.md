@@ -109,7 +109,7 @@ OutcomeSpec defines what was measured. ReviewPacket renders a judgment on whethe
 
 ## 3. Proposed Required Fields
 
-These fields are required for OutcomeSpec v1. They define the core measurement target. Implementation is deferred to a later schema PR.
+These fields are required for OutcomeSpec v1. They define the core measurement target. Implementation is complete (PRs #96, #97).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -491,17 +491,17 @@ Hermes and OpenClaw **may not**:
 
 ## 11. Validation Roadmap
 
-OutcomeSpec v1 will be validated through the standard AED validator pipeline:
+OutcomeSpec v1 is validated through the standard AED validator pipeline:
 
-1. **Design doc** (this document, PR #94) — describes the schema and field semantics
-2. **Schema** (future PR) — JSON schema for OutcomeSpec v1
-3. **Fixtures** (future PR) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
-4. **Validator** (future PR) — `scripts/local/validate_outcome_spec.py` implementing the schema rules
-5. **Tests** (future PR) — pytest coverage of all validator paths
-6. **CI wiring** (future PR) — add to `scripts/ci/validate_governance_manifests.sh`
-7. **Docs status update** (future PR) — update `docs/current_project_status.md` and `docs/README.md`
+1. **Design doc** (PR #94) — describes the schema and field semantics
+2. **Schema** (PR #96, #97) — JSON schema for OutcomeSpec v1
+3. **Fixtures** (PR #98) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
+4. **Validator** (PR #99, #100) — `scripts/local/validate_outcome_spec.py` implementing the schema rules
+5. **Tests** (PR #101) — pytest coverage of all validator paths
+6. **CI wiring** (PR #102) — added to `scripts/ci/validate_governance_manifests.sh`
+7. **Docs status update** (PR #103) — updated `docs/current_project_status.md` and `docs/README.md`
 
-This roadmap follows the same pattern used for TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, and ExperimentSpec.
+This roadmap follows the same pattern used for TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, and ExperimentSpec. Implementation milestone complete.
 
 ---
 

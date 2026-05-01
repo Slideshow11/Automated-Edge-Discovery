@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design and implementation is complete. All four governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry) are implemented, tested, and CI-wired. The governance validator milestone is complete.
+The enforcement-layer design and implementation is complete. All six governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec) are implemented, tested, and CI-wired. The governance validator milestone is complete.
 
 The project is not yet an autonomous discovery engine.
 
@@ -62,6 +62,27 @@ The project is not yet a live trading or production system.
 - PR #79 docs: fix three Codex review issues in ExperimentSpec v1 design
 - PR #80 ExperimentSpec v1 JSON schema: domain-neutral schema with required fields, enums, prohibited modes, stop rules
 - PR #81 Literature requirements for AED: requirements extraction from Bailey/Borwein/López de Prado/Zhu PBO, López de Prado AFML, Montgomery DOE, Ilmanen Expected Returns, Efron & Hastie CASI; artifact implications for OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, ModelAssessmentSpec extensions, ReviewPacket
+- PR #82 schemas: fix ExperimentSpec allowed trial lanes constraint (theory_first, exploratory_anomaly, post_hoc_theory, confirmatory)
+- PR #83 docs: fix literature requirements consistency
+- PR #84 docs: fix modularity audit ambiguities
+- PR #85 docs: PR #84 follow-up design doc
+- PR #86 schemas: fix ExperimentSpec optional fields bug
+- PR #87 schemas: align ExperimentSpec contract
+- PR #88 tests: add ExperimentSpec v1 validator tests
+- PR #89 schemas: align ExperimentSpec prohibited modes
+- PR #90 ci: ExperimentSpec governance wiring
+- PR #91 docs: literature requirements refinement
+- PR #92 docs: fix OutcomeSpec ownership overreach
+- PR #93 docs: fix Codex review issues
+- PR #94 OutcomeSpec v1 design
+- PR #95 OutcomeSpec crypto example window_unit fix
+- PR #96 OutcomeSpec v1 schema
+- PR #97 OutcomeSpec schema/design window-policy alignment
+- PR #98 OutcomeSpec v1 fixtures
+- PR #99 OutcomeSpec v1 local validator
+- PR #100 OutcomeSpec validator nested object enforcement fix
+- PR #101 OutcomeSpec validator tests
+- PR #102 OutcomeSpec CI helper wiring
 
 ## Current stop rules
 
@@ -81,21 +102,22 @@ The project is not yet a live trading or production system.
 - PostHocTheoryNote JSON schema deferred
 - EventStudySpec JSON schema deferred
 - OptionsEventRiskSpec JSON schema deferred
-- ExperimentSpec v1 **design complete** (PR #78): schema deferred
-- OutcomeSpec JSON schema deferred
-- InstrumentUniverseSpec JSON schema deferred
+- ExperimentSpec v1 **complete** (PRs #78, #79, #80, #82, #86, #87, #88, #89, #90): design, schema, fixtures, local validator, tests, CI wired
+- OutcomeSpec v1 **complete** (PRs #94–#102): design, schema, fixtures, local validator, tests, CI wired
+- InstrumentUniverseSpec v1 schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
 - TrialLedger validator **complete** (PR #58): schema, fixtures, tests, CI wired
 - SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
-- Governance validators CI-wired **complete** (PRs #60, #64, #74)
+- Governance validators CI-wired **complete** (PRs #60, #64, #74, #90, #102)
 - EdgeHypothesisRegistry v1 **complete** (PRs #66, #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
 
 ## Next planned PRs
 
-- PR #77 Domain-neutral modularity audit: governance layer clean, engine/ expected coupling documented, design implications for ExperimentSpec v1 identified
-- PR #78 ExperimentSpec v1 design: domain-neutral experiment declaration schema, entry/exit rule abstractions, trial generation modes, stop rules
-- OutcomeSpec v1 schema and validator design
-- InstrumentUniverseSpec v1 schema and validator design
+- OutcomeSpec v1 milestone **complete** (PRs #94–#102): design, schema, fixtures, local validator, tests, CI wired
+- InstrumentUniverseSpec v1 design
+- InstrumentUniverseSpec v1 schema
+- InstrumentUniverseSpec v1 fixtures
+- InstrumentUniverseSpec v1 validator and CI wiring
 - EventStudySpec JSON schema
 - OptionsEventRiskSpec JSON schema
 
@@ -150,13 +172,15 @@ See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.
 
 ## Governance validators
 
-All four governance validators are implemented, tested, and CI-wired:
+All six governance validators are implemented, tested, and CI-wired:
 
 - **TrialLedger** (PR #58): `scripts/local/validate_trial_ledger.py`, schema, 5 fixtures, 21 tests. CI: `governance-validators` job.
 - **SearchSpaceManifest** (PR #59): `scripts/local/validate_search_space_manifest.py`, schema, 6 fixtures, 29 tests. CI: `governance-validators` job.
 - **ModelAssessmentSpec** (PR #63, #64): `scripts/local/validate_model_assessment_spec.py`, schema, 6 fixtures, 38 tests. CI: `governance-validators` job.
-- **EdgeHypothesisRegistry** (PRs #68, #71, #72, #73, #74): `scripts/local/validate_edge_hypothesis_registry.py`, schema, 10 fixtures, 27 tests. CI: `governance-validators` job.
+- **EdgeHypothesisRegistry** (PRs #68, #71, #72, #73, #74): `scripts/local/validate_edge_hypothesis_registry.py`, schema, 10 fixtures, 31 tests. CI: `governance-validators` job.
+- **ExperimentSpec** (PRs #78, #79, #80, #82, #86, #87, #88, #89, #90): `scripts/local/validate_experiment_spec.py`, schema, 12 fixtures, 77 tests. CI: `governance-validators` job.
+- **OutcomeSpec** (PRs #94–#102): `scripts/local/validate_outcome_spec.py`, schema, 21 fixtures, 111 tests. CI: `governance-validators` job.
 
-Total CI-enforced validator tests: 151 (18 Event/Options via `validator` job + 133 governance via `governance-validators` job).
+Total CI-enforced validator tests: 321 governance via `governance-validators` job + 18 Event/Options via `validator` job = **339 total**.
 
 ## Operational notes
