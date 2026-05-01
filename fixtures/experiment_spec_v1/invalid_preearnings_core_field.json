@@ -34,5 +34,9 @@
   "entry_dpe": -5,
   "delta_target": -0.25,
   "created_at": "2026-04-15T00:00:00Z",
-  "reviewer": "dr_elliot_review_2026"
+  "reviewer": {
+    "name": "dr_elliot_review_2026",
+    "affiliation": "independent",
+    "date": "2026-04-15"
+  }
 }
