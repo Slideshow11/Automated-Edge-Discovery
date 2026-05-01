@@ -17,6 +17,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - Governance validators CI-wired (PR #60)
 - ModelAssessmentSpec v1 schema, validator, fixtures, and CI wiring complete (PRs #63, #64)
 - Governance validator milestone complete: all three manifests (TRL, SSM, MAS) enforced in CI
+- EdgeHypothesisRegistry v1 schema, fixtures, local validator, pytest, and CI wiring complete (PRs #66, #68, #71, #72, #73, #74)
 
 ## Document groups
 
@@ -45,7 +46,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_event_options_contract.py | Validates event and options observation CSV against the Event/Options contract spec. | Read-only |
 | scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the Event/Options validator across all fixture profiles and pytest. | CI helper |
-| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger, SearchSpaceManifest, and ModelAssessmentSpec validators and their pytest suites. | CI helper |
+| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, and EdgeHypothesisRegistry validators and their pytest suites. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |
@@ -61,11 +62,13 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - TrialLedger validator **complete** (PR #58): local validator, JSON schema, fixtures
 - SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
 - ModelAssessmentSpec validator **complete** (PRs #63, #64): local validator, JSON schema, fixtures, CI wired
+- EdgeHypothesisRegistry v1 validator **complete** (PRs #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
 - Event/Options JSON schemas deferred
 - EventStudySpec / OptionsEventRiskSpec schemas deferred
 - MechanismDiscoveryReport schema deferred
-- registry validator deferred
-- EdgeHypothesisRegistry JSONL migration deferred
+- ExperimentSpec schema deferred
+- OutcomeSpec schema deferred
+- InstrumentUniverseSpec schema deferred
 - autonomous search and optimization tooling are locked until trial accounting exists
 
 ## Canonical terms
