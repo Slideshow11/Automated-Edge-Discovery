@@ -442,7 +442,7 @@ metric_direction: maximize
 outcome_window:
   window_start_days: 1
   window_end_days: 24
-  window_unit: hours
+  window_unit: periods
   anchor: regime_identification_time
 window_role: out_of_sample
 labeling_scheme: forward_return
@@ -461,6 +461,8 @@ purge_embargo_policy:
   embargo_fraction: 0.15
   embargo_units: fraction
 ```
+
+In this example, one period represents a one-hour bar as defined by the data manifest or domain profile. OutcomeSpec core uses `periods` rather than adding an intraday-specific hours enum.
 
 Domain profile (separate artifact) would add: specific regime definitions (high/low volatility, bull/bear), exchange-specific factors, or custody and slippage models.
 
