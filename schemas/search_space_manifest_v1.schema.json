@@ -84,19 +84,24 @@
       "type": "object",
       "properties": {
         "autonomous_search": {
-          "type": "boolean"
+          "description": "Must be absent or false. Automated search is not permitted.",
+          "enum": [false]
         },
         "bayesian_optimization": {
-          "type": "boolean"
+          "description": "Must be absent or false. Bayesian optimization is not permitted.",
+          "enum": [false]
         },
         "genetic_programming": {
-          "type": "boolean"
+          "description": "Must be absent or false. Genetic programming is not permitted.",
+          "enum": [false]
         },
         "automated_promotion": {
-          "type": "boolean"
+          "description": "Must be absent or false. No promotion governance in place.",
+          "enum": [false]
         },
         "live_trading": {
-          "type": "boolean"
+          "description": "Must be absent or false. Live trading is not permitted.",
+          "enum": [false]
         }
       }
     }
