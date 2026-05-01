@@ -110,7 +110,7 @@ Every status change in the EdgeHypothesisRegistry requires a ReviewPacket with h
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `experiment_id` | string | Yes | Canonical ID. Format: `EXP-YYYY-NNNN`. Year from `decision_timestamp_policy.decision_point`. Sequential per year. |
+| `experiment_id` | string | Yes | Canonical ID. Format: `EXP-YYYY-NNNN`. Year is the record creation year from `created_at`. Sequential per year. `decision_timestamp_policy` controls anti-lookahead timing, not ID allocation. |
 | `experiment_version` | integer | Yes | Monotonically increasing version number. Start at 1. Increment on any field change after initial commit. |
 | `hypothesis_id` | string | Yes | Reference to EdgeHypothesisRegistry.hypothesis_id. Format: `HYP-YYYY-NNNN`. |
 | `search_space_id` | string | Yes | Reference to SearchSpaceManifest.search_space_id. Format: `SSM-YYYY-NNNN`. |
@@ -131,6 +131,8 @@ Every status change in the EdgeHypothesisRegistry requires a ReviewPacket with h
 |-------|------|----------|-------------|
 | `study_type` | enum | Yes | The class of study. Values: `event_study`, `calendar_seasonality`, `regime_conditioned_signal`, `cross_sectional_ranking`, `time_series_momentum`, `literature_replication`, `options_event_risk`, `custom`. |
 | `experiment_family` | string | No | Human-readable family label for grouping related experiments. Free text. |
+| `model_assessment_ref` | string | No | Reference to a ModelAssessmentSpec by ID. Optional in ExperimentSpec v1. The ModelAssessmentSpec remains the canonical assessment artifact; ExperimentSpec may reference an expected or planned assessment but does not approve or finalize it. |
+| `model_assessment_inline` | object | No | Inline ModelAssessmentSpec content. Optional in ExperimentSpec v1. Same constraints as `model_assessment_ref`. |
 | `entry_rule_ref` | string | No | Reference URI to the entry rule definition. Abstract — resolved by domain profile. |
 | `exit_rule_ref` | string | No | Reference URI to the exit rule definition. Abstract — resolved by domain profile. |
 | `outcome_spec_ref` | string | No | Reference to OutcomeSpec (future). Reserved for forward compatibility. |
@@ -268,7 +270,7 @@ These are enforced by `ExperimentSpec.prohibited_modes` and validated by the Exp
 
 ### 7c. Mode Constraints
 
-- `exploratory_agent_assisted` requires that the SearchSpaceManifest has `search_mode: exploratory` and that the agent's proposals are logged and human-approved before trial generation begins.
+- `exploratory_agent_assisted` requires that the referenced SearchSpaceManifest has `search_mode: exploratory_agent_assisted` and that the agent's proposals are logged and human-approved before trial generation begins.
 - No mode may produce trials that fall outside `allowed_trial_lanes`.
 - No mode may modify `EdgeHypothesisRegistry` records — trial generation is read-only with respect to the registry.
 
