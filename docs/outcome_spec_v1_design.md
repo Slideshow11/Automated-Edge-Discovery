@@ -135,8 +135,8 @@ These fields are required for OutcomeSpec v1. They define the core measurement t
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `window_start_days` | integer | Days relative to event or anchor (negative = before) |
-| `window_end_days` | integer | Days relative to event or anchor |
+| `window_start_days` | integer | Offset from anchor to window start, expressed in window_unit terms (negative = before anchor) |
+| `window_end_days` | integer | Offset from anchor to window end, expressed in window_unit terms |
 | `window_unit` | enum | days \| observations \| periods |
 | `anchor` | string | Event field name to anchor the window, e.g. "event_time_utc" |
 
