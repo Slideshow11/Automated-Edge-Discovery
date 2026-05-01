@@ -292,69 +292,106 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
 
     # 6. outcome_window must be an object
     ow = entry.get("outcome_window")
-    if ow is not None and isinstance(ow, dict):
-        # 6a. Required nested fields in outcome_window
-        for field in ("anchor",):
-            val = ow.get(field)
-            if val is None:
-                blockers.append(Blocker(
-                    "missing_required_field",
-                    "outcome_spec",
-                    f"outcome_window.{field}",
-                    f"outcome_window.{field} is required"
-                ))
-            elif isinstance(val, str) and val.strip() == "":
-                blockers.append(Blocker(
-                    "missing_required_field",
-                    "outcome_spec",
-                    f"outcome_window.{field}",
-                    f"outcome_window.{field} cannot be empty"
-                ))
-            elif val is not None and not isinstance(val, str):
-                blockers.append(Blocker(
-                    "invalid_type",
-                    "outcome_spec",
-                    f"outcome_window.{field}",
-                    f"outcome_window.{field} must be a string, got {type(val).__name__}"
-                ))
+    if ow is None:
+        pass  # Caught by required top-level check above
+    elif not isinstance(ow, dict):
+        blockers.append(Blocker(
+            "invalid_object",
+            "outcome_spec",
+            "outcome_window",
+            f"outcome_window must be an object, got {type(ow).__name__}"
+        ))
+    else:
+        # 6a. anchor — required, non-empty string
+        val = ow.get("anchor")
+        if val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "outcome_window.anchor",
+                "outcome_window.anchor is required"
+            ))
+        elif isinstance(val, str) and val.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "outcome_window.anchor",
+                "outcome_window.anchor cannot be empty"
+            ))
+        elif not isinstance(val, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "outcome_window.anchor",
+                f"outcome_window.anchor must be a string, got {type(val).__name__}"
+            ))
 
-        for field in ("window_start_days", "window_end_days"):
-            val = ow.get(field)
-            if val is not None:
-                if isinstance(val, bool) or not isinstance(val, int):
-                    blockers.append(Blocker(
-                        "invalid_type",
-                        "outcome_spec",
-                        f"outcome_window.{field}",
-                        f"outcome_window.{field} must be an integer, got {type(val).__name__}"
-                    ))
+        # 6b. window_start_days — required, integer
+        val = ow.get("window_start_days")
+        if val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "outcome_window.window_start_days",
+                "outcome_window.window_start_days is required"
+            ))
+        elif isinstance(val, bool) or not isinstance(val, int):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "outcome_window.window_start_days",
+                f"outcome_window.window_start_days must be an integer, got {type(val).__name__}"
+            ))
 
-        # window_unit enum
+        # 6c. window_end_days — required, integer
+        val = ow.get("window_end_days")
+        if val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "outcome_window.window_end_days",
+                "outcome_window.window_end_days is required"
+            ))
+        elif isinstance(val, bool) or not isinstance(val, int):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "outcome_window.window_end_days",
+                f"outcome_window.window_end_days must be an integer, got {type(val).__name__}"
+            ))
+
+        # 6d. window_unit — required, enum
         wu_val = ow.get("window_unit")
-        if wu_val is not None:
-            if not isinstance(wu_val, str):
-                blockers.append(Blocker(
-                    "invalid_enum",
-                    "outcome_spec",
-                    "outcome_window.window_unit",
-                    f"outcome_window.window_unit must be a string, got {type(wu_val).__name__}"
-                ))
-            elif wu_val == "hours":
-                blockers.append(Blocker(
-                    "invalid_enum",
-                    "outcome_spec",
-                    "outcome_window.window_unit",
-                    "outcome_window.window_unit 'hours' is not allowed"
-                ))
-            elif wu_val not in WINDOW_UNITS:
-                blockers.append(Blocker(
-                    "invalid_enum",
-                    "outcome_spec",
-                    "outcome_window.window_unit",
-                    f"outcome_window.window_unit '{wu_val}' not in allowed set"
-                ))
+        if wu_val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "outcome_window.window_unit",
+                "outcome_window.window_unit is required"
+            ))
+        elif not isinstance(wu_val, str):
+            blockers.append(Blocker(
+                "invalid_enum",
+                "outcome_spec",
+                "outcome_window.window_unit",
+                f"outcome_window.window_unit must be a string, got {type(wu_val).__name__}"
+            ))
+        elif wu_val == "hours":
+            blockers.append(Blocker(
+                "invalid_enum",
+                "outcome_spec",
+                "outcome_window.window_unit",
+                "outcome_window.window_unit 'hours' is not allowed"
+            ))
+        elif wu_val not in WINDOW_UNITS:
+            blockers.append(Blocker(
+                "invalid_enum",
+                "outcome_spec",
+                "outcome_window.window_unit",
+                f"outcome_window.window_unit '{wu_val}' not in allowed set"
+            ))
 
-        # Block legacy/wrong keys
+        # 6e. Block legacy/wrong keys
         for legacy in ("start_offset", "end_offset"):
             if legacy in ow:
                 blockers.append(Blocker(
@@ -458,77 +495,113 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
             f"evidence_role_requirements must be an object, got {type(err).__name__}"
         ))
 
-    # 14. purge_embargo_policy — must be an object with required nested fields
+    # 14. purge_embargo_policy — must be an object with all 4 required nested fields
     pep = entry.get("purge_embargo_policy")
-    if pep is not None and isinstance(pep, dict):
-        # purge_gap_days — integer >= 0
-        pgd = pep.get("purge_gap_days")
-        if pgd is not None:
-            if isinstance(pgd, bool) or not isinstance(pgd, int):
-                blockers.append(Blocker(
-                    "invalid_type",
-                    "outcome_spec",
-                    "purge_embargo_policy.purge_gap_days",
-                    f"purge_embargo_policy.purge_gap_days must be an integer, got {type(pgd).__name__}"
-                ))
-            elif pgd < 0:
-                blockers.append(Blocker(
-                    "invalid_value",
-                    "outcome_spec",
-                    "purge_embargo_policy.purge_gap_days",
-                    f"purge_embargo_policy.purge_gap_days must be >= 0, got {pgd}"
-                ))
-        # embargo_fraction — number in [0, 1]
-        ef = pep.get("embargo_fraction")
-        if ef is not None:
-            if isinstance(ef, bool) or not isinstance(ef, (int, float)):
-                blockers.append(Blocker(
-                    "invalid_type",
-                    "outcome_spec",
-                    "purge_embargo_policy.embargo_fraction",
-                    f"purge_embargo_policy.embargo_fraction must be a number, got {type(ef).__name__}"
-                ))
-            elif not isinstance(ef, bool):
-                if ef < 0 or ef > 1:
-                    blockers.append(Blocker(
-                        "invalid_value",
-                        "outcome_spec",
-                        "purge_embargo_policy.embargo_fraction",
-                        f"purge_embargo_policy.embargo_fraction must be in [0, 1], got {ef}"
-                    ))
-        # embargo_units enum
-        eu_val = pep.get("embargo_units")
-        if eu_val is not None:
-            if not isinstance(eu_val, str):
-                blockers.append(Blocker(
-                    "invalid_enum",
-                    "outcome_spec",
-                    "purge_embargo_policy.embargo_units",
-                    f"purge_embargo_policy.embargo_units must be a string, got {type(eu_val).__name__}"
-                ))
-            elif eu_val not in EMBARGO_UNITS:
-                blockers.append(Blocker(
-                    "invalid_enum",
-                    "outcome_spec",
-                    "purge_embargo_policy.embargo_units",
-                    f"purge_embargo_policy.embargo_units '{eu_val}' not in allowed set"
-                ))
-        # overlap_policy — string
-        op_val = pep.get("overlap_policy")
-        if op_val is not None and not isinstance(op_val, str):
-            blockers.append(Blocker(
-                "invalid_type",
-                "outcome_spec",
-                "purge_embargo_policy.overlap_policy",
-                f"purge_embargo_policy.overlap_policy must be a string, got {type(op_val).__name__}"
-            ))
-    elif pep is not None:
+    if pep is None:
+        pass  # Caught by required top-level check above
+    elif not isinstance(pep, dict):
         blockers.append(Blocker(
             "invalid_object",
             "outcome_spec",
             "purge_embargo_policy",
             f"purge_embargo_policy must be an object, got {type(pep).__name__}"
         ))
+    else:
+        # 14a. purge_gap_days — required, integer >= 0
+        pgd = pep.get("purge_gap_days")
+        if pgd is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "purge_embargo_policy.purge_gap_days",
+                "purge_embargo_policy.purge_gap_days is required"
+            ))
+        elif isinstance(pgd, bool) or not isinstance(pgd, int):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "purge_embargo_policy.purge_gap_days",
+                f"purge_embargo_policy.purge_gap_days must be an integer, got {type(pgd).__name__}"
+            ))
+        elif pgd < 0:
+            blockers.append(Blocker(
+                "invalid_value",
+                "outcome_spec",
+                "purge_embargo_policy.purge_gap_days",
+                f"purge_embargo_policy.purge_gap_days must be >= 0, got {pgd}"
+            ))
+
+        # 14b. embargo_fraction — required, number in [0, 1]
+        ef = pep.get("embargo_fraction")
+        if ef is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_fraction",
+                "purge_embargo_policy.embargo_fraction is required"
+            ))
+        elif isinstance(ef, bool) or not isinstance(ef, (int, float)):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_fraction",
+                f"purge_embargo_policy.embargo_fraction must be a number, got {type(ef).__name__}"
+            ))
+        elif ef < 0 or ef > 1:
+            blockers.append(Blocker(
+                "invalid_value",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_fraction",
+                f"purge_embargo_policy.embargo_fraction must be in [0, 1], got {ef}"
+            ))
+
+        # 14c. embargo_units — required, enum
+        eu_val = pep.get("embargo_units")
+        if eu_val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_units",
+                "purge_embargo_policy.embargo_units is required"
+            ))
+        elif not isinstance(eu_val, str):
+            blockers.append(Blocker(
+                "invalid_enum",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_units",
+                f"purge_embargo_policy.embargo_units must be a string, got {type(eu_val).__name__}"
+            ))
+        elif eu_val not in EMBARGO_UNITS:
+            blockers.append(Blocker(
+                "invalid_enum",
+                "outcome_spec",
+                "purge_embargo_policy.embargo_units",
+                f"purge_embargo_policy.embargo_units '{eu_val}' not in allowed set"
+            ))
+
+        # 14d. overlap_policy — required, non-empty string
+        op_val = pep.get("overlap_policy")
+        if op_val is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "purge_embargo_policy.overlap_policy",
+                "purge_embargo_policy.overlap_policy is required"
+            ))
+        elif isinstance(op_val, str) and op_val.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                "outcome_spec",
+                "purge_embargo_policy.overlap_policy",
+                "purge_embargo_policy.overlap_policy cannot be empty"
+            ))
+        elif not isinstance(op_val, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                "outcome_spec",
+                "purge_embargo_policy.overlap_policy",
+                f"purge_embargo_policy.overlap_policy must be a string, got {type(op_val).__name__}"
+            ))
 
     # 15. model_assessment_refs — list of MAS-YYYY-NNNN strings
     mas_refs = entry.get("model_assessment_refs")
