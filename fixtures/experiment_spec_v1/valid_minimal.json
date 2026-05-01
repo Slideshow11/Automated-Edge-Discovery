@@ -1,0 +1,40 @@
+{
+  "experiment_id": "EXP-2026-0001",
+  "experiment_version": 1,
+  "hypothesis_id": "HYP-2026-0001",
+  "search_space_id": "SSM-2026-0001",
+  "data_manifest_refs": [
+    "MAN-SEASONALITY-2020-LANE0"
+  ],
+  "study_type": "calendar_seasonality",
+  "experiment_family": "equity_calendar_anomalies",
+  "model_assessment_ref": "MAS-2026-0001",
+  "decision_timestamp_policy": {
+    "timestamp_ref": "reference_date",
+    "description": "Decision timestamp is the reference date of each calendar observation window."
+  },
+  "feature_cutoff_policy": {
+    "timestamp_ref": "trade_date",
+    "offset_direction": "before",
+    "offset_unit": "trading_days",
+    "offset_value": 1,
+    "description": "Feature data cuts off one trading day before the decision timestamp to prevent look-ahead bias."
+  },
+  "trial_generation_mode": "literature_replication",
+  "allowed_trial_lanes": [
+    "theory_first",
+    "confirmatory"
+  ],
+  "prohibited_modes": {
+    "autonomous_search": false,
+    "bayesian_optimization": false,
+    "genetic_programming": false,
+    "automated_promotion": false,
+    "automated_registry_mutation": false,
+    "live_trading": false,
+    "production_execution": false,
+    "gcru_integration": false
+  },
+  "created_at": "2026-04-15T00:00:00Z",
+  "reviewer": "dr_elliot_review_2026"
+}
