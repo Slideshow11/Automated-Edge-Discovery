@@ -116,6 +116,41 @@ do
   fi
 done
 
+# --- OutcomeSpec v1 fixture checks ---
+
+echo "=== OutcomeSpec valid fixture ==="
+python3 scripts/local/validate_outcome_spec.py \
+  fixtures/outcome_spec_v1/valid_minimal.json
+
+echo "=== OutcomeSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/outcome_spec_v1/invalid_benchmark_policy.json \
+  fixtures/outcome_spec_v1/invalid_computed_assessment_field.json \
+  fixtures/outcome_spec_v1/invalid_embargo_fraction_out_of_range.json \
+  fixtures/outcome_spec_v1/invalid_embargo_units.json \
+  fixtures/outcome_spec_v1/invalid_evidence_role_missing_field.json \
+  fixtures/outcome_spec_v1/invalid_evidence_role_non_boolean.json \
+  fixtures/outcome_spec_v1/invalid_labeling_scheme.json \
+  fixtures/outcome_spec_v1/invalid_metric_direction.json \
+  fixtures/outcome_spec_v1/invalid_missing_required.json \
+  fixtures/outcome_spec_v1/invalid_model_assessment_ref.json \
+  fixtures/outcome_spec_v1/invalid_outcome_spec_id.json \
+  fixtures/outcome_spec_v1/invalid_outcome_window_field_name.json \
+  fixtures/outcome_spec_v1/invalid_purge_gap_days_negative.json \
+  fixtures/outcome_spec_v1/invalid_return_basis.json \
+  fixtures/outcome_spec_v1/invalid_reviewer_type.json \
+  fixtures/outcome_spec_v1/invalid_trial_ledger_ref.json \
+  fixtures/outcome_spec_v1/invalid_window_end_policy.json \
+  fixtures/outcome_spec_v1/invalid_window_role.json \
+  fixtures/outcome_spec_v1/invalid_window_start_policy.json \
+  fixtures/outcome_spec_v1/invalid_window_unit.json
+do
+  if python3 scripts/local/validate_outcome_spec.py "$f"; then
+    echo "BLOCKER: invalid OutcomeSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -125,6 +160,7 @@ python3 -m pytest \
   tests/test_validate_model_assessment_spec.py \
   tests/test_validate_edge_hypothesis_registry.py \
   tests/test_validate_experiment_spec.py \
+  tests/test_validate_outcome_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
