@@ -65,6 +65,30 @@ do
   fi
 done
 
+# --- EdgeHypothesisRegistry v1 fixture checks ---
+
+echo "=== EdgeHypothesisRegistry valid fixture ==="
+python3 scripts/local/validate_edge_hypothesis_registry.py \
+  fixtures/edge_hypothesis_registry_v1/valid_minimal.jsonl
+
+echo "=== EdgeHypothesisRegistry invalid fixtures must fail ==="
+for f in \
+  fixtures/edge_hypothesis_registry_v1/invalid_approved_missing_review_refs.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_governance_true.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_hypothesis_id.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_missing_required.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_model_assessment_ref.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_registry_mutation_mode.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_search_space_ref.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_status.jsonl \
+  fixtures/edge_hypothesis_registry_v1/invalid_trial_ledger_ref.jsonl
+do
+  if python3 scripts/local/validate_edge_hypothesis_registry.py "$f"; then
+    echo "BLOCKER: invalid EdgeHypothesisRegistry fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -72,6 +96,7 @@ python3 -m pytest \
   tests/test_validate_trial_ledger.py \
   tests/test_validate_search_space_manifest.py \
   tests/test_validate_model_assessment_spec.py \
+  tests/test_validate_edge_hypothesis_registry.py \
   -q
 
 echo "Governance manifests validator checks completed."
