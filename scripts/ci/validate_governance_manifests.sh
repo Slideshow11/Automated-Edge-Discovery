@@ -89,6 +89,33 @@ do
   fi
 done
 
+# --- ExperimentSpec v1 fixture checks ---
+
+echo "=== ExperimentSpec valid fixture ==="
+python3 scripts/local/validate_experiment_spec.py \
+  fixtures/experiment_spec_v1/valid_minimal.json
+
+echo "=== ExperimentSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/experiment_spec_v1/invalid_missing_required.json \
+  fixtures/experiment_spec_v1/invalid_experiment_id.json \
+  fixtures/experiment_spec_v1/invalid_hypothesis_id.json \
+  fixtures/experiment_spec_v1/invalid_search_space_id.json \
+  fixtures/experiment_spec_v1/invalid_study_type.json \
+  fixtures/experiment_spec_v1/invalid_trial_generation_mode.json \
+  fixtures/experiment_spec_v1/invalid_allowed_trial_lane.json \
+  fixtures/experiment_spec_v1/invalid_prohibited_mode_true.json \
+  fixtures/experiment_spec_v1/invalid_data_manifest_refs_empty.json \
+  fixtures/experiment_spec_v1/invalid_model_assessment_ref.json \
+  fixtures/experiment_spec_v1/invalid_preearnings_core_field.json \
+  fixtures/experiment_spec_v1/invalid_missing_prohibited_mode_field.json
+do
+  if python3 scripts/local/validate_experiment_spec.py "$f"; then
+    echo "BLOCKER: invalid ExperimentSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -97,6 +124,7 @@ python3 -m pytest \
   tests/test_validate_search_space_manifest.py \
   tests/test_validate_model_assessment_spec.py \
   tests/test_validate_edge_hypothesis_registry.py \
+  tests/test_validate_experiment_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
