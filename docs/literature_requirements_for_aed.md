@@ -29,8 +29,8 @@ The table below maps each source to a core idea, the AED risk it addresses, the 
 | Source | Core Idea | AED Risk Addressed | Concrete AED Requirement | Affected Artifact | Validator / Schema Implication |
 |--------|-----------|--------------------|---------------------------|-------------------|-------------------------------|
 | Bailey, Borwein, López de Prado, Zhu — PBO | Backtest results can be entirely explained by overfitting rather than true signal | False discovery: AED approves a variant that has no real edge | Track `trial_family_id` linking all variants tested against the same hypothesis; require `n_tried` in ExperimentSpec; require failed variants to be preserved in TrialLedger, not deleted after selection | ExperimentSpec, TrialLedger | Schema field `trial_family_id` required; TrialLedger must preserve all variants |
-| Bailey et al. — PBO | Probability of backtest overfitting (PBO) is quantifiable via combinatorial enumeration | AED lacks a defensible false-positive rate for approved variants | Compute or estimate PBO for each selected variant; if not computed, record explicit `pbo_not_applicable_reason` free-text field | TrialLedger, ReviewPacket | Validator rule: selected variant must have either `pbo` (float 0–1) or `pbo_not_applicable_reason` populated |
-| Bailey et al. — DSR | Deflated Sharpe Ratio corrects for multiple testing and selection bias | Sharpe ratio inflation from trial selection is undetected | Compute or estimate DSR for selected variants; if not computed, record explicit `dsr_not_applicable_reason` | TrialLedger, ReviewPacket | Validator rule: selected variant with positive outcome must have either `dsr` or `dsr_not_applicable_reason` |
+| Bailey et al. — PBO | Probability of backtest overfitting (PBO) is quantifiable via combinatorial enumeration | AED lacks a defensible false-positive rate for approved variants | Compute or estimate PBO for each selected variant; if not computed, record explicit `pbo_not_applicable_reason` free-text field. **Note:** existing `ModelAssessmentSpec v1` uses `metrics.pbo`; future TrialLedger/ReviewPacket requirements use `pbo_estimate` as the canonical name unless a later MAS extension PR chooses an alias. | TrialLedger, ReviewPacket | Validator rule: selected variant must have either `pbo_estimate` (float 0–1) or `pbo_not_applicable_reason` populated |
+| Bailey et al. — DSR | Deflated Sharpe Ratio corrects for multiple testing and selection bias | Sharpe ratio inflation from trial selection is undetected | Compute or estimate DSR for each selected variant; if not computed, record explicit `dsr_not_applicable_reason`. **Note:** existing `ModelAssessmentSpec v1` uses `metrics.dsr`; future TrialLedger/ReviewPacket requirements use `dsr_estimate` as the canonical name unless a later MAS extension PR chooses an alias. | TrialLedger, ReviewPacket | Validator rule: selected variant with positive outcome must have either `dsr_estimate` (float) or `dsr_not_applicable_reason` |
 | López de Prado — AFML Ch. 4 | Purged cross-validation separates tuning and validation sets with a gap | Feature look-ahead: information from the validation window leaks into the training window | Declare `purge_gap_days` as an integer in OutcomeSpec or experiment config; validator enforces `purge_gap_days >= 0` | OutcomeSpec, ExperimentSpec | Schema field `purge_gap_days` (integer, min 0); embargo field must be declared |
 | López de Prado — AFML Ch. 4 | Embargo prevents leakage at the boundary between train and validation windows | Microstructure leakage at feature cutoff boundary | Declare `embargo_fraction` as a float (proportion of lookback window embargoed) in OutcomeSpec | OutcomeSpec | Schema field `embargo_fraction` (float 0–1); `feature_cutoff_policy` must reference this |
 | López de Prado — AFML Ch. 6 | Walk-forward analysis uses expanding or rolling windows for realistic performance estimates | In-sample bias from fixed train/test splits | Declare `walk_forward_type` as enum `{expanding, rolling}` and `n_splits` as integer in OutcomeSpec or experiment config | OutcomeSpec | Schema field `walk_forward_type`; `n_splits` (integer >= 2 for rolling, >= 1 for expanding) |
@@ -133,8 +133,8 @@ The purge gap between tuning and validation windows must be declared and enforce
 
 A fraction of the training lookback window is embargoed to prevent microstructure leakage at the boundary.
 
-- **Schema field:** `embargo_fraction` (float 0–0.5) in OutcomeSpec; `embargo_days` (integer, computed) derived from `embargo_fraction * training_window_days`
-- **Validator rule:** `embargo_fraction` must be in range [0, 0.5]; embargo period must not overlap with validation window
+- **Schema field:** `embargo_fraction` (float in range [0, 1]) in OutcomeSpec; `embargo_days` (integer, computed) derived from `embargo_fraction * training_window_days`
+- **Validator rule:** `embargo_fraction` must be in range [0, 1]; a stricter cap (e.g., [0, 0.5]) may be imposed by a future policy profile or validator profile but is not part of the base literature requirement
 
 ### 4c. Walk Forward Splits
 
@@ -376,7 +376,7 @@ ExperimentSpec v1 is largely complete for required identity fields, study type, 
 | `hypothesis_preregistered_at` | ISO 8601 | Backtest overfitting §3c |
 | `ssm_declaration_timestamp` | ISO 8601 | Backtest overfitting §3d |
 | `purge_gap_days` | integer >= 0 | Financial ML §4a |
-| `embargo_fraction` | float 0–0.5 | Financial ML §4b |
+| `embargo_fraction` | float [0, 1] | Financial ML §4b |
 | `walk_forward_type` | enum {expanding, rolling} | Financial ML §4c |
 | `n_splits` | integer >= 1 | Financial ML §4c |
 | `walk_forward_rebalance_policy` | enum {fixed_holdings, rebalanced} | Financial ML §4c |
@@ -406,7 +406,7 @@ OutcomeSpec v1 will declare the outcome labeling scheme, windows, and purged/emb
 | `outcome_window_start` | ISO 8601 | Financial ML §4g |
 | `outcome_window_end` | ISO 8601 | Financial ML §4g |
 | `purge_gap_days` | integer >= 0 | Financial ML §4a |
-| `embargo_fraction` | float 0–0.5 | Financial ML §4b |
+| `embargo_fraction` | float [0, 1] | Financial ML §4b |
 | `embargo_days` | integer (computed) | Financial ML §4b |
 | `walk_forward_type` | enum {expanding, rolling} | Financial ML §4c |
 | `n_splits` | integer >= 1 | Financial ML §4c |
