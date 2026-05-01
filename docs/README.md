@@ -18,7 +18,8 @@ AED currently uses a governance-first research workflow. The document map helps 
 - ModelAssessmentSpec v1 schema, validator, fixtures, and CI wiring complete (PRs #63, #64)
 - Governance validator milestone complete: all three manifests (TRL, SSM, MAS) enforced in CI
 - EdgeHypothesisRegistry v1 schema, fixtures, local validator, pytest, and CI wiring complete (PRs #66, #68, #71, #72, #73, #74)
-- ExperimentSpec v1 design complete (PR #78): domain-neutral experiment declaration schema, entry/exit rule abstractions, trial generation modes, stop rules
+- ExperimentSpec v1 design and JSON schema complete (PRs #78, #79, #80)
+- Literature requirements baseline established: requirements extraction from PBO, AFML, DOE, Expected Returns, CASI (PR #81)
 
 ## Document groups
 
@@ -36,6 +37,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/domain_neutral_aed_architecture.md | ArchitectureLayer | Defines AED core as domain-neutral: generalized abstractions, domain modules, agent tooling, and stop rules. | Active |
 | docs/domain_neutral_modularity_audit.md | ArchitectureLayer | Audit of existing codebase for pre-earnings/event/options coupling. Identifies governance layer as clean; engine/ as expected domain coupling. | Active |
 | docs/experiment_spec_v1_design.md | ArchitectureLayer | Domain-neutral experiment declaration schema: entry/exit rule abstractions, study types, trial generation modes, prohibited modes, stop rules, agent tooling constraints. | Active v1 design |
+| docs/literature_requirements_for_aed.md | RequirementsLayer | Requirements extraction from Bailey/Borwein/López de Prado/Zhu PBO, López de Prado AFML, Montgomery DOE, Ilmanen Expected Returns, Efron & Hastie CASI. Maps literature ideas to AED artifact implications for OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, ModelAssessmentSpec extensions, and ReviewPacket design. | Active requirements baseline |
 | docs/trial_ledger_v1_design.md | EnforcementLayer | Defines TrialLedger v1: append-only trial record, identity fields, source lanes, promotion rules, and governance states. | Active v1 design |
 | docs/search_space_manifest_v1_design.md | EnforcementLayer | Defines SearchSpaceManifest v1: pre-declared search boundaries, budget, constraints, forbidden modes, and burden accounting. | Active v1 design |
 | docs/trial_ledger_search_space_manifest_v1.md | EnforcementLayer | **Historical combined design note (PR #39).** For v1 authoritative references, use `docs/trial_ledger_v1_design.md` and `docs/search_space_manifest_v1_design.md`. | Historical |
@@ -67,13 +69,16 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - SearchSpaceManifest validator **complete** (PR #59): local validator, JSON schema, fixtures
 - ModelAssessmentSpec validator **complete** (PRs #63, #64): local validator, JSON schema, fixtures, CI wired
 - EdgeHypothesisRegistry v1 validator **complete** (PRs #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
-- ExperimentSpec v1 **design complete** (PR #78): schema, fixtures, validator, pytest, CI wiring deferred
-- Event/Options JSON schemas deferred
-- EventStudySpec / OptionsEventRiskSpec schemas deferred
+- ExperimentSpec v1 schema **complete** (PRs #78, #79, #80): JSON schema, all required fields, enums, prohibited modes
+- OutcomeSpec JSON schema deferred (requirements baseline in PR #81)
+- InstrumentUniverseSpec JSON schema deferred (requirements baseline in PR #81)
+- EventStudySpec JSON schema deferred
+- OptionsEventRiskSpec JSON schema deferred
 - MechanismDiscoveryReport schema deferred
-- ExperimentSpec schema deferred (design complete PR #78)
-- OutcomeSpec schema deferred
-- InstrumentUniverseSpec schema deferred
+- PostHocTheoryNote schema deferred
+- PreEarningsProfile v1 as a domain-specific research module deferred
+- ModelAssessmentSpec extensions deferred (uncertainty quantification, bootstrap, robustness, null model — requirements baseline in PR #81)
+- ReviewPacket design deferred (requirements baseline in PR #81)
 - autonomous search and optimization tooling are locked until trial accounting exists
 
 ## Canonical terms
@@ -93,6 +98,14 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - JumpRiskReport
 - ReviewPacket
 - ManualDecision
+- OutcomeSpec
+- InstrumentUniverseSpec
+- TrialFamilyID
+- PBO
+- DSR
+- purged_cross_validation
+- embargo_policy
+- walk_forward_analysis
 
 ## Current Event/Options milestone
 
