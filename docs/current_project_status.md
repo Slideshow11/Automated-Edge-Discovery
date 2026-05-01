@@ -83,6 +83,8 @@ The project is not yet a live trading or production system.
 - PR #100 OutcomeSpec validator nested object enforcement fix
 - PR #101 OutcomeSpec validator tests
 - PR #102 OutcomeSpec CI helper wiring
+- PR #103 docs: OutcomeSpec v1 milestone status cleanup (PRs #94–#102)
+- PR #104 InstrumentUniverseSpec v1 design: domain-neutral instrument eligibility universe declaration, inclusion/exclusion rules, liquidity policy, domain-neutral multi-asset-class support
 
 ## Current stop rules
 
@@ -104,7 +106,7 @@ The project is not yet a live trading or production system.
 - OptionsEventRiskSpec JSON schema deferred
 - ExperimentSpec v1 **complete** (PRs #78, #79, #80, #82, #86, #87, #88, #89, #90): design, schema, fixtures, local validator, tests, CI wired
 - OutcomeSpec v1 **complete** (PRs #94–#102): design, schema, fixtures, local validator, tests, CI wired
-- InstrumentUniverseSpec v1 schema deferred
+- InstrumentUniverseSpec v1 design **complete** (PR #104): schema deferred
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
 - TrialLedger validator **complete** (PR #58): schema, fixtures, tests, CI wired
 - SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
@@ -114,7 +116,7 @@ The project is not yet a live trading or production system.
 ## Next planned PRs
 
 - OutcomeSpec v1 milestone **complete** (PRs #94–#102): design, schema, fixtures, local validator, tests, CI wired
-- InstrumentUniverseSpec v1 design
+- InstrumentUniverseSpec v1 design **complete** (PR #104): schema next
 - InstrumentUniverseSpec v1 schema
 - InstrumentUniverseSpec v1 fixtures
 - InstrumentUniverseSpec v1 validator and CI wiring
