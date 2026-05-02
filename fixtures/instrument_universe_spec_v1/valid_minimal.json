@@ -1,0 +1,43 @@
+{
+  "instrument_universe_id": "IUS-2026-0001",
+  "universe_version": 1,
+  "universe_family": "us_liquid_equity",
+  "asset_classes": ["equity"],
+  "data_manifest_refs": ["DM-2026-0001"],
+  "universe_construction_policy": "rule_based_filter",
+  "membership_timing_policy": "fixed_snapshot",
+  "inclusion_rules": [
+    {
+      "rule_id": "IRL-2026-0001",
+      "field": "exchange",
+      "operator": "in",
+      "value": ["NYSE", "NASDAQ"],
+      "timing": "decision_time",
+      "reason": "Limit to major U.S. listed exchanges"
+    }
+  ],
+  "exclusion_rules": [
+    {
+      "rule_id": "IRL-2026-0002",
+      "field": "market_cap_usd",
+      "operator": "lt",
+      "value": 1000000000,
+      "timing": "decision_time",
+      "reason": "Exclude micro-cap instruments with insufficient liquidity"
+    }
+  ],
+  "liquidity_policy": {
+    "min_price": 5.0,
+    "min_dollar_volume": 5000000,
+    "max_bid_ask_spread": 0.01,
+    "liquidity_lookback_days": 20,
+    "liquidity_measure_timing": "decision_time"
+  },
+  "survivorship_policy": "point_in_time",
+  "tradability_policy": "tradable_through_window",
+  "corporate_action_policy": "total_return_adjusted",
+  "created_at": "2026-05-01T00:00:00Z",
+  "reviewer": {
+    "name": "dr_elliot_review_2026"
+  }
+}
