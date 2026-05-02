@@ -402,7 +402,8 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
         ))
         return blockers
 
-    # 1. Required top-level fields — missing, null, or empty/whitespace-only string fails
+    # 1. Required top-level fields — missing, null, or empty/whitespace-only string fails.
+    #    created_at additionally requires a string type (not number, boolean, etc.).
     for field in REQUIRED_TOP_LEVEL:
         val = entry.get(field)
         if val is None:
@@ -418,6 +419,14 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                 "event_study_spec",
                 field,
                 f"{field} is required and cannot be empty"
+            ))
+        elif field == "created_at" and not isinstance(val, str):
+            # created_at is declared as a string in the schema; reject numbers, bools, etc.
+            blockers.append(Blocker(
+                "invalid_type",
+                "event_study_spec",
+                field,
+                f"{field} must be a string, got {type(val).__name__}"
             ))
 
     # Cannot safely continue if required fields are missing
@@ -707,50 +716,66 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
     return blockers
 
 
-def validate_file(path: Path, format: str = "text") -> int:
+def validate_file(path: Path) -> tuple[List[Blocker], int]:
     """
-    Validate a single file. Returns 0 if valid, 1 if blockers found, 2 on error.
+    Validate a single file. Returns (blockers, exit_code).
+    Exit codes: 0=valid, 1=blockers, 2=error.
+    Does not print — caller handles output based on format.
     """
     try:
         text = path.read_text(encoding="utf-8")
     except Exception as e:
         print(f"[ERROR] {path}: could not read file: {e}", file=sys.stderr)
-        return 2
+        return ([], 2)
 
     try:
         entry = json.loads(text)
     except Exception as e:
         print(f"[ERROR] {path}: could not parse JSON: {e}", file=sys.stderr)
-        return 2
+        return ([], 2)
 
     blockers = validate_record(entry)
-
-    if not blockers:
-        print(f"[OK] {path}")
-        return 0
-
-    print(f"[FAIL] {path}")
-    for b in blockers:
-        if format == "json":
-            print(json.dumps(b.to_dict(), indent=2))
-        else:
-            print(f"  [{b.code}] {b.object_type}.{b.field}")
-            print(f"        {b.message}")
-    return 1
+    return (blockers, 0 if not blockers else 1)
 
 
 def main():
     args = parse_args()
+    per_file: Dict[str, tuple[List[Blocker], int]] = {}
     any_blockers = False
     any_error = False
 
     for path_str in args.files:
         path = Path(path_str)
-        result = validate_file(path, args.format)
-        if result == 1:
+        blockers, code = validate_file(path)
+        per_file[str(path)] = (blockers, code)
+        if code == 1:
             any_blockers = True
-        elif result == 2:
+        elif code == 2:
             any_error = True
+
+    if args.format == "json":
+        out = {
+            "files": {
+                str(path): {
+                    "blockers_count": len(blks),
+                    "blockers": [b.to_dict() for b in blks],
+                }
+                for path, (blks, _) in per_file.items()
+            },
+            "total_blockers": sum(len(blks) for blks, _ in per_file.values()),
+        }
+        print(json.dumps(out, indent=2))
+    else:
+        for path_str, (blks, code) in per_file.items():
+            if code == 2:
+                continue  # error already printed to stderr
+            if not blks:
+                print(f"[OK] {path_str}")
+            else:
+                print(f"[FAIL] {path_str}")
+                for b in blks:
+                    print(f"  [{b.code}] {b.object_type}.{b.field}")
+                    print(f"        {b.message}")
 
     if any_error:
         sys.exit(2)
