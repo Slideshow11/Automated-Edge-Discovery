@@ -1,0 +1,26 @@
+{
+  "instrument_universe_id": "IUS-2026-0011",
+  "universe_version": 1,
+  "universe_family": "us_liquid_equity",
+  "asset_classes": ["equity"],
+  "data_manifest_refs": ["DM-2026-0001"],
+  "universe_construction_policy": "rule_based_filter",
+  "membership_timing_policy": "fixed_snapshot",
+  "inclusion_rules": [
+    {
+      "rule_id": "IRL-2026-0011",
+      "field": "exchange",
+      "operator": "between",
+      "value": ["NYSE", "NASDAQ"]
+    }
+  ],
+  "exclusion_rules": [],
+  "liquidity_policy": {},
+  "survivorship_policy": "point_in_time",
+  "tradability_policy": "tradable_through_window",
+  "corporate_action_policy": "total_return_adjusted",
+  "created_at": "2026-05-01T00:00:00Z",
+  "reviewer": {
+    "name": "dr_elliot_review_2026"
+  }
+}
