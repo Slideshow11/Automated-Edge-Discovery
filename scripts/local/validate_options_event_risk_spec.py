@@ -37,6 +37,10 @@ GAP_EXPOSURE_POLICIES = {
     "allow_gap_hold", "prohibit_gap_hold", "exit_before_event_anchor",
     "enter_after_event_anchor", "custom"
 }
+QUOTE_QUALITY_METHODS = {
+    "require_bid_ask", "allow_mid_only", "reject_stale_quotes",
+    "require_open_interest", "custom"
+}
 
 # Required top-level fields
 REQUIRED_TOP_LEVEL = [
@@ -703,27 +707,114 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                 f"{field} must be an object, got {type(val).__name__}"
             ))
 
-    # 13. contract_selection_policy — validate known sub-fields if present
+    # 13. contract_selection_policy — required selection_method; optional sub-fields
     csp = entry.get("contract_selection_policy")
     if isinstance(csp, dict):
-        _check_object_string_field(csp, "selection_method", blockers, f"{ot}.contract_selection_policy")
+        # Required nested field
+        csp_sm = csp.get("selection_method")
+        if csp_sm is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "contract_selection_policy.selection_method",
+                "contract_selection_policy.selection_method is required"
+            ))
+        elif not isinstance(csp_sm, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                ot,
+                "contract_selection_policy.selection_method",
+                "contract_selection_policy.selection_method must be a string"
+            ))
+        elif csp_sm.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "contract_selection_policy.selection_method",
+                "contract_selection_policy.selection_method cannot be empty"
+            ))
+        # Optional sub-fields
         _check_object_list_of_numbers(csp, "delta_targets", blockers, f"{ot}.contract_selection_policy")
         _check_object_integer_field(csp, "contract_count_limit", blockers, f"{ot}.contract_selection_policy", min_value=0)
-        _check_object_string_field(csp, "selection_priority", blockers, f"{ot}.contract_selection_policy")
+        # selection_priority — must be a list of strings if present (schema type: array)
+        sp_val = csp.get("selection_priority")
+        if sp_val is not None:
+            if not isinstance(sp_val, list):
+                blockers.append(Blocker(
+                    "invalid_list",
+                    ot,
+                    "contract_selection_policy.selection_priority",
+                    "contract_selection_policy.selection_priority must be a list"
+                ))
+            else:
+                for i, item in enumerate(sp_val):
+                    if not isinstance(item, str):
+                        blockers.append(Blocker(
+                            "invalid_list_item_type",
+                            ot,
+                            f"contract_selection_policy.selection_priority[{i}]",
+                            f"contract_selection_policy.selection_priority items must be strings"
+                        ))
         _check_object_string_field(csp, "tie_break_policy", blockers, f"{ot}.contract_selection_policy")
 
-    # 14. expiry_selection_policy — validate known sub-fields if present
+    # 14. expiry_selection_policy — required selection_method; optional sub-fields
     esp = entry.get("expiry_selection_policy")
     if isinstance(esp, dict):
-        _check_object_string_field(esp, "selection_method", blockers, f"{ot}.expiry_selection_policy")
+        # Required nested field
+        esp_sm = esp.get("selection_method")
+        if esp_sm is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "expiry_selection_policy.selection_method",
+                "expiry_selection_policy.selection_method is required"
+            ))
+        elif not isinstance(esp_sm, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                ot,
+                "expiry_selection_policy.selection_method",
+                "expiry_selection_policy.selection_method must be a string"
+            ))
+        elif esp_sm.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "expiry_selection_policy.selection_method",
+                "expiry_selection_policy.selection_method cannot be empty"
+            ))
+        # Optional sub-fields
         _check_object_integer_field(esp, "min_dte", blockers, f"{ot}.expiry_selection_policy", min_value=0)
         _check_object_integer_field(esp, "max_dte", blockers, f"{ot}.expiry_selection_policy", min_value=0)
         _check_object_list_of_integers(esp, "expiry_ranks", blockers, f"{ot}.expiry_selection_policy", min_value=0)
 
-    # 15. moneyness_selection_policy — validate known sub-fields if present
+    # 15. moneyness_selection_policy — required target_type; optional sub-fields
     msp = entry.get("moneyness_selection_policy")
     if isinstance(msp, dict):
-        _check_object_string_field(msp, "target_type", blockers, f"{ot}.moneyness_selection_policy")
+        # Required nested field
+        msp_tt = msp.get("target_type")
+        if msp_tt is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "moneyness_selection_policy.target_type",
+                "moneyness_selection_policy.target_type is required"
+            ))
+        elif not isinstance(msp_tt, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                ot,
+                "moneyness_selection_policy.target_type",
+                "moneyness_selection_policy.target_type must be a string"
+            ))
+        elif msp_tt.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                ot,
+                "moneyness_selection_policy.target_type",
+                "moneyness_selection_policy.target_type cannot be empty"
+            ))
+        # Optional sub-fields
         _check_object_number_field(msp, "percent_moneyness", blockers, f"{ot}.moneyness_selection_policy", min_value=0)
 
     # 16. liquidity_policy — validate known sub-fields if present
@@ -757,6 +848,30 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
     # 18. quote_quality_policy — validate known sub-fields if present
     qqp = entry.get("quote_quality_policy")
     if isinstance(qqp, dict):
+        # quality_method — optional string enum; reject invalid values
+        qm_val = qqp.get("quality_method")
+        if qm_val is not None:
+            if not isinstance(qm_val, str):
+                blockers.append(Blocker(
+                    "invalid_type",
+                    ot,
+                    "quote_quality_policy.quality_method",
+                    "quote_quality_policy.quality_method must be a string"
+                ))
+            elif qm_val.strip() == "":
+                blockers.append(Blocker(
+                    "missing_required_field",
+                    ot,
+                    "quote_quality_policy.quality_method",
+                    "quote_quality_policy.quality_method cannot be empty"
+                ))
+            elif qm_val not in QUOTE_QUALITY_METHODS:
+                blockers.append(Blocker(
+                    "invalid_field",
+                    ot,
+                    "quote_quality_policy.quality_method",
+                    f"quote_quality_policy.quality_method must be one of: {', '.join(sorted(QUOTE_QUALITY_METHODS))}"
+                ))
         _check_object_boolean_field(qqp, "require_bid_ask", blockers, f"{ot}.quote_quality_policy")
         _check_object_boolean_field(qqp, "allow_mid_only", blockers, f"{ot}.quote_quality_policy")
         _check_object_boolean_field(qqp, "reject_stale_quotes", blockers, f"{ot}.quote_quality_policy")
