@@ -292,16 +292,18 @@ Defines the overall strategy structure.
 
 ### 5g. pricing_policy
 
-Defines how option prices are determined for fill estimation.
+Defines how option fills are priced for estimation. `pricing_policy` is an **object** — it is not itself an enum. The primary pricing basis is declared via `fill_price_basis` inside the object:
 
-|| Value | Description |
-|-------|-------------|
+|| `fill_price_basis` value | Description |
+|---------------------------|-------------|
 | `mid` | Midpoint of bid and ask |
 | `bid` | Bid price (conservative) |
 | `ask` | Ask price (conservative) |
 | `conservative_fill` | Worst-case within spread for the direction of trade |
 | `spread_penalized_mid` | Midpoint minus a spread penalty in basis points |
 | `custom` | Domain-specific pricing defined in a domain profile |
+
+The `pricing_policy` object may also carry `spread_penalty_bps`, `commission_model_ref`, `slippage_model_ref`, `quote_timestamp_policy`, `entry_quote_policy`, `exit_quote_policy`, `partial_fill_policy`, and `multi_leg_execution_policy` as optional fields.
 
 ### 5h. execution_timing_policy
 
@@ -638,8 +640,8 @@ expiry_selection_policy:
 moneyness_selection_policy:
   target_type: percent_moneyness
   percent_moneyness: 1.0
-option_side_policy: calls_and_puts
-strategy_structure_policy: straddle
+option_side_policy: straddle
+strategy_structure_policy: volatility_structure
 gap_exposure_policy: allow_gap_hold
 liquidity_policy:
   min_option_price: 0.10
