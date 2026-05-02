@@ -143,7 +143,7 @@ Domain profiles do not modify EventStudySpec. They provide domain-specific event
 
 ## 3. Proposed Required Fields
 
-These fields are proposed for EventStudySpec v1. Implementation is deferred to a later schema PR.
+These fields define EventStudySpec v1. Implementation is complete (PRs #112–#117).
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -714,15 +714,15 @@ Hermes and OpenClaw **may not**:
 
 ## 12. Validation Roadmap
 
-EventStudySpec v1 follows the same implementation pattern as InstrumentUniverseSpec v1:
+EventStudySpec v1 implementation is complete through PR #117:
 
 1. **Design doc** (PR #112) — describes the field set, enums, window structures, and timing controls (this document)
-2. **Schema** (future PR) — JSON schema for EventStudySpec v1
-3. **Fixtures** (future PR) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
-4. **Validator** (future PR) — `scripts/local/validate_event_study_spec.py` implementing the schema rules
-5. **Tests** (future PR) — pytest coverage of all validator paths
-6. **CI wiring** (future PR) — add to `scripts/ci/validate_governance_manifests.sh`
-7. **Docs status update** (future PR) — update `docs/current_project_status.md` and `docs/README.md`
+2. **Schema** (PR #113) — JSON schema for EventStudySpec v1
+3. **Fixtures** (PR #114) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
+4. **Validator** (PR #115) — `scripts/local/validate_event_study_spec.py` implementing the schema rules
+5. **Tests** (PR #116) — pytest coverage of all validator paths
+6. **CI wiring** (PR #117) — added to `scripts/ci/validate_governance_manifests.sh`
+7. **Docs status update** (PR #118) — updated `docs/current_project_status.md` and `docs/README.md`
 
 This roadmap follows the same pattern used for TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, and InstrumentUniverseSpec.
 

@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design and implementation is complete. All seven governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec) are implemented, tested, and CI-wired. The governance validator milestone is complete through PR #110.
+The enforcement-layer design and implementation is complete. All eight governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, EventStudySpec) are implemented, tested, and CI-wired. The governance validator milestone is complete through PR #117.
 
 The project is not yet an autonomous discovery engine.
 
@@ -92,6 +92,11 @@ The project is not yet a live trading or production system.
 - PR #109 InstrumentUniverseSpec validator tests
 - PR #110 InstrumentUniverseSpec CI helper wiring
 - PR #112 EventStudySpec v1 design: domain-neutral event-alignment contract, window structures, timing controls, leakage policies, event family taxonomy
+- PR #113 EventStudySpec v1 schema
+- PR #114 EventStudySpec v1 fixtures
+- PR #115 EventStudySpec v1 local validator
+- PR #116 EventStudySpec validator tests
+- PR #117 EventStudySpec CI helper wiring
 
 ## Current stop rules
 
@@ -109,7 +114,7 @@ The project is not yet a live trading or production system.
 - ModelAssessmentSpec validator **complete** (PRs #63, #64): schema, fixtures, tests, CI wired
 - MechanismDiscoveryReport JSON schema deferred
 - PostHocTheoryNote JSON schema deferred
-- EventStudySpec JSON schema deferred
+- EventStudySpec v1 **complete** (PRs #112–#117): design, schema, fixtures, local validator, tests, CI wired
 - OptionsEventRiskSpec JSON schema deferred
 - ExperimentSpec v1 **complete** (PRs #78, #79, #80, #82, #86, #87, #88, #89, #90): design, schema, fixtures, local validator, tests, CI wired
 - OutcomeSpec v1 **complete** (PRs #94–#102): design, schema, fixtures, local validator, tests, CI wired
@@ -117,18 +122,19 @@ The project is not yet a live trading or production system.
 - Event/Options contract validator **complete** (PRs #50–#55): local validator, edge-case fixtures, strict_contract_profile, CI job
 - TrialLedger validator **complete** (PR #58): schema, fixtures, tests, CI wired
 - SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
-- Governance validators CI-wired **complete** (PRs #60, #64, #74, #90, #102)
+- Governance validators CI-wired **complete** (PRs #60, #64, #74, #90, #102, #117)
 - EdgeHypothesisRegistry v1 **complete** (PRs #66, #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
 
 ## Next planned PRs
 
 - InstrumentUniverseSpec v1 **complete** (PRs #104–#110): design, schema, fixtures, local validator, tests, CI wired
-- EventStudySpec v1 design **complete** (PR #112): schema next
-- EventStudySpec v1 schema
-- EventStudySpec fixtures
-- EventStudySpec validator and CI wiring
-- OptionsEventRiskSpec v1 design and schema
+- EventStudySpec v1 **complete** (PRs #112–#117): design, schema, fixtures, local validator, tests, CI wired
+- OptionsEventRiskSpec v1 design
+- OptionsEventRiskSpec v1 schema
+- OptionsEventRiskSpec fixtures
+- OptionsEventRiskSpec validator, tests, and CI wiring
 - PreEarningsProfile v1 as a domain-specific research module
+- First thin real-data runner slice
 
 Longer-horizon deferred work:
 - MechanismDiscoveryReport schema
@@ -176,12 +182,11 @@ See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.
 
 **Still deferred:**
 - Event/Options JSON schemas deferred
-- EventStudySpec JSON schema
 - OptionsEventRiskSpec JSON schema
 
 ## Governance validators
 
-All seven governance validators are implemented, tested, and CI-wired:
+All eight governance validators are implemented, tested, and CI-wired:
 
 - **TrialLedger** (PR #58): `scripts/local/validate_trial_ledger.py`, schema, 5 fixtures, 21 tests. CI: `governance-validators` job.
 - **SearchSpaceManifest** (PR #59): `scripts/local/validate_search_space_manifest.py`, schema, 6 fixtures, 29 tests. CI: `governance-validators` job.
@@ -190,7 +195,8 @@ All seven governance validators are implemented, tested, and CI-wired:
 - **ExperimentSpec** (PRs #78, #79, #80, #82, #86, #87, #88, #89, #90): `scripts/local/validate_experiment_spec.py`, schema, 12 fixtures, 77 tests. CI: `governance-validators` job.
 - **OutcomeSpec** (PRs #94–#102): `scripts/local/validate_outcome_spec.py`, schema, 21 fixtures, 111 tests. CI: `governance-validators` job.
 - **InstrumentUniverseSpec** (PRs #104–#110): `scripts/local/validate_instrument_universe_spec.py`, schema, 21 fixtures, 126 tests. CI: `governance-validators` job.
+- **EventStudySpec** (PRs #112–#117): `scripts/local/validate_event_study_spec.py`, schema, 22 fixtures, 106 tests. CI: `governance-validators` job.
 
-Total CI-enforced validator tests: 433 governance via `governance-validators` job + 18 Event/Options via `validator` job = **451 total**.
+Total CI-enforced validator tests: 539 governance via `governance-validators` job + 18 Event/Options via `validator` job = **557 total**.
 
 ## Operational notes
