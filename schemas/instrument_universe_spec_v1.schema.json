@@ -611,7 +611,17 @@
     },
     "reviewer": {
       "description": "Human reviewer metadata for this universe declaration. Must be an object with at minimum a name field.",
-      "type": "object"
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": {
+          "description": "Reviewer name or identifier. Required.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
     }
-  }
+  },
+  "additionalProperties": false
 }
