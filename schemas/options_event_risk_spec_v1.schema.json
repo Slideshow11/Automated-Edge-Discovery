@@ -1,0 +1,806 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "OptionsEventRiskSpec v1",
+  "description": "Domain-neutral options event-risk specification: declares option universe policy, contract selection, expiry and moneyness selection, strategy structure, liquidity and quote-quality requirements, pricing and execution policy, and gap-exposure rules for options event-risk experiments. Does not include pre-earnings-specific, statistical-assessment, or computed-output fields.",
+  "type": "object",
+  "required": [
+    "options_event_risk_spec_id",
+    "options_event_risk_version",
+    "event_study_spec_ref",
+    "instrument_universe_ref",
+    "outcome_spec_refs",
+    "option_universe_policy",
+    "contract_selection_policy",
+    "expiry_selection_policy",
+    "moneyness_selection_policy",
+    "option_side_policy",
+    "strategy_structure_policy",
+    "liquidity_policy",
+    "pricing_policy",
+    "execution_timing_policy",
+    "gap_exposure_policy",
+    "quote_quality_policy",
+    "created_at",
+    "reviewer"
+  ],
+  "properties": {
+    "options_event_risk_spec_id": {
+      "description": "Canonical options event-risk specification identifier. Format: OER-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^OER-[0-9]{4}-[0-9]{4}$"
+    },
+    "options_event_risk_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_study_spec_ref": {
+      "description": "Reference to an EventStudySpec providing event-alignment structure. Format: EVS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^EVS-[0-9]{4}-[0-9]{4}$"
+    },
+    "instrument_universe_ref": {
+      "description": "Reference to an InstrumentUniverseSpec for eligible underlying instruments. Format: IUS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^IUS-[0-9]{4}-[0-9]{4}$"
+    },
+    "outcome_spec_refs": {
+      "description": "References to OutcomeSpecs that measure outcomes in this options experiment. Format: OUT-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^OUT-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "option_universe_policy": {
+      "description": "Asset class of options universe.",
+      "type": "string",
+      "enum": [
+        "listed_equity_options",
+        "index_options",
+        "etf_options",
+        "futures_options",
+        "crypto_options",
+        "custom"
+      ]
+    },
+    "contract_selection_policy": {
+      "description": "How option contracts are selected from the eligible universe (delta, moneyness, strike, premium).",
+      "type": "object",
+      "required": [
+        "selection_method"
+      ],
+      "properties": {
+        "selection_method": {
+          "description": "Method used to select option contracts.",
+          "type": "string",
+          "enum": [
+            "delta_bucket",
+            "moneyness_bucket",
+            "strike_offset",
+            "premium_range",
+            "nearest_liquid_contract",
+            "custom"
+          ]
+        },
+        "delta_targets": {
+          "description": "Target delta values for contract selection (e.g., [0.50, 0.30, 0.10]).",
+          "type": "array",
+          "items": {
+            "type": "number"
+          }
+        },
+        "moneyness_bands": {
+          "description": "Moneyness bands for OTM and ITM contracts.",
+          "type": "object",
+          "properties": {
+            "otm_pct": {
+              "description": "Out-of-the-money percent offsets from spot (e.g., [5, 10, 15]).",
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            },
+            "itm_pct": {
+              "description": "In-the-money percent offsets from spot (e.g., [5, 10]).",
+              "type": "array",
+              "items": {
+                "type": "number"
+              }
+            }
+          }
+        },
+        "dte_range": {
+          "description": "Days-to-expiry range constraint.",
+          "type": "object",
+          "properties": {
+            "min_dte": {
+              "description": "Minimum days to expiry.",
+              "type": "integer"
+            },
+            "max_dte": {
+              "description": "Maximum days to expiry.",
+              "type": "integer"
+            }
+          }
+        },
+        "expiry_ranks": {
+          "description": "Expiry ranks to include (1 = nearest, 2 = next, etc.).",
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "strike_selection_rule": {
+          "description": "Rule for selecting strikes relative to spot or forward.",
+          "type": "object",
+          "properties": {
+            "offset_type": {
+              "description": "Offset is measured from spot or forward.",
+              "type": "string",
+              "enum": [
+                "from_spot",
+                "from_forward",
+                "custom"
+              ]
+            },
+            "offset_value": {
+              "description": "Absolute offset value.",
+              "type": "number"
+            }
+          }
+        },
+        "premium_range": {
+          "description": "Minimum and maximum option premium.",
+          "type": "object",
+          "properties": {
+            "min_premium": {
+              "description": "Minimum option premium in dollars.",
+              "type": "number",
+              "minimum": 0
+            },
+            "max_premium": {
+              "description": "Maximum option premium in dollars.",
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "option_side": {
+          "description": "Which option side is selected.",
+          "type": "string",
+          "enum": [
+            "calls_only",
+            "puts_only",
+            "calls_and_puts",
+            "straddle",
+            "strangle",
+            "vertical_spread",
+            "calendar_spread",
+            "custom"
+          ]
+        },
+        "contract_count_limit": {
+          "description": "Maximum number of contracts per observation.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "selection_priority": {
+          "description": "Priority order when multiple contracts meet criteria (e.g., [\"nearest_expiry\", \"highest_oi\"]).",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tie_break_policy": {
+          "description": "How ties are broken when multiple contracts are equally ranked.",
+          "type": "string",
+          "enum": [
+            "highest_oi",
+            "nearest_expiry",
+            "widest_spread",
+            "custom"
+          ]
+        }
+      }
+    },
+    "expiry_selection_policy": {
+      "description": "How option expiry is selected relative to the event anchor.",
+      "type": "object",
+      "required": [
+        "selection_method"
+      ],
+      "properties": {
+        "selection_method": {
+          "description": "Method used to select expiry relative to event anchor.",
+          "type": "string",
+          "enum": [
+            "nearest_after_event",
+            "nearest_before_event",
+            "fixed_dte_range",
+            "expiry_rank",
+            "monthly_only",
+            "weekly_allowed",
+            "custom"
+          ]
+        },
+        "dte_range": {
+          "description": "Days-to-expiry range when fixed_dte_range is selected.",
+          "type": "object",
+          "properties": {
+            "min_dte": {
+              "description": "Minimum days to expiry.",
+              "type": "integer"
+            },
+            "max_dte": {
+              "description": "Maximum days to expiry.",
+              "type": "integer"
+            }
+          }
+        },
+        "expiry_ranks": {
+          "description": "Which expiry ranks to include (applied when expiry_rank is selected).",
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "exclude_expiry_ranks": {
+          "description": "Expiry ranks to exclude.",
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        },
+        "weekly_allowed": {
+          "description": "Whether weekly expiries are permitted in addition to monthlies.",
+          "type": "boolean"
+        },
+        "monthly_only": {
+          "description": "Restrict to monthly expiries only.",
+          "type": "boolean"
+        }
+      }
+    },
+    "moneyness_selection_policy": {
+      "description": "How moneyness is targeted and bounded.",
+      "type": "object",
+      "required": [
+        "target_type"
+      ],
+      "properties": {
+        "target_type": {
+          "description": "Method for targeting moneyness.",
+          "type": "string",
+          "enum": [
+            "atm",
+            "otm",
+            "itm",
+            "delta_targeted",
+            "percent_moneyness",
+            "custom"
+          ]
+        },
+        "delta_target": {
+          "description": "Target delta when delta_targeted is selected.",
+          "type": "number"
+        },
+        "percent_moneyness": {
+          "description": "Percent of spot or forward price (e.g., 1.05 for 105% moneyness).",
+          "type": "number"
+        },
+        "moneyness_bounds": {
+          "description": "Optional min/max moneyness bounds.",
+          "type": "object",
+          "properties": {
+            "min_moneyness": {
+              "description": "Minimum moneyness (e.g., 0.90 for 90%).",
+              "type": "number"
+            },
+            "max_moneyness": {
+              "description": "Maximum moneyness (e.g., 1.10 for 110%).",
+              "type": "number"
+            }
+          }
+        },
+        "reference_price": {
+          "description": "Price used as reference for moneyness calculation.",
+          "type": "string",
+          "enum": [
+            "spot",
+            "forward",
+            "nearest_future",
+            "custom"
+          ]
+        }
+      }
+    },
+    "option_side_policy": {
+      "description": "Which option sides are included in the event-risk experiment.",
+      "type": "string",
+      "enum": [
+        "calls_only",
+        "puts_only",
+        "calls_and_puts",
+        "straddle",
+        "strangle",
+        "vertical_spread",
+        "calendar_spread",
+        "custom"
+      ]
+    },
+    "strategy_structure_policy": {
+      "description": "Overall strategy structure.",
+      "type": "string",
+      "enum": [
+        "single_leg",
+        "two_leg_spread",
+        "multi_leg_spread",
+        "delta_neutral",
+        "volatility_structure",
+        "custom"
+      ]
+    },
+    "liquidity_policy": {
+      "description": "Minimum liquidity requirements for option contracts.",
+      "type": "object",
+      "properties": {
+        "min_option_price": {
+          "description": "Minimum option price in dollars; reject below.",
+          "type": "number",
+          "minimum": 0
+        },
+        "max_option_price": {
+          "description": "Maximum option price in dollars; reject above.",
+          "type": "number",
+          "minimum": 0
+        },
+        "min_open_interest": {
+          "description": "Minimum open interest in contracts.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_volume": {
+          "description": "Minimum average daily volume.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_bid_ask_spread_abs": {
+          "description": "Maximum absolute bid-ask spread in dollars.",
+          "type": "number",
+          "minimum": 0
+        },
+        "max_bid_ask_spread_pct": {
+          "description": "Maximum spread as a fraction of mid-price (e.g., 0.10 = 10%).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "max_quote_age_seconds": {
+          "description": "Maximum age of a valid quote in seconds.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "require_nbbo": {
+          "description": "Whether NBBO must be respected.",
+          "type": "boolean"
+        },
+        "stale_quote_policy": {
+          "description": "How stale quotes are handled.",
+          "type": "string",
+          "enum": [
+            "reject",
+            "use_last_valid",
+            "interpolate",
+            "custom"
+          ]
+        },
+        "missing_greeks_policy": {
+          "description": "How missing greeks values are handled.",
+          "type": "string",
+          "enum": [
+            "reject",
+            "use_model",
+            "interpolate",
+            "custom"
+          ]
+        },
+        "liquidity_not_applicable_reason": {
+          "description": "Human-readable explanation when liquidity policy is waived.",
+          "type": "string"
+        }
+      }
+    },
+    "pricing_policy": {
+      "description": "How option fills are priced for estimation.",
+      "type": "object",
+      "properties": {
+        "fill_price_basis": {
+          "description": "Basis for fill price estimation.",
+          "type": "string",
+          "enum": [
+            "mid",
+            "bid",
+            "ask",
+            "conservative_fill",
+            "spread_penalized_mid",
+            "custom"
+          ]
+        },
+        "spread_penalty_bps": {
+          "description": "Spread penalty in basis points when spread_penalized_mid is selected.",
+          "type": "number",
+          "minimum": 0
+        },
+        "commission_model_ref": {
+          "description": "Reference to a commission model artifact.",
+          "type": "string"
+        },
+        "slippage_model_ref": {
+          "description": "Reference to a slippage model artifact.",
+          "type": "string"
+        },
+        "quote_timestamp_policy": {
+          "description": "Which timestamp is used for quote lookup.",
+          "type": "string",
+          "enum": [
+            "decision_time",
+            "anchor_time",
+            "settle_time",
+            "custom"
+          ]
+        },
+        "entry_quote_policy": {
+          "description": "Quote policy for entry fills.",
+          "type": "string",
+          "enum": [
+            "mid",
+            "conservative",
+            "aggressive",
+            "custom"
+          ]
+        },
+        "exit_quote_policy": {
+          "description": "Quote policy for exit fills.",
+          "type": "string",
+          "enum": [
+            "mid",
+            "conservative",
+            "aggressive",
+            "custom"
+          ]
+        },
+        "partial_fill_policy": {
+          "description": "How partial fills are handled.",
+          "type": "string",
+          "enum": [
+            "fill_available",
+            "reject",
+            "scale_quantity",
+            "custom"
+          ]
+        },
+        "multi_leg_execution_policy": {
+          "description": "How multi-leg orders are executed.",
+          "type": "string",
+          "enum": [
+            "legs_simultaneous",
+            "legs_sequential",
+            "net_price",
+            "custom"
+          ]
+        }
+      }
+    },
+    "execution_timing_policy": {
+      "description": "When fills are evaluated relative to the event anchor and decision timestamp.",
+      "type": "string",
+      "enum": [
+        "decision_timestamp",
+        "event_anchor_relative",
+        "session_open",
+        "session_close",
+        "next_tradable_quote",
+        "custom"
+      ]
+    },
+    "gap_exposure_policy": {
+      "description": "Whether the strategy may hold across the event anchor and how gap risk is handled.",
+      "type": "string",
+      "enum": [
+        "allow_gap_hold",
+        "prohibit_gap_hold",
+        "exit_before_event_anchor",
+        "enter_after_event_anchor",
+        "custom"
+      ]
+    },
+    "quote_quality_policy": {
+      "description": "Quote quality enforcement requirements for option data.",
+      "type": "object",
+      "properties": {
+        "quality_method": {
+          "description": "Primary quote quality requirement.",
+          "type": "string",
+          "enum": [
+            "require_bid_ask",
+            "allow_mid_only",
+            "reject_stale_quotes",
+            "require_open_interest",
+            "custom"
+          ]
+        },
+        "max_quote_age_seconds": {
+          "description": "Maximum quote age before rejection.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "min_spread_pct": {
+          "description": "Minimum spread as fraction of mid (to detect locked markets).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "require_open_interest": {
+          "description": "Whether open interest check is required.",
+          "type": "boolean"
+        },
+        "min_open_interest_contracts": {
+          "description": "Open interest threshold in contracts.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "underlying_price_ref": {
+      "description": "Reference to a price data manifest for underlying spot or futures prices.",
+      "type": "string"
+    },
+    "volatility_surface_ref": {
+      "description": "Reference to a volatility surface artifact for IV and IV percentile lookups.",
+      "type": "string"
+    },
+    "greeks_policy": {
+      "description": "Delta, gamma, theta, vega, rho computation and reporting requirements.",
+      "type": "object",
+      "properties": {
+        "compute_delta": {
+          "type": "boolean"
+        },
+        "compute_gamma": {
+          "type": "boolean"
+        },
+        "compute_theta": {
+          "type": "boolean"
+        },
+        "compute_vega": {
+          "type": "boolean"
+        },
+        "compute_rho": {
+          "type": "boolean"
+        },
+        "reporting_currency": {
+          "type": "string"
+        }
+      }
+    },
+    "iv_policy": {
+      "description": "Implied volatility handling: IV rank, IV percentile, IV crush modeling.",
+      "type": "object",
+      "properties": {
+        "iv_rank_min": {
+          "description": "Minimum IV rank for entry (0-100).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "iv_rank_max": {
+          "description": "Maximum IV rank for entry (0-100).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "iv_percentile_min": {
+          "description": "Minimum IV percentile for entry (0-100).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "iv_percentile_max": {
+          "description": "Maximum IV percentile for entry (0-100).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "iv_crush_model_ref": {
+          "description": "Reference to an IV crush model artifact.",
+          "type": "string"
+        }
+      }
+    },
+    "skew_policy": {
+      "description": "Volatility skew handling across moneyness.",
+      "type": "object",
+      "properties": {
+        "skew_measure": {
+          "type": "string",
+          "enum": [
+            "skew_ratio",
+            "butterfly_spread",
+            "risk_reversal",
+            "custom"
+          ]
+        },
+        "skew_adjustment": {
+          "type": "boolean"
+        }
+      }
+    },
+    "spread_construction_policy": {
+      "description": "Bid-ask spread construction and spread penalty application.",
+      "type": "object",
+      "properties": {
+        "spread_model": {
+          "type": "string",
+          "enum": [
+            "bbo",
+            "mid",
+            "last_traded",
+            "custom"
+          ]
+        },
+        "apply_spread_penalty": {
+          "type": "boolean"
+        }
+      }
+    },
+    "hedge_policy": {
+      "description": "Delta hedging, gamma scalping, and portfolio-level hedging instructions.",
+      "type": "object",
+      "properties": {
+        "delta_hedge_frequency": {
+          "type": "string",
+          "enum": [
+            "continuous",
+            "end_of_day",
+            "threshold_based",
+            "custom"
+          ]
+        },
+        "delta_hedge_threshold": {
+          "description": "Delta deviation threshold that triggers a hedge.",
+          "type": "number"
+        },
+        "gamma_scalping_enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "assignment_exercise_policy": {
+      "description": "How early assignment or exercise risk is handled.",
+      "type": "string",
+      "enum": [
+        "auto_hedge",
+        "allow_assignment",
+        "exercised_only",
+        "custom"
+      ]
+    },
+    "corporate_action_policy": {
+      "description": "How corporate actions affect option contracts.",
+      "type": "string",
+      "enum": [
+        "adjust_strikes",
+        "adjust_quantity",
+        "use_adjusted",
+        "reject_on_ca",
+        "custom"
+      ]
+    },
+    "expiration_calendar_ref": {
+      "description": "Reference to an expiration calendar artifact for index and equity options.",
+      "type": "string"
+    },
+    "event_session_policy": {
+      "description": "Which market session(s) the options experiment applies to.",
+      "type": "string",
+      "enum": [
+        "regular",
+        "extended",
+        "pre_market",
+        "after_hours",
+        "overnight",
+        "all_sessions",
+        "custom"
+      ]
+    },
+    "domain_profile_refs": {
+      "description": "References to domain profiles providing domain-specific options enrichments.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "preearnings_profile_refs": {
+      "description": "References to PreEarningsProfiles for pre-earnings-specific options semantics. BMO/AMC session rules and DPE targeting live in PreEarningsProfile, not in core fields.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runner_output_refs": {
+      "description": "References to runner outputs produced under this options event-risk spec.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "review_packet_refs": {
+      "description": "References to ReviewPackets that evaluated hypotheses using this spec.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extension_hooks": {
+      "description": "Reserved for future artifact references only. Must not contain computed statistics.",
+      "type": "object",
+      "properties": {
+        "domain_profile_extension_refs": {
+          "description": "Extended references to domain profile specifications.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runner_output_extension_refs": {
+          "description": "Extended references to runner outputs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_packet_extension_refs": {
+          "description": "Extended references to ReviewPacket records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "preearnings_profile_extension_refs": {
+          "description": "Extended references to PreEarningsProfile records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "notes": {
+      "description": "Human-readable notes about the options event-risk design rationale.",
+      "type": "string"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp of options event-risk declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer metadata for this declaration. Must be an object with at minimum a name field.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Reviewer name or identifier. Required.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
