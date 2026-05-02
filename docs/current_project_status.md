@@ -91,6 +91,7 @@ The project is not yet a live trading or production system.
 - PR #108 InstrumentUniverseSpec v1 local validator
 - PR #109 InstrumentUniverseSpec validator tests
 - PR #110 InstrumentUniverseSpec CI helper wiring
+- PR #112 EventStudySpec v1 design: domain-neutral event-alignment contract, window structures, timing controls, leakage policies, event family taxonomy
 
 ## Current stop rules
 
@@ -122,7 +123,7 @@ The project is not yet a live trading or production system.
 ## Next planned PRs
 
 - InstrumentUniverseSpec v1 **complete** (PRs #104–#110): design, schema, fixtures, local validator, tests, CI wired
-- EventStudySpec v1 design
+- EventStudySpec v1 design **complete** (PR #112): schema next
 - EventStudySpec v1 schema
 - EventStudySpec fixtures
 - EventStudySpec validator and CI wiring
