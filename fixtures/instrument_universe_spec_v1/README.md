@@ -31,12 +31,13 @@ This directory contains JSON fixtures for validating InstrumentUniverseSpec v1 r
 | `invalid_liquidity_open_interest_type.json` | **Invalid** | `liquidity_policy.min_open_interest` is `false` (boolean); `type: number` violated. |
 | `invalid_data_availability_coverage_out_of_range.json` | **Invalid** | `data_availability_policy.required_feature_coverage` is `1.5` and `required_outcome_coverage` is `-0.5`; bounds `[0, 1]` violated. |
 | `invalid_reviewer_type.json` | **Invalid** | `reviewer` is a string; must be an object per schema. |
+| `invalid_reviewer_empty_object.json` | **Invalid** | `reviewer` is an empty object `{}`; `name` field is required. |
 | `invalid_reference_array_type.json` | **Invalid** | `universe_snapshot_refs`, `runner_output_refs`, and `domain_profile_refs` are strings; must be arrays. |
-| `invalid_computed_field.json` | **Invalid** (future validator) | Contains `signals` field which is a forbidden computed field per design §9. Currently passes JSON Schema due to no `additionalProperties: false` restriction; requires future Python validator to enforce. |
+| `invalid_computed_field.json` | **Invalid** | Contains `signals` field which is a forbidden computed field per design §9. Blocked by `additionalProperties: false` at schema root. |
 
 ## Schema-Enforceable vs Future-Validator-Only
 
-### JSON Schema-Enforceable Now (17 fixtures)
+### JSON Schema-Enforceable Now (18 fixtures)
 
 These fixtures fail against the current JSON Schema without any Python validation:
 
@@ -59,13 +60,13 @@ These fixtures fail against the current JSON Schema without any Python validatio
 | `invalid_liquidity_open_interest_type.json` | `type: number` on `liquidity_policy.min_open_interest` |
 | `invalid_data_availability_coverage_out_of_range.json` | `minimum: 0, maximum: 1` on coverage fields |
 | `invalid_reviewer_type.json` | `type: object` on `reviewer` |
+| `invalid_reviewer_empty_object.json` | `required: ["name"]` on `reviewer` |
 | `invalid_reference_array_type.json` | `type: array` on ref array fields |
+| `invalid_computed_field.json` | `additionalProperties: false` at root — `signals` not declared |
 
-### Future Python Validator Only (1 fixture)
+### Future Python Validator Only (0 fixtures)
 
-| Fixture | Why Schema Doesn't Catch It |
-|---------|----------------------------|
-| `invalid_computed_field.json` | The schema has no `additionalProperties: false`. Extra fields like `signals` are accepted by JSON Schema validation. A future Python validator implementing the boundary rules from design §9 will catch this. |
+*No fixtures require Python-level validation at this time. All known invalid cases are now caught by JSON Schema constraints.*
 
 ## InstrumentUniverseSpec Boundary
 
@@ -83,4 +84,4 @@ InstrumentUniverseSpec **does not own**:
 - **`selected_variant_id`, `n_tried`, `trial_family_id`** — trial accounting, belong in TrialLedger
 - **ReviewPacket decisions** — belong in ReviewPacket/EdgeHypothesisRegistry
 
-The `invalid_computed_field.json` fixture exists to document this boundary and will be enforced by the future Python validator once implemented.
+The `invalid_computed_field.json` fixture documents this boundary and is now enforced by `additionalProperties: false` at the schema root. A future Python validator may add further cross-field boundary checks.
