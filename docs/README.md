@@ -23,6 +23,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - OutcomeSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #94–#102)
 - InstrumentUniverseSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #104–#110)
 - EventStudySpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #112–#117)
+- OptionsEventRiskSpec v1 design complete (PR #119): schema, fixtures, validator, tests, CI wiring pending
 
 ## Document groups
 
@@ -43,6 +44,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/outcome_spec_v1_design.md | ArchitectureLayer | OutcomeSpec v1: outcome metric declaration, outcome_window, labeling_scheme, return_basis, benchmark_policy, observation_count_policy, evidence_role_requirements, purge_embargo_policy, computed-assessment field restrictions. | Active v1 design |
 | docs/instrument_universe_spec_v1_design.md | ArchitectureLayer | InstrumentUniverseSpec v1: domain-neutral instrument eligibility universe, inclusion/exclusion rules, liquidity policy, survivorship policy, multi-asset-class support via domain_profile_refs. | Active v1 design |
 | docs/event_study_spec_v1_design.md | ArchitectureLayer | EventStudySpec v1: domain-neutral event-alignment contract, event families, window structures, timing controls, leakage policies, event source priority, collision/dedup rules. | Active v1 design |
+| docs/options_event_risk_spec_v1_design.md | ArchitectureLayer | OptionsEventRiskSpec v1: domain-specific options event-risk specialization of EventStudySpec, contract selection, liquidity/pricing policies, gap exposure, domain-neutral pre-earnings profile hook, boundary with EventStudySpec and PreEarningsProfile. | Active v1 design |
 | docs/literature_requirements_for_aed.md | RequirementsLayer | Requirements extraction from Bailey/Borwein/López de Prado/Zhu PBO, López de Prado AFML, Montgomery DOE, Ilmanen Expected Returns, Efron & Hastie CASI. Maps literature ideas to AED artifact implications for OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, ModelAssessmentSpec extensions, and ReviewPacket design. | Active requirements baseline |
 | docs/trial_ledger_v1_design.md | EnforcementLayer | Defines TrialLedger v1: append-only trial record, identity fields, source lanes, promotion rules, and governance states. | Active v1 design |
 | docs/search_space_manifest_v1_design.md | EnforcementLayer | Defines SearchSpaceManifest v1: pre-declared search boundaries, budget, constraints, forbidden modes, and burden accounting. | Active v1 design |
