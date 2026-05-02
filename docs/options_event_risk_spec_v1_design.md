@@ -179,7 +179,7 @@ These fields define OptionsEventRiskSpec v1. Implementation is deferred to a lat
 | `gap_exposure_policy` | enum | Whether strategy may hold across event anchor: allow_gap_hold, prohibit_gap_hold, exit_before_event_anchor, enter_after_event_anchor, custom. See §5i. |
 | `quote_quality_policy` | object | NBBO requirement, stale quote handling, missing greeks policy. See §5j. |
 | `created_at` | string | ISO 8601 timestamp of options event-risk declaration |
-| `reviewer` | object | Reviewer identity with `reviewer_id` (string) and optional `reviewer_name` (string) |
+| `reviewer` | object | Human reviewer metadata. Must contain `name` as a non-empty string. Additional metadata such as `reviewer_id`, `reviewer_name`, `affiliation`, or `review_timestamp` may be included inside the reviewer object. |
 
 ---
 
