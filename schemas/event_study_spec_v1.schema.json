@@ -1,0 +1,421 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "EventStudySpec v1",
+  "description": "Domain-neutral event-alignment specification: declares event family, anchor policies, timing constraints, window structures, leakage controls, and event-quality rules for experiments. Does not include options-specific, pre-earnings-specific, or computed-assessement fields.",
+  "type": "object",
+  "required": [
+    "event_study_spec_id",
+    "event_study_version",
+    "event_family",
+    "event_source_refs",
+    "event_anchor_policy",
+    "event_timestamp_policy",
+    "decision_timestamp_policy",
+    "pre_event_window",
+    "post_event_window",
+    "leakage_policy",
+    "event_deduplication_policy",
+    "event_collision_policy",
+    "missing_event_time_policy",
+    "calendar_policy",
+    "created_at",
+    "reviewer"
+  ],
+  "properties": {
+    "event_study_spec_id": {
+      "description": "Canonical event study specification identifier. Format: EVS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^EVS-[0-9]{4}-[0-9]{4}$"
+    },
+    "event_study_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_family": {
+      "description": "Category of event studied.",
+      "type": "string",
+      "enum": [
+        "earnings",
+        "macro_release",
+        "central_bank_decision",
+        "dividend",
+        "split",
+        "index_rebalance",
+        "product_launch",
+        "crypto_protocol_event",
+        "commodity_inventory",
+        "regulatory_event",
+        "custom"
+      ]
+    },
+    "event_source_refs": {
+      "description": "References to DataManifest entries that provide event timestamps and event metadata.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "event_anchor_policy": {
+      "description": "How the event anchor timestamp is determined.",
+      "type": "string",
+      "enum": [
+        "event_timestamp",
+        "first_tradable_session_after_event",
+        "last_tradable_session_before_event",
+        "next_observation_after_event",
+        "previous_observation_before_event",
+        "custom"
+      ]
+    },
+    "event_timestamp_policy": {
+      "description": "Acceptable timestamp precision for event times.",
+      "type": "string",
+      "enum": [
+        "exact_timestamp_required",
+        "date_only_allowed",
+        "session_only_allowed",
+        "inferred_timestamp_allowed",
+        "custom"
+      ]
+    },
+    "decision_timestamp_policy": {
+      "description": "When the decision timestamp falls relative to event publication.",
+      "type": "string",
+      "enum": [
+        "before_event_publication",
+        "after_event_publication",
+        "prior_session_close",
+        "same_session_open",
+        "next_session_open",
+        "custom"
+      ]
+    },
+    "pre_event_window": {
+      "description": "Pre-event observation window definition. Sign of offsets is not enforced here; use the validator for start/end order checks and sign requirements.",
+      "type": "object",
+      "required": [
+        "start_offset",
+        "end_offset",
+        "units"
+      ],
+      "properties": {
+        "start_offset": {
+          "description": "Offset from the event anchor to the window start (negative for pre-event windows, zero or positive for post-event windows).",
+          "type": "integer"
+        },
+        "end_offset": {
+          "description": "Offset from the event anchor to the window end.",
+          "type": "integer"
+        },
+        "units": {
+          "description": "Unit of measurement for offsets.",
+          "type": "string",
+          "enum": [
+            "calendar_days",
+            "trading_days",
+            "observations",
+            "periods"
+          ]
+        },
+        "include_event_anchor": {
+          "description": "Whether the event anchor itself is included in the window. Default: false for pre-event, false for post-event.",
+          "type": "boolean"
+        },
+        "window_role": {
+          "description": "Semantic role of this window.",
+          "type": "string"
+        }
+      }
+    },
+    "post_event_window": {
+      "description": "Post-event observation window definition. start_offset may be zero (anchor included) or positive. Sign and order checks are delegated to the validator.",
+      "type": "object",
+      "required": [
+        "start_offset",
+        "end_offset",
+        "units"
+      ],
+      "properties": {
+        "start_offset": {
+          "description": "Offset from the event anchor to the window start. Zero or positive for post-event windows.",
+          "type": "integer"
+        },
+        "end_offset": {
+          "description": "Offset from the event anchor to the window end.",
+          "type": "integer"
+        },
+        "units": {
+          "description": "Unit of measurement for offsets.",
+          "type": "string",
+          "enum": [
+            "calendar_days",
+            "trading_days",
+            "observations",
+            "periods"
+          ]
+        },
+        "include_event_anchor": {
+          "description": "Whether the event anchor itself is included in the window.",
+          "type": "boolean"
+        },
+        "window_role": {
+          "description": "Semantic role of this window.",
+          "type": "string"
+        }
+      }
+    },
+    "leakage_policy": {
+      "description": "Controls to prevent lookahead bias around event timing.",
+      "type": "string",
+      "enum": [
+        "strict_no_lookahead",
+        "allow_known_calendar_only",
+        "allow_public_timestamp_only",
+        "custom"
+      ]
+    },
+    "event_deduplication_policy": {
+      "description": "How duplicate events in the same window are resolved.",
+      "type": "string",
+      "enum": [
+        "keep_first",
+        "keep_last",
+        "merge_same_day",
+        "merge_same_timestamp",
+        "reject_duplicates",
+        "custom"
+      ]
+    },
+    "event_collision_policy": {
+      "description": "How overlapping events from different sources are resolved.",
+      "type": "string",
+      "enum": [
+        "allow_overlapping_windows",
+        "reject_overlapping_windows",
+        "keep_highest_priority_event",
+        "merge_event_cluster",
+        "custom"
+      ]
+    },
+    "missing_event_time_policy": {
+      "description": "How events with missing or ambiguous timestamps are handled.",
+      "type": "string",
+      "enum": [
+        "reject_event",
+        "use_date_close",
+        "use_date_open",
+        "infer_from_session",
+        "custom"
+      ]
+    },
+    "calendar_policy": {
+      "description": "How window offsets map to calendar or trading time.",
+      "type": "string",
+      "enum": [
+        "calendar_days",
+        "trading_days",
+        "observations",
+        "custom"
+      ]
+    },
+    "event_type_filter": {
+      "description": "Restrict events to specific subtypes within event_family.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "event_importance_filter": {
+      "description": "Minimum importance or significance threshold for events to include.",
+      "type": "object",
+      "properties": {
+        "min_importance_score": {
+          "type": "number"
+        },
+        "importance_scale": {
+          "type": "string"
+        }
+      }
+    },
+    "event_source_priority": {
+      "description": "Priority order for event sources when multiple sources report the same event.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "event_quality_filter": {
+      "description": "Filters on event data quality metrics.",
+      "type": "object",
+      "properties": {
+        "min_source_reliability_score": {
+          "description": "Minimum source reliability score [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "allow_revisions": {
+          "description": "Whether revised event times are allowed.",
+          "type": "boolean"
+        },
+        "max_revisions": {
+          "description": "Maximum number of revisions allowed before exclusion.",
+          "type": "integer"
+        },
+        "require_announcement_time": {
+          "description": "Whether the exact announcement time must be known.",
+          "type": "boolean"
+        }
+      }
+    },
+    "timezone_policy": {
+      "description": "Timezone convention for event timestamps.",
+      "type": "string",
+      "enum": [
+        "utc",
+        "exchange_local",
+        "macro_release_country",
+        "custom"
+      ]
+    },
+    "trading_calendar_ref": {
+      "description": "Reference to a trading calendar artifact for session-bound event studies.",
+      "type": "string"
+    },
+    "market_session_policy": {
+      "description": "Which market session(s) an event applies to.",
+      "type": "string",
+      "enum": [
+        "regular",
+        "extended",
+        "pre_market",
+        "after_hours",
+        "overnight",
+        "all_sessions",
+        "custom"
+      ]
+    },
+    "event_lag_policy": {
+      "description": "How to handle events discovered after the fact (late announcements, revisions).",
+      "type": "object",
+      "properties": {
+        "max_event_lag_days": {
+          "description": "Maximum lag in days before an event is considered stale.",
+          "type": "integer"
+        },
+        "lag_policy": {
+          "description": "How lag is handled.",
+          "type": "string",
+          "enum": [
+            "reject_late_events",
+            "allow_with_flag",
+            "infer_from_revision_history",
+            "custom"
+          ]
+        }
+      }
+    },
+    "announcement_status_policy": {
+      "description": "How to handle preliminary, revised, or confirmed event announcements.",
+      "type": "string",
+      "enum": [
+        "confirmed_only",
+        "preliminary_allowed",
+        "revised_allowed",
+        "all_statuses",
+        "custom"
+      ]
+    },
+    "domain_profile_refs": {
+      "description": "References to domain profiles providing domain-specific event-alignment enrichments.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "outcome_spec_refs": {
+      "description": "References to OutcomeSpecs that measure outcomes within this event study's windows.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^OUT-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "instrument_universe_refs": {
+      "description": "References to InstrumentUniverseSpecs applicable to events in this study.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^IUS-[0-9]{4}-[0-9]{4}$"
+      }
+    },
+    "runner_output_refs": {
+      "description": "References to runner outputs produced under this event study.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "review_packet_refs": {
+      "description": "References to ReviewPackets that evaluated hypotheses using this event study.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extension_hooks": {
+      "description": "Reserved for future artifact references only. Must not contain computed statistics.",
+      "type": "object",
+      "properties": {
+        "domain_profile_extension_refs": {
+          "description": "Extended references to domain profile specifications.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runner_output_extension_refs": {
+          "description": "Extended references to runner outputs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_packet_extension_refs": {
+          "description": "Extended references to ReviewPacket records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "notes": {
+      "description": "Human-readable notes about event study design rationale.",
+      "type": "string"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp of event study declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer metadata for this event study declaration. Must be an object with at minimum a name field.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "properties": {
+        "name": {
+          "description": "Reviewer name or identifier. Required.",
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": false
+}
