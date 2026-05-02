@@ -186,6 +186,43 @@ do
   fi
 done
 
+# --- EventStudySpec v1 fixture checks ---
+
+echo "=== EventStudySpec valid fixture ==="
+python3 scripts/local/validate_event_study_spec.py \
+  fixtures/event_study_spec_v1/valid_minimal.json
+
+echo "=== EventStudySpec invalid fixtures must fail ==="
+for f in \
+  fixtures/event_study_spec_v1/invalid_boundary_field.json \
+  fixtures/event_study_spec_v1/invalid_calendar_policy.json \
+  fixtures/event_study_spec_v1/invalid_decision_timestamp_policy.json \
+  fixtures/event_study_spec_v1/invalid_event_anchor_policy.json \
+  fixtures/event_study_spec_v1/invalid_event_collision_policy.json \
+  fixtures/event_study_spec_v1/invalid_event_deduplication_policy.json \
+  fixtures/event_study_spec_v1/invalid_event_family.json \
+  fixtures/event_study_spec_v1/invalid_event_source_refs_empty.json \
+  fixtures/event_study_spec_v1/invalid_event_study_spec_id.json \
+  fixtures/event_study_spec_v1/invalid_event_timestamp_policy.json \
+  fixtures/event_study_spec_v1/invalid_extension_hooks_unknown_field.json \
+  fixtures/event_study_spec_v1/invalid_instrument_universe_ref.json \
+  fixtures/event_study_spec_v1/invalid_leakage_policy.json \
+  fixtures/event_study_spec_v1/invalid_missing_event_time_policy.json \
+  fixtures/event_study_spec_v1/invalid_missing_required.json \
+  fixtures/event_study_spec_v1/invalid_outcome_spec_ref.json \
+  fixtures/event_study_spec_v1/invalid_post_event_window_missing_field.json \
+  fixtures/event_study_spec_v1/invalid_pre_event_window_missing_field.json \
+  fixtures/event_study_spec_v1/invalid_reviewer_empty_object.json \
+  fixtures/event_study_spec_v1/invalid_reviewer_type.json \
+  fixtures/event_study_spec_v1/invalid_window_include_anchor_type.json \
+  fixtures/event_study_spec_v1/invalid_window_units.json
+do
+  if python3 scripts/local/validate_event_study_spec.py "$f"; then
+    echo "BLOCKER: invalid EventStudySpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -197,6 +234,7 @@ python3 -m pytest \
   tests/test_validate_experiment_spec.py \
   tests/test_validate_outcome_spec.py \
   tests/test_validate_instrument_universe_spec.py \
+  tests/test_validate_event_study_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
