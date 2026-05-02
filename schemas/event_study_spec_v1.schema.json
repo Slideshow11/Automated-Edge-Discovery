@@ -390,7 +390,8 @@
             "type": "string"
           }
         }
-      }
+      },
+      "additionalProperties": false
     },
     "notes": {
       "description": "Human-readable notes about event study design rationale.",
