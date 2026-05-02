@@ -130,7 +130,7 @@ Domain profiles do not modify InstrumentUniverseSpec. They provide domain-specif
 
 ## 3. Proposed Required Fields
 
-These fields are required for InstrumentUniverseSpec v1. They define the core instrument eligibility declaration. Implementation is deferred to a later schema PR.
+These fields are required for InstrumentUniverseSpec v1. They define the core instrument eligibility declaration.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -513,15 +513,16 @@ Hermes and OpenClaw **may not**:
 
 ## 12. Validation Roadmap
 
-OutcomeSpec v1 is the most recent completed milestone. InstrumentUniverseSpec v1 follows the same pattern:
+InstrumentUniverseSpec v1 is the most recent completed milestone. All implementation items are complete:
 
 1. **Design doc** (PR #104) — describes the schema and field semantics (this document)
-2. **Schema** (future PR) — JSON schema for InstrumentUniverseSpec v1
-3. **Fixtures** (future PR) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
-4. **Validator** (future PR) — `scripts/local/validate_instrument_universe_spec.py` implementing the schema rules
-5. **Tests** (future PR) — pytest coverage of all validator paths
-6. **CI wiring** (future PR) — add to `scripts/ci/validate_governance_manifests.sh`
-7. **Docs status update** (future PR) — update `docs/current_project_status.md` and `docs/README.md`
+2. **Schema** (PR #105) — JSON schema for InstrumentUniverseSpec v1
+3. **Fixtures** (PR #106) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
+4. **Schema hardening** (PR #107) — schema boundary and reviewer field hardening
+5. **Validator** (PR #108) — `scripts/local/validate_instrument_universe_spec.py` implementing the schema rules
+6. **Tests** (PR #109) — pytest coverage of all validator paths
+7. **CI wiring** (PR #110) — added to `scripts/ci/validate_governance_manifests.sh`
+8. **Docs status update** (this PR) — updated `docs/current_project_status.md` and `docs/README.md`
 
 This roadmap follows the same pattern used for TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, and OutcomeSpec.
 
