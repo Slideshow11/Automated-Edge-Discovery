@@ -151,6 +151,41 @@ do
   fi
 done
 
+# --- InstrumentUniverseSpec v1 fixture checks ---
+
+echo "=== InstrumentUniverseSpec valid fixture ==="
+python3 scripts/local/validate_instrument_universe_spec.py \
+  fixtures/instrument_universe_spec_v1/valid_minimal.json
+
+echo "=== InstrumentUniverseSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/instrument_universe_spec_v1/invalid_asset_class_enum.json \
+  fixtures/instrument_universe_spec_v1/invalid_asset_classes_empty.json \
+  fixtures/instrument_universe_spec_v1/invalid_computed_field.json \
+  fixtures/instrument_universe_spec_v1/invalid_corporate_action_policy.json \
+  fixtures/instrument_universe_spec_v1/invalid_data_availability_coverage_out_of_range.json \
+  fixtures/instrument_universe_spec_v1/invalid_data_manifest_refs_empty.json \
+  fixtures/instrument_universe_spec_v1/invalid_instrument_universe_id.json \
+  fixtures/instrument_universe_spec_v1/invalid_liquidity_negative_min_price.json \
+  fixtures/instrument_universe_spec_v1/invalid_liquidity_open_interest_type.json \
+  fixtures/instrument_universe_spec_v1/invalid_liquidity_spread_out_of_range.json \
+  fixtures/instrument_universe_spec_v1/invalid_membership_timing_policy.json \
+  fixtures/instrument_universe_spec_v1/invalid_missing_required.json \
+  fixtures/instrument_universe_spec_v1/invalid_reference_array_type.json \
+  fixtures/instrument_universe_spec_v1/invalid_reviewer_empty_object.json \
+  fixtures/instrument_universe_spec_v1/invalid_reviewer_type.json \
+  fixtures/instrument_universe_spec_v1/invalid_rule_id.json \
+  fixtures/instrument_universe_spec_v1/invalid_rule_operator.json \
+  fixtures/instrument_universe_spec_v1/invalid_survivorship_policy.json \
+  fixtures/instrument_universe_spec_v1/invalid_tradability_policy.json \
+  fixtures/instrument_universe_spec_v1/invalid_universe_construction_policy.json
+do
+  if python3 scripts/local/validate_instrument_universe_spec.py "$f"; then
+    echo "BLOCKER: invalid InstrumentUniverseSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -161,6 +196,7 @@ python3 -m pytest \
   tests/test_validate_edge_hypothesis_registry.py \
   tests/test_validate_experiment_spec.py \
   tests/test_validate_outcome_spec.py \
+  tests/test_validate_instrument_universe_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
