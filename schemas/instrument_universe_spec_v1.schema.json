@@ -1,0 +1,617 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "InstrumentUniverseSpec v1",
+  "description": "Domain-neutral instrument eligibility universe specification: declares which instruments are eligible, excluded, and under what policies for liquidity, survivorship, tradability, and data availability.",
+  "type": "object",
+  "required": [
+    "instrument_universe_id",
+    "universe_version",
+    "universe_family",
+    "asset_classes",
+    "data_manifest_refs",
+    "universe_construction_policy",
+    "membership_timing_policy",
+    "inclusion_rules",
+    "exclusion_rules",
+    "liquidity_policy",
+    "survivorship_policy",
+    "tradability_policy",
+    "corporate_action_policy",
+    "created_at",
+    "reviewer"
+  ],
+  "properties": {
+    "instrument_universe_id": {
+      "description": "Canonical instrument universe identifier. Format: IUS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^IUS-[0-9]{4}-[0-9]{4}$"
+    },
+    "universe_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "universe_family": {
+      "description": "Human-readable family label for grouping related instrument universes (e.g., us_liquid_equity, crypto_spot_liquid, options_event_risk).",
+      "type": "string"
+    },
+    "asset_classes": {
+      "description": "Asset classes included in this universe. At least one is required.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "equity",
+          "etf",
+          "option",
+          "future",
+          "fx",
+          "crypto",
+          "commodity",
+          "rate",
+          "index",
+          "custom"
+        ]
+      },
+      "minItems": 1
+    },
+    "data_manifest_refs": {
+      "description": "References to DataManifest entries that define the source data for this instrument universe.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "universe_construction_policy": {
+      "description": "How the instrument universe is constructed.",
+      "type": "string",
+      "enum": [
+        "static_list",
+        "point_in_time_membership",
+        "rolling_membership",
+        "rule_based_filter",
+        "external_index_membership",
+        "custom"
+      ]
+    },
+    "membership_timing_policy": {
+      "description": "When universe membership is determined.",
+      "type": "string",
+      "enum": [
+        "decision_time",
+        "entry_time",
+        "rebalance_time",
+        "event_time",
+        "fixed_snapshot",
+        "custom"
+      ]
+    },
+    "inclusion_rules": {
+      "description": "Rules that must be satisfied for instrument inclusion in the universe.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "rule_id",
+          "field",
+          "operator",
+          "value"
+        ],
+        "properties": {
+          "rule_id": {
+            "description": "Unique rule identifier within the universe. Format: IRL-YYYY-NNNN.",
+            "type": "string",
+            "pattern": "^IRL-[0-9]{4}-[0-9]{4}$"
+          },
+          "field": {
+            "description": "Instrument field or attribute being evaluated (e.g., exchange, market_cap_usd, country_code).",
+            "type": "string"
+          },
+          "operator": {
+            "description": "Comparison operator for the rule.",
+            "type": "string",
+            "enum": [
+              "eq",
+              "ne",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "in",
+              "not_in",
+              "contains",
+              "regex"
+            ]
+          },
+          "value": {
+            "description": "Comparison value. Type depends on operator and field (string, number, boolean, array, or object)."
+          },
+          "timing": {
+            "description": "When the rule applies. Defaults to decision_time if omitted.",
+            "type": "string",
+            "enum": [
+              "decision_time",
+              "entry_time",
+              "rebalance_time"
+            ]
+          },
+          "data_manifest_ref": {
+            "description": "Reference to the DataManifest that provides the data for evaluating this rule.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Human-readable rationale for this rule.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "exclusion_rules": {
+      "description": "Rules that disqualify instruments regardless of inclusion_rules.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "rule_id",
+          "field",
+          "operator",
+          "value"
+        ],
+        "properties": {
+          "rule_id": {
+            "description": "Unique rule identifier within the universe. Format: IRL-YYYY-NNNN.",
+            "type": "string",
+            "pattern": "^IRL-[0-9]{4}-[0-9]{4}$"
+          },
+          "field": {
+            "description": "Instrument field or attribute being evaluated.",
+            "type": "string"
+          },
+          "operator": {
+            "description": "Comparison operator for the rule.",
+            "type": "string",
+            "enum": [
+              "eq",
+              "ne",
+              "gt",
+              "gte",
+              "lt",
+              "lte",
+              "in",
+              "not_in",
+              "contains",
+              "regex"
+            ]
+          },
+          "value": {
+            "description": "Comparison value. Type depends on operator and field."
+          },
+          "timing": {
+            "description": "When the rule applies. Defaults to decision_time if omitted.",
+            "type": "string",
+            "enum": [
+              "decision_time",
+              "entry_time",
+              "rebalance_time"
+            ]
+          },
+          "data_manifest_ref": {
+            "description": "Reference to the DataManifest that provides the data for evaluating this rule.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Human-readable rationale for this rule.",
+            "type": "string"
+          }
+        }
+      }
+    },
+    "liquidity_policy": {
+      "description": "Minimum liquidity requirements for universe membership.",
+      "type": "object",
+      "properties": {
+        "min_price": {
+          "description": "Minimum instrument price. Instruments below this are excluded.",
+          "type": "number",
+          "minimum": 0
+        },
+        "max_price": {
+          "description": "Maximum instrument price. Instruments above this are excluded.",
+          "type": "number",
+          "minimum": 0
+        },
+        "min_dollar_volume": {
+          "description": "Minimum average daily dollar volume over liquidity_lookback_days.",
+          "type": "number",
+          "minimum": 0
+        },
+        "min_average_volume": {
+          "description": "Minimum average daily share/copy volume over liquidity_lookback_days.",
+          "type": "number",
+          "minimum": 0
+        },
+        "min_open_interest": {
+          "description": "Minimum open interest (for derivatives: options, futures).",
+          "type": "number",
+          "minimum": 0
+        },
+        "max_bid_ask_spread": {
+          "description": "Maximum bid-ask spread as a fraction [0, 1]. A value of 0.01 means 1% spread.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "min_days_listed": {
+          "description": "Minimum number of trading days instrument must have been listed before inclusion.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "liquidity_lookback_days": {
+          "description": "Number of days over which volume and spread metrics are computed. Default: 20.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "liquidity_measure_timing": {
+          "description": "When liquidity is measured.",
+          "type": "string",
+          "enum": [
+            "decision_time",
+            "entry_time",
+            "fixed_snapshot"
+          ]
+        },
+        "liquidity_not_applicable_reason": {
+          "description": "Free-text reason why liquidity policy does not apply (e.g., for illiquid alternative assets). Required if all other liquidity fields are absent.",
+          "type": "string"
+        }
+      }
+    },
+    "survivorship_policy": {
+      "description": "Survivorship bias handling policy.",
+      "type": "string",
+      "enum": [
+        "point_in_time",
+        "current_constituents_only",
+        "survivor_bias_allowed_for_smoke_test",
+        "custom"
+      ]
+    },
+    "tradability_policy": {
+      "description": "Tradability requirements at different stages.",
+      "type": "string",
+      "enum": [
+        "tradable_at_decision_time",
+        "tradable_at_entry_time",
+        "tradable_through_window",
+        "custom"
+      ]
+    },
+    "corporate_action_policy": {
+      "description": "How corporate actions are handled.",
+      "type": "string",
+      "enum": [
+        "adjusted",
+        "raw",
+        "split_adjusted",
+        "dividend_adjusted",
+        "total_return_adjusted",
+        "custom"
+      ]
+    },
+    "instrument_id_namespace": {
+      "description": "Canonical namespace for instrument IDs in this universe (e.g., CUSIP, ISIN, OCC, BUID, CCY).",
+      "type": "string"
+    },
+    "symbol_mapping_policy": {
+      "description": "Maps external symbols to internal instrument IDs.",
+      "type": "object",
+      "properties": {
+        "mapping_source": {
+          "type": "string"
+        },
+        "mapping_version": {
+          "type": "string"
+        },
+        "mapping_timestamp": {
+          "type": "string"
+        }
+      }
+    },
+    "exchange_filter": {
+      "description": "List of permitted exchange codes or venue identifiers.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "country_filter": {
+      "description": "List of permitted country codes (ISO 3166-1 alpha-2).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "currency_filter": {
+      "description": "List of permitted currencies (ISO 4217).",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sector_industry_filter": {
+      "description": "Sector and industry inclusion constraints.",
+      "type": "object",
+      "properties": {
+        "sectors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "industries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude_sectors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "market_cap_filter": {
+      "description": "Market capitalization constraints.",
+      "type": "object",
+      "properties": {
+        "min_market_cap": {
+          "type": "number"
+        },
+        "max_market_cap": {
+          "type": "number"
+        },
+        "market_cap_currency": {
+          "type": "string"
+        }
+      }
+    },
+    "price_filter": {
+      "description": "Price level constraints.",
+      "type": "object",
+      "properties": {
+        "min_price": {
+          "type": "number"
+        },
+        "max_price": {
+          "type": "number"
+        },
+        "price_currency": {
+          "type": "string"
+        }
+      }
+    },
+    "volume_filter": {
+      "description": "Trading volume constraints.",
+      "type": "object",
+      "properties": {
+        "min_average_volume": {
+          "type": "number"
+        },
+        "volume_window_days": {
+          "type": "integer"
+        },
+        "volume_currency": {
+          "type": "string"
+        }
+      }
+    },
+    "open_interest_filter": {
+      "description": "Open interest constraints for derivatives.",
+      "type": "object",
+      "properties": {
+        "min_open_interest": {
+          "type": "number"
+        },
+        "open_interest_currency": {
+          "type": "string"
+        }
+      }
+    },
+    "option_contract_filter": {
+      "description": "Options-specific instrument constraints.",
+      "type": "object",
+      "properties": {
+        "allowed_option_types": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "call",
+              "put",
+              "custom"
+            ]
+          }
+        },
+        "strike_filter": {
+          "type": "object",
+          "properties": {
+            "min_strike": {
+              "type": "number"
+            },
+            "max_strike": {
+              "type": "number"
+            },
+            "strike_currency": {
+              "type": "string"
+            }
+          }
+        },
+        "expiry_filter": {
+          "type": "object",
+          "properties": {
+            "min_dte": {
+              "description": "Minimum days to expiration.",
+              "type": "integer"
+            },
+            "max_dte": {
+              "description": "Maximum days to expiration.",
+              "type": "integer"
+            }
+          }
+        },
+        "option_style": {
+          "type": "string",
+          "enum": [
+            "american",
+            "european",
+            "custom"
+          ]
+        }
+      }
+    },
+    "futures_contract_filter": {
+      "description": "Futures-specific instrument constraints.",
+      "type": "object",
+      "properties": {
+        "allowed_contracts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "contract_size_filter": {
+          "type": "object"
+        },
+        "delivery_filter": {
+          "type": "object"
+        }
+      }
+    },
+    "crypto_exchange_filter": {
+      "description": "Permitted crypto exchanges or venues.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "data_availability_policy": {
+      "description": "Data completeness requirements for universe membership.",
+      "type": "object",
+      "properties": {
+        "required_history_days": {
+          "description": "Minimum number of trading days of history required before instrument can enter universe.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "required_feature_coverage": {
+          "description": "Fraction of feature data points that must be non-null [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "required_outcome_coverage": {
+          "description": "Fraction of outcome data points that must be non-null [0, 1].",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "missing_data_policy": {
+          "description": "How missing data is handled.",
+          "type": "string",
+          "enum": [
+            "exclude",
+            "impute",
+            "allow_partial"
+          ]
+        },
+        "stale_data_policy": {
+          "description": "How stale data is handled.",
+          "type": "string",
+          "enum": [
+            "exclude",
+            "forward_fill",
+            "allow_stale"
+          ]
+        },
+        "point_in_time_required": {
+          "description": "Whether point-in-time data is required (vs. back-adjusted). Default: true.",
+          "type": "boolean"
+        },
+        "feature_cutoff_alignment_required": {
+          "description": "Whether feature timestamps must align with outcome window cutoffs. Default: true.",
+          "type": "boolean"
+        }
+      }
+    },
+    "universe_snapshot_refs": {
+      "description": "References to point-in-time universe snapshot artifacts.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "runner_output_refs": {
+      "description": "References to runner outputs that used this instrument universe.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "domain_profile_refs": {
+      "description": "References to domain profiles providing domain-specific instrument enrichments.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "extension_hooks": {
+      "description": "Reserved for future artifact references only. Must not contain computed statistics.",
+      "type": "object",
+      "properties": {
+        "model_assessment_extension_refs": {
+          "description": "Extended references to ModelAssessmentSpec records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "runner_output_extension_refs": {
+          "description": "Extended references to runner outputs.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "review_packet_extension_refs": {
+          "description": "Extended references to ReviewPacket records.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "domain_profile_extension_refs": {
+          "description": "Extended references to domain profile specifications.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "notes": {
+      "description": "Human-readable notes about universe construction rationale.",
+      "type": "string"
+    },
+    "created_at": {
+      "description": "ISO-8601 timestamp of universe declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer metadata for this universe declaration. Must be an object with at minimum a name field.",
+      "type": "object"
+    }
+  }
+}
