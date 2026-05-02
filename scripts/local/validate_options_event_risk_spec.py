@@ -37,6 +37,10 @@ GAP_EXPOSURE_POLICIES = {
     "allow_gap_hold", "prohibit_gap_hold", "exit_before_event_anchor",
     "enter_after_event_anchor", "custom"
 }
+QUOTE_QUALITY_METHODS = {
+    "require_bid_ask", "allow_mid_only", "reject_stale_quotes",
+    "require_open_interest", "custom"
+}
 
 # Required top-level fields
 REQUIRED_TOP_LEVEL = [
@@ -844,7 +848,7 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
     # 18. quote_quality_policy — validate known sub-fields if present
     qqp = entry.get("quote_quality_policy")
     if isinstance(qqp, dict):
-        # quality_method — optional but must be non-empty string if present
+        # quality_method — optional string enum; reject invalid values
         qm_val = qqp.get("quality_method")
         if qm_val is not None:
             if not isinstance(qm_val, str):
@@ -860,6 +864,13 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                     ot,
                     "quote_quality_policy.quality_method",
                     "quote_quality_policy.quality_method cannot be empty"
+                ))
+            elif qm_val not in QUOTE_QUALITY_METHODS:
+                blockers.append(Blocker(
+                    "invalid_field",
+                    ot,
+                    "quote_quality_policy.quality_method",
+                    f"quote_quality_policy.quality_method must be one of: {', '.join(sorted(QUOTE_QUALITY_METHODS))}"
                 ))
         _check_object_boolean_field(qqp, "require_bid_ask", blockers, f"{ot}.quote_quality_policy")
         _check_object_boolean_field(qqp, "allow_mid_only", blockers, f"{ot}.quote_quality_policy")
