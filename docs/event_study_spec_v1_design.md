@@ -316,7 +316,7 @@ The `pre_event_window` and `post_event_window` objects define the observation wi
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `start_offset` | integer | Yes | Offset from the event anchor to the window start (negative for pre-event, positive for post-event) |
+| `start_offset` | integer | Yes | Offset from the event anchor to the window start (negative for pre-event windows, zero or positive for post-event windows) |
 | `end_offset` | integer | Yes | Offset from the event anchor to the window end |
 | `units` | enum | Yes | Unit of measurement: `calendar_days`, `trading_days`, `observations`, `periods` |
 | `include_event_anchor` | boolean | No | Whether the event anchor itself is included in the window. Default: `false` for pre-event, `false` for post-event |
@@ -354,6 +354,8 @@ The `pre_event_window` and `post_event_window` objects define the observation wi
   "window_role": "pre_event"
 }
 ```
+
+**Note:** `start_offset: 0` is allowed for post-event windows when the event anchor observation is included in the post-event measurement window. Whether the anchor is included is controlled by `include_event_anchor`.
 
 ---
 
@@ -446,13 +448,23 @@ When exact timestamps are unavailable (`inferred_timestamp_allowed`), EventStudy
 
 ### 8d. Feature cutoff and decision timestamp
 
-EventStudySpec enforces that pre-event feature data ends before the decision timestamp:
+EventStudySpec enforces that pre-event feature data ends before the decision timestamp. The constraint depends on the decision mode:
+
+**For pre-event decision modes** (`before_event_publication`, `prior_session_close`, `same_session_open`):
 
 ```
 Feature cutoff ≤ Decision timestamp < Event anchor
 ```
 
+**For post-publication or post-event decision modes** (`after_event_publication`, `next_session_open`):
+
+```
+Feature cutoff ≤ Event anchor ≤ Decision timestamp
+```
+
 The `leakage_policy` field specifies what information is available at each point. Window boundaries alone do not guarantee leakage control — the feature cutoff must be explicitly declared.
+
+**Note:** The validator must apply the correct timing relation based on `decision_timestamp_policy`. `after_event_publication` is valid only when the experiment is explicitly post-publication/post-event and outcome windows do not leak unavailable information into the decision.
 
 ### 8e. Calendar-days vs. trading-days vs. observations
 
