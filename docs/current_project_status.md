@@ -97,6 +97,7 @@ The project is not yet a live trading or production system.
 - PR #115 EventStudySpec v1 local validator
 - PR #116 EventStudySpec validator tests
 - PR #117 EventStudySpec CI helper wiring
+- PR #119 OptionsEventRiskSpec v1 design: domain-specific options event-risk configuration, contract selection, liquidity/pricing policies, gap exposure, pre-earnings profile hook, domain-neutral boundary
 
 ## Current stop rules
 
@@ -129,10 +130,10 @@ The project is not yet a live trading or production system.
 
 - InstrumentUniverseSpec v1 **complete** (PRs #104–#110): design, schema, fixtures, local validator, tests, CI wired
 - EventStudySpec v1 **complete** (PRs #112–#117): design, schema, fixtures, local validator, tests, CI wired
-- OptionsEventRiskSpec v1 design
+- OptionsEventRiskSpec v1 **complete** (PR #119): design doc only — schema, fixtures, validator, tests, CI wiring pending
 - OptionsEventRiskSpec v1 schema
 - OptionsEventRiskSpec fixtures
-- OptionsEventRiskSpec validator, tests, and CI wiring
+- OptionsEventRiskSpec validator and CI wiring
 - PreEarningsProfile v1 as a domain-specific research module
 - First thin real-data runner slice
 
