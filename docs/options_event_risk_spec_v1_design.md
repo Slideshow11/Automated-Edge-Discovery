@@ -158,7 +158,7 @@ Domain profiles do not modify OptionsEventRiskSpec. They provide domain-specific
 
 ## 3. Proposed Required Fields
 
-These fields define OptionsEventRiskSpec v1. Implementation is deferred to a later schema PR.
+These fields define OptionsEventRiskSpec v1. Implementation is complete through PRs #119–#128.
 
 || Field | Type | Description |
 |-------|------|-------------|
@@ -776,15 +776,17 @@ Hermes and OpenClaw **may not**:
 
 ## 13. Validation Roadmap
 
-OptionsEventRiskSpec v1 follows the same implementation pattern as EventStudySpec v1:
+OptionsEventRiskSpec v1 implementation is complete through PR #128:
 
 1. **Design doc** (PR #119) — describes the field set, enums, contract selection structures, liquidity and pricing policies, gap exposure policy, and boundary (this document)
-2. **Schema** (future PR) — JSON schema for OptionsEventRiskSpec v1
-3. **Fixtures** (future PR) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
-4. **Validator** (future PR) — `scripts/local/validate_options_event_risk_spec.py` implementing the schema rules
-5. **Tests** (future PR) — pytest coverage of all validator paths
-6. **CI wiring** (future PR) — add to `scripts/ci/validate_governance_manifests.sh`
-7. **Docs status update** (future PR) — update `docs/current_project_status.md` and `docs/README.md`
+2. **Schema** (PR #120) — JSON schema for OptionsEventRiskSpec v1
+3. **Fixtures** (PR #123) — valid and invalid JSON fixtures covering all required fields, enums, and boundary conditions
+4. **Validator** (PR #124) — `scripts/local/validate_options_event_risk_spec.py` implementing the schema rules
+5. **Schema-alignment fixes** (PR #125) — validator schema-alignment fixes
+6. **Tests** (PR #126) — pytest coverage of all validator paths
+7. **Test name audit/fix** (PR #127) — duplicate test names audit and fix
+8. **CI wiring** (PR #128) — added to `scripts/ci/validate_governance_manifests.sh`
+9. **Docs status update** (PR #129) — updated `docs/current_project_status.md` and `docs/README.md`
 
 This roadmap follows the same pattern used for TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, and EventStudySpec.
 
