@@ -200,15 +200,18 @@
         "iv_crush_measurement_window": {
           "description": "Window for measuring IV crush: start (DPE), end (DPE), unit (dpe/sessions/calendar_days).",
           "type": "object",
+          "required": ["start", "end", "unit"],
           "additionalProperties": true,
           "properties": {
             "start": {
               "description": "DPE at which the measurement window starts.",
-              "type": "integer"
+              "type": "integer",
+              "minimum": -30
             },
             "end": {
               "description": "DPE at which the measurement window ends.",
-              "type": "integer"
+              "type": "integer",
+              "maximum": 90
             },
             "unit": {
               "description": "Unit for the measurement window.",
