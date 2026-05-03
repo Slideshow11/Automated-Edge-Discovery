@@ -85,7 +85,7 @@ def test_invalid_contract_selection_policy_type():
     assert "invalid_object" in codes
 
 
-def test_invalid_event_study_spec_ref():
+def test_invalid_event_study_spec_ref_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_event_study_spec_ref.json")])
     assert code == 1
     data = json.loads(out)
@@ -93,7 +93,7 @@ def test_invalid_event_study_spec_ref():
     assert "invalid_id_format" in codes
 
 
-def test_invalid_execution_timing_policy():
+def test_invalid_execution_timing_policy_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_execution_timing_policy.json")])
     assert code == 1
     data = json.loads(out)
@@ -117,7 +117,7 @@ def test_invalid_extension_hooks_unknown_field():
     assert "invalid_field" in codes
 
 
-def test_invalid_gap_exposure_policy():
+def test_invalid_gap_exposure_policy_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_gap_exposure_policy.json")])
     assert code == 1
     data = json.loads(out)
@@ -125,7 +125,7 @@ def test_invalid_gap_exposure_policy():
     assert "invalid_enum" in codes
 
 
-def test_invalid_instrument_universe_ref():
+def test_invalid_instrument_universe_ref_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_instrument_universe_ref.json")])
     assert code == 1
     data = json.loads(out)
@@ -165,7 +165,7 @@ def test_invalid_negative_numeric_threshold():
     assert "invalid_value" in codes
 
 
-def test_invalid_option_side_policy():
+def test_invalid_option_side_policy_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_option_side_policy.json")])
     assert code == 1
     data = json.loads(out)
@@ -173,7 +173,7 @@ def test_invalid_option_side_policy():
     assert "invalid_enum" in codes
 
 
-def test_invalid_option_universe_policy():
+def test_invalid_option_universe_policy_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_option_universe_policy.json")])
     assert code == 1
     data = json.loads(out)
@@ -245,7 +245,7 @@ def test_invalid_spread_pct_out_of_range():
     assert "invalid_value" in codes
 
 
-def test_invalid_strategy_structure_policy():
+def test_invalid_strategy_structure_policy_fixture():
     code, out, _ = run_validator(["--format", "json", str(FIXTURES / "invalid_strategy_structure_policy.json")])
     assert code == 1
     data = json.loads(out)
