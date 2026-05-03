@@ -23,7 +23,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - OutcomeSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #94–#102)
 - InstrumentUniverseSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #104–#110)
 - EventStudySpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #112–#117)
-- OptionsEventRiskSpec v1 design complete (PR #119): schema, fixtures, validator, tests, CI wiring pending
+- OptionsEventRiskSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #119–#128)
 
 ## Document groups
 
@@ -60,7 +60,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_event_options_contract.py | Validates event and options observation CSV against the Event/Options contract spec. | Read-only |
 | scripts/ci/validate_event_options_contract.sh | CI helper wrapper that runs the Event/Options validator across all fixture profiles and pytest. | CI helper |
-| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, and EventStudySpec validators and their pytest suites. | CI helper |
+| scripts/ci/validate_governance_manifests.sh | CI helper that runs TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, and OptionsEventRiskSpec validators and their pytest suites. | CI helper |
 | scripts/local/evaluate_ledger_entry.py | Evaluates one manual ledger entry for review-only labels and rationale. | Read-only output |
 | scripts/local/make_run_review_packet.py | Builds a manual review packet from ledger/run artifacts. | Writes only requested packet output |
 | scripts/local/_ledger_review_shared.py | Shared helper logic for ledger review tooling. | Helper module |
@@ -81,7 +81,7 @@ If a script listed above is not present in a checkout, treat it as "not present 
 - OutcomeSpec v1 **complete** (PRs #94–#102): design, JSON schema, fixtures, local validator, tests, CI wired
 - InstrumentUniverseSpec v1 **complete** (PRs #104–#110): design, JSON schema, fixtures, local validator, tests, CI wired
 - EventStudySpec v1 **complete** (PRs #112–#117): design, JSON schema, fixtures, local validator, tests, CI wired
-- OptionsEventRiskSpec JSON schema deferred
+- OptionsEventRiskSpec v1 **complete** (PRs #119–#128): design, JSON schema, fixtures, local validator, tests, CI wired
 - MechanismDiscoveryReport schema deferred
 - PostHocTheoryNote schema deferred
 - PreEarningsProfile v1 as a domain-specific research module deferred
