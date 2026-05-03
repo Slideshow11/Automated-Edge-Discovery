@@ -107,6 +107,7 @@ The project is not yet a live trading or production system.
 - PR #126 OptionsEventRiskSpec v1 validator tests
 - PR #127 OptionsEventRiskSpec v1 duplicate test names audit/fix
 - PR #128 OptionsEventRiskSpec v1 CI helper wiring
+- PR #130 PreEarningsProfile v1 design: domain-specific pre-earnings research module, BMO/AMC session semantics, DPE targeting, earnings-specific gap exposure rules, IV crush policy, domain-neutral boundary with EventStudySpec and OptionsEventRiskSpec
 
 ## Current stop rules
 
@@ -137,8 +138,7 @@ The project is not yet a live trading or production system.
 
 ## Next planned PRs
 
-- PreEarningsProfile v1 design: domain-specific pre-earnings research module, BMO/AMC session semantics, DPE targeting, earnings-specific gap exposure rules
-- PreEarningsProfile v1 schema
+- PreEarningsProfile v1 schema (PR #130 complete: design)
 - PreEarningsProfile v1 fixtures
 - PreEarningsProfile v1 local validator, tests, and CI wiring
 - First thin real-data runner slice
