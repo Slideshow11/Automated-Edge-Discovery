@@ -223,6 +223,44 @@ do
   fi
 done
 
+# --- OptionsEventRiskSpec v1 fixture checks ---
+
+echo "=== OptionsEventRiskSpec valid fixture ==="
+python3 scripts/local/validate_options_event_risk_spec.py \
+  fixtures/options_event_risk_spec_v1/valid_minimal.json
+
+echo "=== OptionsEventRiskSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/options_event_risk_spec_v1/invalid_boundary_field.json \
+  fixtures/options_event_risk_spec_v1/invalid_contract_selection_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_event_study_spec_ref.json \
+  fixtures/options_event_risk_spec_v1/invalid_execution_timing_policy.json \
+  fixtures/options_event_risk_spec_v1/invalid_expiry_selection_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_extension_hooks_unknown_field.json \
+  fixtures/options_event_risk_spec_v1/invalid_gap_exposure_policy.json \
+  fixtures/options_event_risk_spec_v1/invalid_instrument_universe_ref.json \
+  fixtures/options_event_risk_spec_v1/invalid_liquidity_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_missing_required.json \
+  fixtures/options_event_risk_spec_v1/invalid_moneyness_selection_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_negative_numeric_threshold.json \
+  fixtures/options_event_risk_spec_v1/invalid_option_side_policy.json \
+  fixtures/options_event_risk_spec_v1/invalid_option_universe_policy.json \
+  fixtures/options_event_risk_spec_v1/invalid_options_event_risk_spec_id.json \
+  fixtures/options_event_risk_spec_v1/invalid_outcome_spec_ref.json \
+  fixtures/options_event_risk_spec_v1/invalid_outcome_spec_refs_empty.json \
+  fixtures/options_event_risk_spec_v1/invalid_pricing_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_quote_quality_policy_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_reviewer_empty_object.json \
+  fixtures/options_event_risk_spec_v1/invalid_reviewer_type.json \
+  fixtures/options_event_risk_spec_v1/invalid_spread_pct_out_of_range.json \
+  fixtures/options_event_risk_spec_v1/invalid_strategy_structure_policy.json
+do
+  if python3 scripts/local/validate_options_event_risk_spec.py "$f"; then
+    echo "BLOCKER: invalid OptionsEventRiskSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -235,6 +273,7 @@ python3 -m pytest \
   tests/test_validate_outcome_spec.py \
   tests/test_validate_instrument_universe_spec.py \
   tests/test_validate_event_study_spec.py \
+  tests/test_validate_options_event_risk_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
