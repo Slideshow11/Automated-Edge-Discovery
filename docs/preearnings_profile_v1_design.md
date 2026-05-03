@@ -169,7 +169,7 @@ These fields define PreEarningsProfile v1.
 || `preearnings_profile_version` | integer | Semantic version integer, ≥ 1 |
 || `event_study_spec_ref` | string | Reference to EventStudySpec providing event-alignment, format EVS-YYYY-NNNN |
 || `options_event_risk_ref` | string | Reference to OptionsEventRiskSpec for options configuration, format OER-YYYY-NNNN |
-|| `session_anchor_policy` | enum | Which session(s) the earnings announcement applies to: bmo_only, amc_only, bmo_and_amc, intra_day, custom. See §5a. |
+|| `session_anchor_policy` | enum | Which session(s) the earnings announcement applies to: bmo_only, amc_only, bmo_and_amc, intra_day, unconfirmed, custom. See §5a. |
 || `earnings_time_reference` | enum | Source of earnings announcement time: after_hours_only, pre_market_only, regular_hours_only, confirmed_after_hours, confirmed_pre_market, unconfirmed, custom. See §5b. |
 || `entry_dpe_policy` | object | DPE targeting policy for entry: target DPE range, anchor day count conventions. See §6. |
 || `exit_dpe_policy` | object | DPE targeting policy for exit: target DPE range, iv_collapse_threshold. See §6. |
@@ -192,7 +192,7 @@ These fields define PreEarningsProfile v1.
 || `session_overlap_policy` | enum | How to handle stocks with both BMO and AMC earnings on same day: prioritize_bmo, prioritize_amc, separate_trials, reject |
 || `earnings_revision_policy` | enum | How to handle earnings date revisions or rescheduled announcements: reject_revision, accept_revision, flag_for_review |
 || `minimum_iv_rank` | number | Minimum IV rank required for inclusion (0.0 to 1.0) |
-|| `iv_regime_filter` | enum | Filter for IV regime: high_iv_only, low_iv_only, any_iv, custom |
+|| `iv_regime_filter` | enum | Filter for IV regime: high_iv_only, low_iv_only, iv_expand_only, iv_collapse_only, any_iv, custom |
 || `gap_historical_policy` | object | Historical gap analysis: gap_percentile_threshold, gap_direction_filter |
 || `earnings_size_filter` | object | Filter by earnings size or surprise history: eps_surprise_threshold, revenue_behavior |
 || `hypothesis_id` | string | Reference to EdgeHypothesisRegistry hypothesis being tested |
