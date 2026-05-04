@@ -894,27 +894,53 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
     # 18. minimum_iv_rank — number 0.0-1.0
     _check_number(entry, "minimum_iv_rank", blockers, min_value=0.0, max_value=1.0)
 
-    # 19. Optional reference arrays
-    _check_list_of_strings(entry, "runner_output_refs", blockers)
-    _check_list_of_strings(entry, "review_packet_refs", blockers)
+    # 19. Optional reference arrays (minItems: 1)
+    _check_list_of_strings(entry, "outcome_spec_refs", blockers, min_items=1)
+    _check_list_of_strings(entry, "runner_output_refs", blockers, min_items=1)
+    _check_list_of_strings(entry, "review_packet_refs", blockers, min_items=1)
 
-    # 20. dpe_calendar_policy — optional object
+    # 20. dpe_calendar_policy — optional object (if present, must be object with valid enum subfields)
     dpe_cal = entry.get("dpe_calendar_policy")
-    if dpe_cal is not None and isinstance(dpe_cal, dict):
-        _check_object_string_field(dpe_cal, "exchange_calendar_ref", blockers, f"{ot}.dpe_calendar_policy")
-        # weekend_handling and holiday_handling are enums but not defined in schema summary as explicit enums; accept strings
+    if dpe_cal is not None:
+        if not isinstance(dpe_cal, dict):
+            blockers.append(Blocker(
+                "invalid_object",
+                ot,
+                "dpe_calendar_policy",
+                f"dpe_calendar_policy must be an object, got {type(dpe_cal).__name__}"
+            ))
+        else:
+            _check_object_enum_field(dpe_cal, "weekend_handling", {"skip", "adjust", "custom"}, blockers, f"{ot}.dpe_calendar_policy")
+            _check_object_enum_field(dpe_cal, "holiday_handling", {"skip", "adjust", "custom"}, blockers, f"{ot}.dpe_calendar_policy")
+            _check_object_string_field(dpe_cal, "exchange_calendar_ref", blockers, f"{ot}.dpe_calendar_policy")
 
-    # 21. gap_historical_policy — optional object
+    # 21. gap_historical_policy — optional object (if present, must be object with valid enum subfields)
     gap_hist = entry.get("gap_historical_policy")
-    if gap_hist is not None and isinstance(gap_hist, dict):
-        _check_object_number_field(gap_hist, "gap_percentile_threshold", blockers, f"{ot}.gap_historical_policy", min_value=0, max_value=1)
-        _check_object_string_field(gap_hist, "gap_direction_filter", blockers, f"{ot}.gap_historical_policy")
+    if gap_hist is not None:
+        if not isinstance(gap_hist, dict):
+            blockers.append(Blocker(
+                "invalid_object",
+                ot,
+                "gap_historical_policy",
+                f"gap_historical_policy must be an object, got {type(gap_hist).__name__}"
+            ))
+        else:
+            _check_object_number_field(gap_hist, "gap_percentile_threshold", blockers, f"{ot}.gap_historical_policy", min_value=0, max_value=1)
+            _check_object_enum_field(gap_hist, "gap_direction_filter", {"up", "down", "both", "custom"}, blockers, f"{ot}.gap_historical_policy")
 
-    # 22. earnings_size_filter — optional object
+    # 22. earnings_size_filter — optional object (if present, must be object with valid enum subfields)
     earn_size = entry.get("earnings_size_filter")
-    if earn_size is not None and isinstance(earn_size, dict):
-        _check_object_number_field(earn_size, "eps_surprise_threshold", blockers, f"{ot}.earnings_size_filter")
-        _check_object_string_field(earn_size, "revenue_behavior", blockers, f"{ot}.earnings_size_filter")
+    if earn_size is not None:
+        if not isinstance(earn_size, dict):
+            blockers.append(Blocker(
+                "invalid_object",
+                ot,
+                "earnings_size_filter",
+                f"earnings_size_filter must be an object, got {type(earn_size).__name__}"
+            ))
+        else:
+            _check_object_number_field(earn_size, "eps_surprise_threshold", blockers, f"{ot}.earnings_size_filter")
+            _check_object_enum_field(earn_size, "revenue_behavior", {"beat", "miss", "in_line", "any", "custom"}, blockers, f"{ot}.earnings_size_filter")
 
     # 23. extension_hooks — optional object, only allowed sub-fields
     ext_hooks = entry.get("extension_hooks")
@@ -947,6 +973,13 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                             f"extension_hooks.{allowed_key} must be a list, got {type(sub_val).__name__}"
                         ))
                     else:
+                        if len(sub_val) == 0:
+                            blockers.append(Blocker(
+                                "invalid_list",
+                                ot,
+                                f"extension_hooks.{allowed_key}",
+                                f"extension_hooks.{allowed_key} must have at least 1 item, got 0"
+                            ))
                         for i, item in enumerate(sub_val):
                             if not isinstance(item, str):
                                 blockers.append(Blocker(
