@@ -30,6 +30,21 @@ REQUIRED_TOP_LEVEL = [
     "results",
 ]
 
+ALLOWED_ROOT_FIELDS = {
+    "trial_id",
+    "search_space_id",
+    "hypothesis_id",
+    "source_lane",
+    "confirmatory_source_lane",
+    "confirmatory_trial_id",
+    "confirmatory_data_scope",
+    "promotion_status",
+    "status",
+    "data_scope",
+    "execution_scope",
+    "results",
+}
+
 DATA_SCOPE_REQUIRED = ["dataset_id"]
 
 
@@ -86,6 +101,16 @@ def validate(entry: Dict[str, Any]) -> List[Blocker]:
 
     if blockers:
         return blockers  # cannot continue if required fields missing
+
+    # 1b. Reject unknown top-level fields
+    for field in entry:
+        if field not in ALLOWED_ROOT_FIELDS:
+            blockers.append(Blocker(
+                "unknown_root_field",
+                "trial_ledger_entry",
+                field,
+                f"unknown root field '{field}' is not permitted"
+            ))
 
     # 2. trial_id format
     trial_id = entry.get("trial_id", "")

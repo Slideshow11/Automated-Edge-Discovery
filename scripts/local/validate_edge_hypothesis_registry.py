@@ -41,6 +41,39 @@ REQUIRED_TOP_LEVEL = [
     "created_at",
 ]
 
+# All permitted top-level fields (for additionalProperties: false enforcement)
+ALLOWED_ROOT_FIELDS = {
+    "hypothesis_id",
+    "registry_version",
+    "title",
+    "status",
+    "status_reason",
+    "evidence_stage",
+    "source_type",
+    "source_lane",
+    "theory_timing",
+    "manual_review_required",
+    "live_trading_allowed",
+    "automated_promotion_allowed",
+    "production_execution_allowed",
+    "automated_registry_mutation_allowed",
+    "created_at",
+    "updated_at",
+    "data_manifest_refs",
+    "search_space_refs",
+    "trial_ledger_refs",
+    "model_assessment_refs",
+    "review_packet_refs",
+    "mechanism_report_refs",
+    "posthoc_theory_note_refs",
+    "manual_decision_refs",
+    "promotion_restrictions",
+    "notes",
+    "hypothesis_card_ref",
+    "lifecycle_events",
+    "mechanism_summary",
+}
+
 # Governance stop-rule fields — must be absent or false
 GOVERNANCE_STOP_RULE_FIELDS = [
     "automated_promotion_allowed",
@@ -133,6 +166,16 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
     # Cannot safely continue if required fields are missing
     if blockers:
         return blockers
+
+    # 1b. Reject unknown top-level fields
+    for field in entry:
+        if field not in ALLOWED_ROOT_FIELDS:
+            blockers.append(Blocker(
+                "unknown_root_field",
+                "edge_hypothesis_registry_entry",
+                field,
+                f"unknown root field '{field}' is not permitted"
+            ))
 
     # 2. hypothesis_id format
     hyp_id = entry.get("hypothesis_id", "")

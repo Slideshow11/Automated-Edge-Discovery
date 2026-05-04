@@ -177,7 +177,7 @@ def test_invalid_json():
 def test_trial_id_wrong_format():
     entry = {
         "assessment_id": "MAS-2026-0010",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-017",  # wrong format
         "search_space_id": "SSM-2026-0001",
         "assessment_status": "draft",
@@ -208,7 +208,7 @@ def test_trial_id_wrong_format():
 def test_search_space_id_wrong_format():
     entry = {
         "assessment_id": "MAS-2026-0011",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0011",
         "search_space_id": "SSM-2026-017",  # wrong format
         "assessment_status": "draft",
@@ -239,7 +239,7 @@ def test_search_space_id_wrong_format():
 def test_assessment_id_wrong_format():
     entry = {
         "assessment_id": "MAS-2026-017",  # wrong format
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0012",
         "search_space_id": "SSM-2026-0012",
         "assessment_status": "draft",
@@ -273,7 +273,7 @@ def test_assessment_id_wrong_format():
 def test_required_checks_not_object():
     entry = {
         "assessment_id": "MAS-2026-0013",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0013",
         "search_space_id": "SSM-2026-0013",
         "assessment_status": "draft",
@@ -298,7 +298,7 @@ def test_required_checks_not_object():
 def test_required_checks_is_list():
     entry = {
         "assessment_id": "MAS-2026-0014",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0014",
         "search_space_id": "SSM-2026-0014",
         "assessment_status": "draft",
@@ -326,7 +326,7 @@ def test_required_checks_is_list():
 def test_required_check_non_boolean_string():
     entry = {
         "assessment_id": "MAS-2026-0015",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0015",
         "search_space_id": "SSM-2026-0015",
         "assessment_status": "draft",
@@ -357,7 +357,7 @@ def test_required_check_non_boolean_string():
 def test_required_check_non_boolean_int():
     entry = {
         "assessment_id": "MAS-2026-0016",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0016",
         "search_space_id": "SSM-2026-0016",
         "assessment_status": "draft",
@@ -391,7 +391,7 @@ def test_required_check_non_boolean_int():
 def test_metrics_not_object():
     entry = {
         "assessment_id": "MAS-2026-0017",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0017",
         "search_space_id": "SSM-2026-0017",
         "assessment_status": "draft",
@@ -425,7 +425,7 @@ def test_metrics_not_object():
 def test_metric_sample_size_zero():
     entry = {
         "assessment_id": "MAS-2026-0018",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0018",
         "search_space_id": "SSM-2026-0018",
         "assessment_status": "draft",
@@ -456,7 +456,7 @@ def test_metric_sample_size_zero():
 def test_metric_sample_size_negative():
     entry = {
         "assessment_id": "MAS-2026-0019",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0019",
         "search_space_id": "SSM-2026-0019",
         "assessment_status": "draft",
@@ -490,7 +490,7 @@ def test_metric_sample_size_negative():
 def test_metric_pbo_too_high():
     entry = {
         "assessment_id": "MAS-2026-0020",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0020",
         "search_space_id": "SSM-2026-0020",
         "assessment_status": "draft",
@@ -521,7 +521,7 @@ def test_metric_pbo_too_high():
 def test_metric_pbo_negative():
     entry = {
         "assessment_id": "MAS-2026-0021",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0021",
         "search_space_id": "SSM-2026-0021",
         "assessment_status": "draft",
@@ -555,7 +555,7 @@ def test_metric_pbo_negative():
 def test_metric_dsr_string():
     entry = {
         "assessment_id": "MAS-2026-0022",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0022",
         "search_space_id": "SSM-2026-0022",
         "assessment_status": "draft",
@@ -590,7 +590,7 @@ def test_accepted_all_checks_true_but_missing_confirmatory():
     """accepted with all checks true except confirmatory_evidence_present → fails."""
     entry = {
         "assessment_id": "MAS-2026-0023",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0023",
         "search_space_id": "SSM-2026-0023",
         "assessment_status": "accepted",
@@ -628,7 +628,7 @@ def test_accepted_all_checks_true_but_missing_confirmatory():
 def test_accepted_missing_sample_size_in_metrics():
     entry = {
         "assessment_id": "MAS-2026-0024",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0024",
         "search_space_id": "SSM-2026-0024",
         "assessment_status": "accepted",
@@ -665,7 +665,7 @@ def test_accepted_missing_sample_size_in_metrics():
 def test_valid_accepted_entry():
     entry = {
         "assessment_id": "MAS-2026-0025",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0025",
         "search_space_id": "SSM-2026-0025",
         "assessment_status": "accepted",
@@ -700,7 +700,7 @@ def test_valid_accepted_entry():
 def test_reviewer_not_object():
     entry = {
         "assessment_id": "MAS-2026-0026",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0026",
         "search_space_id": "SSM-2026-0026",
         "assessment_status": "draft",
@@ -734,7 +734,7 @@ def test_reviewer_not_object():
 def test_null_required_field_assessment_id():
     entry = {
         "assessment_id": None,
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0027",
         "search_space_id": "SSM-2026-0027",
         "assessment_status": "draft",
@@ -768,7 +768,7 @@ def test_null_required_field_assessment_id():
 def test_accepted_with_bool_sample_size_in_metrics():
     entry = {
         "assessment_id": "MAS-2026-0028",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0028",
         "search_space_id": "SSM-2026-0028",
         "assessment_status": "accepted",
@@ -808,7 +808,7 @@ def test_accepted_with_bool_sample_size_in_metrics():
 def test_accepted_with_bool_pbo_in_metrics():
     entry = {
         "assessment_id": "MAS-2026-0029",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0029",
         "search_space_id": "SSM-2026-0029",
         "assessment_status": "accepted",
@@ -846,7 +846,7 @@ def test_accepted_with_bool_pbo_in_metrics():
 def test_accepted_with_bool_dsr_in_metrics():
     entry = {
         "assessment_id": "MAS-2026-0030",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0030",
         "search_space_id": "SSM-2026-0030",
         "assessment_status": "accepted",
@@ -885,7 +885,7 @@ def test_assessment_id_non_string_int():
     """assessment_id as integer must emit invalid_id_format, not TypeError."""
     entry = {
         "assessment_id": 1234,
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0031",
         "search_space_id": "SSM-2026-0031",
         "assessment_status": "draft",
@@ -917,7 +917,7 @@ def test_trial_id_non_string_int():
     """trial_id as integer must emit invalid_id_format, not TypeError."""
     entry = {
         "assessment_id": "MAS-2026-0032",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": 1234,
         "search_space_id": "SSM-2026-0032",
         "assessment_status": "draft",
@@ -949,7 +949,7 @@ def test_search_space_id_non_string_int():
     """search_space_id as integer must emit invalid_id_format, not TypeError."""
     entry = {
         "assessment_id": "MAS-2026-0033",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0033",
         "search_space_id": 1234,
         "assessment_status": "draft",
@@ -984,7 +984,7 @@ def test_assessment_status_non_string_dict():
     """assessment_status as dict must emit invalid_enum, not TypeError."""
     entry = {
         "assessment_id": "MAS-2026-0034",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0034",
         "search_space_id": "SSM-2026-0034",
         "assessment_status": {"status": "accepted"},
@@ -1016,7 +1016,7 @@ def test_assessment_status_non_string_list():
     """assessment_status as list must emit invalid_enum, not TypeError."""
     entry = {
         "assessment_id": "MAS-2026-0035",
-        "hypothesis_id": "EHH-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
         "trial_id": "TRL-2026-0035",
         "search_space_id": "SSM-2026-0035",
         "assessment_status": ["accepted"],
