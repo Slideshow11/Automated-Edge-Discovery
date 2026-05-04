@@ -110,20 +110,23 @@ def cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, n_boo
     clusters = df[cluster_col].unique()
     n_clusters = len(clusters)
     params = []
+    n_successful = 0
     for i in range(n_bootstrap):
         sampled = rng.choice(clusters, size=n_clusters, replace=True)
         df_b = pd.concat([df[df[cluster_col] == c] for c in sampled], ignore_index=True)
         try:
             m_b = smf.ols(formula=formula, data=df_b).fit()
             params.append(m_b.params.values)
+            n_successful += 1
         except Exception:
-            params.append([np.nan] * len(df.columns))
+            pass  # drop this draw; do not append NaN row
 
+    if n_successful == 0:
+        raise ValueError(
+            f"All {n_bootstrap} cluster bootstrap OLS fits failed. "
+            f"Cannot compute confidence intervals with zero successful draws."
+        )
     mat = np.array(params, dtype=float)
-    # drop nan rows
-    mat = mat[~np.isnan(mat).any(axis=1)]
-    if mat.shape[0] == 0:
-        return {}
 
     lower = 100.0 * (alpha / 2.0)
     upper = 100.0 * (1.0 - alpha / 2.0)
@@ -168,6 +171,7 @@ def wild_cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, 
 
     params = []
     names = list(model0.params.index)
+    n_successful = 0
 
     for b in range(n_bootstrap):
         # Rademacher +/-1 per cluster
@@ -185,14 +189,16 @@ def wild_cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, 
         try:
             m_b = smf.ols(formula=formula, data=df_b).fit()
             params.append(m_b.params.values)
+            n_successful += 1
         except Exception:
-            # record nan row
-            params.append([np.nan] * len(names))
+            pass  # drop this draw; do not append NaN row
 
+    if n_successful == 0:
+        raise ValueError(
+            f"All {n_bootstrap} wild cluster bootstrap OLS fits failed. "
+            f"Cannot compute confidence intervals with zero successful draws."
+        )
     mat = np.array(params, dtype=float)
-    mat = mat[~np.isnan(mat).any(axis=1)]
-    if mat.shape[0] == 0:
-        return {}
 
     lower = 100.0 * (alpha / 2.0)
     upper = 100.0 * (1.0 - alpha / 2.0)
