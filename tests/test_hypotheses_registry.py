@@ -253,3 +253,99 @@ def test_get_on_missing_file_returns_none(tmp_registry):
     assert tmp_registry._path.exists() is False
     result = tmp_registry.get("any-id")
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# JSONL append correctness
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_appends_produce_valid_jsonl(tmp_registry):
+    """Multiple sequential register() calls produce one JSON object per line."""
+    for i in range(5):
+        hyp = _make_spec(f"hyp-seq-{i}-v1")
+        tmp_registry.register(hyp)
+
+    raw = tmp_registry._path.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    assert len(lines) == 5, f"expected 5 lines, got {len(lines)}"
+
+    # Every line must be valid JSON
+    for i, ln in enumerate(lines, start=1):
+        json.loads(ln)  # raises if malformed
+
+    # read_all() must recover all 5
+    assert len(tmp_registry.read_all()) == 5
+
+
+def test_update_status_appends_valid_jsonl(tmp_registry):
+    """update_status() appends a new line rather than modifying the file in-place."""
+    hyp = _make_spec("hyp-status-v1", status=HypothesisStatus.draft)
+    tmp_registry.register(hyp)
+
+    tmp_registry.update_status("hyp-status-v1", "registered")
+
+    raw = tmp_registry._path.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    assert len(lines) == 2, f"expected 2 lines, got {len(lines)}"
+
+    for ln in lines:
+        json.loads(ln)  # raises if malformed
+
+    # Latest state should be "registered"
+    latest = tmp_registry.get("hyp-status-v1")
+    assert latest.status == HypothesisStatus.registered
+
+
+def _worker_register(path: str, worker_id: int, count: int) -> None:
+    """Worker function for concurrent register() test (runs in subprocess)."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from engine.edge_discovery.hypotheses.registry import HypothesisRegistry
+    from engine.edge_discovery.hypotheses.spec import HypothesisStatus
+    reg = HypothesisRegistry(path=path)
+    for i in range(count):
+        hyp = _make_spec(f"hyp-w{worker_id}-{i}-v1", status=HypothesisStatus.draft)
+        reg.register(hyp)
+
+
+def test_concurrent_register_produces_correct_line_count(tmp_path):
+    """Concurrent register() calls from multiple processes produce valid JSONL.
+
+    Uses multiprocessing to genuinely exercise the file lock across process
+    boundaries on Linux/WSL.
+    """
+    import multiprocessing
+    import sys
+    from pathlib import Path
+
+    registry_path = tmp_path / "concurrent.jsonl"
+    n_workers = 4
+    n_per_worker = 10
+
+    ctx = multiprocessing.get_context("spawn")
+    workers = [
+        ctx.Process(target=_worker_register, args=(str(registry_path), wid, n_per_worker))
+        for wid in range(n_workers)
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=30)
+        assert not w.exitcode, f"worker {w.pid} exited with {w.exitcode}"
+
+    # Every process registered n_per_worker entries; count lines
+    lines = [ln.strip() for ln in registry_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    expected = n_workers * n_per_worker
+    assert len(lines) == expected, f"expected {expected} lines, got {len(lines)}"
+
+    # Every line must be valid JSON
+    for ln in lines:
+        json.loads(ln)
+
+    # read_all() should recover all
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from engine.edge_discovery.hypotheses.registry import HypothesisRegistry
+    reg = HypothesisRegistry(path=str(registry_path))
+    assert len(reg.read_all()) == expected

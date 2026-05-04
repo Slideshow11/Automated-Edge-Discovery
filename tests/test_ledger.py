@@ -201,3 +201,95 @@ def test_ledger_path_env_var_is_honored(tmp_path, monkeypatch):
     assert "summary" in res
     assert "raw_splits_file" in res
     assert "summary_file" in res
+
+
+# ---------------------------------------------------------------------------
+# D. JSONL append correctness and locking
+# ---------------------------------------------------------------------------
+
+
+def test_sequential_writes_produce_valid_jsonl(tmp_path):
+    """Multiple sequential write() calls produce one JSON object per line."""
+    path = tmp_path / "ledger.jsonl"
+    ledger = ledger_module.Ledger(path=str(path))
+
+    for i in range(5):
+        entry = ledger_module.LedgerEntry(
+            run_id=f"run-{i}",
+            run_type="wfa_cpcv",
+            started_at="2026-04-26T00:00:00+00:00",
+            completed_at="2026-04-26T00:01:00+00:00",
+            status="success",
+            config_hash="abcd12345678efgh",
+        )
+        ledger.write(entry)
+
+    raw = path.read_text(encoding="utf-8")
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    assert len(lines) == 5, f"expected 5 lines, got {len(lines)}"
+
+    # Every line must be valid JSON
+    for ln in lines:
+        json.loads(ln)
+
+    # read() must recover all 5
+    assert len(ledger.read()) == 5
+
+
+def _ledger_worker(path: str, worker_id: int, count: int) -> None:
+    """Worker function for concurrent ledger write() test (runs in subprocess)."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from engine.edge_discovery import ledger as ledger_module
+    ledger = ledger_module.Ledger(path=path)
+    for i in range(count):
+        entry = ledger_module.LedgerEntry(
+            run_id=f"run-w{worker_id}-{i}",
+            run_type="wfa_cpcv",
+            started_at="2026-04-26T00:00:00+00:00",
+            completed_at="2026-04-26T00:01:00+00:00",
+            status="success",
+            config_hash="abcd12345678efgh",
+        )
+        ledger.write(entry)
+
+
+def test_concurrent_writes_produce_correct_line_count(tmp_path):
+    """Concurrent write() calls from multiple processes produce valid JSONL.
+
+    Uses multiprocessing to genuinely exercise the file lock across process
+    boundaries on Linux/WSL.
+    """
+    import multiprocessing
+    import sys
+    from pathlib import Path
+
+    ledger_path = tmp_path / "concurrent_ledger.jsonl"
+    n_workers = 4
+    n_per_worker = 10
+
+    ctx = multiprocessing.get_context("spawn")
+    workers = [
+        ctx.Process(target=_ledger_worker, args=(str(ledger_path), wid, n_per_worker))
+        for wid in range(n_workers)
+    ]
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join(timeout=30)
+        assert not w.exitcode, f"worker {w.pid} exited with {w.exitcode}"
+
+    # Every process wrote n_per_worker entries; count lines
+    lines = [ln.strip() for ln in ledger_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    expected = n_workers * n_per_worker
+    assert len(lines) == expected, f"expected {expected} lines, got {len(lines)}"
+
+    # Every line must be valid JSON
+    for ln in lines:
+        json.loads(ln)
+
+    # read() should recover all
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from engine.edge_discovery import ledger as ledger_module
+    ledger = ledger_module.Ledger(path=str(ledger_path))
+    assert len(ledger.read()) == expected
