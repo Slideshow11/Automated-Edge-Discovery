@@ -467,3 +467,10 @@ def test_confirmatory_data_scope_missing_still_missing_confirmatory_link():
         assert "missing_confirmatory_link" in codes
     finally:
         tmp.unlink()
+
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/trial_ledger_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "trial_ledger_v1 schema must have top-level additionalProperties: false"

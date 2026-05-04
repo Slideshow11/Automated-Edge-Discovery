@@ -1,0 +1,38 @@
+{
+  "trial_id": "TRL-2026-0001",
+  "search_space_id": "SSM-2026-0017",
+  "hypothesis_id": "EHH-2026-0012",
+  "source_lane": "theory_first",
+  "promotion_status": "raw_result",
+  "status": "completed",
+  "data_scope": {
+    "dataset_id": "DS-2026-Q1",
+    "manifest_ids": [
+      "MAN-2026-0041"
+    ],
+    "sample_start": "2024-01-01",
+    "sample_end": "2024-12-31",
+    "universe": "SPX options pre-earnings",
+    "leakage_notes": "none"
+  },
+  "execution_scope": {
+    "runner_id": "runner-local-v1",
+    "config_hash": "a3f2c1d9",
+    "git_commit": "b25ee20c",
+    "environment_fingerprint": "py311-ubuntu22",
+    "random_seed": 42,
+    "validation_scheme": "pbo_cpcv_2fold"
+  },
+  "results": {
+    "metrics_summary": {
+      "sharpe": 1.4,
+      "max_drawdown": -0.08,
+      "win_rate": 0.62
+    },
+    "artifact_paths": [
+      "artifacts/run_2026_001/batch_results.json"
+    ],
+    "evaluator_label": "provisional"
+  },
+  "live_trading_enabled": true
+}

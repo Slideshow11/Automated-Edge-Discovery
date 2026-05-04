@@ -22,7 +22,8 @@
     },
     "hypothesis_id": {
       "description": "Reference to the hypothesis under assessment.",
-      "type": "string"
+      "type": "string",
+      "pattern": "^HYP-[0-9]{4}-[0-9]{4}$"
     },
     "trial_id": {
       "description": "Reference to the TrialLedger entry.",
@@ -86,5 +87,6 @@
       "description": "ISO-8601 creation timestamp.",
       "type": "string"
     }
-  }
+  },
+  "additionalProperties": false
 }

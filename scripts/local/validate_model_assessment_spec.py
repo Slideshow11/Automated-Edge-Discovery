@@ -13,6 +13,7 @@ from pathlib import Path
 ID_PATTERN_MAS = re.compile(r"^MAS-[0-9]{4}-[0-9]{4}$")
 ID_PATTERN_TRL = re.compile(r"^TRL-[0-9]{4}-[0-9]{4}$")
 ID_PATTERN_SSM = re.compile(r"^SSM-[0-9]{4}-[0-9]{4}$")
+ID_PATTERN_HYP = re.compile(r"^HYP-[0-9]{4}-[0-9]{4}$")
 
 # Allowed enum values
 ASSESSMENT_STATUSES = {"draft", "reviewed", "rejected", "provisional", "accepted", "killed"}
@@ -29,6 +30,19 @@ REQUIRED_TOP_LEVEL = [
     "reviewer",
     "created_at",
 ]
+
+# All permitted top-level fields (for additionalProperties: false enforcement)
+ALLOWED_ROOT_FIELDS = {
+    "assessment_id",
+    "hypothesis_id",
+    "trial_id",
+    "search_space_id",
+    "assessment_status",
+    "metrics",
+    "required_checks",
+    "reviewer",
+    "created_at",
+}
 
 # Required boolean checks
 REQUIRED_CHECKS_FIELDS = [
@@ -101,6 +115,16 @@ def validate(entry):
     if blockers:
         return blockers  # cannot continue safely if required fields missing
 
+    # 1b. Reject unknown top-level fields
+    for field in entry:
+        if field not in ALLOWED_ROOT_FIELDS:
+            blockers.append(Blocker(
+                "unknown_root_field",
+                "model_assessment_spec_entry",
+                field,
+                f"unknown root field '{field}' is not permitted"
+            ))
+
     # 2. assessment_id format (MAS-YYYY-NNNN)
     assessment_id = entry.get("assessment_id", "")
     if not isinstance(assessment_id, str):
@@ -150,6 +174,23 @@ def validate(entry):
             "model_assessment_spec_entry",
             "search_space_id",
             f"search_space_id '{search_space_id}' does not match SSM-YYYY-NNNN format"
+        ))
+
+    # 4b. hypothesis_id format (HYP-YYYY-NNNN)
+    hypothesis_id = entry.get("hypothesis_id", "")
+    if not isinstance(hypothesis_id, str):
+        blockers.append(Blocker(
+            "invalid_id_format",
+            "model_assessment_spec_entry",
+            "hypothesis_id",
+            "hypothesis_id must be a string matching HYP-YYYY-NNNN format"
+        ))
+    elif not ID_PATTERN_HYP.match(hypothesis_id):
+        blockers.append(Blocker(
+            "invalid_id_format",
+            "model_assessment_spec_entry",
+            "hypothesis_id",
+            f"hypothesis_id '{hypothesis_id}' does not match HYP-YYYY-NNNN format"
         ))
 
     # 5. assessment_status enum
