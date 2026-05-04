@@ -4,6 +4,9 @@ import sys
 import tempfile
 from pathlib import Path
 
+import jsonschema
+import pytest
+
 REPO = Path(".")
 SCRIPT = REPO / "scripts" / "local" / "validate_search_space_manifest.py"
 FIXTURES = REPO / "fixtures" / "search_space_manifest_v1"
@@ -617,3 +620,20 @@ def test_multiple_blockers():
         assert data["blockers_count"] >= 3
     finally:
         Path(path).unlink()
+
+
+# ----- schema boundary tests -----
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/search_space_manifest_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "search_space_manifest_v1 must have top-level additionalProperties: false"
+
+
+def test_schema_rejects_boundary_autonomous_search():
+    """Schema rejects extra root field autonomous_search."""
+    schema = json.load(open("schemas/search_space_manifest_v1.schema.json"))
+    data = json.load(open("fixtures/search_space_manifest_v1/invalid_boundary_autonomous_search.json"))
+    with pytest.raises(jsonschema.ValidationError, match="Additional properties"):
+        jsonschema.validate(data, schema)
