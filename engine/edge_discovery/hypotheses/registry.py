@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional
 
 from .. import config as ed_config
+from .._file_lock import exclusive_file_lock
 from .spec import HypothesisSpec
 
 
@@ -124,7 +125,8 @@ class HypothesisRegistry:
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(hypothesis.to_dict(), sort_keys=True, ensure_ascii=True) + "\n")
+            with exclusive_file_lock(fh):
+                fh.write(json.dumps(hypothesis.to_dict(), sort_keys=True, ensure_ascii=True) + "\n")
 
     def update_status(
         self,
@@ -175,6 +177,7 @@ class HypothesisRegistry:
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(updated.to_dict(), sort_keys=True, ensure_ascii=True) + "\n")
+            with exclusive_file_lock(fh):
+                fh.write(json.dumps(updated.to_dict(), sort_keys=True, ensure_ascii=True) + "\n")
 
         return updated

@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from ._file_lock import exclusive_file_lock
+
 
 @dataclass
 class LedgerEntry:
@@ -71,7 +73,8 @@ class LedgerEntry:
 class Ledger:
     """Append-only JSON Lines ledger writer and reader.
 
-    Thread-unsafe — use an external lock if concurrent writes are expected.
+    Writes are protected by an exclusive file lock so concurrent processes
+    do not corrupt the JSONL file.
     """
 
     def __init__(self, path: str | Path = ".wfa/ledger.jsonl") -> None:
@@ -82,7 +85,8 @@ class Ledger:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(asdict(entry), ensure_ascii=False)
         with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(line + "\n")
+            with exclusive_file_lock(fh):
+                fh.write(line + "\n")
 
     def read(self) -> List[LedgerEntry]:
         """Read all ledger entries from the file.
