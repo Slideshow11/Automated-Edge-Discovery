@@ -261,6 +261,45 @@ do
   fi
 done
 
+# --- PreEarningsProfile v1 fixture checks ---
+
+echo "=== PreEarningsProfile valid fixture ==="
+python3 scripts/local/validate_preearnings_profile.py \
+  fixtures/preearnings_profile_v1/valid_minimal.json
+
+echo "=== PreEarningsProfile invalid fixtures must fail ==="
+for f in \
+  fixtures/preearnings_profile_v1/invalid_boundary_field.json \
+  fixtures/preearnings_profile_v1/invalid_earnings_time_reference.json \
+  fixtures/preearnings_profile_v1/invalid_entry_dpe_policy_type.json \
+  fixtures/preearnings_profile_v1/invalid_event_study_spec_ref.json \
+  fixtures/preearnings_profile_v1/invalid_exit_dpe_policy_type.json \
+  fixtures/preearnings_profile_v1/invalid_extension_hooks_unknown_field.json \
+  fixtures/preearnings_profile_v1/invalid_gap_exposure_policy.json \
+  fixtures/preearnings_profile_v1/invalid_instrument_universe_ref.json \
+  fixtures/preearnings_profile_v1/invalid_iv_crush_measurement_window_missing_field.json \
+  fixtures/preearnings_profile_v1/invalid_iv_crush_measurement_window_unit.json \
+  fixtures/preearnings_profile_v1/invalid_iv_crush_policy_type.json \
+  fixtures/preearnings_profile_v1/invalid_iv_regime_filter.json \
+  fixtures/preearnings_profile_v1/invalid_live_execution_field.json \
+  fixtures/preearnings_profile_v1/invalid_minimum_iv_rank_out_of_range.json \
+  fixtures/preearnings_profile_v1/invalid_missing_required.json \
+  fixtures/preearnings_profile_v1/invalid_options_event_risk_ref.json \
+  fixtures/preearnings_profile_v1/invalid_outcome_spec_ref.json \
+  fixtures/preearnings_profile_v1/invalid_outcome_spec_refs_empty.json \
+  fixtures/preearnings_profile_v1/invalid_preearnings_profile_id.json \
+  fixtures/preearnings_profile_v1/invalid_preearnings_profile_version.json \
+  fixtures/preearnings_profile_v1/invalid_provider_table_field.json \
+  fixtures/preearnings_profile_v1/invalid_reviewer_empty_object.json \
+  fixtures/preearnings_profile_v1/invalid_reviewer_type.json \
+  fixtures/preearnings_profile_v1/invalid_session_anchor_policy.json
+do
+  if python3 scripts/local/validate_preearnings_profile.py "$f"; then
+    echo "BLOCKER: invalid PreEarningsProfile fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -274,6 +313,7 @@ python3 -m pytest \
   tests/test_validate_instrument_universe_spec.py \
   tests/test_validate_event_study_spec.py \
   tests/test_validate_options_event_risk_spec.py \
+  tests/test_validate_preearnings_profile.py \
   -q
 
 echo "Governance manifests validator checks completed."
