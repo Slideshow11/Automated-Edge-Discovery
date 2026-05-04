@@ -47,12 +47,12 @@ The runner slice consumes the following input artifacts:
 
 | Artifact | Purpose | Source |
 |---|---|---|
-| `ExperimentSpec` | Declares the overall experiment structure, entry/exit modes, stop rules | `schemas/experiment_spec_v1.json` or named fixture |
-| `OutcomeSpec` | Declares which outcome metric is computed over which window | `schemas/outcome_spec_v1.json` or named fixture |
-| `InstrumentUniverseSpec` | Declares eligible instruments and liquidity rules | `schemas/instrument_universe_spec_v1.json` or named fixture |
-| `EventStudySpec` | Declares event-alignment contract, window structures, leakage policies | `schemas/event_study_spec_v1.json` or named fixture |
-| `OptionsEventRiskSpec` | Declares option contract selection, liquidity, pricing, gap exposure | `schemas/options_event_risk_spec_v1.json` or named fixture |
-| `PreEarningsProfile` | Declares BMO/AMC session semantics, DPE targeting, IV crush policy | `schemas/preearnings_profile_v1.json` or named fixture |
+| `ExperimentSpec` | Declares the overall experiment structure, entry/exit modes, stop rules | `schemas/experiment_spec_v1.schema.json` or named fixture |
+| `OutcomeSpec` | Declares which outcome metric is computed over which window | `schemas/outcome_spec_v1.schema.json` or named fixture |
+| `InstrumentUniverseSpec` | Declares eligible instruments and liquidity rules | `schemas/instrument_universe_spec_v1.schema.json` or named fixture |
+| `EventStudySpec` | Declares event-alignment contract, window structures, leakage policies | `schemas/event_study_spec_v1.schema.json` or named fixture |
+| `OptionsEventRiskSpec` | Declares option contract selection, liquidity, pricing, gap exposure | `schemas/options_event_risk_spec_v1.schema.json` or named fixture |
+| `PreEarningsProfile` | Declares BMO/AMC session semantics, DPE targeting, IV crush policy | `schemas/preearnings_profile_v1.schema.json` or named fixture |
 | `DataManifest` | Declares data sources, paths, and availability (if present) | Local data lake or fixture manifest |
 | `local data files` | Actual OHLCV, earnings dates, options quotes (EOD or EOP) | Local path refs in DataManifest |
 
@@ -171,21 +171,31 @@ The runner executes the following stages in order:
 - The outcome metric is fixed by `OutcomeSpec` — no search, no alternate metric computation.
 - Tag post-event anchor rows separately from pre-event evidence rows.
 
-**Stage i. Emit RunnerOutput artifact**
+**Stage i. Run audit checks (gate)**
+- Run all audit checks (see Section 8) before emitting any result rows or promoted artifacts.
+- If any audit check fails:
+  - Emit a FailureOutput artifact containing: `status`, `failed_check`, `blocker_summary`, `input_artifact_refs`, `run_config_hash` if computable, `created_at`, `run_owner`.
+  - Do NOT emit result rows, observation tables, or promoted artifacts.
+  - Halt further processing.
+- If all audit checks pass: proceed to Stage j.
+
+**Stage j. Emit RunnerOutput artifact**
 - Serialize the RunnerOutput with all required fields (see Section 7).
+- For `success` and `partial` runs: include full `row_counts`, `event_counts`, `instrument_counts`, `dropped_rows_summary`, `missing_data_summary`, and `leakage_checks_summary`.
 - Write to local output path.
 - Do not promote, register, or upsert the output to any ledger, registry, or production system.
 
-**Stage j. Emit validation/audit report**
-- Run all audit checks (see Section 8).
-- Append audit results to the RunnerOutput.
-- Emit a human-readable audit summary.
+**Stage k. Emit audit report**
+- Append full audit results to the RunnerOutput.
+- Emit a human-readable audit summary as a companion artifact.
 
 ---
 
 ## 7. Runner Output Contract
 
 The `RunnerOutput` artifact is a new artifact type emitted by the runner. Its schema is not implemented in this PR — this section defines the proposed contract for future implementation.
+
+A related artifact type, `FailureOutput`, is emitted when the run terminates early due to audit check failures. `FailureOutput` is not a `RunnerOutput`; it is a minimal accountability artifact containing only terminal status, blocker summary, and run metadata.
 
 ### Proposed Fields
 
@@ -247,7 +257,7 @@ The runner performs the following audit checks on every run (success or dry-run)
 | `no_registry_mutation` | No EdgeHypothesisRegistry or TrialLedger is written by the runner | Required |
 | `no_autonomous_search_flag_set` | ExperimentSpec `trial_generation_mode` is not `autonomous_search` | Required |
 
-Audit failures cause the runner to emit `status = failed_validation` and halt before producing any output artifact.
+Audit check failures cause the runner to emit a FailureOutput artifact and halt before producing result rows or promoted artifacts. A terminal `status` is always captured for traceability. The FailureOutput is not a promoted artifact — it is a governance artifact for run accountability.
 
 ---
 
