@@ -25,6 +25,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - EventStudySpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #112–#117)
 - OptionsEventRiskSpec v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #119–#128)
 - PreEarningsProfile v1 design, schema, fixtures, local validator, tests, and CI wiring complete (PRs #130–#137)
+- First thin real-data runner slice v1 design in review (PR #139)
 
 ## Document groups
 
@@ -47,6 +48,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/event_study_spec_v1_design.md | ArchitectureLayer | EventStudySpec v1: domain-neutral event-alignment contract, event families, window structures, timing controls, leakage policies, event source priority, collision/dedup rules. | Active v1 design |
 | docs/options_event_risk_spec_v1_design.md | ArchitectureLayer | OptionsEventRiskSpec v1: domain-specific options event-risk specialization of EventStudySpec, contract selection, liquidity/pricing policies, gap exposure, domain-neutral pre-earnings profile hook, boundary with EventStudySpec and PreEarningsProfile. | Active v1 design |
 | docs/preearnings_profile_v1_design.md | ArchitectureLayer | PreEarningsProfile v1: domain-specific pre-earnings research module, BMO/AMC session semantics, DPE targeting, earnings-specific gap exposure rules, IV crush policy, domain-neutral boundary with EventStudySpec and OptionsEventRiskSpec. | Active v1 complete |
+| docs/first_thin_real_data_runner_slice_design.md | ArchitectureLayer | First thin real-data runner slice v1 design: minimal vertical cut connecting governance artifacts to real runner outputs, read-only, non-trading, no autonomous search, no optimization, dry-run and smoke_real_data modes, RunnerOutput contract proposal, audit checks, stop rules, design tensions. | Design v1 in review |
 | docs/literature_requirements_for_aed.md | RequirementsLayer | Requirements extraction from Bailey/Borwein/López de Prado/Zhu PBO, López de Prado AFML, Montgomery DOE, Ilmanen Expected Returns, Efron & Hastie CASI. Maps literature ideas to AED artifact implications for OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, ModelAssessmentSpec extensions, and ReviewPacket design. | Active requirements baseline |
 | docs/trial_ledger_v1_design.md | EnforcementLayer | Defines TrialLedger v1: append-only trial record, identity fields, source lanes, promotion rules, and governance states. | Active v1 design |
 | docs/search_space_manifest_v1_design.md | EnforcementLayer | Defines SearchSpaceManifest v1: pre-declared search boundaries, budget, constraints, forbidden modes, and burden accounting. | Active v1 design |
