@@ -1,0 +1,48 @@
+{
+  "runner_output_id": "RUN-2026-0001",
+  "runner_output_version": "1.0",
+  "run_id": "run-hash-2026-0001",
+  "run_mode": "dry_run",
+  "status": "success",
+  "runner_name": "aed-dry-run-validator",
+  "runner_version": "0.1.0",
+  "experiment_spec_ref": "EXP-2026-0001",
+  "input_artifact_refs": [],
+  "data_manifest_refs": [
+    "DM-2026-0001"
+  ],
+  "run_config_hash": "sha256:config-2026-0001",
+  "started_at": "2026-01-01T00:00:00Z",
+  "completed_at": "2026-01-01T00:01:00Z",
+  "audit_summary": {
+    "overall_result": "pass",
+    "blocker_count": 0,
+    "warning_count": 0,
+    "audits": [
+      {
+        "audit_name": "schema_validation_all_inputs",
+        "audit_result": "pass",
+        "severity": "info",
+        "blocker_count": 0,
+        "warning_count": 0,
+        "details_ref": null,
+        "created_at": "2026-01-01T00:01:00Z"
+      }
+    ]
+  },
+  "output_manifest": [
+    {
+      "output_role": "audit_report",
+      "output_path": "outputs/audit.json",
+      "row_count": 1,
+      "content_hash": "sha256:audit123",
+      "created_at": "2026-01-01T00:01:00Z",
+      "format": "json",
+      "description": "Schema validation audit report",
+      "contains_private_data": false,
+      "publishable": false
+    }
+  ],
+  "created_at": "2026-01-01T00:01:00Z",
+  "run_owner": "aed-dry-run"
+}
