@@ -4,6 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 REPO = Path(".")
 SCRIPT = REPO / "scripts" / "local" / "validate_experiment_spec.py"
 FIXTURES = REPO / "fixtures" / "experiment_spec_v1"
@@ -1142,3 +1144,12 @@ def test_experiment_version_bool_fails():
         assert "invalid_type" in codes
     finally:
         path.unlink()
+
+
+# ----- schema boundary tests -----
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/experiment_spec_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "experiment_spec_v1 must have top-level additionalProperties: false"

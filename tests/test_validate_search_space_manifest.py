@@ -4,6 +4,8 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 REPO = Path(".")
 SCRIPT = REPO / "scripts" / "local" / "validate_search_space_manifest.py"
 FIXTURES = REPO / "fixtures" / "search_space_manifest_v1"
@@ -617,3 +619,12 @@ def test_multiple_blockers():
         assert data["blockers_count"] >= 3
     finally:
         Path(path).unlink()
+
+
+# ----- schema boundary tests -----
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/search_space_manifest_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "search_space_manifest_v1 must have top-level additionalProperties: false"

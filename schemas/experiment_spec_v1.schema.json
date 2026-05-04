@@ -99,7 +99,10 @@
         "offset_direction": {
           "description": "Direction of offset relative to the decision timestamp.",
           "type": "string",
-          "enum": ["before", "after"]
+          "enum": [
+            "before",
+            "after"
+          ]
         },
         "offset_unit": {
           "description": "Unit of the offset value.",
@@ -116,11 +119,11 @@
       }
     },
     "entry_rule_ref": {
-      "description": "Reference URI to the entry rule definition. Abstract — resolved by domain profile.",
+      "description": "Reference URI to the entry rule definition. Abstract \u2014 resolved by domain profile.",
       "type": "string"
     },
     "exit_rule_ref": {
-      "description": "Reference URI to the exit rule definition. Abstract — resolved by domain profile.",
+      "description": "Reference URI to the exit rule definition. Abstract \u2014 resolved by domain profile.",
       "type": "string"
     },
     "outcome_spec_ref": {
@@ -140,7 +143,7 @@
       "type": "object"
     },
     "risk_profile_ref": {
-      "description": "Reference URI to the risk profile. Abstract — resolved by domain profile.",
+      "description": "Reference URI to the risk profile. Abstract \u2014 resolved by domain profile.",
       "type": "string"
     },
     "trial_generation_mode": {
@@ -170,7 +173,7 @@
       "minItems": 1
     },
     "prohibited_modes": {
-      "description": "Stop-rule enforcement object. All eight governance fields must be present and set to false. There is no omit-and-default — every ExperimentSpec must affirmatively declare its stop rules.",
+      "description": "Stop-rule enforcement object. All eight governance fields must be present and set to false. There is no omit-and-default \u2014 every ExperimentSpec must affirmatively declare its stop rules.",
       "type": "object",
       "required": [
         "autonomous_search",
@@ -185,35 +188,51 @@
       "properties": {
         "autonomous_search": {
           "description": "No automated exploration of the strategy space without pre-declared SearchSpaceManifest and human review. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "bayesian_optimization": {
           "description": "No automated hyperparameter optimization. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "genetic_programming": {
           "description": "No evolutionary algorithm-driven strategy generation. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "automated_promotion": {
           "description": "No automatic advancement of hypotheses to next stage. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "automated_registry_mutation": {
           "description": "No automatic changes to EdgeHypothesisRegistry records. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "live_trading": {
           "description": "No real-money execution under any circumstances. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "production_execution": {
           "description": "No simulated production with real market impact. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         },
         "gcru_integration": {
           "description": "No connection to live market data feeds, execution systems, or risk management without a separate governance design. Must be false.",
-          "enum": [false]
+          "enum": [
+            false
+          ]
         }
       }
     },
@@ -225,5 +244,6 @@
       "description": "Human reviewer metadata for this experiment declaration. Must be an object with at minimum a name field.",
       "type": "object"
     }
-  }
+  },
+  "additionalProperties": false
 }
