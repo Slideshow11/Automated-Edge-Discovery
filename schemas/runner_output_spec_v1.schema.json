@@ -1,0 +1,1082 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "RunnerOutputSpec v1",
+  "description": "Domain-neutral runner output evidence artifact for AED governance: records run inputs, outputs, audit outcomes, and terminal status. Does not include PBO, DSR, Sharpe, overfit discount, ModelAssessment final scoring, ReviewPacket decision, automated promotion, live trading, or production execution fields. Single-artifact model: RunnerOutput is the sole durable terminal artifact for success, partial, and all failure statuses.",
+  "type": "object",
+  "required": [
+    "runner_output_id",
+    "runner_output_version",
+    "run_id",
+    "run_mode",
+    "status",
+    "runner_name",
+    "runner_version",
+    "experiment_spec_ref",
+    "input_artifact_refs",
+    "data_manifest_refs",
+    "run_config_hash",
+    "started_at",
+    "completed_at",
+    "audit_summary",
+    "output_manifest",
+    "created_at",
+    "run_owner"
+  ],
+  "properties": {
+    "runner_output_id": {
+      "description": "Canonical runner output identifier. Format: RUN-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^RUN-[0-9]{4}-[0-9]{4}$"
+    },
+    "runner_output_version": {
+      "description": "Schema version. Fixed to '1.0' for v1.",
+      "type": "string",
+      "const": "1.0"
+    },
+    "run_id": {
+      "description": "Deterministic run config hash. Hex or base64 encoded.",
+      "type": "string",
+      "minLength": 1
+    },
+    "run_mode": {
+      "description": "Execution mode of the runner.",
+      "type": "string",
+      "enum": [
+        "dry_run",
+        "smoke_real_data",
+        "backtest_real_data",
+        "simulation",
+        "replay",
+        "custom"
+      ]
+    },
+    "status": {
+      "description": "Terminal status of the run. All statuses produce exactly one RunnerOutput artifact.",
+      "type": "string",
+      "enum": [
+        "success",
+        "partial",
+        "failed_missing_data",
+        "failed_validation",
+        "failed_runtime",
+        "cancelled"
+      ]
+    },
+    "runner_name": {
+      "description": "Human-readable runner name, e.g. 'aed-dry-run-validator'.",
+      "type": "string",
+      "minLength": 1
+    },
+    "runner_version": {
+      "description": "Runner implementation version, e.g. '0.1.0'.",
+      "type": "string",
+      "minLength": 1
+    },
+    "experiment_spec_ref": {
+      "description": "Reference to the ExperimentSpec used for this run. Format: EXP-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^EXP-[0-9]{4}-[0-9]{4}$"
+    },
+    "input_artifact_refs": {
+      "description": "All governance artifacts consumed by this run.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "artifact_type",
+          "artifact_id",
+          "content_hash",
+          "validation_status"
+        ],
+        "properties": {
+          "artifact_type": {
+            "description": "Type of governance artifact, e.g. 'ExperimentSpec', 'OutcomeSpec', 'PreEarningsProfile'.",
+            "type": "string",
+            "minLength": 1
+          },
+          "artifact_id": {
+            "description": "Artifact identifier, e.g. 'EXP-2026-0001'.",
+            "type": "string",
+            "minLength": 1
+          },
+          "artifact_path": {
+            "description": "Resolved local filesystem path. Null if artifact is served from a registry.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "schema_ref": {
+            "description": "Schema file path or registry ID used for validation.",
+            "type": "string",
+            "minLength": 1
+          },
+          "validator_ref": {
+            "description": "Validator script path used. Null if no validator was run.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "content_hash": {
+            "description": "SHA-256 or equivalent hash of artifact content.",
+            "type": "string",
+            "minLength": 1
+          },
+          "validation_status": {
+            "description": "Result of AED validator run during this execution.",
+            "type": "string",
+            "enum": [
+              "pass",
+              "fail",
+              "warn",
+              "skipped"
+            ]
+          },
+          "validated_at": {
+            "description": "ISO8601 timestamp when validation ran. Null if validation was not run.",
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "data_manifest_refs": {
+      "description": "DataManifests used or attempted in this run.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "run_config_hash": {
+      "description": "Deterministic hash of the fixed run configuration.",
+      "type": "string",
+      "minLength": 1
+    },
+    "started_at": {
+      "description": "ISO8601 wall-clock start time of the run.",
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "completed_at": {
+      "description": "ISO8601 wall-clock completion time. Null if run is still in progress.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "audit_summary": {
+      "description": "Summary of all audit results.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "overall_result",
+        "blocker_count",
+        "warning_count",
+        "audits"
+      ],
+      "properties": {
+        "overall_result": {
+          "description": "Overall audit result: fail if any required audit is fail; pass if all pass; warn if any warn.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "blocker_count": {
+          "description": "Number of audit checks with result = fail.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "warning_count": {
+          "description": "Number of audit checks with result = warn.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "audits": {
+          "description": "One entry per audit check run.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "audit_name",
+              "audit_result",
+              "severity",
+              "blocker_count",
+              "warning_count",
+              "created_at"
+            ],
+            "properties": {
+              "audit_name": {
+                "description": "Audit check name, e.g. 'schema_validation_all_inputs', 'no_lookahead_in_pre_event'.",
+                "type": "string",
+                "minLength": 1
+              },
+              "audit_result": {
+                "description": "Result of this audit check.",
+                "type": "string",
+                "enum": [
+                  "pass",
+                  "fail",
+                  "warn",
+                  "skipped"
+                ]
+              },
+              "severity": {
+                "description": "Severity classification of this audit check.",
+                "type": "string",
+                "enum": [
+                  "blocker",
+                  "warning",
+                  "info"
+                ]
+              },
+              "blocker_count": {
+                "description": "Number of failures within this audit check.",
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning_count": {
+                "description": "Number of warnings within this audit check.",
+                "type": "integer",
+                "minimum": 0
+              },
+              "details_ref": {
+                "description": "Path or ID to detailed audit output. Null if no details.",
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "minLength": 1
+              },
+              "created_at": {
+                "description": "ISO8601 timestamp when this audit check ran.",
+                "type": "string",
+                "minLength": 1,
+                "format": "date-time"
+              }
+            }
+          }
+        }
+      }
+    },
+    "output_manifest": {
+      "description": "All output files and artifacts produced by this run.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "output_role",
+          "output_path",
+          "content_hash",
+          "created_at",
+          "format",
+          "description",
+          "contains_private_data",
+          "publishable"
+        ],
+        "properties": {
+          "output_role": {
+            "description": "Role of this output in the run lifecycle.",
+            "type": "string",
+            "enum": [
+              "evidence",
+              "audit_report",
+              "failure_report",
+              "intermediate",
+              "debug",
+              "custom"
+            ]
+          },
+          "output_path": {
+            "description": "Relative or absolute path to the output file.",
+            "type": "string",
+            "minLength": 1
+          },
+          "row_count": {
+            "description": "Number of data rows in this output file. Null for non-row artifacts.",
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0
+          },
+          "content_hash": {
+            "description": "SHA-256 or equivalent hash of output file content.",
+            "type": "string",
+            "minLength": 1
+          },
+          "created_at": {
+            "description": "ISO8601 timestamp when this output file was written.",
+            "type": "string",
+            "minLength": 1,
+            "format": "date-time"
+          },
+          "format": {
+            "description": "File format, e.g. 'json', 'csv', 'parquet', 'yaml', 'txt'.",
+            "type": "string",
+            "minLength": 1
+          },
+          "description": {
+            "description": "Human-readable description of this output.",
+            "type": "string",
+            "minLength": 1
+          },
+          "contains_private_data": {
+            "description": "True if output may contain PII, vendor data, or proprietary content.",
+            "type": "boolean"
+          },
+          "publishable": {
+            "description": "True only if contains_private_data is false AND reviewer has approved. Defaults to false.",
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "created_at": {
+      "description": "ISO8601 timestamp when this RunnerOutput artifact was serialized.",
+      "type": "string",
+      "minLength": 1,
+      "format": "date-time"
+    },
+    "run_owner": {
+      "description": "Identity declared at run invocation. Not authenticated.",
+      "type": "string",
+      "minLength": 1
+    },
+    "reviewer": {
+      "description": "Set after manual review. Null if not yet reviewed.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "outcome_spec_refs": {
+      "description": "OutcomeSpec IDs used in this run. Format: OUT-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^OUT-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "instrument_universe_refs": {
+      "description": "InstrumentUniverseSpec IDs used in this run. Format: IUS-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^IUS-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "event_study_spec_refs": {
+      "description": "EventStudySpec IDs used in this run. Format: EVS-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^EVS-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "options_event_risk_refs": {
+      "description": "OptionsEventRiskSpec IDs used in this run. Format: OER-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^OER-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "preearnings_profile_refs": {
+      "description": "PreEarningsProfile IDs used in this run. Format: PEP-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^PEP-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "domain_profile_refs": {
+      "description": "Any domain profile IDs used in this run, including future profiles (crypto, macro, futures, etc.).",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "search_space_manifest_ref": {
+      "description": "SearchSpaceManifest ID used in this run, if any. Format: SSM-YYYY-NNNN.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^SSM-[0-9]{4}-[0-9]{4}$"
+    },
+    "trial_ledger_ref": {
+      "description": "TrialLedger entry ID for this run, if promoted. Format: TRL-YYYY-NNNN.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^TRL-[0-9]{4}-[0-9]{4}$"
+    },
+    "model_assessment_refs": {
+      "description": "ModelAssessmentSpec IDs used in this run. Format: MAS-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^MAS-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "review_packet_refs": {
+      "description": "ReviewPacket IDs for this run, if reviewed.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "failure_summary": {
+      "description": "Present when status is failed_missing_data, failed_validation, failed_runtime, or cancelled. Null for success and partial.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "failure_type": {
+          "description": "Type of failure that caused this run to fail or cancel.",
+          "type": "string",
+          "enum": [
+            "missing_data",
+            "validation_error",
+            "runtime_error",
+            "timeout",
+            "cancelled",
+            "unsupported_config",
+            "custom"
+          ]
+        },
+        "status": {
+          "description": "Must match the top-level status of this RunnerOutput.",
+          "type": "string",
+          "enum": [
+            "success",
+            "partial",
+            "failed_missing_data",
+            "failed_validation",
+            "failed_runtime",
+            "cancelled"
+          ]
+        },
+        "failed_check": {
+          "description": "Name of the specific audit or validation check that failed. Null if no specific check.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "blocker_summary": {
+          "description": "Human-readable summary of what blocked the run.",
+          "type": "string",
+          "minLength": 1
+        },
+        "missing_data_summary_ref": {
+          "description": "Reference to the missing data report or manifest, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "details_ref": {
+          "description": "Path or ID to detailed failure output. Null if no details.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "created_at": {
+          "description": "ISO8601 timestamp when the failure occurred.",
+          "type": "string",
+          "minLength": 1,
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "failure_type",
+        "status",
+        "blocker_summary",
+        "created_at"
+      ]
+    },
+    "partial_summary": {
+      "description": "Present when status is partial. Null for all other statuses.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "partial_reason": {
+          "description": "Why the run is partial, e.g. 'missing_data', 'dropped_rows'.",
+          "type": "string",
+          "minLength": 1
+        },
+        "completed_stages": {
+          "description": "Runner stages that completed before warnings or truncation.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "incomplete_stages": {
+          "description": "Runner stages that were skipped or truncated.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "affected_outputs": {
+          "description": "Output paths affected by warnings or incomplete processing.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "reconciliation_notes": {
+          "description": "Free-text explanation of any reconciliation discrepancies.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "missing_data_summary": {
+      "description": "Summary of data that was unavailable or unresolved during this run.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "data_ref": {
+            "description": "Reference to the unavailable data, e.g. file path or DataManifest ID.",
+            "type": "string",
+            "minLength": 1
+          },
+          "reason": {
+            "description": "Why the data was unavailable.",
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "dropped_rows_summary": {
+      "description": "Summary of rows that were dropped during this run.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "description": "Reason why rows were dropped.",
+            "type": "string",
+            "minLength": 1
+          },
+          "count": {
+            "description": "Number of rows dropped for this reason.",
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "leakage_checks_summary": {
+      "description": "Summary of leakage and anti-lookahead audit checks.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "no_lookahead_in_pre_event": {
+          "description": "Result of no-lookahead-in-pre-event audit check.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "post_event_rows_tagged": {
+          "description": "Result of post-event-row-tagging audit check.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "no_gap_exit_for_pre_event": {
+          "description": "Result of no-gap-exit-for-pre-event audit check.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "data_timestamp_policy": {
+          "description": "Result of data-timestamp-policy audit check.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "feature_cutoff_policy": {
+          "description": "Result of feature-cutoff-policy audit check.",
+          "type": "string",
+          "enum": [
+            "pass",
+            "fail",
+            "warn",
+            "skipped"
+          ]
+        },
+        "details_ref": {
+          "description": "Path to detailed leakage report. Null if no details.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "row_counts": {
+      "description": "Row counts for this run. Present for success and partial statuses.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_observations": {
+          "description": "All rows in primary output.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "pre_event_evidence_rows": {
+          "description": "Rows tagged as pre-event evidence window.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "post_event_anchor_rows": {
+          "description": "Rows tagged as post-event anchor.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "dropped_rows": {
+          "description": "Rows dropped by inclusion or exclusion rules.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "filtered_rows": {
+          "description": "Rows filtered by BMO/AMC or DPE constraints.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "event_counts": {
+      "description": "Event counts for this run. Present for success and partial statuses.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_events": {
+          "description": "All earnings events in eligible universe.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "events_with_options": {
+          "description": "Events that had matching option contracts.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "events_missing_data": {
+          "description": "Events excluded due to missing data.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "events_filtered": {
+          "description": "Events filtered by DPE or session constraints.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "instrument_counts": {
+      "description": "Instrument counts for this run. Present for success and partial statuses.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "total_instruments": {
+          "description": "Instruments in eligible universe before filtering.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "instruments_with_events": {
+          "description": "Instruments that had at least one qualifying event.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "instruments_filtered": {
+          "description": "Instruments filtered by universe or liquidity rules.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "instruments_missing_data": {
+          "description": "Instruments excluded due to missing data.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "execution_environment": {
+      "description": "Runner execution environment information.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "python_version": {
+          "description": "Python version used by the runner.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "platform": {
+          "description": "OS platform, e.g. 'Linux', 'Windows'.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "hostname_redacted": {
+          "description": "Hostname with sensitive portions redacted.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "container_image_ref": {
+          "description": "Container image reference used, if applicable.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "dependency_lock_ref": {
+          "description": "Dependency lock file reference, e.g. poetry.lock or requirements.txt hash.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "code_version_ref": {
+      "description": "Version of runner code executed.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "git_commit": {
+      "description": "Git commit SHA of runner code executed.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "command_line": {
+      "description": "Full command line invocation. Secrets must be redacted before inclusion.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "output_paths": {
+      "description": "Top-level output directory or file paths produced by this run.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "artifact_refs": {
+      "description": "Explicit references to all artifacts produced by this run.",
+      "type": [
+        "array",
+        "null"
+      ],
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1
+    },
+    "extension_hooks": {
+      "description": "Domain-specific extensibility hook. Reference arrays only; additionalProperties false.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "domain_profile_extension_refs": {
+          "description": "References to domain-specific profile extension data.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "runner_extension_refs": {
+          "description": "References to runner-specific extension data.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "audit_extension_refs": {
+          "description": "References to audit-specific extension data.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "output_extension_refs": {
+          "description": "References to output-specific extension data.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        },
+        "review_extension_refs": {
+          "description": "References to review-specific extension data.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "notes": {
+      "description": "Free-text notes from run_owner or reviewer.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    }
+  },
+  "if": {
+    "properties": {
+      "status": {
+        "const": "success"
+      }
+    },
+    "required": [
+      "status"
+    ]
+  },
+  "then": {
+    "properties": {
+      "failure_summary": {
+        "type": "null"
+      },
+      "partial_summary": {
+        "type": "null"
+      }
+    }
+  },
+  "else": {
+    "if": {
+      "properties": {
+        "status": {
+          "const": "partial"
+        }
+      },
+      "required": [
+        "status"
+      ]
+    },
+    "then": {
+      "properties": {
+        "partial_summary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "partial_reason": {
+              "description": "Why the run is partial, e.g. 'missing_data', 'dropped_rows'.",
+              "type": "string",
+              "minLength": 1
+            },
+            "completed_stages": {
+              "description": "Runner stages that completed before warnings or truncation.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "incomplete_stages": {
+              "description": "Runner stages that were skipped or truncated.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "affected_outputs": {
+              "description": "Output paths affected by warnings or incomplete processing.",
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              },
+              "minItems": 1
+            },
+            "reconciliation_notes": {
+              "description": "Free-text explanation of any reconciliation discrepancies.",
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "failure_summary": {
+          "type": "null"
+        }
+      },
+      "required": [
+        "partial_summary"
+      ]
+    },
+    "else": {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "failed_missing_data",
+              "failed_validation",
+              "failed_runtime",
+              "cancelled"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "failure_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "partial_summary": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "failure_summary"
+        ]
+      },
+      "else": {
+        "const": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
