@@ -51,8 +51,10 @@ def compute_pbo(Y: np.ndarray, n_bootstrap: int = 1000, seed: int = 0) -> tuple[
         usable_splits.append(rng.choice(tied))
     n_usable = len(usable_splits)
     if n_usable == 0:
-        # All splits were all-NaN: return safe NaN result, no winner to aggregate
-        return np.nan, np.nan
+        # All splits were all-NaN: fail closed.
+        # No usable evidence means maximum overfit risk (PBO = 1.0).
+        # pbo_std is undefined without usable splits; return nan.
+        return 1.0, np.nan
     freqs = np.bincount(np.array(usable_splits, dtype=int), minlength=n_candidates) / n_usable
     # PBO: proportion of splits where best candidate is not consistently the same
     pbo = 1.0 - float(np.max(freqs))
@@ -73,7 +75,7 @@ def compute_pbo(Y: np.ndarray, n_bootstrap: int = 1000, seed: int = 0) -> tuple[
 
         # Bootstrap winner selection per resampled split with uniform tie-breaking.
         # For each bootstrap sample, for each split: collect candidates at max value
-        # and choose uniformly among them using the child RNG derived from parent.
+        # and choose uniformly among them using the parent seeded RNG.
         # This replaces the old noise+candidate_scale approach which biased toward
         # higher-indexed candidates.
         boots_chunk = np.empty(end - start)
@@ -87,8 +89,7 @@ def compute_pbo(Y: np.ndarray, n_bootstrap: int = 1000, seed: int = 0) -> tuple[
                 tied = np.flatnonzero(tied_mask)
                 if len(tied) == 0:
                     continue  # all-NaN split, skip
-                child_rng = np.random.default_rng(rng.integers(0, 2**31))
-                best_per_split.append(child_rng.choice(tied))
+                best_per_split.append(rng.choice(tied))
             if len(best_per_split) == 0:
                 boots_chunk[i] = 0.0
             else:

@@ -36,15 +36,35 @@ class TestComputePboNanHandling:
         assert 0.0 <= pbo <= 1.0
         assert pbo_std >= 0.0
 
-    def test_all_splits_all_nan_returns_nan(self):
-        """When all split columns are all-NaN, compute_pbo should return (nan, nan)."""
+    def test_all_splits_all_nan_returns_fail_closed(self):
+        """When all split columns are all-NaN, compute_pbo should fail closed.
+
+        No usable split evidence means maximum overfit risk (PBO = 1.0).
+        pbo_std is undefined without usable splits (nan).
+        This prevents silent audit pass on invalid datasets.
+        """
         Y = np.array([
             [np.nan, np.nan],
             [np.nan, np.nan],
         ], dtype=float)
         pbo, pbo_std = compute_pbo(Y, n_bootstrap=10, seed=42)
-        assert np.isnan(pbo)
+        assert pbo == pytest.approx(1.0, abs=1e-6)
         assert np.isnan(pbo_std)
+
+    def test_all_nan_fail_closed_triggers_audit_gate(self):
+        """All-unusable PBO (1.0) exceeds typical threshold, failing the audit gate.
+
+        This verifies the fail-closed behavior actually triggers rejection:
+        pbo=1.0 > pbo_threshold=0.05 → audit should reject.
+        """
+        Y = np.array([
+            [np.nan, np.nan, np.nan],
+            [np.nan, np.nan, np.nan],
+        ], dtype=float)
+        pbo, _ = compute_pbo(Y, n_bootstrap=10, seed=42)
+        # pbo=1.0 > 0.05 threshold → would fail audit gate
+        assert pbo == pytest.approx(1.0, abs=1e-6)
+        assert pbo > 0.05  # typical pbo_threshold in auditor.py
 
     def test_nan_column_at_various_positions(self):
         """NaN columns at different positions should be handled correctly."""
