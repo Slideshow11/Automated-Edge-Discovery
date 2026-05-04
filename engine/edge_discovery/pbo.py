@@ -36,13 +36,24 @@ def compute_pbo(Y: np.ndarray, n_bootstrap: int = 1000, seed: int = 0) -> tuple[
     rng = np.random.default_rng(seed)
     n_bootstrap = min(n_bootstrap, 5000)
 
-    # Compute best candidate per split with tie-breaking (uniform among ties)
-    best_idx_per_split = np.array([
-        rng.choice(np.flatnonzero(Y[:, j] == np.nanmax(Y[:, j])))
-        for j in range(n_splits)
-    ], dtype=int)
-    # Empirical frequency of each candidate being best
-    freqs = np.bincount(best_idx_per_split, minlength=n_candidates) / n_splits
+    # Compute best candidate per split with explicit uniform tie-breaking.
+    # Skips splits where all candidates are NaN (records usable_splits only).
+    usable_splits = []
+    for j in range(n_splits):
+        col = Y[:, j]
+        max_val = np.nanmax(col)
+        # Only consider candidates where col[i] == max_val AND col[i] is not NaN
+        with np.errstate(invalid='ignore'):
+            tied_mask = np.where(np.isnan(col), False, col == max_val)
+        tied = np.flatnonzero(tied_mask)
+        if len(tied) == 0:
+            continue  # all-NaN split: skip (do not count toward winner frequency)
+        usable_splits.append(rng.choice(tied))
+    n_usable = len(usable_splits)
+    if n_usable == 0:
+        # All splits were all-NaN: return safe NaN result, no winner to aggregate
+        return np.nan, np.nan
+    freqs = np.bincount(np.array(usable_splits, dtype=int), minlength=n_candidates) / n_usable
     # PBO: proportion of splits where best candidate is not consistently the same
     pbo = 1.0 - float(np.max(freqs))
 
@@ -60,20 +71,29 @@ def compute_pbo(Y: np.ndarray, n_bootstrap: int = 1000, seed: int = 0) -> tuple[
         # Gather: Y[:, chunk_idx] -> shape (n_candidates, chunk, n_splits)
         values = Y[:, chunk_idx]
 
-        # Tie-breaking: np.argmax picks first-encountered max, which biases
-        # toward smallest index. Add tiny per-bootstrap noise to break ties
-        # uniformly without materially affecting non-tied values.
-        noise = rng.uniform(0, 1e-9, size=(end - start, n_splits))
-        candidate_scale = np.arange(n_candidates).reshape(-1, 1, 1)  # (n_candidates, 1, 1)
-        noisy_values = values + noise * candidate_scale
-
-        best_idx = np.argmax(noisy_values, axis=0)  # (chunk, n_splits)
-
-        # Compute frequencies and PBO per bootstrap sample
+        # Bootstrap winner selection per resampled split with uniform tie-breaking.
+        # For each bootstrap sample, for each split: collect candidates at max value
+        # and choose uniformly among them using the child RNG derived from parent.
+        # This replaces the old noise+candidate_scale approach which biased toward
+        # higher-indexed candidates.
         boots_chunk = np.empty(end - start)
-        for i, bidx in enumerate(best_idx):
-            fb = np.bincount(bidx, minlength=n_candidates) / n_splits
-            boots_chunk[i] = 1.0 - np.max(fb)
+        for i in range(end - start):
+            best_per_split = []
+            for s in range(n_splits):
+                split_values = values[:, i, s]
+                max_val = np.nanmax(split_values)
+                with np.errstate(invalid='ignore'):
+                    tied_mask = np.where(np.isnan(split_values), False, split_values == max_val)
+                tied = np.flatnonzero(tied_mask)
+                if len(tied) == 0:
+                    continue  # all-NaN split, skip
+                child_rng = np.random.default_rng(rng.integers(0, 2**31))
+                best_per_split.append(child_rng.choice(tied))
+            if len(best_per_split) == 0:
+                boots_chunk[i] = 0.0
+            else:
+                fb = np.bincount(np.array(best_per_split, dtype=int), minlength=n_candidates) / len(best_per_split)
+                boots_chunk[i] = 1.0 - np.max(fb)
         boots.append(boots_chunk)
 
     boots = np.concatenate(boots)
