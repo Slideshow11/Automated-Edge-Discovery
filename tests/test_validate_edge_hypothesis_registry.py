@@ -183,6 +183,16 @@ def _make_entry(**overrides):
         "theory_timing": "pre_registration",
         "manual_review_required": True,
         "created_at": "2026-01-01T00:00:00Z",
+        "lifecycle_events": [
+            {
+                "event_id": "EVT-2026-0001",
+                "event_type": "status_change",
+                "event_timestamp": "2026-01-01T00:00:00Z",
+                "actor": "test-user",
+                "to_status": "specified",
+                "manual_review_required": False
+            }
+        ],
     }
     base.update(overrides)
     return base
@@ -454,7 +464,15 @@ def test_governance_field_true_fails():
 
 def test_lifecycle_event_mutation_mode_manual_passes():
     entry = _make_entry(lifecycle_events=[
-        {"event": "created", "registry_mutation_mode": "manual"}
+        {
+            "event_id": "EVT-2026-0001",
+            "event_type": "created",
+            "event_timestamp": "2026-01-01T00:00:00Z",
+            "actor": "test-user",
+            "to_status": "specified",
+            "manual_review_required": False,
+            "registry_mutation_mode": "manual"
+        }
     ])
     f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
     json.dump(entry, f)
@@ -468,7 +486,15 @@ def test_lifecycle_event_mutation_mode_manual_passes():
 
 def test_lifecycle_event_mutation_mode_automated_fails():
     entry = _make_entry(lifecycle_events=[
-        {"event": "updated", "registry_mutation_mode": "automated"}
+        {
+            "event_id": "EVT-2026-0001",
+            "event_type": "updated",
+            "event_timestamp": "2026-01-01T00:00:00Z",
+            "actor": "test-user",
+            "to_status": "specified",
+            "manual_review_required": False,
+            "registry_mutation_mode": "automated"
+        }
     ])
     f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
     json.dump(entry, f)
@@ -512,6 +538,116 @@ def test_lifecycle_event_entry_not_object():
         data = json.loads(out)
         codes = {b["code"] for b in _blockers_for_path(data, path)}
         assert "invalid_object" in codes
+    finally:
+        Path(f.name).unlink()
+
+
+def test_lifecycle_event_missing_event_timestamp():
+    entry = _make_entry(lifecycle_events=[{
+        "event_id": "EVT-2026-0001",
+        "event_type": "status_change",
+        "actor": "test-user",
+        "to_status": "specified",
+        "manual_review_required": False
+    }])
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    json.dump(entry, f)
+    f.close()
+    path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", f.name])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        Path(f.name).unlink()
+
+
+def test_lifecycle_event_missing_actor():
+    entry = _make_entry(lifecycle_events=[{
+        "event_id": "EVT-2026-0001",
+        "event_type": "status_change",
+        "event_timestamp": "2026-01-01T00:00:00Z",
+        "to_status": "specified",
+        "manual_review_required": False
+    }])
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    json.dump(entry, f)
+    f.close()
+    path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", f.name])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        Path(f.name).unlink()
+
+
+def test_lifecycle_event_missing_event_type():
+    entry = _make_entry(lifecycle_events=[{
+        "event_id": "EVT-2026-0001",
+        "event_timestamp": "2026-01-01T00:00:00Z",
+        "actor": "test-user",
+        "to_status": "specified",
+        "manual_review_required": False
+    }])
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    json.dump(entry, f)
+    f.close()
+    path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", f.name])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        Path(f.name).unlink()
+
+
+def test_lifecycle_event_missing_to_status():
+    entry = _make_entry(lifecycle_events=[{
+        "event_id": "EVT-2026-0001",
+        "event_type": "status_change",
+        "event_timestamp": "2026-01-01T00:00:00Z",
+        "actor": "test-user",
+        "manual_review_required": False
+    }])
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    json.dump(entry, f)
+    f.close()
+    path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", f.name])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        Path(f.name).unlink()
+
+
+def test_lifecycle_event_missing_manual_review_required():
+    entry = _make_entry(lifecycle_events=[{
+        "event_id": "EVT-2026-0001",
+        "event_type": "status_change",
+        "event_timestamp": "2026-01-01T00:00:00Z",
+        "actor": "test-user",
+        "to_status": "specified"
+    }])
+    f = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
+    json.dump(entry, f)
+    f.close()
+    path = f.name
+    try:
+        code, out, _ = run_validator(["--format", "json", f.name])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
     finally:
         Path(f.name).unlink()
 

@@ -295,7 +295,7 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                             f"{ref_field} item '{item}' does not match required format"
                         ))
 
-    # 12. lifecycle_events — type check and registry_mutation_mode enforcement
+    # 12. lifecycle_events — type check, required item fields, and registry_mutation_mode enforcement
     lce = entry.get("lifecycle_events")
     if lce is not None:
         if not isinstance(lce, list):
@@ -315,6 +315,44 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                         "lifecycle_events items must be objects"
                     ))
                     continue
+                # Required fields per schema: event_id, event_type, event_timestamp,
+                # actor, to_status, manual_review_required
+                REQUIRED_LCE_FIELDS = [
+                    "event_id", "event_type", "event_timestamp",
+                    "actor", "to_status", "manual_review_required"
+                ]
+                for field in REQUIRED_LCE_FIELDS:
+                    val = evt.get(field)
+                    if val is None:
+                        blockers.append(Blocker(
+                            "missing_required_field",
+                            "edge_hypothesis_registry_entry",
+                            f"lifecycle_events[{i}].{field}",
+                            f"lifecycle_events item field '{field}' is required"
+                        ))
+                    elif field in ("event_id", "event_type", "event_timestamp", "actor", "to_status"):
+                        if not isinstance(val, str):
+                            blockers.append(Blocker(
+                                "invalid_type",
+                                "edge_hypothesis_registry_entry",
+                                f"lifecycle_events[{i}].{field}",
+                                f"lifecycle_events[{i}].{field} must be a string, got {type(val).__name__}"
+                            ))
+                        elif val.strip() == "":
+                            blockers.append(Blocker(
+                                "missing_required_field",
+                                "edge_hypothesis_registry_entry",
+                                f"lifecycle_events[{i}].{field}",
+                                f"lifecycle_events[{i}].{field} is required and cannot be empty"
+                            ))
+                    elif field == "manual_review_required":
+                        if not isinstance(val, bool):
+                            blockers.append(Blocker(
+                                "invalid_boolean",
+                                "edge_hypothesis_registry_entry",
+                                f"lifecycle_events[{i}].{field}",
+                                f"lifecycle_events[{i}].{field} must be a boolean, got {type(val).__name__}"
+                            ))
                 rmm = evt.get("registry_mutation_mode")
                 if rmm is not None and rmm != "manual":
                     blockers.append(Blocker(
