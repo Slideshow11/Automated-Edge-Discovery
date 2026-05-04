@@ -1,0 +1,33 @@
+{
+  "preearnings_profile_id": "PEP-2026-0001",
+  "preearnings_profile_version": 1,
+  "event_study_spec_ref": "EVS-2026-0001",
+  "options_event_risk_ref": "OER-2026-0001",
+  "session_anchor_policy": "amc_only",
+  "earnings_time_reference": "extended_hours_only",
+  "entry_dpe_policy": {
+    "entry_dpe_min": 1,
+    "entry_dpe_max": 5,
+    "dpe_counting_convention": "trading_days",
+    "anchor_day_policy": "earnings_date_anchor"
+  },
+  "exit_dpe_policy": {
+    "exit_dpe_min": 0,
+    "exit_dpe_max": 2,
+    "dpe_counting_convention": "trading_days",
+    "anchor_day_policy": "earnings_date_anchor"
+  },
+  "iv_crush_policy": {
+    "iv_crush_measurement_window": {
+      "start": -1,
+      "end": 5,
+      "unit": "dpe"
+    },
+    "iv_crush_definition": "percent_iv_drop"
+  },
+  "gap_exposure_policy": "prohibit_gap_hold",
+  "created_at": "2026-05-04T00:00:00Z",
+  "reviewer": {
+    "name": "Reviewer"
+  }
+}
