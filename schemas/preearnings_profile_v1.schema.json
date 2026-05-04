@@ -1,0 +1,550 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "PreEarningsProfile v1",
+  "description": "Domain-specific pre-earnings research module for US equity options: BMO/AMC session semantics, DPE targeting, earnings-specific gap-exposure rules, and IV crush policy for options event-risk experiments. Does not include pre-earnings-specific, statistical-assessment, or computed-output fields.",
+  "type": "object",
+  "required": [
+    "preearnings_profile_id",
+    "preearnings_profile_version",
+    "event_study_spec_ref",
+    "options_event_risk_ref",
+    "session_anchor_policy",
+    "earnings_time_reference",
+    "entry_dpe_policy",
+    "exit_dpe_policy",
+    "iv_crush_policy",
+    "gap_exposure_policy",
+    "created_at",
+    "reviewer"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "preearnings_profile_id": {
+      "description": "Canonical pre-earnings profile identifier. Format: PEP-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^PEP-[0-9]{4}-[0-9]{4}$"
+    },
+    "preearnings_profile_version": {
+      "description": "Monotonically increasing version. Start at 1. Increment on any field change after initial commit.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_study_spec_ref": {
+      "description": "Reference to an EventStudySpec providing event-alignment structure. Format: EVS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^EVS-[0-9]{4}-[0-9]{4}$"
+    },
+    "options_event_risk_ref": {
+      "description": "Reference to an OptionsEventRiskSpec providing options configuration. Format: OER-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^OER-[0-9]{4}-[0-9]{4}$"
+    },
+    "session_anchor_policy": {
+      "description": "Which session(s) the earnings announcement applies to.",
+      "type": "string",
+      "enum": [
+        "bmo_only",
+        "amc_only",
+        "bmo_and_amc",
+        "intra_day",
+        "unconfirmed",
+        "custom"
+      ]
+    },
+    "earnings_time_reference": {
+      "description": "Source and reliability of the earnings announcement time.",
+      "type": "string",
+      "enum": [
+        "after_hours_only",
+        "pre_market_only",
+        "regular_hours_only",
+        "confirmed_after_hours",
+        "confirmed_pre_market",
+        "unconfirmed",
+        "custom"
+      ]
+    },
+    "entry_dpe_policy": {
+      "description": "DPE targeting policy for entry: target DPE range, anchor day count conventions.",
+      "type": "object",
+      "required": [
+        "entry_dpe_min",
+        "entry_dpe_max",
+        "dpe_counting_convention",
+        "anchor_day_policy"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "entry_dpe_min": {
+          "description": "Minimum DPE for entry (inclusive), e.g., 1 = 1 day before earnings.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "entry_dpe_max": {
+          "description": "Maximum DPE for entry (inclusive), e.g., 5 = 5 days before earnings.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "dpe_counting_convention": {
+          "description": "Calendar days vs. trading days vs. session days.",
+          "type": "string",
+          "enum": [
+            "calendar_days",
+            "trading_days",
+            "session_days",
+            "custom"
+          ]
+        },
+        "anchor_day_policy": {
+          "description": "How the earnings date anchors the DPE count.",
+          "type": "string",
+          "enum": [
+            "earnings_date_anchor",
+            "announcement_time_anchor",
+            "custom"
+          ]
+        },
+        "entry_window_start": {
+          "description": "When the entry window opens relative to DPE.",
+          "type": "string"
+        },
+        "entry_window_end": {
+          "description": "When the entry window closes relative to DPE.",
+          "type": "string"
+        },
+        "dpe_tolerance": {
+          "description": "Tolerance in DPE units for dynamic adjustment.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "exit_dpe_policy": {
+      "description": "DPE targeting policy for exit and IV crush measurement.",
+      "type": "object",
+      "required": [
+        "exit_dpe_min",
+        "exit_dpe_max",
+        "dpe_counting_convention",
+        "anchor_day_policy"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "exit_dpe_min": {
+          "description": "Minimum DPE for exit (inclusive), e.g., 0 = on earnings date.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "exit_dpe_max": {
+          "description": "Maximum DPE for exit (inclusive), e.g., 30 = 30 days after earnings.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "dpe_counting_convention": {
+          "description": "Calendar days vs. trading days vs. session days.",
+          "type": "string",
+          "enum": [
+            "calendar_days",
+            "trading_days",
+            "session_days",
+            "custom"
+          ]
+        },
+        "anchor_day_policy": {
+          "description": "How the earnings date anchors the DPE count.",
+          "type": "string",
+          "enum": [
+            "earnings_date_anchor",
+            "announcement_time_anchor",
+            "custom"
+          ]
+        },
+        "iv_collapse_threshold": {
+          "description": "IV crush threshold for early exit (e.g., 0.50 = exit when IV collapses 50%).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "post_earnings_window_unit": {
+          "description": "Unit for post-earnings window.",
+          "type": "string",
+          "enum": [
+            "dpe",
+            "sessions",
+            "calendar_days"
+          ]
+        },
+        "exit_trigger_policy": {
+          "description": "What triggers exit.",
+          "type": "string",
+          "enum": [
+            "dpe_exit",
+            "iv_collapse",
+            "time_exit",
+            "profit_target",
+            "stop_loss",
+            "custom"
+          ]
+        }
+      }
+    },
+    "iv_crush_policy": {
+      "description": "IV crush characterization: measurement window, crush magnitude estimate, IV hierarchy policy.",
+      "type": "object",
+      "required": [
+        "iv_crush_measurement_window",
+        "iv_crush_definition"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "iv_crush_measurement_window": {
+          "description": "Window for measuring IV crush: start (DPE), end (DPE), unit (dpe/sessions/calendar_days).",
+          "type": "object",
+          "required": ["start", "end", "unit"],
+          "additionalProperties": true,
+          "properties": {
+            "start": {
+              "description": "DPE at which the measurement window starts.",
+              "type": "integer",
+              "minimum": -30
+            },
+            "end": {
+              "description": "DPE at which the measurement window ends.",
+              "type": "integer",
+              "maximum": 90
+            },
+            "unit": {
+              "description": "Unit for the measurement window.",
+              "type": "string",
+              "enum": [
+                "dpe",
+                "sessions",
+                "calendar_days"
+              ]
+            }
+          }
+        },
+        "iv_crush_definition": {
+          "description": "How crush is defined.",
+          "type": "string",
+          "enum": [
+            "absolute_iv_drop",
+            "percent_iv_drop",
+            "iv_rank_collapse",
+            "iv_percentile_collapse",
+            "custom"
+          ]
+        },
+        "iv_crush_magnitude_estimate": {
+          "description": "Estimated crush magnitude for planning (e.g., 0.35 = 35% IV drop).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "iv_hierarchy_policy": {
+          "description": "Which IV source to use: primary (IV raw, IV rank, IV percentile), fallback sources.",
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "primary": {
+              "description": "Primary IV source.",
+              "type": "string",
+              "enum": [
+                "iv_raw",
+                "iv_rank",
+                "iv_percentile"
+              ]
+            },
+            "fallback": {
+              "description": "Fallback IV source.",
+              "type": "string",
+              "enum": [
+                "iv_raw",
+                "iv_rank",
+                "iv_percentile"
+              ]
+            }
+          }
+        },
+        "iv_pre_event_source": {
+          "description": "Source for pre-event IV.",
+          "type": "string",
+          "enum": [
+            "iv_at_entry",
+            "iv_rank_at_entry",
+            "iv_percentile_at_entry",
+            "custom"
+          ]
+        },
+        "iv_post_event_source": {
+          "description": "Source for post-event IV.",
+          "type": "string",
+          "enum": [
+            "iv_at_exit",
+            "iv_rank_at_exit",
+            "iv_percentile_at_exit",
+            "custom"
+          ]
+        },
+        "crush_confirm_window": {
+          "description": "Window for confirming crush occurred: start, end, unit.",
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "start": {
+              "type": "integer"
+            },
+            "end": {
+              "type": "integer"
+            },
+            "unit": {
+              "type": "string",
+              "enum": [
+                "dpe",
+                "sessions",
+                "calendar_days"
+              ]
+            }
+          }
+        },
+        "iv_surface_ref": {
+          "description": "Reference to volatility surface artifact for IV/IV percentile lookups.",
+          "type": "string"
+        }
+      }
+    },
+    "gap_exposure_policy": {
+      "description": "Whether strategy may hold across earnings announcement.",
+      "type": "string",
+      "enum": [
+        "allow_gap_hold",
+        "prohibit_gap_hold",
+        "exit_before_session",
+        "enter_after_session",
+        "custom"
+      ]
+    },
+    "created_at": {
+      "description": "ISO 8601 timestamp of pre-earnings profile declaration.",
+      "type": "string"
+    },
+    "reviewer": {
+      "description": "Human reviewer metadata.",
+      "type": "object",
+      "required": [
+        "name"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "name": {
+          "description": "Reviewer name. Must be a non-empty string.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "instrument_universe_ref": {
+      "description": "Reference to an InstrumentUniverseSpec for eligible underlying instruments. Format: IUS-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^IUS-[0-9]{4}-[0-9]{4}$"
+    },
+    "outcome_spec_refs": {
+      "description": "References to OutcomeSpecs measuring outcomes in this pre-earnings experiment. Format: OUT-YYYY-NNNN.",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^OUT-[0-9]{4}-[0-9]{4}$"
+      },
+      "minItems": 1
+    },
+    "earnings_calendar_ref": {
+      "description": "Reference to an earnings calendar artifact for confirmed earnings dates.",
+      "type": "string"
+    },
+    "iv_surface_ref": {
+      "description": "Reference to a volatility surface artifact for IV/IV percentile lookups.",
+      "type": "string"
+    },
+    "dpe_calendar_policy": {
+      "description": "DPE calendar conventions: weekend handling, holiday handling, exchange calendar reference.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "weekend_handling": {
+          "type": "string",
+          "enum": [
+            "skip",
+            "adjust",
+            "custom"
+          ]
+        },
+        "holiday_handling": {
+          "type": "string",
+          "enum": [
+            "skip",
+            "adjust",
+            "custom"
+          ]
+        },
+        "exchange_calendar_ref": {
+          "description": "Reference to an exchange calendar artifact.",
+          "type": "string"
+        }
+      }
+    },
+    "session_overlap_policy": {
+      "description": "How to handle stocks with both BMO and AMC earnings on the same day.",
+      "type": "string",
+      "enum": [
+        "prioritize_bmo",
+        "prioritize_amc",
+        "separate_trials",
+        "reject"
+      ]
+    },
+    "earnings_revision_policy": {
+      "description": "How to handle earnings date revisions or rescheduled announcements.",
+      "type": "string",
+      "enum": [
+        "reject_revision",
+        "accept_revision",
+        "flag_for_review"
+      ]
+    },
+    "minimum_iv_rank": {
+      "description": "Minimum IV rank required for inclusion (0.0 to 1.0).",
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "iv_regime_filter": {
+      "description": "Filter for IV regime.",
+      "type": "string",
+      "enum": [
+        "high_iv_only",
+        "low_iv_only",
+        "iv_expand_only",
+        "iv_collapse_only",
+        "any_iv",
+        "custom"
+      ]
+    },
+    "gap_historical_policy": {
+      "description": "Historical gap analysis: gap percentile threshold, gap direction filter.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "gap_percentile_threshold": {
+          "description": "Gap percentile threshold for filtering.",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "gap_direction_filter": {
+          "description": "Filter for gap direction.",
+          "type": "string",
+          "enum": [
+            "up",
+            "down",
+            "both",
+            "custom"
+          ]
+        }
+      }
+    },
+    "earnings_size_filter": {
+      "description": "Filter by earnings size or surprise history: EPS surprise threshold, revenue behavior.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "eps_surprise_threshold": {
+          "description": "EPS surprise threshold for inclusion.",
+          "type": "number"
+        },
+        "revenue_behavior": {
+          "description": "Revenue behavior filter.",
+          "type": "string",
+          "enum": [
+            "beat",
+            "miss",
+            "in_line",
+            "any",
+            "custom"
+          ]
+        }
+      }
+    },
+    "hypothesis_id": {
+      "description": "Reference to EdgeHypothesisRegistry hypothesis being tested. Format: HYP-YYYY-NNNN.",
+      "type": "string",
+      "pattern": "^HYP-[0-9]{4}-[0-9]{4}$"
+    },
+    "runner_output_refs": {
+      "description": "References to runner outputs produced under this pre-earnings profile.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "review_packet_refs": {
+      "description": "References to ReviewPackets that evaluated hypotheses using this profile.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1
+    },
+    "extension_hooks": {
+      "description": "Optional extension object for future domain-specific fields.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "domain_profile_extension_refs": {
+          "description": "Extension references to domain profile artifacts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "runner_output_extension_refs": {
+          "description": "Extension references to runner output artifacts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "review_packet_extension_refs": {
+          "description": "Extension references to review packet artifacts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "options_event_risk_extension_refs": {
+          "description": "Extension references to options event-risk artifacts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "event_study_extension_refs": {
+          "description": "Extension references to event study artifacts.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        }
+      }
+    },
+    "notes": {
+      "description": "Human-readable notes about the pre-earnings design rationale.",
+      "type": "string"
+    }
+  }
+}
