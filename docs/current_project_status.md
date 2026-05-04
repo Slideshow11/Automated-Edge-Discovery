@@ -4,7 +4,7 @@
 
 AED main has completed the manual governance/intake layer v1.
 
-The enforcement-layer design and implementation is complete. All nine governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec) are implemented, tested, and CI-wired. The governance validator milestone is complete through PR #128.
+The enforcement-layer design and implementation is complete. All ten governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, PreEarningsProfile) are implemented, tested, and CI-wired. The governance validator milestone is complete through PR #137.
 
 The project is not yet an autonomous discovery engine.
 
@@ -108,6 +108,13 @@ The project is not yet a live trading or production system.
 - PR #127 OptionsEventRiskSpec v1 duplicate test names audit/fix
 - PR #128 OptionsEventRiskSpec v1 CI helper wiring
 - PR #130 PreEarningsProfile v1 design: domain-specific pre-earnings research module, BMO/AMC session semantics, DPE targeting, earnings-specific gap exposure rules, IV crush policy, domain-neutral boundary with EventStudySpec and OptionsEventRiskSpec
+- PR #131 PreEarningsProfile enum-summary doc fix
+- PR #132 PreEarningsProfile v1 JSON schema
+- PR #133 PreEarningsProfile v1 fixtures
+- PR #134 PreEarningsProfile v1 local validator
+- PR #135 PreEarningsProfile v1 validator schema-parity fix
+- PR #136 PreEarningsProfile v1 validator tests
+- PR #137 PreEarningsProfile v1 CI wiring: governance helper now runs PEP validator and pytest
 
 ## Current stop rules
 
@@ -135,13 +142,12 @@ The project is not yet a live trading or production system.
 - SearchSpaceManifest validator **complete** (PR #59): schema, fixtures, tests, CI wired
 - Governance validators CI-wired **complete** (PRs #60, #64, #74, #90, #102, #117)
 - EdgeHypothesisRegistry v1 **complete** (PRs #66, #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
+- PreEarningsProfile v1 **complete** (PRs #130–#137): design, schema, fixtures, local validator, tests, CI wired
 
 ## Next planned PRs
 
-- PreEarningsProfile v1 schema (PR #130 complete: design)
-- PreEarningsProfile v1 fixtures
-- PreEarningsProfile v1 local validator, tests, and CI wiring
 - First thin real-data runner slice
+- runner contract / runner-output skeleton
 
 Longer-horizon deferred work:
 - MechanismDiscoveryReport schema
@@ -193,7 +199,7 @@ See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.
 
 ## Governance validators
 
-All nine governance validators are implemented, tested, and CI-wired:
+All ten governance validators are implemented, tested, and CI-wired:
 
 - **TrialLedger** (PR #58): `scripts/local/validate_trial_ledger.py`, schema, 5 fixtures, 21 tests. CI: `governance-validators` job.
 - **SearchSpaceManifest** (PR #59): `scripts/local/validate_search_space_manifest.py`, schema, 6 fixtures, 29 tests. CI: `governance-validators` job.
@@ -204,7 +210,8 @@ All nine governance validators are implemented, tested, and CI-wired:
 - **InstrumentUniverseSpec** (PRs #104–#110): `scripts/local/validate_instrument_universe_spec.py`, schema, 21 fixtures, 126 tests. CI: `governance-validators` job.
 - **EventStudySpec** (PRs #112–#117): `scripts/local/validate_event_study_spec.py`, schema, 22 fixtures, 106 tests. CI: `governance-validators` job.
 - **OptionsEventRiskSpec** (PRs #119–#128): `scripts/local/validate_options_event_risk_spec.py`, schema, 24 fixtures, 173 tests. CI: `governance-validators` job.
+- **PreEarningsProfile** (PRs #130–#137): `scripts/local/validate_preearnings_profile.py`, schema, 25 fixtures, 206 tests. CI: `governance-validators` job.
 
-Total CI-enforced validator tests: **712 governance** via `governance-validators` job + **18 Event/Options** via `validator` job = **730 total**.
+Total CI-enforced validator tests: **918 governance** via `governance-validators` job + **18 Event/Options** via `validator` job = **936 total**.
 
 ## Operational notes
