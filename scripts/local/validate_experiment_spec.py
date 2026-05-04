@@ -389,7 +389,7 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
                         f"prohibited_modes.{field} must be present and exactly false"
                     ))
 
-    # 14. reviewer must be an object
+    # 14. reviewer must be an object; reviewer.name must be a non-empty string
     reviewer = entry.get("reviewer")
     if reviewer is not None and not isinstance(reviewer, dict):
         blockers.append(Blocker(
@@ -398,6 +398,29 @@ def validate_record(entry: Dict[str, Any]) -> List[Blocker]:
             "reviewer",
             f"reviewer must be an object, got {type(reviewer).__name__}"
         ))
+    elif reviewer is not None:
+        reviewer_name = reviewer.get("name")
+        if reviewer_name is None:
+            blockers.append(Blocker(
+                "missing_required_field",
+                "experiment_spec",
+                "reviewer.name",
+                "reviewer.name is required"
+            ))
+        elif not isinstance(reviewer_name, str):
+            blockers.append(Blocker(
+                "invalid_type",
+                "experiment_spec",
+                "reviewer.name",
+                f"reviewer.name must be a string, got {type(reviewer_name).__name__}"
+            ))
+        elif reviewer_name.strip() == "":
+            blockers.append(Blocker(
+                "missing_required_field",
+                "experiment_spec",
+                "reviewer.name",
+                "reviewer.name is required and cannot be empty"
+            ))
 
     # 15. Domain-neutrality: block pre-earnings-specific fields at top level
     for field in PREEARNS_FIELDS:

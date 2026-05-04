@@ -1,0 +1,24 @@
+{
+  "experiment_id": "EXP-2026-0095",
+  "experiment_version": 1,
+  "hypothesis_id": "HYP-2026-0001",
+  "search_space_id": "SSM-2026-0001",
+  "data_manifest_refs": ["REF-2026-0001"],
+  "study_type": "event_study",
+  "decision_timestamp_policy": {"policy": "fixed_lag", "lag_days": 5},
+  "feature_cutoff_policy": {"cutoff_days": 30},
+  "trial_generation_mode": "manual_grid",
+  "allowed_trial_lanes": ["theory_first"],
+  "prohibited_modes": {
+    "autonomous_search": false,
+    "bayesian_optimization": false,
+    "genetic_programming": false,
+    "automated_promotion": false,
+    "automated_registry_mutation": false,
+    "live_trading": false,
+    "production_execution": false,
+    "gcru_integration": false
+  },
+  "created_at": "2026-05-04T00:00:00Z",
+  "reviewer": {}
+}
