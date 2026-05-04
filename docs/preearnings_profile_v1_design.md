@@ -605,14 +605,19 @@ The core OptionsEventRiskSpec does not contain `session_anchor_policy`, `entry_d
 
 ---
 
-## 12. Deferred Items (Not in v1)
+## 12. Implementation Status
 
-The following are deferred to future PRs:
+All v1 implementation is complete:
 
-- PreEarningsProfile v1 schema (PR #131)
-- PreEarningsProfile v1 fixtures (PR #132)
-- PreEarningsProfile v1 local validator, tests, and CI wiring (PRs #133–#134)
-- PreEarningsProfile v2 extensions (IV surface integration, earnings surprise weighting, analyst revision integration)
+- PR #131: PreEarningsProfile enum-summary doc fix
+- PR #132: PreEarningsProfile v1 JSON schema
+- PR #133: PreEarningsProfile v1 fixtures (1 valid, 24 invalid)
+- PR #134: PreEarningsProfile v1 local validator
+- PR #135: PreEarningsProfile v1 validator schema-parity fix
+- PR #136: PreEarningsProfile v1 validator tests (206 tests, 161 functions)
+- PR #137: PreEarningsProfile v1 CI wiring (governance helper, 918 governance tests, 936 total)
+
+PreEarningsProfile v2 extensions (IV surface integration, earnings surprise weighting, analyst revision integration) are deferred.
 
 ---
 
