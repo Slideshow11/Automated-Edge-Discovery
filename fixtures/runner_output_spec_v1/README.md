@@ -51,7 +51,7 @@ These fixtures exercise the full JSON Schema Draft-07 validation surface of the 
 | `invalid_failed_validation_empty_failure_summary.json` | `status: failed_validation` but `failure_summary` is `{}` — missing required sub-fields |
 | `invalid_failed_missing_data_missing_failure_summary.json` | `status: failed_missing_data` but `failure_summary` is `null` — caught by `if/then/else` |
 | `invalid_failure_summary_missing_required_field.json` | `failure_summary` present but `blocker_summary` missing — required sub-field absent |
-| `invalid_failure_summary_bad_status.json` | `failure_summary.status` is `success` but top-level status is `failed_validation` — self-consistency (not schema-enforced) |
+| `invalid_failure_summary_bad_status.json` | `failure_summary.status: "not_a_status"` — not in enum `["success","partial","failed_missing_data","failed_validation","failed_runtime","cancelled"]` |
 | `invalid_started_at_not_datetime.json` | `started_at: "not-a-datetime"` — violates `format: "date-time"` |
 | `invalid_completed_at_not_datetime.json` | `completed_at: "2026-01-01"` — violates `format: "date-time"` |
 | `invalid_created_at_not_datetime.json` | `created_at: "Jan 1 2026"` — violates `format: "date-time"` |
@@ -90,7 +90,7 @@ These fixtures fail against the current JSON Schema without any Python validatio
 | `invalid_failed_validation_empty_failure_summary.json` | `required` in `failure_summary` — missing `failure_type`, `status`, `blocker_summary`, `created_at` |
 | `invalid_failed_missing_data_missing_failure_summary.json` | `if/then/else` — `status=failed_missing_data` requires `failure_summary` object |
 | `invalid_failure_summary_missing_required_field.json` | `required` in `failure_summary` — `blocker_summary` absent |
-| `invalid_failure_summary_bad_status.json` | `enum` on `failure_summary.status` — `success` not in enum for a failed status |
+| `invalid_failure_summary_bad_status.json` | `enum` on `failure_summary.status` — `not_a_status` not in enum |
 | `invalid_started_at_not_datetime.json` | `format: "date-time"` on `started_at` |
 | `invalid_completed_at_not_datetime.json` | `format: "date-time"` on `completed_at` |
 | `invalid_created_at_not_datetime.json` | `format: "date-time"` on `created_at` |

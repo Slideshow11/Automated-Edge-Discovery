@@ -57,7 +57,7 @@
   "run_owner": "aed-dry-run",
   "failure_summary": {
     "failure_type": "validation_error",
-    "status": "success",
+    "status": "not_a_status",
     "blocker_summary": "Input artifact validation failed",
     "failed_check": null,
     "missing_data_summary_ref": null,
