@@ -97,23 +97,32 @@ def deflated_sharpe_with_options(
     seed : int
         Bootstrap RNG seed (for 'bootstrap' method).
     deterministic_seed : int
-        Seed for numpy's global RNG state (used when method='lopez').
+        Seed for deterministic reproducibility (used when method='lopez').
 
     Returns
     -------
     np.ndarray
         Deflated Sharpe array, or empty array on failure.
+
+    Notes
+    -----
+    This function uses isolated np.random.default_rng() instances internally
+    and does not mutate NumPy's global RNG state. It is safe to call
+    concurrently with other code that uses NumPy random functions.
     """
-    rng_state = np.random.get_state()
     try:
-        if deterministic_seed is not None:
-            np.random.seed(deterministic_seed)
         if method == "bootstrap":
-            # Bootstrap-based deflation with per-iteration seed
+            # Bootstrap-based deflation using isolated RNG.
+            # Uses a single seeded RNG; child RNGs are derived from the
+            # parent so each call to the function with the same seed
+            # produces the same sequence (deterministic repeated-call equality).
+            rng = np.random.default_rng(seed)
             results = []
             for i in range(n_iter):
-                np.random.seed(seed + i)
-                idx = np.random.randint(0, len(Y), size=len(Y))
+                # Advance the parent RNG to a deterministic child state
+                # without touching global np.random state.
+                child_rng = np.random.default_rng(rng.integers(0, 2**31))
+                idx = child_rng.integers(0, len(Y), size=len(Y))
                 boot = Y[idx]
                 if len(boot) > 0 and np.std(boot) > 0:
                     results.append(np.mean(boot) / np.std(boot))
@@ -121,12 +130,11 @@ def deflated_sharpe_with_options(
                 return np.array(results)
             return np.array([])
         else:
-            # LOPEZ proxy (analytical)
+            # LOPEZ proxy (analytical) — pbo_module.deflated_sharpe is
+            # already internally seeded via np.random.default_rng.
             return pbo_module.deflated_sharpe(Y)
     except Exception:
         return np.array([])
-    finally:
-        np.random.set_state(rng_state)
 
 
 def run_backtest_audit(
