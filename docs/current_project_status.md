@@ -116,7 +116,8 @@ The project is not yet a live trading or production system.
 - PR #136 PreEarningsProfile v1 validator tests
 - PR #137 PreEarningsProfile v1 CI wiring: governance helper now runs PEP validator and pytest
 - PR #138 docs: PreEarningsProfile v1 milestone status cleanup
-- PR #139 **open** — First thin real-data runner slice v1 design (this PR)
+- PR #139 docs: first thin real-data runner slice v1 design
+- PR #140 **open** — RunnerOutputSpec v1 design (this PR)
 
 ## Current stop rules
 
@@ -148,9 +149,11 @@ The project is not yet a live trading or production system.
 
 ## Next planned PRs
 
-- **In review (PR #139):** First thin real-data runner slice v1 design
-- RunnerOutputSpec v1 design
-- RunnerOutputSpec v1 schema and fixtures
+- **In review (PR #140):** RunnerOutputSpec v1 design
+- RunnerOutputSpec v1 schema
+- RunnerOutputSpec v1 fixtures
+- RunnerOutputSpec v1 validator and tests
+- RunnerOutputSpec v1 CI wiring
 - runner dry-run CLI skeleton
 - real-data resolver skeleton
 - first smoke run on tiny local sample
