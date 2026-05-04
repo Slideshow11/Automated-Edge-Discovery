@@ -127,6 +127,15 @@ def cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, n_boo
             f"Cannot compute confidence intervals with zero successful draws."
         )
     mat = np.array(params, dtype=float)
+    # Filter out any rows where params contain NaN or inf (fit "succeeded" but
+    # returned non-finite parameters, e.g. from a degenerate resample).
+    finite_mask = np.isfinite(mat).all(axis=1)
+    mat = mat[finite_mask]
+    if mat.shape[0] == 0:
+        raise ValueError(
+            "All cluster bootstrap parameter draws are non-finite (NaN or inf). "
+            "Cannot compute confidence intervals."
+        )
 
     lower = 100.0 * (alpha / 2.0)
     upper = 100.0 * (1.0 - alpha / 2.0)
@@ -199,6 +208,15 @@ def wild_cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, 
             f"Cannot compute confidence intervals with zero successful draws."
         )
     mat = np.array(params, dtype=float)
+    # Filter out any rows where params contain NaN or inf (fit "succeeded" but
+    # returned non-finite parameters, e.g. from a degenerate resample).
+    finite_mask = np.isfinite(mat).all(axis=1)
+    mat = mat[finite_mask]
+    if mat.shape[0] == 0:
+        raise ValueError(
+            "All wild cluster bootstrap parameter draws are non-finite (NaN or inf). "
+            "Cannot compute confidence intervals."
+        )
 
     lower = 100.0 * (alpha / 2.0)
     upper = 100.0 * (1.0 - alpha / 2.0)

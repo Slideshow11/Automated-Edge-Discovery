@@ -341,3 +341,231 @@ class TestBootstrapSuccessfulBehavior:
             assert not np.isnan(hi)
             assert lo < hi
 
+
+class TestNonFiniteParamsFiltering:
+    """Tests for non-finite (NaN/inf) parameter filtering in bootstrap CI functions.
+
+    Codex's exact concern: statsmodels fits can "succeed" (no exception raised) but
+    return parameter vectors containing NaN or inf. Such draws must not reach
+    np.percentile, because np.percentile(..., nan) = nan.
+
+    PR #153 fixed exception-path failures (OLS raises). This patch fixes the
+    separate non-finite-params-from-successful-fit path.
+    """
+
+    # -------------------------------------------------------------------------
+    # cluster_bootstrap_ci non-finite tests
+    # -------------------------------------------------------------------------
+
+    def test_cluster_bootstrap_nan_params_are_filtered_before_percentile(self):
+        """Fit that "succeeds" but returns NaN params must be dropped.
+
+        Only some bootstrap draws return NaN params; at least one finite draw
+        exists. np.percentile must NOT produce NaN bounds.
+        """
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        call_count = [0]
+
+        def selective_nan_fit(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 10:
+                # Fit "succeeds" (no exception) but returns NaN params
+                nan_params = pandas.Series(
+                    {"Intercept": float("nan"), "x1": float("nan"), "x2": float("nan")}
+                )
+                return MagicMock(params=nan_params)
+            # Rest return finite params
+            return MagicMock(
+                params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+            )
+
+        with patch.object(inf.smf, "ols") as mock_ols:
+            mock_ols.return_value.fit.side_effect = selective_nan_fit
+
+            ci = inf.cluster_bootstrap_ci(
+                formula=formula, df=df, cluster_col="cluster",
+                n_bootstrap=50, rng_seed=1
+            )
+
+            # With at least one finite draw, CI bounds must be finite numbers
+            assert isinstance(ci, dict)
+            assert len(ci) > 0
+            for name, (lo, hi) in ci.items():
+                assert np.isfinite(lo), f"{name} lower bound is not finite: {lo}"
+                assert np.isfinite(hi), f"{name} upper bound is not finite: {hi}"
+                assert lo <= hi
+
+    def test_cluster_bootstrap_all_nan_params_raises_value_error(self):
+        """All successful fits return NaN params (no exception) -> fail closed.
+
+        The n_successful counter is > 0 (fits did not raise), but all params
+        are non-finite. Must raise ValueError, not return NaN CI.
+        """
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        nan_params = pandas.Series(
+            {"Intercept": float("nan"), "x1": float("nan"), "x2": float("nan")}
+        )
+
+        with patch.object(inf.smf, "ols") as mock_ols:
+            mock_ols.return_value.fit.return_value = MagicMock(params=nan_params)
+
+            with pytest.raises(ValueError) as exc_info:
+                inf.cluster_bootstrap_ci(
+                    formula=formula, df=df, cluster_col="cluster",
+                    n_bootstrap=50, rng_seed=1
+                )
+            assert "non-finite" in str(exc_info.value).lower() or \
+                   "NaN" in str(exc_info.value) or "inf" in str(exc_info.value)
+
+    def test_cluster_bootstrap_inf_params_are_filtered_before_percentile(self):
+        """Fit that returns inf params must be dropped before percentile."""
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        call_count = [0]
+
+        def selective_inf_fit(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] <= 10:
+                inf_params = pandas.Series(
+                    {"Intercept": float("inf"), "x1": float("-inf"), "x2": float("nan")}
+                )
+                return MagicMock(params=inf_params)
+            return MagicMock(
+                params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+            )
+
+        with patch.object(inf.smf, "ols") as mock_ols:
+            mock_ols.return_value.fit.side_effect = selective_inf_fit
+
+            ci = inf.cluster_bootstrap_ci(
+                formula=formula, df=df, cluster_col="cluster",
+                n_bootstrap=50, rng_seed=1
+            )
+
+            for name, (lo, hi) in ci.items():
+                assert np.isfinite(lo), f"{name} lower bound not finite: {lo}"
+                assert np.isfinite(hi), f"{name} upper bound not finite: {hi}"
+
+    # -------------------------------------------------------------------------
+    # wild_cluster_bootstrap_ci non-finite tests
+    # -------------------------------------------------------------------------
+
+    def test_wild_cluster_bootstrap_nan_params_are_filtered_before_percentile(self):
+        """Wild bootstrap: fit "succeeds" with NaN params -> filtered before percentile."""
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        call_count = [0]
+
+        def ols_side_effect_nan(*args, **kwargs):
+            call_count[0] += 1
+            mock_model = MagicMock()
+            if call_count[0] == 1:
+                # model0: must succeed with valid names
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    model=MagicMock(endog_names="y"),
+                )
+            elif call_count[0] <= 11:
+                # First 10 bootstrap fits return NaN params (no exception)
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series(
+                        {"Intercept": float("nan"), "x1": float("nan"), "x2": float("nan")}
+                    )
+                )
+            else:
+                # Rest succeed with finite params
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+                )
+            return mock_model
+
+        with patch.object(inf.smf, "ols", side_effect=ols_side_effect_nan):
+            ci = inf.wild_cluster_bootstrap_ci(
+                formula=formula, df=df, cluster_col="cluster",
+                n_bootstrap=50, rng_seed=1
+            )
+
+            assert isinstance(ci, dict)
+            assert len(ci) > 0
+            for name, (lo, hi) in ci.items():
+                assert np.isfinite(lo), f"{name} lower bound not finite: {lo}"
+                assert np.isfinite(hi), f"{name} upper bound not finite: {hi}"
+                assert lo <= hi
+
+    def test_wild_cluster_bootstrap_all_nan_params_raises_value_error(self):
+        """Wild bootstrap: all bootstrap fits return NaN params -> fail closed."""
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        call_count = [0]
+
+        def ols_side_effect_all_nan(*args, **kwargs):
+            call_count[0] += 1
+            mock_model = MagicMock()
+            if call_count[0] == 1:
+                # model0 must succeed
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    model=MagicMock(endog_names="y"),
+                )
+            else:
+                # All bootstrap fits return NaN params (no exception)
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series(
+                        {"Intercept": float("nan"), "x1": float("nan"), "x2": float("nan")}
+                    )
+                )
+            return mock_model
+
+        with patch.object(inf.smf, "ols", side_effect=ols_side_effect_all_nan):
+            with pytest.raises(ValueError) as exc_info:
+                inf.wild_cluster_bootstrap_ci(
+                    formula=formula, df=df, cluster_col="cluster",
+                    n_bootstrap=50, rng_seed=1
+                )
+            assert "non-finite" in str(exc_info.value).lower() or \
+                   "NaN" in str(exc_info.value) or "inf" in str(exc_info.value)
+
+    def test_wild_cluster_bootstrap_inf_params_are_filtered_before_percentile(self):
+        """Wild bootstrap: inf params are filtered before percentile."""
+        df = make_synthetic_clustered(n=100, n_clusters=10, seed=5)
+        formula = "y ~ x1 + x2"
+
+        call_count = [0]
+
+        def ols_side_effect_inf(*args, **kwargs):
+            call_count[0] += 1
+            mock_model = MagicMock()
+            if call_count[0] == 1:
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    model=MagicMock(endog_names="y"),
+                )
+            elif call_count[0] <= 11:
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series(
+                        {"Intercept": float("inf"), "x1": float("-inf"), "x2": float("nan")}
+                    )
+                )
+            else:
+                mock_model.fit.return_value = MagicMock(
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+                )
+            return mock_model
+
+        with patch.object(inf.smf, "ols", side_effect=ols_side_effect_inf):
+            ci = inf.wild_cluster_bootstrap_ci(
+                formula=formula, df=df, cluster_col="cluster",
+                n_bootstrap=50, rng_seed=1
+            )
+
+            for name, (lo, hi) in ci.items():
+                assert np.isfinite(lo), f"{name} lower bound not finite: {lo}"
+                assert np.isfinite(hi), f"{name} upper bound not finite: {hi}"
+
