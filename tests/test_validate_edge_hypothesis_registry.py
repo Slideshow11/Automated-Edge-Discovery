@@ -797,3 +797,10 @@ def test_non_object_root_number():
         assert "invalid_object" in codes
     finally:
         Path(path).unlink()
+
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/edge_hypothesis_registry_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "edge_hypothesis_registry_v1 schema must have top-level additionalProperties: false"

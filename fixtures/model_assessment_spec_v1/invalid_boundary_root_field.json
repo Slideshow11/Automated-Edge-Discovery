@@ -19,5 +19,6 @@
   "reviewer": {
     "reviewer_id": "human-001"
   },
-  "created_at": "2026-04-30T12:00:00Z"
+  "created_at": "2026-04-30T12:00:00Z",
+  "review_packet_decision": "approved"
 }

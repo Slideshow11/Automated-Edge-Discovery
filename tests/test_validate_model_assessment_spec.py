@@ -1042,3 +1042,18 @@ def test_assessment_status_non_string_list():
         assert "invalid_enum" in codes
     finally:
         tmp.unlink()
+
+
+def test_schema_additional_properties_false():
+    """Schema enforces top-level additionalProperties: false."""
+    schema = json.load(open("schemas/model_assessment_spec_v1.schema.json"))
+    assert schema.get("additionalProperties") is False, \
+        "model_assessment_spec_v1 schema must have top-level additionalProperties: false"
+
+
+def test_schema_hypothesis_id_pattern():
+    """Schema enforces HYP-YYYY-NNNN format for hypothesis_id."""
+    schema = json.load(open("schemas/model_assessment_spec_v1.schema.json"))
+    hyp = schema.get("properties", {}).get("hypothesis_id", {})
+    assert hyp.get("pattern") == "^HYP-[0-9]{4}-[0-9]{4}$", \
+        "model_assessment_spec_v1 hypothesis_id must have HYP-YYYY-NNNN pattern"
