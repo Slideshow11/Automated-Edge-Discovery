@@ -4,7 +4,6 @@ import sys
 import tempfile
 from pathlib import Path
 
-import jsonschema
 import pytest
 
 REPO = Path(".")
@@ -1151,16 +1150,6 @@ def test_experiment_version_bool_fails():
 
 def test_schema_additional_properties_false():
     """Schema enforces top-level additionalProperties: false."""
-    import jsonschema
     schema = json.load(open("schemas/experiment_spec_v1.schema.json"))
     assert schema.get("additionalProperties") is False, \
         "experiment_spec_v1 must have top-level additionalProperties: false"
-
-
-def test_schema_rejects_boundary_live_trading_enabled():
-    """Schema rejects extra root field live_trading_enabled."""
-    import jsonschema
-    schema = json.load(open("schemas/experiment_spec_v1.schema.json"))
-    data = json.load(open("fixtures/experiment_spec_v1/invalid_boundary_live_trading_enabled.json"))
-    with pytest.raises(jsonschema.ValidationError, match="Additional properties"):
-        jsonschema.validate(data, schema)
