@@ -9,8 +9,12 @@ Verifies that:
 """
 
 import numpy as np
-import pandas as pd
 import pytest
+
+# pandas and statsmodels are required for these tests; skip the entire module if unavailable
+pandas = pytest.importorskip("pandas")
+statsmodels = pytest.importorskip("statsmodels")
+
 from unittest.mock import patch, MagicMock
 
 from engine.edge_discovery import inference as inf
@@ -23,7 +27,7 @@ def make_synthetic_clustered(n=200, n_clusters=20, seed=0):
     x1 = rng.normal(size=n)
     x2 = rng.normal(size=n)
     y = 1.0 + 2.0 * x1 + (-0.5) * x2 + rng.normal(scale=0.5, size=n)
-    return pd.DataFrame({"y": y, "x1": x1, "x2": x2, "cluster": clusters})
+    return pandas.DataFrame({"y": y, "x1": x1, "x2": x2, "cluster": clusters})
 
 
 class TestClusterBootstrapFailClosed:
@@ -88,7 +92,7 @@ class TestWildClusterBootstrapFailClosed:
             if call_count[0] == 1:
                 # model0 fit: must succeed, provides param names
                 mock_model.fit.return_value = MagicMock(
-                    params=pd.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
                     model=MagicMock(endog_names="y")
                 )
             else:
@@ -115,7 +119,7 @@ class TestWildClusterBootstrapFailClosed:
             mock_model = MagicMock()
             if call_count[0] == 1:
                 mock_model.fit.return_value = MagicMock(
-                    params=pd.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
                     model=MagicMock(endog_names="y")
                 )
             else:
@@ -152,7 +156,7 @@ class TestClusterBootstrapPartialFailure:
                 raise Exception("forced failure for first 10 iterations")
             # Succeed for the rest
             return MagicMock(
-                params=pd.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+                params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
             )
 
         with patch.object(inf.smf, "ols") as mock_ols:
@@ -202,7 +206,7 @@ class TestWildClusterBootstrapPartialFailure:
             if call_count[0] == 1:
                 # model0: must succeed
                 mock_model.fit.return_value = MagicMock(
-                    params=pd.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5}),
                     model=MagicMock(endog_names="y")
                 )
             elif call_count[0] <= 11:  # 1 model0 + 10 m_b failures
@@ -210,7 +214,7 @@ class TestWildClusterBootstrapPartialFailure:
             else:
                 # Bootstrap fits 11-50: succeed
                 mock_model.fit.return_value = MagicMock(
-                    params=pd.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
+                    params=pandas.Series({"Intercept": 1.0, "x1": 2.0, "x2": -0.5})
                 )
             return mock_model
 
