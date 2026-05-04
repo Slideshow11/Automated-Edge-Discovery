@@ -195,6 +195,7 @@ model_assessment_refs: list[string]         # ModelAssessmentSpec IDs used
 review_packet_refs: list[string]            # ReviewPacket IDs, if reviewed (future)
 
 failure_summary: FailureSummary | null   # Present when status is failed_* or cancelled
+partial_summary: PartialSummary | null  # Present when status is partial; explains incomplete runs
 missing_data_summary: list[MissingDataEntry] | null  # Present when data was unavailable
 dropped_rows_summary: list[DroppedRowsEntry] | null  # Present when rows were dropped
 leakage_checks_summary: LeakageChecksSummary | null  # Present for all status values
@@ -235,8 +236,8 @@ custom              — Runner-defined custom mode; runner_name defines semantic
 ```
 success              — All stages completed; audit checks passed; results available
 partial              — Run completed with warnings; some data was unavailable or some rows dropped; results present but limited
-failed_missing_data  — Run halted before execution; required data was unavailable; FailureOutput emitted
-failed_validation    — Run halted before execution; governance artifact validation failed; FailureOutput emitted
+failed_missing_data  — Run halted before execution; required data was unavailable; RunnerOutput emitted with failure_summary populated
+failed_validation    — Run halted before execution; governance artifact validation failed; RunnerOutput emitted with failure_summary populated
 failed_runtime       — Run halted during execution; runtime error occurred after data was resolved
 cancelled            — Run was explicitly cancelled before completion
 ```
@@ -256,7 +257,7 @@ custom            — Runner-defined type; semantics defined by runner_name
 ```
 evidence         — Primary result artifact (RunnerOutput)
 audit_report     — Human-readable audit summary
-failure_report   — FailureOutput / failure summary document
+failure_report   — Failure summary document (RunnerOutput with failure_summary populated)
 intermediate     — Intermediate computation artifact (not primary output)
 debug            — Debug artifact (may contain verbose or non-publishable data)
 custom           — Runner-defined role
@@ -301,7 +302,7 @@ InputArtifactRef:
   validated_at: ISO8601 timestamp | null  # When validation ran; null if not validated
 ```
 
-The `validation_status` field records whether the artifact passed its AED validator during this run. An artifact may be present in `input_artifact_refs` even if `validation_status = fail` — in that case the run would set `status = failed_validation` and emit a FailureOutput.
+The `validation_status` field records whether the artifact passed its AED validator during this run. An artifact may be present in `input_artifact_refs` even if `validation_status = fail` — in that case the run sets `status = failed_validation` and the RunnerOutput is populated with `failure_summary`.
 
 ---
 
@@ -402,6 +403,24 @@ When the runner halts during execution after data has been resolved:
 
 Every run — success, partial, or failed — produces exactly one `RunnerOutput` artifact. The `runner_output_id` is assigned and the artifact is serialized before the run exits. There is no run that produces no artifact. This ensures full traceability for post-run auditing and review.
 
+### Partial Runs (`status = partial`)
+
+When a run completes with warnings but still produces result rows:
+
+- `RunnerOutput.status = partial`.
+- `RunnerOutput.partial_summary` is populated:
+  ```
+  PartialSummary:
+    partial_reason: string            # Why the run is partial, e.g., "missing_data", "dropped_rows"
+    completed_stages: list[string]    # Stages that completed before warnings
+    incomplete_stages: list[string]   # Stages that were skipped or truncated
+    affected_outputs: list[string]     # Output paths affected by warnings
+    reconciliation_notes: string       # Free-text explanation of any reconciliation discrepancies
+  ```
+- `row_counts`, `event_counts`, `instrument_counts` are present but may not reconcile fully.
+- `failure_summary` is `null` (partial is not a failure).
+- No `TrialLedger` entry is created. No promoted artifacts are emitted.
+
 ---
 
 ## 10. Counts and Reconciliation
@@ -446,7 +465,7 @@ For `status = success`:
 
 For `status = partial`:
 - Reconciliation invariants may not hold if failure occurred mid-execution.
-- `failure_summary.reason` should explain the discrepancy.
+- `partial_summary.reconciliation_notes` should explain the discrepancy.
 
 For `status = failed_*` or `cancelled`:
 - `row_counts`, `event_counts`, `instrument_counts` are `null`.
