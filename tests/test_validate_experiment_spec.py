@@ -632,6 +632,54 @@ def test_reviewer_not_object():
         path.unlink()
 
 
+def test_reviewer_empty_object():
+    path = _tmp_json(reviewer={})
+    try:
+        code, out, _ = run_validator(["--format", "json", str(path)])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        path.unlink()
+
+
+def test_reviewer_name_empty_string():
+    path = _tmp_json(reviewer={"name": ""})
+    try:
+        code, out, _ = run_validator(["--format", "json", str(path)])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        path.unlink()
+
+
+def test_reviewer_name_whitespace():
+    path = _tmp_json(reviewer={"name": "   "})
+    try:
+        code, out, _ = run_validator(["--format", "json", str(path)])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "missing_required_field" in codes
+    finally:
+        path.unlink()
+
+
+def test_reviewer_name_non_string():
+    path = _tmp_json(reviewer={"name": 123})
+    try:
+        code, out, _ = run_validator(["--format", "json", str(path)])
+        assert code == 1
+        data = json.loads(out)
+        codes = {b["code"] for b in _blockers_for_path(data, path)}
+        assert "invalid_type" in codes
+    finally:
+        path.unlink()
+
+
 # ----- prohibited_modes -----
 
 def test_prohibited_modes_all_false_passes():
