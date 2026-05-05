@@ -29,6 +29,7 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     build_runner_output,
     write_runner_output,
     GovernanceRejection,
+    UnsupportedConfig,
     main,
     _compute_run_config_hash,
     _compute_run_id,
@@ -39,6 +40,8 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _parse_required_columns,
     _read_csv_header,
     _validate_observation_table_columns,
+    _normalize_optional_column_name,
+    _summarize_observation_table_canonical,
 )
 
 
@@ -2495,7 +2498,427 @@ def test_missing_experiment_spec_id_exits_1(tmp_path):
     assert not output_path.exists()
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Existing valid/invalid DataManifest tests still pass
 # (implicit: tested by running the full suite)
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Canonical summary (observation-table canonical summary audit)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def csv_with_date_and_symbol(tmp_path):
+    """CSV with date and symbol columns for canonical summary tests."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-03,MSFT,420.0\n"
+        "2024-01-03,GOOGL,175.0\n"
+        "2024-01-04,AAPL,187.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_missing_date_column(tmp_path):
+    """CSV without the expected date column."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text("symbol,close\nAAPL,185.5\nMSFT,420.0\n")
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_missing_symbol_column(tmp_path):
+    """CSV without the expected symbol column."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text("date,close\n2024-01-01,185.5\n2024-01-02,186.0\n")
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+class TestNormalizeOptionalColumnName:
+    """Tests for _normalize_optional_column_name helper."""
+
+    def test_none_returns_none(self):
+        assert _normalize_optional_column_name(None) is None
+
+    def test_strips_leading_trailing(self):
+        assert _normalize_optional_column_name("  date  ") == "date"
+
+    def test_preserves_internal_whitespace(self):
+        assert _normalize_optional_column_name("close price") == "close price"
+        assert _normalize_optional_column_name("close   price") == "close   price"
+        # Leading/trailing stripped, internal whitespace preserved
+        assert _normalize_optional_column_name("  close price  ") == "close price"
+
+    def test_empty_after_strip_returns_none(self):
+        assert _normalize_optional_column_name("   ") is None
+
+
+class TestCanonicalSummaryComputation:
+    """Tests for _summarize_observation_table_canonical helper."""
+
+    def test_date_column_produces_min_max(self, csv_with_date_and_symbol):
+        _, csv_file = csv_with_date_and_symbol
+        result = _summarize_observation_table_canonical(csv_file, "date", None)
+        assert "row_count=5" in result["details"]
+        assert "min_date=2024-01-01" in result["details"]
+        assert "max_date=2024-01-04" in result["details"]
+
+    def test_symbol_column_produces_unique_count(self, csv_with_date_and_symbol):
+        _, csv_file = csv_with_date_and_symbol
+        result = _summarize_observation_table_canonical(csv_file, None, "symbol")
+        assert "row_count=5" in result["details"]
+        assert "unique_symbol_count=3" in result["details"]
+
+    def test_both_columns_include_both_summaries(self, csv_with_date_and_symbol):
+        _, csv_file = csv_with_date_and_symbol
+        result = _summarize_observation_table_canonical(csv_file, "date", "symbol")
+        assert "min_date=" in result["details"]
+        assert "unique_symbol_count=" in result["details"]
+
+    def test_missing_date_column_raises_value_error(self, csv_missing_date_column):
+        _, csv_file = csv_missing_date_column
+        with pytest.raises(ValueError) as exc_info:
+            _summarize_observation_table_canonical(csv_file, "date", None)
+        assert "date" in str(exc_info.value)
+
+    def test_missing_symbol_column_raises_value_error(self, csv_missing_symbol_column):
+        _, csv_file = csv_missing_symbol_column
+        with pytest.raises(ValueError) as exc_info:
+            _summarize_observation_table_canonical(csv_file, None, "symbol")
+        assert "symbol" in str(exc_info.value)
+
+    def test_date_column_with_empty_values_handled(self, tmp_path):
+        """Empty date values are skipped in min/max computation."""
+        csv_file = tmp_path / "obs.csv"
+        csv_file.write_text("date,symbol\n2024-01-01,AAPL\n,MSFT\n2024-01-03,GOOGL\n")
+        result = _summarize_observation_table_canonical(csv_file, "date", None)
+        assert "min_date=2024-01-01" in result["details"]
+        assert "max_date=2024-01-03" in result["details"]
+
+    def test_empty_csv_all_blanks(self, tmp_path):
+        """CSV with no non-empty date values: min/max may be null/empty."""
+        csv_file = tmp_path / "obs.csv"
+        csv_file.write_text("date,symbol\n,\n  ,  \n")
+        result = _summarize_observation_table_canonical(csv_file, "date", None)
+        # Should not raise; details_ref indicates empty
+
+
+class TestCanonicalSummaryCLI:
+    """Tests for CLI-level canonical summary behavior."""
+
+    def test_date_column_cli_arg_accepted(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "success"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        canon = next(a for a in artifact["audit_summary"]["audits"]
+                     if a["audit_name"] == "observation_table_canonical_summary")
+        assert canon["audit_result"] == "pass"
+        assert "min_date=" in canon["details_ref"]
+        assert "max_date=" in canon["details_ref"]
+
+    def test_symbol_column_cli_arg_accepted(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "success"
+        canon = next(a for a in artifact["audit_summary"]["audits"]
+                     if a["audit_name"] == "observation_table_canonical_summary")
+        assert "unique_symbol_count=3" in canon["details_ref"]
+
+    def test_both_columns_together(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        canon = next(a for a in artifact["audit_summary"]["audits"]
+                     if a["audit_name"] == "observation_table_canonical_summary")
+        assert "min_date=" in canon["details_ref"]
+        assert "unique_symbol_count=" in canon["details_ref"]
+
+    def test_missing_date_column_exit_1(self, csv_missing_date_column, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_missing_date_column
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        # Schema-valid failed_validation artifact written
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+        canon = next(a for a in artifact["audit_summary"]["audits"]
+                     if a["audit_name"] == "observation_table_canonical_summary")
+        assert canon["audit_result"] == "fail"
+
+    def test_missing_symbol_column_exit_1(self, csv_missing_symbol_column, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_missing_symbol_column
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+
+    def test_date_column_without_manifest_exit_1(self, valid_experiment_spec, tmp_path):
+        """Date column requires a DataManifest."""
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+
+    def test_non_csv_manifest_with_date_column_exit_1(self, valid_sqlite_manifest, valid_experiment_spec, tmp_path):
+        """Non-CSV DataManifest with date column should fail."""
+        manifest_file, _ = valid_sqlite_manifest
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert "unsupported_config" in artifact["failure_summary"]["failure_type"]
+
+    def test_required_columns_plus_missing_date_column_preserves_both(self, csv_missing_date_column, valid_experiment_spec, tmp_path):
+        """Required-column fail + missing date column fail → both in audit_summary."""
+        manifest_file, _ = csv_missing_date_column
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--required-observation-columns", "date,symbol",
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        # Both required-column and canonical-summary failures are present
+        assert "observation_table_shape_validation" in audit_names
+        assert "observation_table_canonical_summary" in audit_names
+        # blocker_count reflects both
+        assert artifact["audit_summary"]["blocker_count"] >= 2
+
+    def test_hash_includes_date_column(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "trade_date",  # different column name
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        a1 = json.loads(output1.read_text())
+        a2 = json.loads(output2.read_text())
+        assert a1["run_config_hash"] != a2["run_config_hash"]
+
+    def test_hash_includes_symbol_column(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-symbol-column", "ticker",  # different column name
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        a1 = json.loads(output1.read_text())
+        a2 = json.loads(output2.read_text())
+        assert a1["run_config_hash"] != a2["run_config_hash"]
+
+    def test_hash_whitespace_normalized_for_column_names(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", " date ",  # extra whitespace
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",  # normalized form
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        a1 = json.loads(output1.read_text())
+        a2 = json.loads(output2.read_text())
+        assert a1["run_config_hash"] == a2["run_config_hash"]
+
+    def test_internal_whitespace_preserved_for_hash(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        manifest_file, _ = csv_with_date_and_symbol
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "my date",  # space inside
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "mydate",  # no space
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        a1 = json.loads(output1.read_text())
+        a2 = json.loads(output2.read_text())
+        assert a1["run_config_hash"] != a2["run_config_hash"]
+
+    def test_no_registry_mutation_with_canonical_summary(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path, monkeypatch):
+        """Canonical summary does not write to any registry or ledger."""
+        written = []
+        monkeypatch.setattr(Path, "touch", lambda self: written.append(str(self)))
+        manifest_file, _ = csv_with_date_and_symbol
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        registry_ledger_patterns = ["registry", "ledger", "EdgeHypothesis", "TrialLedger"]
+        assert not any(p in str(w).lower() for w in written for p in registry_ledger_patterns)
+
+    def test_schema_validation_on_success_canonical(self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path):
+        """Success artifact with canonical summary validates against schema."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+        manifest_file, _ = csv_with_date_and_symbol
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        with open(SCHEMA_PATH) as fh:
+            schema = json.load(fh)
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+    def test_schema_validation_on_failed_canonical(self, csv_missing_date_column, valid_experiment_spec, tmp_path):
+        """Failed-validation artifact with missing date column validates against schema."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+        manifest_file, _ = csv_missing_date_column
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        with open(SCHEMA_PATH) as fh:
+            schema = json.load(fh)
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+

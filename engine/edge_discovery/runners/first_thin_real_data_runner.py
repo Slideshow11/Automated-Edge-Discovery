@@ -64,6 +64,8 @@ def _compute_run_config_hash(
     experiment_spec_path: Path,
     data_manifest_path: Path | None = None,
     required_observation_columns: list[str] | None = None,
+    observation_date_column: str | None = None,
+    observation_symbol_column: str | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -80,7 +82,15 @@ def _compute_run_config_hash(
     (sorted, stripped) and appended to the hash input so that different
     column requirements produce different run_config_hash values.
 
+    When observation_date_column is provided, it is stripped and appended
+    to the hash input. When observation_symbol_column is provided, it is
+    stripped and appended.
+
     Whitespace variation does not affect the hash.
+
+    ``observation_date_column`` and ``observation_symbol_column`` participate
+    in the hash so that changing which columns are used for the canonical
+    summary produces a different run_id.
     """
     with open(experiment_spec_path, "rb") as fh:
         spec_raw = json.loads(fh.read().decode("utf-8"))
@@ -94,7 +104,6 @@ def _compute_run_config_hash(
         combined = spec_canonical
 
     # Incorporate required_observation_columns into hash when present.
-    # Incorporate required_observation_columns into hash when present.
     # Strip leading/trailing whitespace per token; preserve internal whitespace.
     # "close price" and "closeprice" are distinct. " close " and "close" are same.
     if required_observation_columns is not None and len(required_observation_columns) > 0:
@@ -103,6 +112,16 @@ def _compute_run_config_hash(
             separators=(",", ":"),
         ).encode("utf-8")
         combined = combined + b"\n" + normalized
+
+    # observation_date_column: strip, include in hash if non-None
+    if observation_date_column is not None and observation_date_column.strip():
+        date_col_normalized = observation_date_column.strip()
+        combined = combined + b"\ndate_col:" + date_col_normalized.encode("utf-8")
+
+    # observation_symbol_column: strip, include in hash if non-None
+    if observation_symbol_column is not None and observation_symbol_column.strip():
+        symbol_col_normalized = observation_symbol_column.strip()
+        combined = combined + b"\nsymbol_col:" + symbol_col_normalized.encode("utf-8")
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -252,6 +271,122 @@ def _parse_required_columns(raw: str | None) -> list[str]:
     return normalized
 
 
+def _normalize_optional_column_name(raw: str | None) -> str | None:
+    """
+    Normalize an optional column name: strip leading/trailing whitespace.
+
+    Returns None if raw is None or empty string.
+    Internal whitespace is preserved.
+    """
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    if stripped == "":
+        return None
+    return stripped
+
+
+def _summarize_observation_table_canonical(
+    dataset_path: Path,
+    observation_date_column: str | None,
+    observation_symbol_column: str | None,
+) -> dict:
+    """
+    Compute a canonical summary of a CSV observation table in a single pass
+    using csv.DictReader.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    observation_date_column : str | None
+        Column name to use for min/max date computation. If None, skipped.
+    observation_symbol_column : str | None
+        Column name to use for unique symbol count. If None, skipped.
+
+    Returns
+    -------
+    dict
+        Canonical summary dict with keys:
+        - row_count (int): total non-header rows read
+        - min_date (str | None): lexicographic minimum of non-empty date values
+        - max_date (str | None): lexicographic maximum of non-empty date values
+        - unique_symbol_count (int | None): count of distinct non-empty symbol values
+        - date_column (str | None): the date column name used
+        - symbol_column (str | None): the symbol column name used
+        - details (str): human-readable summary string for audit details_ref
+
+    Raises
+    ------
+    FileNotFoundError
+        If dataset_path does not exist.
+    ValueError
+        If observation_date_column or observation_symbol_column is not in the CSV header.
+    """
+    row_count = 0
+    date_values: list[str] = []
+    symbol_values: set[str] = set()
+    date_col = observation_date_column.strip() if observation_date_column else None
+    symbol_col = observation_symbol_column.strip() if observation_symbol_column else None
+
+    with open(dataset_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        # Validate requested columns are present in header
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {dataset_path}")
+        header_set = {f.strip() for f in reader.fieldnames}
+        if date_col is not None and date_col not in header_set:
+            raise ValueError(
+                f"observation_date_column '{observation_date_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+        if symbol_col is not None and symbol_col not in header_set:
+            raise ValueError(
+                f"observation_symbol_column '{observation_symbol_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+
+        for row in reader:
+            row_count += 1
+            if date_col is not None:
+                val = row.get(date_col, "").strip()
+                if val:
+                    date_values.append(val)
+            if symbol_col is not None:
+                val = row.get(symbol_col, "").strip()
+                if val:
+                    symbol_values.add(val)
+
+    min_date = min(date_values) if date_values else None
+    max_date = max(date_values) if date_values else None
+    unique_symbol_count = len(symbol_values) if symbol_values else None
+
+    # Build details string for audit details_ref
+    parts = [f"row_count={row_count}"]
+    if date_col is not None:
+        if min_date is not None and max_date is not None:
+            parts.append(f"date_column={date_col}")
+            parts.append(f"min_date={min_date}")
+            parts.append(f"max_date={max_date}")
+        else:
+            parts.append(f"date_column={date_col}")
+            parts.append("min_date=None")
+            parts.append("max_date=None")
+    if symbol_col is not None:
+        parts.append(f"symbol_column={symbol_col}")
+        parts.append(f"unique_symbol_count={unique_symbol_count}")
+
+    return {
+        "row_count": row_count,
+        "min_date": min_date,
+        "max_date": max_date,
+        "unique_symbol_count": unique_symbol_count,
+        "date_column": date_col,
+        "symbol_column": symbol_col,
+        "details": "; ".join(parts),
+    }
+
+
 def _read_csv_header(file_path: Path) -> list[str] | None:
     """
     Read the header row (first line) of a CSV file using csv.reader.
@@ -390,9 +525,22 @@ class GovernanceRejection(Exception):
     """
 
     def __init__(self, artifact: dict, message: str):
-        super().__init__(message)
         self.artifact = artifact
         self.message = message
+        super().__init__(message)
+
+
+class UnsupportedConfig(Exception):
+    """
+    Raised when canonical summary is requested but the dataset format
+    does not support it (e.g., non-CSV). Carries the failure_type
+    so the caller can set failure_type='unsupported_config' in the
+    failure_summary instead of 'validation_error'.
+    """
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
 
 
 # --------------------------------------------------------------------------
@@ -707,6 +855,8 @@ def build_runner_output(
     run_owner: str = "unknown",
     data_manifest_path: str | Path | None = None,
     required_observation_columns: list[str] | None = None,
+    observation_date_column: str | None = None,
+    observation_symbol_column: str | None = None,
 ) -> dict:
     """
     Build a complete RunnerOutput v1 artifact for a dry-run.
@@ -731,6 +881,16 @@ def build_runner_output(
         table CSV referenced by the DataManifest. Only supported for CSV format.
         If provided without a DataManifest, emits failed_validation. If provided
         for a non-CSV DataManifest format, emits failed_validation.
+    observation_date_column : str | None
+        Optional name of the date column in the observation table CSV used for
+        canonical summary (min/max date). Only supported for CSV format.
+        Requires --data-manifest. If the column is absent from the CSV, emits
+        failed_validation.
+    observation_symbol_column : str | None
+        Optional name of the symbol column in the observation table CSV used for
+        canonical summary (unique symbol count). Only supported for CSV format.
+        Requires --data-manifest. If the column is absent from the CSV, emits
+        failed_validation.
 
     Returns
     -------
@@ -767,6 +927,12 @@ def build_runner_output(
             "Column validation requires a DataManifest to determine the dataset path."
         )
 
+    # Early validation: date/symbol summary columns need a DataManifest
+    has_canonical_summary_requested = (
+        (observation_date_column is not None and observation_date_column.strip())
+        or (observation_symbol_column is not None and observation_symbol_column.strip())
+    )
+
     # Timestamps
     started_at = _utc_now()
     completed_at = _utc_now()
@@ -779,6 +945,11 @@ def build_runner_output(
     manifest_base_dir: Path = experiment_spec_path.parent
     observation_validation_passed = False
     observation_missing_columns: list[str] = []
+    # Initialize canonical_summary_audit_entry before the manifest loading block.
+    # It will be populated by the canonical summary section below (when manifest
+    # is present) or by the no-manifest + canonical-summary path (when manifest
+    # is absent but date/symbol columns were requested).
+    canonical_summary_audit_entry: dict | None = None
 
     if data_manifest_path is not None:
         data_manifest_path = Path(data_manifest_path)
@@ -836,7 +1007,10 @@ def build_runner_output(
 
     # Deterministic hashes — include DataManifest content and required columns when present
     run_config_hash = _compute_run_config_hash(
-        experiment_spec_path, data_manifest_path, required_observation_columns
+        experiment_spec_path, data_manifest_path,
+        required_observation_columns,
+        observation_date_column,
+        observation_symbol_column,
     )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
@@ -905,6 +1079,211 @@ def build_runner_output(
     # "hash of output file content" semantics for this dry-run skeleton.
     # This is NOT the RunnerOutput JSON path (that artifact IS the run
     # output; output_manifest describes referenced artifacts).
+    # -------------------------------------------------------------------------
+    # Canonical observation-table summary (optional).
+    # Computed BEFORE required-column validation so both audits appear in
+    # the GovernanceRejection artifact if required columns also fail.
+    # - If CSV dataset exists and columns are present → pass audit entry.
+    # - If CSV dataset missing or column absent → fail audit entry.
+    # - Non-CSV dataset → raise GovernanceRejection with failed_validation artifact.
+    # - No DataManifest at all → raise GovernanceRejection with failed_validation artifact.
+    # -------------------------------------------------------------------------
+    if has_canonical_summary_requested:
+        if data_manifest_path is None:
+            # Canonical summary requested but no DataManifest provided — raise
+            # GovernanceRejection so the artifact is written by main().
+            now = _utc_now()
+            spec_content_hash = _compute_content_hash(experiment_spec_path)
+            canonical_audit = {
+                "audit_name": "observation_table_canonical_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    "canonical_summary_error: Cannot compute canonical summary: "
+                    "--data-manifest was not provided."
+                ),
+                "created_at": now,
+            }
+            new_audits_list = list(audit_summary["audits"])
+            new_audits_list.append(canonical_audit)
+            total_b = sum(
+                a["blocker_count"] for a in new_audits_list
+                if a["audit_result"] == "fail"
+            )
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": (
+                    "Input experiment spec referenced by this dry-run artifact."
+                ),
+            }
+            partial_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": _compute_run_id(run_config_hash),
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": RUNNER_NAME_DEFAULT,
+                "runner_version": RUNNER_VERSION_DEFAULT,
+                "experiment_spec_ref": experiment_spec.get("experiment_id"),
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [],
+                "run_config_hash": run_config_hash,
+                "started_at": started_at,
+                "completed_at": now,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": total_b,
+                    "warning_count": 0,
+                    "audits": new_audits_list,
+                },
+                "output_manifest": [spec_entry],
+                "failure_summary": {
+                    "failure_type": "validation_error",
+                    "status": "failed_validation",
+                    "failed_check": "observation_table_canonical_summary",
+                    "blocker_summary": (
+                        f"observation_table_canonical_summary; "
+                        f"Total blockers: {total_b}."
+                    ),
+                    "missing_data_summary_ref": None,
+                    "details_ref": None,
+                    "created_at": now,
+                },
+                "created_at": created_at,
+                "run_owner": run_owner,
+            }
+            raise GovernanceRejection(
+                partial_artifact,
+                "--observation-date-column/--observation-symbol-column was supplied "
+                "but no --data-manifest was provided. "
+                "Canonical summary requires a DataManifest.",
+            )
+        elif manifest is not None:
+            if manifest.source_kind.value != "local_csv":
+                # Non-CSV with canonical summary args → raise GovernanceRejection
+                # Build a minimal failed_validation artifact with canonical audit
+                now = _utc_now()
+                canonical_audit = {
+                    "audit_name": "observation_table_canonical_summary",
+                    "audit_result": "fail",
+                    "severity": "blocker",
+                    "blocker_count": 1,
+                    "warning_count": 0,
+                    "details_ref": (
+                        f"canonical_summary_error: --observation-date-column/"
+                        f"--observation-symbol-column is only supported for CSV "
+                        f"(dataset has source_kind='{manifest.source_kind.value}')."
+                    ),
+                    "created_at": now,
+                }
+                new_audits_list = list(audit_summary["audits"])
+                new_audits_list.append(canonical_audit)
+                total_b = sum(
+                    a["blocker_count"] for a in new_audits_list
+                    if a["audit_result"] == "fail"
+                )
+                canonical_failure_summary = {
+                    "failure_type": "unsupported_config",
+                    "status": "failed_validation",
+                    "failed_check": "observation_table_canonical_summary",
+                    "blocker_summary": (
+                        f"observation_table_canonical_summary; "
+                        f"Total blockers: {total_b}."
+                    ),
+                    "missing_data_summary_ref": None,
+                    "details_ref": None,
+                    "created_at": now,
+                }
+                spec_content_hash = _compute_content_hash(experiment_spec_path)
+                spec_entry = {
+                    "output_role": "evidence",
+                    "output_path": (
+                        str(experiment_spec_path.resolve())
+                        if experiment_spec_path.is_absolute()
+                        else str(experiment_spec_path)
+                    ),
+                    "row_count": None,
+                    "content_hash": f"sha256:{spec_content_hash}",
+                    "created_at": created_at,
+                    "format": "json",
+                    "description": (
+                        "Input experiment spec referenced by this dry-run artifact."
+                    ),
+                }
+                partial_artifact = {
+                    "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                    "runner_output_version": RUNNER_OUTPUT_VERSION,
+                    "run_id": _compute_run_id(run_config_hash),
+                    "run_mode": "dry_run",
+                    "status": "failed_validation",
+                    "runner_name": RUNNER_NAME_DEFAULT,
+                    "runner_version": RUNNER_VERSION_DEFAULT,
+                    "experiment_spec_ref": experiment_spec.get("experiment_id"),
+                    "input_artifact_refs": input_artifact_refs,
+                    "data_manifest_refs": [],
+                    "run_config_hash": run_config_hash,
+                    "started_at": started_at,
+                    "completed_at": now,
+                    "audit_summary": {
+                        "overall_result": "fail",
+                        "blocker_count": total_b,
+                        "warning_count": 0,
+                        "audits": new_audits_list,
+                    },
+                    "output_manifest": [spec_entry],
+                    "failure_summary": canonical_failure_summary,
+                    "created_at": created_at,
+                    "run_owner": run_owner,
+                }
+                raise GovernanceRejection(
+                    partial_artifact,
+                    f"--observation-date-column/--observation-symbol-column is only "
+                    f"supported for CSV datasets (dataset has "
+                    f"source_kind='{manifest.source_kind.value}').",
+                )
+            # CSV dataset — attempt canonical summary computation
+            raw_path = Path(manifest.path)
+            dataset_resolved = (
+                raw_path if raw_path.is_absolute()
+                else (manifest_base_dir / raw_path).resolve()
+            )
+            try:
+                summary_result = _summarize_observation_table_canonical(
+                    dataset_resolved,
+                    observation_date_column=observation_date_column,
+                    observation_symbol_column=observation_symbol_column,
+                )
+                canonical_summary_audit_entry = {
+                    "audit_name": "observation_table_canonical_summary",
+                    "audit_result": "pass",
+                    "severity": "info",
+                    "blocker_count": 0,
+                    "warning_count": 0,
+                    "details_ref": summary_result["details"],
+                    "created_at": _utc_now(),
+                }
+            except ValueError as exc:
+                canonical_summary_audit_entry = {
+                    "audit_name": "observation_table_canonical_summary",
+                    "audit_result": "fail",
+                    "severity": "blocker",
+                    "blocker_count": 1,
+                    "warning_count": 0,
+                    "details_ref": f"canonical_summary_error: {exc}",
+                    "created_at": _utc_now(),
+                }
+
     # Observation-table column validation (only for CSV format).
     # Performed AFTER successful DataManifest loading, AFTER output_manifest is built.
     # - ValueError for non-CSV format propagates to caller (tests assert on this).
@@ -941,6 +1320,9 @@ def build_runner_output(
             }
             new_audits = list(audit_summary["audits"])
             new_audits.append(obs_audit_entry)
+            # Append canonical summary audit if it was computed (may be fail or pass)
+            if canonical_summary_audit_entry is not None:
+                new_audits.append(canonical_summary_audit_entry)
             # Recalculate blocker_count from all audits (governance + observation)
             total_blockers = sum(
                 a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
@@ -1034,6 +1416,140 @@ def build_runner_output(
             "warning_count": audit_summary["warning_count"],
             "audits": new_audits,
         }
+
+    # -------------------------------------------------------------------------
+    # Canonical summary computation (observation_table_canonical_summary audit)
+    # Runs after required_observation_columns validation (which may raise).
+    # Only applies when a DataManifest is present and date/symbol columns requested.
+    # -------------------------------------------------------------------------
+    canonical_summary_passed = False
+    canonical_summary_details: str | None = None
+    if (
+        has_canonical_summary_requested
+        and manifest is not None
+    ):
+        if manifest.source_kind.value != "local_csv":
+            raise UnsupportedConfig(
+                f"observation date/symbol column summary is only supported for CSV datasets "
+                f"(DataManifest dataset_id='{manifest.dataset_id}' has "
+                f"source_kind='{manifest.source_kind.value}')."
+            )
+        raw_path = Path(manifest.path)
+        dataset_resolved = (
+            raw_path if raw_path.is_absolute()
+            else (manifest_base_dir / raw_path).resolve()
+        )
+        now = _utc_now()
+        try:
+            summary = _summarize_observation_table_canonical(
+                dataset_resolved,
+                observation_date_column,
+                observation_symbol_column,
+            )
+            canonical_summary_passed = True
+            canonical_summary_details = summary["details"]
+            canon_audit_entry = {
+                "audit_name": "observation_table_canonical_summary",
+                "audit_result": "pass",
+                "severity": "blocker",
+                "blocker_count": 0,
+                "warning_count": 0,
+                "details_ref": canonical_summary_details,
+                "created_at": now,
+            }
+        except (ValueError, UnsupportedConfig) as exc:
+            canonical_summary_failure_type = (
+                "unsupported_config" if isinstance(exc, UnsupportedConfig) else "validation_error"
+            )
+            canonical_summary_details = str(exc)
+            canon_audit_entry = {
+                "audit_name": "observation_table_canonical_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": canonical_summary_details,
+                "created_at": now,
+            }
+
+        new_audits = list(audit_summary["audits"])
+        new_audits.append(canon_audit_entry)
+        total_blockers = sum(
+            a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+        )
+        overall_result = "fail" if total_blockers > 0 else audit_summary["overall_result"]
+        audit_summary = {
+            "overall_result": overall_result,
+            "blocker_count": total_blockers,
+            "warning_count": audit_summary["warning_count"],
+            "audits": new_audits,
+        }
+
+        # If canonical summary failed and no governance blockers existed before,
+        # we still need to emit a failed_validation artifact. Do not raise
+        # GovernanceRejection — just mark status failed and build failure_summary.
+        if not canonical_summary_passed and audit_summary["blocker_count"] > 0:
+            # Build failure_summary since we now have blockers
+            failing_checks = [
+                a["audit_name"] for a in audit_summary["audits"]
+                if a["audit_result"] == "fail"
+            ]
+            failure_summary = {
+                "failure_type": canonical_summary_failure_type,
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_canonical_summary: {canonical_summary_details}. "
+                    f"Total blockers: {audit_summary['blocker_count']}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            # Build artifact with updated audit_summary and failure_summary
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": (
+                    "Input experiment spec referenced by this dry-run artifact."
+                ),
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": audit_summary,
+                "output_manifest": [spec_entry],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"Run blocked by observation_table_canonical_summary failure: "
+                f"{canonical_summary_details}.",
+            )
 
     output_manifest = [
         {
@@ -1197,6 +1713,29 @@ def main(argv: list[str] | None = None) -> int:
             "Example: --required-observation-columns event_id,symbol,close_price"
         ),
     )
+    parser.add_argument(
+        "--observation-date-column",
+        required=False,
+        default=None,
+        help=(
+            "Optional name of the date column in the observation table CSV. "
+            "Used for canonical summary (min/max date). "
+            "Requires --data-manifest pointing to a CSV. "
+            "Lexicographic min/max is used (not date parsing). "
+            "Example: --observation-date-column date"
+        ),
+    )
+    parser.add_argument(
+        "--observation-symbol-column",
+        required=False,
+        default=None,
+        help=(
+            "Optional name of the symbol/ticker column in the observation table CSV. "
+            "Used for canonical summary (unique symbol count). "
+            "Requires --data-manifest pointing to a CSV. "
+            "Example: --observation-symbol-column symbol"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1223,6 +1762,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
 
+    # Parse optional date/symbol columns for canonical summary
+    observation_date_column = _normalize_optional_column_name(args.observation_date_column)
+    observation_symbol_column = _normalize_optional_column_name(args.observation_symbol_column)
+
     # Build artifact — may raise GovernanceRejection if governance blockers found
     try:
         artifact = build_runner_output(
@@ -1232,6 +1775,8 @@ def main(argv: list[str] | None = None) -> int:
             run_owner=args.run_owner,
             data_manifest_path=data_manifest_path,
             required_observation_columns=required_observation_columns,
+            observation_date_column=observation_date_column,
+            observation_symbol_column=observation_symbol_column,
         )
     except GovernanceRejection as exc:
         # Governance rejection: emit the failed_validation artifact and exit 1
