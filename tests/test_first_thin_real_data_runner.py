@@ -3342,6 +3342,18 @@ class TestCloseReturnSummaryIntegration:
         artifact = exc_info.value.artifact
         assert artifact["status"] == "failed_validation"
         assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+        # P1 fix: input_artifact_refs must satisfy minItems >= 1
+        assert len(artifact["input_artifact_refs"]) >= 1
+        assert artifact["input_artifact_refs"][0]["artifact_type"] == "ExperimentSpec"
+        # data_manifest_refs must also satisfy minItems >= 1
+        assert len(artifact["data_manifest_refs"]) >= 1
+        assert len(artifact["data_manifest_refs"][0]) > 0
+        # output_manifest must remain non-empty
+        assert len(artifact["output_manifest"]) >= 1
+        # Schema validation if jsonschema available
+        jsonschema = pytest.importorskip("jsonschema")
+        schema_path = Path(__file__).parent.parent / "schemas" / "runner_output_spec_v1.schema.json"
+        jsonschema.validate(artifact, json.loads(schema_path.read_text()))
 
     def test_no_valid_returns_fails_closed(
         self, csv_all_symbols_single_date, valid_experiment_spec

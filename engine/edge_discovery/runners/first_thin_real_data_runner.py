@@ -1195,6 +1195,25 @@ def build_runner_output(
             _total_blockers = 1
             _failing_checks = ["observation_table_close_return_summary"]
             _spec_content_hash = _compute_content_hash(experiment_spec_path)
+            _experiment_id = experiment_spec.get("experiment_id", "unknown")
+            _spec_artifact_ref = {
+                "artifact_type": "ExperimentSpec",
+                "artifact_id": _experiment_id,
+                "artifact_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "schema_ref": "schemas/experiment_spec_v1.schema.json",
+                "validator_ref": None,
+                "content_hash": f"sha256:{_spec_content_hash}",
+                "validation_status": "pass",
+                "validated_at": created_at,
+            }
+            _dm_id = _raw_manifest.get("dataset_id")
+            _data_manifest_ref = (
+                _dm_id if (_dm_id and _dm_id.strip()) else DRY_RUN_DATA_MANIFEST_PLACEHOLDER
+            )
             _spec_entry = {
                 "output_role": "evidence",
                 "output_path": (
@@ -1231,9 +1250,9 @@ def build_runner_output(
                 "status": "failed_validation",
                 "runner_name": runner_name,
                 "runner_version": runner_version,
-                "experiment_spec_ref": experiment_spec.get("experiment_id", "unknown"),
-                "input_artifact_refs": [],
-                "data_manifest_refs": [_raw_manifest.get("dataset_id", "unknown")],
+                "experiment_spec_ref": _experiment_id,
+                "input_artifact_refs": [_spec_artifact_ref],
+                "data_manifest_refs": [_data_manifest_ref],
                 "run_config_hash": f"sha256:{_cfg_hash}",
                 "started_at": _now,
                 "completed_at": _now,
