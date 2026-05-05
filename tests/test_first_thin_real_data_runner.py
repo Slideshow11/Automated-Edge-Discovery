@@ -36,6 +36,9 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _utc_now,
     GOVERNANCE_STOP_RULE_FIELDS,
     SCHEMA_PATH,
+    _parse_required_columns,
+    _read_csv_header,
+    _validate_observation_table_columns,
 )
 
 
@@ -1172,9 +1175,490 @@ def invalid_data_manifest_bad_role(tmp_path):
     return manifest_file
 
 
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Unit tests for observation-table helpers
+# ---------------------------------------------------------------------------
+
+class TestParseRequiredColumns:
+    def test_none_returns_empty(self):
+        assert _parse_required_columns(None) == []
+
+    def test_single_column(self):
+        assert _parse_required_columns("event_id") == ["event_id"]
+
+    def test_multiple_columns(self):
+        assert _parse_required_columns("event_id,symbol,close") == ["event_id", "symbol", "close"]
+
+    def test_whitespace_trimmed(self):
+        assert _parse_required_columns("  event_id  ,  symbol , close  ") == [
+            "event_id", "symbol", "close"
+        ]
+
+    def test_empty_token_raises_value_error(self):
+        with pytest.raises(ValueError, match="empty token"):
+            _parse_required_columns("event_id,,symbol")
+
+    def test_leading_comma_raises(self):
+        with pytest.raises(ValueError, match="empty token"):
+            _parse_required_columns(",event_id,symbol")
+
+    def test_trailing_comma_raises(self):
+        with pytest.raises(ValueError, match="empty token"):
+            _parse_required_columns("event_id,symbol,")
+
+    def test_duplicate_columns_preserves_first_occurrence(self):
+        result = _parse_required_columns("event_id,symbol,event_id,symbol,close")
+        assert result == ["event_id", "symbol", "close"]
+
+    def test_all_whitespace_token_raises(self):
+        with pytest.raises(ValueError, match="empty token"):
+            _parse_required_columns("event_id,   ,symbol")
+
+
+class TestReadCsvHeader:
+    def test_returns_header_list(self, tmp_path):
+        csv_file = tmp_path / "test.csv"
+        csv_file.write_text("date,open,high,low,close\n2024-01-01,100,101,99,100.5\n")
+        header = _read_csv_header(csv_file)
+        assert header == ["date", "open", "high", "low", "close"]
+
+    def test_missing_file_returns_none(self, tmp_path):
+        result = _read_csv_header(tmp_path / "nonexistent.csv")
+        assert result is None
+
+    def test_empty_file_returns_empty_list(self, tmp_path):
+        csv_file = tmp_path / "empty.csv"
+        csv_file.write_text("")
+        result = _read_csv_header(csv_file)
+        assert result == []
+
+
+class TestValidateObservationTableColumns:
+    def test_all_present_returns_true(self, tmp_path):
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        missing, ok = _validate_observation_table_columns(csv_file, ["date", "symbol", "close"])
+        assert ok is True
+        assert missing == []
+
+    def test_some_missing_returns_false(self, tmp_path):
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        missing, ok = _validate_observation_table_columns(csv_file, ["date", "missing_col", "also_absent"])
+        assert ok is False
+        assert set(missing) == {"missing_col", "also_absent"}
+
+    def test_all_missing_returns_false(self, tmp_path):
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        missing, ok = _validate_observation_table_columns(csv_file, ["not_there", "also_not_there"])
+        assert ok is False
+        assert set(missing) == {"not_there", "also_not_there"}
+
+    def test_whitespace_in_header_stripped(self, tmp_path):
+        """Whitespace in header cells is stripped before column comparison.
+
+        csv.reader preserves whitespace inside quoted fields, but we strip
+        it before matching so that " date " matches "date".
+        """
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text(" date ,symbol, close \n2024-01-01,AAPL,150.0\n")
+        missing, ok = _validate_observation_table_columns(csv_file, ["date", "symbol", "close"])
+        assert ok is True  # whitespace stripped before comparison → match
+        assert missing == []
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: observation table validation in build_runner_output
+# ---------------------------------------------------------------------------
+
+def _make_spec_with_dm_refs(tmp_path, experiment_id="EXP-2026-0001", dm_refs=None):
+    """Helper: create a minimal experiment spec with data_manifest_refs."""
+    if dm_refs is None:
+        dm_refs = ["DM-2026-0001"]
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": experiment_id,
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": dm_refs,
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date"},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    return spec
+
+
+class TestObservationTableValidation:
+    def test_required_columns_present_csv_success(self, tmp_path):
+        """Required columns present in CSV → status=success."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n2024-01-02,AAPL,151.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            data_manifest_path=manifest_file,
+            required_observation_columns=["date", "symbol", "close"],
+        )
+        assert artifact["status"] == "success"
+        assert artifact["failure_summary"] is None
+
+    def test_required_columns_missing_csv_failed_validation(self, tmp_path):
+        """Required columns missing from CSV → raises GovernanceRejection with
+        failed_validation artifact preserving audit_summary (blocker_count=1)."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol\n2024-01-01,AAPL\n2024-01-02,AAPL\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"] is not None
+
+    def test_missing_columns_listed_in_blocker_summary(self, tmp_path):
+        """Missing columns appear in failure_summary.blocker_summary."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol\n2024-01-01,AAPL\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
+        blocker = artifact["failure_summary"]["blocker_summary"]
+        assert "close" in blocker
+
+    def test_required_columns_audit_entry_added(self, tmp_path):
+        """observation_table_shape_validation audit entry present when columns provided."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            data_manifest_path=manifest_file,
+            required_observation_columns=["date", "symbol", "close"],
+        )
+        audit_names = {a["audit_name"] for a in artifact["audit_summary"]["audits"]}
+        assert "observation_table_shape_validation" in audit_names
+        obs_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_shape_validation"
+        )
+        assert obs_audit["audit_result"] == "pass"
+        assert obs_audit["blocker_count"] == 0
+
+    def test_required_columns_without_data_manifest_raises_value_error(self, tmp_path):
+        """required_observation_columns without --data-manifest raises ValueError."""
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(ValueError, match="required-observation-columns"):
+            build_runner_output(
+                experiment_spec_path=spec,
+                required_observation_columns=["date", "symbol"],
+            )
+
+    def test_required_columns_with_sqlite_manifest_raises_value_error(self, tmp_path):
+        """required_observation_columns with SQLite DataManifest raises ValueError."""
+        db_subdir = tmp_path / "db"
+        db_subdir.mkdir()
+        db_file = db_subdir / "options.sqlite"
+        db_file.write_text("")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_sqlite",
+            "role": "options_backtest_db",
+            "source_kind": "local_sqlite",
+            "path": "db/options.sqlite",
+            "format": "sqlite",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(ValueError, match="only supported for CSV"):
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol"],
+            )
+
+    def test_run_config_hash_incorporates_required_columns(self, tmp_path):
+        """Different required_observation_columns → different run_config_hash."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec1 = _make_spec_with_dm_refs(tmp_path, experiment_id="EXP-2026-0001")
+        spec2 = tmp_path / "spec2.json"
+        spec2.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": ["DM-2026-0001"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+            "feature_cutoff_policy": {"timestamp_ref": "trade_date"},
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first"],
+            "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+            "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+        }))
+        hash1 = _compute_run_config_hash(spec1, manifest_file, ["date", "symbol", "close"])
+        hash2 = _compute_run_config_hash(spec1, manifest_file, ["date", "symbol"])
+        hash3 = _compute_run_config_hash(spec1, manifest_file, ["date", "extra_col"])
+        assert hash1 != hash2, "Different column sets must produce different hashes"
+        assert hash2 != hash3, "Different column sets must produce different hashes"
+
+    def test_normalized_columns_produce_same_hash(self, tmp_path):
+        """Same normalized columns regardless of input order/whitespace → same hash."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec1 = _make_spec_with_dm_refs(tmp_path, experiment_id="EXP-2026-0001")
+        spec2 = tmp_path / "spec2.json"
+        spec2.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": ["DM-2026-0001"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+            "feature_cutoff_policy": {"timestamp_ref": "trade_date"},
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first"],
+            "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+            "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+        }))
+        # "date" and "symbol" with extra whitespace all normalize to "date" and "symbol"
+        # after "".join(c.split()) which removes ALL whitespace.
+        hash1 = _compute_run_config_hash(spec1, manifest_file, ["symbol", "date"])
+        hash2 = _compute_run_config_hash(spec1, manifest_file, [" date ", " symbol "])
+        assert hash1 == hash2, "Normalized columns must produce identical hashes"
+
+    def test_no_required_columns_preserves_existing_behavior(self, tmp_path):
+        """Without required_observation_columns, behavior is identical to PR #160."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            data_manifest_path=manifest_file,
+            required_observation_columns=None,
+        )
+        assert artifact["status"] == "success"
+        assert artifact["failure_summary"] is None
+        audit_names = {a["audit_name"] for a in artifact["audit_summary"]["audits"]}
+        assert "observation_table_shape_validation" not in audit_names
+
+    def test_cli_accepts_required_observation_columns_arg(self, tmp_path):
+        """CLI accepts --required-observation-columns."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec),
+            "--output-path", str(output),
+            "--run-owner", "test",
+            "--data-manifest", str(manifest_file),
+            "--required-observation-columns", "date,symbol,close",
+        ])
+        assert rc == 0, "CLI should accept --required-observation-columns"
+        assert output.exists()
+
+    def test_cli_missing_required_columns_exits_1(self, tmp_path):
+        """CLI with missing required columns exits 1."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol\n2024-01-01,AAPL\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec),
+            "--output-path", str(output),
+            "--run-owner", "test",
+            "--data-manifest", str(manifest_file),
+            "--required-observation-columns", "date,symbol,close",
+        ])
+        assert rc == 1, f"Expected exit 1 for missing columns, got {rc}"
+        loaded = json.loads(output.read_text())
+        assert loaded["status"] == "failed_validation"
+        assert "close" in loaded["failure_summary"]["blocker_summary"]
+
+    def test_cli_required_columns_no_manifest_exits_1(self, tmp_path):
+        """CLI --required-observation-columns without --data-manifest exits 1."""
+        spec = _make_spec_with_dm_refs(tmp_path)
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec),
+            "--output-path", str(output),
+            "--run-owner", "test",
+            "--required-observation-columns", "date,symbol",
+        ])
+        assert rc == 1, f"Expected exit 1 for missing manifest, got {rc}"
+
+    def test_cli_required_columns_sqlite_exits_1(self, tmp_path):
+        """CLI with SQLite DataManifest + required columns exits 1."""
+        db_subdir = tmp_path / "db"
+        db_subdir.mkdir()
+        db_file = db_subdir / "options.sqlite"
+        db_file.write_text("")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_sqlite",
+            "role": "options_backtest_db",
+            "source_kind": "local_sqlite",
+            "path": "db/options.sqlite",
+            "format": "sqlite",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec),
+            "--output-path", str(output),
+            "--run-owner", "test",
+            "--data-manifest", str(manifest_file),
+            "--required-observation-columns", "date,symbol",
+        ])
+        assert rc == 1, f"Expected exit 1 for SQLite with required columns, got {rc}"
+
+    def test_success_artifact_schema_validates_with_observation_columns(self, tmp_path):
+        """Success artifact with required columns validates against schema."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol,close\n2024-01-01,AAPL,150.0\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            data_manifest_path=manifest_file,
+            required_observation_columns=["date", "symbol", "close"],
+        )
+        schema = json.loads(SCHEMA_PATH.read_text())
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+    def test_failed_validation_artifact_schema_validates_with_missing_columns(self, tmp_path):
+        """Failed-validation artifact with missing columns validates against schema.
+
+        Missing CSV columns are a blocking governance failure → GovernanceRejection.
+        The artifact inside the exception validates against the schema.
+        """
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,symbol\n2024-01-01,AAPL\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "test_csv",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        schema = json.loads(SCHEMA_PATH.read_text())
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+
+# ---------------------------------------------------------------------------
 # CLI accepts --data-manifest
-# -----------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 def test_cli_accepts_data_manifest_arg(tmp_path):
     """CLI --data-manifest argument is accepted without error."""
@@ -1570,7 +2054,12 @@ def test_invalid_data_manifest_produces_failed_validation_artifact(tmp_path, inv
 
 
 def test_invalid_data_manifest_audit_includes_data_manifest_validation(tmp_path, invalid_data_manifest_bad_role):
-    """audit_summary includes data_manifest_validation audit with fail result."""
+    """audit_summary includes data_manifest_validation audit with fail result.
+
+    data_manifest_validation is a user-level data validation failure, NOT a
+    governance blocker. blocker_count=0 so it does not inflate governance
+    blocker counts (e.g., autonomous_search violations).
+    """
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({
         "experiment_id": "EXP-2026-0001",
@@ -1594,7 +2083,8 @@ def test_invalid_data_manifest_audit_includes_data_manifest_validation(tmp_path,
     assert "data_manifest_validation" in audit_names
     dm_audit = next(a for a in artifact["audit_summary"]["audits"] if a["audit_name"] == "data_manifest_validation")
     assert dm_audit["audit_result"] == "fail"
-    assert dm_audit["blocker_count"] == 1
+    # data_manifest_validation is a user validation failure, not a governance blocker
+    assert dm_audit["blocker_count"] == 0
 
 
 # -----------------------------------------------------------------------
