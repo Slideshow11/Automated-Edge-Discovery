@@ -345,6 +345,80 @@ def _summarize_observation_close_returns(
     }
 
 
+def _summarize_observation_missing_values(
+    dataset_path: Path,
+    columns: list[str],
+) -> dict:
+    """
+    Compute per-column missing-value counts from a CSV observation table in a
+    single pass using csv.DictReader.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    columns : list[str]
+        Column names to check for missing values. Each column must be present
+        in the CSV header. Tokens are assumed to be pre-normalized (stripped,
+        deduplicated) by the caller.
+
+    Returns
+    -------
+    dict
+        Missing-value summary dict with keys:
+        - row_count (int): total non-header rows read
+        - missing (dict[str, int]): per-column count of rows where the value
+          is None (CSV field absent) or empty after strip
+        - details (str): human-readable summary string for audit details_ref
+
+    Raises
+    ------
+    ValueError
+        If any requested column is not in the CSV header.
+    """
+    row_count = 0
+    missing_counts: dict[str, int] = {col: 0 for col in columns}
+
+    # Strip columns for header comparison (header tokens may have whitespace)
+    stripped_columns = [col.strip() for col in columns]
+
+    with open(dataset_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {dataset_path}")
+
+        # Strip fieldnames so DictReader row keys are clean
+        reader.fieldnames = [f.strip() for f in reader.fieldnames]
+        header_fields = set(reader.fieldnames)
+
+        # Validate all requested columns are present
+        for col in stripped_columns:
+            if col not in header_fields:
+                raise ValueError(
+                    f"Column '{col}' not found in CSV header: "
+                    f"{list(reader.fieldnames)}"
+                )
+
+        for row in reader:
+            row_count += 1
+            for col in stripped_columns:
+                val = row.get(col)
+                # Missing: None (field absent from row) or empty/whitespace after strip
+                if val is None or str(val).strip() == "":
+                    missing_counts[col] += 1
+
+    # Build details string for audit details_ref
+    details_parts = [f"row_count={row_count}"]
+    for col in stripped_columns:
+        details_parts.append(f"missing[{col}]={missing_counts[col]}")
+
+    return {
+        "row_count": row_count,
+        "missing": missing_counts,
+        "details": "; ".join(details_parts),
+    }
+
+
 def _read_csv_header(file_path: Path) -> list[str] | None:
     """
     Read the header row (first line) of a CSV file using csv.reader.
