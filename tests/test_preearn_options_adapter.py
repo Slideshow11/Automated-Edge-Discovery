@@ -514,3 +514,170 @@ def test_config_hash_different_if_param_changes():
         preearn_repo_path="/repo/engine",
     )
     assert config_hash(spec1) != config_hash(spec2)
+
+
+# ---------------------------------------------------------------------------
+# H. Path sanitization — preearn_repo_path
+# ---------------------------------------------------------------------------
+
+def test_candidate_spec_whitespace_only_repo_path_rejected():
+    """A whitespace-only preearn_repo_path is rejected."""
+    with pytest.raises(ValueError, match="non-whitespace-only"):
+        CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path="/data/opts.db",
+            preearn_repo_path="   ",
+        )
+
+
+def test_candidate_spec_whitespace_only_options_db_rejected():
+    """A whitespace-only options_db_path is rejected."""
+    with pytest.raises(ValueError, match="non-whitespace-only"):
+        CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path="   ",
+            preearn_repo_path="/repo/engine",
+        )
+
+
+def test_run_preearn_backtest_repo_path_not_a_directory(tmp_path, monkeypatch):
+    """A preearn_repo_path pointing to a file (not a directory) is rejected."""
+    ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
+
+    fake_file = tmp_path / "not_a_dir.txt"
+    fake_file.touch()
+
+    spec = CandidateSpec(
+        entry_dpe=2,
+        delta_target=0.30,
+        expiry_rank=0,
+        options_db_path=str(tmp_path / "opts.db"),
+        preearn_repo_path=str(fake_file),  # file, not directory
+        output_dir=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="not a directory"):
+        run_preearn_backtest(spec)
+
+
+def test_run_preearn_backtest_options_db_not_a_file(tmp_path, monkeypatch):
+    """An options_db_path pointing to a directory (not a file) is rejected."""
+    ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
+
+    # Create the script structure
+    script_dir = tmp_path / "scripts"
+    script_dir.mkdir()
+    (script_dir / "run_options_backtest_v1.py").write_text("# fake\n")
+    # options_db is a directory, not a file
+    opts_dir = tmp_path / "opts_dir"
+    opts_dir.mkdir()
+
+    spec = CandidateSpec(
+        entry_dpe=2,
+        delta_target=0.30,
+        expiry_rank=0,
+        options_db_path=str(opts_dir),  # directory, not file
+        preearn_repo_path=str(tmp_path),
+        output_dir=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="not a file"):
+        run_preearn_backtest(spec)
+
+
+def test_run_preearn_backtest_script_symlink_escape_rejected(tmp_path, monkeypatch):
+    """A symlink inside the repo pointing outside the repo root is rejected.
+
+    The symlink target lives outside preearn_repo_path, so after symlink
+    resolution the script path is outside the allowed boundary and is rejected.
+    """
+    import uuid
+
+    ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
+
+    # Create the repo structure
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    scripts_dir = repo / "scripts"
+    scripts_dir.mkdir()
+
+    # Create the symlink inside repo/scripts -> target OUTSIDE repo
+    unique_name = f"dm_escape_target_{uuid.uuid4().hex[:8]}"
+    outside_target = tmp_path.parent / unique_name
+    outside_target.parent.mkdir(exist_ok=True)
+    outside_target.touch()
+
+    link = scripts_dir / "run_options_backtest_v1.py"
+    try:
+        link.symlink_to(outside_target)
+    except OSError:
+        pytest.skip("symlink creation not supported on this platform")
+
+    # Also need a real options_db
+    opts_db = tmp_path / "opts.db"
+    opts_db.touch()
+
+    spec = CandidateSpec(
+        entry_dpe=2,
+        delta_target=0.30,
+        expiry_rank=0,
+        options_db_path=str(opts_db),
+        preearn_repo_path=str(repo),
+        output_dir=str(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="resolves outside|symlink escape"):
+        run_preearn_backtest(spec)
+
+
+def test_run_preearn_backtest_legitimate_absolute_external_repo_passes(tmp_path, monkeypatch):
+    """A legitimate absolute preearn_repo_path outside the AED repo is accepted.
+
+    External checkouts with absolute paths are explicitly supported by the
+    docstring. The fix does not reject them merely for being outside AED.
+    """
+    ledger_file = tmp_path / "ledger.jsonl"
+    monkeypatch.setenv("EDGE_DISCOVERY_LEDGER_PATH", str(ledger_file))
+
+    # Create fake repo structure
+    scripts_dir = tmp_path / "scripts"
+    scripts_dir.mkdir()
+    (scripts_dir / "run_options_backtest_v1.py").write_text("# fake\nimport sys\nsys.exit(0)\n")
+    opts_db = tmp_path / "opts.db"
+    opts_db.touch()
+
+    def fake_run(cmd, cwd, capture_output, text, timeout):
+        out_csv_idx = cmd.index("--out-csv")
+        actual_out_csv = Path(cmd[out_csv_idx + 1])
+        actual_out_csv.parent.mkdir(parents=True, exist_ok=True)
+        with actual_out_csv.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=["earnings_event_id", "symbol", "total_return"])
+            writer.writeheader()
+            writer.writerow({"earnings_event_id": "EVT1", "symbol": "AAPL", "total_return": "0.05"})
+        class FakeResult:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    spec = CandidateSpec(
+        entry_dpe=2,
+        delta_target=0.30,
+        expiry_rank=0,
+        options_db_path=str(opts_db),
+        preearn_repo_path=str(tmp_path),  # absolute, outside AED — but valid
+        output_dir=str(tmp_path),
+    )
+
+    # Must not raise ValueError or FileNotFoundError
+    result = run_preearn_backtest(spec, timeout=60)
+    assert result.status == "success"
