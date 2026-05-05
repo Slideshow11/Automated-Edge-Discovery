@@ -66,6 +66,7 @@ def _compute_run_config_hash(
     required_observation_columns: list[str] | None = None,
     observation_date_column: str | None = None,
     observation_symbol_column: str | None = None,
+    observation_close_column: str | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -84,13 +85,15 @@ def _compute_run_config_hash(
 
     When observation_date_column is provided, it is stripped and appended
     to the hash input. When observation_symbol_column is provided, it is
+    stripped and appended. When observation_close_column is provided, it is
     stripped and appended.
 
     Whitespace variation does not affect the hash.
 
-    ``observation_date_column`` and ``observation_symbol_column`` participate
-    in the hash so that changing which columns are used for the canonical
-    summary produces a different run_id.
+    ``observation_date_column``, ``observation_symbol_column``, and
+    ``observation_close_column`` participate in the hash so that changing
+    which columns are used for the canonical or return summary produces a
+    different run_id.
     """
     with open(experiment_spec_path, "rb") as fh:
         spec_raw = json.loads(fh.read().decode("utf-8"))
@@ -122,6 +125,11 @@ def _compute_run_config_hash(
     if observation_symbol_column is not None and observation_symbol_column.strip():
         symbol_col_normalized = observation_symbol_column.strip()
         combined = combined + b"\nsymbol_col:" + symbol_col_normalized.encode("utf-8")
+
+    # observation_close_column: strip, include in hash if non-None
+    if observation_close_column is not None and observation_close_column.strip():
+        close_col_normalized = observation_close_column.strip()
+        combined = combined + b"\nclose_col:" + close_col_normalized.encode("utf-8")
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -384,6 +392,165 @@ def _summarize_observation_table_canonical(
         "date_column": date_col,
         "symbol_column": symbol_col,
         "details": "; ".join(parts),
+    }
+
+
+def _summarize_observation_close_returns(
+    dataset_path: Path,
+    observation_date_column: str,
+    observation_symbol_column: str,
+    observation_close_column: str,
+) -> dict:
+    """
+    Compute per-symbol first/last close return summary from a CSV observation table
+    in a single pass using csv.DictReader.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    observation_date_column : str
+        Column name for date values (used for first/last ordering).
+    observation_symbol_column : str
+        Column name for symbol/ticker values.
+    observation_close_column : str
+        Column name for close price values.
+
+    Returns
+    -------
+    dict
+        Close-return summary dict with keys:
+        - symbols_with_return (int): number of symbols with ≥2 distinct dates
+          and valid non-zero first close
+        - min_return (float | None): minimum simple return across symbols
+        - max_return (float | None): maximum simple return across symbols
+        - mean_return (float | None): mean simple return across symbols
+        - close_column (str): the close column name used
+        - skipped_symbols (int): number of symbols skipped (no valid return)
+        - details (str): human-readable summary string for audit details_ref
+
+    Raises
+    ------
+    ValueError
+        If observation_close_column is not in the CSV header.
+        (Missing date/symbol columns raise in _summarize_observation_table_canonical
+        which is called before this function in build_runner_output.)
+    """
+    # Per-symbol state: track first and last (by lexicographic date) close.
+    # We store first_valid_date and first_valid_close for the earliest date seen,
+    # and last_valid_close for the latest date seen.
+    # A symbol needs at least 2 distinct dates with valid close to have a return.
+    symbol_data: dict[str, dict] = {}
+
+    date_col = observation_date_column.strip()
+    symbol_col = observation_symbol_column.strip()
+    close_col = observation_close_column.strip()
+
+    with open(dataset_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {dataset_path}")
+        header_set = {f.strip() for f in reader.fieldnames}
+        if close_col not in header_set:
+            raise ValueError(
+                f"observation_close_column '{observation_close_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+        # Date/symbol columns are expected to have been validated by
+        # _summarize_observation_table_canonical already; check them too.
+        if date_col not in header_set:
+            raise ValueError(
+                f"observation_date_column '{observation_date_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+        if symbol_col not in header_set:
+            raise ValueError(
+                f"observation_symbol_column '{observation_symbol_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+
+        for row in reader:
+            date_val = row.get(date_col, "").strip()
+            symbol_val = row.get(symbol_col, "").strip()
+            close_raw = row.get(close_col, "").strip()
+
+            # Skip rows with missing essential fields
+            if not date_val or not symbol_val:
+                continue
+
+            # Parse close: skip empty or non-numeric
+            if not close_raw:
+                continue
+            try:
+                close_val = float(close_raw)
+            except ValueError:
+                continue
+
+            # Skip non-finite
+            if not (0 < abs(close_val) < float("inf")):
+                # float("inf") or nan — skip
+                continue
+
+            # Initialize symbol entry if first time seen
+            if symbol_val not in symbol_data:
+                symbol_data[symbol_val] = {
+                    "first_date": date_val,
+                    "first_close": close_val,
+                    "last_date": date_val,
+                    "last_close": close_val,
+                }
+            else:
+                # Update first if earlier (lexicographic)
+                if date_val < symbol_data[symbol_val]["first_date"]:
+                    symbol_data[symbol_val]["first_date"] = date_val
+                    symbol_data[symbol_val]["first_close"] = close_val
+                # Update last if later (lexicographic)
+                if date_val > symbol_data[symbol_val]["last_date"]:
+                    symbol_data[symbol_val]["last_date"] = date_val
+                    symbol_data[symbol_val]["last_close"] = close_val
+
+    # Compute returns for symbols with ≥2 distinct dates and non-zero first close
+    returns: list[float] = []
+    for symbol, data in symbol_data.items():
+        # Require at least 2 distinct dates
+        if data["first_date"] == data["last_date"]:
+            continue
+        # Require non-zero first close
+        if data["first_close"] == 0:
+            continue
+        simple_return = (data["last_close"] / data["first_close"]) - 1.0
+        returns.append(simple_return)
+
+    symbols_with_return = len(returns)
+    skipped_symbols = len(symbol_data) - symbols_with_return
+
+    if returns:
+        min_return = min(returns)
+        max_return = max(returns)
+        mean_return = sum(returns) / len(returns)
+    else:
+        min_return = None
+        max_return = None
+        mean_return = None
+
+    details_parts = [
+        f"symbols_with_return={symbols_with_return}",
+        f"close_column={close_col}",
+        f"skipped_symbols={skipped_symbols}",
+    ]
+    if min_return is not None:
+        details_parts.append(f"min_return={min_return!r}")
+        details_parts.append(f"max_return={max_return!r}")
+        details_parts.append(f"mean_return={mean_return!r}")
+
+    return {
+        "symbols_with_return": symbols_with_return,
+        "min_return": min_return,
+        "max_return": max_return,
+        "mean_return": mean_return,
+        "close_column": close_col,
+        "skipped_symbols": skipped_symbols,
+        "details": "; ".join(details_parts),
     }
 
 
@@ -857,6 +1024,7 @@ def build_runner_output(
     required_observation_columns: list[str] | None = None,
     observation_date_column: str | None = None,
     observation_symbol_column: str | None = None,
+    observation_close_column: str | None = None,
 ) -> dict:
     """
     Build a complete RunnerOutput v1 artifact for a dry-run.
@@ -890,6 +1058,14 @@ def build_runner_output(
         Optional name of the symbol column in the observation table CSV used for
         canonical summary (unique symbol count). Only supported for CSV format.
         Requires --data-manifest. If the column is absent from the CSV, emits
+        failed_validation.
+    observation_close_column : str | None
+        Optional name of the close price column in the observation table CSV used for
+        per-symbol first/last close return summary (symbols_with_return, min_return,
+        max_return, mean_return). Only supported for CSV format.
+        Requires --data-manifest. Requires --observation-date-column and
+        --observation-symbol-column. If the column is absent, emits failed_validation.
+        If no symbols have valid returns (zero first close or <2 dates), emits
         failed_validation.
 
     Returns
@@ -933,10 +1109,33 @@ def build_runner_output(
         or (observation_symbol_column is not None and observation_symbol_column.strip())
     )
 
+    # Early validation: close-return summary requires date, symbol, AND data manifest
+    has_close_return_summary_requested = (
+        observation_close_column is not None and observation_close_column.strip()
+    )
+
     # Timestamps
     started_at = _utc_now()
     completed_at = _utc_now()
     created_at = completed_at  # same instant for dry-run skeleton
+
+    # Early validation: close-return summary requires a DataManifest
+    if has_close_return_summary_requested and data_manifest_path is None:
+        raise ValueError(
+            "--observation-close-column was supplied but no --data-manifest was provided. "
+            "Close-return summary requires a DataManifest to determine the dataset path."
+        )
+
+    # Early validation: close-return summary requires date and symbol columns
+    if has_close_return_summary_requested:
+        date_ok = observation_date_column is not None and observation_date_column.strip()
+        symbol_ok = observation_symbol_column is not None and observation_symbol_column.strip()
+        if not date_ok or not symbol_ok:
+            raise ValueError(
+                "--observation-close-column was supplied but one or both of "
+                "--observation-date-column and --observation-symbol-column are missing. "
+                "Close-return summary requires date, symbol, and close columns."
+            )
 
     # Optional DataManifest loading and validation
     data_manifest_extra_audits: list[str] = []
@@ -956,6 +1155,125 @@ def build_runner_output(
         # Resolve relative dataset paths from the DataManifest file's directory,
         # not the experiment spec's directory. Use manifest's parent as base_dir.
         manifest_base_dir = data_manifest_path.resolve(strict=False).parent
+
+        # --- Pre-check source_kind before loading to get a clean unsupported_config path ---
+        # We use yaml.safe_load here (without full DataManifest validation) to read
+        # only the source_kind field. This avoids a DataSourceKind ValueError from
+        # load_data_manifest_for_runner which would be caught as validation_error
+        # instead of unsupported_config.
+        try:
+            import yaml as _yaml
+            with open(data_manifest_path, encoding="utf-8") as _fh:
+                _raw_manifest = _yaml.safe_load(_fh) or {}
+            _raw_source_kind = _raw_manifest.get("source_kind", "")
+        except Exception:
+            _raw_source_kind = ""
+
+        # Unsupported source_kind for close-return summary → raise GovernanceRejection
+        # directly with unsupported_config failure_type (before attempting to load)
+        if has_close_return_summary_requested and _raw_source_kind not in ("local_csv", ""):
+            _now = _utc_now()
+            _cfg_hash = _compute_run_config_hash(
+                experiment_spec_path, data_manifest_path,
+                required_observation_columns,
+                observation_date_column, observation_symbol_column,
+                observation_close_column,
+            )
+            _close_fail_audit = {
+                "audit_name": "observation_table_close_return_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    f"source_kind '{_raw_source_kind}' is not supported "
+                    f"for --observation-close-column (only CSV is supported)."
+                ),
+                "created_at": _now,
+            }
+            _all_audits = [_close_fail_audit]
+            _total_blockers = 1
+            _failing_checks = ["observation_table_close_return_summary"]
+            _spec_content_hash = _compute_content_hash(experiment_spec_path)
+            _experiment_id = experiment_spec.get("experiment_id", "unknown")
+            _spec_artifact_ref = {
+                "artifact_type": "ExperimentSpec",
+                "artifact_id": _experiment_id,
+                "artifact_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "schema_ref": "schemas/experiment_spec_v1.schema.json",
+                "validator_ref": None,
+                "content_hash": f"sha256:{_spec_content_hash}",
+                "validation_status": "pass",
+                "validated_at": created_at,
+            }
+            _dm_id = _raw_manifest.get("dataset_id")
+            _data_manifest_ref = (
+                _dm_id if (_dm_id and _dm_id.strip()) else DRY_RUN_DATA_MANIFEST_PLACEHOLDER
+            )
+            _spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(Path(experiment_spec_path).resolve())
+                    if Path(experiment_spec_path).is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{_spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": "Input experiment spec referenced by this dry-run artifact.",
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            _failure_summary = {
+                "failure_type": "unsupported_config",
+                "status": "failed_validation",
+                "failed_check": ", ".join(_failing_checks),
+                "blocker_summary": (
+                    f"observation_table_close_return_summary: "
+                    f"source_kind '{_raw_source_kind}' is not supported "
+                    f"for --observation-close-column (only CSV is supported)."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": _now,
+            }
+            _failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": _compute_run_id(_cfg_hash),
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": _experiment_id,
+                "input_artifact_refs": [_spec_artifact_ref],
+                "data_manifest_refs": [_data_manifest_ref],
+                "run_config_hash": f"sha256:{_cfg_hash}",
+                "started_at": _now,
+                "completed_at": _now,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": _total_blockers,
+                    "warning_count": 0,
+                    "audits": _all_audits,
+                },
+                "output_manifest": [_spec_entry],
+                "created_at": _now,
+                "run_owner": run_owner,
+                "failure_summary": _failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                _failed_artifact,
+                f"Run blocked: --observation-close-column requires CSV datasets "
+                f"(source_kind='{_raw_source_kind}' is not supported).",
+            )
+
         try:
             manifest = load_data_manifest_for_runner(
                 data_manifest_path=data_manifest_path,
@@ -1011,6 +1329,7 @@ def build_runner_output(
         required_observation_columns,
         observation_date_column,
         observation_symbol_column,
+        observation_close_column,
     )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
@@ -1551,6 +1870,228 @@ def build_runner_output(
                 f"{canonical_summary_details}.",
             )
 
+    # -------------------------------------------------------------------------
+    # Close-return summary (observation_table_close_return_summary audit)
+    # Runs after canonical summary (which validates date/symbol columns).
+    # Only applies when --observation-close-column is provided and manifest is
+    # present (early validation ensures manifest + date + symbol columns exist).
+    # -------------------------------------------------------------------------
+    close_return_summary_passed = False
+    close_return_summary_details: str | None = None
+    if has_close_return_summary_requested and manifest is not None:
+        # Unsupported format check
+        if manifest.source_kind.value != "local_csv":
+            now = _utc_now()
+            close_fail_audit = {
+                "audit_name": "observation_table_close_return_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    f"close_return_summary_error: --observation-close-column is only "
+                    f"supported for CSV datasets "
+                    f"(source_kind='{manifest.source_kind.value}')."
+                ),
+                "created_at": now,
+            }
+            new_audits = list(audit_summary["audits"])
+            new_audits.append(close_fail_audit)
+            total_b = sum(
+                a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+            )
+            failing_checks = [a["audit_name"] for a in new_audits if a["audit_result"] == "fail"]
+            close_failure_summary = {
+                "failure_type": "unsupported_config",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_close_return_summary: "
+                    f"unsupported format; Total blockers: {total_b}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": "Input experiment spec referenced by this dry-run artifact.",
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": total_b,
+                    "warning_count": 0,
+                    "audits": new_audits,
+                },
+                "output_manifest": [spec_entry],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": close_failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"--observation-close-column is only supported for CSV datasets "
+                f"(source_kind='{manifest.source_kind.value}').",
+            )
+
+        # CSV: resolve dataset path
+        raw_path = Path(manifest.path)
+        dataset_resolved = (
+            raw_path if raw_path.is_absolute()
+            else (manifest_base_dir / raw_path).resolve()
+        )
+        now = _utc_now()
+        try:
+            close_result = _summarize_observation_close_returns(
+                dataset_resolved,
+                observation_date_column=observation_date_column,
+                observation_symbol_column=observation_symbol_column,
+                observation_close_column=observation_close_column,
+            )
+            # No valid returns → fail closed
+            if close_result["symbols_with_return"] == 0:
+                close_return_summary_details = close_result["details"]
+                close_fail_audit = {
+                    "audit_name": "observation_table_close_return_summary",
+                    "audit_result": "fail",
+                    "severity": "blocker",
+                    "blocker_count": 1,
+                    "warning_count": 0,
+                    "details_ref": (
+                        f"close_return_summary_error: no symbols with valid returns: "
+                        f"{close_return_summary_details}."
+                    ),
+                    "created_at": now,
+                }
+                close_return_summary_passed = False
+            else:
+                close_return_summary_passed = True
+                close_return_summary_details = close_result["details"]
+                close_fail_audit = {
+                    "audit_name": "observation_table_close_return_summary",
+                    "audit_result": "pass",
+                    "severity": "blocker",
+                    "blocker_count": 0,
+                    "warning_count": 0,
+                    "details_ref": close_return_summary_details,
+                    "created_at": now,
+                }
+        except ValueError as exc:
+            close_return_summary_details = str(exc)
+            close_fail_audit = {
+                "audit_name": "observation_table_close_return_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": f"close_return_summary_error: {close_return_summary_details}",
+                "created_at": now,
+            }
+            close_return_summary_passed = False
+
+        # Append close-return audit to audit_summary
+        new_audits = list(audit_summary["audits"])
+        new_audits.append(close_fail_audit)
+        total_blockers = sum(
+            a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+        )
+        overall_result = (
+            "fail" if total_blockers > 0 else audit_summary["overall_result"]
+        )
+        audit_summary = {
+            "overall_result": overall_result,
+            "blocker_count": total_blockers,
+            "warning_count": audit_summary["warning_count"],
+            "audits": new_audits,
+        }
+
+        # If close-return summary failed → emit failed_validation artifact
+        if not close_return_summary_passed and audit_summary["blocker_count"] > 0:
+            failing_checks = [
+                a["audit_name"] for a in audit_summary["audits"]
+                if a["audit_result"] == "fail"
+            ]
+            failure_summary = {
+                "failure_type": "validation_error",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_close_return_summary: "
+                    f"{close_return_summary_details}. "
+                    f"Total blockers: {audit_summary['blocker_count']}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": "Input experiment spec referenced by this dry-run artifact.",
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": audit_summary,
+                "output_manifest": [spec_entry],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"Run blocked by observation_table_close_return_summary failure: "
+                f"{close_return_summary_details}.",
+            )
+
     output_manifest = [
         {
             "output_role": "evidence",
@@ -1736,6 +2277,19 @@ def main(argv: list[str] | None = None) -> int:
             "Example: --observation-symbol-column symbol"
         ),
     )
+    parser.add_argument(
+        "--observation-close-column",
+        required=False,
+        default=None,
+        help=(
+            "Optional name of the close price column in the observation table CSV. "
+            "Used for per-symbol first/last close return summary (symbols_with_return, "
+            "min_return, max_return, mean_return). "
+            "Requires --data-manifest pointing to a CSV. "
+            "Requires --observation-date-column and --observation-symbol-column. "
+            "Example: --observation-close-column close"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1765,6 +2319,7 @@ def main(argv: list[str] | None = None) -> int:
     # Parse optional date/symbol columns for canonical summary
     observation_date_column = _normalize_optional_column_name(args.observation_date_column)
     observation_symbol_column = _normalize_optional_column_name(args.observation_symbol_column)
+    observation_close_column = _normalize_optional_column_name(args.observation_close_column)
 
     # Build artifact — may raise GovernanceRejection if governance blockers found
     try:
@@ -1777,6 +2332,7 @@ def main(argv: list[str] | None = None) -> int:
             required_observation_columns=required_observation_columns,
             observation_date_column=observation_date_column,
             observation_symbol_column=observation_symbol_column,
+            observation_close_column=observation_close_column,
         )
     except GovernanceRejection as exc:
         # Governance rejection: emit the failed_validation artifact and exit 1
