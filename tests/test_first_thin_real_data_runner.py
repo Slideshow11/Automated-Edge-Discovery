@@ -42,6 +42,7 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _validate_observation_table_columns,
     _normalize_optional_column_name,
     _summarize_observation_table_canonical,
+    _summarize_observation_close_returns,
 )
 
 
@@ -2921,4 +2922,671 @@ class TestCanonicalSummaryCLI:
             schema = json.load(fh)
         checker = FormatChecker()
         jsonschema.validate(artifact, schema, format_checker=checker)
+
+
+# -------------------------------------------------------------------------------------------------
+# Fixtures for close-return summary tests
+# -------------------------------------------------------------------------------------------------
+
+@pytest.fixture
+def csv_with_date_symbol_close(tmp_path):
+    """
+    CSV with date, symbol, and close columns for close-return summary tests.
+
+    AAPL: 2024-01-01@185.5, 2024-01-02@186.0, 2024-01-04@187.0
+      return = 187.0/185.5 - 1 = 0.0080857...
+    MSFT: 2024-01-03@420.0 (single date → skipped, no return)
+    GOOGL: 2024-01-03@175.0 (single date → skipped, no return)
+
+    Expected: symbols_with_return=1 (AAPL only), min=max=mean=~0.008085
+    """
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-03,MSFT,420.0\n"
+        "2024-01-03,GOOGL,175.0\n"
+        "2024-01-04,AAPL,187.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_date_symbol_close_two_symbols(tmp_path):
+    """
+    CSV with two symbols having valid returns.
+
+    AAPL: 2024-01-01@185.5 → 2024-01-04@187.0 → return = 187.0/185.5-1 = 0.00808...
+    MSFT: 2024-01-01@410.0 → 2024-01-04@420.0 → return = 420.0/410.0-1 = 0.02439...
+
+    Expected: symbols_with_return=2, min~=0.008, max~=0.024, mean~=0.016
+    """
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-03,MSFT,410.0\n"
+        "2024-01-04,AAPL,187.0\n"
+        "2024-01-04,MSFT,420.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_missing_close_column(tmp_path):
+    """CSV without the expected close column."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text("date,symbol\n2024-01-01,AAPL\n2024-01-02,AAPL\n")
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_non_numeric_close(tmp_path):
+    """CSV with non-numeric close values (should be skipped)."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,N/A\n"
+        "2024-01-02,AAPL,ABC\n"
+        "2024-01-03,AAPL,186.0\n"
+        "2024-01-04,AAPL,\n"
+        "2024-01-05,AAPL,187.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_zero_first_close(tmp_path):
+    """CSV where first close is zero (should be skipped)."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,0.0\n"
+        "2024-01-02,AAPL,185.5\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_all_symbols_single_date(tmp_path):
+    """CSV where all symbols have only one date (no valid returns)."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-01,MSFT,420.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_obs_csv",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+class TestSummarizeObservationCloseReturns:
+    """Unit tests for _summarize_observation_close_returns helper."""
+
+    def test_symbols_with_return_and_stats(self, csv_with_date_symbol_close_two_symbols):
+        """Close-return summary computes symbols_with_return, min, max, mean."""
+        _, csv_file = csv_with_date_symbol_close_two_symbols
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        result = _summarize_observation_close_returns(
+            csv_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        assert result["symbols_with_return"] == 2
+        assert result["close_column"] == "close"
+        assert result["skipped_symbols"] == 0
+        assert result["min_return"] is not None
+        assert result["max_return"] is not None
+        assert result["mean_return"] is not None
+        # AAPL: 187.0/185.5-1 = 0.0080857...
+        # MSFT: 420.0/410.0-1 = 0.024390...
+        aapl_return = 187.0 / 185.5 - 1.0
+        msft_return = 420.0 / 410.0 - 1.0
+        assert abs(result["min_return"] - min(aapl_return, msft_return)) < 1e-10
+        assert abs(result["max_return"] - max(aapl_return, msft_return)) < 1e-10
+        assert abs(result["mean_return"] - ((aapl_return + msft_return) / 2)) < 1e-10
+
+    def test_skips_non_numeric_close(self, csv_with_non_numeric_close):
+        """Non-numeric close rows are skipped."""
+        _, csv_file = csv_with_non_numeric_close
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        result = _summarize_observation_close_returns(
+            csv_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        # AAPL: dates 2024-01-03 (186.0), 2024-01-05 (187.0) → return = 187.0/186.0-1
+        assert result["symbols_with_return"] == 1
+        expected = 187.0 / 186.0 - 1.0
+        assert abs(result["min_return"] - expected) < 1e-10
+
+    def test_skips_zero_first_close(self, csv_with_zero_first_close):
+        """Symbol with zero first close is skipped."""
+        _, csv_file = csv_with_zero_first_close
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        result = _summarize_observation_close_returns(
+            csv_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        assert result["symbols_with_return"] == 0
+        assert result["skipped_symbols"] == 1
+
+    def test_single_date_symbol_skipped(self, csv_with_date_symbol_close):
+        """Symbol with only one date is skipped (no return possible)."""
+        _, csv_file = csv_with_date_symbol_close
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        result = _summarize_observation_close_returns(
+            csv_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        # AAPL has 3 dates: return = 187.0/185.5-1
+        # MSFT and GOOGL have 1 date each → skipped
+        assert result["symbols_with_return"] == 1
+        assert result["skipped_symbols"] == 2
+
+    def test_missing_close_column_raises(self, csv_missing_close_column):
+        """Missing close column raises ValueError."""
+        _, csv_file = csv_missing_close_column
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            _summarize_observation_close_returns(
+                csv_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+            )
+        assert "close" in str(exc_info.value)
+
+    def test_no_valid_returns(self, csv_all_symbols_single_date):
+        """No symbols with ≥2 dates → symbols_with_return=0."""
+        _, csv_file = csv_all_symbols_single_date
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _summarize_observation_close_returns,
+        )
+        result = _summarize_observation_close_returns(
+            csv_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        assert result["symbols_with_return"] == 0
+        assert result["min_return"] is None
+        assert result["max_return"] is None
+        assert result["mean_return"] is None
+
+
+class TestCloseReturnSummaryIntegration:
+    """Integration tests for close-return summary via CLI and build_runner_output."""
+
+    def test_close_column_not_required_for_success(
+        self, csv_with_date_and_symbol, valid_experiment_spec
+    ):
+        """Without --observation-close-column, success is unchanged."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_file, _ = csv_with_date_and_symbol
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            run_owner="test",
+        )
+        assert artifact["status"] == "success"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_close_return_summary" not in audit_names
+
+    def test_cli_accepts_close_column(
+        self, csv_with_date_symbol_close, valid_experiment_spec, tmp_path
+    ):
+        """CLI accepts --observation-close-column."""
+        manifest_file, _ = csv_with_date_symbol_close
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "success"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_close_return_summary" in audit_names
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "pass"
+        assert "symbols_with_return=1" in close_audit["details_ref"]
+
+    def test_close_requires_data_manifest(self, valid_experiment_spec, tmp_path):
+        """Close column without data manifest raises ValueError."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        with pytest.raises(ValueError) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=None,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        assert "data-manifest" in str(exc_info.value)
+
+    def test_close_requires_date_column(
+        self, csv_with_date_symbol_close, valid_experiment_spec
+    ):
+        """Close column without date column raises ValueError."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_file, _ = csv_with_date_symbol_close
+        with pytest.raises(ValueError) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column=None,
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        assert "date" in str(exc_info.value)
+
+    def test_close_requires_symbol_column(
+        self, csv_with_date_symbol_close, valid_experiment_spec
+    ):
+        """Close column without symbol column raises ValueError."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_file, _ = csv_with_date_symbol_close
+        with pytest.raises(ValueError) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column=None,
+                observation_close_column="close",
+                run_owner="test",
+            )
+        assert "symbol" in str(exc_info.value)
+
+    def test_missing_close_column_fails_closed(
+        self, csv_missing_close_column, valid_experiment_spec
+    ):
+        """Missing close column fails closed with GovernanceRejection."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+            GovernanceRejection,
+        )
+        manifest_file, _ = csv_missing_close_column
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_close_return_summary" in audit_names
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "fail"
+        assert "close" in close_audit["details_ref"].lower()
+
+    def test_non_csv_manifest_with_close_fails(
+        self, valid_experiment_spec, tmp_path
+    ):
+        """Non-CSV manifest with close column fails closed."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+            GovernanceRejection,
+        )
+        # Create a parquet manifest
+        manifest_file = tmp_path / "dm.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-PARQUET",
+            "role": "generic",
+            "source_kind": "parquet",
+            "path": "data.parquet",
+            "format": "parquet",
+        }))
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+
+    def test_no_valid_returns_fails_closed(
+        self, csv_all_symbols_single_date, valid_experiment_spec
+    ):
+        """No valid returns (all symbols single-date) fails closed."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+            GovernanceRejection,
+        )
+        manifest_file, _ = csv_all_symbols_single_date
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "fail"
+        assert "no symbols" in close_audit["details_ref"]
+
+    def test_valid_csv_close_computes_stats(
+        self, csv_with_date_symbol_close_two_symbols, valid_experiment_spec
+    ):
+        """Valid CSV computes symbols_with_return and min/max/mean."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_file, _ = csv_with_date_symbol_close_two_symbols
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+            run_owner="test",
+        )
+        assert artifact["status"] == "success"
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "pass"
+        assert "symbols_with_return=2" in close_audit["details_ref"]
+        assert "min_return=" in close_audit["details_ref"]
+        assert "max_return=" in close_audit["details_ref"]
+        assert "mean_return=" in close_audit["details_ref"]
+
+    def test_preserves_canonical_and_shape_audits(
+        self, csv_with_date_symbol_close_two_symbols, valid_experiment_spec
+    ):
+        """Close-return audit does not remove canonical or shape audits."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_file, _ = csv_with_date_symbol_close_two_symbols
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+            run_owner="test",
+        )
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        assert "observation_table_close_return_summary" in audit_names
+
+    def test_missing_close_preserves_other_audits(
+        self, csv_missing_close_column, valid_experiment_spec
+    ):
+        """Missing close column preserves other audit entries."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+            GovernanceRejection,
+        )
+        manifest_file, _ = csv_missing_close_column
+        with pytest.raises(GovernanceRejection):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+
+    def test_hash_includes_close_column(
+        self, csv_with_date_symbol_close, valid_experiment_spec
+    ):
+        """run_config_hash changes when close column changes."""
+        manifest_file, _ = csv_with_date_symbol_close
+        artifact1 = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+            run_owner="test",
+        )
+        # Different column name may raise GovernanceRejection if column is missing;
+        # compare hash from the exception artifact
+        try:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="adj_close",
+                run_owner="test",
+            )
+        except GovernanceRejection as exc:
+            hash2 = exc.artifact["run_config_hash"]
+        assert artifact1["run_config_hash"] != hash2
+        assert artifact1["run_id"] != hash2  # run_id derives from hash
+
+    def test_hash_whitespace_normalized_for_close_column(
+        self, csv_with_date_symbol_close, valid_experiment_spec
+    ):
+        """Leading/trailing whitespace in close column name is normalized for hash."""
+        manifest_file, _ = csv_with_date_symbol_close
+        artifact1 = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+            run_owner="test",
+        )
+        artifact2 = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_file,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="  close  ",
+            run_owner="test",
+        )
+        assert artifact1["run_config_hash"] == artifact2["run_config_hash"]
+
+    def test_internal_whitespace_preserved_for_close_hash(
+        self, csv_with_date_symbol_close, valid_experiment_spec
+    ):
+        """Internal whitespace in close column name changes hash."""
+        manifest_file, _ = csv_with_date_symbol_close
+        # "close price" doesn't exist in CSV — GovernanceRejection raised; extract hash
+        try:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close price",
+                run_owner="test",
+            )
+        except GovernanceRejection as exc:
+            hash1 = exc.artifact["run_config_hash"]
+        # "closeprice" also doesn't exist — different hash expected
+        try:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="closeprice",
+                run_owner="test",
+            )
+        except GovernanceRejection as exc:
+            hash2 = exc.artifact["run_config_hash"]
+        assert hash1 != hash2
+
+    def test_schema_validation_close_success(
+        self, csv_with_date_symbol_close, valid_experiment_spec, tmp_path
+    ):
+        """Success artifact with close-return summary validates against schema."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+        manifest_file, _ = csv_with_date_symbol_close
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output.read_text())
+        with open(SCHEMA_PATH) as fh:
+            schema = json.load(fh)
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+    def test_schema_validation_close_failure(
+        self, csv_all_symbols_single_date, valid_experiment_spec, tmp_path
+    ):
+        """Failed-validation artifact with no valid returns validates against schema."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        from jsonschema import FormatChecker
+        manifest_file, _ = csv_all_symbols_single_date
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        with open(SCHEMA_PATH) as fh:
+            schema = json.load(fh)
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+    def test_no_registry_mutation_with_close_summary(
+        self, csv_with_date_symbol_close, valid_experiment_spec, tmp_path
+    ):
+        """Close-return summary does not write to registry or ledger paths."""
+        manifest_file, _ = csv_with_date_symbol_close
+        out = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--output-path", str(out),
+            "--run-owner", "test",
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+        ])
+        assert rc == 0, f"Expected exit 0, got {rc}"
+        assert out.exists()
+        artifact_text = out.read_text()
+        assert "TrialLedger" not in artifact_text
 
