@@ -501,6 +501,9 @@ def build_runner_output(
 
     if data_manifest_path is not None:
         data_manifest_path = Path(data_manifest_path)
+        # Resolve relative dataset paths from the DataManifest file's directory,
+        # not the experiment spec's directory. Use manifest's parent as base_dir.
+        manifest_base_dir = data_manifest_path.resolve(strict=False).parent
         try:
             manifest = load_data_manifest_for_runner(
                 data_manifest_path=data_manifest_path,
@@ -511,7 +514,7 @@ def build_runner_output(
                 manifest_path=data_manifest_path,
                 base_dir=manifest_base_dir,
             )
-        except (FileNotFoundError, ValueError) as exc:
+        except (FileNotFoundError, ValueError, KeyError) as exc:
             # DataManifest validation failed — emit failed_validation artifact
             # with the error in the failure_summary.
             spec_content_hash = _compute_content_hash(experiment_spec_path)
@@ -870,6 +873,11 @@ def main(argv: list[str] | None = None) -> int:
         except OSError as write_exc:
             print(f"ERROR writing governance-rejected output: {write_exc}", file=sys.stderr)
             return 2
+        return 1
+    except ValueError as exc:
+        # Expected user validation error (e.g. missing experiment_spec_id).
+        # Emit a meaningful message and exit 1.
+        print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"ERROR building runner output: {exc}", file=sys.stderr)

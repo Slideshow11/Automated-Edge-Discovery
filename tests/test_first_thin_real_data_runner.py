@@ -1845,3 +1845,167 @@ def test_changing_data_manifest_content_changes_run_config_hash(valid_data_manif
     )
 
     assert artifact1["run_config_hash"] != artifact2["run_config_hash"]
+
+
+# -----------------------------------------------------------------------
+# Cross-directory DataManifest resolution
+# -----------------------------------------------------------------------
+
+def test_data_manifest_in_different_dir_from_spec(tmp_path):
+    """DataManifest relative paths resolve from manifest directory, not spec directory.
+
+    This test creates:
+    - spec_dir/spec.json
+    - manifest_dir/data_manifest.json  (manifest_dir != spec_dir)
+    - manifest_dir/prices.csv  (dataset path is "prices.csv" relative to manifest_dir)
+
+    The manifest's dataset path should resolve relative to manifest_dir, not spec_dir.
+    """
+    manifest_dir = tmp_path / "manifests"
+    spec_dir = tmp_path / "specs"
+    manifest_dir.mkdir()
+    spec_dir.mkdir()
+
+    # Dataset lives under manifest_dir
+    csv_file = manifest_dir / "prices.csv"
+    csv_file.write_text("date,open,high,low,close\n2024-01-01,100,101,99,100\n2024-01-02,100,102,99,101\n")
+
+    # Manifest uses relative path "prices.csv" — resolves from manifest_dir
+    manifest_file = manifest_dir / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_cross_dir",
+        "role": "price_history",
+        "source_kind": "local_csv",
+        "path": "prices.csv",
+        "format": "csv",
+    }, indent=2))
+
+    # Spec lives under spec_dir (different directory)
+    spec = spec_dir / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    assert artifact["status"] == "success"
+    assert artifact["data_manifest_refs"] == ["test_cross_dir"]
+    # Verify DataManifest is in input_artifact_refs
+    dm_ref = next(ref for ref in artifact["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    assert dm_ref["artifact_id"] == "test_cross_dir"
+    assert dm_ref["validation_status"] == "pass"
+
+
+# -----------------------------------------------------------------------
+# Malformed DataManifest: missing required "path" raises KeyError
+# -----------------------------------------------------------------------
+
+def test_malformed_data_manifest_missing_path_exits_1(tmp_path):
+    """Malformed DataManifest missing 'path' key produces failed_validation and exit 1.
+
+    Missing 'path' in data_manifest.py::dataset_manifest_from_dict raises KeyError.
+    Previously this fell through to the generic Exception handler (exit 2).
+    Now caught as KeyError → failed_validation artifact → exit 1.
+    """
+    manifest_file = tmp_path / "malformed_manifest.json"
+    # Missing 'path' key — triggers KeyError in dataset_manifest_from_dict
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_malformed",
+        "role": "price_history",
+        "source_kind": "local_csv",
+        # 'path' intentionally omitted
+        "format": "csv",
+    }, indent=2))
+
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    output_path = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output_path),
+        "--run-owner", "test",
+        "--data-manifest", str(manifest_file),
+    ])
+
+    # Must exit 1 (user validation error), not 2 (internal error)
+    assert rc == 1
+    # And the output artifact must be a valid failed_validation
+    with open(output_path) as f:
+        artifact = json.load(f)
+    assert artifact["status"] == "failed_validation"
+    assert artifact["failure_summary"]["failure_type"] == "validation_error"
+
+    # jsonschema validation if available
+    validate_orskip = pytest.importorskip("jsonschema").validate
+    from jsonschema import FormatChecker
+    with open(SCHEMA_PATH) as fh:
+        schema = json.load(fh)
+    checker = FormatChecker()
+    validate_orskip(artifact, schema, format_checker=checker)
+
+
+# -----------------------------------------------------------------------
+# Missing experiment_spec_id → exit 1
+# -----------------------------------------------------------------------
+
+def test_missing_experiment_spec_id_exits_1(tmp_path):
+    """Missing experiment_id in spec produces exit 1 (user error), not exit 2."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        # 'experiment_id' intentionally omitted
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    output_path = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output_path),
+        "--run-owner", "test",
+    ])
+
+    # Must exit 1 (user validation error), not 2 (internal error)
+    assert rc == 1
+    # No artifact written (build failed before artifact existed)
+    assert not output_path.exists()
+
+
+# -----------------------------------------------------------------------
+# Existing valid/invalid DataManifest tests still pass
+# (implicit: tested by running the full suite)
+# -----------------------------------------------------------------------
