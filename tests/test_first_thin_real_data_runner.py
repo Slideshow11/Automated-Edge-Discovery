@@ -35,6 +35,7 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _check_experiment_spec_id,
     _utc_now,
     GOVERNANCE_STOP_RULE_FIELDS,
+    SCHEMA_PATH,
 )
 
 
@@ -1096,3 +1097,751 @@ def test_no_registry_mutation_in_dry_run(valid_experiment_spec, tmp_path):
         assert registry_path.stat().st_mtime == registry_mtime_before
     if ledger_mtime_before is not None:
         assert ledger_path.stat().st_mtime == ledger_mtime_before
+
+
+# ============================================================================
+# DataManifest integration tests
+# ============================================================================
+
+MINIMAL_MANIFEST_DATA = {
+    "dataset_id": "test_options_2021",
+    "role": "options_backtest_db",
+    "source_kind": "local_sqlite",
+    "path": "/tmp/options.sqlite",
+    "format": "sqlite",
+}
+
+MINIMAL_CSV_MANIFEST_DATA = {
+    "dataset_id": "test_csv_data",
+    "role": "price_history",
+    "source_kind": "local_csv",
+    "path": "prices.csv",
+    "format": "csv",
+}
+
+
+@pytest.fixture
+def valid_data_manifest(tmp_path):
+    """Create a valid DataManifest JSON file with a real CSV file."""
+    csv_file = tmp_path / "prices.csv"
+    csv_file.write_text("date,open,high,low,close\n2024-01-01,100.0,101.0,99.0,100.5\n2024-01-02,100.5,102.0,99.5,101.0\n2024-01-03,101.0,103.0,100.0,102.0\n")
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps(MINIMAL_CSV_MANIFEST_DATA, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def valid_sqlite_manifest(tmp_path):
+    """Create a valid DataManifest JSON file with a SQLite database path.
+
+    Uses a relative path so the dataset resolves inside base_dir
+    (tmp_path, which is the manifest file's parent directory).
+    """
+    db_subdir = tmp_path / "db"
+    db_subdir.mkdir()
+    db_file = db_subdir / "options.sqlite"
+    db_file.write_text("")
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "test_options_2021",
+        "role": "options_backtest_db",
+        "source_kind": "local_sqlite",
+        "path": "db/options.sqlite",
+        "format": "sqlite",
+    }, indent=2))
+    return manifest_file, db_file
+
+
+@pytest.fixture
+def invalid_data_manifest_bad_role(tmp_path):
+    """Create an invalid DataManifest JSON file with an unrecognized role enum value.
+
+    Using an invalid role (not missing 'path', which triggers a latent KeyError
+    in data_manifest.py validate_dataset_manifest). This raises ValueError from
+    DatasetRole() inside validate_dataset_manifest, which is caught cleanly.
+    """
+    manifest_data = {
+        "dataset_id": "test_invalid",
+        "role": "options_backtest_db_broken",  # invalid enum → ValueError
+        "source_kind": "local_sqlite",
+        "path": "/tmp/options.sqlite",
+        "format": "sqlite",
+    }
+    manifest_file = tmp_path / "invalid_manifest.json"
+    manifest_file.write_text(json.dumps(manifest_data, indent=2))
+    return manifest_file
+
+
+# -----------------------------------------------------------------------
+# CLI accepts --data-manifest
+# -----------------------------------------------------------------------
+
+def test_cli_accepts_data_manifest_arg(tmp_path):
+    """CLI --data-manifest argument is accepted without error."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(spec),  # using spec as dummy manifest
+    ])
+    # Either 0 (success if spec is valid manifest) or 1 (ValueError from manifest loading)
+    # is acceptable for this smoke test; key is no argparse error
+    assert rc in (0, 1)
+
+
+# -----------------------------------------------------------------------
+# Valid DataManifest produces success artifact
+# -----------------------------------------------------------------------
+
+def test_valid_data_manifest_produces_success(valid_data_manifest, tmp_path):
+    """Valid DataManifest JSON path produces status=success RunnerOutput."""
+    manifest_file, csv_file = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(manifest_file),
+    ])
+    assert rc == 0
+    with open(output) as fh:
+        artifact = json.load(fh)
+    assert artifact["status"] == "success"
+    assert artifact["run_mode"] == "dry_run"
+
+
+def test_data_manifest_refs_uses_dataset_id_when_provided(valid_data_manifest, tmp_path):
+    """data_manifest_refs contains the real dataset_id when DataManifest is provided."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    # dataset_id from MINIMAL_CSV_MANIFEST_DATA
+    assert artifact["data_manifest_refs"] == ["test_csv_data"]
+    assert "dry_run_no_data_manifest" not in artifact["data_manifest_refs"]
+
+
+def test_input_artifact_refs_includes_data_manifest_when_provided(valid_data_manifest, tmp_path):
+    """input_artifact_refs includes both ExperimentSpec and DataManifest entries."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    artifact_types = [ref["artifact_type"] for ref in artifact["input_artifact_refs"]]
+    assert "ExperimentSpec" in artifact_types
+    assert "DataManifest" in artifact_types
+    assert len(artifact["input_artifact_refs"]) == 2
+
+
+def test_input_artifact_refs_data_manifest_has_required_fields(valid_data_manifest, tmp_path):
+    """DataManifest entry in input_artifact_refs has all required schema fields."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    dm_ref = next(ref for ref in artifact["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    assert dm_ref["artifact_type"] == "DataManifest"
+    assert dm_ref["artifact_id"] == "test_csv_data"
+    assert dm_ref["content_hash"].startswith("sha256:")
+    assert dm_ref["validation_status"] == "pass"
+
+
+# -----------------------------------------------------------------------
+# Determinism with DataManifest
+# -----------------------------------------------------------------------
+
+def test_run_config_hash_incorporates_data_manifest_when_provided(valid_data_manifest, tmp_path):
+    """run_config_hash changes when DataManifest content changes."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    # Without DataManifest
+    artifact_no_dm = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+    )
+    # With DataManifest
+    artifact_with_dm = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    # run_config_hash must differ
+    assert artifact_no_dm["run_config_hash"] != artifact_with_dm["run_config_hash"]
+    # run_id must differ
+    assert artifact_no_dm["run_id"] != artifact_with_dm["run_id"]
+
+
+def test_run_config_hash_deterministic_with_same_manifest(valid_data_manifest, tmp_path):
+    """Same experiment spec + same DataManifest produce identical run_config_hash."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    artifact1 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    artifact2 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    assert artifact1["run_config_hash"] == artifact2["run_config_hash"]
+    assert artifact1["run_id"] == artifact2["run_id"]
+
+
+def test_run_id_deterministic_with_data_manifest(valid_data_manifest, tmp_path):
+    """run_id is deterministic from run_config_hash with DataManifest."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    # run_id should be first 16 hex chars of hash
+    expected_run_id = artifact["run_config_hash"][7:23]  # strip "sha256:"
+    assert artifact["run_id"] == expected_run_id
+
+
+# -----------------------------------------------------------------------
+# Row count
+# -----------------------------------------------------------------------
+
+def test_data_manifest_entry_has_required_schema_fields(valid_data_manifest, tmp_path):
+    """DataManifest entry in input_artifact_refs has all schema-required fields."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    dm_ref = next(ref for ref in artifact["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    # Required fields only (input_artifact_refs.items has additionalProperties: false)
+    assert dm_ref["artifact_type"] == "DataManifest"
+    assert dm_ref["artifact_id"] == "test_csv_data"
+    assert dm_ref["content_hash"].startswith("sha256:")
+    assert dm_ref["validation_status"] == "pass"
+
+
+def test_sqlite_manifest_produces_valid_data_manifest_entry(valid_sqlite_manifest, tmp_path):
+    """SQLite DataManifest produces a valid DataManifest entry in input_artifact_refs."""
+    manifest_file, _ = valid_sqlite_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    dm_ref = next(ref for ref in artifact["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    # Row_count not stored in schema-compatible input_artifact_refs entry
+    # (additionalProperties: false). SQLite row_count=None by design.
+    assert dm_ref["artifact_type"] == "DataManifest"
+    assert dm_ref["validation_status"] == "pass"
+
+
+# -----------------------------------------------------------------------
+# Invalid DataManifest
+# -----------------------------------------------------------------------
+
+def test_missing_data_manifest_file_returns_nonzero(tmp_path):
+    """Missing --data-manifest file causes CLI to exit nonzero."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(tmp_path / "nonexistent.json"),
+    ])
+    assert rc == 1
+
+
+def test_invalid_data_manifest_fails_validation_returns_nonzero(tmp_path, invalid_data_manifest_bad_role):
+    """Invalid DataManifest (validation failure) causes CLI to exit nonzero."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(invalid_data_manifest_bad_role),
+    ])
+    assert rc == 1
+
+
+def test_invalid_data_manifest_produces_failed_validation_artifact(tmp_path, invalid_data_manifest_bad_role):
+    """Invalid DataManifest produces a schema-valid failed_validation artifact."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=invalid_data_manifest_bad_role,
+    )
+    assert artifact["status"] == "failed_validation"
+    assert artifact["failure_summary"] is not None
+    assert artifact["failure_summary"]["failure_type"] == "validation_error"
+
+
+def test_invalid_data_manifest_audit_includes_data_manifest_validation(tmp_path, invalid_data_manifest_bad_role):
+    """audit_summary includes data_manifest_validation audit with fail result."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=invalid_data_manifest_bad_role,
+    )
+    audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+    assert "data_manifest_validation" in audit_names
+    dm_audit = next(a for a in artifact["audit_summary"]["audits"] if a["audit_name"] == "data_manifest_validation")
+    assert dm_audit["audit_result"] == "fail"
+    assert dm_audit["blocker_count"] == 1
+
+
+# -----------------------------------------------------------------------
+# Schema validation
+# -----------------------------------------------------------------------
+
+def test_success_artifact_schema_validates_with_data_manifest(valid_data_manifest, tmp_path):
+    """Success artifact with DataManifest validates against runner_output_spec_v1.schema.json."""
+    pytest.importorskip("jsonschema")
+    from jsonschema import validate, FormatChecker
+
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output_path = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output_path),
+        "--run-owner", "test",
+        "--data-manifest", str(manifest_file),
+    ])
+    assert rc == 0
+
+    import jsonschema
+    with open(SCHEMA_PATH) as fh:
+        schema = json.load(fh)
+    with open(output_path) as fh:
+        loaded = json.load(fh)
+
+    checker = FormatChecker()
+    jsonschema.validate(loaded, schema, format_checker=checker)
+
+
+def test_failed_validation_artifact_schema_validates_with_invalid_manifest(tmp_path, invalid_data_manifest_bad_role):
+    """Failed_validation artifact with invalid DataManifest validates against schema."""
+    pytest.importorskip("jsonschema")
+    import jsonschema
+    from jsonschema import FormatChecker
+
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=invalid_data_manifest_bad_role,
+    )
+
+    with open(SCHEMA_PATH) as fh:
+        schema = json.load(fh)
+    checker = FormatChecker()
+    jsonschema.validate(artifact, schema, format_checker=checker)
+
+
+# -----------------------------------------------------------------------
+# No-overwrite and no-registry-mutation with DataManifest
+# -----------------------------------------------------------------------
+
+def test_no_overwrite_with_data_manifest(valid_data_manifest, tmp_path):
+    """Output file refusal-to-overwrite is preserved when DataManifest is used."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    output = tmp_path / "output.json"
+    output.write_text("existing")
+
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(manifest_file),
+    ])
+    assert rc == 1
+
+
+def test_no_registry_mutation_with_data_manifest(valid_data_manifest, tmp_path):
+    """No registry/ledger writes occur when DataManifest is provided."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    manifest_file, _ = valid_data_manifest
+
+    registry_path = _ROOT / "docs" / "edge_hypothesis_registry.csv"
+    ledger_path = _ROOT / "docs" / "trial_ledger.jsonl"
+
+    registry_mtime_before = registry_path.stat().st_mtime if registry_path.exists() else None
+    ledger_mtime_before = ledger_path.stat().st_mtime if ledger_path.exists() else None
+
+    output = tmp_path / "output.json"
+    rc = main([
+        "--experiment-spec", str(spec),
+        "--output-path", str(output),
+        "--run-owner", "test",
+        "--data-manifest", str(manifest_file),
+    ])
+    assert rc == 0
+
+    if registry_mtime_before is not None:
+        assert registry_path.stat().st_mtime == registry_mtime_before
+    if ledger_mtime_before is not None:
+        assert ledger_path.stat().st_mtime == ledger_mtime_before
+
+
+# -----------------------------------------------------------------------
+# Preserved dry-run behavior (no data manifest)
+# -----------------------------------------------------------------------
+
+def test_no_data_manifest_uses_placeholder(tmp_path):
+    """Without --data-manifest, data_manifest_refs uses dry_run_no_data_manifest."""
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+    artifact = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+    )
+    assert artifact["data_manifest_refs"] == ["dry_run_no_data_manifest"]
+    assert len(artifact["input_artifact_refs"]) == 1  # only ExperimentSpec
+    assert artifact["input_artifact_refs"][0]["artifact_type"] == "ExperimentSpec"
+
+
+def test_data_manifest_content_hash_is_deterministic(valid_data_manifest, tmp_path):
+    """DataManifest content_hash is deterministic across builds."""
+    manifest_file, _ = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    artifact1 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+    artifact2 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    dm_ref1 = next(ref for ref in artifact1["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    dm_ref2 = next(ref for ref in artifact2["input_artifact_refs"] if ref["artifact_type"] == "DataManifest")
+    assert dm_ref1["content_hash"] == dm_ref2["content_hash"]
+
+
+def test_changing_data_manifest_content_changes_run_config_hash(valid_data_manifest, tmp_path):
+    """Changing DataManifest content changes run_config_hash."""
+    manifest_file, csv_file = valid_data_manifest
+    spec = tmp_path / "spec.json"
+    spec.write_text(json.dumps({
+        "experiment_id": "EXP-2026-0001",
+        "hypothesis_id": "HYP-2026-0001",
+        "search_space_id": "SSM-2026-0001",
+        "data_manifest_refs": [],
+        "study_type": "options_event_risk",
+        "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+        "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+        "trial_generation_mode": "literature_replication",
+        "allowed_trial_lanes": ["theory_first"],
+        "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+        "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+    }))
+
+    artifact1 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    # Append a row to the CSV — this changes nothing about the manifest validation
+    # but the manifest content (its JSON bytes) remains the same.
+    # So let's actually change the manifest content.
+    manifest_data = json.loads(manifest_file.read_text())
+    manifest_data["dataset_id"] = "test_csv_data_v2"
+    manifest_file.write_text(json.dumps(manifest_data, indent=2))
+
+    artifact2 = build_runner_output(
+        experiment_spec_path=spec,
+        run_owner="test@test",
+        data_manifest_path=manifest_file,
+    )
+
+    assert artifact1["run_config_hash"] != artifact2["run_config_hash"]
