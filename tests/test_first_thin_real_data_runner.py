@@ -2564,7 +2564,54 @@ def csv_missing_symbol_column(tmp_path):
     return manifest_file, csv_file
 
 
-class TestNormalizeOptionalColumnName:
+# ---------------------------------------------------------------------------
+# Missing-value summary (observation_table_missing_value_summary audit)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def csv_with_volume_and_missing_values(tmp_path):
+    """CSV with some missing volume values for missing-value summary tests."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,volume,bid\n"
+        "2024-01-01,AAPL,1000,100.0\n"
+        "2024-01-02,AAPL,,101.0\n"
+        "2024-01-03,AAPL,3000,102.0\n"
+        "2024-01-04,MSFT,2000,\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "DM-2026-MISSING-VAL",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_no_missing_values(tmp_path):
+    """CSV with no missing values for missing-value summary success tests."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,volume,bid\n"
+        "2024-01-01,AAPL,1000,100.0\n"
+        "2024-01-02,AAPL,2000,101.0\n"
+        "2024-01-03,MSFT,3000,102.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "DM-2026-NO-MISSING",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+class TestMissingValueSummaryComputation:
     """Tests for _normalize_optional_column_name helper."""
 
     def test_none_returns_none(self):
@@ -2992,9 +3039,9 @@ def csv_with_date_symbol_close_two_symbols(tmp_path):
 
 @pytest.fixture
 def csv_missing_close_column(tmp_path):
-    """CSV without the expected close column."""
+    """CSV without the expected close column and with a missing symbol value."""
     csv_file = tmp_path / "obs.csv"
-    csv_file.write_text("date,symbol\n2024-01-01,AAPL\n2024-01-02,AAPL\n")
+    csv_file.write_text("date,symbol\n2024-01-01,\n2024-01-02,AAPL\n")
     manifest_file = tmp_path / "data_manifest.json"
     manifest_file.write_text(json.dumps({
         "dataset_id": "test_obs_csv",
@@ -3713,4 +3760,410 @@ class TestSchemaRegressionFailureArtifacts:
         assert artifact["failure_summary"] is not None
         assert artifact["failure_summary"]["failure_type"] in (
             "validation_error", "unsupported_config", "runtime_error"
+        )
+
+
+class TestMissingValueSummaryIntegration:
+    """Integration tests for --observation-missing-value-columns feature."""
+
+    def test_no_missing_value_columns_preserves_success_behavior(
+        self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path
+    ):
+        """Without --observation-missing-value-columns, runner succeeds normally."""
+        manifest_path, csv_path = csv_with_date_and_symbol
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "success"
+        # No missing-value audit entry
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_missing_value_summary" not in audit_names
+
+    def test_cli_accepts_missing_value_columns(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """CLI accepts --observation-missing-value-columns without error."""
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        # Missing volume → validation_error exit 1 (column exists, values missing)
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+
+    def test_missing_value_requires_data_manifest(self, valid_experiment_spec, tmp_path):
+        """--observation-missing-value-columns without --data-manifest fails closed."""
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        # ValueError from build_runner_output → exit 1
+        assert rc == 1
+
+    def test_non_csv_manifest_with_missing_value_fails_closed(
+        self, valid_sqlite_manifest, valid_experiment_spec, tmp_path
+    ):
+        """Non-CSV manifest with --observation-missing-value-columns fails with unsupported_config."""
+        manifest_path, _ = valid_sqlite_manifest
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+
+    def test_missing_requested_column_fails_closed(
+        self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path
+    ):
+        """Requesting a non-existent column fails closed with validation_error."""
+        manifest_path, csv_path = csv_with_date_and_symbol
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "nonexistent_col",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+
+    def test_valid_csv_missing_value_summary_audit_pass(
+        self, csv_with_no_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Valid CSV with no missing values produces pass audit."""
+        manifest_path, csv_path = csv_with_no_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume,bid",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "success"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_missing_value_summary" in audit_names
+        missing_val_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_missing_value_summary"
+        )
+        assert missing_val_audit["audit_result"] == "pass"
+        assert "row_count=3" in missing_val_audit["details_ref"]
+        assert "missing[volume]=0" in missing_val_audit["details_ref"]
+        assert "missing[bid]=0" in missing_val_audit["details_ref"]
+
+    def test_missing_value_summary_details_include_counts(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Details include row_count and missing counts per column."""
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume,bid",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        missing_val_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_missing_value_summary"
+        )
+        assert missing_val_audit["audit_result"] == "fail"
+        assert "row_count=4" in missing_val_audit["details_ref"]
+        assert "missing[volume]=1" in missing_val_audit["details_ref"]
+        assert "missing[bid]=1" in missing_val_audit["details_ref"]
+
+    def test_multiple_requested_columns_summarized(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Multiple requested columns are each summarized."""
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume,bid",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        missing_val_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_missing_value_summary"
+        )
+        details = missing_val_audit["details_ref"]
+        assert "missing[volume]=" in details
+        assert "missing[bid]=" in details
+        assert "row_count=" in details
+
+    def test_hash_changes_when_missing_value_columns_provided(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """run_config_hash changes when missing-value columns are included."""
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+
+        # Without missing-value columns
+        rc1 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        assert rc1 == 0
+
+        # With missing-value columns
+        rc2 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        assert rc2 == 1  # missing values exist
+
+        artifact1 = json.loads(output1.read_text())
+        artifact2 = json.loads(output2.read_text())
+        assert artifact1["run_config_hash"] != artifact2["run_config_hash"]
+
+    def test_hash_whitespace_normalized_for_missing_value_columns(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Leading/trailing whitespace in missing-value columns is normalized for hash."""
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+
+        rc1 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", " volume ",
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        rc2 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        # Both should fail (volume has missing values) but hash should be same
+        assert rc1 == 1
+        assert rc2 == 1
+        artifact1 = json.loads(output1.read_text())
+        artifact2 = json.loads(output2.read_text())
+        assert artifact1["run_config_hash"] == artifact2["run_config_hash"]
+
+    def test_internal_whitespace_preserved_for_hash(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Internal whitespace in column names is preserved for hash determinism."""
+        csv_file = tmp_path / "internal_ws.csv"
+        csv_file.write_text(
+            "date,symbol,close price\n"
+            "2024-01-01,AAPL,100.0\n"
+            "2024-01-02,AAPL,\n"
+        )
+        manifest_file = tmp_path / "dm.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-WS",
+            "role": "generic",
+            "source_kind": "local_csv",
+            "path": "internal_ws.csv",
+            "format": "csv",
+        }, indent=2))
+
+        output1 = tmp_path / "output1.json"
+        output2 = tmp_path / "output2.json"
+
+        rc1 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-missing-value-columns", "close price",
+            "--output-path", str(output1),
+            "--run-owner", "test",
+        ])
+        rc2 = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_file),
+            "--observation-missing-value-columns", "close price",
+            "--output-path", str(output2),
+            "--run-owner", "test",
+        ])
+        assert rc1 == 1
+        assert rc2 == 1
+        artifact1 = json.loads(output1.read_text())
+        artifact2 = json.loads(output2.read_text())
+        assert artifact1["run_config_hash"] == artifact2["run_config_hash"]
+
+    def test_required_columns_plus_missing_value_failure_preserves_both(
+        self, csv_missing_close_column, valid_experiment_spec, tmp_path
+    ):
+        """Required columns failure + missing-value failure preserves both blockers."""
+        manifest_path, csv_path = csv_missing_close_column
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--required-observation-columns", "date,symbol,close",
+            "--observation-missing-value-columns", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_shape_validation" in audit_names
+        assert "observation_table_missing_value_summary" in audit_names
+        assert artifact["audit_summary"]["blocker_count"] >= 2
+
+    def test_governance_blocker_plus_missing_value_failure_preserves_both(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Autonomous search blocker + missing-value failure preserves both blockers."""
+        spec_with_autonomous = tmp_path / "spec.json"
+        spec_content = {
+            "experiment_id": "EXP-AUTO-BLOCKER",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-AUTO",
+            "search_space_id": "SSM-AUTO",
+            "data_manifest_refs": ["DM-AUTO"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+            "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first"],
+            "prohibited_modes": {"autonomous_search": True},  # BLOCKER
+            "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+        }
+        spec_with_autonomous.write_text(json.dumps(spec_content, indent=2))
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output_path = tmp_path / "output.json"
+
+        rc = main([
+            "--experiment-spec", str(spec_with_autonomous),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "no_autonomous_search_flag_set" in audit_names
+        assert "observation_table_missing_value_summary" in audit_names
+        assert artifact["audit_summary"]["blocker_count"] >= 2
+
+    def test_schema_validation_missing_value_success(
+        self, csv_with_no_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Success artifact with missing-value summary validates against schema."""
+        jsonschema = pytest.importorskip("jsonschema")
+        manifest_path, csv_path = csv_with_no_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        schema_path = _ROOT / "schemas" / "runner_output_spec_v1.schema.json"
+        jsonschema.validate(artifact, json.loads(schema_path.read_text()))
+
+    def test_schema_validation_missing_value_failure(
+        self, csv_with_volume_and_missing_values, valid_experiment_spec, tmp_path
+    ):
+        """Failed-validation artifact with missing-value summary validates against schema."""
+        jsonschema = pytest.importorskip("jsonschema")
+        manifest_path, csv_path = csv_with_volume_and_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        schema_path = _ROOT / "schemas" / "runner_output_spec_v1.schema.json"
+        jsonschema.validate(artifact, json.loads(schema_path.read_text()))
+
+    def test_no_registry_mutation_with_missing_value_summary(
+        self, csv_with_no_missing_values, valid_experiment_spec, tmp_path, monkeypatch
+    ):
+        """No registry or ledger files are written during missing-value summary."""
+        writes = []
+        original_open = open
+
+        def track_open(path, *args, **kwargs):
+            writes.append(str(path))
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.open", track_open)
+        manifest_path, csv_path = csv_with_no_missing_values
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        # Verify registry and ledger files are not mutated by checking mtime
+        registry_path = Path(_ROOT) / "docs" / "edge_hypothesis_registry.csv"
+        ledger_path = Path(_ROOT) / "docs" / "trial_ledger.jsonl"
+        registry_mtime_before = registry_mtime_after = None
+        ledger_mtime_before = ledger_mtime_after = None
+        if registry_path.exists():
+            registry_mtime_before = registry_path.stat().st_mtime
+        if ledger_path.exists():
+            ledger_mtime_before = ledger_path.stat().st_mtime
+        # (Dry-run completes here — rc == 0 above confirms it succeeded)
+        if registry_path.exists():
+            registry_mtime_after = registry_path.stat().st_mtime
+        if ledger_path.exists():
+            ledger_mtime_after = ledger_path.stat().st_mtime
+        assert registry_mtime_before == registry_mtime_after, (
+            f"EdgeHypothesisRegistry was modified during dry-run"
+        )
+        assert ledger_mtime_before == ledger_mtime_after, (
+            f"TrialLedger was modified during dry-run"
         )

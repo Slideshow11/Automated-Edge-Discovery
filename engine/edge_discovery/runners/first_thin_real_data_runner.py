@@ -34,6 +34,7 @@ from engine.edge_discovery.runners.observation_table import (
     _normalize_optional_column_name,
     _summarize_observation_table_canonical,
     _summarize_observation_close_returns,
+    _summarize_observation_missing_values,
     _read_csv_header,
     _validate_observation_table_columns,
 )
@@ -81,6 +82,7 @@ def _compute_run_config_hash(
     observation_date_column: str | None = None,
     observation_symbol_column: str | None = None,
     observation_close_column: str | None = None,
+    observation_missing_value_columns: list[str] | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -99,8 +101,12 @@ def _compute_run_config_hash(
 
     When observation_date_column is provided, it is stripped and appended
     to the hash input. When observation_symbol_column is provided, it is
-    stripped and appended. When observation_close_column is provided, it is
-    stripped and appended.
+    When observation_close_column is provided, it is stripped and appended
+    to the hash input.
+
+    When observation_missing_value_columns is provided, it is normalized
+    (sorted, stripped) and appended to the hash input so that different
+    column sets produce different run_config_hash values.
 
     Whitespace variation does not affect the hash.
 
@@ -144,6 +150,17 @@ def _compute_run_config_hash(
     if observation_close_column is not None and observation_close_column.strip():
         close_col_normalized = observation_close_column.strip()
         combined = combined + b"\nclose_col:" + close_col_normalized.encode("utf-8")
+
+    # observation_missing_value_columns: strip each, sorted, include in hash
+    if (
+        observation_missing_value_columns is not None
+        and len(observation_missing_value_columns) > 0
+    ):
+        normalized = json.dumps(
+            sorted(c.strip() for c in observation_missing_value_columns),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        combined = combined + b"\nmissing_val_cols:" + normalized
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -612,6 +629,7 @@ def build_runner_output(
     observation_date_column: str | None = None,
     observation_symbol_column: str | None = None,
     observation_close_column: str | None = None,
+    observation_missing_value_columns: list[str] | None = None,
 ) -> dict:
     """
     Build a complete RunnerOutput v1 artifact for a dry-run.
@@ -654,6 +672,13 @@ def build_runner_output(
         --observation-symbol-column. If the column is absent, emits failed_validation.
         If no symbols have valid returns (zero first close or <2 dates), emits
         failed_validation.
+    observation_missing_value_columns : list[str] | None
+        Optional list of column names to check for missing values in the
+        observation table CSV. Only supported for CSV format.
+        Requires --data-manifest.
+        If any requested column is absent from the CSV header, emits
+        failed_validation with validation_error.
+        If source_kind is not CSV, emits failed_validation with unsupported_config.
 
     Returns
     -------
@@ -700,6 +725,10 @@ def build_runner_output(
     has_close_return_summary_requested = (
         observation_close_column is not None and observation_close_column.strip()
     )
+    has_missing_value_summary_requested = (
+        observation_missing_value_columns is not None
+        and len(observation_missing_value_columns) > 0
+    )
 
     # Timestamps
     started_at = _utc_now()
@@ -713,7 +742,14 @@ def build_runner_output(
             "Close-return summary requires a DataManifest to determine the dataset path."
         )
 
-    # Early validation: close-return summary requires date and symbol columns
+    # Early validation: missing-value summary requires a DataManifest
+    if has_missing_value_summary_requested and data_manifest_path is None:
+        raise ValueError(
+            "--observation-missing-value-columns was supplied but no --data-manifest was provided. "
+            "Missing-value summary requires a DataManifest to determine the dataset path."
+        )
+
+    # Early validation: observation_date_column and observation_symbol_column required
     if has_close_return_summary_requested:
         date_ok = observation_date_column is not None and observation_date_column.strip()
         symbol_ok = observation_symbol_column is not None and observation_symbol_column.strip()
@@ -723,6 +759,17 @@ def build_runner_output(
                 "--observation-date-column and --observation-symbol-column are missing. "
                 "Close-return summary requires date, symbol, and close columns."
             )
+
+    # Early validation: missing-value columns need a data manifest
+    has_missing_value_summary_requested = (
+        observation_missing_value_columns is not None
+        and len(observation_missing_value_columns) > 0
+    )
+    if has_missing_value_summary_requested and data_manifest_path is None:
+        raise ValueError(
+            "--observation-missing-value-columns was supplied but no --data-manifest "
+            "was provided. Missing-value summary requires a DataManifest."
+        )
 
     # Optional DataManifest loading and validation
     data_manifest_extra_audits: list[str] = []
@@ -765,6 +812,7 @@ def build_runner_output(
                 required_observation_columns,
                 observation_date_column, observation_symbol_column,
                 observation_close_column,
+                observation_missing_value_columns,
             )
             _close_fail_audit = {
                 "audit_name": "observation_table_close_return_summary",
@@ -861,6 +909,111 @@ def build_runner_output(
                 f"(source_kind='{_raw_source_kind}' is not supported).",
             )
 
+        # Unsupported source_kind for missing-value summary → unsupported_config
+        if has_missing_value_summary_requested and _raw_source_kind not in ("local_csv", ""):
+            _now = _utc_now()
+            _cfg_hash = _compute_run_config_hash(
+                experiment_spec_path, data_manifest_path,
+                required_observation_columns,
+                observation_date_column, observation_symbol_column,
+                observation_close_column,
+                observation_missing_value_columns,
+            )
+            _missing_val_fail_audit = {
+                "audit_name": "observation_table_missing_value_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    f"source_kind '{_raw_source_kind}' is not supported "
+                    f"for --observation-missing-value-columns (only CSV is supported)."
+                ),
+                "created_at": _now,
+            }
+            _all_audits = [_missing_val_fail_audit]
+            _total_blockers = 1
+            _failing_checks = ["observation_table_missing_value_summary"]
+            _spec_content_hash = _compute_content_hash(experiment_spec_path)
+            _experiment_id = experiment_spec.get("experiment_id", "unknown")
+            _spec_artifact_ref = {
+                "artifact_type": "ExperimentSpec",
+                "artifact_id": _experiment_id,
+                "artifact_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "schema_ref": "schemas/experiment_spec_v1.schema.json",
+                "validator_ref": None,
+                "content_hash": f"sha256:{_spec_content_hash}",
+                "validation_status": "pass",
+                "validated_at": created_at,
+            }
+            _dm_id = _raw_manifest.get("dataset_id")
+            _data_manifest_ref = (
+                _dm_id if (_dm_id and _dm_id.strip()) else DRY_RUN_DATA_MANIFEST_PLACEHOLDER
+            )
+            _spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(Path(experiment_spec_path).resolve())
+                    if Path(experiment_spec_path).is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{_spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": "Input experiment spec referenced by this dry-run artifact.",
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            _failure_summary = {
+                "failure_type": "unsupported_config",
+                "status": "failed_validation",
+                "failed_check": ", ".join(_failing_checks),
+                "blocker_summary": (
+                    f"observation_table_missing_value_summary: "
+                    f"source_kind '{_raw_source_kind}' is not supported "
+                    f"for --observation-missing-value-columns (only CSV is supported)."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": _now,
+            }
+            _failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": _compute_run_id(_cfg_hash),
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": _experiment_id,
+                "input_artifact_refs": [_spec_artifact_ref],
+                "data_manifest_refs": [_data_manifest_ref],
+                "run_config_hash": f"sha256:{_cfg_hash}",
+                "started_at": _now,
+                "completed_at": _now,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": _total_blockers,
+                    "warning_count": 0,
+                    "audits": _all_audits,
+                },
+                "output_manifest": [_spec_entry],
+                "created_at": _now,
+                "run_owner": run_owner,
+                "failure_summary": _failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                _failed_artifact,
+                f"Run blocked: --observation-missing-value-columns requires CSV datasets "
+                f"(source_kind='{_raw_source_kind}' is not supported).",
+            )
+
         try:
             manifest = load_data_manifest_for_runner(
                 data_manifest_path=data_manifest_path,
@@ -917,6 +1070,7 @@ def build_runner_output(
         observation_date_column,
         observation_symbol_column,
         observation_close_column,
+        observation_missing_value_columns,
     )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
@@ -964,6 +1118,193 @@ def build_runner_output(
         experiment_spec_path,
         run_config_hash,
     )
+
+    # Missing-value summary (observation_table_missing_value_summary audit).
+    # Runs BEFORE column/canonical validation so both audits appear in the
+    # GovernanceRejection artifact if multiple validations fail.
+    if has_missing_value_summary_requested and manifest is not None:
+        if manifest.source_kind.value != "local_csv":
+            # Unsupported format → raise unsupported_config before any other validation
+            now = _utc_now()
+            missing_val_fail_audit = {
+                "audit_name": "observation_table_missing_value_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    f"source_kind '{manifest.source_kind.value}' is not supported "
+                    f"for --observation-missing-value-columns (only CSV is supported)."
+                ),
+                "created_at": now,
+            }
+            new_audits = list(audit_summary["audits"])
+            new_audits.append(missing_val_fail_audit)
+            total_blockers = sum(
+                a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+            )
+            _spec_artifact_ref = {
+                "artifact_type": "ExperimentSpec",
+                "artifact_id": experiment_id,
+                "artifact_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "schema_ref": "schemas/experiment_spec_v1.schema.json",
+                "validator_ref": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "validation_status": "pass",
+                "validated_at": created_at,
+            }
+            _data_manifest_ref = (
+                manifest.dataset_id if manifest.dataset_id else DRY_RUN_DATA_MANIFEST_PLACEHOLDER
+            )
+            _spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": "Input experiment spec referenced by this dry-run artifact.",
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            _failure_summary = {
+                "failure_type": "unsupported_config",
+                "status": "failed_validation",
+                "failed_check": "observation_table_missing_value_summary",
+                "blocker_summary": (
+                    f"observation_table_missing_value_summary: "
+                    f"source_kind '{manifest.source_kind.value}' is not supported "
+                    f"for --observation-missing-value-columns (only CSV is supported)."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            _failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": [_spec_artifact_ref],
+                "data_manifest_refs": [_data_manifest_ref],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": created_at,
+                "completed_at": now,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": total_blockers,
+                    "warning_count": 0,
+                    "audits": new_audits,
+                },
+                "output_manifest": [_spec_entry],
+                "created_at": now,
+                "run_owner": run_owner,
+                "failure_summary": _failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                _failed_artifact,
+                f"Run blocked: --observation-missing-value-columns requires CSV datasets "
+                f"(source_kind='{manifest.source_kind.value}' is not supported).",
+            )
+        # CSV dataset — compute missing-value summary
+        raw_path = Path(manifest.path)
+        dataset_resolved = (
+            raw_path if raw_path.is_absolute()
+            else (manifest_base_dir / raw_path).resolve()
+        )
+        now = _utc_now()
+        try:
+            missing_val_result = _summarize_observation_missing_values(
+                dataset_resolved,
+                observation_missing_value_columns,
+            )
+            missing_val_details = missing_val_result["details"]
+            any_missing = any(
+                count > 0 for count in missing_val_result["missing"].values()
+            )
+            if any_missing:
+                missing_val_passed = False
+                missing_val_fail_audit = {
+                    "audit_name": "observation_table_missing_value_summary",
+                    "audit_result": "fail",
+                    "severity": "blocker",
+                    "blocker_count": 1,
+                    "warning_count": 0,
+                    "details_ref": f"missing_value_summary_error: {missing_val_details}",
+                    "created_at": now,
+                }
+            else:
+                missing_val_passed = True
+                missing_val_fail_audit = {
+                    "audit_name": "observation_table_missing_value_summary",
+                    "audit_result": "pass",
+                    "severity": "blocker",
+                    "blocker_count": 0,
+                    "warning_count": 0,
+                    "details_ref": missing_val_details,
+                    "created_at": now,
+                }
+        except ValueError as exc:
+            missing_val_passed = False
+            missing_val_details = str(exc)
+            missing_val_fail_audit = {
+                "audit_name": "observation_table_missing_value_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": f"missing_value_summary_error: {missing_val_details}",
+                "created_at": now,
+            }
+        # Append missing-value audit to audit_summary
+        new_audits = list(audit_summary["audits"])
+        new_audits.append(missing_val_fail_audit)
+        total_blockers = sum(
+            a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+        )
+        audit_summary = {
+            "overall_result": (
+                "fail" if total_blockers > 0 else audit_summary["overall_result"]
+            ),
+            "blocker_count": total_blockers,
+            "warning_count": audit_summary["warning_count"],
+            "audits": new_audits,
+        }
+        # If missing-value summary found violations, set status/failure_summary
+        # but do NOT raise — let column validation also add its audit.
+        # The rejection is raised by column validation (or "Determine terminal status")
+        # with all accumulated audits.
+        if not missing_val_passed:
+            status = "failed_validation"
+            failing_checks = [
+                a["audit_name"] for a in audit_summary["audits"]
+                if a["audit_result"] == "fail"
+            ]
+            failure_summary = {
+                "failure_type": "validation_error",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_missing_value_summary: {missing_val_details}. "
+                    f"Total blockers: {audit_summary['blocker_count']}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
 
     # Determine terminal status based on audit result
     if audit_summary["blocker_count"] > 0:
@@ -1883,6 +2224,18 @@ def main(argv: list[str] | None = None) -> int:
             "Example: --observation-close-column close"
         ),
     )
+    parser.add_argument(
+        "--observation-missing-value-columns",
+        required=False,
+        default=None,
+        help=(
+            "Optional comma-separated list of column names to summarize missing values for "
+            "in the observation table CSV (row_count, missing count per column). "
+            "Requires --data-manifest pointing to a CSV. "
+            "Only supported for CSV datasets. "
+            "Example: --observation-missing-value-columns volume,bid,ask"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1914,6 +2267,17 @@ def main(argv: list[str] | None = None) -> int:
     observation_symbol_column = _normalize_optional_column_name(args.observation_symbol_column)
     observation_close_column = _normalize_optional_column_name(args.observation_close_column)
 
+    # Parse optional missing-value columns
+    observation_missing_value_columns: list[str] | None = None
+    if args.observation_missing_value_columns is not None:
+        try:
+            observation_missing_value_columns = _parse_required_columns(
+                args.observation_missing_value_columns
+            )
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
     # Build artifact — may raise GovernanceRejection if governance blockers found
     try:
         artifact = build_runner_output(
@@ -1926,6 +2290,7 @@ def main(argv: list[str] | None = None) -> int:
             observation_date_column=observation_date_column,
             observation_symbol_column=observation_symbol_column,
             observation_close_column=observation_close_column,
+            observation_missing_value_columns=observation_missing_value_columns,
         )
     except GovernanceRejection as exc:
         # Governance rejection: emit the failed_validation artifact and exit 1

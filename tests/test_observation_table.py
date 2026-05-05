@@ -20,6 +20,7 @@ from engine.edge_discovery.runners.observation_table import (
     _parse_required_columns,
     _read_csv_header,
     _summarize_observation_close_returns,
+    _summarize_observation_missing_values,
     _summarize_observation_table_canonical,
     _validate_observation_table_columns,
 )
@@ -482,3 +483,153 @@ class TestSummarizeObservationCloseReturns:
         assert "min_return=" in result["details"]
         assert "max_return=" in result["details"]
         assert "mean_return=" in result["details"]
+
+
+class TestSummarizeObservationMissingValues:
+    """Unit tests for _summarize_observation_missing_values."""
+
+    def test_missing_value_summary_counts_empty_strings(self, tmp_path):
+        """Empty CSV field values count as missing."""
+        path = tmp_path / "empty_val.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "volume"],
+                ["2024-01-01", "AAPL", "1000"],
+                ["2024-01-02", "AAPL", ""],  # empty string → missing
+                ["2024-01-03", "AAPL", "3000"],
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["volume"])
+        assert result["row_count"] == 3
+        assert result["missing"]["volume"] == 1
+        assert "row_count=3" in result["details"]
+        assert "missing[volume]=1" in result["details"]
+
+    def test_missing_value_summary_counts_whitespace_only_strings(self, tmp_path):
+        """Whitespace-only string values count as missing after strip."""
+        path = tmp_path / "whitespace_val.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "volume"],
+                ["2024-01-01", "AAPL", "1000"],
+                ["2024-01-02", "AAPL", "   "],  # whitespace only → missing
+                ["2024-01-03", "AAPL", "3000"],
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["volume"])
+        assert result["row_count"] == 3
+        assert result["missing"]["volume"] == 1
+
+    def test_missing_value_summary_counts_missing_csv_fields(self, tmp_path):
+        """None from DictReader (field absent from row) counts as missing."""
+        path = tmp_path / "missing_field.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "volume"],
+                ["2024-01-01", "AAPL", "1000"],
+                ["2024-01-02", "AAPL"],  # fewer fields → volume is None
+                ["2024-01-03", "AAPL", "3000"],
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["volume"])
+        assert result["row_count"] == 3
+        assert result["missing"]["volume"] == 1
+
+    def test_missing_value_summary_multiple_columns(self, tmp_path):
+        """Multiple columns are each summarized independently."""
+        path = tmp_path / "multi_col.csv"
+        make_csv(
+            path,
+            [
+                ["date", "bid", "ask"],
+                ["2024-01-01", "100.0", "101.0"],
+                ["2024-01-02", "", "102.0"],  # bid missing
+                ["2024-01-03", "103.0", ""],  # ask missing
+                ["2024-01-04", "", ""],  # both missing
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["bid", "ask"])
+        assert result["row_count"] == 4
+        assert result["missing"]["bid"] == 2
+        assert result["missing"]["ask"] == 2
+
+    def test_missing_requested_column_fails_deterministically(self, tmp_path):
+        """Requesting a column not in header raises ValueError with column name."""
+        path = tmp_path / "header_only.csv"
+        make_csv(path, [["date", "symbol", "close"]])
+        with pytest.raises(ValueError, match="not found in CSV header"):
+            _summarize_observation_missing_values(path, ["nonexistent_column"])
+
+    def test_header_whitespace_normalization(self, tmp_path):
+        """Header tokens are stripped when matching column names."""
+        path = tmp_path / "header_ws.csv"
+        make_csv(
+            path,
+            [
+                [" date ", "symbol", " close "],  # whitespace in header
+                ["2024-01-01", "AAPL", "100.0"],
+            ],
+        )
+        # Pass stripped column names (as caller would)
+        result = _summarize_observation_missing_values(path, ["date", "close"])
+        assert result["row_count"] == 1
+        assert result["missing"]["date"] == 0
+        assert result["missing"]["close"] == 0
+
+    def test_internal_whitespace_in_column_names_preserved(self, tmp_path):
+        """Internal whitespace in column names is preserved for matching."""
+        path = tmp_path / "internal_ws.csv"
+        make_csv(
+            path,
+            [
+                ["date", "close price", "adj close"],
+                ["2024-01-01", "100.0", "99.0"],
+                ["2024-01-02", "", "98.0"],  # close price missing
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["close price", "adj close"])
+        assert result["row_count"] == 2
+        assert result["missing"]["close price"] == 1
+        assert result["missing"]["adj close"] == 0
+
+    def test_details_format_stable(self, tmp_path):
+        """details string is stable: row_count=N, missing[col]=N per column."""
+        path = tmp_path / "stable_fmt.csv"
+        make_csv(
+            path,
+            [
+                ["date", "bid", "ask"],
+                ["2024-01-01", "100.0", "101.0"],
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["bid", "ask"])
+        # Check format is stable
+        assert result["details"].startswith("row_count=1; ")
+        assert "missing[bid]=0" in result["details"]
+        assert "missing[ask]=0" in result["details"]
+        # No row-level values or symbols
+        details_lower = result["details"].lower()
+        assert "100.0" not in details_lower
+        assert "101.0" not in details_lower
+        assert "aapl" not in details_lower
+
+    def test_no_row_level_values_in_details(self, tmp_path):
+        """Details must not contain actual data values."""
+        path = tmp_path / "privacy.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "185.50"],
+                ["2024-01-02", "AAPL", "190.25"],
+            ],
+        )
+        result = _summarize_observation_missing_values(path, ["close"])
+        details_lower = result["details"].lower()
+        assert "185" not in details_lower
+        assert "190" not in details_lower
+        assert "aapl" not in details_lower
+
