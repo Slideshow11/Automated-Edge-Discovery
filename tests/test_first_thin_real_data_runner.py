@@ -29,6 +29,7 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     build_runner_output,
     write_runner_output,
     GovernanceRejection,
+    UnsupportedConfig,
     main,
     _compute_run_config_hash,
     _compute_run_id,

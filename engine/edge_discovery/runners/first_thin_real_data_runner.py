@@ -525,9 +525,22 @@ class GovernanceRejection(Exception):
     """
 
     def __init__(self, artifact: dict, message: str):
-        super().__init__(message)
         self.artifact = artifact
         self.message = message
+        super().__init__(message)
+
+
+class UnsupportedConfig(Exception):
+    """
+    Raised when canonical summary is requested but the dataset format
+    does not support it (e.g., non-CSV). Carries the failure_type
+    so the caller can set failure_type='unsupported_config' in the
+    failure_summary instead of 'validation_error'.
+    """
+
+    def __init__(self, message: str):
+        self.message = message
+        super().__init__(message)
 
 
 # --------------------------------------------------------------------------
@@ -1416,7 +1429,7 @@ def build_runner_output(
         and manifest is not None
     ):
         if manifest.source_kind.value != "local_csv":
-            raise ValueError(
+            raise UnsupportedConfig(
                 f"observation date/symbol column summary is only supported for CSV datasets "
                 f"(DataManifest dataset_id='{manifest.dataset_id}' has "
                 f"source_kind='{manifest.source_kind.value}')."
@@ -1444,8 +1457,10 @@ def build_runner_output(
                 "details_ref": canonical_summary_details,
                 "created_at": now,
             }
-        except ValueError as exc:
-            # Column missing from CSV header → fail audit entry (not GovernanceRejection)
+        except (ValueError, UnsupportedConfig) as exc:
+            canonical_summary_failure_type = (
+                "unsupported_config" if isinstance(exc, UnsupportedConfig) else "validation_error"
+            )
             canonical_summary_details = str(exc)
             canon_audit_entry = {
                 "audit_name": "observation_table_canonical_summary",
@@ -1480,7 +1495,7 @@ def build_runner_output(
                 if a["audit_result"] == "fail"
             ]
             failure_summary = {
-                "failure_type": "validation_error",
+                "failure_type": canonical_summary_failure_type,
                 "status": "failed_validation",
                 "failed_check": ", ".join(failing_checks),
                 "blocker_summary": (
