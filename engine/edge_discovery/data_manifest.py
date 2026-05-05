@@ -176,7 +176,14 @@ def _is_safe_relative_path(path: str | Path, base_dir: Path) -> tuple[Path, Path
         or symlinks.
     """
     base_resolved = base_dir.resolve(strict=False)
-    p_resolved = Path(path).resolve(strict=False)
+    raw_path = Path(path)
+    # Relative paths must resolve against base_dir, not process cwd.
+    # Absolute paths resolve directly.
+    if raw_path.is_absolute():
+        candidate = raw_path
+    else:
+        candidate = base_resolved / raw_path
+    p_resolved = candidate.resolve(strict=False)
 
     # is_relative_to() returns False when p_resolved is not a sub-path of
     # base_resolved (Python 3.11). Python 3.12+ raises ValueError instead.

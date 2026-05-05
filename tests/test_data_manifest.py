@@ -567,10 +567,16 @@ class TestValidateDatasetManifestPathSecurity:
 
         Path.resolve() follows symlinks, so the resolved path is the real
         target location — which is outside base_dir and correctly rejected.
+        The symlink lives under base_dir; the target lives OUTSIDE base_dir.
         """
+        import uuid
+
         inside = tmp_path / "inside"
         inside.mkdir()
-        target = tmp_path / "outside_target"
+        # Target lives OUTSIDE base_dir (tmp_path.parent), not inside it.
+        # Using a unique name under tmp_path.parent to guarantee it's outside.
+        unique_name = f"dm_sym_target_{uuid.uuid4().hex[:8]}"
+        target = tmp_path.parent / unique_name
         target.touch()
         link = inside / "escape_link"
         try:
@@ -613,6 +619,56 @@ class TestValidateDatasetManifestPathSecurity:
         result = validate_dataset_manifest(manifest, base_dir=tmp_path)
         assert result.ok is False
         assert any("non-empty" in e for e in result.errors)
+
+    def test_relative_path_under_base_dir_accepted_with_different_cwd(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A relative path inside base_dir passes even when cwd is NOT base_dir.
+
+        This is the core regression test for the fix: Path(path).resolve()
+        must resolve relative paths against base_dir, not process cwd.
+        Without the fix, a relative path like 'sub/data.csv' resolves to
+        /cwd/sub/data.csv instead of /base_dir/sub/data.csv and fails the
+        containment check when cwd != base_dir.
+        """
+        # Ensure cwd is somewhere completely different from base_dir.
+        monkeypatch.chdir(tmp_path.parent.parent if len(tmp_path.parents) > 1 else Path("/tmp"))
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        data_file = sub / "data.csv"
+        data_file.touch()
+        manifest = DatasetManifest(
+            dataset_id="relative_under_base",
+            role=DatasetRole.price_history,
+            source_kind=DataSourceKind.local_csv,
+            path="sub/data.csv",
+            format="csv",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is True, f"Expected ok=True, got errors: {result.errors}"
+
+    def test_normalized_path_under_base_dir_accepted_with_different_cwd(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A normalized relative path like sub/../sub/data.csv under base_dir passes.
+
+        Even when cwd != base_dir, Path.resolve() normalizes the ..
+        components and the final resolved path must still land inside base_dir.
+        """
+        monkeypatch.chdir(tmp_path.parent.parent if len(tmp_path.parents) > 1 else Path("/tmp"))
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        data_file = sub / "data.csv"
+        data_file.touch()
+        manifest = DatasetManifest(
+            dataset_id="normalized_under_base",
+            role=DatasetRole.price_history,
+            source_kind=DataSourceKind.local_csv,
+            path="sub/../sub/data.csv",
+            format="csv",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is True, f"Expected ok=True, got errors: {result.errors}"
 
 
 class TestDatasetManifestFromDictPathValidation:
