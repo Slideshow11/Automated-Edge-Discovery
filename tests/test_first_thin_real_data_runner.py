@@ -3602,3 +3602,116 @@ class TestCloseReturnSummaryIntegration:
         artifact_text = out.read_text()
         assert "TrialLedger" not in artifact_text
 
+
+
+
+class TestSchemaRegressionFailureArtifacts:
+    """Schema regression tests for failed_validation RunnerOutput artifacts.
+
+    These tests verify that every failure artifact produced by the runner
+    satisfies minItems constraints and schema structural requirements.
+
+    Previously fixed bugs:
+    - BUG: data_manifest_refs = [] violated minItems >= 1 (line ~1046, ~1140)
+    - BUG: missing partial_summary = None in some failure artifacts
+    """
+
+    def test_canonical_summary_no_manifest_data_manifest_refs_min_items(
+        self, valid_experiment_spec, tmp_path
+    ):
+        """Canonical summary without DataManifest → data_manifest_refs is non-empty.
+
+        Regression test for the bug where data_manifest_refs was set to []
+        in the canonical summary failure path when no DataManifest was provided.
+        """
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+        # Schema: data_manifest_refs minItems >= 1
+        assert len(artifact["data_manifest_refs"]) >= 1
+        assert artifact["data_manifest_refs"][0]  # non-empty string
+        # input_artifact_refs and output_manifest must also be non-empty
+        assert len(artifact["input_artifact_refs"]) >= 1
+        assert len(artifact["output_manifest"]) >= 1
+        # partial_summary should be None for failure artifacts
+        assert artifact.get("partial_summary") is None
+
+    def test_no_valid_returns_close_artifact_schema_regression(
+        self, csv_all_symbols_single_date, valid_experiment_spec, tmp_path
+    ):
+        """Close-return no-valid-returns artifact satisfies schema minItems constraints.
+
+        Regression test to ensure the close-return failure artifact has
+        non-empty input_artifact_refs, data_manifest_refs, output_manifest.
+        """
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+            GovernanceRejection,
+        )
+        manifest_file, _ = csv_all_symbols_single_date
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+        # Schema: all refs lists must satisfy minItems >= 1
+        assert len(artifact["input_artifact_refs"]) >= 1
+        assert len(artifact["data_manifest_refs"]) >= 1
+        assert len(artifact["output_manifest"]) >= 1
+        # failure_summary must not be null and must have valid failure_type
+        assert artifact["failure_summary"] is not None
+        assert artifact["failure_summary"]["failure_type"] in (
+            "validation_error", "unsupported_config", "runtime_error"
+        )
+
+    def test_combined_governance_and_validation_blockers_min_items(
+        self, csv_missing_date_column, valid_experiment_spec, tmp_path
+    ):
+        """Governance blocker + observation validation blocker → both preserved, schema valid.
+
+        Regression test for the bug where data_manifest_refs was [] in the
+        canonical summary failure path when no DataManifest was provided.
+        Tests the combined path (experiment spec with required_observation_columns
+        and observation_date_column but no data manifest).
+        """
+        output = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(csv_missing_date_column[0]),
+            "--required-observation-columns", "date,symbol",
+            "--observation-date-column", "date",
+            "--output-path", str(output),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output.read_text())
+        assert artifact["status"] == "failed_validation"
+        # Schema: all refs lists must satisfy minItems >= 1
+        assert len(artifact["input_artifact_refs"]) >= 1
+        assert len(artifact["data_manifest_refs"]) >= 1
+        assert len(artifact["output_manifest"]) >= 1
+        # Both blocker types present in audit_summary
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_shape_validation" in audit_names
+        assert "observation_table_canonical_summary" in audit_names
+        # blocker_count reflects both
+        assert artifact["audit_summary"]["blocker_count"] >= 2
+        # failure_summary present and schema-compatible
+        assert artifact["failure_summary"] is not None
+        assert artifact["failure_summary"]["failure_type"] in (
+            "validation_error", "unsupported_config", "runtime_error"
+        )

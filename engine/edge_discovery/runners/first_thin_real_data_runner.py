@@ -1043,7 +1043,9 @@ def build_runner_output(
                 "runner_version": RUNNER_VERSION_DEFAULT,
                 "experiment_spec_ref": experiment_spec.get("experiment_id"),
                 "input_artifact_refs": input_artifact_refs,
-                "data_manifest_refs": [],
+                "data_manifest_refs": (
+                    experiment_spec.get("data_manifest_refs") or [DRY_RUN_DATA_MANIFEST_PLACEHOLDER]
+                ),
                 "run_config_hash": run_config_hash,
                 "started_at": started_at,
                 "completed_at": now,
@@ -1066,6 +1068,7 @@ def build_runner_output(
                     "details_ref": None,
                     "created_at": now,
                 },
+                "partial_summary": None,
                 "created_at": created_at,
                 "run_owner": run_owner,
             }
@@ -1137,7 +1140,9 @@ def build_runner_output(
                     "runner_version": RUNNER_VERSION_DEFAULT,
                     "experiment_spec_ref": experiment_spec.get("experiment_id"),
                     "input_artifact_refs": input_artifact_refs,
-                    "data_manifest_refs": [],
+                    "data_manifest_refs": (
+                        experiment_spec.get("data_manifest_refs") or [DRY_RUN_DATA_MANIFEST_PLACEHOLDER]
+                    ),
                     "run_config_hash": run_config_hash,
                     "started_at": started_at,
                     "completed_at": now,
@@ -1149,6 +1154,7 @@ def build_runner_output(
                     },
                     "output_manifest": [spec_entry],
                     "failure_summary": canonical_failure_summary,
+                    "partial_summary": None,
                     "created_at": created_at,
                     "run_owner": run_owner,
                 }
