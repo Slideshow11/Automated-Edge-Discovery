@@ -849,6 +849,41 @@ class TestStructuredErrorSemantics:
         assert "TimeoutExpired" in result.error
         assert "300" in result.error
 
+    def test_timeout_error_zero_seconds_preserved(self, tmp_path):
+        """TimeoutExpired(timeout=0) preserves 0 in timeout_seconds, not None."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.TimeoutExpired(cmd=["python", "instant.py"], timeout=0)
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.error_type == "timeout"
+        assert result.timed_out is True
+        assert result.timeout_seconds == 0
+        assert "0s" in result.error
+        assert "TimeoutExpired" in result.error
+
+    def test_timeout_error_zero_float_seconds_preserved(self, tmp_path):
+        """TimeoutExpired(timeout=0.0) preserves 0.0 in timeout_seconds."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.TimeoutExpired(cmd=["python", "instant.py"], timeout=0.0)
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.error_type == "timeout"
+        assert result.timed_out is True
+        assert result.timeout_seconds == 0.0
+        assert "0" in result.error
+
     def test_internal_error_is_structured(self, tmp_path):
         """Unexpected Exception is encoded with error_type=internal_error."""
         spec = CandidateSpec(
