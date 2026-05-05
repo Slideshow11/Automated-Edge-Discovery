@@ -88,10 +88,10 @@ class CandidateSpec:
             )
         if self.expiry_rank < 0:
             raise ValueError(f"expiry_rank must be >= 0, got {self.expiry_rank}")
-        if not self.options_db_path:
-            raise ValueError("options_db_path must be a non-empty string")
-        if not self.preearn_repo_path:
-            raise ValueError("preearn_repo_path must be a non-empty string")
+        if not self.preearn_repo_path or not self.preearn_repo_path.strip():
+            raise ValueError("preearn_repo_path must be a non-empty, non-whitespace-only string")
+        if not self.options_db_path or not self.options_db_path.strip():
+            raise ValueError("options_db_path must be a non-empty, non-whitespace-only string")
         if self.fill_policy not in _VALID_FILL_POLICIES:
             raise ValueError(
                 f"fill_policy must be one of {_VALID_FILL_POLICIES}, "
@@ -331,18 +331,38 @@ def run_preearn_backtest(
     """
     # Preflight validation
     preearn_root = Path(spec.preearn_repo_path)
+    preearn_root_resolved = preearn_root.resolve(strict=False)
     if not preearn_root.exists():
         raise FileNotFoundError(f"preearn_repo_path does not exist: {spec.preearn_repo_path}")
+    if not preearn_root_resolved.is_dir():
+        raise ValueError(f"preearn_repo_path is not a directory: {spec.preearn_repo_path}")
 
     backtest_script = preearn_root / "scripts" / "run_options_backtest_v1.py"
+    backtest_script_resolved = backtest_script.resolve(strict=False)
     if not backtest_script.exists():
         raise FileNotFoundError(
             f"Pre-earnings backtest script not found: {backtest_script}"
         )
+    # Ensure the resolved script path is still under the resolved repo root.
+    # resolve() follows symlinks, so a symlink inside the repo pointing outside
+    # will have its real target checked against the repo boundary.
+    try:
+        is_inside = backtest_script_resolved.is_relative_to(preearn_root_resolved)
+    except ValueError:
+        is_inside = False
+    if not is_inside:
+        raise ValueError(
+            f"Backtest script at '{backtest_script_resolved}' resolves outside "
+            f"preearn_repo_path boundary '{preearn_root_resolved}'. "
+            f"Symlink escape is not permitted."
+        )
 
     options_db = Path(spec.options_db_path)
+    options_db_resolved = options_db.resolve(strict=False)
     if not options_db.exists():
         raise FileNotFoundError(f"options_db_path does not exist: {spec.options_db_path}")
+    if not options_db_resolved.is_file():
+        raise ValueError(f"options_db_path is not a file: {spec.options_db_path}")
 
     # Generate run_id and output paths
     import time
