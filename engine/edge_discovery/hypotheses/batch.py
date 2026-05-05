@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -290,18 +291,7 @@ def run_candidate_batch(
             results_list.append(res)
         except Exception as exc:  # noqa: BLE001
             results_list.append(
-                PreearnResult(
-                    run_id=f"err_{int(time.time() * 1000)}",
-                    candidate_id=candidate_id(spec),
-                    status="error",
-                    config_hash="",
-                    git_commit=None,
-                    command="",
-                    repo_path=preearn_repo_path,
-                    output_artifacts={},
-                    metrics_summary={},
-                    error=str(exc)[:500],
-                )
+                _build_error_result(spec, exc, preearn_repo_path)
             )
 
     n_success = sum(1 for r in results_list if r.status == "success")
@@ -363,6 +353,57 @@ def _write_summary(result: BatchResult, output_dir: str) -> None:
     path.mkdir(parents=True, exist_ok=True)
     summary_path = path / f"batch_{result.batch_id}.json"
     summary_path.write_text(json.dumps(result.to_dict(), indent=2), encoding="utf-8")
+
+
+def _build_error_result(
+    spec: CandidateSpec,
+    exc: Exception,
+    repo_path: str,
+) -> PreearnResult:
+    """Build a structured error PreearnResult from an exception.
+
+    Distinguishes subprocess failures (return code, stdout/stderr), timeouts
+    (timeout value), and unexpected internal errors. The error_type, return_code,
+    timed_out, and timeout_seconds fields allow callers and tests to
+    differentiate failure modes without parsing free-text error strings.
+    """
+    error_type: str
+    return_code: int | None = None
+    timed_out: bool = False
+    timeout_seconds: float | None = None
+    error_msg: str = str(exc)[:500]
+
+    if isinstance(exc, subprocess.CalledProcessError):
+        error_type = "subprocess_error"
+        return_code = exc.returncode
+        # Include returncode and brief stderr snippet in the error message
+        stderr_snippet = (exc.stderr or "").strip()[:200]
+        error_msg = f"CalledProcessError(returncode={exc.returncode}): {stderr_snippet}" if stderr_snippet else f"CalledProcessError(returncode={exc.returncode})"
+    elif isinstance(exc, subprocess.TimeoutExpired):
+        error_type = "timeout"
+        timed_out = True
+        timeout_seconds = exc.timeout if hasattr(exc, "timeout") and exc.timeout else None
+        timeout_str = f"{timeout_seconds}s" if timeout_seconds else "unknown"
+        error_msg = f"TimeoutExpired after {timeout_str}"
+    else:
+        error_type = "internal_error"
+
+    return PreearnResult(
+        run_id=f"err_{int(time.time() * 1000)}",
+        candidate_id=candidate_id(spec),
+        status="error",
+        config_hash="",
+        git_commit=None,
+        command="",  # command was constructed inside run_preearn_backtest; not available here
+        repo_path=repo_path,
+        output_artifacts={},
+        metrics_summary={},
+        error=error_msg,
+        error_type=error_type,
+        return_code=return_code,
+        timed_out=timed_out,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _config_hash_for_batch(

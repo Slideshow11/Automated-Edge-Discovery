@@ -125,6 +125,19 @@ class PreearnResult:
         Summary metrics extracted from the output CSV.
     error : str or None
         Error message string when status == "error".
+    error_type : str or None
+        Structured error type when available. One of:
+        ``subprocess_error``, ``timeout``, ``internal_error``.
+        Present on error results from batch.py exception handlers.
+    return_code : int or None
+        Subprocess return code, present when the error was a
+        ``CalledProcessError``.
+    timed_out : bool
+        True when the error was a ``TimeoutExpired``.
+        Default: False.
+    timeout_seconds : float or None
+        Timeout threshold in seconds that was exceeded, present on
+        ``TimeoutExpired`` errors.
     """
 
     run_id: str
@@ -137,6 +150,10 @@ class PreearnResult:
     output_artifacts: Dict[str, str]
     metrics_summary: Dict[str, Any]
     error: Optional[str] = None
+    error_type: Optional[str] = None
+    return_code: Optional[int] = None
+    timed_out: bool = False
+    timeout_seconds: Optional[float] = None
 
 
 # ---------------------------------------------------------------------------

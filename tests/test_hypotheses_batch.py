@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
+from dataclasses import asdict
 from pathlib import Path
 from unittest import mock
 
@@ -775,5 +777,273 @@ class TestBatchLedgerEntry:
         entries = Ledger(ledger_path).read()
         batch_entries = [e for e in entries if e.run_type == "preearn_candidate_batch"]
         assert len(batch_entries) == 1
-        # Hypotheses file should not exist
+            # Hypotheses file should not exist
         assert not Path(tmp_path / "hypotheses.jsonl").exists()
+
+
+# --------------------------------------------------------------------------
+# Structured error semantics
+# --------------------------------------------------------------------------
+
+
+from engine.edge_discovery.hypotheses.batch import _build_error_result
+
+
+class TestStructuredErrorSemantics:
+    """Verify that _build_error_result produces structured error metadata."""
+
+    def test_subprocess_error_has_structured_fields(self, tmp_path):
+        """CalledProcessError is encoded with error_type=subprocess_error and return_code."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.CalledProcessError(returncode=42, cmd=["python", "fail.py"], stderr=b" Segmentation fault\n")
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.status == "error"
+        assert result.error_type == "subprocess_error"
+        assert result.return_code == 42
+        assert result.timed_out is False
+        assert result.timeout_seconds is None
+        assert "CalledProcessError" in result.error
+        assert "42" in result.error
+        assert "Segmentation fault" in result.error
+
+    def test_subprocess_error_no_stderr(self, tmp_path):
+        """CalledProcessError with no stderr still has structured return_code."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.CalledProcessError(returncode=1, cmd=["python", "fail.py"])
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.error_type == "subprocess_error"
+        assert result.return_code == 1
+        assert "CalledProcessError(returncode=1)" in result.error
+
+    def test_timeout_error_has_structured_fields(self, tmp_path):
+        """TimeoutExpired is encoded with error_type=timeout and timed_out=True."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.TimeoutExpired(cmd=["python", "slow.py"], timeout=300.0)
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.status == "error"
+        assert result.error_type == "timeout"
+        assert result.timed_out is True
+        assert result.timeout_seconds == 300.0
+        assert result.return_code is None
+        assert "TimeoutExpired" in result.error
+        assert "300" in result.error
+
+    def test_internal_error_is_structured(self, tmp_path):
+        """Unexpected Exception is encoded with error_type=internal_error."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = ValueError("unexpected config mismatch")
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        assert result.status == "error"
+        assert result.error_type == "internal_error"
+        assert result.timed_out is False
+        assert result.return_code is None
+        assert result.timeout_seconds is None
+        assert "unexpected config mismatch" in result.error
+
+    def test_error_result_is_json_serializable(self, tmp_path):
+        """Structured error result can be JSON-serialized."""
+        spec = CandidateSpec(
+            entry_dpe=2,
+            delta_target=0.30,
+            expiry_rank=0,
+            options_db_path=str(tmp_path / "opts.db"),
+            preearn_repo_path=str(tmp_path / "repo"),
+        )
+        exc = subprocess.CalledProcessError(returncode=1, cmd=["python", "fail.py"])
+        result = _build_error_result(spec, exc, str(tmp_path / "repo"))
+
+        json_str = json.dumps(asdict(result))
+        restored = json.loads(json_str)
+        assert restored["status"] == "error"
+        assert restored["error_type"] == "subprocess_error"
+        assert restored["return_code"] == 1
+
+    def test_batch_continues_after_subprocess_error(self, tmp_path):
+        """Batch continues and records structured error when one candidate fails."""
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2, 3)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        outdir = str(tmp_path / "output")
+        success_result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd",
+            git_commit=None,
+            command="",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={},
+        )
+
+        def _mock_run(spec, **kwargs):
+            if not hasattr(_mock_run, "_called"):
+                _mock_run._called = True
+                return success_result
+            raise subprocess.CalledProcessError(returncode=127, cmd=["missing"], stderr=b"command not found")
+
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            side_effect=_mock_run,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
+                output_dir=outdir,
+                dry_run=False,
+            )
+
+        assert result.status == "partial"
+        assert result.n_success == 1
+        assert result.n_error == 1
+        error_result = next(r for r in result.results if r.error_type == "subprocess_error")
+        assert error_result.return_code == 127
+        assert "command not found" in error_result.error
+
+    def test_batch_continues_after_timeout(self, tmp_path):
+        """Batch continues and records structured error when one candidate times out."""
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2, 3)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        outdir = str(tmp_path / "output")
+        success_result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd",
+            git_commit=None,
+            command="",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={},
+        )
+
+        def _mock_run(spec, **kwargs):
+            if not hasattr(_mock_run, "_called"):
+                _mock_run._called = True
+                return success_result
+            raise subprocess.TimeoutExpired(cmd=["python", "slow.py"], timeout=600.0)
+
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            side_effect=_mock_run,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
+                output_dir=outdir,
+                dry_run=False,
+            )
+
+        assert result.status == "partial"
+        assert result.n_error == 1
+        error_result = next(r for r in result.results if r.error_type == "timeout")
+        assert error_result.timed_out is True
+        assert error_result.timeout_seconds == 600.0
+        assert "TimeoutExpired" in error_result.error
+
+    def test_success_result_has_no_error_fields(self, tmp_path):
+        """Successful PreearnResult has no error_type or return_code set."""
+        result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd",
+            git_commit=None,
+            command="python run.py",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={"pnl": 1.5},
+        )
+        # error_type/return_code/timed_out/timeout_seconds default to None/False/None
+        assert result.error_type is None
+        assert result.return_code is None
+        assert result.timed_out is False
+        assert result.timeout_seconds is None
+
+    def test_existing_batch_mixed_success_and_error_test_still_passes(self, tmp_path):
+        """The existing mixed_success_and_error test continues to pass unchanged."""
+        hyp = _make_preearn_hypothesis(
+            candidate_constraints=(
+                ParameterConstraint(name="entry_dpe", values=(2, 3)),
+                ParameterConstraint(name="delta_target", values=(0.3,)),
+                ParameterConstraint(name="expiry_rank", values=(0,)),
+            ),
+        )
+        outdir = str(tmp_path / "output")
+        success_result = PreearnResult(
+            run_id="run_001",
+            candidate_id="preearn_dpe2_delta30_rank0",
+            status="success",
+            config_hash="abcd",
+            git_commit=None,
+            command="",
+            repo_path="/tmp/repo",
+            output_artifacts={},
+            metrics_summary={},
+        )
+
+        def _mock_run(spec, **kwargs):
+            if not hasattr(_mock_run, "_called"):
+                _mock_run._called = True
+                return success_result
+            raise RuntimeError("infra failure")
+
+        with mock.patch(
+            "engine.edge_discovery.hypotheses.batch.run_preearn_backtest",
+            side_effect=_mock_run,
+        ):
+            result = run_candidate_batch(
+                hyp,
+                options_db_path="/tmp/does_not_exist.db",
+                preearn_repo_path="/tmp/does_not_exist",
+                ledger_path=str(tmp_path / "ledger.jsonl"),
+                output_dir=outdir,
+                dry_run=False,
+            )
+
+        assert result.status == "partial"
+        assert result.n_success == 1
+        assert result.n_error == 1
+        error_result = next(r for r in result.results if r.status == "error")
+        assert error_result.error_type == "internal_error"
