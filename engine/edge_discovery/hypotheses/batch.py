@@ -382,8 +382,9 @@ def _build_error_result(
     elif isinstance(exc, subprocess.TimeoutExpired):
         error_type = "timeout"
         timed_out = True
-        timeout_seconds = exc.timeout if hasattr(exc, "timeout") and exc.timeout else None
-        timeout_str = f"{timeout_seconds}s" if timeout_seconds else "unknown"
+        raw_timeout = getattr(exc, "timeout", None)
+        timeout_seconds = raw_timeout if raw_timeout is not None else None
+        timeout_str = f"{timeout_seconds}s" if timeout_seconds is not None else "unknown"
         error_msg = f"TimeoutExpired after {timeout_str}"
     else:
         error_type = "internal_error"
