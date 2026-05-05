@@ -300,6 +300,44 @@ do
   fi
 done
 
+# --- RunnerOutputSpec v1 fixture checks ---
+
+echo "=== RunnerOutputSpec valid fixture ==="
+python3 scripts/local/validate_runner_output_spec.py \
+  fixtures/runner_output_spec_v1/valid_success_minimal.json
+
+echo "=== RunnerOutputSpec valid failed_validation fixture ==="
+python3 scripts/local/validate_runner_output_spec.py \
+  fixtures/runner_output_spec_v1/valid_failed_validation_minimal.json
+
+echo "=== RunnerOutputSpec valid partial fixture ==="
+python3 scripts/local/validate_runner_output_spec.py \
+  fixtures/runner_output_spec_v1/valid_partial_minimal.json
+
+echo "=== RunnerOutputSpec valid failed_missing_data fixture ==="
+python3 scripts/local/validate_runner_output_spec.py \
+  fixtures/runner_output_spec_v1/valid_failed_missing_data_minimal.json
+
+echo "=== RunnerOutputSpec invalid fixtures must fail ==="
+for f in \
+  fixtures/runner_output_spec_v1/invalid_runner_output_id.json \
+  fixtures/runner_output_spec_v1/invalid_status.json \
+  fixtures/runner_output_spec_v1/invalid_output_manifest_empty.json \
+  fixtures/runner_output_spec_v1/invalid_input_artifact_refs_empty.json \
+  fixtures/runner_output_spec_v1/invalid_audit_summary_missing_required.json \
+  fixtures/runner_output_spec_v1/invalid_data_manifest_refs_empty.json \
+  fixtures/runner_output_spec_v1/invalid_failed_validation_missing_failure_summary.json \
+  fixtures/runner_output_spec_v1/invalid_partial_with_failure_summary.json \
+  fixtures/runner_output_spec_v1/invalid_success_with_failure_summary.json \
+  fixtures/runner_output_spec_v1/invalid_success_with_partial_summary.json \
+  fixtures/runner_output_spec_v1/invalid_missing_required.json
+do
+  if python3 scripts/local/validate_runner_output_spec.py "$f"; then
+    echo "BLOCKER: invalid RunnerOutputSpec fixture unexpectedly passed: $f"
+    exit 1
+  fi
+done
+
 # --- pytest governance validator tests ---
 
 echo "=== pytest governance validators ==="
@@ -314,6 +352,7 @@ python3 -m pytest \
   tests/test_validate_event_study_spec.py \
   tests/test_validate_options_event_risk_spec.py \
   tests/test_validate_preearnings_profile.py \
+  tests/test_validate_runner_output_spec.py \
   -q
 
 echo "Governance manifests validator checks completed."
