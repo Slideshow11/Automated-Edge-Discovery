@@ -345,19 +345,29 @@ def build_runner_output(
         status = "success"
         failure_summary = None
 
-    # output_manifest — dry-run report entry.
-    # content_hash is set from experiment spec content hash (stable,
-    # not self-referential). The output_path placeholder will be replaced
-    # in write_runner_output with the actual output path.
+    # output_manifest — entry describing the input experiment spec.
+    #
+    # content_hash is the experiment spec file hash (computed above).
+    # output_path points to the experiment spec file so that content_hash
+    # genuinely hashes the file it names — satisfying the schema's
+    # "hash of output file content" semantics for this dry-run skeleton.
+    # This is NOT the RunnerOutput JSON path (that artifact IS the run
+    # output; output_manifest describes referenced artifacts).
     output_manifest = [
         {
             "output_role": "evidence",
-            "output_path": "<runner_output_json>",  # replaced in write_runner_output
+            "output_path": str(experiment_spec_path.resolve())
+            if experiment_spec_path.is_absolute()
+            else str(experiment_spec_path),
             "row_count": None,
             "content_hash": f"sha256:{spec_content_hash}",
             "created_at": created_at,
             "format": "json",
-            "description": "First thin real-data runner dry-run output artifact",
+            "description": (
+                "Input experiment spec referenced by this dry-run artifact. "
+                "Content hash is of the experiment spec JSON file, providing "
+                "a stable content identifier for the input governance document."
+            ),
             "contains_private_data": False,
             "publishable": False,
         }
@@ -430,13 +440,6 @@ def write_runner_output(
         )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # Replace output_path placeholder in output_manifest with actual path.
-    # content_hash was already set in build_runner_output (stable,
-    # non-self-referential hash from experiment spec bytes).
-    for entry in artifact["output_manifest"]:
-        if entry["output_path"] == "<runner_output_json>":
-            entry["output_path"] = str(output_path)
 
     # Write ONCE. content_hash is already correct (computed from experiment
     # spec bytes in build_runner_output) so no re-write is needed.

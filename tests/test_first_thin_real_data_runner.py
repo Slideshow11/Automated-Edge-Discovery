@@ -670,6 +670,97 @@ def test_governance_rejected_artifact_validates_against_schema(
 
 
 # ---------------------------------------------------------------------------
+# Test: output_manifest content_hash honesty
+# ---------------------------------------------------------------------------
+
+def test_output_manifest_content_hash_matches_experiment_spec(valid_experiment_spec):
+    """
+    output_manifest[0].content_hash must be the SHA-256 of the file at
+    output_manifest[0].output_path.
+
+    For this dry-run skeleton, output_path points to the experiment spec
+    file and content_hash is sha256:<experiment_spec_bytes>. This test
+    verifies the hash is computed correctly and matches the file.
+    """
+    import hashlib
+
+    artifact = build_runner_output(
+        experiment_spec_path=valid_experiment_spec,
+        run_owner="test@test",
+    )
+
+    entry = artifact["output_manifest"][0]
+
+    # content_hash must be sha256:<hex>
+    assert entry["content_hash"].startswith("sha256:"), (
+        f"content_hash must be sha256:<hex>, got: {entry['content_hash']}"
+    )
+
+    # The hash must match the experiment spec file bytes
+    stored_hash = entry["content_hash"][7:]  # strip "sha256:"
+    actual_hash = hashlib.sha256(
+        Path(valid_experiment_spec).read_bytes()
+    ).hexdigest()
+
+    assert stored_hash == actual_hash, (
+        f"content_hash {stored_hash!r} does not match "
+        f"experiment spec hash {actual_hash!r}"
+    )
+
+    # output_path must point to the experiment spec (the file whose hash is stored)
+    assert Path(entry["output_path"]).resolve() == Path(valid_experiment_spec).resolve(), (
+        f"output_path {entry['output_path']} does not match "
+        f"experiment spec path {valid_experiment_spec}"
+    )
+
+
+def test_output_manifest_description_honest(valid_experiment_spec):
+    """
+    output_manifest[0].description must honestly describe that content_hash
+    is of the experiment spec file, not of the RunnerOutput JSON.
+    """
+    artifact = build_runner_output(
+        experiment_spec_path=valid_experiment_spec,
+        run_owner="test@test",
+    )
+
+    entry = artifact["output_manifest"][0]
+    desc = entry["description"]
+
+    # Description must acknowledge the hash is of the experiment spec
+    assert "experiment spec" in desc.lower(), (
+        f"description must mention 'experiment spec', got: {desc!r}"
+    )
+    assert "content hash" in desc.lower(), (
+        f"description must mention 'content hash', got: {desc!r}"
+    )
+    # Must NOT claim the hash is of the RunnerOutput JSON
+    assert "output artifact" not in desc.lower() and "runner output" not in desc.lower(), (
+        f"description must not claim content_hash is of RunnerOutput JSON, got: {desc!r}"
+    )
+
+
+def test_output_manifest_content_hash_stable_across_builds(valid_experiment_spec):
+    """
+    For the same experiment spec, output_manifest[0].content_hash must be
+    identical across multiple build_runner_output calls (determinism).
+    """
+    hash1 = build_runner_output(
+        experiment_spec_path=valid_experiment_spec,
+        run_owner="test@test",
+    )["output_manifest"][0]["content_hash"]
+
+    hash2 = build_runner_output(
+        experiment_spec_path=valid_experiment_spec,
+        run_owner="test@test",
+    )["output_manifest"][0]["content_hash"]
+
+    assert hash1 == hash2, (
+        f"content_hash not stable: {hash1!r} != {hash2!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Test: runner_output_id is stable format
 # ---------------------------------------------------------------------------
 
@@ -878,10 +969,11 @@ def test_output_manifest_content_hash_deterministic_across_runs(valid_experiment
     assert hash1 == hash2
 
 
-def test_output_manifest_output_path_is_replaced(tmp_path, valid_experiment_spec):
+def test_output_manifest_output_path_is_experiment_spec_path(tmp_path, valid_experiment_spec):
     """
-    output_manifest[].output_path is replaced from <runner_output_json>
-    placeholder to the actual output path in write_runner_output.
+    output_manifest[].output_path is the experiment spec path (not a
+    placeholder), so that content_hash genuinely hashes the file named
+    by output_path. This is the honest semantics for the dry-run skeleton.
     """
     output_path = tmp_path / "runner_output.json"
 
@@ -894,7 +986,8 @@ def test_output_manifest_output_path_is_replaced(tmp_path, valid_experiment_spec
     with open(output_path) as fh:
         loaded = json.load(fh)
 
-    assert loaded["output_manifest"][0]["output_path"] == str(output_path)
+    # output_path must be the experiment spec path (not a placeholder)
+    assert loaded["output_manifest"][0]["output_path"] == str(valid_experiment_spec)
     assert "<runner_output_json>" not in loaded["output_manifest"][0]["output_path"]
 
 
