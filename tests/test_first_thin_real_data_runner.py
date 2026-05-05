@@ -1316,7 +1316,8 @@ class TestObservationTableValidation:
         assert artifact["failure_summary"] is None
 
     def test_required_columns_missing_csv_failed_validation(self, tmp_path):
-        """Required columns missing from CSV → status=failed_validation."""
+        """Required columns missing from CSV → raises GovernanceRejection with
+        failed_validation artifact preserving audit_summary (blocker_count=1)."""
         csv_file = tmp_path / "prices.csv"
         csv_file.write_text("date,symbol\n2024-01-01,AAPL\n2024-01-02,AAPL\n")
         manifest_file = tmp_path / "data_manifest.json"
@@ -1328,11 +1329,13 @@ class TestObservationTableValidation:
             "format": "csv",
         }))
         spec = _make_spec_with_dm_refs(tmp_path)
-        artifact = build_runner_output(
-            experiment_spec_path=spec,
-            data_manifest_path=manifest_file,
-            required_observation_columns=["date", "symbol", "close"],
-        )
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
         assert artifact["status"] == "failed_validation"
         assert artifact["failure_summary"] is not None
 
@@ -1349,11 +1352,13 @@ class TestObservationTableValidation:
             "format": "csv",
         }))
         spec = _make_spec_with_dm_refs(tmp_path)
-        artifact = build_runner_output(
-            experiment_spec_path=spec,
-            data_manifest_path=manifest_file,
-            required_observation_columns=["date", "symbol", "close"],
-        )
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
         blocker = artifact["failure_summary"]["blocker_summary"]
         assert "close" in blocker
 
@@ -1618,7 +1623,11 @@ class TestObservationTableValidation:
         jsonschema.validate(artifact, schema, format_checker=checker)
 
     def test_failed_validation_artifact_schema_validates_with_missing_columns(self, tmp_path):
-        """Failed-validation artifact with missing columns validates against schema."""
+        """Failed-validation artifact with missing columns validates against schema.
+
+        Missing CSV columns are a blocking governance failure → GovernanceRejection.
+        The artifact inside the exception validates against the schema.
+        """
         pytest.importorskip("jsonschema")
         import jsonschema
         from jsonschema import FormatChecker
@@ -1634,11 +1643,13 @@ class TestObservationTableValidation:
             "format": "csv",
         }))
         spec = _make_spec_with_dm_refs(tmp_path)
-        artifact = build_runner_output(
-            experiment_spec_path=spec,
-            data_manifest_path=manifest_file,
-            required_observation_columns=["date", "symbol", "close"],
-        )
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                required_observation_columns=["date", "symbol", "close"],
+            )
+        artifact = exc_info.value.artifact
         assert artifact["status"] == "failed_validation"
         schema = json.loads(SCHEMA_PATH.read_text())
         checker = FormatChecker()
@@ -2043,7 +2054,12 @@ def test_invalid_data_manifest_produces_failed_validation_artifact(tmp_path, inv
 
 
 def test_invalid_data_manifest_audit_includes_data_manifest_validation(tmp_path, invalid_data_manifest_bad_role):
-    """audit_summary includes data_manifest_validation audit with fail result."""
+    """audit_summary includes data_manifest_validation audit with fail result.
+
+    data_manifest_validation is a user-level data validation failure, NOT a
+    governance blocker. blocker_count=0 so it does not inflate governance
+    blocker counts (e.g., autonomous_search violations).
+    """
     spec = tmp_path / "spec.json"
     spec.write_text(json.dumps({
         "experiment_id": "EXP-2026-0001",
@@ -2067,7 +2083,8 @@ def test_invalid_data_manifest_audit_includes_data_manifest_validation(tmp_path,
     assert "data_manifest_validation" in audit_names
     dm_audit = next(a for a in artifact["audit_summary"]["audits"] if a["audit_name"] == "data_manifest_validation")
     assert dm_audit["audit_result"] == "fail"
-    assert dm_audit["blocker_count"] == 1
+    # data_manifest_validation is a user validation failure, not a governance blocker
+    assert dm_audit["blocker_count"] == 0
 
 
 # -----------------------------------------------------------------------

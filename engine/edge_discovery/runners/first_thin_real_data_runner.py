@@ -94,12 +94,12 @@ def _compute_run_config_hash(
         combined = spec_canonical
 
     # Incorporate required_observation_columns into hash when present.
-    # Normalize to sorted, whitespace-stripped list for deterministic ordering.
-    # Strip ALL whitespace (not just leading/trailing) so "symbol , close" and
-    # "symbol,close" both become "symbol,close".
+    # Incorporate required_observation_columns into hash when present.
+    # Strip leading/trailing whitespace per token; preserve internal whitespace.
+    # "close price" and "closeprice" are distinct. " close " and "close" are same.
     if required_observation_columns is not None and len(required_observation_columns) > 0:
         normalized = json.dumps(
-            sorted("".join(c.split()) for c in required_observation_columns),
+            sorted(c.strip() for c in required_observation_columns),
             separators=(",", ":"),
         ).encode("utf-8")
         combined = combined + b"\n" + normalized
@@ -395,7 +395,165 @@ class GovernanceRejection(Exception):
         self.message = message
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# DataManifest validation failure handler
+# --------------------------------------------------------------------------
+
+def _handle_data_manifest_validation_failure(
+    experiment_spec: dict,
+    experiment_spec_path: Path,
+    created_at: str,
+    required_observation_columns: list[str] | None,
+    failure_type: str,
+    exc: Exception,
+) -> tuple[dict, int]:
+    """
+    Build and return a (partial_failed_validation_artifact, governance_blocker_count)
+    tuple when DataManifest loading fails (file missing, KeyError, or unsupported
+    format error).
+
+    Appends data_manifest_validation audit to governance audits and
+    builds failure_summary with the caller-supplied failure_type
+    (e.g. "validation_error" for missing files, "unsupported_config" for
+    unsupported format + required_observation_columns).
+
+    Returns
+    -------
+    tuple[dict, int]
+        (artifact_dict, governance_blocker_count).
+        The caller should:
+        - If governance_blocker_count > 0: raise GovernanceRejection with artifact.
+        - If governance_blocker_count == 0: return artifact directly (failed_validation).
+    """
+    now = _utc_now()
+    spec_content_hash = _compute_content_hash(experiment_spec_path)
+    run_config_hash_partial = _compute_run_config_hash(
+        experiment_spec_path, None, required_observation_columns
+    )
+    run_id_partial = _compute_run_id(run_config_hash_partial)
+
+    spec_dm_refs = experiment_spec.get("data_manifest_refs", None)
+    if spec_dm_refs and len(spec_dm_refs) > 0:
+        data_manifest_refs_list = spec_dm_refs
+    else:
+        data_manifest_refs_list = [DRY_RUN_DATA_MANIFEST_PLACEHOLDER]
+
+    input_artifact_refs = [
+        {
+            "artifact_type": "ExperimentSpec",
+            "artifact_id": experiment_spec["experiment_id"],
+            "artifact_path": (
+                str(experiment_spec_path.resolve())
+                if experiment_spec_path.is_absolute()
+                else str(experiment_spec_path)
+            ),
+            "schema_ref": "schemas/experiment_spec_v1.schema.json",
+            "validator_ref": None,
+            "content_hash": f"sha256:{spec_content_hash}",
+            "validation_status": "pass",
+            "validated_at": created_at,
+        }
+    ]
+
+    # Governance audit — run it here so blockers (e.g. autonomous_search) are
+    # preserved in the artifact even when DataManifest loading fails.
+    # data_manifest_validation is appended to audit_summary.audits as a non-blocker
+    # (blocker_count=0) so it appears in audit output but does NOT inflate
+    # the governance blocker_count that triggers GovernanceRejection.
+    governance_audit_summary = _audit_dry_run(
+        experiment_spec,
+        experiment_spec_path,
+        run_config_hash_partial,
+    )
+
+    # Append data_manifest_validation failure as non-blocker entry
+    # (blocker_count=0 so it doesn't affect governance blocker_count)
+    new_audits = list(governance_audit_summary["audits"])
+    new_audits.append({
+        "audit_name": "data_manifest_validation",
+        "audit_result": "fail",
+        "severity": "blocker",
+        "blocker_count": 0,  # NOT a governance blocker — user validation failure
+        "warning_count": 0,
+        "details_ref": None,
+        "created_at": now,
+    })
+    governance_audit_summary = {
+        "overall_result": governance_audit_summary["overall_result"],
+        "blocker_count": governance_audit_summary["blocker_count"],  # unchanged
+        "warning_count": governance_audit_summary["warning_count"],
+        "audits": new_audits,
+    }
+
+    # Build failure_summary with schema-compliant failure_type
+    # data_manifest_validation failure goes into blocker_summary (not audit_summary)
+    failing_checks = [a["audit_name"] for a in governance_audit_summary["audits"] if a["audit_result"] == "fail"]
+    blocker_parts = [f"Validation failed: {', '.join(failing_checks)}."]
+    if required_observation_columns is not None:
+        blocker_parts.append(
+            f"required_observation_columns could not be validated "
+            f"(format unsupported for column checks)."
+        )
+    blocker_summary_str = " ".join(blocker_parts)
+
+    failure_summary = {
+        "failure_type": failure_type,
+        "status": "failed_validation",
+        "failed_check": ", ".join(failing_checks) or None,
+        "blocker_summary": blocker_summary_str,
+        "missing_data_summary_ref": None,
+        "details_ref": None,
+        "created_at": now,
+    }
+
+    output_manifest = [
+        {
+            "output_role": "evidence",
+            "output_path": (
+                str(experiment_spec_path.resolve())
+                if experiment_spec_path.is_absolute()
+                else str(experiment_spec_path)
+            ),
+            "row_count": None,
+            "content_hash": f"sha256:{spec_content_hash}",
+            "created_at": created_at,
+            "format": "json",
+            "description": (
+                "Input experiment spec referenced by this dry-run artifact. "
+                "Content hash is of the experiment spec JSON file, providing "
+                "a stable content identifier for the input governance document."
+            ),
+            "contains_private_data": False,
+            "publishable": False,
+        }
+    ]
+
+    failed_artifact = {
+        "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+        "runner_output_version": RUNNER_OUTPUT_VERSION,
+        "run_id": run_id_partial,
+        "run_mode": "dry_run",
+        "status": "failed_validation",
+        "runner_name": RUNNER_NAME_DEFAULT,
+        "runner_version": RUNNER_VERSION_DEFAULT,
+        "experiment_spec_ref": experiment_spec["experiment_id"],
+        "input_artifact_refs": input_artifact_refs,
+        "data_manifest_refs": data_manifest_refs_list,
+        "run_config_hash": f"sha256:{run_config_hash_partial}",
+        "started_at": created_at,
+        "completed_at": now,
+        "audit_summary": governance_audit_summary,
+        "output_manifest": output_manifest,
+        "created_at": created_at,
+        "run_owner": "unknown",  # Not available at partial-artifact stage
+        "failure_summary": failure_summary,
+        "partial_summary": None,
+    }
+
+    return (failed_artifact, governance_audit_summary["blocker_count"])
+
+
+# -----------------------------------------------------------------------------
 # Audit
 # ---------------------------------------------------------------------------
 
@@ -637,113 +795,44 @@ def build_runner_output(
                 manifest_path=data_manifest_path,
                 base_dir=manifest_base_dir,
             )
-        except (FileNotFoundError, ValueError, KeyError) as exc:
-            # DataManifest validation failed — emit failed_validation artifact
-            # with the error in the failure_summary.
-            spec_content_hash = _compute_content_hash(experiment_spec_path)
-            run_config_hash_partial = _compute_run_config_hash(
-                experiment_spec_path, None, required_observation_columns
+        except (FileNotFoundError, KeyError) as exc:
+            # DataManifest file missing or schema KeyError → validation_error
+            failure_type = "validation_error"
+            partial_artifact, governance_blocker_count = (
+                _handle_data_manifest_validation_failure(
+                    experiment_spec, experiment_spec_path, created_at,
+                    required_observation_columns, failure_type, exc,
+                )
             )
-            run_id_partial = _compute_run_id(run_config_hash_partial)
-
-            input_artifact_refs = [
-                {
-                    "artifact_type": "ExperimentSpec",
-                    "artifact_id": experiment_spec["experiment_id"],
-                    "artifact_path": (
-                        str(experiment_spec_path.resolve())
-                        if experiment_spec_path.is_absolute()
-                        else str(experiment_spec_path)
-                    ),
-                    "schema_ref": "schemas/experiment_spec_v1.schema.json",
-                    "validator_ref": None,
-                    "content_hash": f"sha256:{spec_content_hash}",
-                    "validation_status": "pass",
-                    "validated_at": created_at,
-                }
-            ]
-
-            spec_dm_refs = experiment_spec.get("data_manifest_refs", None)
-            if spec_dm_refs and len(spec_dm_refs) > 0:
-                data_manifest_refs = spec_dm_refs
+            if governance_blocker_count > 0:
+                raise GovernanceRejection(
+                    partial_artifact,
+                    f"DataManifest validation failed ({failure_type}): {exc}",
+                )
+            return partial_artifact
+        except ValueError as exc:
+            # ValueError may be from unsupported format + required_observation_columns,
+            # or from other DataManifest validation errors. Distinguish by message.
+            if (
+                required_observation_columns is not None
+                and "required_observation_columns is only supported for CSV"
+                in str(exc)
+            ):
+                failure_type = "unsupported_config"
             else:
-                data_manifest_refs = [DRY_RUN_DATA_MANIFEST_PLACEHOLDER]
-
-            # Governance audit (should pass for missing/invalid DataManifest
-            # unless other blockers exist)
-            audit_summary = _audit_dry_run(
-                experiment_spec,
-                experiment_spec_path,
-                run_config_hash_partial,
+                failure_type = "validation_error"
+            partial_artifact, governance_blocker_count = (
+                _handle_data_manifest_validation_failure(
+                    experiment_spec, experiment_spec_path, created_at,
+                    required_observation_columns, failure_type, exc,
+                )
             )
-
-            data_manifest_audit_failing = True
-            new_audits = list(audit_summary["audits"])
-            new_audits.append({
-                "audit_name": "data_manifest_validation",
-                "audit_result": "fail",
-                "severity": "blocker",
-                "blocker_count": 1,
-                "warning_count": 0,
-                "details_ref": None,
-                "created_at": created_at,
-            })
-            audit_summary = {
-                "overall_result": "fail",
-                "blocker_count": audit_summary["blocker_count"] + 1,
-                "warning_count": 0,
-                "audits": new_audits,
-            }
-
-            failure_summary = _build_failure_summary(
-                audit_summary,
-                "failed_validation",
-                observation_missing_columns=None,
-            )
-
-            output_manifest = [
-                {
-                    "output_role": "evidence",
-                    "output_path": (
-                        str(experiment_spec_path.resolve())
-                        if experiment_spec_path.is_absolute()
-                        else str(experiment_spec_path)
-                    ),
-                    "row_count": None,
-                    "content_hash": f"sha256:{spec_content_hash}",
-                    "created_at": created_at,
-                    "format": "json",
-                    "description": (
-                        "Input experiment spec referenced by this dry-run artifact. "
-                        "Content hash is of the experiment spec JSON file, providing "
-                        "a stable content identifier for the input governance document."
-                    ),
-                    "contains_private_data": False,
-                    "publishable": False,
-                }
-            ]
-
-            return {
-                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
-                "runner_output_version": RUNNER_OUTPUT_VERSION,
-                "run_id": run_id_partial,
-                "run_mode": "dry_run",
-                "status": "failed_validation",
-                "runner_name": runner_name,
-                "runner_version": runner_version,
-                "experiment_spec_ref": experiment_spec["experiment_id"],
-                "input_artifact_refs": input_artifact_refs,
-                "data_manifest_refs": data_manifest_refs,
-                "run_config_hash": f"sha256:{run_config_hash_partial}",
-                "started_at": started_at,
-                "completed_at": completed_at,
-                "audit_summary": audit_summary,
-                "output_manifest": output_manifest,
-                "created_at": created_at,
-                "run_owner": run_owner,
-                "failure_summary": failure_summary,
-                "partial_summary": None,
-            }
+            if governance_blocker_count > 0:
+                raise GovernanceRejection(
+                    partial_artifact,
+                    f"DataManifest validation failed ({failure_type}): {exc}",
+                )
+            return partial_artifact
 
     # Deterministic hashes — include DataManifest content and required columns when present
     run_config_hash = _compute_run_config_hash(
@@ -819,7 +908,7 @@ def build_runner_output(
     # Observation-table column validation (only for CSV format).
     # Performed AFTER successful DataManifest loading, AFTER output_manifest is built.
     # - ValueError for non-CSV format propagates to caller (tests assert on this).
-    # - Missing columns → return failed_validation artifact (NOT GovernanceRejection).
+    # - Missing columns → append to audit_summary, raise GovernanceRejection.
     # - Columns present → add pass audit entry to audit_summary (non-blocker).
     observation_validation_passed = False
     observation_missing_columns: list[str] = []
@@ -836,8 +925,9 @@ def build_runner_output(
         observation_missing_columns = missing
         observation_validation_passed = ok
 
-        # Missing columns → return failed_validation artifact directly (not GovernanceRejection).
-        # observation_table shape is a data contract, not a governance rule.
+        # Missing columns → append observation_table_shape_validation failure
+        # to the existing audit_summary (preserving any prior governance blockers
+        # such as autonomous_search). blocker_count is recalculated from all audits.
         if not observation_validation_passed:
             now = _utc_now()
             obs_audit_entry = {
@@ -849,18 +939,56 @@ def build_runner_output(
                 "details_ref": None,
                 "created_at": now,
             }
-            obs_audit_summary = {
-                "overall_result": "fail",
-                "blocker_count": 1,
-                "warning_count": 0,
-                "audits": [obs_audit_entry],
-            }
-            failure_summary = _build_failure_summary(
-                obs_audit_summary,
-                "failed_validation",
-                observation_missing_columns=observation_missing_columns,
+            new_audits = list(audit_summary["audits"])
+            new_audits.append(obs_audit_entry)
+            # Recalculate blocker_count from all audits (governance + observation)
+            total_blockers = sum(
+                a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
             )
-            return {
+            audit_summary = {
+                "overall_result": "fail",
+                "blocker_count": total_blockers,
+                "warning_count": audit_summary["warning_count"],
+                "audits": new_audits,
+            }
+            # Build failure_summary with all blockers (governance + observation)
+            blocker_parts = [
+                f"observation_table_column_validation: missing columns {observation_missing_columns!r}"
+            ]
+            for a in new_audits:
+                if a["audit_result"] == "fail" and a["audit_name"] != "observation_table_shape_validation":
+                    blocker_parts.append(f"{a['audit_name']}")
+            failure_summary = {
+                "failure_type": "validation_error",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing for failing in [a["audit_name"] for a in new_audits if a["audit_result"] == "fail"]),
+                "blocker_summary": "; ".join(blocker_parts) + f"; Total blockers: {total_blockers}.",
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            # Build full runner output artifact for GovernanceRejection
+            # Include experiment spec in output_manifest (schema requires minItems: 1)
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": (
+                    "Input experiment spec referenced by this dry-run artifact. "
+                    "Content hash is of the experiment spec JSON file, providing "
+                    "a stable content identifier for the input governance document."
+                ),
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
                 "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
                 "runner_output_version": RUNNER_OUTPUT_VERSION,
                 "run_id": run_id,
@@ -874,33 +1002,19 @@ def build_runner_output(
                 "run_config_hash": f"sha256:{run_config_hash}",
                 "started_at": started_at,
                 "completed_at": completed_at,
-                "audit_summary": obs_audit_summary,
-                "output_manifest": [
-                    {
-                        "output_role": "evidence",
-                        "output_path": (
-                            str(experiment_spec_path.resolve())
-                            if experiment_spec_path.is_absolute()
-                            else str(experiment_spec_path)
-                        ),
-                        "row_count": None,
-                        "content_hash": f"sha256:{spec_content_hash}",
-                        "created_at": created_at,
-                        "format": "json",
-                        "description": (
-                            "Input experiment spec referenced by this dry-run artifact. "
-                            "Content hash is of the experiment spec JSON file, providing "
-                            "a stable content identifier for the input governance document."
-                        ),
-                        "contains_private_data": False,
-                        "publishable": False,
-                    }
-                ],
+                "audit_summary": audit_summary,
+                "output_manifest": [spec_entry],
                 "created_at": created_at,
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
             }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"Run blocked by {total_blockers} blocker(s): "
+                f"observation_table_column_validation: missing columns "
+                f"{observation_missing_columns!r}.",
+            )
         # Columns present → add pass audit entry (non-blocker; no GovernanceRejection)
         now = _utc_now()
         obs_audit_entry = {
