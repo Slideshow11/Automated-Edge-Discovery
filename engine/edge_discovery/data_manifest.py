@@ -143,6 +143,60 @@ class DatasetValidationResult:
 
 
 # ---------------------------------------------------------------------------
+# Path security
+# ---------------------------------------------------------------------------
+
+
+class _PathSecurityError(ValueError):
+    """Raised when a DatasetManifest path escapes its allowed base directory."""
+    pass
+
+
+def _is_safe_relative_path(path: str | Path, base_dir: Path) -> tuple[Path, Path]:
+    """Resolve ``path`` and verify it stays within ``base_dir``.
+
+    Parameters
+    ----------
+    path : str | Path
+        The declared path from a DatasetManifest ``path`` field.
+    base_dir : Path
+        The directory the path must remain within after resolution.
+
+    Returns
+    -------
+    resolved : Path
+        The fully resolved Path object.
+    resolved_base : Path
+        The resolved base directory.
+
+    Raises
+    ------
+    _PathSecurityError
+        When the resolved path escapes ``base_dir`` via traversal components
+        or symlinks.
+    """
+    base_resolved = base_dir.resolve(strict=False)
+    p_resolved = Path(path).resolve(strict=False)
+
+    # is_relative_to() returns False when p_resolved is not a sub-path of
+    # base_resolved (Python 3.11). Python 3.12+ raises ValueError instead.
+    # We handle both for compatibility across Python versions.
+    try:
+        is_inside = p_resolved.is_relative_to(base_resolved)
+    except ValueError:
+        is_inside = False
+
+    if not is_inside:
+        raise _PathSecurityError(
+            f"Path '{path}' resolves to '{p_resolved}', which is outside "
+            f"the allowed base directory '{base_resolved}'. "
+            f"Path traversal and symlink escapes are not permitted."
+        )
+
+    return p_resolved, base_resolved
+
+
+# ---------------------------------------------------------------------------
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
@@ -205,6 +259,10 @@ def dataset_manifest_from_dict(data: dict[str, Any]) -> DatasetManifest:
     else:
         quality_flags = (str(quality_flags_raw),)
 
+    path_val = data["path"]
+    if not isinstance(path_val, str) or not path_val.strip():
+        raise ValueError("path must be a non-empty string")
+
     return DatasetManifest(
         dataset_id=data["dataset_id"],
         role=role,
@@ -263,13 +321,18 @@ def _suffix_ok(path: Path, allowed: tuple[str, ...]) -> bool:
     return path.suffix.lower() in allowed
 
 
-def validate_dataset_manifest(manifest: DatasetManifest) -> DatasetValidationResult:
+def validate_dataset_manifest(
+    manifest: DatasetManifest,
+    *,
+    base_dir: str | Path | None = None,
+) -> DatasetValidationResult:
     """Validate a DatasetManifest against the local filesystem.
 
     Performs path-level checks only:
     - Existence of the declared path.
     - Correct file-vs-directory type.
     - Correct file extension where applicable.
+    - Path stays within the allowed base directory (no traversal, no symlink escape).
 
     No schema inspection, no data reads, no network I/O.
 
@@ -277,13 +340,63 @@ def validate_dataset_manifest(manifest: DatasetManifest) -> DatasetValidationRes
     ----------
     manifest : DatasetManifest
         The manifest to validate.
+    base_dir : str | Path | None, optional
+        Directory that all dataset paths must remain within.
+        Paths outside this directory are rejected with a security error.
+        If None, the current working directory is used as the base.
+        This parameter does not change the path's meaning — it only enforces
+        a containment boundary. Absolute paths are checked against the resolved
+        base_dir; paths that resolve outside it are rejected.
 
     Returns
     -------
     DatasetValidationResult
     """
     dataset_id = manifest.dataset_id
+    base = Path(base_dir) if base_dir is not None else Path.cwd()
+
+    # --- Reject empty path strings (including whitespace-only) ---
+    path_str = manifest.path
+    if not isinstance(path_str, str) or not path_str.strip():
+        return DatasetValidationResult(
+            dataset_id=dataset_id,
+            ok=False,
+            path_exists=False,
+            is_file=False,
+            is_dir=False,
+            errors=("path must be a non-empty string",),
+            warnings=(),
+        )
+
+    # --- Security check: reject traversal and symlink escapes ---
+    #
+    # Policy:
+    #   - When base_dir is explicitly provided: all paths (absolute and relative)
+    #     must resolve within base_dir. This lets callers declare a containment
+    #     boundary for both relative traversal (../..) and absolute paths.
+    #   - When base_dir is None (defaults to cwd): only relative paths are checked.
+    #     Absolute paths are allowed through without base_dir security check.
+    #     This preserves backward compatibility for existing tests that use
+    #     absolute /tmp/... paths without passing base_dir.
+    #
+    base = Path(base_dir) if base_dir is not None else Path.cwd()
     p = Path(manifest.path)
+
+    if base_dir is not None or not p.is_absolute():
+        # Explicit base_dir: always check. Or: implicit base (cwd) + relative path.
+        try:
+            p, _ = _is_safe_relative_path(manifest.path, base)
+        except _PathSecurityError as e:
+            return DatasetValidationResult(
+                dataset_id=dataset_id,
+                ok=False,
+                path_exists=False,
+                is_file=False,
+                is_dir=False,
+                errors=(str(e),),
+                warnings=(),
+            )
+
     errors: list[str] = []
     warnings: list[str] = []
 

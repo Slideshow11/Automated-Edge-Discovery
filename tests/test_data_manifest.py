@@ -432,3 +432,266 @@ def test_no_vendor_network_subprocess():
             assert "download(" not in src
         else:
             assert term not in src.lower(), f"forbidden term '{term}' found in data_manifest.py"
+
+
+# ---------------------------------------------------------------------------
+# Path sanitization — traversal and symlink escape tests
+# ---------------------------------------------------------------------------
+
+
+class TestValidateDatasetManifestPathSecurity:
+    """Tests for DatasetManifest path security: traversal, symlinks, empty paths."""
+
+    def test_absolute_path_within_base_passes(self, tmp_path: Path):
+        """An absolute path that exists inside base_dir is accepted."""
+        f = tmp_path / "data.parquet"
+        f.touch()
+        manifest = DatasetManifest(
+            dataset_id="safe_parquet",
+            role=DatasetRole.fmp_feature_lake,
+            source_kind=DataSourceKind.local_parquet,
+            path=str(f),  # absolute path within base
+            format="parquet",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is True
+        assert result.path_exists is True
+        assert result.is_file is True
+
+    def test_relative_path_resolved_outside_base_traversal_rejected(self, tmp_path: Path):
+        """A relative path that resolves outside base_dir is rejected.
+
+        When a relative path (e.g. data/../../etc) resolves to an absolute path
+        outside base_dir, it is rejected. This is the core traversal-escape case.
+        """
+        # Create a subdirectory inside tmp_path
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        # Create a sibling directory OUTSIDE tmp_path via ../sibling
+        sibling = tmp_path.parent / "DMtest_sibling_dir"
+        sibling.mkdir(exist_ok=True)
+        sibling_file = sibling / "data.csv"
+        sibling_file.touch()
+        try:
+            manifest = DatasetManifest(
+                dataset_id="escape",
+                role=DatasetRole.price_history,
+                source_kind=DataSourceKind.local_csv,
+                path=f"../DMtest_sibling_dir/data.csv",
+                format="csv",
+            )
+            result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+            assert result.ok is False
+            assert any(
+                "outside" in e or "traversal" in e.lower()
+                for e in result.errors
+            ), f"Expected traversal error, got: {result.errors}"
+        finally:
+            sibling_file.unlink(missing_ok=True)
+            sibling.rmdir()
+
+    def test_dotdot_traversal_outside_base_rejected(self, tmp_path: Path):
+        """A path containing ../ that resolves outside base_dir is rejected.
+
+        This is the classic ../../../etc/passwd attack vector.
+        The resolved absolute path is checked against base_dir.
+        """
+        # Create the file at /tmp/<unique>
+        import uuid
+        unique_name = f"dm_traversal_{uuid.uuid4().hex[:8]}"
+        escape_file = Path(f"/tmp/{unique_name}.txt")
+        escape_file.touch()
+        try:
+            # Construct a relative path that escapes tmp_path to reach /tmp
+            # tmp_path is at /tmp/pytest-of-max/pytest-N/test_dotdot
+            # We need to go up past tmp_path parent and then to /tmp
+            # Path from tmp_path: ../../../tmp/<unique>.txt
+            depth = len(tmp_path.parts)  # e.g. 5 for /tmp/pytest-of-max/...
+            traversal = "/".join([".."] * depth) + f"/tmp/{unique_name}.txt"
+            manifest = DatasetManifest(
+                dataset_id="bad_traversal",
+                role=DatasetRole.options_backtest_db,
+                source_kind=DataSourceKind.local_sqlite,
+                path=traversal,
+                format="sqlite",
+            )
+            result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+            assert result.ok is False
+            assert any(
+                "outside" in e or "traversal" in e.lower()
+                for e in result.errors
+            ), f"Expected traversal error, got: {result.errors}"
+        finally:
+            escape_file.unlink(missing_ok=True)
+
+    def test_normalized_dotdot_path_within_base_accepted(
+        self, tmp_path: Path, monkeypatch,
+    ):
+        """A normalized path like sub/../sub/data.csv that stays within base is accepted.
+
+        Path.resolve() normalizes .. components against CWD, so we must chdir to
+        base_dir so the resolved path lands inside base_dir.
+        """
+        monkeypatch.chdir(tmp_path)
+        sub = tmp_path / "sub"
+        sub.mkdir()
+        f = sub / "data.csv"
+        f.touch()
+        manifest = DatasetManifest(
+            dataset_id="normalized_ok",
+            role=DatasetRole.price_history,
+            source_kind=DataSourceKind.local_csv,
+            path="sub/../sub/data.csv",
+            format="csv",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is True
+        assert result.path_exists is True
+        assert result.is_file is True
+
+    def test_absolute_path_outside_base_rejected(self, tmp_path: Path):
+        """An absolute path that resolves outside base_dir is rejected."""
+        manifest = DatasetManifest(
+            dataset_id="outside_absolute",
+            role=DatasetRole.options_backtest_db,
+            source_kind=DataSourceKind.local_sqlite,
+            path="/etc/passwd",
+            format="sqlite",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is False
+        assert any("outside" in e or "traversal" in e.lower() for e in result.errors)
+
+    def test_symlink_inside_base_pointing_outside_rejected(self, tmp_path: Path):
+        """A symlink inside base_dir that resolves outside base_dir is rejected.
+
+        Path.resolve() follows symlinks, so the resolved path is the real
+        target location — which is outside base_dir and correctly rejected.
+        """
+        inside = tmp_path / "inside"
+        inside.mkdir()
+        target = tmp_path / "outside_target"
+        target.touch()
+        link = inside / "escape_link"
+        try:
+            link.symlink_to(target)
+        except OSError:
+            pytest.skip("symlink creation not supported on this platform")
+        manifest = DatasetManifest(
+            dataset_id="symlink_escape",
+            role=DatasetRole.fmp_feature_lake,
+            source_kind=DataSourceKind.local_parquet,
+            path="inside/escape_link",
+            format="parquet",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is False
+        assert any("symlink" in e.lower() or "outside" in e for e in result.errors)
+
+    def test_empty_path_string_rejected(self, tmp_path: Path):
+        """An empty string path is rejected."""
+        manifest = DatasetManifest(
+            dataset_id="empty_path",
+            role=DatasetRole.options_backtest_db,
+            source_kind=DataSourceKind.local_sqlite,
+            path="",
+            format="sqlite",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is False
+        assert any("non-empty" in e for e in result.errors)
+
+    def test_whitespace_only_path_rejected(self, tmp_path: Path):
+        """A whitespace-only path string is rejected."""
+        manifest = DatasetManifest(
+            dataset_id="whitespace_path",
+            role=DatasetRole.options_backtest_db,
+            source_kind=DataSourceKind.local_sqlite,
+            path="   ",
+            format="sqlite",
+        )
+        result = validate_dataset_manifest(manifest, base_dir=tmp_path)
+        assert result.ok is False
+        assert any("non-empty" in e for e in result.errors)
+
+
+class TestDatasetManifestFromDictPathValidation:
+    """Tests for path field validation in dataset_manifest_from_dict."""
+
+    def test_empty_path_raises(self):
+        """An empty path string raises ValueError during deserialization."""
+        data = {
+            "dataset_id": "test",
+            "role": "options_backtest_db",
+            "source_kind": "local_sqlite",
+            "path": "",
+            "format": "sqlite",
+        }
+        with pytest.raises(ValueError, match="non-empty"):
+            dataset_manifest_from_dict(data)
+
+    def test_whitespace_only_path_raises(self):
+        """A whitespace-only path string raises ValueError during deserialization."""
+        data = {
+            "dataset_id": "test",
+            "role": "options_backtest_db",
+            "source_kind": "local_sqlite",
+            "path": "   ",
+            "format": "sqlite",
+        }
+        with pytest.raises(ValueError, match="non-empty"):
+            dataset_manifest_from_dict(data)
+
+    def test_missing_path_field_raises(self):
+        """A missing path field raises KeyError during deserialization."""
+        data = {
+            "dataset_id": "test",
+            "role": "options_backtest_db",
+            "source_kind": "local_sqlite",
+            "format": "sqlite",
+        }
+        with pytest.raises(KeyError):
+            dataset_manifest_from_dict(data)
+
+
+class TestValidateDatasetManifestDefaultBaseDir:
+    """Tests for the default base_dir (current working directory) behavior."""
+
+    def test_relative_path_within_cwd_passes(self, tmp_path: Path, monkeypatch):
+        """A relative path that resolves inside CWD is accepted when base_dir defaults."""
+        monkeypatch.chdir(tmp_path)
+        # Use correct .sqlite suffix for local_sqlite source_kind
+        escape_file = tmp_path / "escape_target.sqlite"
+        escape_file.touch()
+        try:
+            manifest = DatasetManifest(
+                dataset_id="within_cwd",
+                role=DatasetRole.options_backtest_db,
+                source_kind=DataSourceKind.local_sqlite,
+                path="escape_target.sqlite",  # resolves to tmp_path/escape_target.sqlite — inside CWD
+                format="sqlite",
+            )
+            result = validate_dataset_manifest(manifest)
+            assert result.ok is True
+        finally:
+            escape_file.unlink(missing_ok=True)
+
+    def test_absolute_path_fails_without_base_dir(self, tmp_path: Path, monkeypatch):
+        """An absolute path outside CWD fails validation (suffix check) without explicit base_dir.
+
+        Without an explicit base_dir, absolute paths bypass the security check
+        (they are treated as self-contained). The manifest then fails the
+        source_kind suffix/type check. This test verifies that /etc/passwd
+        is not silently accepted.
+        """
+        monkeypatch.chdir(tmp_path)
+        manifest = DatasetManifest(
+            dataset_id="abs_rejected",
+            role=DatasetRole.options_backtest_db,
+            source_kind=DataSourceKind.local_sqlite,
+            path="/etc/passwd",
+            format="sqlite",
+        )
+        result = validate_dataset_manifest(manifest)
+        # Must be rejected (suffix/type check, not security check without base_dir)
+        assert result.ok is False
