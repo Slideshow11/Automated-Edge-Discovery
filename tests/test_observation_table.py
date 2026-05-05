@@ -461,8 +461,8 @@ class TestSummarizeObservationCloseReturns:
         )
         result = _summarize_observation_close_returns(path, "date", "symbol", "close")
         details_lower = result["details"].lower()
-        assert "AAPL" not in details_lower
-        assert "MSFT" not in details_lower
+        assert "aapl" not in details_lower
+        assert "msft" not in details_lower
         assert "symbols_with_return=2" in result["details"]
 
     def test_details_format_stable(self, tmp_path):
