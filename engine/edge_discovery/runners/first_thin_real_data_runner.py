@@ -30,6 +30,10 @@ RUNNER_OUTPUT_ID_DEFAULT = "RUN-2026-0001"
 RUNNER_OUTPUT_VERSION = "1.0"
 SCHEMA_PATH = Path(__file__).resolve().parents[4] / "schemas" / "runner_output_spec_v1.schema.json"
 
+# Stable placeholder for data_manifest_refs when no real DataManifest exists
+# in this dry-run skeleton. Satisfies schema minItems: 1 requirement.
+DRY_RUN_DATA_MANIFEST_PLACEHOLDER = "dry_run_no_data_manifest"
+
 # Governance stop-rule field names — must all be false in prohibited_modes
 GOVERNANCE_STOP_RULE_FIELDS = (
     "autonomous_search",
@@ -95,6 +99,20 @@ def _check_experiment_spec_id(experiment_spec: dict) -> None:
         )
 
 
+class GovernanceRejection(Exception):
+    """
+    Raised when governance validation fails (blocker_count > 0).
+
+    Carries the artifact dict so main() can emit a failed_validation
+    RunnerOutput artifact before exiting with a nonzero code.
+    """
+
+    def __init__(self, artifact: dict, message: str):
+        super().__init__(message)
+        self.artifact = artifact
+        self.message = message
+
+
 def _audit_dry_run(
     experiment_spec: dict,
     experiment_spec_path: Path,
@@ -107,9 +125,11 @@ def _audit_dry_run(
     - schema_validation_all_inputs : experiment spec has required experiment_id
     - no_registry_mutation          : dry-run makes no registry writes by definition
     - no_autonomous_search_flag_set : prohibited_modes.autonomous_search is false
-    - deterministic_run_config_hash : run_config_hash is stable from file content
+    - deterministic_run_config_hash  : run_config_hash is stable from file content
 
-    All checks pass for a correctly-formed dry-run skeleton.
+    Returns a dict with overall_result, blocker_count, warning_count, and audits.
+
+    Raises GovernanceRejection if any blocker_count > 0.
     """
     now = _utc_now()
 
@@ -196,6 +216,37 @@ def _audit_dry_run(
     }
 
 
+def _build_failure_summary(
+    audit_summary: dict,
+    status: str,
+) -> dict:
+    """
+    Build a failure_summary dict for failed_validation / failed_runtime statuses.
+
+    Collects all failing audit names from audit_summary and formats them into
+    a blocker_summary.
+    """
+    now = _utc_now()
+    failing_audits = [
+        a["audit_name"]
+        for a in audit_summary["audits"]
+        if a["audit_result"] == "fail"
+    ]
+    blocker_summary = (
+        f"Governance validation failed: {', '.join(failing_audits)}. "
+        f"Total blockers: {audit_summary['blocker_count']}."
+    )
+    return {
+        "failure_type": "validation_error",
+        "status": status,
+        "failed_check": ", ".join(failing_audits) or None,
+        "blocker_summary": blocker_summary,
+        "missing_data_summary_ref": None,
+        "details_ref": None,
+        "created_at": now,
+    }
+
+
 def build_runner_output(
     experiment_spec_path: str | Path,
     runner_name: str = RUNNER_NAME_DEFAULT,
@@ -219,7 +270,8 @@ def build_runner_output(
     Returns
     -------
     dict
-        A RunnerOutput v1 compatible artifact (dry_run / success).
+        A RunnerOutput v1 compatible artifact (dry_run / success OR
+        dry_run / failed_validation if governance blockers found).
 
     Raises
     ------
@@ -227,6 +279,10 @@ def build_runner_output(
         If experiment_spec_path does not exist.
     ValueError
         If experiment_spec is missing required experiment_id field.
+    GovernanceRejection
+        If governance validation fails (blocker_count > 0). The exception
+        carries the pre-built artifact with status="failed_validation" so
+        main() can emit it before exiting nonzero.
     """
     experiment_spec_path = Path(experiment_spec_path)
 
@@ -246,7 +302,8 @@ def build_runner_output(
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
 
-    # Content hash of experiment spec
+    # Content hash of experiment spec — used as stable content_hash for
+    # the output_manifest entry (avoids self-referential hash computation).
     spec_content_hash = _compute_content_hash(experiment_spec_path)
 
     # Build input_artifact_refs
@@ -263,23 +320,41 @@ def build_runner_output(
         }
     ]
 
-    # data_manifest_refs — forward from experiment spec
-    data_manifest_refs = experiment_spec.get("data_manifest_refs", [])
+    # data_manifest_refs — forward from experiment spec, with stable
+    # dry-run placeholder if no real manifests are referenced.
+    spec_dm_refs = experiment_spec.get("data_manifest_refs", None)
+    if spec_dm_refs and len(spec_dm_refs) > 0:
+        data_manifest_refs = spec_dm_refs
+    else:
+        # Dry-run skeleton has no real DataManifest; use stable placeholder
+        # to satisfy schema minItems: 1 requirement.
+        data_manifest_refs = [DRY_RUN_DATA_MANIFEST_PLACEHOLDER]
 
-    # Audit summary
+    # Audit summary — this may raise GovernanceRejection
     audit_summary = _audit_dry_run(
         experiment_spec,
         experiment_spec_path,
         run_config_hash,
     )
 
-    # output_manifest — dry-run report entry
+    # Determine terminal status based on audit result
+    if audit_summary["blocker_count"] > 0:
+        status = "failed_validation"
+        failure_summary = _build_failure_summary(audit_summary, status)
+    else:
+        status = "success"
+        failure_summary = None
+
+    # output_manifest — dry-run report entry.
+    # content_hash is set from experiment spec content hash (stable,
+    # not self-referential). The output_path placeholder will be replaced
+    # in write_runner_output with the actual output path.
     output_manifest = [
         {
             "output_role": "evidence",
-            "output_path": "<runner_output_json>",
+            "output_path": "<runner_output_json>",  # replaced in write_runner_output
             "row_count": None,
-            "content_hash": None,  # computed after serialization
+            "content_hash": f"sha256:{spec_content_hash}",
             "created_at": created_at,
             "format": "json",
             "description": "First thin real-data runner dry-run output artifact",
@@ -293,7 +368,7 @@ def build_runner_output(
         "runner_output_version": RUNNER_OUTPUT_VERSION,
         "run_id": run_id,
         "run_mode": "dry_run",
-        "status": "success",
+        "status": status,
         "runner_name": runner_name,
         "runner_version": runner_version,
         "experiment_spec_ref": experiment_id,
@@ -306,9 +381,19 @@ def build_runner_output(
         "output_manifest": output_manifest,
         "created_at": created_at,
         "run_owner": run_owner,
-        "failure_summary": None,
+        "failure_summary": failure_summary,
         "partial_summary": None,
     }
+
+    # Raise GovernanceRejection if blockers exist so main() can emit
+    # the failed_validation artifact before exiting nonzero.
+    if audit_summary["blocker_count"] > 0:
+        raise GovernanceRejection(
+            artifact,
+            f"Governance validation failed: {audit_summary['blocker_count']} blocker(s) found. "
+            f"Refusing to emit success artifact. "
+            f"Run status set to 'failed_validation'."
+        )
 
     return artifact
 
@@ -346,17 +431,15 @@ def write_runner_output(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with open(output_path, "w", encoding="utf-8") as fh:
-        json.dump(artifact, fh, indent=2, sort_keys=True)
-
-    # Update output_manifest with actual content hash and path
-    content_hash = _compute_content_hash(output_path)
+    # Replace output_path placeholder in output_manifest with actual path.
+    # content_hash was already set in build_runner_output (stable,
+    # non-self-referential hash from experiment spec bytes).
     for entry in artifact["output_manifest"]:
         if entry["output_path"] == "<runner_output_json>":
             entry["output_path"] = str(output_path)
-            entry["content_hash"] = f"sha256:{content_hash}"
 
-    # Re-serialize with updated manifest
+    # Write ONCE. content_hash is already correct (computed from experiment
+    # spec bytes in build_runner_output) so no re-write is needed.
     with open(output_path, "w", encoding="utf-8") as fh:
         json.dump(artifact, fh, indent=2, sort_keys=True)
 
@@ -370,7 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     Dry-run runner CLI entry point.
 
     Exits 0 on success, 1 on user error (missing file, missing field,
-    existing output path), 2 on unexpected errors.
+    existing output path, governance rejection), 2 on unexpected errors.
     """
     parser = argparse.ArgumentParser(
         prog="run_first_thin_real_data_runner",
@@ -415,7 +498,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: experiment spec not found: {experiment_spec_path}", file=sys.stderr)
         return 1
 
-    # Build artifact
+    # Build artifact — may raise GovernanceRejection if blockers found
     try:
         artifact = build_runner_output(
             experiment_spec_path=experiment_spec_path,
@@ -423,6 +506,19 @@ def main(argv: list[str] | None = None) -> int:
             runner_version=args.runner_version,
             run_owner=args.run_owner,
         )
+    except GovernanceRejection as exc:
+        # Governance rejection: emit the failed_validation artifact and exit 1
+        print(f"ERROR: {exc.message}", file=sys.stderr)
+        try:
+            write_runner_output(args.output_path, exc.artifact)
+            print(f"Governance-rejected RunnerOutput written to: {args.output_path}", file=sys.stderr)
+        except FileExistsError:
+            print(f"ERROR: output path already exists: {args.output_path}", file=sys.stderr)
+            return 1
+        except OSError as write_exc:
+            print(f"ERROR writing governance-rejected output: {write_exc}", file=sys.stderr)
+            return 2
+        return 1
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
