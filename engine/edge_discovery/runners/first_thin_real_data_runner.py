@@ -63,6 +63,7 @@ GOVERNANCE_STOP_RULE_FIELDS = (
 def _compute_run_config_hash(
     experiment_spec_path: Path,
     data_manifest_path: Path | None = None,
+    required_observation_columns: list[str] | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -74,6 +75,10 @@ def _compute_run_config_hash(
     concatenation of the experiment spec canonical JSON bytes plus the
     DataManifest file bytes. This ensures that changing the DataManifest
     content changes the run_config_hash and thus the run_id.
+
+    When required_observation_columns is provided, it is normalized
+    (sorted, stripped) and appended to the hash input so that different
+    column requirements produce different run_config_hash values.
 
     Whitespace variation does not affect the hash.
     """
@@ -87,6 +92,17 @@ def _compute_run_config_hash(
         combined = spec_canonical + b"\n" + dm_bytes
     else:
         combined = spec_canonical
+
+    # Incorporate required_observation_columns into hash when present.
+    # Normalize to sorted, whitespace-stripped list for deterministic ordering.
+    # Strip ALL whitespace (not just leading/trailing) so "symbol , close" and
+    # "symbol,close" both become "symbol,close".
+    if required_observation_columns is not None and len(required_observation_columns) > 0:
+        normalized = json.dumps(
+            sorted("".join(c.split()) for c in required_observation_columns),
+            separators=(",", ":"),
+        ).encode("utf-8")
+        combined = combined + b"\n" + normalized
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -195,6 +211,93 @@ def _count_csv_rows(file_path: Path) -> int | None:
         # If any error occurs (encoding, malformed CSV, etc.), return None
         # rather than propagating the error.
         return None
+
+
+# ---------------------------------------------------------------------------
+# Observation-table column validation
+# ---------------------------------------------------------------------------
+
+def _parse_required_columns(raw: str | None) -> list[str]:
+    """
+    Parse a comma-separated required-column string into a normalized list.
+
+    - Trims whitespace from each token.
+    - Rejects empty tokens (e.g. "a,,b" → ValueError).
+    - De-duplicates preserving first occurrence.
+    - Returns list in order of first occurrence (stable for hashing: caller
+      normalizes to sorted for deterministic run_config_hash).
+
+    Raises ValueError if any token is empty after trimming.
+    """
+    if raw is None:
+        return []
+
+    tokens = [t.strip() for t in raw.split(",")]
+    # Check for empty tokens
+    for t in tokens:
+        if t == "":
+            raise ValueError(
+                "required_observation_columns contains an empty token; "
+                "each column name must be non-empty"
+            )
+
+    # De-duplicate preserving first occurrence
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            normalized.append(t)
+
+    return normalized
+
+
+def _read_csv_header(file_path: Path) -> list[str] | None:
+    """
+    Read the header row (first line) of a CSV file using csv.reader.
+
+    Returns None if the file cannot be opened or parsed as CSV.
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if header is None:
+                return []
+            return header
+    except Exception:
+        return None
+
+
+def _validate_observation_table_columns(
+    dataset_path: Path,
+    required_columns: list[str],
+) -> tuple[list[str], bool]:
+    """
+    Check that all required columns are present in a CSV file's header row.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    required_columns : list[str]
+        Column names that must be present in the CSV header.
+
+    Returns
+    -------
+    tuple[list[str], bool]
+        (missing_columns, all_present).
+        missing_columns is the list of required columns not found in the header.
+        all_present is True when missing_columns is empty.
+    """
+    header = _read_csv_header(dataset_path)
+    if header is None:
+        # Could not read CSV; treat all required columns as missing
+        return list(required_columns), False
+
+    header_set = {col.strip() for col in header}
+    missing = [col for col in required_columns if col.strip() not in header_set]
+    return missing, len(missing) == 0
 
 
 def _summarize_data_manifest_for_runner(
@@ -402,12 +505,14 @@ def _audit_dry_run(
 def _build_failure_summary(
     audit_summary: dict,
     status: str,
+    observation_missing_columns: list[str] | None = None,
 ) -> dict:
     """
     Build a failure_summary dict for failed_validation / failed_runtime statuses.
 
     Collects all failing audit names from audit_summary and formats them into
-    a blocker_summary.
+    a blocker_summary. When observation_missing_columns is provided, appends
+    the column names to the blocker_summary string.
     """
     now = _utc_now()
     failing_audits = [
@@ -415,10 +520,13 @@ def _build_failure_summary(
         for a in audit_summary["audits"]
         if a["audit_result"] == "fail"
     ]
-    blocker_summary = (
-        f"Validation failed: {', '.join(failing_audits)}. "
-        f"Total blockers: {audit_summary['blocker_count']}."
-    )
+    blocker_summary_parts = [f"Validation failed: {', '.join(failing_audits)}."]
+    if observation_missing_columns:
+        blocker_summary_parts.append(
+            f"Missing observation-table columns: {', '.join(observation_missing_columns)}."
+        )
+    blocker_summary_parts.append(f"Total blockers: {audit_summary['blocker_count']}.")
+    blocker_summary = " ".join(blocker_summary_parts)
     return {
         "failure_type": "validation_error",
         "status": status,
@@ -440,6 +548,7 @@ def build_runner_output(
     runner_version: str = RUNNER_VERSION_DEFAULT,
     run_owner: str = "unknown",
     data_manifest_path: str | Path | None = None,
+    required_observation_columns: list[str] | None = None,
 ) -> dict:
     """
     Build a complete RunnerOutput v1 artifact for a dry-run.
@@ -459,6 +568,11 @@ def build_runner_output(
         is loaded and validated. If validation fails, a failed_validation
         artifact is returned. If validation passes, the manifest is included
         in input_artifact_refs and data_manifest_refs.
+    required_observation_columns : list[str] | None
+        Optional list of column names that must be present in the observation
+        table CSV referenced by the DataManifest. Only supported for CSV format.
+        If provided without a DataManifest, emits failed_validation. If provided
+        for a non-CSV DataManifest format, emits failed_validation.
 
     Returns
     -------
@@ -488,6 +602,13 @@ def build_runner_output(
     # Validate structural requirement
     _check_experiment_spec_id(experiment_spec)
 
+    # Early validation: required_observation_columns needs a DataManifest to validate against
+    if required_observation_columns is not None and data_manifest_path is None:
+        raise ValueError(
+            "--required-observation-columns was supplied but no --data-manifest was provided. "
+            "Column validation requires a DataManifest to determine the dataset path."
+        )
+
     # Timestamps
     started_at = _utc_now()
     completed_at = _utc_now()
@@ -498,6 +619,8 @@ def build_runner_output(
     manifest: DatasetManifest | None = None
     manifest_summary: dict | None = None
     manifest_base_dir: Path = experiment_spec_path.parent
+    observation_validation_passed = False
+    observation_missing_columns: list[str] = []
 
     if data_manifest_path is not None:
         data_manifest_path = Path(data_manifest_path)
@@ -518,7 +641,9 @@ def build_runner_output(
             # DataManifest validation failed — emit failed_validation artifact
             # with the error in the failure_summary.
             spec_content_hash = _compute_content_hash(experiment_spec_path)
-            run_config_hash_partial = _compute_run_config_hash(experiment_spec_path, None)
+            run_config_hash_partial = _compute_run_config_hash(
+                experiment_spec_path, None, required_observation_columns
+            )
             run_id_partial = _compute_run_id(run_config_hash_partial)
 
             input_artifact_refs = [
@@ -573,6 +698,7 @@ def build_runner_output(
             failure_summary = _build_failure_summary(
                 audit_summary,
                 "failed_validation",
+                observation_missing_columns=None,
             )
 
             output_manifest = [
@@ -619,8 +745,10 @@ def build_runner_output(
                 "partial_summary": None,
             }
 
-    # Deterministic hashes — include DataManifest content when present
-    run_config_hash = _compute_run_config_hash(experiment_spec_path, data_manifest_path)
+    # Deterministic hashes — include DataManifest content and required columns when present
+    run_config_hash = _compute_run_config_hash(
+        experiment_spec_path, data_manifest_path, required_observation_columns
+    )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
 
@@ -671,7 +799,11 @@ def build_runner_output(
     # Determine terminal status based on audit result
     if audit_summary["blocker_count"] > 0:
         status = "failed_validation"
-        failure_summary = _build_failure_summary(audit_summary, status)
+        failure_summary = _build_failure_summary(
+            audit_summary,
+            status,
+            observation_missing_columns=(observation_missing_columns if not observation_validation_passed else None),
+        )
     else:
         status = "success"
         failure_summary = None
@@ -684,6 +816,111 @@ def build_runner_output(
     # "hash of output file content" semantics for this dry-run skeleton.
     # This is NOT the RunnerOutput JSON path (that artifact IS the run
     # output; output_manifest describes referenced artifacts).
+    # Observation-table column validation (only for CSV format).
+    # Performed AFTER successful DataManifest loading, AFTER output_manifest is built.
+    # - ValueError for non-CSV format propagates to caller (tests assert on this).
+    # - Missing columns → return failed_validation artifact (NOT GovernanceRejection).
+    # - Columns present → add pass audit entry to audit_summary (non-blocker).
+    observation_validation_passed = False
+    observation_missing_columns: list[str] = []
+    if required_observation_columns is not None and manifest is not None:
+        if manifest.source_kind.value != "local_csv":
+            raise ValueError(
+                f"required_observation_columns is only supported for CSV datasets "
+                f"(DataManifest dataset_id='{manifest.dataset_id}' has "
+                f"source_kind='{manifest.source_kind.value}')."
+            )
+        raw_path = Path(manifest.path)
+        dataset_resolved = raw_path if raw_path.is_absolute() else (manifest_base_dir / raw_path).resolve()
+        missing, ok = _validate_observation_table_columns(dataset_resolved, required_observation_columns)
+        observation_missing_columns = missing
+        observation_validation_passed = ok
+
+        # Missing columns → return failed_validation artifact directly (not GovernanceRejection).
+        # observation_table shape is a data contract, not a governance rule.
+        if not observation_validation_passed:
+            now = _utc_now()
+            obs_audit_entry = {
+                "audit_name": "observation_table_shape_validation",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": None,
+                "created_at": now,
+            }
+            obs_audit_summary = {
+                "overall_result": "fail",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "audits": [obs_audit_entry],
+            }
+            failure_summary = _build_failure_summary(
+                obs_audit_summary,
+                "failed_validation",
+                observation_missing_columns=observation_missing_columns,
+            )
+            return {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": obs_audit_summary,
+                "output_manifest": [
+                    {
+                        "output_role": "evidence",
+                        "output_path": (
+                            str(experiment_spec_path.resolve())
+                            if experiment_spec_path.is_absolute()
+                            else str(experiment_spec_path)
+                        ),
+                        "row_count": None,
+                        "content_hash": f"sha256:{spec_content_hash}",
+                        "created_at": created_at,
+                        "format": "json",
+                        "description": (
+                            "Input experiment spec referenced by this dry-run artifact. "
+                            "Content hash is of the experiment spec JSON file, providing "
+                            "a stable content identifier for the input governance document."
+                        ),
+                        "contains_private_data": False,
+                        "publishable": False,
+                    }
+                ],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": failure_summary,
+                "partial_summary": None,
+            }
+        # Columns present → add pass audit entry (non-blocker; no GovernanceRejection)
+        now = _utc_now()
+        obs_audit_entry = {
+            "audit_name": "observation_table_shape_validation",
+            "audit_result": "pass",
+            "severity": "blocker",
+            "blocker_count": 0,
+            "warning_count": 0,
+            "details_ref": None,
+            "created_at": now,
+        }
+        new_audits = list(audit_summary["audits"])
+        new_audits.append(obs_audit_entry)
+        audit_summary = {
+            "overall_result": audit_summary["overall_result"],
+            "blocker_count": audit_summary["blocker_count"],
+            "warning_count": audit_summary["warning_count"],
+            "audits": new_audits,
+        }
+
     output_manifest = [
         {
             "output_role": "evidence",
@@ -835,6 +1072,17 @@ def main(argv: list[str] | None = None) -> int:
             "If absent, uses dry_run_no_data_manifest placeholder."
         ),
     )
+    parser.add_argument(
+        "--required-observation-columns",
+        required=False,
+        default=None,
+        help=(
+            "Optional comma-separated list of column names that must be present "
+            "in the observation table CSV referenced by the DataManifest. "
+            "Only supported for CSV datasets. "
+            "Example: --required-observation-columns event_id,symbol,close_price"
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -852,6 +1100,15 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: data manifest not found: {data_manifest_path}", file=sys.stderr)
             return 1
 
+    # Parse required observation columns
+    required_observation_columns: list[str] | None = None
+    if args.required_observation_columns is not None:
+        try:
+            required_observation_columns = _parse_required_columns(args.required_observation_columns)
+        except ValueError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
     # Build artifact — may raise GovernanceRejection if governance blockers found
     try:
         artifact = build_runner_output(
@@ -860,6 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
             runner_version=args.runner_version,
             run_owner=args.run_owner,
             data_manifest_path=data_manifest_path,
+            required_observation_columns=required_observation_columns,
         )
     except GovernanceRejection as exc:
         # Governance rejection: emit the failed_validation artifact and exit 1
