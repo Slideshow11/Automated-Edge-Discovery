@@ -279,8 +279,6 @@ class TestBuildFailureSummary:
 # trial_accounting_summary schema
 # ---------------------------------------------------------------------------
 
-import jsonschema as _jsonschema
-
 
 class TestTrialAccountingSummarySchema:
     """Tests for the optional trial_accounting_summary field in RunnerOutput."""
@@ -349,10 +347,20 @@ class TestTrialAccountingSummarySchema:
             ],
         }
 
+    def _get_validation_error(self):
+        """Return jsonschema.ValidationError, guarding optional jsonschema."""
+        jsonschema = pytest.importorskip("jsonschema")
+        return jsonschema.ValidationError
+
+    def _validate_with_schema(self, instance, schema):
+        """Validate instance against the runner output schema (guards optional jsonschema)."""
+        jsonschema = pytest.importorskip("jsonschema")
+        jsonschema.validate(instance, schema)
+
     def test_runner_output_accepts_missing_trial_accounting_summary(self, schema):
         """Existing RunnerOutput artifacts without trial_accounting_summary remain valid."""
         artifact = self._make_minimal_valid_runner_output()
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
 
     def test_runner_output_accepts_trial_accounting_summary_not_applicable(self, schema):
         """trial_accounting_summary with status=not_applicable and no_mutation is valid."""
@@ -361,7 +369,7 @@ class TestTrialAccountingSummarySchema:
             "status": "not_applicable",
             "mutation_mode": "no_mutation",
         }
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
 
     def test_runner_output_accepts_dry_run_reference_trial_accounting_summary(self, schema):
         """Full trial_accounting_summary with proposed IDs and dry_run_reference_only is valid."""
@@ -389,7 +397,7 @@ class TestTrialAccountingSummarySchema:
                 "complexity_bucket": "low",
             },
         }
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_unknown_trial_accounting_field(self, schema):
         """Unknown field inside trial_accounting_summary must fail validation."""
@@ -399,8 +407,8 @@ class TestTrialAccountingSummarySchema:
             "mutation_mode": "no_mutation",
             "unknown_field": "should-reject",
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_negative_n_tried(self, schema):
         """n_tried of -1 must fail validation (minimum: 0)."""
@@ -410,8 +418,8 @@ class TestTrialAccountingSummarySchema:
             "mutation_mode": "dry_run_reference_only",
             "n_tried": -1,
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_negative_candidate_variant_count(self, schema):
         """candidate_variant_count of -1 must fail validation."""
@@ -421,8 +429,8 @@ class TestTrialAccountingSummarySchema:
             "mutation_mode": "dry_run_reference_only",
             "candidate_variant_count": -1,
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_mutating_mode_ledger_write(self, schema):
         """mutation_mode=ledger_write must fail — not a permitted value."""
@@ -431,8 +439,8 @@ class TestTrialAccountingSummarySchema:
             "status": "linked",
             "mutation_mode": "ledger_write",
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_mutating_mode_registry_write(self, schema):
         """mutation_mode=registry_write must fail — not a permitted value."""
@@ -441,8 +449,8 @@ class TestTrialAccountingSummarySchema:
             "status": "linked",
             "mutation_mode": "registry_write",
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_runner_output_rejects_unknown_complexity_field(self, schema):
         """Unknown field inside complexity sub-object must fail validation."""
@@ -455,8 +463,8 @@ class TestTrialAccountingSummarySchema:
                 "unknown_complexity_field": "reject",
             },
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_trial_accounting_summary_complexity_bucket_unknown(self, schema):
         """complexity_bucket=unknown is a valid value."""
@@ -468,7 +476,7 @@ class TestTrialAccountingSummarySchema:
                 "complexity_bucket": "unknown",
             },
         }
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
 
     def test_trial_accounting_summary_complexity_bucket_excessive(self, schema):
         """complexity_bucket=excessive is valid (blocks promotion at review time, not at schema level)."""
@@ -482,7 +490,7 @@ class TestTrialAccountingSummarySchema:
                 "complexity_bucket": "excessive",
             },
         }
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
 
     def test_trial_accounting_summary_rejects_missing_required_status(self, schema):
         """status field is required — omitting it must fail."""
@@ -490,8 +498,8 @@ class TestTrialAccountingSummarySchema:
         artifact["trial_accounting_summary"] = {
             "mutation_mode": "no_mutation",
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_trial_accounting_summary_rejects_missing_required_mutation_mode(self, schema):
         """mutation_mode field is required — omitting it must fail."""
@@ -499,11 +507,11 @@ class TestTrialAccountingSummarySchema:
         artifact["trial_accounting_summary"] = {
             "status": "not_applicable",
         }
-        with pytest.raises(_jsonschema.ValidationError):
-            _jsonschema.validate(artifact, schema)
+        with pytest.raises(self._get_validation_error()):
+            self._validate_with_schema(artifact, schema)
 
     def test_trial_accounting_summary_null_is_valid(self, schema):
         """trial_accounting_summary can be explicitly null."""
         artifact = self._make_minimal_valid_runner_output()
         artifact["trial_accounting_summary"] = None
-        _jsonschema.validate(artifact, schema)
+        self._validate_with_schema(artifact, schema)
