@@ -4786,3 +4786,587 @@ class TestDateCoverageSummaryIntegration:
         )
         assert canonical_audit["blocker_count"] == 0
 
+
+
+# -------------------------------------------------------------------------- -
+# Test: First thin runner local smoke — full dry-run path with observation tables
+# -------------------------------------------------------------------------- -
+
+SMOKE_CSV_DATA = (
+    "date,symbol,close\n"
+    "2024-01-02,AAPL,185.50\n"
+    "2024-01-03,AAPL,186.00\n"
+    "2024-01-04,AAPL,187.20\n"
+    "2024-01-02,MSFT,415.00\n"
+    "2024-01-03,MSFT,416.50\n"
+    "2024-01-04,GOOGL,175.00\n"
+)
+
+SMOKE_MANIFEST_DATA = {
+    "dataset_id": "DM-2026-SMOKE",
+    "role": "generic",
+    "source_kind": "local_csv",
+    "path": "smoke_obs.csv",
+    "format": "csv",
+}
+
+
+class TestFirstThinRunnerLocalSmoke:
+    """Tiny end-to-end smoke tests for the first thin real data runner.
+
+    Exercises the full dry-run path with a local CSV observation table and
+    DataManifest, verifying schema-valid RunnerOutput and the presence of all
+    observation table audit entries (canonical, close-return, duplicate-row,
+    date-coverage).  Missing-value summary is not requested so it does not
+    appear — that is the current runner behaviour and changing it is out of
+    scope for this PR.
+    """
+
+    def test_full_dry_run_produces_success_artifact(
+        self, tmp_path
+    ):
+        """main() with date+symbol+close CSV returns rc=0 and status='success'."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0, f"main() returned {rc}"
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "success", (
+            f"Expected status='success', got {artifact['status']}"
+        )
+
+    def test_artifact_schema_valid_and_contains_required_fields(
+        self, tmp_path
+    ):
+        """RunnerOutput is schema-valid and has all required fields."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0002",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0002",
+            "search_space_id": "SSM-2026-0002",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "runner_output_spec_v1.schema.json"
+        )
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+        # Required structural fields
+        assert artifact["input_artifact_refs"], "input_artifact_refs must be non-empty"
+        assert artifact["data_manifest_refs"], "data_manifest_refs must be non-empty"
+        assert artifact["output_manifest"], "output_manifest must be non-empty"
+        assert artifact["run_mode"] == "dry_run"
+
+    def test_all_five_observation_table_audits_present(
+        self, tmp_path
+    ):
+        """audit_summary contains all five observation table audits (missing-value not requested)."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0003",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0003",
+            "search_space_id": "SSM-2026-0003",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        assert "observation_table_close_return_summary" in audit_names
+        # missing_value_summary requires --observation-missing-value-columns; not requested
+        assert "observation_table_duplicate_row_summary" in audit_names
+        assert "observation_table_date_coverage_summary" in audit_names
+
+    def test_audit_results_and_blocker_count(
+        self, tmp_path
+    ):
+        """All present audits pass; overall blocker_count is 0."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0004",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0004",
+            "search_space_id": "SSM-2026-0004",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        assert artifact["audit_summary"]["overall_result"] == "pass"
+        assert artifact["audit_summary"]["blocker_count"] == 0
+        # blocker_count equals sum of all individual blocker_counts
+        total = sum(
+            a["blocker_count"]
+            for a in artifact["audit_summary"]["audits"]
+        )
+        assert total == 0, f"Expected 0, got {total}"
+        # Individual audit checks
+        for audit in artifact["audit_summary"]["audits"]:
+            assert audit["audit_result"] in ("pass", "warn", "skipped"), (
+                f"Unexpected audit_result={audit['audit_result']} "
+                f"for {audit['audit_name']}"
+            )
+
+    def test_canonical_summary_row_count(
+        self, tmp_path
+    ):
+        """canonical_summary row_count matches the 6 CSV data rows."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0005",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0005",
+            "search_space_id": "SSM-2026-0005",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        canonical_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_canonical_summary"
+        )
+        assert canonical_audit["audit_result"] == "pass"
+        assert "row_count=" in canonical_audit["details_ref"]
+        # row_count should be 6 for the 6 CSV data rows
+        import re
+        m = re.search(r"row_count=(\d+)", canonical_audit["details_ref"])
+        assert m is not None, f"row_count not found in details_ref: {canonical_audit['details_ref']}"
+        assert int(m.group(1)) == 6, f"Expected row_count=6, got {m.group(1)}"
+
+    def test_duplicate_row_summary_no_duplicates(
+        self, tmp_path
+    ):
+        """duplicate_row_summary reports has_duplicates=false for the smoke CSV."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0006",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0006",
+            "search_space_id": "SSM-2026-0006",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dup_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_duplicate_row_summary"
+        )
+        assert dup_audit["audit_result"] == "pass"
+        assert "duplicate_row_count=0" in dup_audit["details_ref"]
+        assert dup_audit["blocker_count"] == 0
+
+    def test_date_coverage_summary_reflects_symbols_and_dates(
+        self, tmp_path
+    ):
+        """date_coverage_summary reflects symbol_count=3 and the observed date range."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0007",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0007",
+            "search_space_id": "SSM-2026-0007",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dc_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_date_coverage_summary"
+        )
+        assert dc_audit["audit_result"] == "pass"
+        assert dc_audit["severity"] == "info"
+        assert dc_audit["blocker_count"] == 0
+        details = dc_audit["details_ref"]
+        assert "symbol_count=3" in details, f"Expected symbol_count=3 in {details}"
+        assert "min_date=2024-01-02" in details, f"Expected min_date=2024-01-02 in {details}"
+        assert "max_date=2024-01-04" in details, f"Expected max_date=2024-01-04 in {details}"
+        # AAPL has 3 dates, MSFT has 2, GOOGL has 1 → observed_date_count = 6
+        assert "observed_date_count=6" in details, f"Expected observed_date_count=6 in {details}"
+
+    def test_close_return_summary_passes_for_smoke_csv(
+        self, tmp_path
+    ):
+        """close_return_summary audit is present and passes with the smoke CSV."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0008",
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0008",
+            "search_space_id": "SSM-2026-0008",
+            "data_manifest_refs": ["DM-2026-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "pass"
+        assert close_audit["blocker_count"] == 0
+
+
