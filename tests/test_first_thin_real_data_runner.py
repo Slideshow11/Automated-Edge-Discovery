@@ -5684,6 +5684,179 @@ class TestDataManifestRunnerUnit:
         assert summary["validation_status"] == "pass"
 
 
+
+class TestFirstThinRunnerMissingValueSmoke:
+    """Tiny end-to-end smoke tests for the first thin runner with
+    --observation-missing-value-columns requested.
+
+    Verifies the runner produces schema-valid success and failed_validation
+    artifacts and that observation_table_missing_value_summary audit is present
+    when a missing-value column is requested.  Uses the same tmp_path + local
+    CSV + DataManifest + ExperimentSpec pattern as TestFirstThinRunnerLocalSmoke.
+    """
+
+    def _make_manifest(self, csv_file, dataset_id, tmp_path):
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": dataset_id,
+            "role": "generic",
+            "source_kind": "local_csv",
+            "path": csv_file.name,
+            "format": "csv",
+        }, indent=2))
+        return manifest_file
+
+    def _make_spec(self, experiment_id, data_manifest_ref, tmp_path):
+        spec_file = tmp_path / "smoke_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": experiment_id,
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": [data_manifest_ref],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        return spec_file
+
+    def test_missing_value_smoke_produces_success_artifact(
+        self, tmp_path
+    ):
+        """main() with --observation-missing-value-columns and no missing
+        values returns rc=0, status='success', and schema-valid artifact."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(
+            "date,symbol,close,volume\n"
+            "2024-01-02,AAPL,185.50,1000\n"
+            "2024-01-03,AAPL,186.00,2000\n"
+            "2024-01-04,AAPL,187.20,3000\n"
+            "2024-01-02,MSFT,415.00,5000\n"
+            "2024-01-03,MSFT,416.50,6000\n"
+        )
+        manifest_file = self._make_manifest(csv_file, "DM-2026-MV-SMOKE", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0001", "DM-2026-MV-SMOKE", tmp_path)
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0, f"main() returned {rc}"
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "success"
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        schema_path = Path(__file__).parent.parent / "schemas" / "runner_output_spec_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+
+    def test_missing_value_audit_present_and_counts_correctly(
+        self, tmp_path
+    ):
+        """observation_table_missing_value_summary is present with correct counts."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(
+            "date,symbol,close,volume\n"
+            "2024-01-02,AAPL,185.50,1000\n"
+            "2024-01-03,AAPL,186.00,\n"
+            "2024-01-04,AAPL,187.20,3000\n"
+        )
+        manifest_file = self._make_manifest(csv_file, "DM-2026-MV-SMOKE2", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0002", "DM-2026-MV-SMOKE2", tmp_path)
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        # volume has one missing value → missing-value audit fail, blocker>0
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_missing_value_summary" in audit_names
+        missing_val_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_missing_value_summary"
+        )
+        assert missing_val_audit["audit_result"] == "fail"
+        assert missing_val_audit["blocker_count"] == 1
+        assert "row_count=3" in missing_val_audit["details_ref"]
+        assert "missing[volume]=1" in missing_val_audit["details_ref"]
+
+    def test_missing_value_smoke_preserves_all_observation_audits(
+        self, tmp_path
+    ):
+        """When missing-value columns have no missing values, all five observation
+        audits are present in the artifact."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(
+            "date,symbol,close,volume\n"
+            "2024-01-02,AAPL,185.50,1000\n"
+            "2024-01-03,AAPL,186.00,2000\n"
+            "2024-01-04,AAPL,187.20,3000\n"
+        )
+        manifest_file = self._make_manifest(csv_file, "DM-2026-MV-SMOKE3", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0003", "DM-2026-MV-SMOKE3", tmp_path)
+        output_path = tmp_path / "smoke_output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        assert "observation_table_close_return_summary" in audit_names
+        assert "observation_table_missing_value_summary" in audit_names
+        assert "observation_table_duplicate_row_summary" in audit_names
+        assert "observation_table_date_coverage_summary" in audit_names
+
+
 class TestFirstThinRunnerAmbiguousHeaderSmoke:
     """Smoke tests for ambiguous stripped observation CSV headers.
 
