@@ -142,6 +142,7 @@ The project is not yet a live trading or production system.
 - PR #180 test: cover missing-value smoke path
 - PR #181 test: cover unsupported observation source kind
 - PR #182 fix: schema-valid unsupported observation failure artifacts
+- PR #184 docs: design runner trial-accounting linkage
 
 ## Current stop rules
 
@@ -234,7 +235,10 @@ All five audits use a shared CSV header resolver with the following policy:
 ## Next planned PRs
 
 - Leakage checks stub wiring (schema field exists in RunnerOutput; not yet wired in runner)
-- Autonomous search readiness gate (autonomous_search blocked until leakage checks are wired)
+- RunnerOutput trial-accounting linkage schema update (add experiment_id, search_space_id, trial_id, variant_id, n_tried, sample_to_trial_ratio, complexity_bucket fields)
+- TrialLedger linkage extension (carry search_space_id, variant_id, complexity_bucket, all_variants_preserved)
+- ReviewPacket acceptance gate (require linkage fields and complexity before marking review_ready)
+- Autonomous search readiness gate (autonomous_search blocked until DSR/PBO/CPCV support exists)
 - Registry write path (append-only EHR update after manual review)
 
 Longer-horizon deferred work:
