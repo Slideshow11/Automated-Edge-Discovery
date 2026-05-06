@@ -535,11 +535,33 @@ def _summarize_observation_duplicate_rows(
                 f"not found in CSV header: {list(reader.fieldnames)}"
             )
 
-        # Map stripped header names back to actual DictReader keys so row
-        # lookups work regardless of surrounding whitespace in the CSV header.
-        header_map = {f.strip(): f for f in reader.fieldnames}
-        date_key = header_map[date_col]
-        symbol_key = header_map[symbol_col]
+        # Resolve actual DictReader field names for date/symbol columns.
+        # Strategy: exact match → single stripped match → error on ambiguity.
+        # This prevents silent column misresolution when multiple CSV headers
+        # normalize to the same name (e.g. both "date" and " date " strip to "date").
+        fieldnames = reader.fieldnames
+
+        def _resolve_header(fieldnames, requested):
+            requested = requested.strip()
+            # 1. Exact match wins
+            if requested in fieldnames:
+                return requested
+            # 2. Stripped fallback only when exactly one match exists
+            stripped_matches = [f for f in fieldnames if f.strip() == requested]
+            if not stripped_matches:
+                raise ValueError(
+                    f"Column '{requested}' not found in CSV header: "
+                    f"{list(fieldnames)}"
+                )
+            if len(stripped_matches) > 1:
+                raise ValueError(
+                    f"Ambiguous column '{requested}': multiple CSV headers "
+                    f"normalize to that name: {list(fieldnames)}"
+                )
+            return stripped_matches[0]
+
+        date_key = _resolve_header(fieldnames, date_col)
+        symbol_key = _resolve_header(fieldnames, symbol_col)
 
         for row in reader:
             row_count += 1
