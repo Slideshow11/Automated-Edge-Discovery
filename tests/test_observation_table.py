@@ -434,19 +434,19 @@ class TestSummarizeObservationCloseReturns:
     def test_missing_close_column_raises(self, tmp_path):
         path = tmp_path / "no_close.csv"
         make_csv(path, [["date", "symbol"], ["2024-01-01", "AAPL"]])
-        with pytest.raises(ValueError, match="observation_close_column"):
+        with pytest.raises(ValueError, match="Column 'close' not found"):
             _summarize_observation_close_returns(path, "date", "symbol", "close")
 
     def test_missing_date_column_raises(self, tmp_path):
         path = tmp_path / "no_date.csv"
         make_csv(path, [["symbol", "close"], ["AAPL", "185.0"]])
-        with pytest.raises(ValueError, match="observation_date_column"):
+        with pytest.raises(ValueError, match="Column 'date' not found"):
             _summarize_observation_close_returns(path, "date", "symbol", "close")
 
     def test_missing_symbol_column_raises(self, tmp_path):
         path = tmp_path / "no_symbol.csv"
         make_csv(path, [["date", "close"], ["2024-01-01", "185.0"]])
-        with pytest.raises(ValueError, match="observation_symbol_column"):
+        with pytest.raises(ValueError, match="Column 'symbol' not found"):
             _summarize_observation_close_returns(path, "date", "symbol", "close")
 
     def test_no_symbol_names_in_details(self, tmp_path):
@@ -485,6 +485,142 @@ class TestSummarizeObservationCloseReturns:
         assert "min_return=" in result["details"]
         assert "max_return=" in result["details"]
         assert "mean_return=" in result["details"]
+
+
+    # -------------------------------------------------------------------------
+    # Safe header resolver coverage for close-return
+    # -------------------------------------------------------------------------
+
+    def test_padded_date_header_works(self, tmp_path):
+        """Single padded date header resolves correctly via stripped fallback."""
+        path = tmp_path / "padded_date.csv"
+        make_csv(
+            path,
+            [
+                [" date ", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_close_returns(
+            path, "date", "symbol", "close"
+        )
+        assert result["symbols_with_return"] == 1
+        assert result["close_column"] == "close"
+
+    def test_padded_symbol_header_works(self, tmp_path):
+        """Single padded symbol header resolves correctly via stripped fallback."""
+        path = tmp_path / "padded_symbol.csv"
+        make_csv(
+            path,
+            [
+                ["date", " symbol ", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_close_returns(
+            path, "date", "symbol", "close"
+        )
+        assert result["symbols_with_return"] == 1
+        assert result["close_column"] == "close"
+
+    def test_padded_close_header_works(self, tmp_path):
+        """Single padded close header resolves correctly via stripped fallback."""
+        path = tmp_path / "padded_close.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", " close "],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_close_returns(
+            path, "date", "symbol", "close"
+        )
+        assert result["symbols_with_return"] == 1
+        assert result["close_column"] == "close"
+
+    def test_all_padded_headers_work(self, tmp_path):
+        """All three columns padded — still resolves via stripped fallback."""
+        path = tmp_path / "all_padded.csv"
+        make_csv(
+            path,
+            [
+                [" date ", " symbol ", " close "],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_close_returns(
+            path, "date", "symbol", "close"
+        )
+        assert result["symbols_with_return"] == 1
+        assert result["close_column"] == "close"
+
+    def test_exact_header_wins_over_padded_shadow(self, tmp_path):
+        """When both exact and padded versions exist, exact match is used."""
+        path = tmp_path / "shadow.csv"
+        make_csv(
+            path,
+            [
+                ["date", " date ", "symbol", "close"],
+                ["2024-01-01", "2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        # exact "date" wins; " date " is ignored
+        result = _summarize_observation_close_returns(
+            path, "date", "symbol", "close"
+        )
+        assert result["symbols_with_return"] == 1
+        assert result["close_column"] == "close"
+
+    def test_ambiguous_date_header_raises(self, tmp_path):
+        """Ambiguous date (both ' date' and 'date ') raises ValueError."""
+        path = tmp_path / "ambig_date.csv"
+        make_csv(
+            path,
+            [
+                [" date", "date ", "symbol", "close"],
+                ["2024-01-01", "2024-01-01", "AAPL", "100.0"],
+            ],
+        )
+        with pytest.raises(ValueError, match="Ambiguous column 'date'"):
+            _summarize_observation_close_returns(
+                path, "date", "symbol", "close"
+            )
+
+    def test_ambiguous_symbol_header_raises(self, tmp_path):
+        """Ambiguous symbol (both ' symbol' and 'symbol ') raises ValueError."""
+        path = tmp_path / "ambig_symbol.csv"
+        make_csv(
+            path,
+            [
+                ["date", " symbol", "symbol ", "close"],
+                ["2024-01-01", "AAPL", "AAPL", "100.0"],
+            ],
+        )
+        with pytest.raises(ValueError, match="Ambiguous column 'symbol'"):
+            _summarize_observation_close_returns(
+                path, "date", "symbol", "close"
+            )
+
+    def test_ambiguous_close_header_raises(self, tmp_path):
+        """Ambiguous close (both ' close' and 'close ') raises ValueError."""
+        path = tmp_path / "ambig_close.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", " close", "close "],
+                ["2024-01-01", "AAPL", "100.0", "110.0"],
+            ],
+        )
+        with pytest.raises(ValueError, match="Ambiguous column 'close'"):
+            _summarize_observation_close_returns(
+                path, "date", "symbol", "close"
+            )
 
 
 class TestSummarizeObservationMissingValues:
