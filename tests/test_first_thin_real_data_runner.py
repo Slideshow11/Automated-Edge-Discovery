@@ -3227,6 +3227,80 @@ class TestSummarizeObservationCloseReturns:
         assert result["mean_return"] is None
 
 
+# ---------------------------------------------------------------------------
+# Duplicate-row summary (observation_table_duplicate_row_summary audit)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def csv_with_no_duplicates(tmp_path):
+    """CSV with unique (symbol, date) rows — no duplicates."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-03,AAPL,187.0\n"
+        "2024-01-01,MSFT,420.0\n"
+        "2024-01-03,GOOGL,175.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "DM-2026-NODUP",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_one_duplicate_pair(tmp_path):
+    """CSV with one duplicate (symbol, date) key appearing twice."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-01,AAPL,185.6\n"   # duplicate of 2024-01-01
+        "2024-01-01,MSFT,420.0\n"
+        "2024-01-03,GOOGL,175.0\n"
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "DM-2026-DUP1",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
+@pytest.fixture
+def csv_with_multiple_duplicate_pairs(tmp_path):
+    """CSV with two distinct duplicate (symbol, date) keys."""
+    csv_file = tmp_path / "obs.csv"
+    csv_file.write_text(
+        "date,symbol,close\n"
+        "2024-01-01,AAPL,185.5\n"
+        "2024-01-02,AAPL,186.0\n"
+        "2024-01-01,AAPL,185.6\n"   # duplicate AAPL 2024-01-01
+        "2024-01-01,MSFT,420.0\n"
+        "2024-01-02,MSFT,421.0\n"
+        "2024-01-01,MSFT,420.5\n"   # duplicate MSFT 2024-01-01
+    )
+    manifest_file = tmp_path / "data_manifest.json"
+    manifest_file.write_text(json.dumps({
+        "dataset_id": "DM-2026-DUPMULTI",
+        "role": "generic",
+        "source_kind": "local_csv",
+        "path": "obs.csv",
+        "format": "csv",
+    }, indent=2))
+    return manifest_file, csv_file
+
+
 class TestCloseReturnSummaryIntegration:
     """Integration tests for close-return summary via CLI and build_runner_output."""
 
@@ -4360,3 +4434,218 @@ class TestCloseReturnHashDeterminism:
         assert run_id_close != run_id_price, (
             "Different observation_close_column must produce different run_id"
         )
+
+
+class TestDuplicateRowSummaryIntegration:
+    """Integration tests for observation_table_duplicate_row_summary audit wiring."""
+
+    def test_audit_entry_present_when_date_and_symbol_columns_provided(
+        self, csv_with_no_duplicates, valid_experiment_spec, tmp_path
+    ):
+        """With date+symbol columns, audit contains observation_table_duplicate_row_summary."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_duplicate_row_summary" in audit_names
+
+    def test_audit_result_pass_when_no_duplicates(
+        self, csv_with_no_duplicates, valid_experiment_spec, tmp_path
+    ):
+        """No duplicate rows → audit_result = 'pass', blocker_count unchanged."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dup_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_duplicate_row_summary"
+        )
+        assert dup_audit["audit_result"] == "pass"
+        assert dup_audit["blocker_count"] == 0
+        assert "no duplicate observation rows were detected" in dup_audit["details_ref"]
+
+    def test_audit_result_fail_when_duplicates_exist(
+        self, csv_with_one_duplicate_pair, valid_experiment_spec, tmp_path
+    ):
+        """Duplicate rows exist → audit_result = 'fail' (severity info, not blocker)."""
+        manifest_path, _ = csv_with_one_duplicate_pair
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dup_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_duplicate_row_summary"
+        )
+        assert dup_audit["audit_result"] == "fail"
+        assert dup_audit["severity"] == "info"
+        assert dup_audit["blocker_count"] == 0
+        assert "duplicate_row_count=1" in dup_audit["details_ref"]
+
+    def test_duplicate_row_count_reflected_in_audit_details(
+        self, csv_with_multiple_duplicate_pairs, valid_experiment_spec, tmp_path
+    ):
+        """Multiple duplicate pairs → affected_key_count and duplicate_row_count reflected."""
+        manifest_path, _ = csv_with_multiple_duplicate_pairs
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dup_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_duplicate_row_summary"
+        )
+        # AAPL 2024-01-01: 2 rows (1 excess), MSFT 2024-01-01: 2 rows (1 excess)
+        assert "duplicate_row_count=2" in dup_audit["details_ref"]
+        assert "affected_key_count=2" in dup_audit["details_ref"]
+
+    def test_existing_audit_entries_preserved(
+        self, csv_with_no_duplicates, valid_experiment_spec, tmp_path
+    ):
+        """Duplicate-row audit appends; existing audit entries are preserved."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        # Must have canonical summary audit (since date+symbol are provided)
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        # Must have duplicate-row audit
+        assert "observation_table_duplicate_row_summary" in audit_names
+        # Must have governance audits
+        assert "schema_validation_all_inputs" in audit_names
+        assert "no_registry_mutation" in audit_names
+
+    def test_no_date_symbol_columns_no_duplicate_audit(
+        self, csv_with_date_and_symbol, valid_experiment_spec, tmp_path
+    ):
+        """Without date+symbol columns, no duplicate-row audit is produced."""
+        manifest_path, _ = csv_with_date_and_symbol
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_duplicate_row_summary" not in audit_names
+
+    def test_non_csv_manifest_duplicate_audit_fails_closed(
+        self, valid_sqlite_manifest, valid_experiment_spec, tmp_path
+    ):
+        """Non-CSV manifest with date+symbol columns fails with unsupported_config.
+
+        Note: the canonical summary block raises GovernanceRejection BEFORE
+        the duplicate-row block can run for this exact configuration. The
+        duplicate-row unsupported_format audit only appears when the
+        canonical summary does NOT raise first (i.e., when the duplicate-row
+        block itself encounters an unsupported format).
+        """
+        manifest_path, _ = valid_sqlite_manifest
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+
+    def test_artifact_schema_valid_with_duplicate_audit(
+        self, csv_with_one_duplicate_pair, valid_experiment_spec, tmp_path
+    ):
+        """RunnerOutput artifact is schema-valid when duplicate audit is present."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        manifest_path, _ = csv_with_one_duplicate_pair
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "runner_output_spec_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+
+    def test_build_runner_output_duplicate_audit_entry_preserves_blocker_count(
+        self, csv_with_no_duplicates, valid_experiment_spec
+    ):
+        """Adding duplicate audit does not corrupt blocker_count from prior audits."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_path, _ = csv_with_no_duplicates
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_path,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            run_owner="test",
+        )
+        assert artifact["status"] == "success"
+        assert artifact["audit_summary"]["blocker_count"] == 0
+        # canonical audit + duplicate audit should both be present
+        canonical_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_canonical_summary"
+        )
+        dup_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_duplicate_row_summary"
+        )
+        assert canonical_audit["blocker_count"] == 0
+        assert dup_audit["blocker_count"] == 0
