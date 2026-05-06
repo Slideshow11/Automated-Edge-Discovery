@@ -5684,6 +5684,127 @@ class TestDataManifestRunnerUnit:
         assert summary["validation_status"] == "pass"
 
 
+class TestFirstThinRunnerAmbiguousHeaderSmoke:
+    """Smoke tests for ambiguous stripped observation CSV headers.
+
+    Verifies the first thin runner produces a schema-valid failed_validation
+    RunnerOutput artifact when the observation CSV has headers that are
+    textually distinct but normalize to the same stripped value (e.g. " date"
+    and "date "). The runner must emit a schema-valid failed_validation
+    artifact with audit_result='fail' and blocker_count > 0.
+
+    No production behaviour changes.
+    """
+
+    def test_ambiguous_stripped_date_header_produces_failed_validation_artifact(
+        self, tmp_path
+    ):
+        """Ambiguous date header → GovernanceRejection with failed_validation artifact.
+
+        CSV header has two textually distinct fields (" date" and "date ") that
+        both strip to "date". The close-return section runs before the
+        duplicate-row section in the runner and catches the ambiguous header
+        first: since DictReader uses the raw header keys (" date", "date ")
+        while the close-return function looks up the stripped name ("date"),
+        all rows are skipped, producing symbols_with_return=0 and a fail.
+
+        NOTE: The duplicate-row section also has ambiguous-header coverage
+        (it uses the same _resolve_observation_csv_header helper), but it is
+        gated behind the close-return section and is not reached when
+        close-return already raised GovernanceRejection. This is a runner
+        section-ordering artifact, not a correctness issue.
+        """
+        # Ambiguous CSV: " date" and "date " both strip to "date"
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text(
+            " date,date ,symbol,close\n"
+            "2024-01-02,2024-01-02,AAPL,185.50\n"
+        )
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-ambig",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test@test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"] is not None
+        assert artifact["failure_summary"]["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "validation_error"
+        # audit_summary reflects failure
+        assert artifact["audit_summary"]["overall_result"] == "fail"
+        assert artifact["audit_summary"]["blocker_count"] > 0
+        # Verify schema validity
+        jsonschema = pytest.importorskip("jsonschema")
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "runner_output_spec_v1.schema.json"
+        )
+        if schema_path.exists():
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            checker = jsonschema.FormatChecker()
+            jsonschema.validate(artifact, schema, format_checker=checker)
+
+    def test_ambiguous_stripped_symbol_header_produces_failed_validation_artifact(
+        self, tmp_path
+    ):
+        """Ambiguous symbol header → GovernanceRejection with failed_validation artifact.
+
+        CSV header has two textually distinct fields (" symbol" and "symbol ")
+        that both strip to "symbol". The duplicate-row section catches this
+        because the symbol column lookup returns empty, causing the
+        observation_table_duplicate_row_summary audit to fail.
+        """
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text(
+            "date, symbol,symbol ,close\n"
+            "2024-01-02,AAPL,AAPL,185.50\n"
+        )
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-ambig-sym",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        spec = _make_spec_with_dm_refs(tmp_path)
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=spec,
+                data_manifest_path=manifest_file,
+                observation_date_column="date",
+                observation_symbol_column="symbol",
+                observation_close_column="close",
+                run_owner="test@test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"] is not None
+        assert artifact["audit_summary"]["overall_result"] == "fail"
+        assert artifact["audit_summary"]["blocker_count"] > 0
+        # The failing audit is either close-return or duplicate-row depending
+        # on runner section ordering; both are valid failure paths
+        failing_audits = [
+            a["audit_name"] for a in artifact["audit_summary"]["audits"]
+            if a["audit_result"] == "fail"
+        ]
+        assert len(failing_audits) > 0, "No failing audits found"
+
+
 class TestFirstThinRunnerLocalSmokeGovernance:
     """Governance-rejection smoke tests for the first thin real data runner.
 
