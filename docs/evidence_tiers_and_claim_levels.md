@@ -153,8 +153,8 @@ Characteristics:
 - `ReviewPacket` is present
 - All variants are preserved or documented missing with `not_applicable` reasons
 - Trial accounting linkage is complete (no proposed-only IDs; all trial IDs reference real ledger entries)
-- `acceptance_gate_satisfied: true` in `trial_accounting_summary`
-- `autonomous_search_gate_satisfied` is `false` or documented
+- `acceptance_gate_satisfied: true` — proposed future gate; **not currently a schema field**; requires future schema extension and gate logic
+- `autonomous_search_gate_satisfied` is `false` or documented — proposed future gate; **not currently a schema field**
 
 Permitted:
 - Submission for human review
@@ -245,8 +245,8 @@ Each claim level has mandatory gate requirements. Lower tiers are intentionally 
 - All `robust_candidate` gates satisfied
 - `ModelAssessmentSpec` present with PBO and DSR results documented
 - `ReviewPacket` present with explicit reviewer rationale
-- `trial_accounting_summary.acceptance_gate_satisfied: true`
-- `trial_accounting_summary.autonomous_search_gate_satisfied: false`
+- `acceptance_gate_satisfied: true` — proposed future gate; **not currently a schema field**; requires future schema extension
+- `autonomous_search_gate_satisfied: false` — proposed future gate; **not currently a schema field**
 - No unreported variants
 - All linkage IDs reference real (not proposed-only) ledger entries
 
@@ -326,8 +326,8 @@ Trial accounting (PRs #184, #185) records search pressure. Evidence tiers determ
 
 Rules:
 
-- **Raw exploratory evidence remains visible.** A `RunnerOutput` with `status: exploratory` remains in the ledger and is not automatically deleted or hidden because a later confirmatory run failed.
-- **Adjusted acceptance evidence controls promotion.** Only `trial_accounting_summary` with `acceptance_gate_satisfied: true` may advance a candidate to `review_ready`.
+- **Raw exploratory evidence remains visible.** `RunnerOutput` artifacts at the `exploratory` evidence tier remain in the ledger and are not automatically deleted or hidden because a later confirmatory run failed. (Note: `RunnerOutput.status` describes run execution outcome — success, failed_validation, etc. — and is distinct from the evidence tier label.)
+- **Adjusted acceptance evidence controls promotion.** Only candidates meeting the proposed `acceptance_gate_satisfied` gate (a future field, not yet in schema) may advance to `review_ready`.
 - **No ReviewPacket may mark `review_ready` without trial accounting.** The ReviewPacket acceptance gate (Section 7 of PR #184 design) requires linkage fields and complexity metadata. An exploratory artifact without trial accounting cannot be promoted beyond `exploratory`.
 - **Trial burden carries forward if promoted.** If an exploratory idea is later promoted to `candidate` or higher, the original exploratory run count is recorded in `trial_accounting_summary.n_tried` for the promoted run.
 - **Search pressure fields are tier-diagnostic.** High `n_tried` with low `candidate_variant_count` indicates heavy selection bias risk. This must be flagged in the `ModelAssessmentSpec` and visible to reviewers.
@@ -394,8 +394,8 @@ This section records the current implementation state of the concepts in this de
 | `ReviewPacket` schema | Deferred; requirements baseline in PR #81 |
 | `trial_accounting_summary` schema | Implemented (PR #185); not yet wired in runner |
 | Runner emission of trial accounting | Not yet implemented |
-| `acceptance_gate_satisfied` field | Schema field present (PR #185); gate logic not implemented |
-| `autonomous_search_gate_satisfied` field | Schema field present (PR #185); gate logic not implemented |
+| `acceptance_gate_satisfied` field | Proposed future gate field; **not currently in RunnerOutput schema**; not implemented |
+| `autonomous_search_gate_satisfied` field | Proposed future gate field; **not currently in RunnerOutput schema**; not implemented |
 | Registry mutation | Prohibited; append-only manual v1 only |
 | Ledger mutation | Prohibited in current AED stop rules |
 | Autonomous search | Locked via AED stop rules |
