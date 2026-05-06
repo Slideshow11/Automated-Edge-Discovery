@@ -4167,3 +4167,196 @@ class TestMissingValueSummaryIntegration:
         assert ledger_mtime_before == ledger_mtime_after, (
             f"TrialLedger was modified during dry-run"
         )
+
+
+class TestCloseReturnHashDeterminism:
+    """Integration tests proving observation_close_column contributes
+    deterministically to run_config_hash and run_id, matching the pattern
+    established for required_observation_columns and missing_value_columns.
+
+    These tests use _compute_run_config_hash directly to isolate the hash-
+    computation logic without requiring a full CLI run or CSV file.
+    """
+
+    def test_same_close_column_produces_same_hash(self, valid_experiment_spec):
+        """Identical observation_close_column → identical run_config_hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash1 = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        hash2 = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        assert hash1 == hash2, (
+            "Same observation_close_column must produce identical run_config_hash"
+        )
+
+    def test_different_close_column_produces_different_hash(
+        self, valid_experiment_spec
+    ):
+        """Different observation_close_column → different run_config_hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_close = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        hash_price = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="price",
+        )
+        assert hash_close != hash_price, (
+            "Different observation_close_column must produce different "
+            "run_config_hash"
+        )
+
+    def test_whitespace_normalized_close_column_same_hash(
+        self, valid_experiment_spec
+    ):
+        """Leading/trailing whitespace in observation_close_column is stripped;
+        ' close ' and 'close' produce the same run_config_hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_stripped = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        hash_whitespace = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="  close  ",
+        )
+        assert hash_stripped == hash_whitespace, (
+            "Whitespace-normalized observation_close_column must produce "
+            "identical run_config_hash"
+        )
+
+    def test_close_column_with_date_and_symbol_columns_same_hash(
+        self, valid_experiment_spec
+    ):
+        """observation_close_column interacts with date/symbol columns in the hash;
+        all three together produce a deterministic hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_all_three = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        hash_again = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        assert hash_all_three == hash_again, (
+            "Same date+symbol+close columns must produce identical hash"
+        )
+
+    def test_close_column_changes_date_symbol_hash(
+        self, valid_experiment_spec
+    ):
+        """Adding observation_close_column to date+symbol columns changes the hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_date_symbol = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+        )
+        hash_date_symbol_close = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            observation_close_column="close",
+        )
+        assert hash_date_symbol != hash_date_symbol_close, (
+            "Adding observation_close_column must change the run_config_hash"
+        )
+
+    def test_run_id_derives_from_hash_with_close_column(
+        self, valid_experiment_spec
+    ):
+        """run_id is derived from run_config_hash (first 16 hex chars) even when
+        observation_close_column is included in the hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+            _compute_run_id,
+        )
+        hash1 = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        hash2 = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        run_id1 = _compute_run_id(hash1)
+        run_id2 = _compute_run_id(hash2)
+        assert run_id1 == run_id2, (
+            "run_id must be identical for identical close_column configuration"
+        )
+        assert run_id1 == hash1[:16], (
+            "run_id must be the first 16 hex characters of run_config_hash"
+        )
+
+    def test_missing_close_column_omitted_from_hash(self, valid_experiment_spec):
+        """When observation_close_column is None, the hash does not include
+        the close_col: prefix; it matches the base hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_no_close = _compute_run_config_hash(valid_experiment_spec)
+        hash_with_close = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column=None,
+        )
+        assert hash_no_close == hash_with_close, (
+            "observation_close_column=None must not alter the hash"
+        )
+
+    def test_empty_close_column_omitted_from_hash(self, valid_experiment_spec):
+        """When observation_close_column is an empty string, the hash does not
+        include the close_col: prefix; it matches the base hash."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+        )
+        hash_no_close = _compute_run_config_hash(valid_experiment_spec)
+        hash_empty_close = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="  ",
+        )
+        assert hash_no_close == hash_empty_close, (
+            "observation_close_column='' or whitespace-only must not alter "
+            "the hash"
+        )
+
+    def test_run_id_differs_when_close_column_differs(
+        self, valid_experiment_spec
+    ):
+        """Different observation_close_column → different run_id."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            _compute_run_config_hash,
+            _compute_run_id,
+        )
+        hash_close = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="close",
+        )
+        hash_price = _compute_run_config_hash(
+            valid_experiment_spec,
+            observation_close_column="price",
+        )
+        run_id_close = _compute_run_id(hash_close)
+        run_id_price = _compute_run_id(hash_price)
+        assert run_id_close != run_id_price, (
+            "Different observation_close_column must produce different run_id"
+        )
