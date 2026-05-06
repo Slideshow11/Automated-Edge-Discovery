@@ -2,9 +2,11 @@
 
 ## Current state
 
-AED main has completed the manual governance/intake layer v1.
+AED main has completed the manual governance/intake layer v1 and the first thin real-data runner milestone.
 
 The enforcement-layer design and implementation is complete. All ten governance validators (TrialLedger, SearchSpaceManifest, ModelAssessmentSpec, EdgeHypothesisRegistry, ExperimentSpec, OutcomeSpec, InstrumentUniverseSpec, EventStudySpec, OptionsEventRiskSpec, PreEarningsProfile) are implemented, tested, and CI-wired. The governance validator milestone is complete through PR #137.
+
+The first thin real-data runner exists and emits RunnerOutput v1 success and failed_validation artifacts. All five observation table audits are implemented. Smoke coverage is present for local CSV success, governance rejection, ambiguous headers, missing-value, unsupported source kind, and schema-valid artifact paths. The RunnerOutputSpec v1 validator is CI-wired. The runner milestone is complete through PR #182.
 
 The project is not yet an autonomous discovery engine.
 
@@ -117,7 +119,29 @@ The project is not yet a live trading or production system.
 - PR #137 PreEarningsProfile v1 CI wiring: governance helper now runs PEP validator and pytest
 - PR #138 docs: PreEarningsProfile v1 milestone status cleanup
 - PR #139 docs: first thin real-data runner slice v1 design
-- PR #140 **open** — RunnerOutputSpec v1 design (this PR)
+- PR #140 docs: RunnerOutputSpec v1 design
+- PR #142 fixtures: RunnerOutputSpec v1 JSON fixtures
+- PR #159 feat: first thin real-data runner dry-run CLI skeleton
+- PR #160 feat: first thin runner DataManifest resolution
+- PR #161 feat: first thin runner observation-table column validation
+- PR #162 feat: first thin runner canonical observation-table summary
+- PR #163 feat: first thin runner observation close-return summary
+- PR #164 refactor: deep-module split of first_thin_real_data_runner
+- PR #168 feat: observation-table missing-value summary
+- PR #169 feat(governance): add RunnerOutputSpec v1 validator
+- PR #170 test: cover close-return run ID determinism
+- PR #171 feat: audit duplicate observation rows
+- PR #172 fix: normalize duplicate-row CSV headers
+- PR #173 feat: audit observation date coverage
+- PR #174 test: first thin local smoke coverage
+- PR #175 test: governance rejection smoke coverage
+- PR #176 test: cover experiment spec loading
+- PR #177 test: cover data manifest runner helpers
+- PR #178 test: cover ambiguous observation headers
+- PR #179 fix: normalize close-return CSV headers
+- PR #180 test: cover missing-value smoke path
+- PR #181 test: cover unsupported observation source kind
+- PR #182 fix: schema-valid unsupported observation failure artifacts
 
 ## Current stop rules
 
@@ -146,29 +170,86 @@ The project is not yet a live trading or production system.
 - Governance validators CI-wired **complete** (PRs #60, #64, #74, #90, #102, #117)
 - EdgeHypothesisRegistry v1 **complete** (PRs #66, #68, #71, #72, #73, #74): JSON schema, fixtures, local validator, pytest, CI wired
 - PreEarningsProfile v1 **complete** (PRs #130–#137): design, schema, fixtures, local validator, tests, CI wired
+- RunnerOutputSpec v1 **complete** (PRs #140, #142, #169): design, fixtures, validator, CI wired
+- First thin real-data runner **complete** (PRs #159–#182): dry-run CLI skeleton, DataManifest resolution, observation table audits (canonical, close-return, missing-value, duplicate-row, date-coverage), smoke coverage, schema-valid failure artifacts
+
+## First thin runner milestone — completed through PR #182
+
+### RunnerOutput v1 status
+
+The first thin runner emits `RunnerOutput` v1 artifacts for two status values:
+
+- `success` — all requested observation table audits passed or produced info-level summaries
+- `failed_validation` — governance input validation failed or a blocker-level audit check failed
+
+The `failed_validation` artifact is schema-valid and includes `contains_private_data: False` and `publishable: False` on the experiment spec output manifest entry (PR #182).
+
+`partial_summary` is `None` in all failure artifacts. `data_manifest_refs` always satisfies `minItems >= 1` via a placeholder when no manifest is available.
+
+### Observation table audits implemented
+
+| Audit name | Severity | Blocker on failure | Notes |
+|---|---|---|---|
+| `observation_table_canonical_summary` | info | No | Column set validation against declared columns |
+| `observation_table_close_return_summary` | info | No | Close-return column resolution via shared resolver |
+| `observation_table_missing_value_summary` | info | No | Missing-value count per column |
+| `observation_table_duplicate_row_summary` | info | No | Duplicate (date, symbol) pair detection |
+| `observation_table_date_coverage_summary` | info | No | Per-symbol min/max date and symbol count |
+
+All five audits use a shared CSV header resolver with the following policy:
+
+- **Exact match wins** — header string equality is checked first
+- **Single stripped fallback allowed** — if exactly one column name strip()s to the expected name, it is used
+- **Ambiguous stripped fallback fails closed** — if two or more column names strip() to the same value, the runner raises `GovernanceRejection`
+
+### Helpers using the shared resolver
+
+- `close-return summary` — normalizes close-return CSV column names deterministically
+- `duplicate-row summary` — normalizes duplicate-row CSV column names deterministically
+- `date-coverage summary` — normalizes date-coverage CSV column names deterministically
+
+### Smoke coverage present
+
+- Local CSV success path (CSV + DataManifest + all declared column types)
+- Governance failure path (`autonomous_search=True` triggers `GovernanceRejection`)
+- Ambiguous stripped header failure path (closed on ambiguity)
+- Missing-value success path (`--observation-missing-value-columns` with CSV source)
+- Missing-value blocking failure path (non-CSV source_kind with missing-value request)
+- Unsupported source kind failure paths (non-CSV source_kind for close-return, missing-value, canonical audits — all schema-valid)
+- Schema-valid `success` and `failed_validation` `RunnerOutput` artifact paths
+
+### Helper unit coverage present
+
+- `ExperimentSpec` loader and ID helper (PR #176)
+- `DataManifest` loader and summary helper (PR #177)
+- Observation table summary helpers (PRs #168, #171, #173)
+- Runner artifact helpers (`build_runner_output`, `GovernanceRejection`, `UnsupportedConfig`)
+
+### Unsupported source kind schema status
+
+- `close-return` unsupported format: schema-valid (PR #181)
+- `missing-value` unsupported format: schema-valid (PR #180)
+- `canonical` unsupported format: schema-valid (PR #182)
 
 ## Next planned PRs
 
-- **In review (PR #140):** RunnerOutputSpec v1 design
-- RunnerOutputSpec v1 schema
-- RunnerOutputSpec v1 fixtures
-- RunnerOutputSpec v1 validator and tests
-- RunnerOutputSpec v1 CI wiring
-- runner dry-run CLI skeleton
-- real-data resolver skeleton
-- first smoke run on tiny local sample
-- audit report fixtures
+- Leakage checks stub wiring (schema field exists in RunnerOutput; not yet wired in runner)
+- Autonomous search readiness gate (autonomous_search blocked until leakage checks are wired)
+- Registry write path (append-only EHR update after manual review)
 
 Longer-horizon deferred work:
+
 - MechanismDiscoveryReport schema
 - PostHocTheoryNote schema
 - PreEarningsProfile v1 as a domain-specific research module
+- Real backtest execution path (beyond dry-run skeleton)
 
 ## AED architecture note
 
 AED core is domain-neutral. It enforces governance, provenance, and trial accounting without assuming any specific asset class, strategy type, or research domain. PreEarningsProfile v1 is one supported domain-specific research module — it is not the identity of the system.
 
 See [docs/domain_neutral_aed_architecture.md](./domain_neutral_aed_architecture.md) for the full architecture design note covering:
+
 - Core AED concepts and their generalized abstractions
 - Domain modules and profiles (PreEarningsProfile, SeasonalityProfile, MacroRegimeProfile, etc.)
 - Boundary rule for core vs. domain-specific fields
@@ -176,6 +257,7 @@ See [docs/domain_neutral_aed_architecture.md](./domain_neutral_aed_architecture.
 - Stop rules and manual review rule
 
 See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.md) for the modularity audit covering:
+
 - Governance layer is clean and domain-neutral (schemas, validators, fixtures, CI helpers)
 - engine/ contains expected pre-earnings backtest orchestration coupling
 - Event/Options validator is intentionally domain-specific
@@ -204,6 +286,7 @@ See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.
 - Fixture examples exist for valid and invalid event/options records
 
 **Still deferred:**
+
 - Event/Options JSON schemas deferred
 - OptionsEventRiskSpec JSON schema
 
@@ -222,6 +305,6 @@ All ten governance validators are implemented, tested, and CI-wired:
 - **OptionsEventRiskSpec** (PRs #119–#128): `scripts/local/validate_options_event_risk_spec.py`, schema, 24 fixtures, 173 tests. CI: `governance-validators` job.
 - **PreEarningsProfile** (PRs #130–#137): `scripts/local/validate_preearnings_profile.py`, schema, 25 fixtures, 206 tests. CI: `governance-validators` job.
 
-Total CI-enforced validator tests: **918 governance** via `governance-validators` job + **18 Event/Options** via `validator` job = **936 total**.
+Total CI-enforced governance validator tests: **918** via `governance-validators` job. Event/Options contract validator adds **18** via `validator` job.
 
 ## Operational notes
