@@ -5857,6 +5857,186 @@ class TestFirstThinRunnerMissingValueSmoke:
         assert "observation_table_date_coverage_summary" in audit_names
 
 
+class TestFirstThinRunnerUnsupportedFormatSmoke:
+    """Tiny end-to-end smoke tests for unsupported observation source kinds.
+
+    Verifies the runner produces schema-valid failed_validation artifacts when
+    a non-local_csv DataManifest is used with observation table audits.
+    Each test confirms the correct failing audit name, failure_type, and
+    blocker_count.  Uses the same tmp_path + local SQLite manifest + ExperimentSpec
+    pattern as the existing unsupported-format integration tests.
+    """
+
+    def _make_sqlite_manifest(self, dataset_id, tmp_path):
+        """Create a minimal local_sqlite DataManifest with an empty db file."""
+        db_dir = tmp_path / "db"
+        db_dir.mkdir()
+        db_file = db_dir / "data.sqlite"
+        db_file.write_text("")
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": dataset_id,
+            "role": "generic",
+            "source_kind": "local_sqlite",
+            "path": "db/data.sqlite",
+            "format": "sqlite",
+        }, indent=2))
+        return manifest_file
+
+    def _make_spec(self, experiment_id, tmp_path):
+        spec_file = tmp_path / "spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": experiment_id,
+            "experiment_version": 1,
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": ["DM-SQLITE-SMOKE"],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {
+                "timestamp_ref": "reference_date",
+                "description": "Decision timestamp is the reference date.",
+            },
+            "feature_cutoff_policy": {
+                "timestamp_ref": "trade_date",
+                "offset_direction": "before",
+                "offset_unit": "trading_days",
+                "offset_value": 1,
+                "description": "Feature data cuts off one trading day before.",
+            },
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first", "confirmatory"],
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "created_at": "2026-05-06T00:00:00Z",
+            "reviewer": {
+                "name": "smoke_tester",
+                "affiliation": "ci",
+                "date": "2026-05-06",
+            },
+        }, indent=2))
+        return spec_file
+
+    def test_close_return_unsupported_source_kind_produces_failed_validation(
+        self, tmp_path
+    ):
+        """SQLite manifest with --observation-close-column fails at close-return
+        section (checked before manifest is loaded) with unsupported_config."""
+        manifest_file = self._make_sqlite_manifest("DM-SQLITE-CR", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0001", tmp_path)
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 1, f"main() returned {rc}"
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        schema_path = Path(__file__).parent.parent / "schemas" / "runner_output_spec_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+        assert artifact["audit_summary"]["overall_result"] == "fail"
+        assert artifact["audit_summary"]["blocker_count"] >= 1
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_close_return_summary" in audit_names
+        close_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_close_return_summary"
+        )
+        assert close_audit["audit_result"] == "fail"
+        assert close_audit["blocker_count"] >= 1
+
+    def test_missing_value_unsupported_source_kind_produces_failed_validation(
+        self, tmp_path
+    ):
+        """SQLite manifest with --observation-missing-value-columns fails at
+        missing-value section with unsupported_config."""
+        manifest_file = self._make_sqlite_manifest("DM-SQLITE-MV", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0002", tmp_path)
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-missing-value-columns", "volume",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 1, f"main() returned {rc}"
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        schema_path = Path(__file__).parent.parent / "schemas" / "runner_output_spec_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+        assert artifact["audit_summary"]["overall_result"] == "fail"
+        assert artifact["audit_summary"]["blocker_count"] >= 1
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_missing_value_summary" in audit_names
+        mv_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_missing_value_summary"
+        )
+        assert mv_audit["audit_result"] == "fail"
+        assert mv_audit["blocker_count"] >= 1
+
+    def test_duplicate_row_section_skipped_when_canonical_fails_first(
+        self, tmp_path
+    ):
+        """SQLite manifest with date+symbol columns (no close) — canonical section
+        raises unsupported_config before duplicate-row section can run.
+
+        When date+symbol are both provided, the canonical section's non-CSV check
+        (line ~1425) fires first and raises GovernanceRejection.  The duplicate-row
+        section's unsupported_format check is never reached.  This test documents
+        that actual ordering: canonical fails, duplicate-row audit is absent.
+        """
+        manifest_file = self._make_sqlite_manifest("DM-SQLITE-DUP", tmp_path)
+        spec_file = self._make_spec("EXP-2026-0003", tmp_path)
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(spec_file),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke",
+        ])
+        assert rc == 1, f"main() returned {rc}"
+        artifact = json.loads(output_path.read_text())
+        assert artifact["status"] == "failed_validation"
+        assert artifact["failure_summary"]["failure_type"] == "unsupported_config"
+        assert artifact["audit_summary"]["overall_result"] == "fail"
+        assert artifact["audit_summary"]["blocker_count"] >= 1
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        # Canonical section fires first; duplicate-row section is never reached
+        assert "observation_table_canonical_summary" in audit_names
+        # duplicate-row is NOT present because canonical raises before it runs
+        assert "observation_table_duplicate_row_summary" not in audit_names
+        canonical_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_canonical_summary"
+        )
+        assert canonical_audit["audit_result"] == "fail"
+        assert canonical_audit["blocker_count"] >= 1
+
+
 class TestFirstThinRunnerAmbiguousHeaderSmoke:
     """Smoke tests for ambiguous stripped observation CSV headers.
 
