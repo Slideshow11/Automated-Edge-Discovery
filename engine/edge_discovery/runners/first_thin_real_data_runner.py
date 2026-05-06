@@ -1472,6 +1472,8 @@ def build_runner_output(
                     "description": (
                         "Input experiment spec referenced by this dry-run artifact."
                     ),
+                    "contains_private_data": False,
+                    "publishable": False,
                 }
                 partial_artifact = {
                     "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
