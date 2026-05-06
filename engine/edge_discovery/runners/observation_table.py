@@ -241,29 +241,19 @@ def _summarize_observation_close_returns(
         reader = csv.DictReader(fh)
         if reader.fieldnames is None:
             raise ValueError(f"CSV has no header row: {dataset_path}")
-        header_set = {f.strip() for f in reader.fieldnames}
-        if close_col not in header_set:
-            raise ValueError(
-                f"observation_close_column '{observation_close_column}' "
-                f"not found in CSV header: {list(reader.fieldnames)}"
-            )
-        # Date/symbol columns are expected to have been validated by
-        # _summarize_observation_table_canonical already; check them too.
-        if date_col not in header_set:
-            raise ValueError(
-                f"observation_date_column '{observation_date_column}' "
-                f"not found in CSV header: {list(reader.fieldnames)}"
-            )
-        if symbol_col not in header_set:
-            raise ValueError(
-                f"observation_symbol_column '{observation_symbol_column}' "
-                f"not found in CSV header: {list(reader.fieldnames)}"
-            )
+        # Resolve actual DictReader field names using the same safe header
+        # resolver as duplicate-row and date-coverage summaries:
+        # exact match wins, single stripped fallback allowed,
+        # ambiguous stripped fallback raises ValueError.
+        fieldnames = reader.fieldnames
+        date_key = _resolve_observation_csv_header(fieldnames, date_col)
+        symbol_key = _resolve_observation_csv_header(fieldnames, symbol_col)
+        close_key = _resolve_observation_csv_header(fieldnames, close_col)
 
         for row in reader:
-            date_val = row.get(date_col, "").strip()
-            symbol_val = row.get(symbol_col, "").strip()
-            close_raw = row.get(close_col, "").strip()
+            date_val = row.get(date_key, "").strip()
+            symbol_val = row.get(symbol_key, "").strip()
+            close_raw = row.get(close_key, "").strip()
 
             # Skip rows with missing essential fields
             if not date_val or not symbol_val:
