@@ -535,10 +535,16 @@ def _summarize_observation_duplicate_rows(
                 f"not found in CSV header: {list(reader.fieldnames)}"
             )
 
+        # Map stripped header names back to actual DictReader keys so row
+        # lookups work regardless of surrounding whitespace in the CSV header.
+        header_map = {f.strip(): f for f in reader.fieldnames}
+        date_key = header_map[date_col]
+        symbol_key = header_map[symbol_col]
+
         for row in reader:
             row_count += 1
-            date_val = row.get(date_col, "").strip()
-            symbol_val = row.get(symbol_col, "").strip()
+            date_val = row.get(date_key, "").strip()
+            symbol_val = row.get(symbol_key, "").strip()
 
             # Skip rows with missing essential fields
             if not date_val or not symbol_val:
