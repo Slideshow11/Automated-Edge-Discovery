@@ -273,3 +273,237 @@ class TestBuildFailureSummary:
         # Extract the failure_summary sub-schema for validation
         failure_summary_schema = schema["properties"]["failure_summary"]
         jsonschema.validate(result, failure_summary_schema)
+
+
+# ---------------------------------------------------------------------------
+# trial_accounting_summary schema
+# ---------------------------------------------------------------------------
+
+import jsonschema as _jsonschema
+
+
+class TestTrialAccountingSummarySchema:
+    """Tests for the optional trial_accounting_summary field in RunnerOutput."""
+
+    SCHEMA_PATH = (
+        Path(__file__).parent.parent
+        / "schemas"
+        / "runner_output_spec_v1.schema.json"
+    )
+
+    @pytest.fixture
+    def schema(self):
+        return json.loads(self.SCHEMA_PATH.read_text())
+
+    def _make_minimal_valid_runner_output(self) -> dict:
+        """Minimal valid RunnerOutput that passes schema validation."""
+        return {
+            "runner_output_id": "RUN-2026-0001",
+            "runner_output_version": "1.0",
+            "run_id": "test-run-id",
+            "run_mode": "dry_run",
+            "status": "success",
+            "runner_name": "aed-dry-run-validator",
+            "runner_version": "0.1.0",
+            "experiment_spec_ref": "EXP-2026-0001",
+            "input_artifact_refs": [
+                {
+                    "artifact_type": "ExperimentSpec",
+                    "artifact_id": "EXP-2026-0001",
+                    "content_hash": "abc123",
+                    "validation_status": "pass",
+                }
+            ],
+            "data_manifest_refs": ["DM-2026-0001"],
+            "run_config_hash": "hash123",
+            "started_at": "2026-01-01T00:00:00Z",
+            "completed_at": "2026-01-01T00:01:00Z",
+            "run_owner": "test-owner",
+            "created_at": "2026-01-01T00:00:00Z",
+            "audit_summary": {
+                "overall_result": "pass",
+                "audits": [
+                    {
+                        "audit_name": "smoke_audit",
+                        "audit_result": "pass",
+                        "severity": "info",
+                        "blocker_count": 0,
+                        "warning_count": 0,
+                        "created_at": "2026-01-01T00:00:00Z",
+                    }
+                ],
+                "blocker_count": 0,
+                "warning_count": 0,
+            },
+            "output_manifest": [
+                {
+                    "output_role": "evidence",
+                    "output_path": "output.json",
+                    "content_hash": "abc123",
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "format": "json",
+                    "description": "Test output",
+                    "contains_private_data": False,
+                    "publishable": False,
+                }
+            ],
+        }
+
+    def test_runner_output_accepts_missing_trial_accounting_summary(self, schema):
+        """Existing RunnerOutput artifacts without trial_accounting_summary remain valid."""
+        artifact = self._make_minimal_valid_runner_output()
+        _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_accepts_trial_accounting_summary_not_applicable(self, schema):
+        """trial_accounting_summary with status=not_applicable and no_mutation is valid."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "not_applicable",
+            "mutation_mode": "no_mutation",
+        }
+        _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_accepts_dry_run_reference_trial_accounting_summary(self, schema):
+        """Full trial_accounting_summary with proposed IDs and dry_run_reference_only is valid."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "experiment_id": "EXP-2026-0001",
+            "data_manifest_id": "DM-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "trial_family_id": "TRF-2026-0001",
+            "proposed_trial_id": "TRL-2026-PROPOSED-0001",
+            "variant_id": "VAR-2026-0001",
+            "n_tried": 10,
+            "candidate_variant_count": 8,
+            "failed_variant_count": 2,
+            "all_variants_preserved": False,
+            "sample_length": 120,
+            "sample_to_trial_ratio": 12.0,
+            "complexity": {
+                "rule_count": 3,
+                "parameter_count": 5,
+                "signal_count": 2,
+                "filter_count": 4,
+                "complexity_bucket": "low",
+            },
+        }
+        _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_unknown_trial_accounting_field(self, schema):
+        """Unknown field inside trial_accounting_summary must fail validation."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "not_applicable",
+            "mutation_mode": "no_mutation",
+            "unknown_field": "should-reject",
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_negative_n_tried(self, schema):
+        """n_tried of -1 must fail validation (minimum: 0)."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "n_tried": -1,
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_negative_candidate_variant_count(self, schema):
+        """candidate_variant_count of -1 must fail validation."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "candidate_variant_count": -1,
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_mutating_mode_ledger_write(self, schema):
+        """mutation_mode=ledger_write must fail — not a permitted value."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "linked",
+            "mutation_mode": "ledger_write",
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_mutating_mode_registry_write(self, schema):
+        """mutation_mode=registry_write must fail — not a permitted value."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "linked",
+            "mutation_mode": "registry_write",
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_runner_output_rejects_unknown_complexity_field(self, schema):
+        """Unknown field inside complexity sub-object must fail validation."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "complexity": {
+                "rule_count": 3,
+                "unknown_complexity_field": "reject",
+            },
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_trial_accounting_summary_complexity_bucket_unknown(self, schema):
+        """complexity_bucket=unknown is a valid value."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "complexity": {
+                "complexity_bucket": "unknown",
+            },
+        }
+        _jsonschema.validate(artifact, schema)
+
+    def test_trial_accounting_summary_complexity_bucket_excessive(self, schema):
+        """complexity_bucket=excessive is valid (blocks promotion at review time, not at schema level)."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "proposed",
+            "mutation_mode": "dry_run_reference_only",
+            "complexity": {
+                "rule_count": 20,
+                "parameter_count": 50,
+                "complexity_bucket": "excessive",
+            },
+        }
+        _jsonschema.validate(artifact, schema)
+
+    def test_trial_accounting_summary_rejects_missing_required_status(self, schema):
+        """status field is required — omitting it must fail."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "mutation_mode": "no_mutation",
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_trial_accounting_summary_rejects_missing_required_mutation_mode(self, schema):
+        """mutation_mode field is required — omitting it must fail."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = {
+            "status": "not_applicable",
+        }
+        with pytest.raises(_jsonschema.ValidationError):
+            _jsonschema.validate(artifact, schema)
+
+    def test_trial_accounting_summary_null_is_valid(self, schema):
+        """trial_accounting_summary can be explicitly null."""
+        artifact = self._make_minimal_valid_runner_output()
+        artifact["trial_accounting_summary"] = None
+        _jsonschema.validate(artifact, schema)

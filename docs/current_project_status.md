@@ -143,6 +143,7 @@ The project is not yet a live trading or production system.
 - PR #181 test: cover unsupported observation source kind
 - PR #182 fix: schema-valid unsupported observation failure artifacts
 - PR #184 docs: design runner trial-accounting linkage
+- PR #185 schema: add optional RunnerOutput trial_accounting_summary field (backward-compatible, no runtime behavior)
 
 ## Current stop rules
 

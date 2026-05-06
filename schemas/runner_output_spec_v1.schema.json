@@ -957,6 +957,225 @@
         "null"
       ],
       "minLength": 1
+    },
+    "trial_accounting_summary": {
+      "description": "Optional trial-accounting linkage summary. Records linkage to governance artifacts (experiment, search space, trial ledger), search pressure metrics, and complexity metadata. Present when the run uses or references trial accounting fields. Absent for runs that do not use trial accounting. This field does not mutate the TrialLedger or EdgeHypothesisRegistry — it only records the linkage state.",
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "status": {
+          "description": "Current trial-accounting status for this run.",
+          "type": "string",
+          "enum": [
+            "not_applicable",
+            "proposed",
+            "linked",
+            "blocked"
+          ]
+        },
+        "mutation_mode": {
+          "description": "Whether this run mutated the TrialLedger or registry. dry_run_reference_only means proposed IDs were recorded in the artifact but no ledger or registry write occurred. no_mutation means no proposed IDs were emitted either.",
+          "type": "string",
+          "enum": [
+            "no_mutation",
+            "dry_run_reference_only"
+          ]
+        },
+        "experiment_id": {
+          "description": "ExperimentSpec ID or fixture path hash that declared the experiment.",
+          "type": "string",
+          "minLength": 1
+        },
+        "data_manifest_id": {
+          "description": "DataManifest ID or path. Absent when run_mode is dry_run with no manifest.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "search_space_id": {
+          "description": "SearchSpaceManifest ID that declared the parameter space. Absent for fixed-config runs.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "trial_family_id": {
+          "description": "Groups related trials (confirmatory, exploratory, follow-up) under a shared hypothesis.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "trial_id": {
+          "description": "TrialLedger entry ID for this specific run. Absent for dry-run or smoke runs.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "proposed_trial_id": {
+          "description": "Proposed trial_id for a future real execution. Used in dry-run mode. Not a real ledger entry.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "variant_id": {
+          "description": "Identifies this variant within a parameterized search space.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "selected_variant_id": {
+          "description": "ID of the selected variant after search. Absent for fixed-config runs.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "model_assessment_id": {
+          "description": "ModelAssessmentSpec ID associated with this run or variant.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "review_packet_id": {
+          "description": "ReviewPacket ID produced by manual review of this RunnerOutput.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "n_tried": {
+          "description": "Total number of variants attempted in this search.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "candidate_variant_count": {
+          "description": "Number of variants that produced a valid RunnerOutput.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "failed_variant_count": {
+          "description": "Number of variants that produced a failed or invalid output.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "all_variants_preserved": {
+          "description": "True if every attempted variant is recorded in the TrialLedger or has a not_applicable reason. False if some are missing.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "sample_length": {
+          "description": "Length of the sample (number of events, rows, or time steps) used for this trial.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "sample_to_trial_ratio": {
+          "description": "Ratio of sample_length to n_tried. Low values indicate high overfitting risk. Null if n_tried is zero or unknown.",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "complexity": {
+          "description": "Strategy complexity metadata for overfitting risk classification.",
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "rule_count": {
+              "description": "Number of entry/exit/filter rules declared in the experiment configuration.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "parameter_count": {
+              "description": "Total number of free parameters across all rules.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "signal_count": {
+              "description": "Number of distinct signal or indicator computations performed.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "filter_count": {
+              "description": "Number of filter or condition checks applied before a signal fires.",
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "complexity_bucket": {
+              "description": "Complexity classification for overfitting risk assessment.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "enum": [
+                "low",
+                "medium",
+                "high",
+                "excessive",
+                "unknown"
+              ]
+            }
+          }
+        },
+        "notes": {
+          "description": "Free-text notes on trial accounting state.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      },
+      "required": [
+        "status",
+        "mutation_mode"
+      ]
     }
   },
   "if": {
