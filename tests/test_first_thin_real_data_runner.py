@@ -44,6 +44,8 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _normalize_optional_column_name,
     _summarize_observation_table_canonical,
     _summarize_observation_close_returns,
+    load_data_manifest_for_runner,
+    _summarize_data_manifest_for_runner,
 )
 
 
@@ -5487,6 +5489,199 @@ class TestExperimentSpecLoaderUnit:
         assert result["trial_generation_mode"] == "literature_replication"
         # _check_experiment_spec_id passes the loaded dict
         _check_experiment_spec_id(result)
+
+
+class TestDataManifestRunnerUnit:
+    """Unit tests for load_data_manifest_for_runner() and _summarize_data_manifest_for_runner().
+
+    These helpers are exercised through integration in build_runner_output(),
+    but direct unit coverage clarifies their actual contract.
+    """
+
+    # ------------------------------------------------------------------
+    # load_data_manifest_for_runner
+    # ------------------------------------------------------------------
+
+    def test_load_data_manifest_for_runner_valid_local_csv_manifest(self, tmp_path):
+        """load_data_manifest_for_runner loads a valid local_csv manifest and returns DatasetManifest."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,open,high,low,close\n2024-01-01,100.0,101.0,99.0,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-test",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        result = load_data_manifest_for_runner(manifest_file)
+        assert result.dataset_id == "DM-2026-test"
+        assert result.source_kind.value == "local_csv"
+        assert result.path == "prices.csv"
+        assert result.format == "csv"
+
+    def test_load_data_manifest_for_runner_missing_file_raises(self, tmp_path):
+        """load_data_manifest_for_runner raises FileNotFoundError when manifest file is absent."""
+        fake = tmp_path / "nonexistent.json"
+        with pytest.raises(FileNotFoundError):
+            load_data_manifest_for_runner(fake)
+
+    def test_load_data_manifest_for_runner_invalid_json_raises(self, tmp_path):
+        """load_data_manifest_for_runner raises JSONDecodeError for malformed JSON."""
+        manifest_file = tmp_path / "bad.json"
+        manifest_file.write_text("{ not valid json ")
+        with pytest.raises(json.JSONDecodeError):
+            load_data_manifest_for_runner(manifest_file)
+
+    def test_load_data_manifest_for_runner_invalid_role_raises(self, tmp_path):
+        """load_data_manifest_for_runner raises ValueError for an unrecognised DatasetRole."""
+        manifest_file = tmp_path / "bad_role.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-test",
+            "role": "not_a_real_role",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        with pytest.raises(ValueError, match="DatasetRole"):
+            load_data_manifest_for_runner(manifest_file)
+
+    def test_load_data_manifest_for_runner_missing_required_field_raises(self, tmp_path):
+        """load_data_manifest_for_runner raises KeyError when dataset_id is absent."""
+        manifest_file = tmp_path / "no_id.json"
+        manifest_file.write_text(json.dumps({
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        with pytest.raises(KeyError):
+            load_data_manifest_for_runner(manifest_file)
+
+    def test_load_data_manifest_for_runner_preserves_optional_fields(self, tmp_path):
+        """load_data_manifest_for_runner preserves optional fields from the manifest."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,close\n2024-01-01,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-optionals",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+            "source_name": "vendor_a",
+            "date_range_start": "2024-01-01",
+            "date_range_end": "2024-12-31",
+            "symbols": ["AAPL", "MSFT"],
+            "quality_flags": ["cleaned"],
+            "provenance_notes": "Test data.",
+        }))
+        result = load_data_manifest_for_runner(manifest_file)
+        assert result.source_name == "vendor_a"
+        assert result.date_range_start == "2024-01-01"
+        assert result.date_range_end == "2024-12-31"
+        assert result.symbols == ("AAPL", "MSFT")
+        assert result.quality_flags == ("cleaned",)
+        assert result.provenance_notes == "Test data."
+
+    def test_load_data_manifest_for_runner_validation_failure_raises(self, tmp_path):
+        """load_data_manifest_for_runner raises ValueError when the dataset path does not exist."""
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-missing",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "this_file_does_not_exist.csv",
+            "format": "csv",
+        }))
+        with pytest.raises(ValueError, match="does not exist"):
+            load_data_manifest_for_runner(manifest_file)
+
+    # ------------------------------------------------------------------
+    # _summarize_data_manifest_for_runner
+    # ------------------------------------------------------------------
+
+    def test_summarize_data_manifest_for_runner_returns_required_fields(self, tmp_path):
+        """_summarize_data_manifest_for_runner returns a dict with required artifact fields."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,close\n2024-01-01,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-summary",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        manifest = load_data_manifest_for_runner(manifest_file)
+        summary = _summarize_data_manifest_for_runner(
+            manifest, manifest_file, tmp_path
+        )
+        assert summary["artifact_type"] == "DataManifest"
+        assert summary["artifact_id"] == "DM-2026-summary"
+        assert summary["artifact_path"] == str(manifest_file.resolve())
+        assert summary["schema_ref"] == "N/A"
+        assert summary["validator_ref"] is None
+        assert summary["content_hash"].startswith("sha256:")
+        assert summary["validation_status"] == "pass"
+
+    def test_summarize_data_manifest_for_runner_is_json_serializable(self, tmp_path):
+        """_summarize_data_manifest_for_runner output is JSON-serializable."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,close\n2024-01-01,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-json",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        manifest = load_data_manifest_for_runner(manifest_file)
+        summary = _summarize_data_manifest_for_runner(
+            manifest, manifest_file, tmp_path
+        )
+        json.dumps(summary)  # raises if not serializable
+
+    def test_summarize_data_manifest_for_runner_preserves_artifact_id(self, tmp_path):
+        """_summarize_data_manifest_for_runner preserves dataset_id as artifact_id."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,close\n2024-01-01,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-sk",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        manifest = load_data_manifest_for_runner(manifest_file)
+        summary = _summarize_data_manifest_for_runner(
+            manifest, manifest_file, tmp_path
+        )
+        assert summary["artifact_id"] == "DM-2026-sk"
+
+    def test_summarize_data_manifest_for_runner_does_not_require_real_dataset_content(
+        self, tmp_path
+    ):
+        """_summarize_data_manifest_for_runner can produce a summary without reading dataset rows."""
+        csv_file = tmp_path / "prices.csv"
+        csv_file.write_text("date,close\n2024-01-01,100.5\n")
+        manifest_file = tmp_path / "data_manifest.json"
+        manifest_file.write_text(json.dumps({
+            "dataset_id": "DM-2026-noread",
+            "role": "price_history",
+            "source_kind": "local_csv",
+            "path": "prices.csv",
+            "format": "csv",
+        }))
+        manifest = load_data_manifest_for_runner(manifest_file)
+        # Should not raise even though we don't read the CSV content
+        summary = _summarize_data_manifest_for_runner(
+            manifest, manifest_file, tmp_path
+        )
+        assert summary["artifact_type"] == "DataManifest"
+        assert summary["validation_status"] == "pass"
 
 
 class TestFirstThinRunnerLocalSmokeGovernance:
