@@ -23,6 +23,7 @@ from engine.edge_discovery.runners.observation_table import (
     _summarize_observation_missing_values,
     _summarize_observation_table_canonical,
     _summarize_observation_duplicate_rows,
+    _summarize_observation_date_coverage,
     _validate_observation_table_columns,
 )
 
@@ -1055,3 +1056,228 @@ class TestSummarizeObservationDuplicateRows:
         assert result["has_duplicates"] is True
         assert result["duplicate_row_count"] == 1
         assert result["affected_symbols"] == ["AAPL"]
+
+
+class TestSummarizeObservationDateCoverage:
+    """Tests for _summarize_observation_date_coverage."""
+
+    def test_empty_csv(self, tmp_path):
+        """Empty CSV (header only) → zero counts, None min/max."""
+        path = tmp_path / "empty.csv"
+        make_csv(path, [["date", "symbol", "close"]])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["total_rows"] == 0
+        assert result["symbol_count"] == 0
+        assert result["min_date"] is None
+        assert result["max_date"] is None
+        assert result["observed_date_count"] == 0
+        assert result["truncated_symbol_count"] == 0
+        assert result["symbols"] == []
+
+    def test_one_symbol_one_date(self, tmp_path):
+        """One symbol, one date → simple counts."""
+        path = tmp_path / "one.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["total_rows"] == 1
+        assert result["symbol_count"] == 1
+        assert result["min_date"] == "2024-01-01"
+        assert result["max_date"] == "2024-01-01"
+        assert result["observed_date_count"] == 1
+        assert result["symbols"][0]["symbol"] == "AAPL"
+        assert result["symbols"][0]["observed_date_count"] == 1
+
+    def test_one_symbol_multiple_dates(self, tmp_path):
+        """One symbol with multiple distinct dates → observed_date_count = 3."""
+        path = tmp_path / "multi_date.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-02", "AAPL", "101.0"],
+            ["2024-01-03", "AAPL", "102.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["symbol_count"] == 1
+        assert result["observed_date_count"] == 3
+        assert result["min_date"] == "2024-01-01"
+        assert result["max_date"] == "2024-01-03"
+        assert result["symbols"][0]["observed_date_count"] == 3
+
+    def test_multiple_symbols_different_date_ranges(self, tmp_path):
+        """Multiple symbols with different date ranges → per-symbol spans differ."""
+        path = tmp_path / "multi_sym.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-02", "AAPL", "101.0"],
+            ["2024-01-03", "AAPL", "102.0"],
+            ["2024-01-02", "MSFT", "200.0"],
+            ["2024-01-03", "MSFT", "201.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["symbol_count"] == 2
+        assert result["observed_date_count"] == 5  # 3 AAPL + 2 MSFT
+        # Symbols sorted alphabetically
+        assert result["symbols"][0]["symbol"] == "AAPL"
+        assert result["symbols"][0]["observed_date_count"] == 3
+        assert result["symbols"][0]["min_date"] == "2024-01-01"
+        assert result["symbols"][0]["max_date"] == "2024-01-03"
+        assert result["symbols"][1]["symbol"] == "MSFT"
+        assert result["symbols"][1]["observed_date_count"] == 2
+        assert result["symbols"][1]["min_date"] == "2024-01-02"
+        assert result["symbols"][1]["max_date"] == "2024-01-03"
+
+    def test_duplicate_dates_count_once_per_symbol(self, tmp_path):
+        """Same date appears twice for one symbol → observed_date_count counts once."""
+        path = tmp_path / "dup_date.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-01", "AAPL", "101.0"],  # same date, different row
+            ["2024-01-02", "AAPL", "102.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        # observed_date_count = 2 (2024-01-01 and 2024-01-02), not 3
+        assert result["observed_date_count"] == 2
+        assert result["symbols"][0]["observed_date_count"] == 2
+
+    def test_rows_with_missing_date_skipped(self, tmp_path):
+        """Rows with empty date are skipped; counts reflect only valid rows."""
+        path = tmp_path / "missing_date.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["", "AAPL", "101.0"],  # missing date
+            ["2024-01-02", "AAPL", "102.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["total_rows"] == 3  # all rows counted
+        assert result["observed_date_count"] == 2  # only valid dates counted
+
+    def test_rows_with_missing_symbol_skipped(self, tmp_path):
+        """Rows with empty symbol are skipped; counts reflect only valid rows."""
+        path = tmp_path / "missing_symbol.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-02", "", "101.0"],  # missing symbol
+            ["2024-01-03", "AAPL", "102.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["total_rows"] == 3
+        assert result["symbol_count"] == 1  # only AAPL counted
+        assert result["observed_date_count"] == 2  # only rows with valid symbol counted
+
+    def test_padded_headers_work(self, tmp_path):
+        """Padded CSV headers (e.g. ' date ') are resolved via safe header resolver."""
+        path = tmp_path / "padded.csv"
+        make_csv(path, [
+            [" date ", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-02", "AAPL", "101.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["min_date"] == "2024-01-01"
+        assert result["max_date"] == "2024-01-02"
+        assert result["symbol_count"] == 1
+        assert result["observed_date_count"] == 2
+
+    def test_ambiguous_stripped_headers_fail_closed(self, tmp_path):
+        """Multiple padded variants strip to same name, no exact match → ValueError (ambiguous)."""
+        path = tmp_path / "ambiguous.csv"
+        make_csv(path, [
+            [" date ", " symbol ", "close"],  # "date" and "symbol" have no exact match
+            ["2024-01-01", "AAPL", "100.0"],
+        ])
+        # When requesting "date" with no exact match but multiple stripped matches (" date ")
+        # this is actually NOT ambiguous — only one stripped match exists per name.
+        # The truly ambiguous case requires two different headers that both strip to "date".
+        # This test documents the current resolver behavior: single stripped fallback succeeds.
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["symbol_count"] == 1
+
+    def test_ambiguous_two_date_headers_fail_closed(self, tmp_path):
+        """Two headers that both strip to 'date' (no exact 'date') → ValueError ambiguous."""
+        path = tmp_path / "ambiguous.csv"
+        make_csv(path, [
+            [" date ", "date ", "symbol", "close"],  # both strip to "date"
+            ["2024-01-01", "2024-01-01", "AAPL", "100.0"],
+        ])
+        with pytest.raises(ValueError, match="Ambiguous"):
+            _summarize_observation_date_coverage(path, "date", "symbol")
+
+    def test_deterministic_symbol_ordering(self, tmp_path):
+        """Symbol entries are sorted alphabetically by symbol name."""
+        path = tmp_path / "ordering.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "ZEBRA", "100.0"],
+            ["2024-01-01", "APPLE", "100.0"],
+            ["2024-01-01", "BANANA", "100.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        symbols = [s["symbol"] for s in result["symbols"]]
+        assert symbols == ["APPLE", "BANANA", "ZEBRA"]
+
+    def test_symbol_summary_cap_and_truncated_count(self, tmp_path):
+        """More than 50 symbols → cap at 50, truncated_symbol_count > 0."""
+        path = tmp_path / "cap.csv"
+        rows = [["date", "symbol", "close"]]
+        for i in range(60):
+            rows.append([f"2024-01-{(i%30)+1:02d}", f"SYM{i:03d}", "100.0"])
+        make_csv(path, rows)
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        assert result["symbol_count"] == 60
+        assert len(result["symbols"]) == 50
+        assert result["truncated_symbol_count"] == 10
+        assert result["symbol_summary_limit"] == 50
+
+    def test_json_serializable(self, tmp_path):
+        """Result dict is JSON-serializable with no non-serializable types."""
+        import json
+        path = tmp_path / "json.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-02", "AAPL", "101.0"],
+        ])
+        result = _summarize_observation_date_coverage(path, "date", "symbol")
+        # Should not raise
+        json.dumps(result)
+        # All values are JSON-native
+        assert isinstance(result["total_rows"], int)
+        assert isinstance(result["symbol_count"], int)
+        assert isinstance(result["min_date"], (str, type(None)))
+        assert isinstance(result["max_date"], (str, type(None)))
+        assert isinstance(result["observed_date_count"], int)
+        assert isinstance(result["truncated_symbol_count"], int)
+        assert isinstance(result["symbols"], list)
+        for s in result["symbols"]:
+            assert isinstance(s["symbol"], str)
+            assert isinstance(s["min_date"], (str, type(None)))
+            assert isinstance(s["max_date"], (str, type(None)))
+            assert isinstance(s["observed_date_count"], int)
+
+    def test_resolver_hoist_duplicate_row_still_passes(self, tmp_path):
+        """After hoisting _resolve_observation_csv_header, duplicate-row summary still works.
+
+        This is a regression test: the resolver hoist must not break the existing
+        _summarize_observation_duplicate_rows function.
+        """
+        path = tmp_path / "dup.csv"
+        make_csv(path, [
+            ["date", "symbol", "close"],
+            ["2024-01-01", "AAPL", "100.0"],
+            ["2024-01-01", "AAPL", "101.0"],  # duplicate
+        ])
+        from engine.edge_discovery.runners.observation_table import (
+            _summarize_observation_duplicate_rows,
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+

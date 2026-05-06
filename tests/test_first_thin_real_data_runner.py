@@ -4649,3 +4649,140 @@ class TestDuplicateRowSummaryIntegration:
         )
         assert canonical_audit["blocker_count"] == 0
         assert dup_audit["blocker_count"] == 0
+
+
+class TestDateCoverageSummaryIntegration:
+    """Integration tests for observation_table_date_coverage_summary audit wiring."""
+
+    def test_audit_entry_present(self, csv_with_no_duplicates, valid_experiment_spec, tmp_path):
+        """With date+symbol columns, audit contains observation_table_date_coverage_summary."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_date_coverage_summary" in audit_names
+
+    def test_audit_result_pass(self, csv_with_no_duplicates, valid_experiment_spec, tmp_path):
+        """Successful summary → audit_result = 'pass', severity = 'info'."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dc_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_date_coverage_summary"
+        )
+        assert dc_audit["audit_result"] == "pass"
+        assert dc_audit["severity"] == "info"
+        assert dc_audit["blocker_count"] == 0
+
+    def test_summary_reflects_counts(self, csv_with_no_duplicates, valid_experiment_spec, tmp_path):
+        """Summary fields reflect correct symbol_count, min_date, max_date, observed_date_count."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        dc_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_date_coverage_summary"
+        )
+        # details_ref contains the summary fields
+        details = dc_audit["details_ref"]
+        assert "symbol_count=" in details
+        assert "observed_date_count=" in details
+        assert "min_date=" in details
+        assert "max_date=" in details
+
+    def test_existing_audit_entries_preserved(self, csv_with_no_duplicates, valid_experiment_spec, tmp_path):
+        """Date-coverage audit appends; existing audits (canonical, duplicate) are preserved."""
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        audit_names = [a["audit_name"] for a in artifact["audit_summary"]["audits"]]
+        assert "observation_table_canonical_summary" in audit_names
+        assert "observation_table_duplicate_row_summary" in audit_names
+        assert "observation_table_date_coverage_summary" in audit_names
+
+    def test_artifact_schema_valid(self, csv_with_no_duplicates, valid_experiment_spec, tmp_path):
+        """RunnerOutput artifact is schema-valid when date-coverage audit is present."""
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        manifest_path, _ = csv_with_no_duplicates
+        output_path = tmp_path / "output.json"
+        rc = main([
+            "--experiment-spec", str(valid_experiment_spec),
+            "--data-manifest", str(manifest_path),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--output-path", str(output_path),
+            "--run-owner", "test",
+        ])
+        assert rc == 0
+        artifact = json.loads(output_path.read_text())
+        schema_path = Path(__file__).resolve().parents[1] / "schemas" / "runner_output_spec_v1.schema.json"
+        schema = json.loads(schema_path.read_text())
+        jsonschema.validate(artifact, schema)
+
+    def test_blocker_count_preserved_after_adding_date_coverage_audit(
+        self, csv_with_no_duplicates, valid_experiment_spec
+    ):
+        """Adding date-coverage audit does not corrupt blocker_count from prior audits."""
+        from engine.edge_discovery.runners.first_thin_real_data_runner import (
+            build_runner_output,
+        )
+        manifest_path, _ = csv_with_no_duplicates
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=manifest_path,
+            observation_date_column="date",
+            observation_symbol_column="symbol",
+            run_owner="test",
+        )
+        assert artifact["status"] == "success"
+        # blocker_count must be 0 and not inflated by the info-severity date-coverage audit
+        assert artifact["audit_summary"]["blocker_count"] == 0
+        dc_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_date_coverage_summary"
+        )
+        assert dc_audit["blocker_count"] == 0
+        canonical_audit = next(
+            a for a in artifact["audit_summary"]["audits"]
+            if a["audit_name"] == "observation_table_canonical_summary"
+        )
+        assert canonical_audit["blocker_count"] == 0
+

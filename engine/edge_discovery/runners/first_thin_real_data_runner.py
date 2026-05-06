@@ -36,6 +36,7 @@ from engine.edge_discovery.runners.observation_table import (
     _summarize_observation_close_returns,
     _summarize_observation_missing_values,
     _summarize_observation_duplicate_rows,
+    _summarize_observation_date_coverage,
     _read_csv_header,
     _validate_observation_table_columns,
 )
@@ -2239,6 +2240,226 @@ def build_runner_output(
                 failed_artifact,
                 f"Run blocked by observation_table_duplicate_row_summary failure: "
                 f"{dup_details}.",
+            )
+
+    # -------------------------------------------------------------------------
+    # Date-coverage summary (observation_table_date_coverage_summary audit).
+    # Runs when BOTH date and symbol columns are provided along with a CSV
+    # manifest. Reuses the same has_dup_summary_requested guard.
+    # -------------------------------------------------------------------------
+    if (
+        has_dup_summary_requested
+        and manifest is not None
+    ):
+        # Unsupported format check — mirror duplicate-row pattern
+        if manifest.source_kind.value != "local_csv":
+            now = _utc_now()
+            dc_fail_audit = {
+                "audit_name": "observation_table_date_coverage_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": (
+                    f"date_coverage_summary_error: --observation-date-column/ "
+                    f"--observation-symbol-column is only supported for CSV "
+                    f"(dataset has source_kind='{manifest.source_kind.value}')."
+                ),
+                "created_at": now,
+            }
+            new_audits = list(audit_summary["audits"])
+            new_audits.append(dc_fail_audit)
+            total_b = sum(
+                a["blocker_count"] for a in new_audits
+                if a["audit_result"] == "fail"
+            )
+            failing_checks = [
+                a["audit_name"] for a in new_audits
+                if a["audit_result"] == "fail"
+            ]
+            dc_failure_summary = {
+                "failure_type": "unsupported_config",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_date_coverage_summary: "
+                    f"unsupported format; Total blockers: {total_b}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": (
+                    "Input experiment spec referenced by this dry-run artifact. "
+                    "Content hash is of the experiment spec JSON file, providing "
+                    "a stable content identifier for the input governance document."
+                ),
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": {
+                    "overall_result": "fail",
+                    "blocker_count": total_b,
+                    "warning_count": 0,
+                    "audits": new_audits,
+                },
+                "output_manifest": [spec_entry],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": dc_failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"--observation-date-column/--observation-symbol-column "
+                f"date-coverage check is only supported for CSV datasets "
+                f"(source_kind='{manifest.source_kind.value}').",
+            )
+
+        # CSV: resolve dataset path
+        raw_path = Path(manifest.path)
+        dataset_resolved = (
+            raw_path if raw_path.is_absolute()
+            else (manifest_base_dir / raw_path).resolve()
+        )
+        now = _utc_now()
+        try:
+            dc_result = _summarize_observation_date_coverage(
+                dataset_resolved,
+                observation_date_column=observation_date_column,
+                observation_symbol_column=observation_symbol_column,
+            )
+            dc_passed = True
+            dc_details = dc_result["details"]
+        except ValueError as exc:
+            dc_passed = False
+            dc_details = f"date_coverage_summary_error: {exc}"
+
+        if dc_passed:
+            dc_audit = {
+                "audit_name": "observation_table_date_coverage_summary",
+                "audit_result": "pass",
+                "severity": "info",
+                "blocker_count": 0,
+                "warning_count": 0,
+                "details_ref": dc_details,
+                "created_at": now,
+            }
+        else:
+            dc_audit = {
+                "audit_name": "observation_table_date_coverage_summary",
+                "audit_result": "fail",
+                "severity": "blocker",
+                "blocker_count": 1,
+                "warning_count": 0,
+                "details_ref": dc_details,
+                "created_at": now,
+            }
+            dc_passed = False
+
+        # Append date-coverage audit; recompute blocker_count from full audit list
+        new_audits = list(audit_summary["audits"])
+        new_audits.append(dc_audit)
+        total_blockers = sum(
+            a["blocker_count"] for a in new_audits if a["audit_result"] == "fail"
+        )
+        overall_result = (
+            "fail" if total_blockers > 0 else audit_summary["overall_result"]
+        )
+        audit_summary = {
+            "overall_result": overall_result,
+            "blocker_count": total_blockers,
+            "warning_count": audit_summary["warning_count"],
+            "audits": new_audits,
+        }
+
+        # If date-coverage summary failed with blockers → emit failed_validation
+        if not dc_passed and audit_summary["blocker_count"] > 0:
+            failing_checks = [
+                a["audit_name"] for a in audit_summary["audits"]
+                if a["audit_result"] == "fail"
+            ]
+            failure_summary = {
+                "failure_type": "validation_error",
+                "status": "failed_validation",
+                "failed_check": ", ".join(failing_checks),
+                "blocker_summary": (
+                    f"observation_table_date_coverage_summary: {dc_details}. "
+                    f"Total blockers: {audit_summary['blocker_count']}."
+                ),
+                "missing_data_summary_ref": None,
+                "details_ref": None,
+                "created_at": now,
+            }
+            spec_entry = {
+                "output_role": "evidence",
+                "output_path": (
+                    str(experiment_spec_path.resolve())
+                    if experiment_spec_path.is_absolute()
+                    else str(experiment_spec_path)
+                ),
+                "row_count": None,
+                "content_hash": f"sha256:{spec_content_hash}",
+                "created_at": created_at,
+                "format": "json",
+                "description": (
+                    "Input experiment spec referenced by this dry-run artifact. "
+                    "Content hash is of the experiment spec JSON file, providing "
+                    "a stable content identifier for the input governance document."
+                ),
+                "contains_private_data": False,
+                "publishable": False,
+            }
+            failed_artifact = {
+                "runner_output_id": RUNNER_OUTPUT_ID_DEFAULT,
+                "runner_output_version": RUNNER_OUTPUT_VERSION,
+                "run_id": run_id,
+                "run_mode": "dry_run",
+                "status": "failed_validation",
+                "runner_name": runner_name,
+                "runner_version": runner_version,
+                "experiment_spec_ref": experiment_id,
+                "input_artifact_refs": input_artifact_refs,
+                "data_manifest_refs": [manifest.dataset_id],
+                "run_config_hash": f"sha256:{run_config_hash}",
+                "started_at": started_at,
+                "completed_at": completed_at,
+                "audit_summary": audit_summary,
+                "output_manifest": [spec_entry],
+                "created_at": created_at,
+                "run_owner": run_owner,
+                "failure_summary": failure_summary,
+                "partial_summary": None,
+            }
+            raise GovernanceRejection(
+                failed_artifact,
+                f"Run blocked by observation_table_date_coverage_summary failure: "
+                f"{dc_details}.",
             )
 
     output_manifest = [
