@@ -465,3 +465,136 @@ def _validate_observation_table_columns(
     header_set = {col.strip() for col in header}
     missing = [col for col in required_columns if col.strip() not in header_set]
     return missing, len(missing) == 0
+
+
+def _summarize_observation_duplicate_rows(
+    dataset_path: Path,
+    observation_date_column: str,
+    observation_symbol_column: str,
+) -> dict:
+    """
+    Detect duplicate (symbol, date) rows in a CSV observation table in a single
+    pass using csv.DictReader.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    observation_date_column : str
+        Column name for date values.
+    observation_symbol_column : str
+        Column name for symbol/ticker values.
+
+    Returns
+    -------
+    dict
+        Duplicate-row summary dict with keys:
+        - total_rows (int): total non-header rows read
+        - duplicate_row_count (int): total excess rows beyond first occurrence
+          (e.g. a key appearing 3 times contributes 2 to this count)
+        - affected_key_count (int): number of distinct (symbol, date) keys
+          that appear more than once
+        - affected_symbols (list[str]): sorted list of symbols that have at
+          least one duplicate (date) key; JSON-serializable
+        - affected_dates (list[str]): sorted list of dates that appear in at
+          least one duplicate key; JSON-serializable
+        - has_duplicates (bool): True when duplicate_row_count > 0
+        - duplicate_examples (list[dict]): first 10 duplicate keys sorted by
+          (symbol, date), each as {"symbol": str, "date": str,
+          "row_count": int, "excess_row_count": int}; JSON-serializable
+        - details (str): human-readable summary string for audit details_ref
+
+    Raises
+    ------
+    ValueError
+        If observation_date_column or observation_symbol_column is not in the
+        CSV header.
+    """
+    date_col = observation_date_column.strip()
+    symbol_col = observation_symbol_column.strip()
+
+    # (symbol, date) → occurrence count; tracks distinct keys seen
+    key_counts: dict[tuple[str, str], int] = {}
+    # Per-key first occurrence for examples
+    key_first_date: dict[tuple[str, str], str] = {}
+    row_count = 0
+
+    with open(dataset_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {dataset_path}")
+        header_set = {f.strip() for f in reader.fieldnames}
+        if date_col not in header_set:
+            raise ValueError(
+                f"observation_date_column '{observation_date_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+        if symbol_col not in header_set:
+            raise ValueError(
+                f"observation_symbol_column '{observation_symbol_column}' "
+                f"not found in CSV header: {list(reader.fieldnames)}"
+            )
+
+        for row in reader:
+            row_count += 1
+            date_val = row.get(date_col, "").strip()
+            symbol_val = row.get(symbol_col, "").strip()
+
+            # Skip rows with missing essential fields
+            if not date_val or not symbol_val:
+                continue
+
+            key = (symbol_val, date_val)
+            if key not in key_counts:
+                key_counts[key] = 1
+                key_first_date[key] = date_val
+            else:
+                key_counts[key] += 1
+
+    # Identify duplicate keys and aggregate
+    duplicate_keys = sorted(
+        (sym, dt) for (sym, dt), cnt in key_counts.items() if cnt > 1
+    )
+
+    duplicate_row_count = sum(
+        cnt - 1 for cnt in key_counts.values() if cnt > 1
+    )
+    affected_key_count = len(duplicate_keys)
+
+    # Collect affected symbols and dates from duplicate keys
+    affected_symbols = sorted({sym for sym, _ in duplicate_keys})
+    affected_dates = sorted({dt for _, dt in duplicate_keys})
+
+    has_duplicates = duplicate_row_count > 0
+
+    # Build deterministic examples: first 10 duplicate keys sorted (sym, dt)
+    duplicate_examples = [
+        {
+            "symbol": sym,
+            "date": dt,
+            "row_count": key_counts[(sym, dt)],
+            "excess_row_count": key_counts[(sym, dt)] - 1,
+        }
+        for (sym, dt) in duplicate_keys[:10]
+    ]
+
+    # details string — must not include actual data values or symbol names
+    details_parts = [f"total_rows={row_count}"]
+    details_parts.append(f"duplicate_row_count={duplicate_row_count}")
+    details_parts.append(f"affected_key_count={affected_key_count}")
+    if has_duplicates:
+        details_parts.append(f"affected_symbol_count={len(affected_symbols)}")
+        details_parts.append(f"affected_date_count={len(affected_dates)}")
+    else:
+        details_parts.append("no duplicate observation rows were detected")
+
+    return {
+        "total_rows": row_count,
+        "duplicate_row_count": duplicate_row_count,
+        "affected_key_count": affected_key_count,
+        "affected_symbols": affected_symbols,
+        "affected_dates": affected_dates,
+        "has_duplicates": has_duplicates,
+        "duplicate_examples": duplicate_examples,
+        "details": "; ".join(details_parts),
+    }

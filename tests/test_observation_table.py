@@ -22,6 +22,7 @@ from engine.edge_discovery.runners.observation_table import (
     _summarize_observation_close_returns,
     _summarize_observation_missing_values,
     _summarize_observation_table_canonical,
+    _summarize_observation_duplicate_rows,
     _validate_observation_table_columns,
 )
 
@@ -633,3 +634,247 @@ class TestSummarizeObservationMissingValues:
         assert "190" not in details_lower
         assert "aapl" not in details_lower
 
+
+class TestSummarizeObservationDuplicateRows:
+    """Unit tests for _summarize_observation_duplicate_rows."""
+
+    def test_no_duplicates(self, tmp_path):
+        """No duplicate (symbol, date) keys → duplicate_row_count = 0."""
+        path = tmp_path / "no_dup.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+                ["2024-01-01", "MSFT", "200.0"],
+                ["2024-01-03", "MSFT", "210.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["total_rows"] == 4
+        assert result["duplicate_row_count"] == 0
+        assert result["affected_key_count"] == 0
+        assert result["affected_symbols"] == []
+        assert result["affected_dates"] == []
+        assert result["has_duplicates"] is False
+        assert result["duplicate_examples"] == []
+        assert "no duplicate observation rows were detected" in result["details"]
+
+    def test_one_duplicate_pair_two_occurrences(self, tmp_path):
+        """A (symbol, date) key appearing exactly twice → duplicate_row_count = 1."""
+        path = tmp_path / "one_dup_pair.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+                ["2024-01-01", "AAPL", "101.0"],  # duplicate of row 1
+                ["2024-01-03", "MSFT", "200.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["total_rows"] == 4
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_key_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+        assert result["affected_dates"] == ["2024-01-01"]
+        assert result["has_duplicates"] is True
+        assert len(result["duplicate_examples"]) == 1
+        assert result["duplicate_examples"][0]["symbol"] == "AAPL"
+        assert result["duplicate_examples"][0]["date"] == "2024-01-01"
+        assert result["duplicate_examples"][0]["row_count"] == 2
+        assert result["duplicate_examples"][0]["excess_row_count"] == 1
+
+    def test_duplicate_pair_three_occurrences(self, tmp_path):
+        """A key appearing three times → duplicate_row_count = 2 (3 - 1)."""
+        path = tmp_path / "triple_dup.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],
+                ["2024-01-01", "AAPL", "102.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["duplicate_row_count"] == 2
+        assert result["affected_key_count"] == 1
+        assert result["duplicate_examples"][0]["row_count"] == 3
+        assert result["duplicate_examples"][0]["excess_row_count"] == 2
+
+    def test_multiple_duplicate_pairs(self, tmp_path):
+        """Two distinct duplicate keys → affected_key_count = 2."""
+        path = tmp_path / "multi_dup.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+                ["2024-01-01", "AAPL", "101.0"],  # AAPL 2024-01-01 duplicate
+                ["2024-01-01", "MSFT", "200.0"],
+                ["2024-01-02", "MSFT", "210.0"],
+                ["2024-01-01", "MSFT", "201.0"],  # MSFT 2024-01-01 duplicate
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["duplicate_row_count"] == 2
+        assert result["affected_key_count"] == 2
+        assert set(result["affected_symbols"]) == {"AAPL", "MSFT"}
+        assert set(result["affected_dates"]) == {"2024-01-01"}
+        assert len(result["duplicate_examples"]) == 2
+        # Sorted deterministically by (symbol, date)
+        assert result["duplicate_examples"][0]["symbol"] == "AAPL"
+        assert result["duplicate_examples"][0]["date"] == "2024-01-01"
+        assert result["duplicate_examples"][1]["symbol"] == "MSFT"
+        assert result["duplicate_examples"][1]["date"] == "2024-01-01"
+
+    def test_same_symbol_different_date_not_duplicate(self, tmp_path):
+        """Same symbol on different dates is not a duplicate."""
+        path = tmp_path / "same_sym_diff_date.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+                ["2024-01-03", "AAPL", "105.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["duplicate_row_count"] == 0
+        assert result["has_duplicates"] is False
+        assert result["affected_symbols"] == []
+
+    def test_same_date_different_symbol_not_duplicate(self, tmp_path):
+        """Same date across different symbols is not a duplicate."""
+        path = tmp_path / "same_date_diff_sym.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "MSFT", "200.0"],
+                ["2024-01-01", "GOOG", "150.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["duplicate_row_count"] == 0
+        assert result["has_duplicates"] is False
+        assert result["affected_symbols"] == []
+
+    def test_empty_csv(self, tmp_path):
+        """CSV with header only and no data rows."""
+        path = tmp_path / "empty.csv"
+        make_csv(path, [["date", "symbol", "close"]])
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["total_rows"] == 0
+        assert result["duplicate_row_count"] == 0
+        assert result["has_duplicates"] is False
+        assert result["duplicate_examples"] == []
+        assert "no duplicate observation rows were detected" in result["details"]
+
+    def test_duplicate_examples_sorted_deterministic(self, tmp_path):
+        """duplicate_examples are sorted by (symbol, date) for determinism."""
+        path = tmp_path / "sorted_dups.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-02", "MSFT", "210.0"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "MSFT", "211.0"],
+                ["2024-01-01", "AAPL", "101.0"],
+                ["2024-01-01", "GOOG", "150.0"],
+                ["2024-01-01", "GOOG", "151.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert len(result["duplicate_examples"]) == 3
+        # Sorted alphabetically by symbol: AAPL, GOOG, MSFT
+        assert result["duplicate_examples"][0]["symbol"] == "AAPL"
+        assert result["duplicate_examples"][1]["symbol"] == "GOOG"
+        assert result["duplicate_examples"][2]["symbol"] == "MSFT"
+
+    def test_json_serializable(self, tmp_path):
+        """Return dict must be JSON-serializable (no Python sets)."""
+        import json
+        path = tmp_path / "json_ok.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        # Should not raise
+        json.dumps(result)
+        assert isinstance(result["affected_symbols"], list)
+        assert isinstance(result["affected_dates"], list)
+        assert isinstance(result["duplicate_examples"], list)
+
+    def test_missing_date_column_raises(self, tmp_path):
+        """Missing date column raises ValueError."""
+        path = tmp_path / "no_date.csv"
+        make_csv(path, [["symbol", "close"], ["AAPL", "100.0"]])
+        with pytest.raises(ValueError, match="observation_date_column"):
+            _summarize_observation_duplicate_rows(path, "date", "symbol")
+
+    def test_missing_symbol_column_raises(self, tmp_path):
+        """Missing symbol column raises ValueError."""
+        path = tmp_path / "no_sym.csv"
+        make_csv(path, [["date", "close"], ["2024-01-01", "100.0"]])
+        with pytest.raises(ValueError, match="observation_symbol_column"):
+            _summarize_observation_duplicate_rows(path, "date", "symbol")
+
+    def test_row_with_missing_date_skipped(self, tmp_path):
+        """Row with missing date value is skipped and does not cause false duplicate."""
+        path = tmp_path / "missing_date.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["", "AAPL", "110.0"],   # missing date → skipped
+                ["2024-01-02", "AAPL", "101.0"],  # different date, not a duplicate of row 1
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        # Row with empty date is skipped; rows 1 and 3 have different dates
+        assert result["total_rows"] == 3
+        assert result["duplicate_row_count"] == 0
+
+    def test_row_with_missing_symbol_skipped(self, tmp_path):
+        """Row with missing symbol value is skipped and does not cause false duplicate."""
+        path = tmp_path / "missing_sym.csv"
+        make_csv(
+            path,
+            [
+                ["date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "", "110.0"],  # missing symbol → skipped
+                ["2024-01-01", "MSFT", "101.0"],  # different symbol, not a duplicate of row 1
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["total_rows"] == 3
+        assert result["duplicate_row_count"] == 0
+
+    def test_duplicate_examples_capped_at_10(self, tmp_path):
+        """When > 10 duplicate keys exist, only first 10 appear in examples."""
+        rows = [["date", "symbol", "close"]]
+        for i in range(20):
+            rows.append([f"2024-01-01", f"SYM{i:02d}", "100.0"])
+            rows.append([f"2024-01-01", f"SYM{i:02d}", "101.0"])  # duplicate
+        path = tmp_path / "many_dups.csv"
+        make_csv(path, rows)
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["affected_key_count"] == 20
+        assert len(result["duplicate_examples"]) == 10
+        assert result["duplicate_row_count"] == 20  # 1 excess per key
