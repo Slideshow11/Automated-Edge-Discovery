@@ -467,6 +467,53 @@ def _validate_observation_table_columns(
     return missing, len(missing) == 0
 
 
+def _resolve_observation_csv_header(
+    fieldnames: list[str],
+    requested_column: str,
+) -> str:
+    """
+    Resolve a requested CSV column name to its actual DictReader field name
+    using the safe priority policy: exact match first, single stripped fallback,
+    ambiguous stripped fallback raises ValueError.
+
+    Parameters
+    ----------
+    fieldnames : list[str]
+        Raw field names from csv.DictReader.fieldnames (may contain surrounding
+        whitespace).
+    requested_column : str
+        Column name requested by the caller (e.g. "date", "symbol").
+
+    Returns
+    -------
+    str
+        The actual field name from fieldnames that maps to the requested column.
+
+    Raises
+    ------
+    ValueError
+        - If no field name matches the requested column (after stripping).
+        - If multiple field names normalize to the requested column after stripping
+          (ambiguous).
+    """
+    requested = requested_column.strip()
+    # 1. Exact match wins
+    if requested in fieldnames:
+        return requested
+    # 2. Stripped fallback only when exactly one match exists
+    stripped_matches = [f for f in fieldnames if f.strip() == requested]
+    if not stripped_matches:
+        raise ValueError(
+            f"Column '{requested}' not found in CSV header: {list(fieldnames)}"
+        )
+    if len(stripped_matches) > 1:
+        raise ValueError(
+            f"Ambiguous column '{requested}': multiple CSV headers "
+            f"normalize to that name: {list(fieldnames)}"
+        )
+    return stripped_matches[0]
+
+
 def _summarize_observation_duplicate_rows(
     dataset_path: Path,
     observation_date_column: str,
@@ -536,32 +583,12 @@ def _summarize_observation_duplicate_rows(
             )
 
         # Resolve actual DictReader field names for date/symbol columns.
-        # Strategy: exact match → single stripped match → error on ambiguity.
-        # This prevents silent column misresolution when multiple CSV headers
-        # normalize to the same name (e.g. both "date" and " date " strip to "date").
+        # Uses the module-level safe header resolver:
+        # exact match → single stripped fallback → error on ambiguity.
         fieldnames = reader.fieldnames
 
-        def _resolve_header(fieldnames, requested):
-            requested = requested.strip()
-            # 1. Exact match wins
-            if requested in fieldnames:
-                return requested
-            # 2. Stripped fallback only when exactly one match exists
-            stripped_matches = [f for f in fieldnames if f.strip() == requested]
-            if not stripped_matches:
-                raise ValueError(
-                    f"Column '{requested}' not found in CSV header: "
-                    f"{list(fieldnames)}"
-                )
-            if len(stripped_matches) > 1:
-                raise ValueError(
-                    f"Ambiguous column '{requested}': multiple CSV headers "
-                    f"normalize to that name: {list(fieldnames)}"
-                )
-            return stripped_matches[0]
-
-        date_key = _resolve_header(fieldnames, date_col)
-        symbol_key = _resolve_header(fieldnames, symbol_col)
+        date_key = _resolve_observation_csv_header(fieldnames, date_col)
+        symbol_key = _resolve_observation_csv_header(fieldnames, symbol_col)
 
         for row in reader:
             row_count += 1
@@ -626,3 +653,127 @@ def _summarize_observation_duplicate_rows(
         "duplicate_examples": duplicate_examples,
         "details": "; ".join(details_parts),
     }
+
+
+def _summarize_observation_date_coverage(
+    dataset_path: Path,
+    observation_date_column: str,
+    observation_symbol_column: str,
+) -> dict:
+    """
+    Compute raw observed-date coverage statistics from a CSV observation table
+    in a single pass using csv.DictReader.
+
+    Tracks per-symbol and global observed date spans. A date is counted once
+    per symbol regardless of how many observation rows contain it.
+
+    Parameters
+    ----------
+    dataset_path : Path
+        Path to the CSV observation table file.
+    observation_date_column : str
+        Column name for date values.
+    observation_symbol_column : str
+        Column name for symbol/ticker values.
+
+    Returns
+    -------
+    dict
+        Date coverage summary dict with keys:
+        - total_rows (int): total non-header rows read
+        - symbol_count (int): number of distinct non-empty symbols observed
+        - min_date (str | None): lexicographic minimum date across all valid rows
+        - max_date (str | None): lexicographic maximum date across all valid rows
+        - observed_date_count (int): number of distinct (symbol, date) pairs;
+          duplicate dates for one symbol count once
+        - symbol_summary_limit (int): maximum symbols included in `symbols` list
+        - truncated_symbol_count (int): number of symbols beyond the cap
+        - symbols (list[dict]): up to 50 symbol entries sorted by symbol name,
+          each as {"symbol": str, "min_date": str|None, "max_date": str|None,
+          "observed_date_count": int}
+        - details (str): human-readable summary string for audit details_ref
+
+    Raises
+    ------
+    ValueError
+        If observation_date_column or observation_symbol_column is not in the
+        CSV header (or is ambiguous after stripping).
+    """
+    date_col = observation_date_column.strip()
+    symbol_col = observation_symbol_column.strip()
+
+    total_rows = 0
+    # Global date span across all valid rows
+    all_dates: set[str] = set()
+    # Per-symbol date tracking: symbol → set of observed dates
+    symbol_dates: dict[str, set[str]] = {}
+
+    with open(dataset_path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV has no header row: {dataset_path}")
+
+        # Resolve actual DictReader field names using safe header resolver
+        fieldnames = reader.fieldnames
+        date_key = _resolve_observation_csv_header(fieldnames, date_col)
+        symbol_key = _resolve_observation_csv_header(fieldnames, symbol_col)
+
+        for row in reader:
+            total_rows += 1
+            date_val = row.get(date_key, "").strip()
+            symbol_val = row.get(symbol_key, "").strip()
+
+            # Skip rows with missing essential fields
+            if not date_val or not symbol_val:
+                continue
+
+            all_dates.add(date_val)
+            if symbol_val not in symbol_dates:
+                symbol_dates[symbol_val] = set()
+            symbol_dates[symbol_val].add(date_val)
+
+    # Global date span
+    sorted_all_dates = sorted(all_dates)
+    min_date = sorted_all_dates[0] if sorted_all_dates else None
+    max_date = sorted_all_dates[-1] if sorted_all_dates else None
+
+    # Per-symbol summaries sorted deterministically
+    symbol_count = len(symbol_dates)
+    SYMBOL_SUMMARY_LIMIT = 50
+    sorted_symbols = sorted(symbol_dates.keys())
+    truncated_symbol_count = max(0, symbol_count - SYMBOL_SUMMARY_LIMIT)
+    symbols_summary = []
+    for sym in sorted_symbols[:SYMBOL_SUMMARY_LIMIT]:
+        sd = sorted(symbol_dates[sym])
+        symbols_summary.append({
+            "symbol": sym,
+            "min_date": sd[0] if sd else None,
+            "max_date": sd[-1] if sd else None,
+            "observed_date_count": len(symbol_dates[sym]),
+        })
+
+    observed_date_count = sum(len(dates) for dates in symbol_dates.values())
+
+    details_parts = [
+        f"total_rows={total_rows}",
+        f"symbol_count={symbol_count}",
+        f"observed_date_count={observed_date_count}",
+        f"symbol_summary_limit={SYMBOL_SUMMARY_LIMIT}",
+        f"truncated_symbol_count={truncated_symbol_count}",
+    ]
+    if min_date is not None and max_date is not None:
+        details_parts.append(f"min_date={min_date}")
+        details_parts.append(f"max_date={max_date}")
+
+    return {
+        "total_rows": total_rows,
+        "symbol_count": symbol_count,
+        "min_date": min_date,
+        "max_date": max_date,
+        "observed_date_count": observed_date_count,
+        "symbol_summary_limit": SYMBOL_SUMMARY_LIMIT,
+        "truncated_symbol_count": truncated_symbol_count,
+        "symbols": symbols_summary,
+        "details": "; ".join(details_parts),
+    }
+
