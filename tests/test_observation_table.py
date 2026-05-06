@@ -878,3 +878,180 @@ class TestSummarizeObservationDuplicateRows:
         assert result["affected_key_count"] == 20
         assert len(result["duplicate_examples"]) == 10
         assert result["duplicate_row_count"] == 20  # 1 excess per key
+
+    # -------------------------------------------------------------------------
+    # Regression tests: padded / whitespace-surrounded CSV headers
+    # -------------------------------------------------------------------------
+
+    def test_padded_headers_detect_duplicates(self, tmp_path):
+        """CSV with padded headers like ' date ' and ' symbol ' must still find duplicates."""
+        path = tmp_path / "padded_dup.csv"
+        make_csv(
+            path,
+            [
+                [" date ", " symbol ", "close"],  # padded headers
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+                ["2024-01-03", "AAPL", "105.0"],
+                ["2024-01-03", "AAPL", "106.0"],  # duplicate of 2024-01-03
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_key_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+        assert result["affected_dates"] == ["2024-01-03"]
+        assert result["duplicate_examples"][0]["symbol"] == "AAPL"
+        assert result["duplicate_examples"][0]["date"] == "2024-01-03"
+
+    def test_padded_headers_no_duplicates(self, tmp_path):
+        """Padded headers with no duplicates → has_duplicates is False."""
+        path = tmp_path / "padded_no_dup.csv"
+        make_csv(
+            path,
+            [
+                [" date ", " symbol ", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is False
+        assert result["duplicate_row_count"] == 0
+        assert result["affected_key_count"] == 0
+        assert result["affected_symbols"] == []
+        assert result["affected_dates"] == []
+
+    def test_mixed_padded_and_normal_headers(self, tmp_path):
+        """Mixed padding: 'date ' and ' symbol' — must still detect duplicates."""
+        path = tmp_path / "mixed_pad.csv"
+        make_csv(
+            path,
+            [
+                ["date ", " symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],  # duplicate
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+        assert result["affected_dates"] == ["2024-01-01"]
+
+    def test_padded_headers_json_serializable(self, tmp_path):
+        """Padded-header result must remain JSON-serializable."""
+        import json
+        path = tmp_path / "padded_json.csv"
+        make_csv(
+            path,
+            [
+                [" date ", " symbol ", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        json.dumps(result)  # must not raise
+        assert isinstance(result["affected_symbols"], list)
+        assert isinstance(result["affected_dates"], list)
+        assert isinstance(result["duplicate_examples"], list)
+
+    def test_padded_headers_only_one_column_padded(self, tmp_path):
+        """Only one column padded (date) — duplicates must still be detected."""
+        path = tmp_path / "one_pad.csv"
+        make_csv(
+            path,
+            [
+                [" date", "symbol", "close"],
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],  # duplicate
+                ["2024-01-02", "AAPL", "110.0"],
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+
+    # -------------------------------------------------------------------------
+    # Ambiguous-header regression tests
+    # -------------------------------------------------------------------------
+
+    def test_exact_date_header_wins_over_padded_shadow(self, tmp_path):
+        """Exact 'date' column wins when both 'date' and ' date ' are present."""
+        path = tmp_path / "exact_date_wins.csv"
+        make_csv(
+            path,
+            [
+                ["date", " date ", "symbol", "close"],  # date + padded shadow
+                ["2024-01-01", "2024-01-02", "AAPL", "100.0"],
+                ["2024-01-01", "2024-01-02", "AAPL", "101.0"],  # duplicate via exact 'date'
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        # Must detect duplicate via the exact 'date' column (value "2024-01-01")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_dates"] == ["2024-01-01"]
+
+    def test_exact_symbol_header_wins_over_padded_shadow(self, tmp_path):
+        """Exact 'symbol' column wins when both 'symbol' and ' symbol ' are present."""
+        path = tmp_path / "exact_symbol_wins.csv"
+        make_csv(
+            path,
+            [
+                ["date", " symbol ", "symbol", "close"],  # symbol + padded shadow
+                ["2024-01-01", "MSFT", "AAPL", "100.0"],
+                ["2024-01-01", "MSFT", "AAPL", "101.0"],  # duplicate via exact 'symbol'
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        # Must detect duplicate via the exact 'symbol' column (value "AAPL")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
+
+    def test_ambiguous_date_header_fails_closed(self, tmp_path):
+        """No exact 'date' and multiple stripped matches → ValueError."""
+        path = tmp_path / "ambiguous_date.csv"
+        make_csv(
+            path,
+            [
+                [" date", "date ", "symbol", "close"],  # two padded variants, no exact
+                ["2024-01-01", "2024-01-02", "AAPL", "100.0"],
+            ],
+        )
+        with pytest.raises(ValueError, match="Ambiguous"):
+            _summarize_observation_duplicate_rows(path, "date", "symbol")
+
+    def test_ambiguous_symbol_header_fails_closed(self, tmp_path):
+        """No exact 'symbol' and multiple stripped matches → ValueError."""
+        path = tmp_path / "ambiguous_symbol.csv"
+        make_csv(
+            path,
+            [
+                ["date", " symbol", "symbol ", "close"],  # two padded variants, no exact
+                ["2024-01-01", "AAPL", "MSFT", "100.0"],
+            ],
+        )
+        with pytest.raises(ValueError, match="Ambiguous"):
+            _summarize_observation_duplicate_rows(path, "date", "symbol")
+
+    def test_single_padded_fallback_still_works(self, tmp_path):
+        """Single padded header (no exact, no ambiguity) — must still detect dups."""
+        path = tmp_path / "single_padded.csv"
+        make_csv(
+            path,
+            [
+                [" date ", "symbol", "close"],  # only padded date, no padded symbol
+                ["2024-01-01", "AAPL", "100.0"],
+                ["2024-01-01", "AAPL", "101.0"],  # duplicate
+            ],
+        )
+        result = _summarize_observation_duplicate_rows(path, "date", "symbol")
+        assert result["has_duplicates"] is True
+        assert result["duplicate_row_count"] == 1
+        assert result["affected_symbols"] == ["AAPL"]
