@@ -5370,3 +5370,180 @@ class TestFirstThinRunnerLocalSmoke:
         assert close_audit["blocker_count"] == 0
 
 
+class TestFirstThinRunnerLocalSmokeGovernance:
+    """Governance-rejection smoke tests for the first thin real data runner.
+
+    Mirrors TestFirstThinRunnerLocalSmoke (PR #174) but exercises the failure
+    path: when prohibited_modes.autonomous_search=True the runner must emit a
+    schema-valid failed_validation artifact with audit_result='fail' and
+    blocker_count > 0.  No production behaviour changes.
+    """
+
+    def _write_smoke_files(self, tmp_path, spec_file):
+        """Write the shared smoke CSV and manifest alongside spec_file."""
+        csv_file = tmp_path / "smoke_obs.csv"
+        csv_file.write_text(SMOKE_CSV_DATA)
+        manifest_file = tmp_path / "smoke_manifest.json"
+        manifest_file.write_text(json.dumps(SMOKE_MANIFEST_DATA, indent=2))
+        return csv_file, manifest_file
+
+    def test_autonomous_search_blocker_produces_failed_validation_artifact(
+        self, tmp_path, experiment_spec_autonomous_search_true
+    ):
+        """main() with autonomous_search=True returns rc=1 and status='failed_validation'.
+
+        The smoke CSV + local DataManifest are included so the observation table
+        audit path is exercised; the autonomous_search blocker is the sole reason
+        for rejection.
+        """
+        csv_file, manifest_file = self._write_smoke_files(tmp_path, experiment_spec_autonomous_search_true)
+        output_path = tmp_path / "governance_rejected.json"
+
+        rc = main([
+            "--experiment-spec", str(experiment_spec_autonomous_search_true),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke_gov",
+        ])
+
+        assert rc == 1, f"Expected exit 1, got {rc}"
+        assert output_path.exists(), "Failed artifact must be written"
+
+        artifact = json.loads(output_path.read_text())
+
+        # Status
+        assert artifact["status"] == "failed_validation", (
+            f"Expected status='failed_validation', got {artifact['status']}"
+        )
+
+        # Schema validity
+        pytest.importorskip("jsonschema")
+        import jsonschema
+        schema_path = (
+            Path(__file__).resolve().parents[1]
+            / "schemas"
+            / "runner_output_spec_v1.schema.json"
+        )
+        schema = json.loads(schema_path.read_text())
+        from jsonschema import FormatChecker
+        checker = FormatChecker()
+        jsonschema.validate(artifact, schema, format_checker=checker)
+
+        # Audit summary
+        audit_summary = artifact["audit_summary"]
+        assert audit_summary["overall_result"] == "fail", (
+            f"Expected overall_result='fail', got {audit_summary['overall_result']}"
+        )
+        assert audit_summary["blocker_count"] > 0, (
+            f"Expected blocker_count > 0, got {audit_summary['blocker_count']}"
+        )
+
+        # The no_autonomous_search_flag_set audit is fail
+        auto_audit = next(
+            (a for a in audit_summary["audits"]
+             if a["audit_name"] == "no_autonomous_search_flag_set"),
+            None
+        )
+        assert auto_audit is not None, (
+            "no_autonomous_search_flag_set audit not found in audit_summary"
+        )
+        assert auto_audit["audit_result"] == "fail", (
+            f"Expected audit_result='fail', got {auto_audit['audit_result']}"
+        )
+        assert auto_audit["blocker_count"] > 0, (
+            f"Expected blocker_count > 0 on no_autonomous_search_flag_set, "
+            f"got {auto_audit['blocker_count']}"
+        )
+
+        # failure_summary is populated
+        assert artifact["failure_summary"] is not None, (
+            "failure_summary must be non-null for failed_validation"
+        )
+
+    def test_governance_rejection_artifact_has_required_failure_fields(
+        self, tmp_path, experiment_spec_autonomous_search_true
+    ):
+        """failed_validation artifact has all required failure_summary fields."""
+        csv_file, manifest_file = self._write_smoke_files(tmp_path, experiment_spec_autonomous_search_true)
+        output_path = tmp_path / "gov_rejected_fields.json"
+
+        rc = main([
+            "--experiment-spec", str(experiment_spec_autonomous_search_true),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke_gov",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+        fs = artifact["failure_summary"]
+
+        # Required failure_summary fields
+        assert fs["failure_type"] == "validation_error", (
+            f"Expected failure_type='validation_error', got {fs.get('failure_type')}"
+        )
+        assert fs["status"] == "failed_validation", (
+            f"Expected failure_summary.status='failed_validation', "
+            f"got {fs.get('status')}"
+        )
+        assert fs["blocker_summary"] is not None, (
+            "failure_summary.blocker_summary must be non-null"
+        )
+        assert len(fs["blocker_summary"]) > 0, (
+            "failure_summary.blocker_summary must be non-empty"
+        )
+        # failed_check or equivalent field — the runner uses "failed_check"
+        # field that names the failing governance rule
+        failed_check_field = fs.get("failed_check") or fs.get("failed_audit")
+        assert failed_check_field is not None, (
+            f"failure_summary must have 'failed_check' or 'failed_audit', got {list(fs.keys())}"
+        )
+        assert "autonomous_search" in str(failed_check_field).lower(), (
+            f"failed_check should reference autonomous_search, got {failed_check_field}"
+        )
+        assert fs.get("created_at") is not None, (
+            "failure_summary.created_at must be present"
+        )
+
+        # Structural fields
+        assert artifact["input_artifact_refs"], "input_artifact_refs must be non-empty"
+        assert artifact["data_manifest_refs"], "data_manifest_refs must be non-empty"
+        assert artifact["output_manifest"], "output_manifest must be non-empty"
+        assert artifact["run_mode"] == "dry_run"
+
+    def test_blocker_count_sum_in_failed_artifact_is_correct(
+        self, tmp_path, experiment_spec_autonomous_search_true
+    ):
+        """audit_summary.blocker_count equals the sum of individual audit blocker_counts."""
+        csv_file, manifest_file = self._write_smoke_files(tmp_path, experiment_spec_autonomous_search_true)
+        output_path = tmp_path / "gov_blocker_sum.json"
+
+        rc = main([
+            "--experiment-spec", str(experiment_spec_autonomous_search_true),
+            "--data-manifest", str(manifest_file),
+            "--observation-date-column", "date",
+            "--observation-symbol-column", "symbol",
+            "--observation-close-column", "close",
+            "--output-path", str(output_path),
+            "--run-owner", "smoke_gov",
+        ])
+        assert rc == 1
+        artifact = json.loads(output_path.read_text())
+
+        audits = artifact["audit_summary"]["audits"]
+        individual_sum = sum(a.get("blocker_count", 0) for a in audits)
+        assert artifact["audit_summary"]["blocker_count"] == individual_sum, (
+            f"audit_summary.blocker_count={artifact['audit_summary']['blocker_count']} "
+            f"!= sum of individual counts ({individual_sum})"
+        )
+        # At minimum the no_autonomous_search_flag_set audit contributed at least 1
+        assert artifact["audit_summary"]["blocker_count"] >= 1, (
+            "Expected at least 1 blocker from autonomous_search rejection"
+        )
+
+
