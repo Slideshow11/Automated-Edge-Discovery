@@ -34,6 +34,7 @@ from engine.edge_discovery.runners.first_thin_real_data_runner import (
     _compute_run_config_hash,
     _compute_run_id,
     _check_experiment_spec_id,
+    _load_experiment_spec,
     _utc_now,
     GOVERNANCE_STOP_RULE_FIELDS,
     SCHEMA_PATH,
@@ -5368,6 +5369,124 @@ class TestFirstThinRunnerLocalSmoke:
         )
         assert close_audit["audit_result"] == "pass"
         assert close_audit["blocker_count"] == 0
+
+
+class TestExperimentSpecLoaderUnit:
+    """Unit tests for _load_experiment_spec() and _check_experiment_spec_id().
+
+    These helpers are exercised through integration in build_runner_output(),
+    but direct unit coverage clarifies their actual contract and edge cases.
+    """
+
+    # ------------------------------------------------------------------
+    # _check_experiment_spec_id — non-format structural validation only
+    # ------------------------------------------------------------------
+
+    def test_check_experiment_spec_id_accepts_valid_id(self):
+        """A non-empty string experiment_id passes validation."""
+        _check_experiment_spec_id({"experiment_id": "EXP-2026-0001"})
+        _check_experiment_spec_id({"experiment_id": "EXP-2026-9999"})
+        _check_experiment_spec_id({"experiment_id": "any-string-here"})
+
+    def test_check_experiment_spec_id_rejects_missing_field(self):
+        """Missing experiment_id field raises ValueError."""
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({})
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"hypothesis_id": "HYP-2026-0001"})
+
+    def test_check_experiment_spec_id_rejects_empty_string(self):
+        """Empty string experiment_id raises ValueError."""
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": ""})
+
+    def test_check_experiment_spec_id_rejects_whitespace_only(self):
+        """Whitespace-only experiment_id raises ValueError."""
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": "   "})
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": "\n\t"})
+
+    def test_check_experiment_spec_id_rejects_non_string(self):
+        """Non-string experiment_id raises ValueError."""
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": None})
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": 42})
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": []})
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id({"experiment_id": {}})
+
+    # ------------------------------------------------------------------
+    # _load_experiment_spec — file loading
+    # ------------------------------------------------------------------
+
+    def test_load_experiment_spec_valid_minimal_file(self, tmp_path):
+        """_load_experiment_spec loads a valid JSON file and returns the dict."""
+        spec_file = tmp_path / "experiment_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+        }))
+        result = _load_experiment_spec(spec_file)
+        assert result["experiment_id"] == "EXP-2026-0001"
+        assert result["hypothesis_id"] == "HYP-2026-0001"
+        assert result["search_space_id"] == "SSM-2026-0001"
+
+    def test_load_experiment_spec_missing_file_raises(self, tmp_path):
+        """_load_experiment_spec raises FileNotFoundError for a missing file."""
+        fake = tmp_path / "nonexistent.json"
+        with pytest.raises(FileNotFoundError):
+            _load_experiment_spec(fake)
+
+    def test_load_experiment_spec_invalid_json_raises(self, tmp_path):
+        """_load_experiment_spec raises JSONDecodeError for malformed JSON."""
+        spec_file = tmp_path / "bad.json"
+        spec_file.write_text("{ not valid json ")
+        with pytest.raises(json.JSONDecodeError):
+            _load_experiment_spec(spec_file)
+
+    def test_load_experiment_spec_invalid_experiment_id_rejected(self, tmp_path):
+        """A file with missing experiment_id passes file load but fails ID check."""
+        spec_file = tmp_path / "no_id.json"
+        spec_file.write_text(json.dumps({
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+        }))
+        # File loads fine
+        spec = _load_experiment_spec(spec_file)
+        assert "experiment_id" not in spec
+        # But _check_experiment_spec_id rejects it
+        with pytest.raises(ValueError, match="experiment_id"):
+            _check_experiment_spec_id(spec)
+
+    def test_load_experiment_spec_preserves_governance_fields(self, tmp_path):
+        """_load_experiment_spec returns a dict that preserves governance fields."""
+        spec_file = tmp_path / "governance_spec.json"
+        spec_file.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "prohibited_modes": {
+                "autonomous_search": False,
+                "bayesian_optimization": False,
+                "genetic_programming": False,
+                "automated_promotion": False,
+                "automated_registry_mutation": False,
+                "live_trading": False,
+                "production_execution": False,
+                "gcru_integration": False,
+            },
+            "trial_generation_mode": "literature_replication",
+        }))
+        result = _load_experiment_spec(spec_file)
+        assert result["prohibited_modes"]["autonomous_search"] is False
+        assert result["prohibited_modes"]["live_trading"] is False
+        assert result["trial_generation_mode"] == "literature_replication"
+        # _check_experiment_spec_id passes the loaded dict
+        _check_experiment_spec_id(result)
 
 
 class TestFirstThinRunnerLocalSmokeGovernance:
