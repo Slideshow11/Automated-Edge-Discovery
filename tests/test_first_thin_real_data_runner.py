@@ -3840,6 +3840,217 @@ class TestSchemaRegressionFailureArtifacts:
         )
 
 
+class TestTrialAccountingConditionalEmission:
+    """Tests for conditional trial_accounting_summary emission based on CLI flags."""
+
+    def test_trial_accounting_summary_absent_when_no_flags_supplied(self, valid_experiment_spec):
+        """When no trial-accounting flags are given, trial_accounting_summary is None in the artifact."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            # no trial-accounting flags
+        )
+        assert artifact.get("trial_accounting_summary") is None
+
+    def test_trial_accounting_summary_emitted_in_success_artifact_when_flags_supplied(
+        self, valid_experiment_spec
+    ):
+        """trial_accounting_summary appears in success artifact when at least one flag is given."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SS-001",
+            n_tried=10,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+        assert tas["search_space_id"] == "SS-001"
+        assert tas["n_tried"] == 10
+        assert tas["experiment_id"] == "EXP-2026-0001"
+        assert tas["complexity"] is None
+
+    def test_trial_accounting_summary_defaults_status_to_proposed(self, valid_experiment_spec):
+        """When flags are supplied but status is omitted, status defaults to 'proposed'."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+
+    def test_trial_accounting_summary_defaults_mutation_mode_to_dry_run_reference_only(
+        self, valid_experiment_spec
+    ):
+        """When flags are supplied but mutation_mode is omitted, it defaults to dry_run_reference_only."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+
+    def test_trial_accounting_summary_rejects_ledger_write(self, valid_experiment_spec):
+        """--trial-accounting-mutation-mode ledger_write must be rejected with a clear error."""
+        with pytest.raises(ValueError, match="ledger_write"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="ledger_write",
+            )
+
+    def test_trial_accounting_summary_rejects_registry_write(self, valid_experiment_spec):
+        """--trial-accounting-mutation-mode registry_write must be rejected with a clear error."""
+        with pytest.raises(ValueError, match="registry_write"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="registry_write",
+            )
+
+    def test_trial_accounting_summary_rejects_invalid_mutation_mode(self, valid_experiment_spec):
+        """An invalid mutation_mode value not in the allowed set is rejected."""
+        with pytest.raises(ValueError, match="Invalid mutation_mode"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="some_invalid_mode",
+            )
+
+    def test_not_applicable_only_when_explicitly_supplied(self, valid_experiment_spec):
+        """status=not_applicable is accepted only when explicitly supplied (not as default)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="not_applicable",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "not_applicable"
+
+    def test_complexity_object_emitted_when_complexity_flags_supplied(
+        self, valid_experiment_spec
+    ):
+        """Complexity sub-object is present when complexity flags are given."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            complexity_rule_count=42,
+            complexity_parameter_count=7,
+            complexity_signal_count=5,
+            complexity_filter_count=3,
+            complexity_bucket="medium",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["complexity"] is not None
+        assert tas["complexity"]["rule_count"] == 42
+        assert tas["complexity"]["parameter_count"] == 7
+        assert tas["complexity"]["signal_count"] == 5
+        assert tas["complexity"]["filter_count"] == 3
+        assert tas["complexity"]["complexity_bucket"] == "medium"
+
+    def test_complexity_object_null_when_no_complexity_flags(self, valid_experiment_spec):
+        """Complexity is None (not omitted) when no complexity flags are supplied."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=5,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["complexity"] is None
+
+    def test_experiment_id_auto_populated(self, valid_experiment_spec):
+        """experiment_id is automatically populated from experiment_spec without a CLI flag."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["experiment_id"] == "EXP-2026-0001"
+
+    def test_data_manifest_id_auto_populated(self, tmp_path, valid_experiment_spec):
+        """data_manifest_id is automatically populated when a DataManifest is loaded."""
+        csv_path = tmp_path / "obs.csv"
+        csv_path.write_text("date,symbol,close\n2026-01-02,AAPL,150.0\n")
+
+        dm_content = {
+            "dataset_id": "DM-2026-0001",
+            "role": "generic",
+            "source_kind": "local_csv",
+            "path": csv_path.name,
+            "format": "csv",
+        }
+        dm_path = tmp_path / "manifest.json"
+        dm_path.write_text(json.dumps(dm_content))
+
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=str(dm_path),
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["data_manifest_id"] == "DM-2026-0001"
+
+    def test_trial_accounting_summary_in_failed_validation_artifact_when_flags_supplied(
+        self, experiment_spec_autonomous_search_true
+    ):
+        """failed_validation artifact includes trial_accounting_summary when flags are supplied."""
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=experiment_spec_autonomous_search_true,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+        artifact = exc_info.value.artifact
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+
+    def test_trial_accounting_summary_absent_in_failed_validation_when_no_flags(
+        self, experiment_spec_autonomous_search_true
+    ):
+        """When no trial-accounting flags are given, failed_validation artifact has None for the field."""
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=experiment_spec_autonomous_search_true,
+                run_owner="test@test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact.get("trial_accounting_summary") is None
+
+    def test_mutation_mode_no_mutation_accepted(self, valid_experiment_spec):
+        """mutation_mode=no_mutation is accepted and passed through correctly."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="no_mutation",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "no_mutation"
+
+
 class TestMissingValueSummaryIntegration:
     """Integration tests for --observation-missing-value-columns feature."""
 
