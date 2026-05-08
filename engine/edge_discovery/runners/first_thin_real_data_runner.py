@@ -966,6 +966,17 @@ def build_runner_output(
         complexity_bucket=complexity_bucket,
     )
 
+    # Build trial_accounting_summary early — before DataManifest loading — so it
+    # is present in failed_validation artifacts when manifest loading/validation
+    # fails but trial-accounting flags were supplied.  data_manifest_id will be
+    # populated from the manifest after a successful load (see below).
+    if _any_trial_accounting_flag(_ta_flags):
+        trial_accounting_summary = _build_trial_accounting_summary(
+            experiment_spec, None, _ta_flags
+        )
+    else:
+        trial_accounting_summary = None
+
     # Early validation: required_observation_columns needs a DataManifest to validate against
     if required_observation_columns is not None and data_manifest_path is None:
         raise ValueError(
@@ -1041,11 +1052,6 @@ def build_runner_output(
     # is present) or by the no-manifest + canonical-summary path (when manifest
     # is absent but date/symbol columns were requested).
     canonical_summary_audit_entry: dict | None = None
-
-    # Initialise trial_accounting_summary before the manifest loading block
-    # so it is available in exception handlers that may be reached before
-    # the main trial_accounting_summary construction below.
-    trial_accounting_summary: dict | None = None
 
     if data_manifest_path is not None:
         data_manifest_path = Path(data_manifest_path)
@@ -1330,14 +1336,10 @@ def build_runner_output(
                 )
             return partial_artifact
 
-    # Build trial_accounting_summary if any flag was supplied
-    # (must be done after manifest is loaded so data_manifest_id is available)
-    if _any_trial_accounting_flag(_ta_flags):
-        trial_accounting_summary = _build_trial_accounting_summary(
-            experiment_spec, manifest, _ta_flags
-        )
-    else:
-        trial_accounting_summary = None
+    # Populate data_manifest_id in the early-built trial_accounting_summary
+    # (built before DataManifest loading) now that manifest has loaded successfully.
+    if trial_accounting_summary is not None and manifest is not None:
+        trial_accounting_summary["data_manifest_id"] = manifest.dataset_id
 
     # Deterministic hashes — include DataManifest content and required columns when present
     run_config_hash = _compute_run_config_hash(
@@ -3052,9 +3054,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--all-variants-preserved",
         required=False,
-        type=bool,
+        action=argparse.BooleanOptionalAction,
         default=None,
-        help="Whether all variants were preserved.",
+        help="Whether all variants were preserved. Use --all-variants-preserved for True, --no-all-variants-preserved for False.",
     )
     parser.add_argument(
         "--sample-length",

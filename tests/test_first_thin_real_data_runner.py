@@ -4050,6 +4050,89 @@ class TestTrialAccountingConditionalEmission:
         assert tas is not None
         assert tas["mutation_mode"] == "no_mutation"
 
+    # ---------------------------------------------------------------------
+    # P1: Boolean parsing fix — BooleanOptionalAction for --all-variants-preserved
+    # ---------------------------------------------------------------------
+    def test_all_variants_preserved_true(self, valid_experiment_spec):
+        """--all-variants-preserved (flag present) sets all_variants_preserved=True."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            all_variants_preserved=True,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["all_variants_preserved"] is True
+
+    def test_all_variants_preserved_false_explicit(self, valid_experiment_spec):
+        """--no-all-variants-preserved sets all_variants_preserved=False (not treated as truthy string)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            all_variants_preserved=False,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["all_variants_preserved"] is False
+
+    def test_all_variants_preserved_none_when_omitted(self, valid_experiment_spec):
+        """When the flag is omitted, all_variants_preserved is None (absent from summary)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas.get("all_variants_preserved") is None
+
+    # ---------------------------------------------------------------------
+    # P2: trial_accounting_summary in failed_validation when manifest load fails
+    # ---------------------------------------------------------------------
+    def test_trial_accounting_summary_in_failed_validation_on_manifest_failure(
+        self, tmp_path, invalid_data_manifest_bad_role
+    ):
+        """When trial-accounting flags are supplied but DataManifest loading fails,
+        the failed_validation artifact still includes trial_accounting_summary with
+        status, mutation_mode, experiment_id; data_manifest_id is absent.
+
+        The invalid role causes ValueError during manifest load (blocker_count=0),
+        so build_runner_output returns the failed_validation artifact directly
+        (no GovernanceRejection raised)."""
+        spec = tmp_path / "spec.json"
+        spec.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": [],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+            "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first"],
+            "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+            "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+        }))
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            run_owner="test@test",
+            data_manifest_path=invalid_data_manifest_bad_role,
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=10,
+        )
+        assert artifact["status"] == "failed_validation"
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None, "trial_accounting_summary must be present when flags are supplied, even on manifest failure"
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+        assert tas["experiment_id"] == "EXP-2026-0001"
+        assert tas["n_tried"] == 10
+        # data_manifest_id must be absent/None because manifest never loaded
+        assert "data_manifest_id" not in tas or tas.get("data_manifest_id") is None
+
 
 class TestMissingValueSummaryIntegration:
     """Integration tests for --observation-missing-value-columns feature."""
