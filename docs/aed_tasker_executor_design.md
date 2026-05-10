@@ -508,16 +508,30 @@ The gate config must include:
 1. Verify PR exists and head branch matches the expected branch.
 2. Resolve current head SHA.
 3. Compare changed files against `allowed_files` and forbidden patterns.
-4. Verify required checks are complete and successful.
+4. Verify required checks are complete and successful for the current head.
 5. Request Codex review for the current head.
 6. Wait for Codex response or clean reaction.
-7. If Codex suggestions apply to current head, create a scoped Builder patch task.
-8. After Builder patch, re-run steps 2 through 7.
-9. If patch cycle count exceeds `max_patch_cycles`, block for Human decision.
-10. When Codex and checks are clean, create Reviewer task.
-11. If Reviewer recommends merge, produce final packet for Human merge authorization.
+7. Classify Codex evidence only after matching it to the current head.
+8. If Codex suggestions apply to current head, create a scoped Builder patch task.
+9. After Builder patch, re-run steps 2 through 8.
+10. If patch cycle count exceeds `max_patch_cycles`, block for Human decision.
+11. When Codex and checks are clean, create Reviewer task.
+12. If Reviewer recommends merge, produce final packet for Human merge authorization.
 
 PR Gate Controller never edits files and never merges.
+
+### Codex current-head evidence rules
+
+The PR Gate Controller must not count stale Codex or Reviewer evidence toward merge readiness.
+
+Rules:
+
+- Always resolve and record the PR's current head SHA before interpreting Codex, Reviewer, or CI state.
+- Codex clean may appear as an issue comment or reaction, not only as a formal pull request review object.
+- A Codex clean signal is usable only when it can be tied to the latest `@codex review` request and the PR's current head.
+- A Codex review object, issue comment, reaction, or suggestion thread that applies to an older head is stale evidence.
+- Current-head validation must happen before counting Codex or Reviewer results.
+- If the PR head changes after a clean result, PR Gate Controller must request or wait for fresh current-head evidence before creating Reviewer or merge-readiness packets.
 
 ## 10. Safety rules
 
