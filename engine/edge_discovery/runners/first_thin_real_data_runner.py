@@ -694,6 +694,16 @@ def _non_negative_float_arg(value: Any, field_name: str) -> float:
     return parsed
 
 
+def _optional_non_empty_string_arg(value: Any, field_name: str) -> str | None:
+    """Normalize optional schema strings: strip whitespace and convert blank to None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or None; got {value!r}")
+    normalized = value.strip()
+    return normalized or None
+
+
 def _non_negative_int_cli_arg(field_name: str):
     """Return an argparse converter for a named non-negative integer field."""
     def _converter(value: str) -> int:
@@ -946,14 +956,14 @@ def _build_trial_accounting_summary(
         "mutation_mode": mutation_mode,
         "experiment_id": experiment_spec.get("experiment_id"),
         "data_manifest_id": manifest.dataset_id if manifest is not None else None,
-        "search_space_id": flags.search_space_id,
-        "trial_family_id": flags.trial_family_id,
-        "trial_id": flags.trial_id,
-        "proposed_trial_id": flags.proposed_trial_id,
-        "variant_id": flags.variant_id,
-        "selected_variant_id": flags.selected_variant_id,
-        "model_assessment_id": flags.model_assessment_id,
-        "review_packet_id": flags.review_packet_id,
+        "search_space_id": _optional_non_empty_string_arg(flags.search_space_id, "search_space_id"),
+        "trial_family_id": _optional_non_empty_string_arg(flags.trial_family_id, "trial_family_id"),
+        "trial_id": _optional_non_empty_string_arg(flags.trial_id, "trial_id"),
+        "proposed_trial_id": _optional_non_empty_string_arg(flags.proposed_trial_id, "proposed_trial_id"),
+        "variant_id": _optional_non_empty_string_arg(flags.variant_id, "variant_id"),
+        "selected_variant_id": _optional_non_empty_string_arg(flags.selected_variant_id, "selected_variant_id"),
+        "model_assessment_id": _optional_non_empty_string_arg(flags.model_assessment_id, "model_assessment_id"),
+        "review_packet_id": _optional_non_empty_string_arg(flags.review_packet_id, "review_packet_id"),
         "n_tried": n_tried,
         "candidate_variant_count": candidate_variant_count,
         "failed_variant_count": failed_variant_count,
@@ -961,7 +971,7 @@ def _build_trial_accounting_summary(
         "sample_length": sample_length,
         "sample_to_trial_ratio": sample_to_trial_ratio,
         "complexity": _build_complexity(flags),
-        "notes": flags.trial_accounting_notes,
+        "notes": _optional_non_empty_string_arg(flags.trial_accounting_notes, "trial_accounting_notes"),
     }
 
 

@@ -3873,6 +3873,59 @@ class TestTrialAccountingConditionalEmission:
         assert tas["experiment_id"] == "EXP-2026-0001"
         assert tas["complexity"] is None
 
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "search_space_id",
+            "trial_family_id",
+            "trial_id",
+            "proposed_trial_id",
+            "variant_id",
+            "selected_variant_id",
+            "model_assessment_id",
+            "review_packet_id",
+            "trial_accounting_notes",
+        ],
+    )
+    @pytest.mark.parametrize("blank_value", ["", "   "])
+    def test_trial_accounting_summary_normalizes_blank_optional_strings_to_none(
+        self, valid_experiment_spec, field_name, blank_value
+    ):
+        """Blank optional trial-accounting strings normalize to None, preserving schema minLength."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            **{field_name: blank_value},
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        summary_field = "notes" if field_name == "trial_accounting_notes" else field_name
+        assert tas[summary_field] is None
+
+    @pytest.mark.parametrize(
+        "field_name, raw_value, expected_value",
+        [
+            ("search_space_id", " SSM-2026-0001 ", "SSM-2026-0001"),
+            ("trial_id", " TRIAL-2026-0001 ", "TRIAL-2026-0001"),
+            ("trial_accounting_notes", " reviewer note ", "reviewer note"),
+        ],
+    )
+    def test_trial_accounting_summary_strips_optional_strings(
+        self, valid_experiment_spec, field_name, raw_value, expected_value
+    ):
+        """Optional trial-accounting strings are stripped before artifact emission."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            **{field_name: raw_value},
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        summary_field = "notes" if field_name == "trial_accounting_notes" else field_name
+        assert tas[summary_field] == expected_value
+
     def test_trial_accounting_summary_defaults_status_to_proposed(self, valid_experiment_spec):
         """When flags are supplied but status is omitted, status defaults to 'proposed'."""
         artifact = build_runner_output(
