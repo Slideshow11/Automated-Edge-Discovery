@@ -975,19 +975,51 @@ def _build_trial_accounting_summary(
         else None
     )
 
+    search_space_id = _optional_non_empty_string_arg(flags.search_space_id, "search_space_id")
+    trial_family_id = _optional_non_empty_string_arg(flags.trial_family_id, "trial_family_id")
+    trial_id = _optional_non_empty_string_arg(flags.trial_id, "trial_id")
+    proposed_trial_id = _optional_non_empty_string_arg(
+        flags.proposed_trial_id,
+        "proposed_trial_id",
+    )
+    variant_id = _optional_non_empty_string_arg(flags.variant_id, "variant_id")
+    selected_variant_id = _optional_non_empty_string_arg(
+        flags.selected_variant_id,
+        "selected_variant_id",
+    )
+    model_assessment_id = _optional_non_empty_string_arg(
+        flags.model_assessment_id,
+        "model_assessment_id",
+    )
+    review_packet_id = _optional_non_empty_string_arg(flags.review_packet_id, "review_packet_id")
+    if mutation_mode == "no_mutation":
+        linkage_ids = {
+            "trial_family_id": trial_family_id,
+            "trial_id": trial_id,
+            "proposed_trial_id": proposed_trial_id,
+            "variant_id": variant_id,
+            "selected_variant_id": selected_variant_id,
+        }
+        present_linkage_ids = [name for name, value in linkage_ids.items() if value is not None]
+        if present_linkage_ids:
+            raise ValueError(
+                "mutation_mode='no_mutation' cannot include linkage IDs: "
+                f"{', '.join(present_linkage_ids)}"
+            )
+
     return {
         "status": status,
         "mutation_mode": mutation_mode,
         "experiment_id": experiment_spec.get("experiment_id"),
         "data_manifest_id": manifest.dataset_id if manifest is not None else None,
-        "search_space_id": _optional_non_empty_string_arg(flags.search_space_id, "search_space_id"),
-        "trial_family_id": _optional_non_empty_string_arg(flags.trial_family_id, "trial_family_id"),
-        "trial_id": _optional_non_empty_string_arg(flags.trial_id, "trial_id"),
-        "proposed_trial_id": _optional_non_empty_string_arg(flags.proposed_trial_id, "proposed_trial_id"),
-        "variant_id": _optional_non_empty_string_arg(flags.variant_id, "variant_id"),
-        "selected_variant_id": _optional_non_empty_string_arg(flags.selected_variant_id, "selected_variant_id"),
-        "model_assessment_id": _optional_non_empty_string_arg(flags.model_assessment_id, "model_assessment_id"),
-        "review_packet_id": _optional_non_empty_string_arg(flags.review_packet_id, "review_packet_id"),
+        "search_space_id": search_space_id,
+        "trial_family_id": trial_family_id,
+        "trial_id": trial_id,
+        "proposed_trial_id": proposed_trial_id,
+        "variant_id": variant_id,
+        "selected_variant_id": selected_variant_id,
+        "model_assessment_id": model_assessment_id,
+        "review_packet_id": review_packet_id,
         "n_tried": n_tried,
         "candidate_variant_count": candidate_variant_count,
         "failed_variant_count": failed_variant_count,

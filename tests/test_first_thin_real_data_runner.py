@@ -4103,6 +4103,45 @@ class TestTrialAccountingConditionalEmission:
         assert tas is not None
         assert tas["mutation_mode"] == "no_mutation"
 
+    @pytest.mark.parametrize(
+        "field_name, field_value",
+        [
+            ("trial_family_id", "TFAM-2026-0001"),
+            ("trial_id", "TRIAL-2026-0001"),
+            ("proposed_trial_id", "PTRIAL-2026-0001"),
+            ("variant_id", "VAR-2026-0001"),
+            ("selected_variant_id", "VAR-2026-0002"),
+        ],
+    )
+    def test_mutation_mode_no_mutation_rejects_linkage_ids(
+        self, valid_experiment_spec, field_name, field_value
+    ):
+        """no_mutation must not emit trial/variant linkage IDs."""
+        with pytest.raises(ValueError, match=f"no_mutation.*{field_name}"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="no_mutation",
+                **{field_name: field_value},
+            )
+
+    def test_mutation_mode_no_mutation_allows_blank_linkage_ids(self, valid_experiment_spec):
+        """Blank linkage ID values normalize to None and do not contradict no_mutation."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="no_mutation",
+            trial_id="   ",
+            variant_id="",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "no_mutation"
+        assert tas["trial_id"] is None
+        assert tas["variant_id"] is None
+
     # ---------------------------------------------------------------------
     # P1: Boolean parsing fix — BooleanOptionalAction for --all-variants-preserved
     # ---------------------------------------------------------------------
