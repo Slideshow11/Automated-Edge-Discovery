@@ -4141,6 +4141,19 @@ class TestTrialAccountingConditionalEmission:
         assert tas is not None
         assert tas.get("all_variants_preserved") is None
 
+    @pytest.mark.parametrize("bad_value", ["false", "true", "", 0, 1])
+    def test_all_variants_preserved_rejects_non_bool_programmatic_values(
+        self, valid_experiment_spec, bad_value
+    ):
+        """Programmatic all_variants_preserved values must be bool/None, not coerced."""
+        with pytest.raises(ValueError, match="all_variants_preserved.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                all_variants_preserved=bad_value,
+            )
+
     # ---------------------------------------------------------------------
     # P2: trial_accounting_summary in failed_validation when manifest load fails
     # ---------------------------------------------------------------------

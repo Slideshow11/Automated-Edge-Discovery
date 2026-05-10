@@ -704,6 +704,15 @@ def _optional_non_empty_string_arg(value: Any, field_name: str) -> str | None:
     return normalized or None
 
 
+def _optional_bool_arg(value: Any, field_name: str) -> bool | None:
+    """Validate optional boolean schema fields without coercing truthy/falsy values."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean or None; got {value!r}")
+    return value
+
+
 def _non_negative_int_cli_arg(field_name: str):
     """Return an argparse converter for a named non-negative integer field."""
     def _converter(value: str) -> int:
@@ -967,7 +976,7 @@ def _build_trial_accounting_summary(
         "n_tried": n_tried,
         "candidate_variant_count": candidate_variant_count,
         "failed_variant_count": failed_variant_count,
-        "all_variants_preserved": flags.all_variants_preserved,
+        "all_variants_preserved": _optional_bool_arg(flags.all_variants_preserved, "all_variants_preserved"),
         "sample_length": sample_length,
         "sample_to_trial_ratio": sample_to_trial_ratio,
         "complexity": _build_complexity(flags),
