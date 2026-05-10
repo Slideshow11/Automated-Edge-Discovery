@@ -240,6 +240,7 @@ The memo and packet must include:
 ```json
 {
   "packet_kind": "aed.tasker.report.v1",
+  "schema_version": 1,
   "repo": "/home/max/Automated-Edge-Discovery",
   "base_ref": "origin/main",
   "observed_head": "<sha>",
@@ -321,6 +322,8 @@ The output must include:
   "acceptance_criteria": [],
   "reviewer_focus": [],
   "gate_config": {
+    "base_branch": "main",
+    "allowed_files": [],
     "required_checks": [],
     "max_patch_cycles": 3,
     "codex_cooldown_seconds": 300,
