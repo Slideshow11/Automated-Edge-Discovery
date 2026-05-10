@@ -3840,6 +3840,839 @@ class TestSchemaRegressionFailureArtifacts:
         )
 
 
+class TestTrialAccountingConditionalEmission:
+    """Tests for conditional trial_accounting_summary emission based on CLI flags."""
+
+    def test_trial_accounting_summary_absent_when_no_flags_supplied(self, valid_experiment_spec):
+        """When no trial-accounting flags are given, trial_accounting_summary is None in the artifact."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            # no trial-accounting flags
+        )
+        assert artifact.get("trial_accounting_summary") is None
+
+    def test_trial_accounting_summary_emitted_in_success_artifact_when_flags_supplied(
+        self, valid_experiment_spec
+    ):
+        """trial_accounting_summary appears in success artifact when at least one flag is given."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SS-001",
+            n_tried=10,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+        assert tas["search_space_id"] == "SS-001"
+        assert tas["n_tried"] == 10
+        assert tas["experiment_id"] == "EXP-2026-0001"
+        assert tas["complexity"] is None
+
+    @pytest.mark.parametrize(
+        "field_name",
+        [
+            "search_space_id",
+            "trial_family_id",
+            "trial_id",
+            "proposed_trial_id",
+            "variant_id",
+            "selected_variant_id",
+            "model_assessment_id",
+            "review_packet_id",
+            "trial_accounting_notes",
+        ],
+    )
+    @pytest.mark.parametrize("blank_value", ["", "   "])
+    def test_trial_accounting_summary_normalizes_blank_optional_strings_to_none(
+        self, valid_experiment_spec, field_name, blank_value
+    ):
+        """Blank optional trial-accounting strings normalize to None, preserving schema minLength."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            **{field_name: blank_value},
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        summary_field = "notes" if field_name == "trial_accounting_notes" else field_name
+        assert tas[summary_field] is None
+
+    @pytest.mark.parametrize(
+        "field_name, raw_value, expected_value",
+        [
+            ("search_space_id", " SSM-2026-0001 ", "SSM-2026-0001"),
+            ("trial_id", " TRIAL-2026-0001 ", "TRIAL-2026-0001"),
+            ("trial_accounting_notes", " reviewer note ", "reviewer note"),
+        ],
+    )
+    def test_trial_accounting_summary_strips_optional_strings(
+        self, valid_experiment_spec, field_name, raw_value, expected_value
+    ):
+        """Optional trial-accounting strings are stripped before artifact emission."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            **{field_name: raw_value},
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        summary_field = "notes" if field_name == "trial_accounting_notes" else field_name
+        assert tas[summary_field] == expected_value
+
+    def test_trial_accounting_summary_defaults_status_to_proposed(self, valid_experiment_spec):
+        """When flags are supplied but status is omitted, status defaults to 'proposed'."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+
+    def test_trial_accounting_summary_defaults_mutation_mode_to_dry_run_reference_only(
+        self, valid_experiment_spec
+    ):
+        """When flags are supplied but mutation_mode is omitted, it defaults to dry_run_reference_only."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+
+    def test_trial_accounting_summary_rejects_ledger_write(self, valid_experiment_spec):
+        """--trial-accounting-mutation-mode ledger_write must be rejected with a clear error."""
+        with pytest.raises(ValueError, match="ledger_write"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="ledger_write",
+            )
+
+    def test_trial_accounting_summary_rejects_registry_write(self, valid_experiment_spec):
+        """--trial-accounting-mutation-mode registry_write must be rejected with a clear error."""
+        with pytest.raises(ValueError, match="registry_write"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="registry_write",
+            )
+
+    def test_trial_accounting_summary_rejects_invalid_mutation_mode(self, valid_experiment_spec):
+        """An invalid mutation_mode value not in the allowed set is rejected."""
+        with pytest.raises(ValueError, match="Invalid mutation_mode"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_mutation_mode="some_invalid_mode",
+            )
+
+    def test_not_applicable_only_when_explicitly_supplied(self, valid_experiment_spec):
+        """status=not_applicable is accepted only when explicitly supplied (not as default)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="not_applicable",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "not_applicable"
+
+    def test_complexity_object_emitted_when_complexity_flags_supplied(
+        self, valid_experiment_spec
+    ):
+        """Complexity sub-object is present when complexity flags are given."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            complexity_rule_count=42,
+            complexity_parameter_count=7,
+            complexity_signal_count=5,
+            complexity_filter_count=3,
+            complexity_bucket="medium",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["complexity"] is not None
+        assert tas["complexity"]["rule_count"] == 42
+        assert tas["complexity"]["parameter_count"] == 7
+        assert tas["complexity"]["signal_count"] == 5
+        assert tas["complexity"]["filter_count"] == 3
+        assert tas["complexity"]["complexity_bucket"] == "medium"
+
+    def test_complexity_object_null_when_no_complexity_flags(self, valid_experiment_spec):
+        """Complexity is None (not omitted) when no complexity flags are supplied."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=5,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["complexity"] is None
+
+    def test_experiment_id_auto_populated(self, valid_experiment_spec):
+        """experiment_id is automatically populated from experiment_spec without a CLI flag."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["experiment_id"] == "EXP-2026-0001"
+
+    def test_data_manifest_id_auto_populated(self, tmp_path, valid_experiment_spec):
+        """data_manifest_id is automatically populated when a DataManifest is loaded."""
+        csv_path = tmp_path / "obs.csv"
+        csv_path.write_text("date,symbol,close\n2026-01-02,AAPL,150.0\n")
+
+        dm_content = {
+            "dataset_id": "DM-2026-0001",
+            "role": "generic",
+            "source_kind": "local_csv",
+            "path": csv_path.name,
+            "format": "csv",
+        }
+        dm_path = tmp_path / "manifest.json"
+        dm_path.write_text(json.dumps(dm_content))
+
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            data_manifest_path=str(dm_path),
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["data_manifest_id"] == "DM-2026-0001"
+
+    def test_trial_accounting_summary_in_failed_validation_artifact_when_flags_supplied(
+        self, experiment_spec_autonomous_search_true
+    ):
+        """failed_validation artifact includes trial_accounting_summary when flags are supplied."""
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=experiment_spec_autonomous_search_true,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+        artifact = exc_info.value.artifact
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+
+    def test_trial_accounting_summary_absent_in_failed_validation_when_no_flags(
+        self, experiment_spec_autonomous_search_true
+    ):
+        """When no trial-accounting flags are given, failed_validation artifact has None for the field."""
+        with pytest.raises(GovernanceRejection) as exc_info:
+            build_runner_output(
+                experiment_spec_path=experiment_spec_autonomous_search_true,
+                run_owner="test@test",
+            )
+        artifact = exc_info.value.artifact
+        assert artifact.get("trial_accounting_summary") is None
+
+    def test_mutation_mode_no_mutation_accepted(self, valid_experiment_spec):
+        """mutation_mode=no_mutation is accepted and passed through correctly."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="no_mutation",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "no_mutation"
+
+    @pytest.mark.parametrize(
+        "field_name, field_value",
+        [
+            ("trial_family_id", "TFAM-2026-0001"),
+            ("trial_id", "TRIAL-2026-0001"),
+            ("proposed_trial_id", "PTRIAL-2026-0001"),
+            ("variant_id", "VAR-2026-0001"),
+            ("selected_variant_id", "VAR-2026-0002"),
+        ],
+    )
+    def test_mutation_mode_no_mutation_rejects_linkage_ids(
+        self, valid_experiment_spec, field_name, field_value
+    ):
+        """no_mutation must not emit trial/variant linkage IDs."""
+        with pytest.raises(ValueError, match=f"no_mutation.*{field_name}"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="no_mutation",
+                **{field_name: field_value},
+            )
+
+    def test_mutation_mode_no_mutation_allows_blank_linkage_ids(self, valid_experiment_spec):
+        """Blank linkage ID values normalize to None and do not contradict no_mutation."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="no_mutation",
+            trial_id="   ",
+            variant_id="",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["mutation_mode"] == "no_mutation"
+        assert tas["trial_id"] is None
+        assert tas["variant_id"] is None
+
+    # ---------------------------------------------------------------------
+    # P1: Boolean parsing fix — BooleanOptionalAction for --all-variants-preserved
+    # ---------------------------------------------------------------------
+    def test_all_variants_preserved_true(self, valid_experiment_spec):
+        """--all-variants-preserved (flag present) sets all_variants_preserved=True."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            all_variants_preserved=True,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["all_variants_preserved"] is True
+
+    def test_all_variants_preserved_false_explicit(self, valid_experiment_spec):
+        """--no-all-variants-preserved sets all_variants_preserved=False (not treated as truthy string)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            all_variants_preserved=False,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["all_variants_preserved"] is False
+
+    def test_all_variants_preserved_none_when_omitted(self, valid_experiment_spec):
+        """When the flag is omitted, all_variants_preserved is None (absent from summary)."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas.get("all_variants_preserved") is None
+
+    @pytest.mark.parametrize("bad_value", ["false", "true", "", 0, 1])
+    def test_all_variants_preserved_rejects_non_bool_programmatic_values(
+        self, valid_experiment_spec, bad_value
+    ):
+        """Programmatic all_variants_preserved values must be bool/None, not coerced."""
+        with pytest.raises(ValueError, match="all_variants_preserved.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                all_variants_preserved=bad_value,
+            )
+
+    # ---------------------------------------------------------------------
+    # P2: trial_accounting_summary in failed_validation when manifest load fails
+    # ---------------------------------------------------------------------
+    def test_trial_accounting_summary_in_failed_validation_on_manifest_failure(
+        self, tmp_path, invalid_data_manifest_bad_role
+    ):
+        """When trial-accounting flags are supplied but DataManifest loading fails,
+        the failed_validation artifact still includes trial_accounting_summary with
+        status, mutation_mode, experiment_id; data_manifest_id is absent.
+
+        The invalid role causes ValueError during manifest load (blocker_count=0),
+        so build_runner_output returns the failed_validation artifact directly
+        (no GovernanceRejection raised)."""
+        spec = tmp_path / "spec.json"
+        spec.write_text(json.dumps({
+            "experiment_id": "EXP-2026-0001",
+            "hypothesis_id": "HYP-2026-0001",
+            "search_space_id": "SSM-2026-0001",
+            "data_manifest_refs": [],
+            "study_type": "options_event_risk",
+            "decision_timestamp_policy": {"timestamp_ref": "reference_date"},
+            "feature_cutoff_policy": {"timestamp_ref": "trade_date", "offset_direction": "before", "offset_unit": "trading_days", "offset_value": 1},
+            "trial_generation_mode": "literature_replication",
+            "allowed_trial_lanes": ["theory_first"],
+            "prohibited_modes": {k: False for k in GOVERNANCE_STOP_RULE_FIELDS},
+            "reviewer": {"name": "t", "affiliation": "t", "date": "2026-01-01"},
+        }))
+        artifact = build_runner_output(
+            experiment_spec_path=spec,
+            run_owner="test@test",
+            data_manifest_path=invalid_data_manifest_bad_role,
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=10,
+        )
+        assert artifact["status"] == "failed_validation"
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None, "trial_accounting_summary must be present when flags are supplied, even on manifest failure"
+        assert tas["status"] == "proposed"
+        assert tas["mutation_mode"] == "dry_run_reference_only"
+        assert tas["experiment_id"] == "EXP-2026-0001"
+        assert tas["n_tried"] == 10
+        # data_manifest_id must be absent/None because manifest never loaded
+        assert "data_manifest_id" not in tas or tas.get("data_manifest_id") is None
+
+
+class TestTrialAccountingStatusValidation:
+    """Validate trial_accounting_status enum values via build_runner_output API."""
+
+    ALLOWED_STATUSES = {"not_applicable", "proposed", "linked", "blocked"}
+
+    def test_valid_status_values_accepted(self, valid_experiment_spec):
+        """All allowed status values pass validation without error."""
+        for status in self.ALLOWED_STATUSES:
+            artifact = build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status=status,
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+            tas = artifact.get("trial_accounting_summary")
+            assert tas is not None
+            assert tas["status"] == status, f"status={status!r} not reflected in artifact"
+
+    def test_invalid_status_rejected_by_build_runner_output(self, valid_experiment_spec):
+        """An invalid status value raises ValueError and does not emit schema-invalid artifact."""
+        with pytest.raises(ValueError, match="Invalid.*status|not.*allowed"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="bad_status_value",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+
+
+class TestComplexityBucketValidation:
+    """Validate complexity_bucket enum values via build_runner_output API."""
+
+    ALLOWED_BUCKETS = {"low", "medium", "high", "excessive", "unknown"}
+
+    def test_valid_complexity_bucket_values_accepted(self, valid_experiment_spec):
+        """All allowed complexity_bucket values pass validation."""
+        for bucket in self.ALLOWED_BUCKETS:
+            artifact = build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                complexity_bucket=bucket,
+            )
+            tas = artifact.get("trial_accounting_summary")
+            assert tas is not None
+            assert tas["complexity"] is not None
+            assert tas["complexity"]["complexity_bucket"] == bucket
+
+    def test_invalid_complexity_bucket_rejected(self, valid_experiment_spec):
+        """An invalid complexity_bucket value raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid.*complexity_bucket|not.*allowed"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                complexity_bucket="not_a_real_bucket",
+            )
+
+
+class TestNonNegativeTrialAccountingFields:
+    """Validate that non-negative trial-accounting numeric fields reject negative values."""
+
+    def test_n_tried_negative_rejected(self, valid_experiment_spec):
+        """n_tried=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|n_tried.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=-1,
+            )
+
+    def test_candidate_variant_count_negative_rejected(self, valid_experiment_spec):
+        """candidate_variant_count=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|candidate_variant_count.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                candidate_variant_count=-1,
+            )
+
+    def test_failed_variant_count_negative_rejected(self, valid_experiment_spec):
+        """failed_variant_count=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|failed_variant_count.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                failed_variant_count=-1,
+            )
+
+    def test_sample_length_negative_rejected(self, valid_experiment_spec):
+        """sample_length=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|sample_length.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=-1,
+            )
+
+    def test_sample_to_trial_ratio_negative_rejected(self, valid_experiment_spec):
+        """sample_to_trial_ratio=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|sample_to_trial_ratio.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=-1.0,
+            )
+
+    def test_n_tried_zero_accepted(self, valid_experiment_spec):
+        """n_tried=0 is valid and appears in the artifact."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["n_tried"] == 0
+
+    def test_candidate_variant_count_zero_accepted(self, valid_experiment_spec):
+        """candidate_variant_count=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            candidate_variant_count=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["candidate_variant_count"] == 0
+
+    def test_failed_variant_count_zero_accepted(self, valid_experiment_spec):
+        """failed_variant_count=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            failed_variant_count=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["failed_variant_count"] == 0
+
+    def test_sample_length_zero_accepted(self, valid_experiment_spec):
+        """sample_length=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            sample_length=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["sample_length"] == 0
+
+    def test_sample_to_trial_ratio_zero_accepted(self, valid_experiment_spec):
+        """sample_to_trial_ratio=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            sample_to_trial_ratio=0.0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["sample_to_trial_ratio"] == 0.0
+
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_sample_to_trial_ratio_bool_rejected(self, valid_experiment_spec, bool_val):
+        """sample_to_trial_ratio=True/False must be rejected, not coerced to 1.0/0.0."""
+        with pytest.raises(ValueError, match="sample_to_trial_ratio.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=bool_val,
+            )
+
+    @pytest.mark.parametrize("bad_ratio", [float("nan"), float("inf"), float("-inf")])
+    def test_sample_to_trial_ratio_non_finite_rejected(
+        self, valid_experiment_spec, bad_ratio
+    ):
+        """sample_to_trial_ratio must be finite, not NaN or Infinity."""
+        with pytest.raises(ValueError, match="finite|sample_to_trial_ratio"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=bad_ratio,
+            )
+
+    @pytest.mark.parametrize(
+        "field_name, kwargs",
+        [
+            ("complexity_rule_count", {"complexity_rule_count": -1}),
+            ("complexity_parameter_count", {"complexity_parameter_count": -1}),
+            ("complexity_signal_count", {"complexity_signal_count": -1}),
+            ("complexity_filter_count", {"complexity_filter_count": -1}),
+        ],
+    )
+    def test_complexity_count_negative_rejected(
+        self, valid_experiment_spec, field_name, kwargs
+    ):
+        """Complexity count fields must be non-negative via direct API calls."""
+        with pytest.raises(ValueError, match=f"{field_name}.*non-negative|non-negative.*{field_name}"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                **kwargs,
+            )
+
+
+class TestNonIntegralNumericRejection:
+    """Regression: non-integral numeric objects must not silently truncate via int()."""
+
+    def test_n_tried_decimal_half_rejected(self, valid_experiment_spec):
+        """Decimal('1.5') passed to n_tried must raise, not truncate to 1."""
+        from decimal import Decimal
+        with pytest.raises(ValueError, match="n_tried.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=Decimal("1.5"),
+            )
+
+    def test_sample_length_decimal_half_rejected(self, valid_experiment_spec):
+        """Decimal('1.5') passed to sample_length must raise, not truncate to 1."""
+        from decimal import Decimal
+        with pytest.raises(ValueError, match="sample_length.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=Decimal("1.5"),
+            )
+
+    def test_n_tried_numpy_float_half_rejected(self, valid_experiment_spec):
+        """numpy.float32(1.5) passed to n_tried must raise, not truncate to 1."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="n_tried.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=np.float32(1.5),
+            )
+
+    def test_sample_length_numpy_float_half_rejected(self, valid_experiment_spec):
+        """numpy.float32(1.5) passed to sample_length must raise, not truncate to 1."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="sample_length.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=np.float32(1.5),
+            )
+
+
+class TestBoolLikeScalarRejection:
+    """Regression: bool-like numpy scalars must not be silently coerced in float fields."""
+
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_sample_to_trial_ratio_numpy_bool_rejected(self, valid_experiment_spec, bool_val):
+        """numpy.bool_(True/False) passed to sample_to_trial_ratio must raise."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="sample_to_trial_ratio.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=np.bool_(bool_val),
+            )
+
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_n_tried_numpy_bool_rejected(self, valid_experiment_spec, bool_val):
+        """numpy.bool_(True/False) passed to n_tried must raise via int-path check."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="n_tried.*boolean|integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=np.bool_(bool_val),
+            )
+
+
+class TestTrialAccountingCliInputValidation:
+    """CLI validation must reject schema-invalid trial-accounting values before emission."""
+
+    def test_cli_invalid_status_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "bad_status_value",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice" in captured.err
+        assert "bad_status_value" in captured.err
+        assert not output_path.exists()
+
+    def test_cli_invalid_complexity_bucket_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "proposed",
+                "--complexity-bucket", "not_a_real_bucket",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice" in captured.err
+        assert "not_a_real_bucket" in captured.err
+        assert not output_path.exists()
+
+    def test_cli_negative_numeric_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "proposed",
+                "--n-tried", "-1",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "n_tried must be non-negative" in captured.err
+        assert not output_path.exists()
+
+
+class TestTrialAccountingIdentityHash:
+    """Trial-accounting metadata must participate in run identity."""
+
+    def test_trial_accounting_flags_change_run_config_hash_and_run_id(
+        self, valid_experiment_spec
+    ):
+        base_artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SSM-2026-0001",
+            trial_id="TRIAL-001",
+            n_tried=1,
+        )
+        changed_artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SSM-2026-0002",
+            trial_id="TRIAL-002",
+            n_tried=2,
+        )
+
+        assert base_artifact["run_config_hash"] != changed_artifact["run_config_hash"]
+        assert base_artifact["run_id"] != changed_artifact["run_id"]
+
+    def test_no_trial_accounting_flags_preserve_existing_identity(
+        self, valid_experiment_spec
+    ):
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+        )
+        expected_hash = _compute_run_config_hash(valid_experiment_spec)
+
+        assert artifact["run_config_hash"] == f"sha256:{expected_hash}"
+        assert artifact["run_id"] == _compute_run_id(expected_hash)
+
+
+class TestTrialAccountingProgrammaticIntegerValidation:
+    """Programmatic integer inputs must not be silently truncated or coerced."""
+
+    @pytest.mark.parametrize("bad_value", [1.9, True, False])
+    def test_n_tried_rejects_fractional_float_and_bool(
+        self, valid_experiment_spec, bad_value
+    ):
+        with pytest.raises(ValueError, match="n_tried.*integer|integer.*n_tried|boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=bad_value,
+            )
+
+    def test_n_tried_accepts_integral_float(self, valid_experiment_spec):
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=1.0,
+        )
+
+        assert artifact["trial_accounting_summary"]["n_tried"] == 1
+
+
 class TestMissingValueSummaryIntegration:
     """Integration tests for --observation-missing-value-columns feature."""
 

@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,7 @@ def _compute_run_config_hash(
     observation_symbol_column: str | None = None,
     observation_close_column: str | None = None,
     observation_missing_value_columns: list[str] | None = None,
+    trial_accounting_summary: dict | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -109,6 +111,10 @@ def _compute_run_config_hash(
     When observation_missing_value_columns is provided, it is normalized
     (sorted, stripped) and appended to the hash input so that different
     column sets produce different run_config_hash values.
+
+    When trial_accounting_summary is provided, its schema-normalized JSON is
+    appended to the hash input so trial-accounting metadata changes produce
+    distinct run_config_hash/run_id values.
 
     Whitespace variation does not affect the hash.
 
@@ -163,6 +169,15 @@ def _compute_run_config_hash(
             separators=(",", ":"),
         ).encode("utf-8")
         combined = combined + b"\nmissing_val_cols:" + normalized
+
+    # trial_accounting_summary: canonical JSON, include in hash if emitted
+    if trial_accounting_summary is not None:
+        normalized = json.dumps(
+            trial_accounting_summary,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        combined = combined + b"\ntrial_accounting_summary:" + normalized
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -357,6 +372,7 @@ def _handle_data_manifest_validation_failure(
     required_observation_columns: list[str] | None,
     failure_type: str,
     exc: Exception,
+    trial_accounting_summary: dict | None = None,
 ) -> tuple[dict, int]:
     """
     Build and return a (partial_failed_validation_artifact, governance_blocker_count)
@@ -379,7 +395,10 @@ def _handle_data_manifest_validation_failure(
     now = _utc_now()
     spec_content_hash = _compute_content_hash(experiment_spec_path)
     run_config_hash_partial = _compute_run_config_hash(
-        experiment_spec_path, None, required_observation_columns
+        experiment_spec_path,
+        None,
+        required_observation_columns,
+        trial_accounting_summary=trial_accounting_summary,
     )
     run_id_partial = _compute_run_id(run_config_hash_partial)
 
@@ -499,6 +518,7 @@ def _handle_data_manifest_validation_failure(
         "run_owner": "unknown",  # Not available at partial-artifact stage
         "failure_summary": failure_summary,
         "partial_summary": None,
+        "trial_accounting_summary": trial_accounting_summary,
     }
 
     return (failed_artifact, governance_audit_summary["blocker_count"])
@@ -621,6 +641,396 @@ def _audit_dry_run(
 # Core artifact builder
 # ---------------------------------------------------------------------------
 
+
+# ---------------------------------------------------------------------------
+# Trial accounting helpers
+# ---------------------------------------------------------------------------
+
+ALLOWED_MUTATION_MODES = {"no_mutation", "dry_run_reference_only"}
+REJECTED_MUTATION_MODES = {"ledger_write", "registry_write"}
+STATUS_ENUM_VALUES = {
+    "not_applicable",
+    "proposed",
+    "linked",
+    "blocked",
+}
+COMPLEXITY_BUCKET_ENUM_VALUES = {
+    "low",
+    "medium",
+    "high",
+    "excessive",
+    "unknown",
+}
+
+
+def _is_bool_like_scalar(value: Any) -> bool:
+    """Return True for builtin bools and scalar bool types such as numpy.bool_."""
+    if isinstance(value, bool):
+        return True
+    dtype = getattr(value, "dtype", None)
+    if getattr(dtype, "kind", None) == "b":
+        return True
+    return type(value).__module__.startswith("numpy") and type(value).__name__ in {
+        "bool",
+        "bool_",
+    }
+
+
+def _non_negative_int_arg(value: Any, field_name: str) -> int:
+    """Parse and validate that an integer field is non-negative."""
+    if _is_bool_like_scalar(value):
+        raise ValueError(f"{field_name} must be an integer; got boolean {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field_name} must be an integer; got {value!r}")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer; got {value!r}") from exc
+    if not isinstance(value, str) and parsed != value:
+        raise ValueError(f"{field_name} must be an integer; got {value!r}")
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative; got {parsed}")
+    return parsed
+
+
+def _non_negative_float_arg(value: Any, field_name: str) -> float:
+    """Parse and validate that a float field is non-negative and finite."""
+    if _is_bool_like_scalar(value):
+        raise ValueError(f"{field_name} must be a number; got boolean {value!r}")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number; got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite; got {parsed}")
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative; got {parsed}")
+    return parsed
+
+
+def _optional_non_empty_string_arg(value: Any, field_name: str) -> str | None:
+    """Normalize optional schema strings: strip whitespace and convert blank to None."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field_name} must be a string or None; got {value!r}")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _optional_bool_arg(value: Any, field_name: str) -> bool | None:
+    """Validate optional boolean schema fields without coercing truthy/falsy values."""
+    if value is None:
+        return None
+    if not isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a boolean or None; got {value!r}")
+    return value
+
+
+def _non_negative_int_cli_arg(field_name: str):
+    """Return an argparse converter for a named non-negative integer field."""
+    def _converter(value: str) -> int:
+        try:
+            return _non_negative_int_arg(value, field_name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return _converter
+
+
+def _non_negative_float_cli_arg(field_name: str):
+    """Return an argparse converter for a named non-negative float field."""
+    def _converter(value: str) -> float:
+        try:
+            return _non_negative_float_arg(value, field_name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return _converter
+
+
+class _TrialAccountingFlags:
+    """
+    Lightweight container for trial-accounting CLI flags.
+    Mirrors the fields used by _any_trial_accounting_flag and
+    _build_trial_accounting_summary so a single object can be passed
+    to those helpers without requiring argparse at the call site.
+    """
+
+    def __init__(
+        self,
+        trial_accounting_status=None,
+        trial_accounting_mutation_mode=None,
+        search_space_id=None,
+        trial_family_id=None,
+        trial_id=None,
+        proposed_trial_id=None,
+        variant_id=None,
+        selected_variant_id=None,
+        model_assessment_id=None,
+        review_packet_id=None,
+        n_tried=None,
+        candidate_variant_count=None,
+        failed_variant_count=None,
+        all_variants_preserved=None,
+        sample_length=None,
+        sample_to_trial_ratio=None,
+        trial_accounting_notes=None,
+        complexity_rule_count=None,
+        complexity_parameter_count=None,
+        complexity_signal_count=None,
+        complexity_filter_count=None,
+        complexity_bucket=None,
+    ):
+        self.trial_accounting_status = trial_accounting_status
+        self.trial_accounting_mutation_mode = trial_accounting_mutation_mode
+        self.search_space_id = search_space_id
+        self.trial_family_id = trial_family_id
+        self.trial_id = trial_id
+        self.proposed_trial_id = proposed_trial_id
+        self.variant_id = variant_id
+        self.selected_variant_id = selected_variant_id
+        self.model_assessment_id = model_assessment_id
+        self.review_packet_id = review_packet_id
+        self.n_tried = n_tried
+        self.candidate_variant_count = candidate_variant_count
+        self.failed_variant_count = failed_variant_count
+        self.all_variants_preserved = all_variants_preserved
+        self.sample_length = sample_length
+        self.sample_to_trial_ratio = sample_to_trial_ratio
+        self.trial_accounting_notes = trial_accounting_notes
+        self.complexity_rule_count = complexity_rule_count
+        self.complexity_parameter_count = complexity_parameter_count
+        self.complexity_signal_count = complexity_signal_count
+        self.complexity_filter_count = complexity_filter_count
+        self.complexity_bucket = complexity_bucket
+
+
+def _any_trial_accounting_flag(flags: _TrialAccountingFlags) -> bool:
+    """
+    Return True if any trial-accounting or complexity CLI flag was supplied.
+    Used to determine whether to emit trial_accounting_summary at all.
+    """
+    trial_accounting_fields = [
+        flags.trial_accounting_status,
+        flags.trial_accounting_mutation_mode,
+        flags.search_space_id,
+        flags.trial_family_id,
+        flags.trial_id,
+        flags.proposed_trial_id,
+        flags.variant_id,
+        flags.selected_variant_id,
+        flags.model_assessment_id,
+        flags.review_packet_id,
+        flags.n_tried,
+        flags.candidate_variant_count,
+        flags.failed_variant_count,
+        flags.all_variants_preserved,
+        flags.sample_length,
+        flags.sample_to_trial_ratio,
+        flags.trial_accounting_notes,
+        # complexity sub-object flags
+        flags.complexity_rule_count,
+        flags.complexity_parameter_count,
+        flags.complexity_signal_count,
+        flags.complexity_filter_count,
+        flags.complexity_bucket,
+    ]
+    return any(f is not None for f in trial_accounting_fields)
+
+
+def _build_complexity(flags: _TrialAccountingFlags) -> dict | None:
+    """
+    Build the complexity sub-object if any complexity flag was supplied.
+    Returns None if no complexity flags were provided (not a missing key —
+    the field is present with value None per schema).
+    """
+    complexity_fields = [
+        flags.complexity_rule_count,
+        flags.complexity_parameter_count,
+        flags.complexity_signal_count,
+        flags.complexity_filter_count,
+        flags.complexity_bucket,
+    ]
+    if not any(f is not None for f in complexity_fields):
+        return None
+
+    if flags.complexity_bucket is not None and flags.complexity_bucket not in COMPLEXITY_BUCKET_ENUM_VALUES:
+        raise ValueError(
+            f"Invalid complexity_bucket='{flags.complexity_bucket}'. "
+            f"Allowed values: {sorted(COMPLEXITY_BUCKET_ENUM_VALUES)}"
+        )
+
+    rule_count = (
+        _non_negative_int_arg(flags.complexity_rule_count, "complexity_rule_count")
+        if flags.complexity_rule_count is not None
+        else None
+    )
+    parameter_count = (
+        _non_negative_int_arg(flags.complexity_parameter_count, "complexity_parameter_count")
+        if flags.complexity_parameter_count is not None
+        else None
+    )
+    signal_count = (
+        _non_negative_int_arg(flags.complexity_signal_count, "complexity_signal_count")
+        if flags.complexity_signal_count is not None
+        else None
+    )
+    filter_count = (
+        _non_negative_int_arg(flags.complexity_filter_count, "complexity_filter_count")
+        if flags.complexity_filter_count is not None
+        else None
+    )
+
+    return {
+        "rule_count": rule_count,
+        "parameter_count": parameter_count,
+        "signal_count": signal_count,
+        "filter_count": filter_count,
+        "complexity_bucket": flags.complexity_bucket,
+    }
+
+
+def _build_trial_accounting_summary(
+    experiment_spec: dict,
+    manifest: "DatasetManifest | None",
+    flags: _TrialAccountingFlags,
+) -> dict:
+    """
+    Build a trial_accounting_summary dict.
+
+    Must only be called when at least one trial-accounting CLI flag was supplied.
+
+    Parameters
+    ----------
+    experiment_spec : dict
+        The loaded experiment spec dict.
+    manifest : DatasetManifest | None
+        The validated DataManifest, or None if no manifest was loaded.
+    flags : _TrialAccountingFlags
+        Parsed CLI flags for trial accounting.
+
+    Returns
+    -------
+    dict
+        A trial_accounting_summary dict. Matches RunnerOutputSpec v1 schema.
+
+    Raises
+    ------
+    ValueError
+        If mutation_mode is not in ALLOWED_MUTATION_MODES.
+    """
+    # Resolve mutation_mode with default
+    mutation_mode = flags.trial_accounting_mutation_mode
+    if mutation_mode is None:
+        mutation_mode = "dry_run_reference_only"
+
+    # Reject explicitly disallowed modes
+    if mutation_mode in REJECTED_MUTATION_MODES:
+        raise ValueError(
+            f"mutation_mode='{mutation_mode}' is not supported by this runner. "
+            f"Allowed values: {sorted(ALLOWED_MUTATION_MODES)}"
+        )
+    if mutation_mode not in ALLOWED_MUTATION_MODES:
+        raise ValueError(
+            f"Invalid mutation_mode='{mutation_mode}'. "
+            f"Allowed values: {sorted(ALLOWED_MUTATION_MODES)}"
+        )
+
+    # Resolve status with default
+    status = flags.trial_accounting_status
+    if status is None:
+        status = "proposed"  # not_applicable only when explicitly supplied
+
+    if status not in STATUS_ENUM_VALUES:
+        raise ValueError(
+            f"Invalid trial_accounting_status='{status}'. "
+            f"Allowed values: {sorted(STATUS_ENUM_VALUES)}"
+        )
+
+    n_tried = (
+        _non_negative_int_arg(flags.n_tried, "n_tried")
+        if flags.n_tried is not None
+        else None
+    )
+    candidate_variant_count = (
+        _non_negative_int_arg(flags.candidate_variant_count, "candidate_variant_count")
+        if flags.candidate_variant_count is not None
+        else None
+    )
+    failed_variant_count = (
+        _non_negative_int_arg(flags.failed_variant_count, "failed_variant_count")
+        if flags.failed_variant_count is not None
+        else None
+    )
+    sample_length = (
+        _non_negative_int_arg(flags.sample_length, "sample_length")
+        if flags.sample_length is not None
+        else None
+    )
+    sample_to_trial_ratio = (
+        _non_negative_float_arg(flags.sample_to_trial_ratio, "sample_to_trial_ratio")
+        if flags.sample_to_trial_ratio is not None
+        else None
+    )
+
+    search_space_id = _optional_non_empty_string_arg(flags.search_space_id, "search_space_id")
+    trial_family_id = _optional_non_empty_string_arg(flags.trial_family_id, "trial_family_id")
+    trial_id = _optional_non_empty_string_arg(flags.trial_id, "trial_id")
+    proposed_trial_id = _optional_non_empty_string_arg(
+        flags.proposed_trial_id,
+        "proposed_trial_id",
+    )
+    variant_id = _optional_non_empty_string_arg(flags.variant_id, "variant_id")
+    selected_variant_id = _optional_non_empty_string_arg(
+        flags.selected_variant_id,
+        "selected_variant_id",
+    )
+    model_assessment_id = _optional_non_empty_string_arg(
+        flags.model_assessment_id,
+        "model_assessment_id",
+    )
+    review_packet_id = _optional_non_empty_string_arg(flags.review_packet_id, "review_packet_id")
+    if mutation_mode == "no_mutation":
+        linkage_ids = {
+            "trial_family_id": trial_family_id,
+            "trial_id": trial_id,
+            "proposed_trial_id": proposed_trial_id,
+            "variant_id": variant_id,
+            "selected_variant_id": selected_variant_id,
+        }
+        present_linkage_ids = [name for name, value in linkage_ids.items() if value is not None]
+        if present_linkage_ids:
+            raise ValueError(
+                "mutation_mode='no_mutation' cannot include linkage IDs: "
+                f"{', '.join(present_linkage_ids)}"
+            )
+
+    return {
+        "status": status,
+        "mutation_mode": mutation_mode,
+        "experiment_id": experiment_spec.get("experiment_id"),
+        "data_manifest_id": manifest.dataset_id if manifest is not None else None,
+        "search_space_id": search_space_id,
+        "trial_family_id": trial_family_id,
+        "trial_id": trial_id,
+        "proposed_trial_id": proposed_trial_id,
+        "variant_id": variant_id,
+        "selected_variant_id": selected_variant_id,
+        "model_assessment_id": model_assessment_id,
+        "review_packet_id": review_packet_id,
+        "n_tried": n_tried,
+        "candidate_variant_count": candidate_variant_count,
+        "failed_variant_count": failed_variant_count,
+        "all_variants_preserved": _optional_bool_arg(flags.all_variants_preserved, "all_variants_preserved"),
+        "sample_length": sample_length,
+        "sample_to_trial_ratio": sample_to_trial_ratio,
+        "complexity": _build_complexity(flags),
+        "notes": _optional_non_empty_string_arg(flags.trial_accounting_notes, "trial_accounting_notes"),
+    }
+
+
 def build_runner_output(
     experiment_spec_path: str | Path,
     runner_name: str = RUNNER_NAME_DEFAULT,
@@ -632,6 +1042,30 @@ def build_runner_output(
     observation_symbol_column: str | None = None,
     observation_close_column: str | None = None,
     observation_missing_value_columns: list[str] | None = None,
+    # Trial-accounting flags
+    trial_accounting_status: str | None = None,
+    trial_accounting_mutation_mode: str | None = None,
+    search_space_id: str | None = None,
+    trial_family_id: str | None = None,
+    trial_id: str | None = None,
+    proposed_trial_id: str | None = None,
+    variant_id: str | None = None,
+    selected_variant_id: str | None = None,
+    model_assessment_id: str | None = None,
+    review_packet_id: str | None = None,
+    n_tried: int | None = None,
+    candidate_variant_count: int | None = None,
+    failed_variant_count: int | None = None,
+    all_variants_preserved: bool | None = None,
+    sample_length: int | None = None,
+    sample_to_trial_ratio: float | None = None,
+    trial_accounting_notes: str | None = None,
+    # Complexity flags
+    complexity_rule_count: int | None = None,
+    complexity_parameter_count: int | None = None,
+    complexity_signal_count: int | None = None,
+    complexity_filter_count: int | None = None,
+    complexity_bucket: str | None = None,
 ) -> dict:
     """
     Build a complete RunnerOutput v1 artifact for a dry-run.
@@ -709,6 +1143,43 @@ def build_runner_output(
 
     # Validate structural requirement
     _check_experiment_spec_id(experiment_spec)
+
+    # Build _TrialAccountingFlags from the kwargs
+    _ta_flags = _TrialAccountingFlags(
+        trial_accounting_status=trial_accounting_status,
+        trial_accounting_mutation_mode=trial_accounting_mutation_mode,
+        search_space_id=search_space_id,
+        trial_family_id=trial_family_id,
+        trial_id=trial_id,
+        proposed_trial_id=proposed_trial_id,
+        variant_id=variant_id,
+        selected_variant_id=selected_variant_id,
+        model_assessment_id=model_assessment_id,
+        review_packet_id=review_packet_id,
+        n_tried=n_tried,
+        candidate_variant_count=candidate_variant_count,
+        failed_variant_count=failed_variant_count,
+        all_variants_preserved=all_variants_preserved,
+        sample_length=sample_length,
+        sample_to_trial_ratio=sample_to_trial_ratio,
+        trial_accounting_notes=trial_accounting_notes,
+        complexity_rule_count=complexity_rule_count,
+        complexity_parameter_count=complexity_parameter_count,
+        complexity_signal_count=complexity_signal_count,
+        complexity_filter_count=complexity_filter_count,
+        complexity_bucket=complexity_bucket,
+    )
+
+    # Build trial_accounting_summary early — before DataManifest loading — so it
+    # is present in failed_validation artifacts when manifest loading/validation
+    # fails but trial-accounting flags were supplied.  data_manifest_id will be
+    # populated from the manifest after a successful load (see below).
+    if _any_trial_accounting_flag(_ta_flags):
+        trial_accounting_summary = _build_trial_accounting_summary(
+            experiment_spec, None, _ta_flags
+        )
+    else:
+        trial_accounting_summary = None
 
     # Early validation: required_observation_columns needs a DataManifest to validate against
     if required_observation_columns is not None and data_manifest_path is None:
@@ -810,11 +1281,14 @@ def build_runner_output(
         if has_close_return_summary_requested and _raw_source_kind not in ("local_csv", ""):
             _now = _utc_now()
             _cfg_hash = _compute_run_config_hash(
-                experiment_spec_path, data_manifest_path,
+                experiment_spec_path,
+                data_manifest_path,
                 required_observation_columns,
-                observation_date_column, observation_symbol_column,
+                observation_date_column,
+                observation_symbol_column,
                 observation_close_column,
                 observation_missing_value_columns,
+                trial_accounting_summary=trial_accounting_summary,
             )
             _close_fail_audit = {
                 "audit_name": "observation_table_close_return_summary",
@@ -904,6 +1378,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": _failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 _failed_artifact,
@@ -915,11 +1390,14 @@ def build_runner_output(
         if has_missing_value_summary_requested and _raw_source_kind not in ("local_csv", ""):
             _now = _utc_now()
             _cfg_hash = _compute_run_config_hash(
-                experiment_spec_path, data_manifest_path,
+                experiment_spec_path,
+                data_manifest_path,
                 required_observation_columns,
-                observation_date_column, observation_symbol_column,
+                observation_date_column,
+                observation_symbol_column,
                 observation_close_column,
                 observation_missing_value_columns,
+                trial_accounting_summary=trial_accounting_summary,
             )
             _missing_val_fail_audit = {
                 "audit_name": "observation_table_missing_value_summary",
@@ -1009,6 +1487,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": _failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 _failed_artifact,
@@ -1033,6 +1512,7 @@ def build_runner_output(
                 _handle_data_manifest_validation_failure(
                     experiment_spec, experiment_spec_path, created_at,
                     required_observation_columns, failure_type, exc,
+                    trial_accounting_summary=trial_accounting_summary,
                 )
             )
             if governance_blocker_count > 0:
@@ -1056,6 +1536,7 @@ def build_runner_output(
                 _handle_data_manifest_validation_failure(
                     experiment_spec, experiment_spec_path, created_at,
                     required_observation_columns, failure_type, exc,
+                    trial_accounting_summary=trial_accounting_summary,
                 )
             )
             if governance_blocker_count > 0:
@@ -1065,14 +1546,21 @@ def build_runner_output(
                 )
             return partial_artifact
 
+    # Populate data_manifest_id in the early-built trial_accounting_summary
+    # (built before DataManifest loading) now that manifest has loaded successfully.
+    if trial_accounting_summary is not None and manifest is not None:
+        trial_accounting_summary["data_manifest_id"] = manifest.dataset_id
+
     # Deterministic hashes — include DataManifest content and required columns when present
     run_config_hash = _compute_run_config_hash(
-        experiment_spec_path, data_manifest_path,
+        experiment_spec_path,
+        data_manifest_path,
         required_observation_columns,
         observation_date_column,
         observation_symbol_column,
         observation_close_column,
         observation_missing_value_columns,
+        trial_accounting_summary=trial_accounting_summary,
     )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]
@@ -1215,6 +1703,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": _failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 _failed_artifact,
@@ -1647,6 +2136,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -1801,6 +2291,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -1891,6 +2382,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": close_failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2023,6 +2515,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2120,6 +2613,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": dup_failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2237,6 +2731,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2335,6 +2830,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": dc_failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2457,6 +2953,7 @@ def build_runner_output(
                 "run_owner": run_owner,
                 "failure_summary": failure_summary,
                 "partial_summary": None,
+                "trial_accounting_summary": trial_accounting_summary,
             }
             raise GovernanceRejection(
                 failed_artifact,
@@ -2506,6 +3003,7 @@ def build_runner_output(
         "run_owner": run_owner,
         "failure_summary": failure_summary,
         "partial_summary": None,
+        "trial_accounting_summary": trial_accounting_summary,
     }
 
     # Raise GovernanceRejection if blockers exist so main() can emit
@@ -2674,6 +3172,161 @@ def main(argv: list[str] | None = None) -> int:
             "Example: --observation-missing-value-columns volume,bid,ask"
         ),
     )
+    # Trial-accounting flags
+    parser.add_argument(
+        "--trial-accounting-status",
+        required=False,
+        default=None,
+        choices=sorted(STATUS_ENUM_VALUES),
+        help=(
+            "Trial accounting status enum value. "
+            "Allowed: not_applicable, proposed, linked, blocked. "
+            "Defaults to 'proposed' when any trial-accounting flag is supplied."
+        ),
+    )
+    parser.add_argument(
+        "--trial-accounting-mutation-mode",
+        required=False,
+        default=None,
+        help=(
+            "Trial accounting mutation mode. "
+            "Allowed: no_mutation, dry_run_reference_only. "
+            "Defaults to 'dry_run_reference_only'. "
+            "REJECTED: ledger_write, registry_write (raises error)."
+        ),
+    )
+    parser.add_argument(
+        "--search-space-id",
+        required=False,
+        default=None,
+        help="Search space ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--trial-family-id",
+        required=False,
+        default=None,
+        help="Trial family ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--trial-id",
+        required=False,
+        default=None,
+        help="Trial ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--proposed-trial-id",
+        required=False,
+        default=None,
+        help="Proposed trial ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--variant-id",
+        required=False,
+        default=None,
+        help="Variant ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--selected-variant-id",
+        required=False,
+        default=None,
+        help="Selected variant ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--model-assessment-id",
+        required=False,
+        default=None,
+        help="Model assessment ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--review-packet-id",
+        required=False,
+        default=None,
+        help="Review packet ID for trial accounting.",
+    )
+    parser.add_argument(
+        "--n-tried",
+        required=False,
+        type=_non_negative_int_cli_arg("n_tried"),
+        default=None,
+        help="Number of trials tried.",
+    )
+    parser.add_argument(
+        "--candidate-variant-count",
+        required=False,
+        type=_non_negative_int_cli_arg("candidate_variant_count"),
+        default=None,
+        help="Candidate variant count.",
+    )
+    parser.add_argument(
+        "--failed-variant-count",
+        required=False,
+        type=_non_negative_int_cli_arg("failed_variant_count"),
+        default=None,
+        help="Failed variant count.",
+    )
+    parser.add_argument(
+        "--all-variants-preserved",
+        required=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Whether all variants were preserved. Use --all-variants-preserved for True, --no-all-variants-preserved for False.",
+    )
+    parser.add_argument(
+        "--sample-length",
+        required=False,
+        type=_non_negative_int_cli_arg("sample_length"),
+        default=None,
+        help="Sample length for trial accounting.",
+    )
+    parser.add_argument(
+        "--sample-to-trial-ratio",
+        required=False,
+        type=_non_negative_float_cli_arg("sample_to_trial_ratio"),
+        default=None,
+        help="Sample-to-trial ratio.",
+    )
+    parser.add_argument(
+        "--trial-accounting-notes",
+        required=False,
+        default=None,
+        help="Notes for trial accounting.",
+    )
+    # Complexity flags
+    parser.add_argument(
+        "--complexity-rule-count",
+        required=False,
+        type=int,
+        default=None,
+        help="Complexity: rule count.",
+    )
+    parser.add_argument(
+        "--complexity-parameter-count",
+        required=False,
+        type=int,
+        default=None,
+        help="Complexity: parameter count.",
+    )
+    parser.add_argument(
+        "--complexity-signal-count",
+        required=False,
+        type=int,
+        default=None,
+        help="Complexity: signal count.",
+    )
+    parser.add_argument(
+        "--complexity-filter-count",
+        required=False,
+        type=int,
+        default=None,
+        help="Complexity: filter count.",
+    )
+    parser.add_argument(
+        "--complexity-bucket",
+        required=False,
+        default=None,
+        choices=sorted(COMPLEXITY_BUCKET_ENUM_VALUES),
+        help="Complexity bucket label.",
+    )
 
     args = parser.parse_args(argv)
 
@@ -2729,6 +3382,28 @@ def main(argv: list[str] | None = None) -> int:
             observation_symbol_column=observation_symbol_column,
             observation_close_column=observation_close_column,
             observation_missing_value_columns=observation_missing_value_columns,
+            trial_accounting_status=args.trial_accounting_status,
+            trial_accounting_mutation_mode=args.trial_accounting_mutation_mode,
+            search_space_id=args.search_space_id,
+            trial_family_id=args.trial_family_id,
+            trial_id=args.trial_id,
+            proposed_trial_id=args.proposed_trial_id,
+            variant_id=args.variant_id,
+            selected_variant_id=args.selected_variant_id,
+            model_assessment_id=args.model_assessment_id,
+            review_packet_id=args.review_packet_id,
+            n_tried=args.n_tried,
+            candidate_variant_count=args.candidate_variant_count,
+            failed_variant_count=args.failed_variant_count,
+            all_variants_preserved=args.all_variants_preserved,
+            sample_length=args.sample_length,
+            sample_to_trial_ratio=args.sample_to_trial_ratio,
+            trial_accounting_notes=args.trial_accounting_notes,
+            complexity_rule_count=args.complexity_rule_count,
+            complexity_parameter_count=args.complexity_parameter_count,
+            complexity_signal_count=args.complexity_signal_count,
+            complexity_filter_count=args.complexity_filter_count,
+            complexity_bucket=args.complexity_bucket,
         )
     except GovernanceRejection as exc:
         # Governance rejection: emit the failed_validation artifact and exit 1

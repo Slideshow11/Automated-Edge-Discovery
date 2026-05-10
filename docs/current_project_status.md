@@ -145,6 +145,7 @@ The project is not yet a live trading or production system.
 - PR #184 docs: design runner trial-accounting linkage
 - PR #185 schema: add optional RunnerOutput trial_accounting_summary field (backward-compatible, no runtime behavior)
 - PR #186 docs: define evidence tiers and claim levels (design-only companion to PRs #184, #185; no schema or runtime changes)
+- PR #187 feat: emit optional RunnerOutput trial_accounting_summary in dry-run mode with conditional CLI-driven emission (no schema change, no mutation)
 
 ## Current stop rules
 
