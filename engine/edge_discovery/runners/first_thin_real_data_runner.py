@@ -636,6 +636,57 @@ STATUS_ENUM_VALUES = {
     "linked",
     "blocked",
 }
+COMPLEXITY_BUCKET_ENUM_VALUES = {
+    "low",
+    "medium",
+    "high",
+    "excessive",
+    "unknown",
+}
+
+
+def _non_negative_int_arg(value: Any, field_name: str) -> int:
+    """Parse and validate that an integer field is non-negative."""
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be an integer; got {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative; got {parsed}")
+    return parsed
+
+
+def _non_negative_float_arg(value: Any, field_name: str) -> float:
+    """Parse and validate that a float field is non-negative."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a number; got {value!r}") from exc
+    if parsed < 0:
+        raise ValueError(f"{field_name} must be non-negative; got {parsed}")
+    return parsed
+
+
+def _non_negative_int_cli_arg(field_name: str):
+    """Return an argparse converter for a named non-negative integer field."""
+    def _converter(value: str) -> int:
+        try:
+            return _non_negative_int_arg(value, field_name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return _converter
+
+
+def _non_negative_float_cli_arg(field_name: str):
+    """Return an argparse converter for a named non-negative float field."""
+    def _converter(value: str) -> float:
+        try:
+            return _non_negative_float_arg(value, field_name)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+
+    return _converter
 
 
 class _TrialAccountingFlags:
@@ -743,6 +794,13 @@ def _build_complexity(flags: _TrialAccountingFlags) -> dict | None:
     ]
     if not any(f is not None for f in complexity_fields):
         return None
+
+    if flags.complexity_bucket is not None and flags.complexity_bucket not in COMPLEXITY_BUCKET_ENUM_VALUES:
+        raise ValueError(
+            f"Invalid complexity_bucket='{flags.complexity_bucket}'. "
+            f"Allowed values: {sorted(COMPLEXITY_BUCKET_ENUM_VALUES)}"
+        )
+
     return {
         "rule_count": flags.complexity_rule_count,
         "parameter_count": flags.complexity_parameter_count,
@@ -803,6 +861,38 @@ def _build_trial_accounting_summary(
     if status is None:
         status = "proposed"  # not_applicable only when explicitly supplied
 
+    if status not in STATUS_ENUM_VALUES:
+        raise ValueError(
+            f"Invalid trial_accounting_status='{status}'. "
+            f"Allowed values: {sorted(STATUS_ENUM_VALUES)}"
+        )
+
+    n_tried = (
+        _non_negative_int_arg(flags.n_tried, "n_tried")
+        if flags.n_tried is not None
+        else None
+    )
+    candidate_variant_count = (
+        _non_negative_int_arg(flags.candidate_variant_count, "candidate_variant_count")
+        if flags.candidate_variant_count is not None
+        else None
+    )
+    failed_variant_count = (
+        _non_negative_int_arg(flags.failed_variant_count, "failed_variant_count")
+        if flags.failed_variant_count is not None
+        else None
+    )
+    sample_length = (
+        _non_negative_int_arg(flags.sample_length, "sample_length")
+        if flags.sample_length is not None
+        else None
+    )
+    sample_to_trial_ratio = (
+        _non_negative_float_arg(flags.sample_to_trial_ratio, "sample_to_trial_ratio")
+        if flags.sample_to_trial_ratio is not None
+        else None
+    )
+
     return {
         "status": status,
         "mutation_mode": mutation_mode,
@@ -816,12 +906,12 @@ def _build_trial_accounting_summary(
         "selected_variant_id": flags.selected_variant_id,
         "model_assessment_id": flags.model_assessment_id,
         "review_packet_id": flags.review_packet_id,
-        "n_tried": flags.n_tried,
-        "candidate_variant_count": flags.candidate_variant_count,
-        "failed_variant_count": flags.failed_variant_count,
+        "n_tried": n_tried,
+        "candidate_variant_count": candidate_variant_count,
+        "failed_variant_count": failed_variant_count,
         "all_variants_preserved": flags.all_variants_preserved,
-        "sample_length": flags.sample_length,
-        "sample_to_trial_ratio": flags.sample_to_trial_ratio,
+        "sample_length": sample_length,
+        "sample_to_trial_ratio": sample_to_trial_ratio,
         "complexity": _build_complexity(flags),
         "notes": flags.trial_accounting_notes,
     }
@@ -2965,6 +3055,7 @@ def main(argv: list[str] | None = None) -> int:
         "--trial-accounting-status",
         required=False,
         default=None,
+        choices=sorted(STATUS_ENUM_VALUES),
         help=(
             "Trial accounting status enum value. "
             "Allowed: not_applicable, proposed, linked, blocked. "
@@ -3033,21 +3124,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--n-tried",
         required=False,
-        type=int,
+        type=_non_negative_int_cli_arg("n_tried"),
         default=None,
         help="Number of trials tried.",
     )
     parser.add_argument(
         "--candidate-variant-count",
         required=False,
-        type=int,
+        type=_non_negative_int_cli_arg("candidate_variant_count"),
         default=None,
         help="Candidate variant count.",
     )
     parser.add_argument(
         "--failed-variant-count",
         required=False,
-        type=int,
+        type=_non_negative_int_cli_arg("failed_variant_count"),
         default=None,
         help="Failed variant count.",
     )
@@ -3061,14 +3152,14 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--sample-length",
         required=False,
-        type=int,
+        type=_non_negative_int_cli_arg("sample_length"),
         default=None,
         help="Sample length for trial accounting.",
     )
     parser.add_argument(
         "--sample-to-trial-ratio",
         required=False,
-        type=float,
+        type=_non_negative_float_cli_arg("sample_to_trial_ratio"),
         default=None,
         help="Sample-to-trial ratio.",
     )
@@ -3111,6 +3202,7 @@ def main(argv: list[str] | None = None) -> int:
         "--complexity-bucket",
         required=False,
         default=None,
+        choices=sorted(COMPLEXITY_BUCKET_ENUM_VALUES),
         help="Complexity bucket label.",
     )
 

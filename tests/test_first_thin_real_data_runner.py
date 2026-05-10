@@ -4134,6 +4134,241 @@ class TestTrialAccountingConditionalEmission:
         assert "data_manifest_id" not in tas or tas.get("data_manifest_id") is None
 
 
+class TestTrialAccountingStatusValidation:
+    """Validate trial_accounting_status enum values via build_runner_output API."""
+
+    ALLOWED_STATUSES = {"not_applicable", "proposed", "linked", "blocked"}
+
+    def test_valid_status_values_accepted(self, valid_experiment_spec):
+        """All allowed status values pass validation without error."""
+        for status in self.ALLOWED_STATUSES:
+            artifact = build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status=status,
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+            tas = artifact.get("trial_accounting_summary")
+            assert tas is not None
+            assert tas["status"] == status, f"status={status!r} not reflected in artifact"
+
+    def test_invalid_status_rejected_by_build_runner_output(self, valid_experiment_spec):
+        """An invalid status value raises ValueError and does not emit schema-invalid artifact."""
+        with pytest.raises(ValueError, match="Invalid.*status|not.*allowed"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="bad_status_value",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+            )
+
+
+class TestComplexityBucketValidation:
+    """Validate complexity_bucket enum values via build_runner_output API."""
+
+    ALLOWED_BUCKETS = {"low", "medium", "high", "excessive", "unknown"}
+
+    def test_valid_complexity_bucket_values_accepted(self, valid_experiment_spec):
+        """All allowed complexity_bucket values pass validation."""
+        for bucket in self.ALLOWED_BUCKETS:
+            artifact = build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                complexity_bucket=bucket,
+            )
+            tas = artifact.get("trial_accounting_summary")
+            assert tas is not None
+            assert tas["complexity"] is not None
+            assert tas["complexity"]["complexity_bucket"] == bucket
+
+    def test_invalid_complexity_bucket_rejected(self, valid_experiment_spec):
+        """An invalid complexity_bucket value raises ValueError."""
+        with pytest.raises(ValueError, match="Invalid.*complexity_bucket|not.*allowed"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                complexity_bucket="not_a_real_bucket",
+            )
+
+
+class TestNonNegativeTrialAccountingFields:
+    """Validate that non-negative trial-accounting numeric fields reject negative values."""
+
+    def test_n_tried_negative_rejected(self, valid_experiment_spec):
+        """n_tried=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|n_tried.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=-1,
+            )
+
+    def test_candidate_variant_count_negative_rejected(self, valid_experiment_spec):
+        """candidate_variant_count=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|candidate_variant_count.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                candidate_variant_count=-1,
+            )
+
+    def test_failed_variant_count_negative_rejected(self, valid_experiment_spec):
+        """failed_variant_count=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|failed_variant_count.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                failed_variant_count=-1,
+            )
+
+    def test_sample_length_negative_rejected(self, valid_experiment_spec):
+        """sample_length=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|sample_length.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=-1,
+            )
+
+    def test_sample_to_trial_ratio_negative_rejected(self, valid_experiment_spec):
+        """sample_to_trial_ratio=-1 raises ValueError."""
+        with pytest.raises(ValueError, match="non-negative|sample_to_trial_ratio.*negative"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=-1.0,
+            )
+
+    def test_n_tried_zero_accepted(self, valid_experiment_spec):
+        """n_tried=0 is valid and appears in the artifact."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["n_tried"] == 0
+
+    def test_candidate_variant_count_zero_accepted(self, valid_experiment_spec):
+        """candidate_variant_count=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            candidate_variant_count=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["candidate_variant_count"] == 0
+
+    def test_failed_variant_count_zero_accepted(self, valid_experiment_spec):
+        """failed_variant_count=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            failed_variant_count=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["failed_variant_count"] == 0
+
+    def test_sample_length_zero_accepted(self, valid_experiment_spec):
+        """sample_length=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            sample_length=0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["sample_length"] == 0
+
+    def test_sample_to_trial_ratio_zero_accepted(self, valid_experiment_spec):
+        """sample_to_trial_ratio=0 is valid."""
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            sample_to_trial_ratio=0.0,
+        )
+        tas = artifact.get("trial_accounting_summary")
+        assert tas is not None
+        assert tas["sample_to_trial_ratio"] == 0.0
+
+
+class TestTrialAccountingCliInputValidation:
+    """CLI validation must reject schema-invalid trial-accounting values before emission."""
+
+    def test_cli_invalid_status_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "bad_status_value",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice" in captured.err
+        assert "bad_status_value" in captured.err
+        assert not output_path.exists()
+
+    def test_cli_invalid_complexity_bucket_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "proposed",
+                "--complexity-bucket", "not_a_real_bucket",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "invalid choice" in captured.err
+        assert "not_a_real_bucket" in captured.err
+        assert not output_path.exists()
+
+    def test_cli_negative_numeric_rejected_without_artifact(self, valid_experiment_spec, tmp_path, capsys):
+        output_path = tmp_path / "output.json"
+        with pytest.raises(SystemExit) as exc_info:
+            main([
+                "--experiment-spec", str(valid_experiment_spec),
+                "--output-path", str(output_path),
+                "--run-owner", "test@test",
+                "--trial-accounting-status", "proposed",
+                "--n-tried", "-1",
+            ])
+        assert exc_info.value.code == 2
+        captured = capsys.readouterr()
+        assert "n_tried must be non-negative" in captured.err
+        assert not output_path.exists()
+
+
 class TestMissingValueSummaryIntegration:
     """Integration tests for --observation-missing-value-columns feature."""
 
