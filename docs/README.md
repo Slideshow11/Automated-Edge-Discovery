@@ -65,6 +65,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | Script | Purpose | Mutation behavior |
 |---|---|---|
 | scripts/local/pr_readiness_report.py | Produces local branch, diff, changed-file, untracked-file, recent-commit, and optional PR metadata reports. | Read-only |
+| scripts/local/classify_pr_gate_state.py | Classifies a GitHub PR's read-only gate state into a structured JSON packet using scope, CI, and current-head Codex evidence. | Read-only |
 | scripts/local/validate_edge_hypothesis_card.py | Validates required content and guardrails in the edge hypothesis card doc. | Read-only |
 | scripts/local/validate_search_space_manifest.py | Validates a single SearchSpaceManifest v1 JSON entry against the schema and governance rules. | Read-only |
 | scripts/local/validate_trial_ledger.py | Validates a single TrialLedger v1 JSON entry against the schema and governance rules. | Read-only |
