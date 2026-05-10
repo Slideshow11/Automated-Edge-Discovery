@@ -681,6 +681,8 @@ def _non_negative_int_arg(value: Any, field_name: str) -> int:
 
 def _non_negative_float_arg(value: Any, field_name: str) -> float:
     """Parse and validate that a float field is non-negative and finite."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number; got boolean {value!r}")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:

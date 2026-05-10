@@ -4318,6 +4318,18 @@ class TestNonNegativeTrialAccountingFields:
         assert tas is not None
         assert tas["sample_to_trial_ratio"] == 0.0
 
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_sample_to_trial_ratio_bool_rejected(self, valid_experiment_spec, bool_val):
+        """sample_to_trial_ratio=True/False must be rejected, not coerced to 1.0/0.0."""
+        with pytest.raises(ValueError, match="sample_to_trial_ratio.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=bool_val,
+            )
+
     @pytest.mark.parametrize("bad_ratio", [float("nan"), float("inf"), float("-inf")])
     def test_sample_to_trial_ratio_non_finite_rejected(
         self, valid_experiment_spec, bad_ratio
