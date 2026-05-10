@@ -4318,6 +4318,42 @@ class TestNonNegativeTrialAccountingFields:
         assert tas is not None
         assert tas["sample_to_trial_ratio"] == 0.0
 
+    @pytest.mark.parametrize("bad_ratio", [float("nan"), float("inf"), float("-inf")])
+    def test_sample_to_trial_ratio_non_finite_rejected(
+        self, valid_experiment_spec, bad_ratio
+    ):
+        """sample_to_trial_ratio must be finite, not NaN or Infinity."""
+        with pytest.raises(ValueError, match="finite|sample_to_trial_ratio"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=bad_ratio,
+            )
+
+    @pytest.mark.parametrize(
+        "field_name, kwargs",
+        [
+            ("complexity_rule_count", {"complexity_rule_count": -1}),
+            ("complexity_parameter_count", {"complexity_parameter_count": -1}),
+            ("complexity_signal_count", {"complexity_signal_count": -1}),
+            ("complexity_filter_count", {"complexity_filter_count": -1}),
+        ],
+    )
+    def test_complexity_count_negative_rejected(
+        self, valid_experiment_spec, field_name, kwargs
+    ):
+        """Complexity count fields must be non-negative via direct API calls."""
+        with pytest.raises(ValueError, match=f"{field_name}.*non-negative|non-negative.*{field_name}"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                **kwargs,
+            )
+
 
 class TestTrialAccountingCliInputValidation:
     """CLI validation must reject schema-invalid trial-accounting values before emission."""

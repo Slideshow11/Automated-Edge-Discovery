@@ -17,6 +17,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -657,11 +658,13 @@ def _non_negative_int_arg(value: Any, field_name: str) -> int:
 
 
 def _non_negative_float_arg(value: Any, field_name: str) -> float:
-    """Parse and validate that a float field is non-negative."""
+    """Parse and validate that a float field is non-negative and finite."""
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be a number; got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite; got {parsed}")
     if parsed < 0:
         raise ValueError(f"{field_name} must be non-negative; got {parsed}")
     return parsed
@@ -801,11 +804,32 @@ def _build_complexity(flags: _TrialAccountingFlags) -> dict | None:
             f"Allowed values: {sorted(COMPLEXITY_BUCKET_ENUM_VALUES)}"
         )
 
+    rule_count = (
+        _non_negative_int_arg(flags.complexity_rule_count, "complexity_rule_count")
+        if flags.complexity_rule_count is not None
+        else None
+    )
+    parameter_count = (
+        _non_negative_int_arg(flags.complexity_parameter_count, "complexity_parameter_count")
+        if flags.complexity_parameter_count is not None
+        else None
+    )
+    signal_count = (
+        _non_negative_int_arg(flags.complexity_signal_count, "complexity_signal_count")
+        if flags.complexity_signal_count is not None
+        else None
+    )
+    filter_count = (
+        _non_negative_int_arg(flags.complexity_filter_count, "complexity_filter_count")
+        if flags.complexity_filter_count is not None
+        else None
+    )
+
     return {
-        "rule_count": flags.complexity_rule_count,
-        "parameter_count": flags.complexity_parameter_count,
-        "signal_count": flags.complexity_signal_count,
-        "filter_count": flags.complexity_filter_count,
+        "rule_count": rule_count,
+        "parameter_count": parameter_count,
+        "signal_count": signal_count,
+        "filter_count": filter_count,
         "complexity_bucket": flags.complexity_bucket,
     }
 
