@@ -663,9 +663,22 @@ COMPLEXITY_BUCKET_ENUM_VALUES = {
 }
 
 
+def _is_bool_like_scalar(value: Any) -> bool:
+    """Return True for builtin bools and scalar bool types such as numpy.bool_."""
+    if isinstance(value, bool):
+        return True
+    dtype = getattr(value, "dtype", None)
+    if getattr(dtype, "kind", None) == "b":
+        return True
+    return type(value).__module__.startswith("numpy") and type(value).__name__ in {
+        "bool",
+        "bool_",
+    }
+
+
 def _non_negative_int_arg(value: Any, field_name: str) -> int:
     """Parse and validate that an integer field is non-negative."""
-    if isinstance(value, bool):
+    if _is_bool_like_scalar(value):
         raise ValueError(f"{field_name} must be an integer; got boolean {value!r}")
     if isinstance(value, float):
         if not math.isfinite(value) or not value.is_integer():
@@ -674,6 +687,8 @@ def _non_negative_int_arg(value: Any, field_name: str) -> int:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{field_name} must be an integer; got {value!r}") from exc
+    if not isinstance(value, str) and parsed != value:
+        raise ValueError(f"{field_name} must be an integer; got {value!r}")
     if parsed < 0:
         raise ValueError(f"{field_name} must be non-negative; got {parsed}")
     return parsed
@@ -681,7 +696,7 @@ def _non_negative_int_arg(value: Any, field_name: str) -> int:
 
 def _non_negative_float_arg(value: Any, field_name: str) -> float:
     """Parse and validate that a float field is non-negative and finite."""
-    if isinstance(value, bool):
+    if _is_bool_like_scalar(value):
         raise ValueError(f"{field_name} must be a number; got boolean {value!r}")
     try:
         parsed = float(value)

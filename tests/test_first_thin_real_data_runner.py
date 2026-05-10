@@ -4433,6 +4433,88 @@ class TestNonNegativeTrialAccountingFields:
             )
 
 
+class TestNonIntegralNumericRejection:
+    """Regression: non-integral numeric objects must not silently truncate via int()."""
+
+    def test_n_tried_decimal_half_rejected(self, valid_experiment_spec):
+        """Decimal('1.5') passed to n_tried must raise, not truncate to 1."""
+        from decimal import Decimal
+        with pytest.raises(ValueError, match="n_tried.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=Decimal("1.5"),
+            )
+
+    def test_sample_length_decimal_half_rejected(self, valid_experiment_spec):
+        """Decimal('1.5') passed to sample_length must raise, not truncate to 1."""
+        from decimal import Decimal
+        with pytest.raises(ValueError, match="sample_length.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=Decimal("1.5"),
+            )
+
+    def test_n_tried_numpy_float_half_rejected(self, valid_experiment_spec):
+        """numpy.float32(1.5) passed to n_tried must raise, not truncate to 1."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="n_tried.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=np.float32(1.5),
+            )
+
+    def test_sample_length_numpy_float_half_rejected(self, valid_experiment_spec):
+        """numpy.float32(1.5) passed to sample_length must raise, not truncate to 1."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="sample_length.*integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_length=np.float32(1.5),
+            )
+
+
+class TestBoolLikeScalarRejection:
+    """Regression: bool-like numpy scalars must not be silently coerced in float fields."""
+
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_sample_to_trial_ratio_numpy_bool_rejected(self, valid_experiment_spec, bool_val):
+        """numpy.bool_(True/False) passed to sample_to_trial_ratio must raise."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="sample_to_trial_ratio.*boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                sample_to_trial_ratio=np.bool_(bool_val),
+            )
+
+    @pytest.mark.parametrize("bool_val", [True, False])
+    def test_n_tried_numpy_bool_rejected(self, valid_experiment_spec, bool_val):
+        """numpy.bool_(True/False) passed to n_tried must raise via int-path check."""
+        np = pytest.importorskip("numpy")
+        with pytest.raises(ValueError, match="n_tried.*boolean|integer"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=np.bool_(bool_val),
+            )
+
+
 class TestTrialAccountingCliInputValidation:
     """CLI validation must reject schema-invalid trial-accounting values before emission."""
 
