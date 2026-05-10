@@ -310,10 +310,12 @@ The output must include:
 ```json
 {
   "packet_kind": "aed.executor.plan.v1",
+  "schema_version": 1,
   "candidate_id": "AED-CAND-001",
   "repo": "/home/max/Automated-Edge-Discovery",
   "base_branch": "main",
   "observed_head": "<sha>",
+  "generated_at": "<iso8601>",
   "pr_title": "<exact title>",
   "goal": "<one PR goal>",
   "allowed_files": [],
@@ -356,7 +358,10 @@ Kanban comments should carry machine-readable packet blocks using explicit senti
 [AED_STATE_JSON_BEGIN]
 {
   "packet_kind": "aed.pr_gate.state.v1",
-  "schema_version": 1
+  "schema_version": 1,
+  "repo": "/home/max/Automated-Edge-Discovery",
+  "observed_head": "<sha>",
+  "generated_at": "<iso8601>"
 }
 [AED_STATE_JSON_END]
 ```
@@ -400,6 +405,7 @@ Required top-level fields:
 - `repo`
 - `base_branch`
 - `observed_head`
+- `generated_at`
 - `pr_title`
 - `goal`
 - `allowed_files`
@@ -417,6 +423,8 @@ Required top-level fields:
 
 - `packet_kind`
 - `schema_version`
+- `repo`
+- `generated_at`
 - `pr_number`
 - `base_branch`
 - `head_branch`
@@ -439,6 +447,8 @@ Required top-level fields:
 
 - `packet_kind`
 - `schema_version`
+- `repo`
+- `generated_at`
 - `pr_number`
 - `observed_head`
 - `scope_result`
