@@ -86,6 +86,7 @@ def _compute_run_config_hash(
     observation_symbol_column: str | None = None,
     observation_close_column: str | None = None,
     observation_missing_value_columns: list[str] | None = None,
+    trial_accounting_summary: dict | None = None,
 ) -> str:
     """
     Compute a deterministic SHA-256 hex digest of the run configuration.
@@ -110,6 +111,10 @@ def _compute_run_config_hash(
     When observation_missing_value_columns is provided, it is normalized
     (sorted, stripped) and appended to the hash input so that different
     column sets produce different run_config_hash values.
+
+    When trial_accounting_summary is provided, its schema-normalized JSON is
+    appended to the hash input so trial-accounting metadata changes produce
+    distinct run_config_hash/run_id values.
 
     Whitespace variation does not affect the hash.
 
@@ -164,6 +169,15 @@ def _compute_run_config_hash(
             separators=(",", ":"),
         ).encode("utf-8")
         combined = combined + b"\nmissing_val_cols:" + normalized
+
+    # trial_accounting_summary: canonical JSON, include in hash if emitted
+    if trial_accounting_summary is not None:
+        normalized = json.dumps(
+            trial_accounting_summary,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        combined = combined + b"\ntrial_accounting_summary:" + normalized
 
     return hashlib.sha256(combined).hexdigest()
 
@@ -381,7 +395,10 @@ def _handle_data_manifest_validation_failure(
     now = _utc_now()
     spec_content_hash = _compute_content_hash(experiment_spec_path)
     run_config_hash_partial = _compute_run_config_hash(
-        experiment_spec_path, None, required_observation_columns
+        experiment_spec_path,
+        None,
+        required_observation_columns,
+        trial_accounting_summary=trial_accounting_summary,
     )
     run_id_partial = _compute_run_id(run_config_hash_partial)
 
@@ -648,6 +665,11 @@ COMPLEXITY_BUCKET_ENUM_VALUES = {
 
 def _non_negative_int_arg(value: Any, field_name: str) -> int:
     """Parse and validate that an integer field is non-negative."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be an integer; got boolean {value!r}")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{field_name} must be an integer; got {value!r}")
     try:
         parsed = int(value)
     except (TypeError, ValueError) as exc:
@@ -1191,11 +1213,14 @@ def build_runner_output(
         if has_close_return_summary_requested and _raw_source_kind not in ("local_csv", ""):
             _now = _utc_now()
             _cfg_hash = _compute_run_config_hash(
-                experiment_spec_path, data_manifest_path,
+                experiment_spec_path,
+                data_manifest_path,
                 required_observation_columns,
-                observation_date_column, observation_symbol_column,
+                observation_date_column,
+                observation_symbol_column,
                 observation_close_column,
                 observation_missing_value_columns,
+                trial_accounting_summary=trial_accounting_summary,
             )
             _close_fail_audit = {
                 "audit_name": "observation_table_close_return_summary",
@@ -1297,11 +1322,14 @@ def build_runner_output(
         if has_missing_value_summary_requested and _raw_source_kind not in ("local_csv", ""):
             _now = _utc_now()
             _cfg_hash = _compute_run_config_hash(
-                experiment_spec_path, data_manifest_path,
+                experiment_spec_path,
+                data_manifest_path,
                 required_observation_columns,
-                observation_date_column, observation_symbol_column,
+                observation_date_column,
+                observation_symbol_column,
                 observation_close_column,
                 observation_missing_value_columns,
+                trial_accounting_summary=trial_accounting_summary,
             )
             _missing_val_fail_audit = {
                 "audit_name": "observation_table_missing_value_summary",
@@ -1457,12 +1485,14 @@ def build_runner_output(
 
     # Deterministic hashes — include DataManifest content and required columns when present
     run_config_hash = _compute_run_config_hash(
-        experiment_spec_path, data_manifest_path,
+        experiment_spec_path,
+        data_manifest_path,
         required_observation_columns,
         observation_date_column,
         observation_symbol_column,
         observation_close_column,
         observation_missing_value_columns,
+        trial_accounting_summary=trial_accounting_summary,
     )
     run_id = _compute_run_id(run_config_hash)
     experiment_id = experiment_spec["experiment_id"]

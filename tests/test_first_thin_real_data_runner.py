@@ -4405,6 +4405,75 @@ class TestTrialAccountingCliInputValidation:
         assert not output_path.exists()
 
 
+class TestTrialAccountingIdentityHash:
+    """Trial-accounting metadata must participate in run identity."""
+
+    def test_trial_accounting_flags_change_run_config_hash_and_run_id(
+        self, valid_experiment_spec
+    ):
+        base_artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SSM-2026-0001",
+            trial_id="TRIAL-001",
+            n_tried=1,
+        )
+        changed_artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            search_space_id="SSM-2026-0002",
+            trial_id="TRIAL-002",
+            n_tried=2,
+        )
+
+        assert base_artifact["run_config_hash"] != changed_artifact["run_config_hash"]
+        assert base_artifact["run_id"] != changed_artifact["run_id"]
+
+    def test_no_trial_accounting_flags_preserve_existing_identity(
+        self, valid_experiment_spec
+    ):
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+        )
+        expected_hash = _compute_run_config_hash(valid_experiment_spec)
+
+        assert artifact["run_config_hash"] == f"sha256:{expected_hash}"
+        assert artifact["run_id"] == _compute_run_id(expected_hash)
+
+
+class TestTrialAccountingProgrammaticIntegerValidation:
+    """Programmatic integer inputs must not be silently truncated or coerced."""
+
+    @pytest.mark.parametrize("bad_value", [1.9, True, False])
+    def test_n_tried_rejects_fractional_float_and_bool(
+        self, valid_experiment_spec, bad_value
+    ):
+        with pytest.raises(ValueError, match="n_tried.*integer|integer.*n_tried|boolean"):
+            build_runner_output(
+                experiment_spec_path=valid_experiment_spec,
+                run_owner="test@test",
+                trial_accounting_status="proposed",
+                trial_accounting_mutation_mode="dry_run_reference_only",
+                n_tried=bad_value,
+            )
+
+    def test_n_tried_accepts_integral_float(self, valid_experiment_spec):
+        artifact = build_runner_output(
+            experiment_spec_path=valid_experiment_spec,
+            run_owner="test@test",
+            trial_accounting_status="proposed",
+            trial_accounting_mutation_mode="dry_run_reference_only",
+            n_tried=1.0,
+        )
+
+        assert artifact["trial_accounting_summary"]["n_tried"] == 1
+
+
 class TestMissingValueSummaryIntegration:
     """Integration tests for --observation-missing-value-columns feature."""
 
