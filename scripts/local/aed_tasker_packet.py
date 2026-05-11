@@ -408,10 +408,20 @@ def render_memo(packet: dict) -> str:
     if scope.get("recent_prs_reviewed"):
         lines.append(f"{indent}**Recent PRs reviewed:** {', '.join(str(p) for p in scope['recent_prs_reviewed'])}")
 
-    # Current state
+    # Current state (design doc format: summary + completed_recent_prs)
     state = packet.get("current_state", {})
     section("Current AED State")
-    for category, items in state.items():
+    if isinstance(state, dict):
+        summary = state.get("summary", "")
+        if summary:
+            lines.append(f"{indent}**Summary:** {summary}")
+        completed = state.get("completed_recent_prs", [])
+        if completed:
+            lines.append(f"{indent}**Completed recent PRs:** {', '.join(str(p) for p in completed)}")
+    # Also render the AED extended state categories if present
+    for category in ("implemented_in_code", "implemented_in_schema", "implemented_in_tests",
+                    "implemented_in_docs_only", "not_implemented"):
+        items = packet.get(category, [])
         if items:
             label = category.replace("_", " ").title()
             for item in items:
@@ -501,12 +511,19 @@ def render_memo(packet: dict) -> str:
             if reason:
                 lines.append(f"{indent}  Reason: {reason}")
 
-    # Open questions
-    oqs = packet.get("open_questions", [])
-    if oqs:
+    # Open questions (canonical fields: questions_for_tom, questions_for_chatgpt)
+    tom_qs = packet.get("questions_for_tom", [])
+    chatgpt_qs = packet.get("questions_for_chatgpt", [])
+    if tom_qs or chatgpt_qs:
         section("Open Questions")
-        for q in oqs:
-            lines.append(f"{indent}- {q}")
+        if tom_qs:
+            lines.append(f"{indent}**For Tom:**")
+            for q in tom_qs:
+                bullet(str(q))
+        if chatgpt_qs:
+            lines.append(f"{indent}**For ChatGPT:**")
+            for q in chatgpt_qs:
+                bullet(str(q))
 
     # Final recommendation
     final = packet.get("final_recommendation", "")
