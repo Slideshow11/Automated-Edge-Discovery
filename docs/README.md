@@ -28,6 +28,8 @@ AED currently uses a governance-first research workflow. The document map helps 
 - First thin real-data runner slice v1 design complete (PR #139)
 - RunnerOutputSpec v1 design, fixtures, and validator complete (PRs #140, #142, #169)
 - Tasker / Executor / PR gate packet architecture design complete (PR #188, design-only; no runtime behavior)
+- PR gate watchdog complete (PRs #189, #190, #191)
+- Tasker packet scaffold complete (PR #192, design-only; no autonomous Tasker agent)
 
 ## Document groups
 
@@ -78,6 +80,8 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/_smoke_shared.py | Shared helper logic for local smoke workflow scripts. | Helper module |
 | scripts/local/smoke_preearn_lifecycle.py | Local smoke workflow for pre-earnings lifecycle artifacts. | Local smoke only |
 | scripts/local/smoke_preearn_bridge.py | Local bridge smoke helper for pre-earnings integration. | Local smoke only |
+| scripts/local/aed_tasker_packet.py | Validates ROADMAP_PACKET.json v1 and renders AED_ROADMAP_TASKER_MEMO.md. Read-only; no LLM calls, no GitHub mutations, no Kanban ops. | Read-only |
+| scripts/local/run_pr_gate_watchdog_once.py | INI-config-aware wrapper for watch_pr_gate_state.py. Supports summary/compact/json output modes. | Read-only |
 
 If a script listed above is not present in a checkout, treat it as "not present in current checkout" rather than inferring behavior from duplicate files outside the repo.
 
