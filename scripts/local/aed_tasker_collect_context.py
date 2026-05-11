@@ -69,13 +69,16 @@ def git_log(
     repo_root: Path,
     max_commits: int = 20,
 ) -> list[dict]:
-    """Return recent commits as dicts."""
+    """Return recent commits as dicts.
+
+    Uses %x00 (null) as field delimiter to avoid JSON injection from
+    commit messages containing quotes or backslashes.
+    """
     result = subprocess.run(
         [
             "git", "log",
             f"-{max_commits}",
-            "--format={\"sha\":\"%H\",\"short_sha\":\"%h\",\"subject\":\"%s\",\"author\":\"%an\",\"date\":\"%aI\"}",
-            "--date=iso"
+            "--format=%H%x00%h%x00%s%x00%an%x00%aI",
         ],
         cwd=str(repo_root),
         capture_output=True,
@@ -83,10 +86,28 @@ def git_log(
         check=True,
     )
     commits = []
-    for line in result.stdout.strip().split("\n"):
-        line = line.strip()
-        if line:
-            commits.append(json.loads(line))
+    for raw in result.stdout.split("\n"):
+        raw = raw.strip()
+        if not raw:
+            continue
+        parts = raw.split("\x00")
+        if len(parts) >= 5:
+            commits.append({
+                "sha": parts[0],
+                "short_sha": parts[1],
+                "subject": parts[2],
+                "author": parts[3],
+                "date": parts[4],
+            })
+        elif len(parts) == 4:
+            # Fallback for compatibility: subject might have contained a null byte
+            commits.append({
+                "sha": parts[0],
+                "short_sha": parts[1],
+                "subject": parts[2],
+                "author": parts[3],
+                "date": "",
+            })
     return commits
 
 
@@ -123,7 +144,10 @@ def file_exists(path: Path) -> bool:
 
 
 def collect_doc_info(path: Path, max_lines: int = 80) -> dict:
-    """Collect info about a doc file: existence and optional snippet."""
+    """Collect info about a doc file: existence and optional snippet.
+
+    When max_lines is 0, skips reading entirely (metadata-only mode).
+    """
     result = {
         "path": str(path),
         "exists": path.is_file(),
@@ -131,12 +155,21 @@ def collect_doc_info(path: Path, max_lines: int = 80) -> dict:
         "truncated": False,
         "total_lines": None,
     }
-    if result["exists"]:
-        snippet_data = read_file_snippet(path, max_lines)
-        if snippet_data:
-            result["snippet"] = snippet_data["snippet"]
-            result["truncated"] = snippet_data["truncated"]
-            result["total_lines"] = snippet_data["total_lines"]
+    if not result["exists"]:
+        return result
+    if max_lines <= 0:
+        # Metadata-only mode: skip reading the file entirely
+        return result
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        content = "".join(lines[:max_lines])
+        result["truncated"] = len(lines) > max_lines
+        result["total_lines"] = len(lines)
+        result["snippet"] = content
+    except Exception as e:
+        result["error"] = str(e)
+        result["read"] = False
     return result
 
 
@@ -403,8 +436,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     # Validate repo-root
+    # Accept both .git/ directory (normal clone) and .git file (worktree)
     repo_root = Path(args.repo_root).resolve()
-    if not (repo_root / ".git").is_dir():
+    git_dir = repo_root / ".git"
+    is_normal_git = git_dir.is_dir()
+    is_worktree_git = git_dir.is_file() and git_dir.suffix == ""
+    # Worktree check: .git is a file containing "gitdir: /path/to/actual/.git"
+    if is_worktree_git:
+        try:
+            content = git_dir.read_text(errors="replace")
+            if content.startswith("gitdir: "):
+                is_worktree_git = True
+            else:
+                is_worktree_git = False
+        except Exception:
+            is_worktree_git = False
+    if not is_normal_git and not is_worktree_git:
         print(f"ERROR: Not a git repository: {repo_root}", file=sys.stderr)
         return 1
 

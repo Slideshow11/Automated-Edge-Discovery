@@ -29,48 +29,31 @@ def make_git_repo(tmp_path: Path) -> Path:
     """Initialize a temporary git repo with one commit."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    # Configure git for this repo
     subprocess.run(["git", "init"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "config", "user.email", "test@example.com"],
-        cwd=str(repo), capture_output=True, check=True,
-    )
-    subprocess.run(
-        ["git", "config", "user.name", "Test User"],
-        cwd=str(repo), capture_output=True, check=True,
-    )
-    # Create a file and commit
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=str(repo), capture_output=True, check=True)
+    subprocess.run(["git", "config", "user.name", "Test User"], cwd=str(repo), capture_output=True, check=True)
     (repo / "README.md").write_text("# Test\n")
     subprocess.run(["git", "add", "README.md"], cwd=str(repo), capture_output=True, check=True)
-    subprocess.run(
-        ["git", "commit", "-m", "Initial commit"],
-        cwd=str(repo), capture_output=True, check=True,
-    )
+    subprocess.run(["git", "commit", "-m", "Initial commit"], cwd=str(repo), capture_output=True, check=True)
     return repo
 
 
 def make_git_repo_with_branch(tmp_path: Path) -> Path:
-    """Initialize a temporary git repo on a named branch."""
     repo = make_git_repo(tmp_path)
     subprocess.run(["git", "checkout", "-b", "feature/test-branch"], cwd=str(repo), capture_output=True, check=True)
     return repo
 
 
 def make_git_repo_with_commits(tmp_path: Path, n: int = 5) -> Path:
-    """Create a repo with n commits on main."""
     repo = make_git_repo(tmp_path)
     for i in range(n):
         (repo / f"file_{i}.txt").write_text(f"content {i}\n")
         subprocess.run(["git", "add", "."], cwd=str(repo), capture_output=True, check=True)
-        subprocess.run(
-            ["git", "commit", "-m", f"Commit {i}"],
-            cwd=str(repo), capture_output=True, check=True,
-        )
+        subprocess.run(["git", "commit", "-m", f"Commit {i}"], cwd=str(repo), capture_output=True, check=True)
     return repo
 
 
 def make_git_repo_with_dirty(tmp_path: Path) -> Path:
-    """Create a repo with uncommitted changes."""
     repo = make_git_repo_with_commits(tmp_path)
     (repo / "dirty.txt").write_text("uncommitted\n")
     return repo
@@ -93,7 +76,7 @@ class TestCollectRepoMetadata:
         repo = make_git_repo(tmp_path)
         ctx = collect_context(repo)
         sha = ctx["repo"]["head_sha"]
-        assert len(sha) == 40  # full SHA
+        assert len(sha) == 40
 
     def test_detects_clean_status(self, tmp_path):
         repo = make_git_repo(tmp_path)
@@ -130,12 +113,25 @@ class TestCollectGitCommits:
         assert "author" in commit
         assert "date" in commit
 
+    def test_collects_commit_with_quotes_in_message(self, tmp_path):
+        """Regression: commit subject with quotes must not corrupt JSON."""
+        repo = make_git_repo(tmp_path)
+        subprocess.run(
+            ["git", "commit", "--allow-empty", "-m", 'Commit with "quotes" and \\backslash'],
+            cwd=str(repo), capture_output=True, check=True,
+        )
+        ctx = collect_context(repo, max_git_commits=5)
+        assert len(ctx["recent_commits"]) >= 1
+        for commit in ctx["recent_commits"]:
+            assert isinstance(commit["sha"], str)
+            assert commit["sha"]
+            assert isinstance(commit["subject"], str)
+
 
 class TestMissingOptionalDocs:
     def test_handles_missing_doc_gracefully(self, tmp_path):
         repo = make_git_repo(tmp_path)
         ctx = collect_context(repo)
-        # All docs should have exists field regardless
         for key, info in ctx["docs"].items():
             assert "exists" in info
             assert isinstance(info["exists"], bool)
@@ -195,15 +191,10 @@ class TestOutputFiles:
 class TestSnippetLimits:
     def test_respects_max_snippet_lines(self, tmp_path):
         repo = make_git_repo(tmp_path)
-        # Create a file with 100 lines
         big_file = repo / "docs" / "big.md"
         big_file.parent.mkdir()
         big_file.write_text("\n".join(f"line {i}" for i in range(200)))
-
         ctx = collect_context(repo, include_snippets=True, max_snippet_lines=50)
-        doc_info = ctx["docs"]["current_project_status"]
-        # The file doesn't exist, but let's check the script logic works
-        # by verifying the option is respected
         assert ctx["options"]["max_snippet_lines"] == 50
 
     def test_snippets_respected_via_options(self, tmp_path):
@@ -235,39 +226,24 @@ class TestCLI:
     def test_cli_returns_nonzero_for_invalid_repo_root(self, tmp_path):
         fake = tmp_path / "not_a_git_repo"
         fake.mkdir()
-        parser = argparse.ArgumentParser()
-        # We test main() directly
-        exit_code = main([
-            "--repo-root", str(fake),
-            "--output-json", str(tmp_path / "out.json"),
-        ])
+        exit_code = main(["--repo-root", str(fake), "--output-json", str(tmp_path / "out.json")])
         assert exit_code == 1
 
     def test_cli_rejects_hermes_output_path(self, tmp_path):
         repo = make_git_repo(tmp_path)
-        result = main([
-            "--repo-root", str(repo),
-            "--output-json", "/home/max/.hermes/context.json",
-        ])
+        result = main(["--repo-root", str(repo), "--output-json", "/home/max/.hermes/context.json"])
         assert result == 1
 
     def test_cli_rejects_hermes_md_output_path(self, tmp_path):
         repo = make_git_repo(tmp_path)
-        result = main([
-            "--repo-root", str(repo),
-            "--output-md", "/home/max/.hermes/context.md",
-        ])
+        result = main(["--repo-root", str(repo), "--output-md", "/home/max/.hermes/context.md"])
         assert result == 1
 
     def test_cli_writes_json_and_md(self, tmp_path):
         repo = make_git_repo(tmp_path)
         json_path = tmp_path / "out.json"
         md_path = tmp_path / "out.md"
-        result = main([
-            "--repo-root", str(repo),
-            "--output-json", str(json_path),
-            "--output-md", str(md_path),
-        ])
+        result = main(["--repo-root", str(repo), "--output-json", str(json_path), "--output-md", str(md_path)])
         assert result == 0
         assert json_path.exists()
         assert md_path.exists()
@@ -279,11 +255,7 @@ class TestCLI:
     def test_cli_respects_max_git_commits(self, tmp_path):
         repo = make_git_repo_with_commits(tmp_path, n=8)
         json_path = tmp_path / "out.json"
-        result = main([
-            "--repo-root", str(repo),
-            "--output-json", str(json_path),
-            "--max-git-commits", "3",
-        ])
+        result = main(["--repo-root", str(repo), "--output-json", str(json_path), "--max-git-commits", "3"])
         assert result == 0
         parsed = json.loads(json_path.read_text(encoding="utf-8"))
         assert len(parsed["recent_commits"]) == 3
@@ -335,7 +307,6 @@ class TestNoMutation:
     def test_no_git_push_or_commit(self):
         path = Path(__file__).parent.parent / "scripts" / "local" / "aed_tasker_collect_context.py"
         content = path.read_text()
-        # subprocess.run with git push or git commit would show up as string literals
         assert '"git", "push"' not in content
         assert "'git', 'push'" not in content
         assert '"git", "commit"' not in content
