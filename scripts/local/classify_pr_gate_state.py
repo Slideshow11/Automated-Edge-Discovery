@@ -134,6 +134,7 @@ def classify_codex(
     issue_comments: list[dict[str, Any]],
     reviews: list[dict[str, Any]],
     codex_bot_login: str,
+    latest_request_reactions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     bot = codex_bot_login.lower()
     latest_request: dict[str, Any] | None = None
@@ -202,6 +203,17 @@ def classify_codex(
         _at, signal, kind = sorted(signals, key=lambda item: item[0])[-1]
         latest_reviewed_head = signal.get("reviewed_head") or latest_reviewed_head
         if kind == "suggestions":
+            codex_reaction_status = None
+            codex_latest_request_acknowledged = None
+            codex_latest_request_acknowledged_at = None
+            if latest_request_reactions:
+                for reaction in latest_request_reactions:
+                    if str(reaction.get("content")) == "+1":
+                        codex_reaction_status = "acknowledged_pending"
+                        codex_latest_request_acknowledged = True
+                        codex_latest_request_acknowledged_at = reaction.get("created_at")
+                        break
+
             return {
                 "codex_status": "suggestions",
                 "classification": "codex_suggestions",
@@ -209,8 +221,23 @@ def classify_codex(
                 "clean_signal": None,
                 "suggestions": signal,
                 "request": latest_request,
+                "codex_latest_request_acknowledged": codex_latest_request_acknowledged,
+                "codex_latest_request_acknowledged_at": codex_latest_request_acknowledged_at,
+                "codex_reaction_status": codex_reaction_status,
                 "uncertainty": [],
             }
+        codex_reaction_status = None
+        codex_latest_request_acknowledged = None
+        codex_latest_request_acknowledged_at = None
+        if latest_request_reactions:
+            for reaction in latest_request_reactions:
+                reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
+                if str(reaction.get("content")) == "+1" and reaction_user == bot:
+                    codex_reaction_status = "acknowledged_pending"
+                    codex_latest_request_acknowledged = True
+                    codex_latest_request_acknowledged_at = reaction.get("created_at")
+                    break
+
         return {
             "codex_status": "clean",
             "classification": "ready_for_reviewer",
@@ -218,8 +245,23 @@ def classify_codex(
             "clean_signal": signal,
             "suggestions": None,
             "request": latest_request,
+            "codex_latest_request_acknowledged": codex_latest_request_acknowledged,
+            "codex_latest_request_acknowledged_at": codex_latest_request_acknowledged_at,
+            "codex_reaction_status": codex_reaction_status,
             "uncertainty": [],
         }
+
+    codex_reaction_status = None
+    codex_latest_request_acknowledged = None
+    codex_latest_request_acknowledged_at = None
+    if latest_request_reactions:
+        for reaction in latest_request_reactions:
+            reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
+            if str(reaction.get("content")) == "+1" and reaction_user == bot:
+                codex_reaction_status = "acknowledged_pending"
+                codex_latest_request_acknowledged = True
+                codex_latest_request_acknowledged_at = reaction.get("created_at")
+                break
 
     if latest_request is not None:
         return {
@@ -229,6 +271,9 @@ def classify_codex(
             "clean_signal": None,
             "suggestions": None,
             "request": latest_request,
+            "codex_latest_request_acknowledged": codex_latest_request_acknowledged,
+            "codex_latest_request_acknowledged_at": codex_latest_request_acknowledged_at,
+            "codex_reaction_status": codex_reaction_status,
             "uncertainty": ["A current-head @codex review request exists, but no later Codex bot response was found."],
         }
     return {
@@ -238,6 +283,9 @@ def classify_codex(
         "clean_signal": None,
         "suggestions": None,
         "request": None,
+        "codex_latest_request_acknowledged": None,
+        "codex_latest_request_acknowledged_at": None,
+        "codex_reaction_status": None,
         "uncertainty": [],
     }
 
@@ -269,6 +317,7 @@ def classify_payloads(
     expected_head: str | None,
     codex_bot_login: str,
     base_branch: str = "main",
+    latest_request_reactions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     head = pr.get("head") or {}
     base = pr.get("base") or {}
@@ -318,6 +367,7 @@ def classify_payloads(
             issue_comments=issue_comments,
             reviews=reviews,
             codex_bot_login=codex_bot_login,
+            latest_request_reactions=latest_request_reactions,
         )
         classification = codex["classification"]
         uncertainty.extend(codex.get("uncertainty") or [])
@@ -349,6 +399,9 @@ def classify_payloads(
         "codex_latest_reviewed_head": codex.get("latest_reviewed_head"),
         "codex_latest_clean_signal": codex.get("clean_signal"),
         "codex_latest_suggestions": codex.get("suggestions"),
+        "codex_latest_request_acknowledged": codex.get("codex_latest_request_acknowledged"),
+        "codex_latest_request_acknowledged_at": codex.get("codex_latest_request_acknowledged_at"),
+        "codex_reaction_status": codex.get("codex_reaction_status"),
         "classification": classification,
         "recommended_next_action": recommended_next_action(classification),
         "blockers": blockers,
@@ -495,8 +548,51 @@ class GitHubClient:
                 url = parse_next_link(response.headers.get("Link"))
         return items
 
+    def get_reactions(self, comment_id: int) -> list[dict[str, Any]]:
+        """Fetch reactions on an issue comment. Returns list of reaction objects."""
+        path = f"/issues/comments/{comment_id}/reactions"
+        if self.use_gh:
+            try:
+                result = subprocess.run(
+                    ["gh", "api", "--paginate", f"repos/{self.owner}/{self.repo}{path}"],
+                    check=True,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                text = result.stdout.strip()
+                if not text:
+                    return []
+                decoder = json.JSONDecoder()
+                idx = 0
+                items: list[dict[str, Any]] = []
+                while idx < len(text):
+                    value, end = decoder.raw_decode(text, idx)
+                    if isinstance(value, list):
+                        items.extend(value)
+                    else:
+                        raise ValueError("reactions endpoint did not return a list")
+                    idx = end
+                    while idx < len(text) and text[idx].isspace():
+                        idx += 1
+                return items
+            except (subprocess.CalledProcessError, json.JSONDecodeError, ValueError):
+                pass
 
-def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str, Any], list[str], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+        url: str | None = f"https://api.github.com/repos/{self.owner}/{self.repo}{path}"
+        items = []
+        while url:
+            request = urllib.request.Request(url, headers=self._headers())
+            with urllib.request.urlopen(request, timeout=30) as response:
+                page = json.loads(response.read().decode("utf-8"))
+                if not isinstance(page, list):
+                    raise TypeError(f"Expected list response for reactions endpoint {path!r}")
+                items.extend(page)
+                url = parse_next_link(response.headers.get("Link"))
+        return items
+
+def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str, Any], list[str], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Returns (pr, files, check_runs, issue_comments, reviews, reactions_for_latest_request)."""
     client = GitHubClient(owner, repo)
     pr = client.get(f"/pulls/{pr_number}")
     files = [item["filename"] for item in client.get_all(f"/pulls/{pr_number}/files?per_page=100")]
@@ -506,7 +602,27 @@ def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str
     reviews = client.get_all(f"/pulls/{pr_number}/reviews?per_page=100")
     if "head_pushed_at" not in pr:
         pr["head_pushed_at"] = None
-    return pr, files, check_runs, comments, reviews
+
+    # Identify the latest current-head @codex review request and fetch its reactions
+    head_pushed_at = parse_time(pr.get("head_pushed_at") or (pr.get("head", {}).get("repo") or {}).get("pushed_at"))
+    latest_request_id: int | None = None
+    latest_request_at: datetime | None = None
+    for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
+        body_l = str(comment.get("body") or "").lower()
+        if "@codex review" not in body_l:
+            continue
+        created_at = parse_time(comment.get("created_at"))
+        mentions_head = head_sha and (head_sha in str(comment.get("body") or "") or head_sha[:10] in str(comment.get("body") or ""))
+        after_head = head_pushed_at is not None and created_at is not None and created_at >= head_pushed_at
+        if mentions_head or after_head:
+            latest_request_id = int(comment["id"])
+            latest_request_at = created_at
+
+    reactions: list[dict[str, Any]] = []
+    if latest_request_id is not None:
+        reactions = client.get_reactions(latest_request_id)
+
+    return pr, files, check_runs, comments, reviews, reactions
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -525,7 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     allowed_files = flatten_allowed_files(args.allowed_file)
-    pr, files, check_runs, comments, reviews = fetch_live_payloads(args.repo_owner, args.repo_name, args.pr_number)
+    pr, files, check_runs, comments, reviews, reactions = fetch_live_payloads(args.repo_owner, args.repo_name, args.pr_number)
     packet = classify_payloads(
         pr=pr,
         changed_files=files,
@@ -536,6 +652,7 @@ def main(argv: list[str] | None = None) -> int:
         expected_head=args.expected_head,
         codex_bot_login=args.codex_bot_login,
         base_branch=args.base_branch,
+        latest_request_reactions=reactions,
     )
     print(json.dumps(packet, sort_keys=True, separators=(",", ":") if args.output_json else None, indent=None if args.output_json else 2))
     return 0

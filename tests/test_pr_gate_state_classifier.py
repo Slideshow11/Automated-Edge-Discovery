@@ -313,3 +313,143 @@ def test_parse_next_link_extracts_only_next_page_url():
     header = '<https://api.github.com/resource?page=2>; rel="next", <https://api.github.com/resource?page=5>; rel="last"'
 
     assert classifier.parse_next_link(header) == "https://api.github.com/resource?page=2"
+
+
+def test_codex_eyes_reaction_on_request_with_no_response_is_pending():
+    """Codex bot reacting with +1 (eyes) on latest request with no later response.
+    Reaction evidence is captured but classification stays codex_pending."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[_request()],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 901, "content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "codex_pending"
+    assert packet["codex_status"] == "pending"
+    assert packet["codex_latest_request_acknowledged"] is True
+    assert packet["codex_reaction_status"] == "acknowledged_pending"
+    assert packet["codex_latest_request_acknowledged_at"] == "2026-05-10T20:01:30Z"
+
+
+def test_codex_eyes_reaction_followed_by_clean_comment_is_ready():
+    """Codex eyes reaction on request, then clean issue comment arrives.
+    Clean signal controls final state; reaction evidence is still captured."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[
+            _request(),
+            _codex_comment("Codex Review: Didn't find any major issues. :+1:", created_at="2026-05-10T20:02:00Z"),
+        ],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 901, "content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "ready_for_reviewer"
+    assert packet["codex_status"] == "clean"
+    assert packet["codex_latest_request_acknowledged"] is True
+    assert packet["codex_reaction_status"] == "acknowledged_pending"
+    assert packet["codex_latest_clean_signal"]["source"] == "issue_comment"
+
+
+def test_codex_eyes_reaction_followed_by_suggestions_comment():
+    """Codex eyes reaction on request, then suggestions issue comment arrives.
+    Final state is codex_suggestions; reaction evidence is captured."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[
+            _request(),
+            _codex_comment("### 💡 Codex Review\n\nHere are some automated review suggestions.", created_at="2026-05-10T20:02:00Z"),
+        ],
+        reviews=[],
+
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 901, "content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "codex_suggestions"
+    assert packet["codex_status"] == "suggestions"
+    assert packet["codex_latest_request_acknowledged"] is True
+    assert packet["codex_reaction_status"] == "acknowledged_pending"
+
+
+def test_no_reaction_means_reaction_fields_none():
+    """When there are no reactions on the latest request, all reaction fields are None."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[_request()],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[],
+    )
+
+    assert packet["classification"] == "codex_pending"
+    assert packet["codex_latest_request_acknowledged"] is None
+    assert packet["codex_reaction_status"] is None
+    assert packet["codex_latest_request_acknowledged_at"] is None
+
+
+def test_non_codex_user_reaction_does_not_set_acknowledged():
+    """A reaction from a non-Codex user should not set acknowledged status."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[_request()],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 902, "content": "+1", "user": {"login": "Slideshow11"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "codex_pending"
+    assert packet["codex_latest_request_acknowledged"] is None
+    assert packet["codex_reaction_status"] is None
+
+
+def test_reaction_status_null_when_no_request_exists():
+    """When there is no @codex review request, reaction fields are None even if reactions provided."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 901, "content": "+1", "user": {"login": "chatgpt-codex-connector[bot]"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "codex_request_needed"
+    assert packet["codex_latest_request_acknowledged"] is None
+    assert packet["codex_reaction_status"] is None
