@@ -204,8 +204,18 @@ def collect_context(
     """Collect all structured context from the repo."""
 
     # Ensure repo_root is a valid git directory
+    # Accept both .git/ directory (normal clone) and .git file (worktree)
     git_dir = repo_root / ".git"
-    if not git_dir.is_dir():
+    is_normal_git = git_dir.is_dir()
+    is_worktree_git = False
+    if not is_normal_git and git_dir.is_file():
+        try:
+            content = git_dir.read_text(errors="replace")
+            if content.startswith("gitdir: "):
+                is_worktree_git = True
+        except Exception:
+            pass
+    if not is_normal_git and not is_worktree_git:
         raise ValueError(f"Not a git repository: {repo_root}")
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S+00:00")
