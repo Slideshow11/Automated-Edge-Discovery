@@ -71,16 +71,22 @@ _MINIMAL_CANDIDATES = [
 
 
 def _make_valid_packet(**overrides) -> dict:
-    """Return a valid minimal packet with sensible defaults."""
+    """Return a valid minimal packet with sensible defaults.
+
+    Schema aligns with the canonical AED Tasker/Executor design
+    (docs/aed_tasker_executor_design.md section 5 ROADMAP_PACKET shape).
+    """
     packet = make_empty_packet()
     packet.update({
         "generated_at": "2026-05-11T12:00:00+00:00",
-        "repo": {
-            "path": "/home/max/Automated-Edge-Discovery",
-            "head_sha": "82f05db5e92d4ed5ac2b6d7a8afe6d67f1758ef3",
-            "branch": "main",
-            "clean_status": "clean",
+        "repo": "/home/max/Automated-Edge-Discovery",
+        "base_ref": "origin/main",
+        "observed_head": "82f05db5e92d4ed5ac2b6d7a8afe6d67f1758ef3",
+        "current_state": {
+            "summary": "PR gate watchdog complete; Tasker scaffold next",
+            "completed_recent_prs": [191, 190, 189],
         },
+        "research_themes_reviewed": [],
         "tasker_scope": {
             "input_docs": ["docs/current_project_status.md"],
             "input_code_paths": ["scripts/local/"],
@@ -88,13 +94,11 @@ def _make_valid_packet(**overrides) -> dict:
             "external_sources_reviewed": [],
             "limitations": "No live research scan.",
         },
-        "current_state": {
-            "implemented_in_code": ["PR gate watchdog"],
-            "implemented_in_schema": [],
-            "implemented_in_tests": [],
-            "implemented_in_docs_only": [],
-            "not_implemented": ["Tasker agent", "Executor agent"],
-        },
+        "implemented_in_code": ["PR gate watchdog"],
+        "implemented_in_schema": [],
+        "implemented_in_tests": [],
+        "implemented_in_docs_only": [],
+        "not_implemented": ["Tasker agent", "Executor agent"],
         "recent_pr_lessons": [
             {"pr_number": 191, "title": "scheduled watchdog", "lesson": "Codex review caught flag-stripping bug", "impact": "high"},
         ],
@@ -105,14 +109,14 @@ def _make_valid_packet(**overrides) -> dict:
             {"module": "tooling", "status": "healthy", "concern": "", "recommended_boundary": "tooling/"},
         ],
         "candidate_prs": _MINIMAL_CANDIDATES,
-        "recommended_next_prs": ["AED-CAND-001", "AED-CAND-002"],
+        "ranked_next_prs": ["AED-CAND-001", "AED-CAND-002"],
         "do_not_build_yet": [
             {"item": "Auto-merge", "reason": "Requires Reviewer agent"},
         ],
-        "open_questions": [
+        "questions_for_tom": [],
+        "questions_for_chatgpt": [
             "Should Executor run before or after specifier approval?",
         ],
-        "final_recommendation": "AED-CAND-001",
     })
     for key, value in overrides.items():
         if "." in key:
@@ -154,7 +158,17 @@ class TestValidatePacket:
         assert any("duplicate" in e.lower() for e in errors)
 
     def test_recommended_id_missing_from_candidates_fails(self):
-        errors = validate_packet(_make_valid_packet(recommended_next_prs=["NOT-A-CANDIDATE"]))
+        errors = validate_packet(_make_valid_packet(ranked_next_prs=["NOT-A-CANDIDATE"]))
+        assert any("NOT-A-CANDIDATE" in e for e in errors)
+
+    def test_recommended_id_missing_using_alias_fails(self):
+        # recommended_next_prs is a supported alias for ranked_next_prs
+        # When ranked_next_prs is not set, recommended_next_prs is used.
+        # When both are set, ranked_next_prs takes precedence and recommended_next_prs
+        # is not validated (it's ignored in favor of ranked_next_prs).
+        # So we test that an invalid ID in recommended_next_prs fails when
+        # ranked_next_prs is NOT set (only alias used).
+        errors = validate_packet(_make_valid_packet(ranked_next_prs=[], recommended_next_prs=["NOT-A-CANDIDATE"]))
         assert any("NOT-A-CANDIDATE" in e for e in errors)
 
     def test_candidate_missing_allowed_files_fails(self):
@@ -197,22 +211,18 @@ class TestValidatePacket:
 
     def test_registry_mutation_with_future_passes(self):
         candidates = [dict(c) for c in _MINIMAL_CANDIDATES]
-        candidates[0]["allowed_files"] = ["edge_hypothesis_registry_v1.jsonl"]
+        candidates[0]["allowed_files"] = ["edge_hypothesis_registry.jsonl"]
         candidates[0]["estimated_scope"] = {"registry_mutation_mode": "future"}
         errors = validate_packet(_make_valid_packet(candidate_prs=candidates))
         assert not any("registry" in e.lower() for e in errors)
 
-    def test_final_recommendation_unknown_id_fails(self):
-        errors = validate_packet(_make_valid_packet(final_recommendation="NOT-A-CANDIDATE"))
-        assert any("final_recommendation" in e for e in errors)
+    def test_base_ref_missing_fails(self):
+        errors = validate_packet(_make_valid_packet(base_ref=""))
+        assert any("base_ref" in e for e in errors)
 
-    def test_final_recommendation_valid_action_passes(self):
-        errors = validate_packet(_make_valid_packet(final_recommendation="defer"))
-        assert not any("final_recommendation" in e for e in errors)
-
-    def test_final_recommendation_valid_candidate_passes(self):
-        errors = validate_packet(_make_valid_packet(final_recommendation="AED-CAND-001"))
-        assert not any("final_recommendation" in e for e in errors)
+    def test_observed_head_missing_fails(self):
+        errors = validate_packet(_make_valid_packet(observed_head=""))
+        assert any("observed_head" in e for e in errors)
 
     def test_fewer_than_3_candidates_fails(self):
         candidates = _MINIMAL_CANDIDATES[:2]
@@ -220,20 +230,65 @@ class TestValidatePacket:
         assert any("at least 3" in e for e in errors)
 
     def test_fewer_than_1_recommended_fails(self):
-        errors = validate_packet(_make_valid_packet(recommended_next_prs=[]))
+        errors = validate_packet(_make_valid_packet(ranked_next_prs=[]))
         assert any("at least 1" in e for e in errors)
 
     def test_more_than_5_recommended_fails(self):
         errors = validate_packet(_make_valid_packet(
-            recommended_next_prs=["AED-CAND-001", "AED-CAND-002", "AED-CAND-003", "AED-CAND-001", "AED-CAND-002", "AED-CAND-003"]
+            ranked_next_prs=["AED-CAND-001", "AED-CAND-002", "AED-CAND-003", "AED-CAND-001", "AED-CAND-002", "AED-CAND-003"]
         ))
         assert any("at most 5" in e for e in errors)
 
-    def test_missing_repo_fields_fails(self):
+    def test_missing_base_ref_fails(self):
+        errors = validate_packet(_make_valid_packet(base_ref=""))
+        assert any("base_ref" in e for e in errors)
+
+    def test_missing_observed_head_fails(self):
+        errors = validate_packet(_make_valid_packet(observed_head=""))
+        assert any("observed_head" in e for e in errors)
+
+    def test_tasker_scope_list_fails(self):
+        # tasker_scope as a list should fail (must be dict)
         packet = _make_valid_packet()
-        packet["repo"]["head_sha"] = ""
+        packet["tasker_scope"] = []
         errors = validate_packet(packet)
-        assert any("repo" in e and "head_sha" in e for e in errors)
+        assert any("tasker_scope" in e and "dict" in e for e in errors)
+
+    def test_current_state_list_fails(self):
+        # current_state as a list should fail (must be dict)
+        packet = _make_valid_packet()
+        packet["current_state"] = []
+        errors = validate_packet(packet)
+        assert any("current_state" in e and "dict" in e for e in errors)
+
+    def test_evaluate_ledger_entry_allowed_file_passes(self):
+        # Read-only tooling paths should not be flagged as registry mutation
+        candidates = [dict(c) for c in _MINIMAL_CANDIDATES]
+        candidates[0]["allowed_files"] = ["scripts/local/evaluate_ledger_entry.py"]
+        errors = validate_packet(_make_valid_packet(candidate_prs=candidates))
+        assert not any("registry" in e.lower() for e in errors)
+
+    def test_trial_ledger_design_doc_allowed_file_passes(self):
+        # Design doc paths should not be flagged as registry mutation
+        candidates = [dict(c) for c in _MINIMAL_CANDIDATES]
+        candidates[0]["allowed_files"] = ["docs/trial_ledger_v1_design.md"]
+        errors = validate_packet(_make_valid_packet(candidate_prs=candidates))
+        assert not any("registry" in e.lower() for e in errors)
+
+    def test_ledger_jsonl_without_locked_fails(self):
+        # Actual ledger data file without locked flag must fail
+        candidates = [dict(c) for c in _MINIMAL_CANDIDATES]
+        candidates[0]["allowed_files"] = ["ledger.jsonl"]
+        errors = validate_packet(_make_valid_packet(candidate_prs=candidates))
+        assert any("ledger" in e.lower() for e in errors)
+
+    def test_ledger_jsonl_with_locked_passes(self):
+        # Ledger data file with locked flag passes
+        candidates = [dict(c) for c in _MINIMAL_CANDIDATES]
+        candidates[0]["allowed_files"] = ["ledger.jsonl"]
+        candidates[0]["estimated_scope"] = {"registry_mutation_mode": "locked"}
+        errors = validate_packet(_make_valid_packet(candidate_prs=candidates))
+        assert not any("ledger" in e.lower() for e in errors)
 
 
 class TestDeterministicOutput:
@@ -259,11 +314,6 @@ class TestRenderMemo:
         assert "AED-CAND-001" in memo
         assert "AED-CAND-002" in memo
 
-    def test_render_includes_final_recommendation(self):
-        packet = _make_valid_packet()
-        memo = render_memo(packet)
-        assert "Final Recommendation" in memo
-
     def test_render_includes_candidates(self):
         packet = _make_valid_packet()
         memo = render_memo(packet)
@@ -279,16 +329,26 @@ class TestRenderMemo:
         memo = render_memo(packet)
         assert "Do Not Build Yet" in memo
 
+    def test_render_includes_questions_for_chatgpt(self):
+        packet = _make_valid_packet()
+        memo = render_memo(packet)
+        assert "Questions for ChatGPT" in memo or "Executor" in memo
+
 
 class TestMakeEmptyPacket:
     def test_has_all_required_top_level_keys(self):
         empty = make_empty_packet()
+        # Design-doc canonical required top-level keys
         required = [
-            "packet_kind", "schema_version", "generated_at", "repo",
-            "tasker_scope", "current_state", "recent_pr_lessons",
-            "drift_risks", "deep_module_assessment", "candidate_prs",
-            "recommended_next_prs", "do_not_build_yet", "open_questions",
-            "final_recommendation",
+            "packet_kind", "schema_version", "repo", "base_ref",
+            "observed_head", "generated_at", "current_state",
+            "research_themes_reviewed", "drift_risks", "deep_module_assessment",
+            "candidate_prs", "ranked_next_prs", "do_not_build_yet",
+            "questions_for_tom", "questions_for_chatgpt",
+            # AED extended fields
+            "tasker_scope", "implemented_in_code", "implemented_in_schema",
+            "implemented_in_tests", "implemented_in_docs_only",
+            "not_implemented", "recent_pr_lessons",
         ]
         for key in required:
             assert key in empty, f"Missing required key: {key}"

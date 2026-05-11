@@ -52,17 +52,32 @@ class ValidationError(Exception):
 # ── Schema definitions ─────────────────────────────────────────────────────────
 
 def make_empty_packet() -> dict:
-    """Return an empty v1 packet skeleton with all required top-level keys."""
+    """Return an empty v1 packet skeleton with all required top-level keys.
+
+    Schema aligns with the canonical AED Tasker/Executor design
+    (docs/aed_tasker_executor_design.md section 5 ROADMAP_PACKET shape).
+    """
     return {
         "packet_kind": PACKET_KIND,
         "schema_version": SCHEMA_VERSION,
+        "repo": "/home/max/Automated-Edge-Discovery",  # path string (design doc compatible)
+        "base_ref": "origin/main",
+        "observed_head": "",
         "generated_at": "",
-        "repo": {
-            "path": "",
-            "head_sha": "",
-            "branch": "",
-            "clean_status": "",
+        "current_state": {
+            "summary": "",
+            "completed_recent_prs": [],
         },
+        "research_themes_reviewed": [],
+        "drift_risks": [],
+        "deep_module_assessment": [],
+        "candidate_prs": [],
+        "ranked_next_prs": [],   # design doc field name
+        "do_not_build_yet": [],
+        "questions_for_tom": [],
+        "questions_for_chatgpt": [],
+        # Extended fields for AED tooling layer (not in design doc but
+        # necessary for the implementation scaffold):
         "tasker_scope": {
             "input_docs": [],
             "input_code_paths": [],
@@ -70,21 +85,12 @@ def make_empty_packet() -> dict:
             "external_sources_reviewed": [],
             "limitations": "",
         },
-        "current_state": {
-            "implemented_in_code": [],
-            "implemented_in_schema": [],
-            "implemented_in_tests": [],
-            "implemented_in_docs_only": [],
-            "not_implemented": [],
-        },
+        "implemented_in_code": [],
+        "implemented_in_schema": [],
+        "implemented_in_tests": [],
+        "implemented_in_docs_only": [],
+        "not_implemented": [],
         "recent_pr_lessons": [],
-        "drift_risks": [],
-        "deep_module_assessment": [],
-        "candidate_prs": [],
-        "recommended_next_prs": [],
-        "do_not_build_yet": [],
-        "open_questions": [],
-        "final_recommendation": "",
     }
 
 
@@ -141,6 +147,21 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
             f"schema_version must be {SCHEMA_VERSION}, got {packet.get('schema_version')!r}"
         )
 
+    # --- repo (string path — design doc compatible) ---
+    repo = packet.get("repo", "")
+    if not isinstance(repo, str) or not repo:
+        errors.append("repo must be a non-empty string path")
+
+    # --- base_ref ---
+    base_ref = packet.get("base_ref", "")
+    if not isinstance(base_ref, str) or not base_ref:
+        errors.append("base_ref is required")
+
+    # --- observed_head ---
+    observed_head = packet.get("observed_head", "")
+    if not isinstance(observed_head, str) or not observed_head:
+        errors.append("observed_head is required")
+
     # --- generated_at ---
     gen_at = packet.get("generated_at", "")
     if not gen_at:
@@ -151,15 +172,6 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
         except ValueError:
             errors.append(f"generated_at must be ISO-8601, got {gen_at!r}")
 
-    # --- repo ---
-    repo = packet.get("repo", {})
-    if not isinstance(repo, dict):
-        errors.append("repo must be a dict")
-    else:
-        for field in ("path", "head_sha", "branch", "clean_status"):
-            if not repo.get(field):
-                errors.append(f"repo.{field} is required")
-
     # --- candidate_prs ---
     candidates = packet.get("candidate_prs", [])
     if not isinstance(candidates, list):
@@ -167,14 +179,19 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
     elif len(candidates) < MIN_CANDIDATES:
         errors.append(f"candidate_prs must have at least {MIN_CANDIDATES} items, got {len(candidates)}")
 
-    # --- recommended_next_prs ---
-    recommended = packet.get("recommended_next_prs", [])
+    # --- ranked_next_prs (canonical name from design doc) ---
+    # supported alias: recommended_next_prs (AED internal variant)
+    ranked = packet.get("ranked_next_prs", [])
+    alias = packet.get("recommended_next_prs", [])
+    # Use ranked_next_prs if set, otherwise fall back to alias
+    recommended = ranked if ranked else alias
+
     if not isinstance(recommended, list):
-        errors.append("recommended_next_prs must be a list")
+        errors.append("ranked_next_prs must be a list")
     elif len(recommended) < MIN_RECOMMENDED:
-        errors.append(f"recommended_next_prs must have at least {MIN_RECOMMENDED} item(s), got {len(recommended)}")
+        errors.append(f"ranked_next_prs must have at least {MIN_RECOMMENDED} item(s), got {len(recommended)}")
     elif len(recommended) > MAX_RECOMMENDED:
-        errors.append(f"recommended_next_prs must have at most {MAX_RECOMMENDED} items, got {len(recommended)}")
+        errors.append(f"ranked_next_prs must have at most {MAX_RECOMMENDED} items, got {len(recommended)}")
 
     # Candidate ID uniqueness
     seen_ids: set[str] = set()
@@ -215,21 +232,26 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
                             f"candidate_prs[{i}].allowed_files contains forbidden directory: {path!r}"
                         )
 
-        # Registry/ledger mutation check
+        # Registry/ledger DATA FILE mutation check.
+        # Only flag writes to actual data files (ledger.jsonl, registry JSONL/CSV).
+        # Paths to read-only tooling (evaluate_ledger_entry.py), design docs
+        # (trial_ledger_v1_design.md), and schema files are not mutations.
         scope = cand.get("estimated_scope", {})
         mutation_mode = scope.get("registry_mutation_mode", "none") if isinstance(scope, dict) else "none"
         is_locked = mutation_mode in LOCKED_MUTATION_KINDS
 
-        # Check for registry/ledger file mutations in allowed_files
         for path in allowed:
-            normalized = path.lower()
-            is_registry = "registry" in normalized
-            is_ledger = "ledger" in normalized
-            is_registry_file = is_registry or "registry" in Path(path).name.lower()
-            is_ledger_file = is_ledger or "ledger" in Path(path).name.lower()
-            if (is_registry_file or is_ledger_file) and not is_locked:
+            basename = Path(path).name.lower()
+            # Only actual data files count as registry/ledger mutations:
+            # - ledger.jsonl (the append-only ledger data file)
+            # - edge_hypothesis_registry.jsonl / .csv (the registry data file)
+            is_data_file = (
+                basename in ("ledger.jsonl", "ledger.jsonl.bak", "ledger.jsonl.tmp") or
+                "edge_hypothesis_registry" in basename and basename.endswith((".jsonl", ".csv"))
+            )
+            if is_data_file and not is_locked:
                 errors.append(
-                    f"candidate_prs[{i}] allows registry/ledger file mutation "
+                    f"candidate_prs[{i}] allows registry/ledger DATA FILE mutation "
                     f"without locked/future flag: {path!r} (registry_mutation_mode={mutation_mode})"
                 )
 
@@ -240,17 +262,14 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
                 f"recommended_next_prs[{i}]={rec_id!r} not found in candidate_prs"
             )
 
-    # --- final_recommendation ---
-    final_rec = packet.get("final_recommendation", "")
-    if not final_rec:
-        errors.append("final_recommendation is required")
-    else:
-        valid_actions = VALID_RECOMMENDATION_ACTIONS | candidate_ids
-        if final_rec not in valid_actions:
-            errors.append(
-                f"final_recommendation={final_rec!r} must be a valid candidate_id "
-                f"or one of {sorted(valid_actions)}"
-            )
+    # --- questions_for_tom and questions_for_chatgpt (design doc fields) ---
+    for field in ("questions_for_tom", "questions_for_chatgpt"):
+        val = packet.get(field, [])
+        if val is not None and not isinstance(val, list):
+            errors.append(f"{field} must be a list")
+
+    # --- ranked_next_prs referencing candidate_ids ---
+    # (used from alias above — already in `recommended` variable)
 
     # --- recent_pr_lessons (optional but if present must be well-formed) ---
     lessons = packet.get("recent_pr_lessons", [])
@@ -273,6 +292,22 @@ def validate_packet(packet: dict, *, strict: bool = True) -> list[str]:
             for field in ("risk", "severity"):
                 if field not in risk:
                     errors.append(f"drift_risks[{i}] missing {field}")
+
+    # --- tasker_scope ---
+    scope = packet.get("tasker_scope", {})
+    if not isinstance(scope, dict):
+        errors.append("tasker_scope must be a dict")
+    elif scope:
+        # Enforce sub-field types when scope is non-empty
+        for list_field in ("input_docs", "input_code_paths", "recent_prs_reviewed", "external_sources_reviewed"):
+            val = scope.get(list_field)
+            if val is not None and not isinstance(val, list):
+                errors.append(f"tasker_scope.{list_field} must be a list if present")
+
+    # --- current_state ---
+    state = packet.get("current_state", {})
+    if not isinstance(state, dict):
+        errors.append("current_state must be a dict")
 
     # --- deep_module_assessment ---
     dmas = packet.get("deep_module_assessment", [])
@@ -350,15 +385,16 @@ def render_memo(packet: dict) -> str:
     lines.append("# AED Tasker Roadmap Memo")
     lines.append("")
     lines.append(f"> Generated: {packet.get('generated_at', 'unknown')} | "
-                 f"Repo: {packet.get('repo', {}).get('path', 'unknown')} | "
-                 f"Head: {packet.get('repo', {}).get('head_sha', 'unknown')[:8]}")
+                 f"Repo: {packet.get('repo', 'unknown')} | "
+                 f"Head: {packet.get('observed_head', 'unknown')[:8]}")
 
     # Repo status
-    repo = packet.get("repo", {})
+    repo = packet.get("repo", "")
+    base_ref = packet.get("base_ref", "")
+    observed_head = packet.get("observed_head", "")
     section("Repository Status")
-    field("Branch", repo.get("branch", "unknown"))
-    field("Head SHA", repo.get("head_sha", "unknown")[:8])
-    field("Clean status", repo.get("clean_status", "unknown"))
+    field("Base ref", base_ref)
+    field("Observed head", observed_head[:8] if observed_head else "unknown")
 
     # Tasker scope
     scope = packet.get("tasker_scope", {})
@@ -444,8 +480,10 @@ def render_memo(packet: dict) -> str:
             if deps:
                 lines.append(f"{indent}  Depends on: {', '.join(deps)}")
 
-    # Recommended next PRs
-    recommended = packet.get("recommended_next_prs", [])
+    # Recommended next PRs (ranked_next_prs is canonical; supported alias recommended_next_prs)
+    ranked = packet.get("ranked_next_prs", [])
+    alias = packet.get("recommended_next_prs", [])
+    recommended = ranked if ranked else alias
     if recommended:
         section("Recommended Next PRs (Ranked)")
         for rank, rec_id in enumerate(recommended, 1):
