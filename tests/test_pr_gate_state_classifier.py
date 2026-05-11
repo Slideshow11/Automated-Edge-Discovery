@@ -511,6 +511,36 @@ def test_merged_pr_short_circuits_to_terminal_state():
     assert any("already merged" in b for b in packet["blockers"])
 
 
+def test_merged_pr_does_not_report_missing_ci_blocker():
+    packet = classifier.classify_payloads(
+        pr=_pr(state="closed", merged=True),
+        changed_files=list(ALLOWED),
+        check_runs=[],
+        issue_comments=[_request()],
+        reviews=[_codex_clean()],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+    )
+
+    assert packet["classification"] == "blocked_pr_merged"
+    assert packet["ci_status"] == "not_applicable"
+    assert packet["blockers"] == ["PR is already merged."]
+
+
+def test_codex_no_findings_comment_is_clean_not_suggestions():
+    packet = _packet(
+        comments=[
+            _request(),
+            _codex_comment("Codex Review: No findings for current head."),
+        ]
+    )
+
+    assert packet["classification"] == "ready_for_reviewer"
+    assert packet["codex_status"] == "clean"
+    assert packet["codex_latest_suggestions"] is None
+
+
 def test_codex_eyes_reaction_also_triggers_acknowledged():
     """Codex eyes reaction (content=='eyes') on request must set acknowledged fields,
     same as +1 reaction. Both are valid Codex acknowledgements."""

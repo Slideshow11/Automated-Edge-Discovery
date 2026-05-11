@@ -43,14 +43,13 @@ CLEAN_PATTERNS = (
     "didn't find any blocking issues",
     "did not find any blocking issues",
     "no major issues",
+    "no findings",
+    "no actionable issues",
 )
 SUGGESTION_PATTERNS = (
     "automated review suggestions",
     "review suggestions",
     "codex review\n\nhere are",
-    "major issues",
-    "finding",
-    "suggestion",
 )
 
 
@@ -331,9 +330,7 @@ def classify_payloads(
     head_matches_expected = None if expected_head is None else head_sha == expected_head
     blockers: list[str] = []
     uncertainty: list[str] = []
-
-    ci_status, ci_blockers = classify_ci(check_runs)
-    blockers.extend(ci_blockers)
+    ci_status = "not_applicable"
 
     classification = "unknown"
     codex = {
@@ -351,31 +348,40 @@ def classify_payloads(
         classification = "blocked_pr_merged"
         blockers.append("PR is already merged.")
     elif base_ref != base_branch:
+        ci_status, ci_blockers = classify_ci(check_runs)
+        blockers.extend(ci_blockers)
         classification = "blocked_wrong_base"
         blockers.append(f"PR base branch is {base_ref!r}, expected {base_branch!r}.")
     elif head_matches_expected is False:
+        ci_status, ci_blockers = classify_ci(check_runs)
+        blockers.extend(ci_blockers)
         classification = "unknown"
         blockers.append(f"PR head SHA is {head_sha!r}, expected {expected_head!r}.")
     elif unexpected_files:
+        ci_status, ci_blockers = classify_ci(check_runs)
+        blockers.extend(ci_blockers)
         classification = "blocked_scope"
         blockers.append("Changed files include paths outside the allowed file list.")
-    elif ci_status == "pending":
-        classification = "ci_pending"
-    elif ci_status == "failed":
-        classification = "ci_failed"
     else:
-        head_repo = head.get("repo") or {}
-        head_pushed_at = parse_time(pr.get("head_pushed_at") or head_repo.get("pushed_at"))
-        codex = classify_codex(
-            head_sha=head_sha,
-            head_pushed_at=head_pushed_at,
-            issue_comments=issue_comments,
-            reviews=reviews,
-            codex_bot_login=codex_bot_login,
-            latest_request_reactions=latest_request_reactions,
-        )
-        classification = codex["classification"]
-        uncertainty.extend(codex.get("uncertainty") or [])
+        ci_status, ci_blockers = classify_ci(check_runs)
+        blockers.extend(ci_blockers)
+        if ci_status == "pending":
+            classification = "ci_pending"
+        elif ci_status == "failed":
+            classification = "ci_failed"
+        else:
+            head_repo = head.get("repo") or {}
+            head_pushed_at = parse_time(pr.get("head_pushed_at") or head_repo.get("pushed_at"))
+            codex = classify_codex(
+                head_sha=head_sha,
+                head_pushed_at=head_pushed_at,
+                issue_comments=issue_comments,
+                reviews=reviews,
+                codex_bot_login=codex_bot_login,
+                latest_request_reactions=latest_request_reactions,
+            )
+            classification = codex["classification"]
+            uncertainty.extend(codex.get("uncertainty") or [])
 
     if classification not in CLASSIFICATIONS:
         uncertainty.append(f"Internal classifier returned unknown state: {classification}")
