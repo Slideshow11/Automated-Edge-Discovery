@@ -611,11 +611,15 @@ def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str
     check_runs = client.get_check_runs_all(str(head_sha))
     comments = client.get_all(f"/issues/{pr_number}/comments?per_page=100")
     reviews = client.get_all(f"/pulls/{pr_number}/reviews?per_page=100")
-    if "head_pushed_at" not in pr:
-        pr["head_pushed_at"] = None
+    if "head_pushed_at" not in pr or pr.get("head_pushed_at") is None:
+        commit = client.get(f"/commits/{head_sha}")
+        pr["head_pushed_at"] = (
+            ((commit.get("commit") or {}).get("committer") or {}).get("date")
+            or ((commit.get("commit") or {}).get("author") or {}).get("date")
+        )
 
     # Identify the latest current-head @codex review request and fetch its reactions
-    head_pushed_at = parse_time(pr.get("head_pushed_at") or (pr.get("head", {}).get("repo") or {}).get("pushed_at"))
+    head_pushed_at = parse_time(pr.get("head_pushed_at"))
     latest_request_id: int | None = None
     latest_request_at: datetime | None = None
     for comment in sorted(comments, key=lambda c: str(c.get("created_at") or "")):
@@ -623,7 +627,7 @@ def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str
         if "@codex review" not in body_l:
             continue
         created_at = parse_time(comment.get("created_at"))
-        mentions_head = head_sha and (head_sha in str(comment.get("body") or "") or head_sha[:10] in str(comment.get("body") or ""))
+        mentions_head = bool(head_sha and _contains_current_head(str(comment.get("body") or ""), str(head_sha)))
         after_head = head_pushed_at is not None and created_at is not None and created_at >= head_pushed_at
         if mentions_head or after_head:
             latest_request_id = int(comment["id"])

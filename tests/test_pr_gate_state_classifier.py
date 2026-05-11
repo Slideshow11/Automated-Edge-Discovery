@@ -497,6 +497,53 @@ def test_reaction_status_null_when_no_request_exists():
     assert packet["codex_reaction_status"] is None
 
 
+def test_fetch_live_payloads_derives_head_pushed_at_from_commit(monkeypatch):
+    class FakeGitHubClient:
+        def __init__(self, owner, repo):
+            self.owner = owner
+            self.repo = repo
+
+        def get(self, path):
+            if path == "/pulls/189":
+                return {
+                    "number": 189,
+                    "head": {"sha": CURRENT_HEAD},
+                    "base": {"ref": "main"},
+                    "state": "open",
+                    "merged": False,
+                }
+            if path == f"/commits/{CURRENT_HEAD}":
+                return {"commit": {"committer": {"date": "2026-05-10T20:00:00Z"}}}
+            raise AssertionError(path)
+
+        def get_all(self, path):
+            if path == "/pulls/189/files?per_page=100":
+                return [{"filename": "scripts/local/classify_pr_gate_state.py"}]
+            if path == "/issues/189/comments?per_page=100":
+                return [{"id": 44, "user": {"login": "Slideshow11"}, "created_at": "2026-05-10T20:01:00Z", "body": "@codex review"}]
+            if path == "/pulls/189/reviews?per_page=100":
+                return []
+            raise AssertionError(path)
+
+        def get_check_runs_all(self, head_sha):
+            return []
+
+        def get_reactions(self, comment_id):
+            assert comment_id == 44
+            return [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
+
+    monkeypatch.setattr(classifier, "GitHubClient", FakeGitHubClient)
+
+    pr, files, checks, comments, reviews, reactions = classifier.fetch_live_payloads("owner", "repo", 189)
+
+    assert pr["head_pushed_at"] == "2026-05-10T20:00:00Z"
+    assert files == ["scripts/local/classify_pr_gate_state.py"]
+    assert checks == []
+    assert comments[0]["id"] == 44
+    assert reviews == []
+    assert reactions == [{"content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}}]
+
+
 def test_non_codex_user_reaction_on_suggestions_request_does_not_acknowledge():
     """Human user's +1 on the request comment must not set acknowledged fields
     when Codex has already posted suggestions. The clean/suggestions branches
