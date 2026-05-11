@@ -371,8 +371,7 @@ def classify_payloads(
         elif ci_status == "failed":
             classification = "ci_failed"
         else:
-            head_repo = head.get("repo") or {}
-            head_pushed_at = parse_time(pr.get("head_pushed_at") or head_repo.get("pushed_at"))
+            head_pushed_at = parse_time(pr.get("head_pushed_at"))
             codex = classify_codex(
                 head_sha=head_sha,
                 head_pushed_at=head_pushed_at,

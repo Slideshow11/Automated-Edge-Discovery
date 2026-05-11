@@ -334,6 +334,23 @@ def test_codex_request_without_head_sha_is_not_current_when_push_time_unknown():
     assert packet["classification"] == "codex_request_needed"
 
 
+def test_repo_pushed_at_fallback_does_not_make_sha_less_request_current():
+    packet = _packet(
+        pr=_pr(
+            head={
+                "ref": "tooling/pr-gate-state-classifier",
+                "sha": CURRENT_HEAD,
+                "repo": {"pushed_at": "2026-05-10T20:00:00Z"},
+            },
+            head_pushed_at=None,
+        ),
+        comments=[_request(body="@codex review")],
+    )
+
+    assert packet["classification"] == "codex_request_needed"
+    assert packet["codex_status"] == "request_needed"
+
+
 def test_parse_next_link_extracts_only_next_page_url():
     header = '<https://api.github.com/resource?page=2>; rel="next", <https://api.github.com/resource?page=5>; rel="last"'
 
