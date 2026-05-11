@@ -67,6 +67,17 @@ def _codex_comment(body, created_at="2026-05-10T20:02:00Z"):
     }
 
 
+def _codex_clean(created_at="2026-05-10T20:02:00Z"):
+    return {
+        "id": 100,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "submitted_at": created_at,
+        "commit_id": CURRENT_HEAD,
+        "body": "Codex Review: Didn't find any major issues.",
+    }
+
+
 def test_scope_clean_ci_green_codex_clean_issue_comment_on_current_head_is_ready():
     packet = _packet(
         comments=[
@@ -482,3 +493,42 @@ def test_non_codex_user_reaction_on_suggestions_request_does_not_acknowledge():
     # Human reaction must NOT set acknowledged — suggestions signal takes precedence
     assert packet["codex_latest_request_acknowledged"] is None
     assert packet["codex_reaction_status"] is None
+
+
+def test_merged_pr_short_circuits_to_terminal_state():
+    """A merged PR must be classified as blocked_pr_merged before CI or Codex checks run."""
+    packet = classifier.classify_payloads(
+        pr=_pr(state="closed", merged=True),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[_request()],
+        reviews=[_codex_clean()],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+    )
+    assert packet["classification"] == "blocked_pr_merged"
+    assert any("already merged" in b for b in packet["blockers"])
+
+
+def test_codex_eyes_reaction_also_triggers_acknowledged():
+    """Codex eyes reaction (content=='eyes') on request must set acknowledged fields,
+    same as +1 reaction. Both are valid Codex acknowledgements."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[_request()],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 902, "content": "eyes", "user": {"login": "chatgpt-codex-connector[bot]"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+    # No clean/suggestions signal yet; pending with eyes acknowledgement
+    assert packet["classification"] == "codex_pending"
+    assert packet["codex_status"] == "pending"
+    assert packet["codex_latest_request_acknowledged"] is True
+    assert packet["codex_reaction_status"] == "acknowledged_pending"

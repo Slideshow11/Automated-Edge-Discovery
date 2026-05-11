@@ -23,6 +23,7 @@ from typing import Any
 CLASSIFICATIONS = {
     "blocked_scope",
     "blocked_pr_closed",
+    "blocked_pr_merged",
     "blocked_wrong_base",
     "ci_pending",
     "ci_failed",
@@ -209,7 +210,7 @@ def classify_codex(
             if latest_request_reactions:
                 for reaction in latest_request_reactions:
                     reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
-                    if str(reaction.get("content")) == "+1" and reaction_user == bot:
+                    if str(reaction.get("content")) in ("+1", "eyes") and reaction_user == bot:
                         codex_reaction_status = "acknowledged_pending"
                         codex_latest_request_acknowledged = True
                         codex_latest_request_acknowledged_at = reaction.get("created_at")
@@ -233,7 +234,7 @@ def classify_codex(
         if latest_request_reactions:
             for reaction in latest_request_reactions:
                 reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
-                if str(reaction.get("content")) == "+1" and reaction_user == bot:
+                if str(reaction.get("content")) in ("+1", "eyes") and reaction_user == bot:
                     codex_reaction_status = "acknowledged_pending"
                     codex_latest_request_acknowledged = True
                     codex_latest_request_acknowledged_at = reaction.get("created_at")
@@ -258,7 +259,7 @@ def classify_codex(
     if latest_request_reactions:
         for reaction in latest_request_reactions:
             reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
-            if str(reaction.get("content")) == "+1" and reaction_user == bot:
+            if str(reaction.get("content")) in ("+1", "eyes") and reaction_user == bot:
                 codex_reaction_status = "acknowledged_pending"
                 codex_latest_request_acknowledged = True
                 codex_latest_request_acknowledged_at = reaction.get("created_at")
@@ -346,6 +347,9 @@ def classify_payloads(
     if state == "closed" and not merged:
         classification = "blocked_pr_closed"
         blockers.append("PR is closed and not merged.")
+    elif merged:
+        classification = "blocked_pr_merged"
+        blockers.append("PR is already merged.")
     elif base_ref != base_branch:
         classification = "blocked_wrong_base"
         blockers.append(f"PR base branch is {base_ref!r}, expected {base_branch!r}.")
