@@ -208,7 +208,8 @@ def classify_codex(
             codex_latest_request_acknowledged_at = None
             if latest_request_reactions:
                 for reaction in latest_request_reactions:
-                    if str(reaction.get("content")) == "+1":
+                    reaction_user = str(reaction.get("user", {}).get("login") or "").lower()
+                    if str(reaction.get("content")) == "+1" and reaction_user == bot:
                         codex_reaction_status = "acknowledged_pending"
                         codex_latest_request_acknowledged = True
                         codex_latest_request_acknowledged_at = reaction.get("created_at")

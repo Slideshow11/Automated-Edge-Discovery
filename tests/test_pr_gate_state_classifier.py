@@ -453,3 +453,32 @@ def test_reaction_status_null_when_no_request_exists():
     assert packet["classification"] == "codex_request_needed"
     assert packet["codex_latest_request_acknowledged"] is None
     assert packet["codex_reaction_status"] is None
+
+
+def test_non_codex_user_reaction_on_suggestions_request_does_not_acknowledge():
+    """Human user's +1 on the request comment must not set acknowledged fields
+    when Codex has already posted suggestions. The clean/suggestions branches
+    already guard on reaction_user == bot, but this test covers the suggestions
+    path specifically."""
+    packet = classifier.classify_payloads(
+        pr=_pr(),
+        changed_files=list(ALLOWED),
+        check_runs=_green_checks(),
+        issue_comments=[
+            _request(),
+            _codex_comment("### 💡 Codex Review\n\nHere are some automated review suggestions.", created_at="2026-05-10T20:02:00Z"),
+        ],
+        reviews=[],
+        allowed_files=ALLOWED,
+        expected_head=CURRENT_HEAD,
+        codex_bot_login="chatgpt-codex-connector[bot]",
+        latest_request_reactions=[
+            {"id": 901, "content": "+1", "user": {"login": "sloppy-hacker99"}, "created_at": "2026-05-10T20:01:30Z"},
+        ],
+    )
+
+    assert packet["classification"] == "codex_suggestions"
+    assert packet["codex_status"] == "suggestions"
+    # Human reaction must NOT set acknowledged — suggestions signal takes precedence
+    assert packet["codex_latest_request_acknowledged"] is None
+    assert packet["codex_reaction_status"] is None
