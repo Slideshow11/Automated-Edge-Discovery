@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """Build a read-only MERGE_READY_PACKET from PR gate data.
 
-Produces MERGE_READY_PACKET.json and MERGE_READY_PACKET.md from:
-  - explicit CLI args (head_sha, pr_number, etc.)
-  - a watch_pr_gate_state.py JSON report
+Produces MERGE_READY_PACKET.json and MERGE_READY_PACKET.md from explicit CLI args.
 
 Does NOT call gh, does NOT merge, does NOT post comments.
 Does NOT auto-authorize. Human must run check_merge_authorization.py.
@@ -23,10 +21,6 @@ Usage:
     --recommendation merge \\
     --output-json /tmp/MERGE_READY_PACKET.json \\
     --output-md /tmp/MERGE_READY_PACKET.md
-
-  # Or pipe watch_pr_gate_state output:
-  python3 scripts/local/watch_pr_gate_state.py --pr-url ... | \\
-    python3 scripts/local/build_merge_ready_packet.py --from-stdin
 """
 
 from __future__ import annotations
@@ -79,8 +73,29 @@ def build_packet(
     # Normalize recommendation to lowercase
     rec = recommendation.lower().strip()
 
-    # blockers exist if recommendation is not "merge"
+    # Derive blockers from gate data — any gate failure is a blocker
     blockers: list[str] = []
+
+    if not mergeable:
+        blockers.append("mergeable is false")
+
+    if ci_status not in ("green", "pending"):
+        blockers.append(f"ci_status is '{ci_status}', not 'green' or 'pending'")
+
+    if codex_status not in ("reviewed_clean", "unavailable", "not_requested"):
+        blockers.append(f"codex_status is '{codex_status}' — not reviewed_clean/unavailable/not_requested")
+
+    if reviewer_status not in ("approved", "pending"):
+        blockers.append(f"reviewer_status is '{reviewer_status}' — not approved/pending")
+
+    # Check changed_files are subset of allowed_files
+    allowed_set = set(allowed_files)
+    for f in changed_files:
+        if f not in allowed_set:
+            blockers.append(f"changed file '{f}' is not in allowed_files")
+            break
+
+    # recommendation != "merge" is always a blocker
     if rec != "merge":
         blockers.append(f"recommendation is '{rec}', not 'merge'")
 
