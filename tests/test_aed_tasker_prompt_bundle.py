@@ -147,7 +147,7 @@ def test_cli_returns_0_for_valid_context(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         capture_output=True,
     )
     assert result.returncode == 0, f"stdout={result.stdout.decode()!r}, stderr={result.stderr.decode()!r}"
@@ -164,7 +164,7 @@ def test_missing_context_file_exits_2(tmp_path):
             "--output-prompt", str(tmp_path / "prompt.md"),
             "--output-config", str(tmp_path / "config.json"),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         capture_output=True,
     )
     assert result.returncode == 2
@@ -182,7 +182,7 @@ def test_malformed_json_exits_2(tmp_path):
             "--output-prompt", str(tmp_path / "prompt.md"),
             "--output-config", str(tmp_path / "config.json"),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         capture_output=True,
     )
     assert result.returncode == 2
@@ -221,7 +221,7 @@ def test_missing_required_field_exits_2(tmp_path):
             "--output-prompt", str(tmp_path / "prompt.md"),
             "--output-config", str(tmp_path / "config.json"),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         capture_output=True,
     )
     assert result.returncode == 2
@@ -237,7 +237,7 @@ def test_refuses_hermes_output_path_exits_2(tmp_path, valid_collector_context):
             "--output-prompt", "/home/max/.hermes/forbidden/prompt.md",
             "--output-config", str(tmp_path / "config.json"),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         capture_output=True,
     )
     assert result.returncode == 2
@@ -257,7 +257,7 @@ def test_prompt_includes_output_contract(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -277,7 +277,7 @@ def test_prompt_includes_stop_rules(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -301,7 +301,7 @@ def test_prompt_includes_model_routing(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -322,7 +322,7 @@ def test_prompt_includes_api_fallback_policy(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -340,7 +340,7 @@ def test_prompt_includes_validation_command(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -358,7 +358,7 @@ def test_prompt_includes_candidate_pr_requirements(tmp_path, valid_collector_con
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -379,7 +379,7 @@ def test_prompt_includes_research_instructions(tmp_path, valid_collector_context
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     content = prompt_out.read_text(encoding="utf-8")
@@ -402,7 +402,7 @@ def test_run_config_is_deterministic(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     config = json.loads(config_out.read_text(encoding="utf-8"))
@@ -426,7 +426,7 @@ def test_run_config_has_required_top_level_keys(tmp_path, valid_collector_contex
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     config = json.loads(config_out.read_text(encoding="utf-8"))
@@ -456,7 +456,7 @@ def test_run_config_expected_outputs_has_two_files(tmp_path, valid_collector_con
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     config = json.loads(config_out.read_text(encoding="utf-8"))
@@ -477,7 +477,7 @@ def test_run_config_stop_rules_has_ten_rules(tmp_path, valid_collector_context):
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     config = json.loads(config_out.read_text(encoding="utf-8"))
@@ -495,7 +495,7 @@ def test_run_config_validation_command_is_executable(tmp_path, valid_collector_c
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
-        cwd="/home/max/Automated-Edge-Discovery",
+        cwd=None,
         check=True,
     )
     config = json.loads(config_out.read_text(encoding="utf-8"))
