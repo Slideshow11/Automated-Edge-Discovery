@@ -295,6 +295,7 @@ def classify_codex(
 def recommended_next_action(classification: str) -> str:
     return {
         "blocked_pr_closed": "Stop; PR is closed without merge.",
+        "blocked_pr_merged": "Stop; PR is already merged. No further gate action is required.",
         "blocked_wrong_base": "Stop; retarget or recreate the PR against the expected base branch.",
         "blocked_scope": "Stop; patch the PR to include only approved files.",
         "ci_pending": "Wait for CI to complete, then rerun this classifier.",

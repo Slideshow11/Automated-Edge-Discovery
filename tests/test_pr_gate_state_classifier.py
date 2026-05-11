@@ -586,6 +586,7 @@ def test_merged_pr_short_circuits_to_terminal_state():
         codex_bot_login="chatgpt-codex-connector[bot]",
     )
     assert packet["classification"] == "blocked_pr_merged"
+    assert packet["recommended_next_action"] == "Stop; PR is already merged. No further gate action is required."
     assert any("already merged" in b for b in packet["blockers"])
 
 
