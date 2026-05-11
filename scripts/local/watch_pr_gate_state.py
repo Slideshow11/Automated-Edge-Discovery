@@ -156,12 +156,13 @@ def run(argv: list[str] | None = None) -> int:
     classification = packet.get("classification", "unknown")
     blockers = packet.get("blockers", [])
 
-    if args.json:
-        print(json.dumps(packet, sort_keys=True, indent=2))
-    if args.compact:
-        print(build_compact(args.pr_number, classification, blockers))
-    if not args.json and not args.compact:
-        print(build_telegram_summary(args.pr_number, classification, blockers))
+    if not args.exit_code_only:
+        if args.json:
+            print(json.dumps(packet, sort_keys=True, indent=2))
+        elif args.compact:
+            print(build_compact(args.pr_number, classification, blockers))
+        else:
+            print(build_telegram_summary(args.pr_number, classification, blockers))
 
     if classification not in CLASSIFICATIONS:
         classification = "unknown"

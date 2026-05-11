@@ -6,7 +6,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import pytest
 
@@ -156,6 +156,96 @@ class TestUrllibErrorHandling:
                 "--pr-number", "1",
             ])
             assert exit_code == EXIT_ARGUMENT_ERROR
+
+
+def _mock_packet(classification: str, blockers: list[str] | None = None) -> dict:
+    return {
+        "classification": classification,
+        "blockers": blockers or [],
+        "ci_state": "pass",
+        "codex_state": "clean",
+    }
+
+
+class TestExitCodeOnly:
+    """--exit-code-only must produce no stdout in every path."""
+
+    def test_exit_code_only_empty_on_success(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("ready_for_reviewer")
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                    "--exit-code-only",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert out == "", f"expected no stdout, got: {out!r}"
+
+    def test_exit_code_only_empty_on_codex_pending(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("codex_pending")
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                    "--exit-code-only",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert out == "", f"expected no stdout, got: {out!r}"
+
+    def test_exit_code_only_returns_exit_0_with_blockers(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("codex_suggestions", ["test-3.11"])
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                    "--exit-code-only",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert out == "", f"expected no stdout, got: {out!r}"
+
+    def test_json_still_prints(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("ready_for_reviewer")
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                    "--json",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert out.strip(), "expected JSON output"
+
+    def test_compact_still_prints(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("ci_pending")
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                    "--compact",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert "[PR #1]" in out
+
+    def test_default_summary_still_prints(self, capsys):
+        with patch("watch_pr_gate_state.fetch_live_payloads") as mock_fetch:
+            mock_fetch.return_value = (MagicMock(), [], [], [], [], [])
+            with patch("watch_pr_gate_state.classify_payloads") as mock_cp:
+                mock_cp.return_value = _mock_packet("ci_failed", ["test-3.11"])
+                code = run([
+                    "--repo-owner", "x", "--repo-name", "y", "--pr-number", "1",
+                ])
+                assert code == 0
+                out = capsys.readouterr().out
+                assert "PR #1" in out and "ci_failed" in out
 
 
 if __name__ == "__main__":
