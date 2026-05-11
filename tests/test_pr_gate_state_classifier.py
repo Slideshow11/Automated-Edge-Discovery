@@ -250,6 +250,17 @@ def test_commit_status_contexts_are_mapped_to_ci_checks():
     ]
 
 
+def test_commit_status_context_mapping_keeps_latest_context_state():
+    checks = classifier.status_contexts_as_check_runs(
+        [
+            {"context": "external-ci", "state": "failure", "created_at": "2026-05-10T20:00:00Z"},
+            {"context": "external-ci", "state": "success", "created_at": "2026-05-10T20:01:00Z"},
+        ]
+    )
+
+    assert checks == [{"name": "external-ci", "status": "completed", "conclusion": "success"}]
+
+
 def test_ci_failed_blocks_before_codex():
     packet = _packet(checks=[{"name": "test", "status": "completed", "conclusion": "failure"}])
 

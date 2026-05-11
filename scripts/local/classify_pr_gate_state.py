@@ -129,15 +129,25 @@ def classify_ci(check_runs: list[dict[str, Any]]) -> tuple[str, list[str]]:
 
 
 def status_contexts_as_check_runs(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    mapped: list[dict[str, Any]] = []
+    latest_by_context: dict[str, dict[str, Any]] = {}
     for status in statuses:
+        context = str(status.get("context") or status.get("id") or "<unnamed>")
+        current = latest_by_context.get(context)
+        current_created = str(current.get("created_at") or "") if current else ""
+        status_created = str(status.get("created_at") or "")
+        if current is None or status_created >= current_created:
+            latest_by_context[context] = status
+
+    mapped: list[dict[str, Any]] = []
+    for context in sorted(latest_by_context):
+        status = latest_by_context[context]
         state = str(status.get("state") or "").lower()
         if state == "success":
-            mapped.append({"name": status.get("context"), "status": "completed", "conclusion": "success"})
+            mapped.append({"name": context, "status": "completed", "conclusion": "success"})
         elif state == "pending":
-            mapped.append({"name": status.get("context"), "status": "in_progress", "conclusion": None})
+            mapped.append({"name": context, "status": "in_progress", "conclusion": None})
         else:
-            mapped.append({"name": status.get("context"), "status": "completed", "conclusion": "failure"})
+            mapped.append({"name": context, "status": "completed", "conclusion": "failure"})
     return mapped
 
 
