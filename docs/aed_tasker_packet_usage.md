@@ -25,7 +25,30 @@ Building the output format before the agent gives us:
 3. **Separation of concerns** — the scaffold is stable and independently testable; the agent can evolve
 4. **Safe iteration** — we can test the rendering and validation pipeline with synthetic packets while the agent is being built
 
-## How a future Tasker agent will use this scaffold
+## How a future Tasker agent will use these tools
+
+```
+PR #192 (packet scaffold)          PR #193 (context collector)
+────────────────────────────────    ──────────────────────────────
+ROADMAP_PACKET.json v1 schema       AED_TASKER_CONTEXT.json input
+aed_tasker_packet.py                aed_tasker_collect_context.py
+  ├── validate                      collects:
+  │     ROADMAP_PACKET.json              repo path, HEAD, branch
+  │                                    latest N git commits
+  └── render-md                          docs present/absent
+        ROADMAP_PACKET.json →             scripts present/absent
+          AED_ROADMAP_TASKER_MEMO.md      tests present/absent
+                                          schemas present/absent
+
+A future PR will connect context collection to an LLM Tasker:
+  1. Run aed_tasker_collect_context.py → AED_TASKER_CONTEXT.json
+  2. Tasker agent reads context + reviews code/docs
+  3. Tasker emits ROADMAP_PACKET.json
+  4. aed_tasker_packet.py validates and renders memo
+  5. Human selects recommended PR
+  6. Executor creates the PR
+
+This PR (#193) remains read-only and non-autonomous.
 
 ```
 Tasker agent (future)                    This scaffold (PR #192)
