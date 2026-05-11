@@ -24,11 +24,6 @@ from pathlib import Path
 HERMES_PREFIX = "/home/max/.hermes"
 FORBIDDEN_OUTPUT_PREFIXES = (HERMES_PREFIX,)
 
-# ── Safety constants ──────────────────────────────────────────────────────────
-
-HERMES_PREFIX = "/home/max/.hermes"
-FORBIDDEN_OUTPUT_PREFIXES = (HERMES_PREFIX,)
-
 # Context schema accepted by this tool.
 # aed_tasker_collect_context.py emits a nested schema:
 #   { repo: {path, branch, head_sha, clean}, docs, scripts, tests, schemas,
