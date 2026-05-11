@@ -43,20 +43,6 @@ STATE_LABELS = {
     "unknown": "unknown",
 }
 
-CI_STATE_LABELS = {
-    "ci_pending": "pending",
-    "ci_failed": "fail",
-    "ci_pass": "pass",
-}
-
-CODEX_STATE_LABELS = {
-    "codex_clean": "clean",
-    "codex_pending": "pending",
-    "codex_suggestions": "suggestions",
-    "codex_request_needed": "needed",
-    "codex_clean_but_no_review": "clean",
-}
-
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
