@@ -29,7 +29,7 @@ from scripts.local import aed_tasker_prompt_bundle as bundle_module
 
 @pytest.fixture
 def valid_context(tmp_path):
-    """Minimal valid AED_TASKER_CONTEXT.json."""
+    """Minimal valid AED_TASKER_CONTEXT.json in flat schema (legacy)."""
     ctx = {
         "repo_root": str(tmp_path),
         "branch": "tooling/test",
@@ -73,20 +73,77 @@ def valid_context(tmp_path):
 
 
 @pytest.fixture
+def valid_collector_context(tmp_path):
+    """Minimal valid AED_TASKER_CONTEXT.json in the nested collector schema.
+
+    This is the actual output format of aed_tasker_collect_context.py.
+    The prompt_bundle tool should accept this schema directly.
+    """
+    ctx = {
+        "repo": {
+            "path": str(tmp_path),
+            "branch": "tooling/test",
+            "head_sha": "abc1234567890def",
+            "clean": True,
+        },
+        "docs": {
+            "aed_tasker_executor_design.md": {"exists": True, "snippet": None},
+            "current_project_status.md": {"exists": True, "snippet": None},
+        },
+        "scripts": {
+            "aed_tasker_packet.py": {"exists": True, "snippet": None},
+            "aed_tasker_collect_context.py": {"exists": False, "snippet": None},
+        },
+        "tests": {
+            "test_aed_tasker_packet.py": {"exists": True},
+        },
+        "schemas": {
+            "trial_ledger_v1.json": {"exists": False},
+        },
+        "summary": {
+            "docs_present": 2,
+            "scripts_present": 1,
+            "tests_present": 1,
+            "schemas_present": 0,
+        },
+        "recent_commits": [
+            {
+                "sha": "abc1234567890def",
+                "short_sha": "abc1234",
+                "subject": "test: initial commit",
+                "author": "Test Author",
+                "date": "2026-05-11",
+            },
+            {
+                "sha": "def4567890123456",
+                "short_sha": "def4567",
+                "subject": "feat: add something important",
+                "author": "Another Author",
+                "date": "2026-05-10",
+            },
+        ],
+    }
+    path = tmp_path / "context.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(ctx, f)
+    return path
+
+
+@pytest.fixture
 def valid_context_path(valid_context):
     return str(valid_context)
 
 
 # ── Exit code tests ───────────────────────────────────────────────────────────
 
-def test_cli_returns_0_for_valid_context(tmp_path, valid_context):
+def test_cli_returns_0_for_valid_context(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     result = subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -133,17 +190,25 @@ def test_malformed_json_exits_2(tmp_path):
 
 
 def test_missing_required_field_exits_2(tmp_path):
-    # Valid JSON but missing 'branch' field
+    # Valid JSON but missing 'recent_commits' field in nested schema
     bad_ctx = {
-        "repo_root": str(tmp_path),
-        # missing 'branch'
-        "head_sha": "abc123",
-        "is_clean": True,
-        "recent_commits": [],
-        "docs_present": {},
-        "scripts_present": {},
-        "tests_present": {},
-        "schemas_present": {},
+        "repo": {
+            "path": str(tmp_path),
+            "branch": "tooling/test",
+            "head_sha": "abc123",
+            "clean": True,
+        },
+        "docs": {},
+        "scripts": {},
+        "tests": {},
+        "schemas": {},
+        "summary": {
+            "docs_present": 0,
+            "scripts_present": 0,
+            "tests_present": 0,
+            "schemas_present": 0,
+        },
+        # missing 'recent_commits'
     }
     path = tmp_path / "bad.json"
     with open(path, "w", encoding="utf-8") as f:
@@ -163,12 +228,12 @@ def test_missing_required_field_exits_2(tmp_path):
     assert b"missing required fields" in result.stderr
 
 
-def test_refuses_hermes_output_path_exits_2(tmp_path, valid_context):
+def test_refuses_hermes_output_path_exits_2(tmp_path, valid_collector_context):
     result = subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", "/home/max/.hermes/forbidden/prompt.md",
             "--output-config", str(tmp_path / "config.json"),
         ],
@@ -181,14 +246,14 @@ def test_refuses_hermes_output_path_exits_2(tmp_path, valid_context):
 
 # ── Prompt content tests ───────────────────────────────────────────────────────
 
-def test_prompt_includes_output_contract(tmp_path, valid_context):
+def test_prompt_includes_output_contract(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -201,14 +266,14 @@ def test_prompt_includes_output_contract(tmp_path, valid_context):
     assert "aed_tasker_packet.py validate ROADMAP_PACKET.json" in content
 
 
-def test_prompt_includes_stop_rules(tmp_path, valid_context):
+def test_prompt_includes_stop_rules(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -225,14 +290,14 @@ def test_prompt_includes_stop_rules(tmp_path, valid_context):
     assert "live trading" in content  # covers "Do NOT attempt live trading"
 
 
-def test_prompt_includes_model_routing(tmp_path, valid_context):
+def test_prompt_includes_model_routing(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -246,14 +311,14 @@ def test_prompt_includes_model_routing(tmp_path, valid_context):
     assert "Tom explicitly approves" in content or "Tom's" in content
 
 
-def test_prompt_includes_api_fallback_policy(tmp_path, valid_context):
+def test_prompt_includes_api_fallback_policy(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -264,14 +329,14 @@ def test_prompt_includes_api_fallback_policy(tmp_path, valid_context):
     assert "api_fallback_policy" in content or "Fallback" in content or "fallback" in content
 
 
-def test_prompt_includes_validation_command(tmp_path, valid_context):
+def test_prompt_includes_validation_command(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -282,14 +347,14 @@ def test_prompt_includes_validation_command(tmp_path, valid_context):
     assert "aed_tasker_packet.py validate" in content
 
 
-def test_prompt_includes_candidate_pr_requirements(tmp_path, valid_context):
+def test_prompt_includes_candidate_pr_requirements(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -303,14 +368,14 @@ def test_prompt_includes_candidate_pr_requirements(tmp_path, valid_context):
     assert "why now" in content.lower() or "Why now" in content
 
 
-def test_prompt_includes_research_instructions(tmp_path, valid_context):
+def test_prompt_includes_research_instructions(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -326,14 +391,14 @@ def test_prompt_includes_research_instructions(tmp_path, valid_context):
 
 # ── Run config tests ───────────────────────────────────────────────────────────
 
-def test_run_config_is_deterministic(tmp_path, valid_context):
+def test_run_config_is_deterministic(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -350,14 +415,14 @@ def test_run_config_is_deterministic(tmp_path, valid_context):
     assert "validation_command" in config
 
 
-def test_run_config_has_required_top_level_keys(tmp_path, valid_context):
+def test_run_config_has_required_top_level_keys(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -380,14 +445,14 @@ def test_run_config_has_required_top_level_keys(tmp_path, valid_context):
     assert required_keys.issubset(config.keys()), f"Missing keys: {required_keys - config.keys()}"
 
 
-def test_run_config_expected_outputs_has_two_files(tmp_path, valid_context):
+def test_run_config_expected_outputs_has_two_files(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -401,14 +466,14 @@ def test_run_config_expected_outputs_has_two_files(tmp_path, valid_context):
     assert "ROADMAP_PACKET.json" in filenames
 
 
-def test_run_config_stop_rules_has_ten_rules(tmp_path, valid_context):
+def test_run_config_stop_rules_has_ten_rules(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -419,14 +484,14 @@ def test_run_config_stop_rules_has_ten_rules(tmp_path, valid_context):
     assert len(config["stop_rules"]) == 10
 
 
-def test_run_config_validation_command_is_executable(tmp_path, valid_context):
+def test_run_config_validation_command_is_executable(tmp_path, valid_collector_context):
     prompt_out = tmp_path / "prompt.md"
     config_out = tmp_path / "config.json"
     subprocess.run(
         [
             sys.executable,
             "scripts/local/aed_tasker_prompt_bundle.py",
-            "--context-json", str(valid_context),
+            "--context-json", str(valid_collector_context),
             "--output-prompt", str(prompt_out),
             "--output-config", str(config_out),
         ],
@@ -455,7 +520,7 @@ def test_no_network_calls(tmp_path, valid_context, monkeypatch):
             f"{name} incorrectly referenced in bundle_module"
 
 
-def test_no_hermes_mutation_calls(tmp_path, valid_context):
+def test_no_hermes_mutation_calls(tmp_path, valid_collector_context):
     """Confirm no hermes tool calls in source — stop-rules text is permitted."""
     src = Path("scripts/local/aed_tasker_prompt_bundle.py").read_text(encoding="utf-8")
     # Must not call these as functions; stop-rules prose is permitted
@@ -468,7 +533,7 @@ def test_no_hermes_mutation_calls(tmp_path, valid_context):
         assert term not in src, f"Forbidden call '{term}' found in source"
 
 
-def test_no_gh_pr_calls(tmp_path, valid_context):
+def test_no_gh_pr_calls(tmp_path, valid_collector_context):
     """Confirm no gh pr merge / comment calls."""
     src = Path("scripts/local/aed_tasker_prompt_bundle.py").read_text(encoding="utf-8")
     assert "gh pr merge" not in src
@@ -477,7 +542,7 @@ def test_no_gh_pr_calls(tmp_path, valid_context):
     assert "gh api" not in src or "gh api --help" in src  # only in help text
 
 
-def test_no_git_push_or_commit_calls(tmp_path, valid_context):
+def test_no_git_push_or_commit_calls(tmp_path, valid_collector_context):
     """Confirm no git push or git commit subprocess calls in script."""
     src = Path("scripts/local/aed_tasker_prompt_bundle.py").read_text(encoding="utf-8")
     # Check for actual subprocess calls, not stop-rules prose text
@@ -493,15 +558,13 @@ def test_no_git_push_or_commit_calls(tmp_path, valid_context):
 
 def test_validate_context_fields_all_present():
     ctx = {
-        "repo_root": "/tmp",
-        "branch": "main",
-        "head_sha": "abc",
-        "is_clean": True,
+        "repo": {"path": "/tmp", "branch": "main", "head_sha": "abc", "clean": True},
+        "docs": {},
+        "scripts": {},
+        "tests": {},
+        "schemas": {},
+        "summary": {"docs_present": 0, "scripts_present": 0, "tests_present": 0, "schemas_present": 0},
         "recent_commits": [],
-        "docs_present": {},
-        "scripts_present": {},
-        "tests_present": {},
-        "schemas_present": {},
     }
     missing = bundle_module.validate_context_fields(ctx)
     assert missing == []
@@ -509,12 +572,12 @@ def test_validate_context_fields_all_present():
 
 def test_validate_context_fields_some_missing():
     ctx = {
-        "repo_root": "/tmp",
-        # missing others
+        "repo": {"path": "/tmp", "branch": "main", "head_sha": "abc", "clean": True},
+        # missing docs, scripts, tests, schemas, summary, recent_commits
     }
     missing = bundle_module.validate_context_fields(ctx)
-    assert "branch" in missing
-    assert "head_sha" in missing
+    assert "docs" in missing
+    assert "scripts" in missing
 
 
 def test_validate_output_path_rejects_hermes(tmp_path):
@@ -529,15 +592,13 @@ def test_run_config_reproducible_for_same_context(tmp_path):
     ctx1 = tmp_path / "ctx1.json"
     ctx2 = tmp_path / "ctx2.json"
     c = {
-        "repo_root": str(tmp_path),
-        "branch": "main",
-        "head_sha": "abc123",
-        "is_clean": True,
+        "repo": {"path": str(tmp_path), "branch": "main", "head_sha": "abc123", "clean": True},
+        "docs": {},
+        "scripts": {},
+        "tests": {},
+        "schemas": {},
+        "summary": {"docs_present": 0, "scripts_present": 0, "tests_present": 0, "schemas_present": 0},
         "recent_commits": [],
-        "docs_present": {},
-        "scripts_present": {},
-        "tests_present": {},
-        "schemas_present": {},
     }
     for p in (ctx1, ctx2):
         with open(p, "w") as f:

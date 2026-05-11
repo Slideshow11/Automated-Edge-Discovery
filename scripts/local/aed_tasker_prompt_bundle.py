@@ -24,17 +24,26 @@ from pathlib import Path
 HERMES_PREFIX = "/home/max/.hermes"
 FORBIDDEN_OUTPUT_PREFIXES = (HERMES_PREFIX,)
 
-# Required top-level keys in AED_TASKER_CONTEXT.json
-REQUIRED_CONTEXT_FIELDS = {
-    "repo_root",
-    "branch",
-    "head_sha",
-    "is_clean",
+# ── Safety constants ──────────────────────────────────────────────────────────
+
+HERMES_PREFIX = "/home/max/.hermes"
+FORBIDDEN_OUTPUT_PREFIXES = (HERMES_PREFIX,)
+
+# Context schema accepted by this tool.
+# aed_tasker_collect_context.py emits a nested schema:
+#   { repo: {path, branch, head_sha, clean}, docs, scripts, tests, schemas,
+#     summary: {docs_present, scripts_present, tests_present, schemas_present},
+#     recent_commits: [{sha, short_sha, subject, author, date}] }
+#
+# This tool normalizes to the flat shape expected by the prompt builder.
+COLLECTOR_SCHEMA_FIELDS = {
+    "repo",        # nested {path, branch, head_sha, clean}
+    "docs",        # dict of doc info
+    "scripts",     # dict of script info
+    "tests",       # dict of test info
+    "schemas",     # dict of schema info
+    "summary",     # {docs_present, scripts_present, tests_present, schemas_present}
     "recent_commits",
-    "docs_present",
-    "scripts_present",
-    "tests_present",
-    "schemas_present",
 }
 
 # ── Validation helpers ───────────────────────────────────────────────────────
@@ -46,12 +55,67 @@ class ValidationError(Exception):
 
 
 def validate_context_fields(context: dict) -> list[str]:
-    """Check required fields. Returns list of missing field names (empty = valid)."""
+    """Check required fields from the collector schema.
+
+    Accepts the nested schema emitted by aed_tasker_collect_context.py:
+      { repo, docs, scripts, tests, schemas, summary, recent_commits }
+
+    Returns list of missing field names (empty = valid).
+    """
     missing = []
-    for field in REQUIRED_CONTEXT_FIELDS:
+    for field in COLLECTOR_SCHEMA_FIELDS:
         if field not in context:
             missing.append(field)
     return missing
+
+
+def normalize_context(context: dict) -> dict:
+    """Normalize the nested collector schema to the flat shape expected by build_prompt_bundle.
+
+    Collector schema:
+      { repo: {path, branch, head_sha, clean},
+        docs: {name: {exists, snippet, ...}},
+        scripts: {name: {exists, snippet, ...}},
+        tests: {name: {exists}},
+        schemas: {name: {exists}},
+        summary: {docs_present, scripts_present, tests_present, schemas_present},
+        recent_commits: [{sha, short_sha, subject, author, date}] }
+
+    Flat shape (for internal use by build_prompt_bundle):
+      { repo_root, branch, head_sha, is_clean,
+        recent_commits, docs_present, scripts_present, tests_present, schemas_present }
+    """
+    repo = context.get("repo", {})
+    summary = context.get("summary", {})
+
+    # recent_commits: collector uses {sha, short_sha, subject, author, date}
+    # build_prompt_bundle expects {sha, author, date, message}
+    raw_commits = context.get("recent_commits", [])
+    commits = []
+    for c in raw_commits:
+        commits.append({
+            "sha": c.get("sha", ""),
+            "author": c.get("author", ""),
+            "date": c.get("date", ""),
+            "message": c.get("subject", ""),
+        })
+
+    return {
+        "repo_root": repo.get("path", "unknown"),
+        "branch": repo.get("branch", "unknown"),
+        "head_sha": repo.get("head_sha", "unknown"),
+        "is_clean": repo.get("clean", False),
+        "recent_commits": commits,
+        "docs_present": _presence_dict(context.get("docs", {})),
+        "scripts_present": _presence_dict(context.get("scripts", {})),
+        "tests_present": _presence_dict(context.get("tests", {})),
+        "schemas_present": _presence_dict(context.get("schemas", {})),
+    }
+
+
+def _presence_dict(raw: dict) -> dict:
+    """Convert a dict of file-info dicts to {name: exists_bool}."""
+    return {k: bool(v.get("exists", False)) for k, v in raw.items()}
 
 
 def validate_output_path(path: str) -> None:
@@ -419,10 +483,13 @@ def main(argv: list[str] | None = None) -> int:
             sys.stderr.write(f"Error: {e}\n")
             return 2
 
+    # Normalize to flat shape for prompt builder
+    flat_context = normalize_context(context)
+
     # Build content
-    prompt_content = build_prompt_bundle(context)
+    prompt_content = build_prompt_bundle(flat_context)
     run_config = build_run_config(
-        context,
+        flat_context,
         args.context_json,
         args.output_prompt,
         args.output_config,
