@@ -108,6 +108,7 @@ def classify_ci(check_runs: list[dict[str, Any]]) -> tuple[str, list[str]]:
     blockers: list[str] = []
     has_pending = False
     has_failed = False
+    passing_conclusions = {"success", "neutral", "skipped"}
     if not check_runs:
         return "pending", ["No CI check runs were found for the current head."]
     for run in check_runs:
@@ -117,7 +118,7 @@ def classify_ci(check_runs: list[dict[str, Any]]) -> tuple[str, list[str]]:
         if status != "completed":
             has_pending = True
             blockers.append(f"CI check pending: {name} status={status}")
-        elif conclusion != "success":
+        elif conclusion not in passing_conclusions:
             has_failed = True
             blockers.append(f"CI check failed: {name} conclusion={conclusion}")
     if has_failed:

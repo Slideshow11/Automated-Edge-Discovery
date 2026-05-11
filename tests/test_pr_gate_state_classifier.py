@@ -222,6 +222,20 @@ def test_pending_ci_with_failed_in_check_name_is_still_pending():
     assert packet["ci_status"] == "pending"
 
 
+def test_skipped_and_neutral_ci_conclusions_are_green():
+    packet = _packet(
+        checks=[
+            {"name": "conditional-docs", "status": "completed", "conclusion": "skipped"},
+            {"name": "advisory", "status": "completed", "conclusion": "neutral"},
+        ],
+        comments=[_request()],
+    )
+
+    assert packet["ci_status"] == "green"
+    assert packet["classification"] == "codex_pending"
+    assert packet["blockers"] == []
+
+
 def test_ci_failed_blocks_before_codex():
     packet = _packet(checks=[{"name": "test", "status": "completed", "conclusion": "failure"}])
 
