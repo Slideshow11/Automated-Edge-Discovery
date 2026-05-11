@@ -17,7 +17,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from watch_pr_gate_state import run as watchdog_run
+from watch_pr_gate_state import run as watchdog_run, EXIT_ARGUMENT_ERROR
 
 DEFAULT_OUTPUT_MODE = "summary"  # summary | compact | json
 
@@ -71,14 +71,23 @@ def load_config(config_path: str) -> dict[str, str]:
 
 
 def _cli_provided_key(cli_args: argparse.Namespace) -> set[str]:
-    """Return the set of argument names that CLI explicitly set (not None)."""
+    """Return the set of argument names that CLI explicitly set (not None).
+
+    Treats list defaults (e.g. allowed_files=[]) as UN-provided so that config
+    values can override them. Only non-None scalar values count as provided.
+    """
     provided = set()
     for key in dir(cli_args):
         if key.startswith("_"):
             continue
         value = getattr(cli_args, key)
-        if value is not None:
-            provided.add(key)
+        # Only treat non-None scalar values as explicitly provided.
+        # Empty lists/dicts from defaults are not considered CLI input.
+        if value is None:
+            continue
+        if isinstance(value, (list, dict)):
+            continue
+        provided.add(key)
     return provided
 
 
@@ -129,7 +138,11 @@ def run(argv: list[str] | None = None) -> int:
     cli = parse_args(argv)
 
     if cli.config:
-        config = load_config(cli.config)
+        try:
+            config = load_config(cli.config)
+        except ValueError:
+            # Config errors are argument/configuration errors → exit 3
+            sys.exit(EXIT_ARGUMENT_ERROR)
     else:
         config = {}
 
@@ -143,7 +156,19 @@ def run(argv: list[str] | None = None) -> int:
         merged_argv.append("--compact")
     # else: default summary — watch_pr_gate_state.py prints by default (no flag needed)
 
-    return watchdog_run(merged_argv)
+    # Strip wrapper-only flags that watchdog parser doesn't accept.
+    # watch_pr_gate_state.py uses --json/--compact/--exit-code-only, not --output.
+    wrapper_only_flags = {"--output"}
+    filtered_argv = []
+    i = 0
+    while i < len(merged_argv):
+        if merged_argv[i] in wrapper_only_flags:
+            i += 2  # skip flag and its value
+        else:
+            filtered_argv.append(merged_argv[i])
+            i += 1
+
+    return watchdog_run(filtered_argv)
 
 
 def main(argv: list[str] | None = None) -> int:
