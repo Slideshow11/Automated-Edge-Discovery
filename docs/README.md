@@ -82,6 +82,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/smoke_preearn_bridge.py | Local bridge smoke helper for pre-earnings integration. | Local smoke only |
 | scripts/local/aed_tasker_packet.py | Validates ROADMAP_PACKET.json v1 and renders AED_ROADMAP_TASKER_MEMO.md. Read-only; no LLM calls, no GitHub mutations, no Kanban ops. | Read-only |
 | scripts/local/aed_tasker_collect_context.py | Collects structured internal repo context (HEAD, branch, docs/scripts/tests/schemas presence, recent commits) for a future Tasker agent. No LLM calls, no network, no Kanban ops. | Read-only |
+| scripts/local/aed_tasker_prompt_bundle.py | Takes AED_TASKER_CONTEXT.json, produces AED_TASKER_PROMPT.md + AED_TASKER_RUN_CONFIG.json with stop rules, model routing, research instructions, and candidate PR output requirements. No LLM calls, no network, no Kanban ops. | Read-only |
 | scripts/local/build_merge_ready_packet.py | Produces MERGE_READY_PACKET.json/md from PR gate data. No LLM calls, no GitHub mutations, no auto-merge. | Read-only |
 | scripts/local/check_merge_authorization.py | Verifies MERGE_READY_PACKET and exact human phrase before merge. Exits 0 (authorized) or 1 (denied). Does not call gh pr merge. | Read-only |
 | scripts/local/run_pr_gate_watchdog_once.py | INI-config-aware wrapper for watch_pr_gate_state.py. Supports summary/compact/json output modes. | Read-only |

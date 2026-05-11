@@ -28,28 +28,28 @@ Building the output format before the agent gives us:
 ## How a future Tasker agent will use these tools
 
 ```
-PR #192 (packet scaffold)          PR #193 (context collector)
-────────────────────────────────    ──────────────────────────────
-ROADMAP_PACKET.json v1 schema       AED_TASKER_CONTEXT.json input
-aed_tasker_packet.py                aed_tasker_collect_context.py
-  ├── validate                      collects:
-  │     ROADMAP_PACKET.json              repo path, HEAD, branch
-  │                                    latest N git commits
+PR #192 (packet scaffold)          PR #193 (context collector)       PR #195 (prompt bundle)
+────────────────────────────────    ──────────────────────────────       ──────────────────────────
+ROADMAP_PACKET.json v1 schema       AED_TASKER_CONTEXT.json              AED_TASKER_PROMPT.md
+aed_tasker_packet.py               aed_tasker_collect_context.py       AED_TASKER_RUN_CONFIG.json
+  ├── validate                        collects:                       takes context JSON + produces
+  │     ROADMAP_PACKET.json              repo path, HEAD, branch       Tasker prompt + run config
+  │                                         latest N git commits
   └── render-md                          docs present/absent
         ROADMAP_PACKET.json →             scripts present/absent
           AED_ROADMAP_TASKER_MEMO.md      tests present/absent
                                           schemas present/absent
 
-A future PR will connect context collection to an LLM Tasker:
+Future Tasker agent connects the three:
   1. Run aed_tasker_collect_context.py → AED_TASKER_CONTEXT.json
-  2. Tasker agent reads context + reviews code/docs
-  3. Tasker emits ROADMAP_PACKET.json
-  4. aed_tasker_packet.py validates and renders memo
-  5. Human selects recommended PR
-  6. Executor creates the PR
-
-This PR (#193) remains read-only and non-autonomous.
-
+  2. Run aed_tasker_prompt_bundle.py --context-json AED_TASKER_CONTEXT.json
+       --output-prompt AED_TASKER_PROMPT.md
+       --output-config AED_TASKER_RUN_CONFIG.json
+  3. Tasker agent reads AED_TASKER_PROMPT.md + AED_TASKER_CONTEXT.json
+  4. Tasker emits ROADMAP_PACKET.json
+  5. aed_tasker_packet.py validates and renders memo
+  6. Human selects recommended PR
+  7. Executor creates the PR
 ```
 Tasker agent (future)                    This scaffold (PR #192)
 ────────────────────────                 ──────────────────────
