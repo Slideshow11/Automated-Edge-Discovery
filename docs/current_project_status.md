@@ -239,6 +239,7 @@ All five audits use a shared CSV header resolver with the following policy:
 
 ## Next planned PRs
 
+- PR #190 tooling: add read-only PR gate watchdog (watch_pr_gate_state.py + tests) — watch an open PR, report CI/Codex/blocker state via compact JSON/summary, exit codes only; no GitHub mutations, no Kanban ops, no Codex requests, no merge
 - Leakage checks stub wiring (schema field exists in RunnerOutput; not yet wired in runner)
 - RunnerOutput trial-accounting linkage schema update (add experiment_id, search_space_id, trial_id, variant_id, n_tried, sample_to_trial_ratio, complexity_bucket fields)
 - TrialLedger linkage extension (carry search_space_id, variant_id, complexity_bucket, all_variants_preserved)
