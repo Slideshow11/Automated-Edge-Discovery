@@ -236,6 +236,20 @@ def test_skipped_and_neutral_ci_conclusions_are_green():
     assert packet["blockers"] == []
 
 
+def test_commit_status_contexts_are_mapped_to_ci_checks():
+    checks = classifier.status_contexts_as_check_runs(
+        [
+            {"context": "external-ci", "state": "success"},
+            {"context": "queued-ci", "state": "pending"},
+        ]
+    )
+
+    assert checks == [
+        {"name": "external-ci", "status": "completed", "conclusion": "success"},
+        {"name": "queued-ci", "status": "in_progress", "conclusion": None},
+    ]
+
+
 def test_ci_failed_blocks_before_codex():
     packet = _packet(checks=[{"name": "test", "status": "completed", "conclusion": "failure"}])
 
@@ -526,6 +540,9 @@ def test_fetch_live_payloads_derives_head_pushed_at_from_commit(monkeypatch):
             raise AssertionError(path)
 
         def get_check_runs_all(self, head_sha):
+            return []
+
+        def get_commit_statuses_all(self, head_sha):
             return []
 
         def get_reactions(self, comment_id):

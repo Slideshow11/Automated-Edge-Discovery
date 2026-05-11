@@ -128,6 +128,19 @@ def classify_ci(check_runs: list[dict[str, Any]]) -> tuple[str, list[str]]:
     return "green", []
 
 
+def status_contexts_as_check_runs(statuses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    mapped: list[dict[str, Any]] = []
+    for status in statuses:
+        state = str(status.get("state") or "").lower()
+        if state == "success":
+            mapped.append({"name": status.get("context"), "status": "completed", "conclusion": "success"})
+        elif state == "pending":
+            mapped.append({"name": status.get("context"), "status": "in_progress", "conclusion": None})
+        else:
+            mapped.append({"name": status.get("context"), "status": "completed", "conclusion": "failure"})
+    return mapped
+
+
 def classify_codex(
     *,
     head_sha: str,
@@ -444,7 +457,13 @@ class GitHubClient:
         hosts = Path.home() / ".config" / "gh" / "hosts.yml"
         if not hosts.exists():
             return None
-        match = re.search(r"oauth_token:\s*(\S+)", hosts.read_text(encoding="utf-8"))
+        text = hosts.read_text(encoding="utf-8")
+        match = re.search(r"(?m)^github\.com:\s*$\n(?P<body>(?:\s+[^\n]*\n?)*)", text)
+        if match:
+            token_match = re.search(r"(?m)^\s+oauth_token:\s*(\S+)", match.group("body"))
+            if token_match:
+                return token_match.group(1)
+        match = re.search(r"oauth_token:\s*(\S+)", text)
         return match.group(1) if match else None
 
     def _headers(self) -> dict[str, str]:
@@ -560,6 +579,11 @@ class GitHubClient:
                 url = parse_next_link(response.headers.get("Link"))
         return items
 
+    def get_commit_statuses_all(self, head_sha: str) -> list[dict[str, Any]]:
+        status_payload = self.get(f"/commits/{head_sha}/status")
+        statuses = status_payload.get("statuses", []) if isinstance(status_payload, dict) else []
+        return statuses if isinstance(statuses, list) else []
+
     def get_reactions(self, comment_id: int) -> list[dict[str, Any]]:
         """Fetch reactions on an issue comment. Returns list of reaction objects."""
         path = f"/issues/comments/{comment_id}/reactions"
@@ -610,6 +634,8 @@ def fetch_live_payloads(owner: str, repo: str, pr_number: int) -> tuple[dict[str
     files = [item["filename"] for item in client.get_all(f"/pulls/{pr_number}/files?per_page=100")]
     head_sha = pr.get("head", {}).get("sha")
     check_runs = client.get_check_runs_all(str(head_sha))
+    commit_statuses = client.get_commit_statuses_all(str(head_sha))
+    check_runs.extend(status_contexts_as_check_runs(commit_statuses))
     comments = client.get_all(f"/issues/{pr_number}/comments?per_page=100")
     reviews = client.get_all(f"/pulls/{pr_number}/reviews?per_page=100")
     if "head_pushed_at" not in pr or pr.get("head_pushed_at") is None:
