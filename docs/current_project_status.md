@@ -242,7 +242,7 @@ All five audits use a shared CSV header resolver with the following policy:
 - PR #191 tooling: add read-only PR gate watchdog (watch_pr_gate_state.py + tests) — watch an open PR, report CI/Codex/blocker state via compact JSON/summary, exit codes only; no GitHub mutations, no Kanban ops, no Codex requests, no merge — **complete PRs #189, #190, #191**
 - PR #192 tooling: add read-only AED Tasker packet scaffold — defines ROADMAP_PACKET.json v1 schema, validates and renders memos, no autonomous Tasker agent — **complete (merged)**
 - PR #193 tooling: add read-only AED Tasker input collector — collects structured internal repo context (HEAD, branch, docs/scripts/tests/schemas presence, recent commits) for future Tasker agent; no LLM calls, no network, no Kanban ops — **complete (merged)**
-- PR #194 tooling: add merge authorization packet (build_merge_ready_packet.py) and guard (check_merge_authorization.py) — explicit human phrase required before merge, no auto-merge, no GitHub mutations — **in review**
+- PR #194 tooling: add merge authorization packet (build_merge_ready_packet.py) and guard (check_merge_authorization.py) — explicit human phrase required before merge, no auto-merge, no GitHub mutations — **merged (41d4323)**
 - Leakage checks stub wiring (schema field exists in RunnerOutput; not yet wired in runner)
 - RunnerOutput trial-accounting linkage schema update (add experiment_id, search_space_id, trial_id, variant_id, n_tried, sample_to_trial_ratio, complexity_bucket fields)
 - TrialLedger linkage extension (carry search_space_id, variant_id, complexity_bucket, all_variants_preserved)
