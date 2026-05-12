@@ -156,6 +156,11 @@ def run_controller(
         classifier_args += ["--base-branch", base_branch]
 
     result = _run_child(classifier_args, check=True)
+    # classify_pr_gate_state.py writes to stdout (--output-json controls compactness).
+    # Capture stdout and write to the expected artifact path.
+    # If stdout is already set by mock (test harness), use it. Otherwise use real output.
+    if result.stdout.strip():
+        classifier_json_path.write_text(result.stdout)
     classifier_packet = _load_json(classifier_json_path)
 
     # Step 2: Generate task draft
