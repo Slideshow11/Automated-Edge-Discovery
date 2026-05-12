@@ -163,14 +163,14 @@ def _reject_hermes_path(output_dir: Path) -> None:
         raise ValueError(f"output-dir cannot be under /home/max/.hermes: {output_dir}")
 
 
-def _build_synthetic_classifier(scenario: dict) -> dict:
+def _build_synthetic_classifier(scenario: dict, *, repo_owner: str, repo_name: str) -> dict:
     head_sha = "a" * 40
     return {
         "classification": scenario["classification"],
         "ci_status": scenario["ci_status"],
         "codex_status": scenario["codex_status"],
         "pr_number": PR_NUMBER,
-        "pr_url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/{PR_NUMBER}",
+        "pr_url": f"https://github.com/{repo_owner}/{repo_name}/pull/{PR_NUMBER}",
         "head_sha": head_sha,
         "base_branch": "main",
         "changed_files": [
@@ -181,12 +181,27 @@ def _build_synthetic_classifier(scenario: dict) -> dict:
     }
 
 
-def _build_synthetic_task_draft(scenario: dict) -> dict:
+def _build_synthetic_task_draft(scenario: dict, *, repo_owner: str, repo_name: str) -> dict:
     """Build a task draft in the schema format that pr_gate_kanban_task_create.py
     validates against (top-level pr_number, head_sha, action, idempotency_key)."""
     classification = scenario["classification"]
     action = scenario["expected_action"]
     head_sha = "a" * 40
+    pr_num = 999
+
+    EXPECTED_ASSIGNEE = {
+        "builder": "aed-builder",
+        "reviewer": "aed-reviewer",
+        "human": "human",
+    }
+    action_assignee_map = {
+        "create_builder_patch_task_draft": "aed-builder",
+        "create_reviewer_task_draft": "aed-reviewer",
+        "create_human_escalation_task_draft": "human",
+        "no_action_wait": None,
+    }
+    action = scenario["expected_action"]
+    assignee = action_assignee_map.get(action)
     pr_num = 999
 
     body_map = {
@@ -220,12 +235,12 @@ def _build_synthetic_task_draft(scenario: dict) -> dict:
         "task_draft": {
             "title": f"PR #{pr_num}: {classification}",
             "body": body_map.get(action, "Task body."),
-            "assignee": None if action == "no_action_wait" else "aed-builder",
+            "assignee": assignee,
             "status": "todo",
         },
         "source": {
             "pr_number": str(pr_num),
-            "pr_url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/{pr_num}",
+            "pr_url": f"https://github.com/{repo_owner}/{repo_name}/pull/{pr_num}",
             "head_sha": head_sha,
             "classification": classification,
             "ci_status": scenario["ci_status"],
@@ -244,12 +259,12 @@ def _build_synthetic_task_draft(scenario: dict) -> dict:
     }
 
 
-def _build_synthetic_merge_ready() -> dict:
+def _build_synthetic_merge_ready(*, repo_owner: str, repo_name: str) -> dict:
     head_sha = "b" * 40
     return {
         "pr": {
             "number": 999,
-            "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/{PR_NUMBER}",
+            "url": f"https://github.com/{repo_owner}/{repo_name}/pull/{PR_NUMBER}",
             "head_sha": head_sha,
             "base_branch": "main",
         },
@@ -298,7 +313,9 @@ def _run_kanban_plan(task_draft_path: Path, output_json: Path, output_md: Path, 
     return data
 
 
-def _run_merge_ready_smoke(output_dir: Path) -> tuple[Path, Path]:
+def _run_merge_ready_smoke(
+    output_dir: Path, *, repo_owner: str, repo_name: str
+) -> tuple[Path, Path]:
     head_sha = "b" * 40
     json_path = output_dir / "MERGE_READY_NOTIFICATION.json"
     md_path = output_dir / "MERGE_READY_NOTIFICATION.md"
@@ -306,7 +323,7 @@ def _run_merge_ready_smoke(output_dir: Path) -> tuple[Path, Path]:
         sys.executable,
         str(_resolve_child("pr_gate_merge_ready_notify.py")),
         "--pr-number", "999",
-        "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/{PR_NUMBER}",
+        "--pr-url", f"https://github.com/{repo_owner}/{repo_name}/pull/{PR_NUMBER}",
         "--head-sha", head_sha,
         "--ci-status", "green",
         "--codex-status", "clean",
@@ -465,7 +482,9 @@ def main(argv: list[str] | None = None) -> int:
         scenario_dir.mkdir(exist_ok=True)
 
         # Step 1: Write synthetic classifier packet
-        classifier = _build_synthetic_classifier(scenario)
+        classifier = _build_synthetic_classifier(
+            scenario, repo_owner=args.repo_owner, repo_name=args.repo_name
+        )
         classifier_path = packets_dir / f"{name}.classifier.json"
         with open(classifier_path, "w") as f:
             json.dump(classifier, f, indent=2)
@@ -493,7 +512,9 @@ def main(argv: list[str] | None = None) -> int:
         # but pr_gate_kanban_task_create.py expects them at the top level.
         # We build a merged packet here that satisfies both schemas so we can
         # smoke-test the full classifier → task_draft → kanban_plan chain.
-        kanban_compat = _build_synthetic_task_draft(scenario)
+        kanban_compat = _build_synthetic_task_draft(
+            scenario, repo_owner=args.repo_owner, repo_name=args.repo_name
+        )
         # Patch the action to match what the child script actually produced
         if actual_action:
             kanban_compat["action"] = actual_action
@@ -525,19 +546,35 @@ def main(argv: list[str] | None = None) -> int:
         action_match = actual_action == scenario["expected_action"]
 
         # Verify: kanban plan matches expected
-        # no_action_wait → plan file exists but kanban_task must be None
-        # others → plan file exists and kanban_task must be non-None
+        # no_action_wait -> plan file exists but kanban_task must be None
+        # others -> plan file exists, kanban_task must be non-None, and assignee
+        #           must match expected_kanban type (builder=aed-builder,
+        #           reviewer=aed-reviewer, human=human)
+        EXPECTED_ASSIGNEE = {
+            "builder": "aed-builder",
+            "reviewer": "aed-reviewer",
+            "human": "human",
+        }
         kanban_match = True
+        has_task = False
+        assignee = None
         if kanban_plan_json.exists():
             kp = kanban_plan_data or {}
             is_dry_run = kp.get("dry_run") is True
             has_task = kp.get("kanban_task") is not None
+            assignee = (
+                kp.get("kanban_task", {}).get("assignee")
+                if has_task else None
+            )
             if expected_kanban is None:
                 # Must produce a "no_action" plan with no task
                 kanban_match = is_dry_run and not has_task
             else:
                 # Must produce a valid dry-run plan with a task
-                kanban_match = is_dry_run and has_task
+                # AND assignee must match the expected_kanban type
+                expected_assignee = EXPECTED_ASSIGNEE.get(expected_kanban)
+                assignee_match = assignee == expected_assignee
+                kanban_match = is_dry_run and has_task and assignee_match
         else:
             # File must exist for all scenarios (even no_action_wait)
             kanban_match = False
@@ -575,8 +612,10 @@ def main(argv: list[str] | None = None) -> int:
                 except Exception:
                     pass
             scenario_result["blockers"].append(
-                f"kanban_plan mismatch: expected_kanban={expected_kanban}, "
-                f"dry_run={kp.get('dry_run')}, has_task={kp.get('kanban_task') is not None}"
+                f"kanban_plan mismatch: expected_kanban={expected_kanban} "
+                f"(assignee={EXPECTED_ASSIGNEE.get(expected_kanban)!r}), "
+                f"dry_run={kp.get('dry_run')}, has_task={has_task}, "
+                f"assignee={assignee!r}"
             )
 
         if not passed:
@@ -588,7 +627,9 @@ def main(argv: list[str] | None = None) -> int:
     # Merge-ready notification smoke
     if not args.skip_merge_ready_smoke:
         try:
-            json_path, md_path = _run_merge_ready_smoke(args.output_dir)
+            json_path, md_path = _run_merge_ready_smoke(
+                args.output_dir, repo_owner=args.repo_owner, repo_name=args.repo_name
+            )
             mr_ok = json_path.exists() and md_path.exists()
             if mr_ok:
                 with open(json_path) as f:
