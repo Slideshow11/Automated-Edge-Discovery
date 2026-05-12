@@ -322,13 +322,16 @@ def build_task_draft(
         title = f"Review PR #{pr_number} (Codex clean, ready for human reviewer)"
         body = _build_reviewer_body(pr_number, pr_url, head_sha, changed_files)
         assignee = ASSIGNEE_MAP[action]
+        executor_allowed: list[str] = []
         if executor_packet:
             pr_plan = executor_packet.get("pr_plan", {})
-            allowed_files = pr_plan.get("allowed_files", changed_files)
+            executor_allowed = pr_plan.get("allowed_files", [])
             forbidden_files = pr_plan.get("forbidden_files", [])
         else:
-            allowed_files = changed_files
+            executor_allowed = []
             forbidden_files = []
+        # Fall back to classifier changed_files if executor allowed_files is empty
+        allowed_files = executor_allowed if executor_allowed else changed_files
         stop_rules = [
             "Stop if PR is closed or merged.",
             "Stop if base branch changes.",
@@ -581,15 +584,13 @@ def validate_task_draft_packet(packet: dict[str, Any]) -> list[str]:
                     "task_draft.body for builder patch must mention allowed files"
                 )
 
-        # All non-wait drafts must prohibit merge
+        # All non-wait drafts must include "Do not merge"
         if action != "no_action_wait":
             body_lower = td.get("body", "").lower()
-            if "merge" in body_lower:
-                # Check that "do not merge" is present
-                if "do not merge" not in body_lower and "do not auto-merge" not in body_lower:
-                    errors.append(
-                        "task_draft.body must include 'Do not merge' instruction"
-                    )
+            if "do not merge" not in body_lower:
+                errors.append(
+                    "task_draft.body must include 'Do not merge' instruction"
+                )
 
     return errors
 

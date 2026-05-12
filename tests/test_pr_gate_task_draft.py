@@ -230,7 +230,7 @@ class TestBuildTaskDraft:
         body = packet["task_draft"]["body"]
         assert "allowed files" in body.lower() or "allowed_files" in body.lower()
 
-    def test_all_drafts_prohibit_merge(self):
+    def test_all_drafts_prohibit_merge_unconditional(self):
         mod = _import_mod()
         actions = [
             ("codex_request_needed", "passed"),
@@ -241,8 +241,8 @@ class TestBuildTaskDraft:
         ]
         for cls, ci in actions:
             packet = mod.build_task_draft(minimal_classifier(cls, ci), None)
-            body = packet["task_draft"]["body"]
-            assert "do not merge" in body.lower(), f"{cls}/{ci} body missing merge prohibition"
+            body = packet["task_draft"]["body"].lower()
+            assert "do not merge" in body, f"{cls}/{ci} body missing unconditional 'Do not merge'"
 
     def test_all_drafts_prohibit_memory_update_and_skill_manage(self):
         mod = _import_mod()
@@ -318,6 +318,43 @@ class TestBuildTaskDraft:
         # Should fall back to classifier changed_files, not empty list
         assert "scripts/local/something.py" in td.get("allowed_files", [])
         assert td["allowed_files"] != []
+
+    def test_reviewer_executor_empty_allowed_files_falls_back_to_changed_files(self):
+        """P2 fix: reviewer task with empty executor allowed_files falls back to classifier."""
+        mod = _import_mod()
+        executor = {
+            "packet_kind": "aed.executor.plan.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-11T00:00:00Z",
+            "pr_plan": {
+                "allowed_files": [],  # empty scope
+                "forbidden_files": [],
+                "goal": "Empty scope",
+                "validation_commands": [],
+            },
+        }
+        classifier = minimal_classifier(
+            "ready_for_reviewer", "passed",
+            changed_files=["scripts/local/another.py"],
+        )
+        packet = mod.build_task_draft(classifier, executor)
+        td = packet["task_draft"]
+        # Should fall back to classifier changed_files
+        assert "scripts/local/another.py" in td.get("allowed_files", [])
+        assert td["allowed_files"] != []
+
+    def test_merge_prohibition_required_even_without_merge_word(self):
+        """P2 fix: validator rejects non-wait body that omits 'Do not merge'."""
+        mod = _import_mod()
+        packet = mod.build_task_draft(
+            minimal_classifier("codex_request_needed", "passed"),
+            None,
+        )
+        # Strip "merge" from body to prove unconditional check
+        packet["task_draft"]["body"] = packet["task_draft"]["body"].lower().replace("merge", "___")
+        errs = mod.validate_task_draft_packet(packet)
+        assert any("do not merge" in e.lower() for e in errs), \
+            "Validator must reject body without 'Do not merge' even when 'merge' word absent"
 
 
 # ---------------------------------------------------------------------------
