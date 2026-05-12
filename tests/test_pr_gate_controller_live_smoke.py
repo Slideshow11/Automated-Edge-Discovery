@@ -597,8 +597,7 @@ def test_ci_check_smoke_exits_zero_on_pass():
     from pathlib import Path
 
     smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
-    if not smoke_py.exists():
-        pytest.skip("ci_check_smoke.py not present in this branch")
+    assert smoke_py.exists(), f"ci_check_smoke.py not found at {smoke_py} — must not be missing"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
@@ -622,8 +621,7 @@ def test_ci_check_smoke_exits_nonzero_on_fail():
     from pathlib import Path
 
     smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
-    if not smoke_py.exists():
-        pytest.skip("ci_check_smoke.py not present in this branch")
+    assert smoke_py.exists(), f"ci_check_smoke.py not found at {smoke_py} — must not be missing"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
@@ -652,8 +650,7 @@ def test_ci_check_smoke_exits_nonzero_when_report_missing():
     from pathlib import Path
 
     smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
-    if not smoke_py.exists():
-        pytest.skip("ci_check_smoke.py not present in this branch")
+    assert smoke_py.exists(), f"ci_check_smoke.py not found at {smoke_py} — must not be missing"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)

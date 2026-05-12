@@ -3,8 +3,18 @@ name: CI
 on:
   push:
     branches: [ main, 'fix/*', 'feat/*' ]
+    paths:
+      - 'scripts/local/pr_gate_*.py'
+      - 'tests/test_pr_gate_controller_live_smoke.py'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/ci_check_smoke.py'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'scripts/local/pr_gate_*.py'
+      - 'tests/test_pr_gate_controller_live_smoke.py'
+      - '.github/workflows/ci.yml'
+      - '.github/workflows/ci_check_smoke.py'
 
 jobs:
   test:
@@ -82,17 +92,10 @@ jobs:
   pr-gate-live-smoke:
     needs: [test]
     runs-on: ubuntu-latest
-    # Run on all PRs to main and on push to main/fix*/feat*/ci* branches.
-    # The smoke harness itself is read-only (no kanban create, no dispatch,
+    # Runs only when pr_gate scripts, tests, or CI workflow files change
+    # (enforced by the paths filter on the workflow trigger above).
+    # The smoke harness is read-only (no kanban create, no dispatch,
     # no merge, no external side-effects).
-    if: |
-      github.event_name == 'pull_request' ||
-      github.event_name == 'push' && (
-        contains(github.event.ref, 'main') ||
-        startsWith(github.event.ref, 'refs/heads/fix/') ||
-        startsWith(github.event.ref, 'refs/heads/feat/') ||
-        startsWith(github.event.ref, 'refs/heads/ci/')
-      )
     steps:
       - name: Checkout
         uses: actions/checkout@v4
