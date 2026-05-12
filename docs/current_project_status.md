@@ -151,6 +151,7 @@ The project is not yet a live trading or production system.
 - PR #199 tooling: add PR gate controller — end-to-end orchestrator chaining classifier → task draft → kanban plan, dry-run by default, optional --apply-create-task
 - PR #200 tooling: add PR gate merge-ready notification packet — consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
 - PR #201 tooling: add PR gate controller live-smoke harness — read-only smoke harness that verifies the full controller chain (classifier → task draft → kanban plan → merge-ready notification) using 4 synthetic scenarios; never dispatches, merges, or calls Codex; prepares future auto-dispatch wiring
+- PR #204 tooling: add CI workflow trigger invariant checker — read-only local checker that validates GitHub Actions CI workflow triggers; detects workflow-level paths filters that can silently suppress full CI; YAML 1.1 boolean-`on` quirk handled; 17 invariants checked; used to prevent future regressions like PR #203's initial paths-filter design
 
 ## Current stop rules
 

@@ -33,6 +33,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - PR gate controller complete (PR #199): end-to-end orchestrator chaining classifier → task draft → kanban plan, dry-run by default
 - PR gate merge-ready notification packet complete (PR #200): consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
 - PR gate controller live-smoke harness complete (PR #201): read-only smoke verifying full chain via 4 synthetic scenarios; prepares future auto-dispatch wiring
+- CI workflow trigger invariant checker complete (PR #204): read-only local checker that validates GitHub Actions CI workflow trigger invariants; detects workflow-level paths filters; YAML 1.1 boolean-`on` quirk handled; 17 invariants
 
 ## Document groups
 
