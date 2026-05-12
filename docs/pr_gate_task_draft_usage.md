@@ -306,6 +306,42 @@ Future automation may wire a controller that:
 
 This keeps human-in-the-loop for all Kanban task creation, just as the merge guard keeps human-in-the-loop for all PR merges.
 
+## 13. PR #201 — Controller Live-Smoke Harness
+
+PR #201 adds `pr_gate_controller_live_smoke.py` — a read-only smoke harness that verifies the PR gate controller chain end-to-end before auto-dispatch is wired.
+
+### Why It Exists
+
+PRs #189 through #200 built the PR control plane (`classify` → `task_draft` → `kanban_task_create` → `merge_ready_notify`). Before wiring auto-dispatch or stronger automation, we need a deterministic smoke test that proves the chain works in a single run without human intervention.
+
+### What It Tests
+
+The harness runs 4 synthetic scenarios through the full chain:
+
+| Scenario | Classification | Expected Action | Kanban Plan |
+|---|---|---|---|
+| `codex_pending` | `codex_pending` | `no_action_wait` | `no_action` (no task) |
+| `codex_suggestions` | `codex_suggestions` | `create_builder_patch_task_draft` | builder task plan |
+| `ready_for_reviewer` | `ready_for_reviewer` | `create_reviewer_task_draft` | reviewer task plan |
+| `blocked_scope` | `blocked_scope` | `create_human_escalation_task_draft` | human escalation plan |
+
+For each scenario it:
+1. Creates a synthetic classifier packet
+2. Runs `pr_gate_task_draft.py` — verifies correct action mapping
+3. Runs `pr_gate_kanban_task_create.py` (dry-run) — verifies plan content
+4. Verifies all stop rules are enforced
+
+### Why It Remains Dry-Run Only
+
+The harness never calls `hermes kanban create-task`, never dispatches workers, and never calls Codex automatically. The purpose is verification, not execution. After smoke passes, future PRs will add optional `--apply` wiring with human authorization.
+
+### How This Prepares Future Controller Automation
+
+Once the smoke harness confirms the full chain is deterministic and error-free:
+- A real controller can be wired to run on a schedule
+- Auto-dispatch can be added with confidence that the chain is solid
+- New scenarios can be added to the smoke harness before they reach production
+
 ### See Also
 
 - `docs/pr_gate_task_draft_usage.md` — Task draft generator documentation

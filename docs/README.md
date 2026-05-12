@@ -32,6 +32,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - Tasker packet scaffold complete (PR #192, design-only; no autonomous Tasker agent)
 - PR gate controller complete (PR #199): end-to-end orchestrator chaining classifier → task draft → kanban plan, dry-run by default
 - PR gate merge-ready notification packet complete (PR #200): consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
+- PR gate controller live-smoke harness complete (PR #201): read-only smoke verifying full chain via 4 synthetic scenarios; prepares future auto-dispatch wiring
 
 ## Document groups
 
@@ -93,6 +94,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/run_pr_gate_watchdog_once.py | INI-config-aware wrapper for watch_pr_gate_state.py. Supports summary/compact/json output modes. | Read-only |
 | scripts/local/pr_gate_controller.py | End-to-end PR gate orchestrator: classify → task draft → kanban plan. Dry-run by default; optional --apply-create-task. Consumes PR data, produces CONTROLLER_RUN_PACKET.json. No hermes kanban, no merge, no dispatch. | Read-only |
 | scripts/local/pr_gate_merge_ready_notify.py | Consumes CONTROLLER_RUN_PACKET.json or direct CLI parameters, produces Telegram-ready MERGE_READY_NOTIFICATION.json/md with authorization phrase and merge command. Two input modes. Does NOT send Telegram. | Read-only |
+| scripts/local/pr_gate_controller_live_smoke.py | Read-only smoke harness verifying full controller chain (classifier → task draft → kanban plan → merge-ready notification) via 4 synthetic scenarios. Never dispatches, merges, or calls Codex. Prepares future auto-dispatch wiring. | Read-only |
 
 If a script listed above is not present in a checkout, treat it as "not present in current checkout" rather than inferring behavior from duplicate files outside the repo.
 

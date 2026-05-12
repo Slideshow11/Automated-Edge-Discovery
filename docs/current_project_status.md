@@ -150,6 +150,7 @@ The project is not yet a live trading or production system.
 - PR #189 tooling: add read-only local PR gate state classifier for scope, CI, and current-head Codex evidence packets (no comments, tasks, dispatch, patching, or merge behavior)
 - PR #199 tooling: add PR gate controller — end-to-end orchestrator chaining classifier → task draft → kanban plan, dry-run by default, optional --apply-create-task
 - PR #200 tooling: add PR gate merge-ready notification packet — consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
+- PR #201 tooling: add PR gate controller live-smoke harness — read-only smoke harness that verifies the full controller chain (classifier → task draft → kanban plan → merge-ready notification) using 4 synthetic scenarios; never dispatches, merges, or calls Codex; prepares future auto-dispatch wiring
 
 ## Current stop rules
 
