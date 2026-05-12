@@ -504,6 +504,34 @@ def test_not_required_with_reason_treated_as_clean(tmp_output_dir):
 
 
 # ---------------------------------------------------------------------------
+# Test: mergeable=False produces not_merge_ready
+# ---------------------------------------------------------------------------
+
+def test_unmergeable_produces_not_merge_ready(tmp_output_dir):
+    """PR with all gates clean but mergeable=False should be not_merge_ready."""
+    out_json = tmp_output_dir / "notification.json"
+    out_md = tmp_output_dir / "notification.md"
+    result = subprocess.run(
+        [
+            sys.executable, str(SCRIPT),
+            "--pr-number", "199", "--pr-url", VALID_PR["url"],
+            "--head-sha", VALID_PR["head_sha"],
+            "--ci-status", "green", "--codex-status", "clean",
+            "--fallback-review-status", "clean", "--reviewer-status", "approved",
+            "--scope-status", "clean",
+            # --mergeable omitted = False
+            "--output-json", str(out_json), "--output-md", str(out_md),
+        ],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0
+    packet = json.loads(out_json.read_text())
+    assert packet["recommendation"] == "not_merge_ready"
+    assert packet["required_authorization_phrase"] is None
+    assert any("mergeable" in b.lower() for b in packet["blockers_or_uncertainty"])
+
+
+# ---------------------------------------------------------------------------
 # Test: not_merge_ready blocked phrase when CI is red
 # ---------------------------------------------------------------------------
 
@@ -525,3 +553,52 @@ def test_blocked_packet_does_not_include_merge_phrase(tmp_output_dir):
     assert packet["required_authorization_phrase"] is None
     assert packet["merge_command_template"] is None
     assert len(packet["blockers_or_uncertainty"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# Test: old MERGE_READY_PACKET (reviewed_clean, no scope_status) produces merge_ready
+# ---------------------------------------------------------------------------
+
+def test_old_packet_format_compatibility(tmp_path):
+    """Old MERGE_READY_PACKET from build_merge_ready_packet.py (PR #193) works."""
+    mrp = tmp_path / "MERGE_READY_PACKET.json"
+    crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+    out_json = tmp_path / "notification.json"
+    out_md = tmp_path / "notification.md"
+
+    # Old format: codex_status = "reviewed_clean", no scope_status, no fallback_review_status
+    mrp.write_text(json.dumps({
+        "pr": {
+            "number": 193, "url": VALID_PR["url"],
+            "head_sha": "af386e4c75341a2a6e7a6f68b680844de5cef1df",
+            "base_branch": "main",
+        },
+        "ci_status": "green",
+        "codex_status": "reviewed_clean",
+        "reviewer_status": "approved",
+        "mergeable": True,
+        "changed_files": ["docs/README.md"],
+        # note: no scope_status, no fallback_review_status
+    }))
+    crp.write_text(json.dumps({
+        "result": {
+            "ci_status": "green",
+            "codex_status": "reviewed_clean",
+            "reviewer_status": "approved",
+        }
+    }))
+    result = subprocess.run(
+        [
+            sys.executable, str(SCRIPT),
+            "--merge-ready-packet", str(mrp),
+            "--controller-run-packet", str(crp),
+            "--output-json", str(out_json),
+            "--output-md", str(out_md),
+        ],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    packet = json.loads(out_json.read_text())
+    assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
+    assert packet["required_authorization_phrase"] is not None
+    assert "af386e4c75341a2a6e7a6f68b680844de5cef1df" in packet["required_authorization_phrase"]

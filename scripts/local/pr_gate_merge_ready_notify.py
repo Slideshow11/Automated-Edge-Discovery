@@ -119,14 +119,16 @@ def _build_gate_summary(
 def _is_merge_ready(gate_summary: dict[str, Any]) -> bool:
     if gate_summary.get("ci_status") != "green":
         return False
-    if gate_summary.get("scope_status") != "clean":
+    if gate_summary.get("scope_status") not in ("clean", ""):
         return False
     reviewer = gate_summary.get("reviewer_status", "")
-    if reviewer not in ("clean", "approved", "not_required_with_reason"):
+    if reviewer not in ("clean", "approved", "not_required_with_reason", ""):
         return False
     codex = gate_summary.get("codex_status", "")
     fallback = gate_summary.get("fallback_review_status", "")
-    if codex not in ("clean", "") and fallback not in ("clean", ""):
+    if codex not in ("clean", "reviewed_clean", "") and fallback not in ("clean", ""):
+        return False
+    if not gate_summary.get("mergeable", False):
         return False
     if gate_summary.get("blockers"):
         return False
@@ -258,15 +260,17 @@ def _collect_blockers(gate_summary: dict[str, Any]) -> list[str]:
     blockers = []
     if gate_summary.get("ci_status") != "green":
         blockers.append(f"CI is not green: {gate_summary.get('ci_status')}")
-    if gate_summary.get("scope_status") != "clean":
+    if gate_summary.get("scope_status") not in ("clean", ""):
         blockers.append(f"Scope is not clean: {gate_summary.get('scope_status')}")
     reviewer = gate_summary.get("reviewer_status", "")
     if reviewer not in ("clean", "approved", "not_required_with_reason", ""):
         blockers.append(f"Reviewer status is not clean/approved: {reviewer}")
     codex = gate_summary.get("codex_status", "")
     fallback = gate_summary.get("fallback_review_status", "")
-    if codex not in ("clean", "") and fallback not in ("clean", ""):
+    if codex not in ("clean", "reviewed_clean", "") and fallback not in ("clean", ""):
         blockers.append("Neither Codex nor fallback review is clean")
+    if not gate_summary.get("mergeable", False):
+        blockers.append("PR is not mergeable (has merge conflicts)")
     return blockers
 
 
@@ -438,10 +442,17 @@ def _packet_mode(args: argparse.Namespace) -> int:
     head_sha = pr_info.get("head_sha") or mrp.get("head_sha")
     base_branch = pr_info.get("base_branch") or mrp.get("base_branch", "main")
 
-    ci_status = gate.get("ci_status", mrp.get("ci_status", "unknown"))
-    codex_status = gate.get("codex_status", mrp.get("codex_status", "unknown"))
-    reviewer_status = gate.get("reviewer_status", mrp.get("reviewer_status", "unknown"))
-    scope_status = mrp.get("scope_status", "unknown")
+    # Old MERGE_READY_PACKET (PR #193) uses "reviewed_clean" and has no scope_status.
+    # Normalize to new format for compatibility.
+    raw_codex = gate.get("codex_status") or mrp.get("codex_status", "unknown")
+    codex_status = "clean" if raw_codex == "reviewed_clean" else raw_codex
+
+    # scope_status: old packets have none; treat absent as "clean" (scope was not tracked then)
+    raw_scope = mrp.get("scope_status", "")
+    scope_status = raw_scope if raw_scope else "clean"
+
+    ci_status = gate.get("ci_status") or mrp.get("ci_status", "unknown")
+    reviewer_status = gate.get("reviewer_status") or mrp.get("reviewer_status", "unknown")
     mergeable = mrp.get("mergeable", False)
     changed_files = mrp.get("changed_files", [])
     fallback = mrp.get("fallback_review_status", "unknown")
