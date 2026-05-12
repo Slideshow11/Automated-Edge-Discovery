@@ -224,6 +224,24 @@ class TestValidateTaskDraft:
         errors = mod.validate_task_draft(draft)
         assert any("pr_number" in e.lower() for e in errors)
 
+    def test_non_string_body_fails(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr198-e6a9eb9-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 198,
+            "head_sha": "e6a9eb9c40c8f8a9f09c7dd64d3a14509ac94fc8",
+            "task_draft": {
+                "title": "Test",
+                "body": 12345,  # non-string body
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert any("must be a string" in e for e in errors)
+
 
 # ---------------------------------------------------------------------------
 # Build plan tests

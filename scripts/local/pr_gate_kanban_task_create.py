@@ -126,7 +126,11 @@ def validate_task_draft(draft: dict) -> list[str]:
         errors.append("task_draft must be a JSON object")
     else:
         body = task_draft.get("body", "")
-        if body:
+        if not isinstance(body, str):
+            errors.append(
+                f"task_draft.body must be a string, got {type(body).__name__}"
+            )
+        elif body:
             for pat in SAFETY_PATTERNS:
                 m = pat.search(body)
                 if m:
@@ -534,11 +538,15 @@ def main() -> int:
 
     # Safety body check (extra layer)
     body = draft.get("task_draft", {}).get("body", "")
-    for pat in SAFETY_PATTERNS:
-        m = pat.search(body)
-        if m:
-            print(f"ERROR: task_draft.body contains forbidden pattern: '{m.group()}'", file=sys.stderr)
-            return 1
+    if not isinstance(body, str):
+        print(f"ERROR: task_draft.body must be a string, got {type(body).__name__}", file=sys.stderr)
+        return 1
+    if body:
+        for pat in SAFETY_PATTERNS:
+            m = pat.search(body)
+            if m:
+                print(f"ERROR: task_draft.body contains forbidden pattern: '{m.group()}'", file=sys.stderr)
+                return 1
 
     dry_run = not args.apply
 
