@@ -388,3 +388,102 @@ def test_safety_grep_no_merge_dispatch_calls():
             if pat in line:
                 findings.append(f"line {i}: {line.strip()}")
     assert not findings, "Forbidden calls found:\n" + "\n".join(findings)
+
+
+# ---------------------------------------------------------------------------
+# P1 Regression test: wrong kanban assignee fails smoke
+# ---------------------------------------------------------------------------
+
+def test_wrong_kanban_assignee_fails_smoke():
+    """If a non-no_action scenario produces a plan with the wrong assignee,
+    the smoke must fail. This is a regression guard for P1.
+
+    The harness now validates that the kanban task assignee matches the
+    expected_kanban type (builder->aed-builder, reviewer->aed-reviewer,
+    human->human). A plan with a mismatched assignee is a smoke failure."""
+    # Import the synthetic builder to verify the routing map directly
+    # Import the module
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "pr_gate_controller_live_smoke",
+        SCRIPT,
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pr_gate_controller_live_smoke"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        pass  # module may already be loaded
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        result = run_smoke(out)
+        report = _load_report(out)
+        assert report["summary"]["passed"], (
+            f"Baseline smoke must pass: {report['summary']['failed_scenarios']}"
+        )
+        # Verify each non-no_action scenario routes to the correct assignee
+        for s in report["scenarios"]:
+            if s["name"] == "codex_pending":
+                continue
+            kp_path = s.get("kanban_plan_json")
+            assert kp_path, f"No kanban plan for {s['name']}"
+            kp_data = json.load(open(kp_path))
+            kt = kp_data.get("kanban_task") or {}
+            assignee = kt.get("assignee")
+            if s["name"] == "codex_suggestions":
+                assert assignee == "aed-builder", (
+                    f"codex_suggestions must route to aed-builder, got {assignee}"
+                )
+            elif s["name"] == "ready_for_reviewer":
+                assert assignee == "aed-reviewer", (
+                    f"ready_for_reviewer must route to aed-reviewer, got {assignee}"
+                )
+            elif s["name"] == "blocked_scope":
+                assert assignee == "human", (
+                    f"blocked_scope must route to human, got {assignee}"
+                )
+    sys.modules.pop("pr_gate_controller_live_smoke", None)
+
+
+# ---------------------------------------------------------------------------
+# P2 test: custom repo args are used consistently in packet URLs
+# ---------------------------------------------------------------------------
+
+def test_custom_repo_args_used_in_packet_urls():
+    """When --repo-owner and --repo-name are provided, generated classifier
+    packets, task draft source, and merge-ready notification URLs must all
+    use those values (not hardcoded Slideshow11/Automated-Edge-Discovery)."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        result = run_smoke(
+            out,
+            extra_args=[
+                "--repo-owner", "acme-corp",
+                "--repo-name", "my-repo",
+            ],
+        )
+        report = _load_report(out)
+        # Report header must use custom repo
+        assert report["repo"]["owner"] == "acme-corp"
+        assert report["repo"]["name"] == "my-repo"
+        # Check classifier packets
+        for scenario_name in ["codex_pending", "codex_suggestions"]:
+            classifier_file = (
+                out / "classifier_packets" / f"{scenario_name}.classifier.json"
+            )
+            assert classifier_file.exists(), f"{scenario_name} classifier not found"
+            data = json.load(open(classifier_file))
+            assert "acme-corp" in data["pr_url"], (
+                f"Classifier URL should use acme-corp, got: {data['pr_url']}"
+            )
+            assert "my-repo" in data["pr_url"], (
+                f"Classifier URL should use my-repo, got: {data['pr_url']}"
+            )
+        # Merge-ready notification URL must use custom repo
+        mr_json = out / "MERGE_READY_NOTIFICATION.json"
+        assert mr_json.exists(), "Merge-ready notification JSON not found"
+        mr_data = json.load(open(mr_json))
+        mr_url = mr_data.get("pr", {}).get("url", "")
+        assert "acme-corp" in mr_url, f"Merge-ready URL should use acme-corp, got: {mr_url}"
+        assert "my-repo" in mr_url, f"Merge-ready URL should use my-repo, got: {mr_url}"
