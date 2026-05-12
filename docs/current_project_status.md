@@ -243,7 +243,8 @@ All five audits use a shared CSV header resolver with the following policy:
 - PR #192 tooling: add read-only AED Tasker packet scaffold — defines ROADMAP_PACKET.json v1 schema, validates and renders memos, no autonomous Tasker agent — **complete (merged)**
 - PR #193 tooling: add read-only AED Tasker input collector — collects structured internal repo context (HEAD, branch, docs/scripts/tests/schemas presence, recent commits) for future Tasker agent; no LLM calls, no network, no Kanban ops — **complete (merged)**
 - PR #194 tooling: add merge authorization packet (build_merge_ready_packet.py) and guard (check_merge_authorization.py) — explicit human phrase required before merge, no auto-merge, no GitHub mutations — **merged (41d4323)**
-- PR #195 tooling: add read-only AED Tasker prompt bundle — takes AED_TASKER_CONTEXT.json, produces AED_TASKER_PROMPT.md + AED_TASKER_RUN_CONFIG.json with stop rules, model routing, research instructions, and candidate PR output requirements — **in review**
+- PR #195 tooling: add read-only AED Tasker prompt bundle — takes AED_TASKER_CONTEXT.json, produces AED_TASKER_PROMPT.md + AED_TASKER_RUN_CONFIG.json with stop rules, model routing, research instructions, and candidate PR output requirements — **merged (de83dae4)**
+- PR #196 tooling: add read-only AED Executor packet scaffold — defines EXECUTOR_PACKET.json v1 schema, validates and renders execution plans, generates draft from ROADMAP_PACKET.json via from-roadmap CLI; does NOT call LLMs, does NOT dispatch Builder, does NOT create Kanban tasks — **in review**
 - Leakage checks stub wiring (schema field exists in RunnerOutput; not yet wired in runner)
 - RunnerOutput trial-accounting linkage schema update (add experiment_id, search_space_id, trial_id, variant_id, n_tried, sample_to_trial_ratio, complexity_bucket fields)
 - TrialLedger linkage extension (carry search_space_id, variant_id, complexity_bucket, all_variants_preserved)
