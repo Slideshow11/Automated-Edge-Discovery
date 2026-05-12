@@ -208,12 +208,30 @@ def _build_kanban_create_command(
 
 
 def _render_body_from_task_draft(task_draft: dict, draft: dict) -> str:
-    """Render task body from task_draft fields."""
+    """Render task body from task_draft fields, appending file-scope constraints."""
     body = task_draft.get("body", "")
     if not body:
         # Fallback to title if body is empty
         title = task_draft.get("title", "")
         body = f"# Task\n\n{title}" if title else "# (no body)"
+
+    # Append file-scope constraints if present
+    allowed = task_draft.get("allowed_files")
+    forbidden = task_draft.get("forbidden_files")
+    if allowed or forbidden:
+        scope_lines = ["", "## File Scope", ""]
+        if allowed:
+            scope_lines.append("Allowed files:")
+            for f in allowed:
+                scope_lines.append(f"  - {f}")
+            scope_lines.append("")
+        if forbidden:
+            scope_lines.append("Forbidden files:")
+            for f in forbidden:
+                scope_lines.append(f"  - {f}")
+            scope_lines.append("")
+        body += "\n".join(scope_lines)
+
     return body
 
 
@@ -291,6 +309,10 @@ def build_plan(
             "idempotency_key": idempotency_key,
             "parent_task_id": task_draft.get("parent_task_id") or None,
             "depends_on": task_draft.get("depends_on") or None,
+            "metadata": {
+                "allowed_files": task_draft.get("allowed_files") or None,
+                "forbidden_files": task_draft.get("forbidden_files") or None,
+            },
         }
 
     # In dry-run mode, never call hermes

@@ -152,6 +152,7 @@ The project is not yet a live trading or production system.
 - PR #200 tooling: add PR gate merge-ready notification packet — consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
 - PR #201 tooling: add PR gate controller live-smoke harness — read-only smoke harness that verifies the full controller chain (classifier → task draft → kanban plan → merge-ready notification) using 4 synthetic scenarios; never dispatches, merges, or calls Codex; prepares future auto-dispatch wiring
 - PR #204 tooling: add CI workflow trigger invariant checker — read-only local checker that validates GitHub Actions CI workflow triggers; detects workflow-level paths filters that can silently suppress full CI; YAML 1.1 boolean-`on` quirk handled; 17 invariants checked; used to prevent future regressions like PR #203's initial paths-filter design
+- PR #205 fix: align task draft and Kanban create schema for allowed_files / forbidden_files — task_draft.allowed_files and forbidden_files now preserved in kanban_task.metadata and body ## File Scope section; 10 new tests; ensures file-scope constraints survive from task draft to Kanban task creation
 
 ## Current stop rules
 

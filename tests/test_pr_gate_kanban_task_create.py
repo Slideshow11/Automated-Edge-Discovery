@@ -442,6 +442,119 @@ class TestCLI:
 
 
 # ---------------------------------------------------------------------------
+# File-scope constraint tests (PR #205)
+# ---------------------------------------------------------------------------
+
+class TestFileScopeConstraints:
+    """Tests for allowed_files / forbidden_files preservation in plan and body."""
+
+    def test_dry_run_plan_includes_allowed_files_metadata(
+        self, mod, valid_draft_builder
+    ):
+        """PLAN JSON includes kanban_task.metadata.allowed_files."""
+        draft = valid_draft_builder
+        draft["task_draft"]["allowed_files"] = [
+            "scripts/local/foo.py",
+            "tests/test_foo.py",
+        ]
+        plan = mod.build_plan(draft, board="aed", dry_run=True, apply_mode=False)
+        assert plan["kanban_task"] is not None
+        assert plan["kanban_task"]["metadata"]["allowed_files"] == [
+            "scripts/local/foo.py",
+            "tests/test_foo.py",
+        ]
+
+    def test_dry_run_plan_includes_forbidden_files_metadata(
+        self, mod, valid_draft_builder
+    ):
+        """PLAN JSON includes kanban_task.metadata.forbidden_files."""
+        draft = valid_draft_builder
+        draft["task_draft"]["forbidden_files"] = [
+            "scripts/local/bar.py",
+            "engine/",
+        ]
+        plan = mod.build_plan(draft, board="aed", dry_run=True, apply_mode=False)
+        assert plan["kanban_task"] is not None
+        assert plan["kanban_task"]["metadata"]["forbidden_files"] == [
+            "scripts/local/bar.py",
+            "engine/",
+        ]
+
+    def test_dry_run_plan_allowed_files_is_null_when_absent(self, mod, valid_draft_builder):
+        """metadata.allowed_files is null when task_draft has no allowed_files."""
+        plan = mod.build_plan(valid_draft_builder, board="aed", dry_run=True, apply_mode=False)
+        assert plan["kanban_task"]["metadata"]["allowed_files"] is None
+
+    def test_dry_run_plan_forbidden_files_is_null_when_absent(self, mod, valid_draft_builder):
+        """metadata.forbidden_files is null when task_draft has no forbidden_files."""
+        plan = mod.build_plan(valid_draft_builder, board="aed", dry_run=True, apply_mode=False)
+        assert plan["kanban_task"]["metadata"]["forbidden_files"] is None
+
+    def test_apply_body_includes_allowed_files(self, mod, valid_draft_builder):
+        """The task body includes the ## File Scope / Allowed files section."""
+        draft = valid_draft_builder
+        draft["task_draft"]["allowed_files"] = [
+            "scripts/local/foo.py",
+            "tests/test_foo.py",
+        ]
+        plan = mod.build_plan(draft, board="aed", dry_run=False, apply_mode=True)
+        body = plan["kanban_task"]["body"]
+        assert "## File Scope" in body
+        assert "Allowed files:" in body
+        assert "scripts/local/foo.py" in body
+        assert "tests/test_foo.py" in body
+
+    def test_apply_body_includes_forbidden_files(self, mod, valid_draft_builder):
+        """The task body includes the ## File Scope / Forbidden files section."""
+        draft = valid_draft_builder
+        draft["task_draft"]["forbidden_files"] = [
+            "scripts/local/bar.py",
+            "engine/",
+        ]
+        plan = mod.build_plan(draft, board="aed", dry_run=False, apply_mode=True)
+        body = plan["kanban_task"]["body"]
+        assert "## File Scope" in body
+        assert "Forbidden files:" in body
+        assert "scripts/local/bar.py" in body
+        assert "engine/" in body
+
+    def test_body_includes_both_allowed_and_forbidden(self, mod, valid_draft_builder):
+        """When both are present, both sections appear in the body."""
+        draft = valid_draft_builder
+        draft["task_draft"]["allowed_files"] = ["scripts/local/foo.py"]
+        draft["task_draft"]["forbidden_files"] = ["scripts/local/bar.py"]
+        plan = mod.build_plan(draft, board="aed", dry_run=False, apply_mode=True)
+        body = plan["kanban_task"]["body"]
+        # Both sections present
+        allowed_idx = body.index("Allowed files:")
+        forbidden_idx = body.index("Forbidden files:")
+        assert allowed_idx < forbidden_idx
+
+    def test_no_action_wait_still_creates_no_task(self, mod, no_action_draft):
+        """Regression: no_action_wait still produces no kanban_task."""
+        plan = mod.build_plan(no_action_draft, board="aed", dry_run=False, apply_mode=True)
+        assert plan["kanban_task"] is None
+        assert plan["recommended_action"] == "no_action"
+
+    def test_dry_run_does_not_call_hermes_kanban(self, mod, valid_draft_builder):
+        """dry_run=True never invokes the hermes kanban helper."""
+        import unittest.mock as mock
+
+        draft = valid_draft_builder
+        draft["task_draft"]["allowed_files"] = ["scripts/local/foo.py"]
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            mod.build_plan(draft, board="aed", dry_run=True, apply_mode=False)
+            mock_call.assert_not_called()
+
+    def test_dry_run_plan_has_no_apply_result(self, mod, valid_draft_builder):
+        """dry_run plan's apply_result shows applied=False and no command."""
+        draft = valid_draft_builder
+        plan = mod.build_plan(draft, board="aed", dry_run=True, apply_mode=False)
+        assert plan["apply_result"]["applied"] is False
+        assert plan["apply_result"]["command_used"] is None
+
+
+# ---------------------------------------------------------------------------
 # Safety grep test
 # ---------------------------------------------------------------------------
 
