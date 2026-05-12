@@ -3,15 +3,8 @@ name: CI
 on:
   push:
     branches: [ main, 'fix/*', 'feat/*' ]
-    paths:
-      - 'scripts/local/pr_gate_*.py'
-      - 'tests/test_pr_gate_controller_live_smoke.py'
-      - '.github/workflows/ci.yml'
-      - '.github/workflows/ci_check_smoke.py'
   pull_request:
     branches: [ main ]
-    # NOTE: no paths filter here — all PRs to main run full CI.
-    # The pr-gate-live-smoke job uses job-level if to self-filter.
 
 jobs:
   test:
