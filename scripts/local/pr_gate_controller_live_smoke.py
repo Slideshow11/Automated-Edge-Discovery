@@ -556,6 +556,8 @@ def main(argv: list[str] | None = None) -> int:
             "human": "human",
         }
         kanban_match = True
+        has_task = False
+        assignee = None
         if kanban_plan_json.exists():
             kp = kanban_plan_data or {}
             is_dry_run = kp.get("dry_run") is True

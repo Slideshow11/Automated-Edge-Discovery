@@ -487,3 +487,101 @@ def test_custom_repo_args_used_in_packet_urls():
         mr_url = mr_data.get("pr", {}).get("url", "")
         assert "acme-corp" in mr_url, f"Merge-ready URL should use acme-corp, got: {mr_url}"
         assert "my-repo" in mr_url, f"Merge-ready URL should use my-repo, got: {mr_url}"
+
+
+# ---------------------------------------------------------------------------
+# P2 regression: missing kanban plan file produces failure, not crash
+# ---------------------------------------------------------------------------
+
+def test_missing_kanban_plan_file_records_failure_not_crash():
+    """When the kanban plan file is absent, the smoke harness must record a
+    scenario-level failure with a useful blocker message — NOT raise
+    UnboundLocalError by referencing has_task or assignee before they are
+    defined."""
+    import importlib.util
+
+    # Import the harness module directly so we can patch _run_kanban_plan
+    spec = importlib.util.spec_from_file_location(
+        "pr_gate_controller_live_smoke", str(SCRIPT)
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["pr_gate_controller_live_smoke"] = mod
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        pass  # already loaded
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        out.mkdir(exist_ok=True)
+
+        # Synthetics: only need classifier + task_draft; patch them in
+        import shutil, uuid
+
+        packets_dir = out / "classifier_packets"
+        packets_dir.mkdir()
+        classifier = {
+            "packet_kind": "aed.pr_gate.classifier.v1",
+            "pr_url": f"https://github.com/Slideshow11/Automated-Edge-Discovery/pull/1",
+            "codex_status": "reviewed_clean",
+            "scope_status": None,
+            "schema_version": 1,
+        }
+        with open(packets_dir / "codex_pending.classifier.json", "w") as f:
+            json.dump(classifier, f)
+
+        scenario_dir = out / "codex_pending"
+        scenario_dir.mkdir()
+        task_draft = {
+            "task_draft": {
+                "action": "create_builder_patch_task_draft",
+                "pr_number": 1,
+                "head_sha": "a" * 40,
+            }
+        }
+        with open(scenario_dir / "codex_pending.task_draft.json", "w") as f:
+            json.dump(task_draft, f)
+        with open(scenario_dir / "codex_pending.task_draft.md", "w") as f:
+            f.write("# Task Draft\n")
+
+        # Make kanban plan file absent by patching Path.exists()
+        import pathlib
+
+        original_exists = pathlib.Path.exists
+        kanban_path = scenario_dir / "codex_pending.kanban_plan.json"
+
+        def patched_exists(self):
+            if self == kanban_path:
+                return False  # simulate file never written
+            return original_exists(self)
+
+        pathlib.Path.exists = patched_exists
+
+        try:
+            # Run the scenario loop step — call the harness' main logic
+            # by invoking the script normally (it will produce the file via
+            # _run_kanban_plan, but our patch prevents it from existing)
+            result = mod.main([
+                "--repo-owner", "Slideshow11",
+                "--repo-name", "Automated-Edge-Discovery",
+                "--board", "aed",
+                "--output-dir", str(out),
+            ])
+        finally:
+            pathlib.Path.exists = original_exists
+
+        report = _load_report(out)
+        codex_pending = next(s for s in report["scenarios"] if s["name"] == "codex_pending")
+        # Must NOT crash (UnboundLocalError); must record a failure
+        assert codex_pending is not None
+        blockers = codex_pending.get("blockers", [])
+        assert any("kanban_plan" in b.lower() or "mismatch" in b.lower() for b in blockers), (
+            f"Expected kanban_plan blocker, got: {blockers}"
+        )
+        # Also verify overall report marks this as a failed scenario
+        assert not report["summary"]["passed"], (
+            "Report must show failure when kanban plan is absent"
+        )
+        assert "codex_pending" in report["summary"]["failed_scenarios"]
+
+    sys.modules.pop("pr_gate_controller_live_smoke", None)
