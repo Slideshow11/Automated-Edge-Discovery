@@ -268,6 +268,8 @@ def _collect_blockers(gate_summary: dict[str, Any]) -> list[str]:
     reviewer = gate_summary.get("reviewer_status", "")
     if reviewer and reviewer not in ("clean", "approved", "not_required_with_reason"):
         blockers.append(f"Reviewer status is not clean/approved: {reviewer}")
+    elif not reviewer:
+        blockers.append("Reviewer status is missing (blank)")
     codex = gate_summary.get("codex_status", "")
     fallback = gate_summary.get("fallback_review_status", "")
     if codex not in ("clean", "reviewed_clean", "unavailable", "not_requested", "") and fallback not in ("clean", ""):
