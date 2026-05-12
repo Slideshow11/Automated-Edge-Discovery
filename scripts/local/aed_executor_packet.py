@@ -87,10 +87,18 @@ def validate_executor_packet(packet: dict, *, from_validation=False) -> list[str
             f"schema_version must be {SCHEMA_VERSION} (got {schema_version})"
         )
 
-    # generated_at check
+    # generated_at check — must be valid ISO-8601 datetime
     generated_at = packet.get("generated_at", "")
     if not generated_at:
         errors.append("generated_at is required")
+    else:
+        try:
+            datetime.datetime.strptime(generated_at, "%Y-%m-%dT%H:%M:%SZ")
+        except ValueError:
+            errors.append(
+                f"generated_at must be ISO-8601 format YYYY-MM-DDTHH:MM:SSZ "
+                f"(got '{generated_at}')"
+            )
 
     # source_roadmap_packet check
     src = packet.get("source_roadmap_packet")
@@ -552,6 +560,15 @@ def from_roadmap(
             "no_github_mutation": True,
         },
     }
+
+    # Validate generated packet before writing — ensures from-roadmap
+    # does not emit packets that immediately fail validation
+    errs = validate_executor_packet(packet, from_validation=False)
+    if errs:
+        raise ValueError(
+            f"Generated EXECUTOR_PACKET.json is invalid: {errs}. "
+            f"Candidate '{candidate_id}' fields are insufficient for a valid packet."
+        )
 
     # Write outputs if requested
     if output_json:

@@ -503,6 +503,11 @@ class TestFromRoadmap:
                     ],
                     "forbidden_files": ["engine/", "schemas/", "fixtures/"],
                     "expected_tests": ["tests/test_aed_executor_packet.py"],
+                    "implementation_steps": [
+                        "Write aed_executor_packet.py",
+                        "Write tests",
+                        "Update docs",
+                    ],
                 }
             ],
         }
@@ -553,6 +558,7 @@ class TestFromRoadmap:
                     "allowed_files": [],
                     "forbidden_files": [],
                     "expected_tests": [],
+                    "implementation_steps": [],
                 }
             ],
         }
@@ -578,6 +584,45 @@ class TestFromRoadmap:
         assert result.returncode != 0
         assert "AED-CAND-202" in result.stderr
         assert "not found" in result.stderr.lower()
+
+    def test_from_roadmap_fails_if_candidate_produces_invalid_packet(self, tmp_path: Path):
+        """P1 fix: from-roadmap must reject candidates that would produce invalid packets."""
+        roadmap = {
+            "packet_kind": "aed.tasker.report.v1",
+            "candidate_prs": [
+                {
+                    "candidate_id": "AED-CAND-501",
+                    "title": "Bad candidate — missing required fields",
+                    "goal": "Goal but no implementation_steps or expected_tests",
+                    "allowed_files": ["scripts/local/something.py"],
+                    "forbidden_files": [],
+                    # Missing expected_tests and implementation_steps — valid
+                    # Tasker candidate but invalid executor packet
+                }
+            ],
+        }
+        roadmap_path = tmp_path / "ROADMAP_PACKET.json"
+        write_packet(roadmap, roadmap_path)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "from-roadmap",
+                "--roadmap-packet",
+                str(roadmap_path),
+                "--candidate-id",
+                "AED-CAND-501",
+                "--output-json",
+                str(tmp_path / "out.json"),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(REPO_ROOT),
+        )
+        # Must fail — generated packet would fail validation
+        assert result.returncode != 0
+        assert "invalid" in result.stderr.lower() or "error" in result.stderr.lower()
 
 
 # ---------------------------------------------------------------------------
