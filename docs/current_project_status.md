@@ -148,6 +148,8 @@ The project is not yet a live trading or production system.
 - PR #187 feat: emit optional RunnerOutput trial_accounting_summary in dry-run mode with conditional CLI-driven emission (no schema change, no mutation)
 - PR #188 docs: design AED Tasker, Executor, and PR gate packet architecture (design-only; no runtime behavior, schemas, tests, auto-merge, or autonomous search)
 - PR #189 tooling: add read-only local PR gate state classifier for scope, CI, and current-head Codex evidence packets (no comments, tasks, dispatch, patching, or merge behavior)
+- PR #199 tooling: add PR gate controller — end-to-end orchestrator chaining classifier → task draft → kanban plan, dry-run by default, optional --apply-create-task
+- PR #200 tooling: add PR gate merge-ready notification packet — consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
 
 ## Current stop rules
 
