@@ -158,8 +158,53 @@ Default TTL is 72 hours. After `expires_at`, the guard rejects the packet even i
 
 To re-authorize after expiration, rebuild the packet (step 1 above) with a fresh timestamp and new phrase.
 
+## Relationship to PR #200: Merge-Ready Notification Packet
+
+PR #200 adds `pr_gate_merge_ready_notify.py` — the final bridge in the PR gate chain. While PR #193's guard (`build_merge_ready_packet.py`) required manual assembly of gate data, PR #200's notify script can consume the full output of `pr_gate_controller.py` (`CONTROLLER_RUN_PACKET.json`) directly and produce a Telegram-ready notification packet.
+
+Key capabilities:
+- **Two input modes**: direct CLI parameters (`--ci-status`, `--codex-status`, etc.) or merged-packet mode (`--merge-ready-packet` + `--controller-run-packet`)
+- **Outputs**: `MERGE_READY_NOTIFICATION.json` + `MERGE_READY_NOTIFICATION.md`
+- **Packet kind**: `aed.pr_gate.merge_ready_notification.v1`
+- **Authorization phrase**: produced automatically when gates are clean
+- **Blockers**: produced automatically when gates are not clean
+
+The notify script does NOT send Telegram messages. It only produces the packet and markdown. A future controller or gateway will handle delivery.
+
+### Why the 40-character SHA is required
+
+PR numbers alone are insufficient for merge authorization because:
+- HEAD changes between pushes — the same PR number can point to different SHAs
+- `--match-head-commit` prevents merging a different commit after authorization was given
+- Stale authorizations become invalid if HEAD changes
+
+The required phrase `I confirm merge PR #<number> at <full_sha>` binds authorization to a specific commit.
+
+### Why `--match-head-commit` is required
+
+`gh pr merge --match-head-commit <sha>` fails if the PR HEAD has changed since the authorization was given. This prevents:
+- A push that changes HEAD after authorization
+- A force-push that rewrites history after authorization
+- Accidental merge of a different commit than the one authorized
+
+### Relationship to future Telegram delivery
+
+`pr_gate_merge_ready_notify.py` produces `user_message` — Telegram-ready text containing the authorization phrase and merge command template. A future gateway or cron job will consume this packet and send it to Tom via Telegram. The current script is intentionally read-only with respect to Telegram.
+
 ## Relationship to PR #193
 
-PR #193 built the Tasker input collector. This PR builds the merge authorization guard. A future PR will wire the two together: the collector produces context, a Tasker agent reviews it and produces a ROADMAP_PACKET, then the authorization guard verifies the human's explicit go-ahead before merge.
+PR #193 built the Tasker input collector. This PR (#200) adds the merge-ready notification bridge. The full chain is:
 
-This PR (PR #194) is purely the authorization mechanism. The Tasker integration is a later PR.
+```
+pr_gate_controller.py (classify → draft → kanban plan)
+  ↓
+pr_gate_merge_ready_notify.py (builds Telegram-ready notification)
+  ↓
+Telegram delivery (future — not implemented in this PR)
+  ↓
+Tom reviews and types exact authorization phrase
+  ↓
+gh pr merge --squash --delete-branch --match-head-commit <sha>
+```
+
+PR #200 does not change the authorization phrase format or the guard script. It only automates the construction of the notification packet.
