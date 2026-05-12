@@ -602,3 +602,75 @@ def test_old_packet_format_compatibility(tmp_path):
     assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
     assert packet["required_authorization_phrase"] is not None
     assert "af386e4c75341a2a6e7a6f68b680844de5cef1df" in packet["required_authorization_phrase"]
+
+
+def test_old_packet_codex_unavailable(tmp_path):
+    """Old MERGE_READY_PACKET with codex_status=unavailable also works."""
+    mrp = tmp_path / "MERGE_READY_PACKET.json"
+    crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+    out_json = tmp_path / "notification.json"
+    out_md = tmp_path / "notification.md"
+
+    mrp.write_text(json.dumps({
+        "pr": {
+            "number": 193, "url": VALID_PR["url"],
+            "head_sha": "af386e4c75341a2a6e7a6f68b680844de5cef1df",
+            "base_branch": "main",
+        },
+        "ci_status": "green",
+        "codex_status": "unavailable",
+        "reviewer_status": "approved",
+        "mergeable": True,
+        "changed_files": ["docs/README.md"],
+    }))
+    crp.write_text(json.dumps({"result": {
+        "ci_status": "green",
+        "codex_status": "unavailable",
+        "reviewer_status": "approved",
+    }}))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--merge-ready-packet", str(mrp),
+         "--controller-run-packet", str(crp),
+         "--output-json", str(out_json), "--output-md", str(out_md)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    packet = json.loads(out_json.read_text())
+    assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
+
+
+def test_old_packet_codex_not_requested(tmp_path):
+    """Old MERGE_READY_PACKET with codex_status=not_requested also works."""
+    mrp = tmp_path / "MERGE_READY_PACKET.json"
+    crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+    out_json = tmp_path / "notification.json"
+    out_md = tmp_path / "notification.md"
+
+    mrp.write_text(json.dumps({
+        "pr": {
+            "number": 193, "url": VALID_PR["url"],
+            "head_sha": "af386e4c75341a2a6e7a6f68b680844de5cef1df",
+            "base_branch": "main",
+        },
+        "ci_status": "green",
+        "codex_status": "not_requested",
+        "reviewer_status": "approved",
+        "mergeable": True,
+        "changed_files": ["docs/README.md"],
+    }))
+    crp.write_text(json.dumps({"result": {
+        "ci_status": "green",
+        "codex_status": "not_requested",
+        "reviewer_status": "approved",
+    }}))
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT),
+         "--merge-ready-packet", str(mrp),
+         "--controller-run-packet", str(crp),
+         "--output-json", str(out_json), "--output-md", str(out_md)],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    packet = json.loads(out_json.read_text())
+    assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
