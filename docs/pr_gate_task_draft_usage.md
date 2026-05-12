@@ -342,6 +342,62 @@ Once the smoke harness confirms the full chain is deterministic and error-free:
 - Auto-dispatch can be added with confidence that the chain is solid
 - New scenarios can be added to the smoke harness before they reach production
 
+---
+
+## PR #204: CI Workflow Trigger Invariant Checker
+
+**File:** `scripts/local/validate_ci_workflow_invariants.py`
+
+PR #203 initially added workflow-level `paths` filters to the GitHub Actions CI workflow. Codex correctly identified that `pull_request` paths filters gate the entire CI workflow — all jobs (test, validator, governance-validators, pr-gate-live-smoke) would silently skip when changed files don't match the paths pattern.
+
+PR #204 encodes this lesson as an automated invariant checker.
+
+### Why Workflow-Level `paths` Filters Are Dangerous
+
+In GitHub Actions, a workflow-level `paths` filter on `pull_request` does NOT selectively skip individual jobs — it gates the **entire workflow**. When the workflow is gated:
+
+- All jobs (`test`, `validator`, `governance-validators`, `pr-gate-live-smoke`) are skipped together
+- No CI failure is reported
+- PRs appear to pass CI when they were never tested
+
+This is silent and invisible — a developer sees green CI on GitHub without realizing no tests ran.
+
+### The Invariant
+
+`validate_ci_workflow_invariants.py` checks that:
+
+1. `pull_request` trigger exists with `branches: [main]`
+2. `pull_request` has **no** `paths` or `paths-ignore` filter
+3. `push` trigger exists with `branches: [main, fix/*, feat/*]`
+4. `push` has **no** `paths` or `paths-ignore` filter
+5. Required jobs exist: `test`, `validator`, `governance-validators`, `pr-gate-live-smoke`
+
+### YAML 1.1 Boolean Quirk
+
+PyYAML (YAML 1.1) parses the bare word `on` as boolean `True`. This means a workflow like:
+
+```yaml
+on:
+  push: ...
+```
+
+is parsed as `{"on": True, "push": {...}}` — GitHub Actions interprets `on: true` as a no-op trigger. The checker handles this by also checking `wf.get(True)` in addition to `wf.get("on")`.
+
+### Usage
+
+```bash
+# Check invariants against current ci.yml
+python3 scripts/local/validate_ci_workflow_invariants.py \
+  --workflow .github/workflows/ci.yml
+
+# Output JSON report
+python3 scripts/local/validate_ci_workflow_invariants.py \
+  --workflow .github/workflows/ci.yml \
+  --output-json /tmp/CI_WORKFLOW_INVARIANTS.json
+```
+
+Exit codes: 0 = pass, 1 = invariant failure, 2 = parse error
+
 ### See Also
 
 - `docs/pr_gate_task_draft_usage.md` — Task draft generator documentation
