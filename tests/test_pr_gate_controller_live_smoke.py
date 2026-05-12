@@ -585,3 +585,85 @@ def test_missing_kanban_plan_file_records_failure_not_crash():
         assert "codex_pending" in report["summary"]["failed_scenarios"]
 
     sys.modules.pop("pr_gate_controller_live_smoke", None)
+
+
+# ---------------------------------------------------------------------------
+# CI helper: ci_check_smoke.py smoke pass/fail validation
+# ---------------------------------------------------------------------------
+
+def test_ci_check_smoke_exits_zero_on_pass():
+    """ci_check_smoke.py must exit 0 when the smoke report shows passed=True."""
+    import tempfile, json
+    from pathlib import Path
+
+    smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
+    if not smoke_py.exists():
+        pytest.skip("ci_check_smoke.py not present in this branch")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        report = {"summary": {"passed": True, "failed_scenarios": []}}
+        with open(out / "PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.json", "w") as f:
+            json.dump(report, f)
+        result = subprocess.run(
+            [sys.executable, str(smoke_py), str(out)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, (
+            f"Expected exit 0 for passed smoke, got {result.returncode}. "
+            f"stderr: {result.stderr}"
+        )
+        assert "SMOKE PASSED" in result.stderr
+
+
+def test_ci_check_smoke_exits_nonzero_on_fail():
+    """ci_check_smoke.py must exit 1 when the smoke report shows passed=False."""
+    import tempfile, json
+    from pathlib import Path
+
+    smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
+    if not smoke_py.exists():
+        pytest.skip("ci_check_smoke.py not present in this branch")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        report = {
+            "summary": {
+                "passed": False,
+                "failed_scenarios": ["codex_suggestions", "blocked_scope"],
+            }
+        }
+        with open(out / "PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.json", "w") as f:
+            json.dump(report, f)
+        result = subprocess.run(
+            [sys.executable, str(smoke_py), str(out)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1, (
+            f"Expected exit 1 for failed smoke, got {result.returncode}. "
+            f"stderr: {result.stderr}"
+        )
+        assert "SMOKE FAILED" in result.stderr
+
+
+def test_ci_check_smoke_exits_nonzero_when_report_missing():
+    """ci_check_smoke.py must exit 1 when the smoke report JSON is absent."""
+    import tempfile
+    from pathlib import Path
+
+    smoke_py = REPO_ROOT / ".github" / "workflows" / "ci_check_smoke.py"
+    if not smoke_py.exists():
+        pytest.skip("ci_check_smoke.py not present in this branch")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        out = Path(tmpdir)
+        # No report.json written
+        result = subprocess.run(
+            [sys.executable, str(smoke_py), str(out)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 1, (
+            f"Expected exit 1 for missing report, got {result.returncode}. "
+            f"stderr: {result.stderr}"
+        )
+        assert "NOT FOUND" in result.stderr

@@ -78,3 +78,56 @@ jobs:
 
       - name: Run governance manifests validator checks
         run: bash scripts/ci/validate_governance_manifests.sh
+
+  pr-gate-live-smoke:
+    needs: [test]
+    runs-on: ubuntu-latest
+    # Run on all PRs to main and on push to main/fix*/feat*/ci* branches.
+    # The smoke harness itself is read-only (no kanban create, no dispatch,
+    # no merge, no external side-effects).
+    if: |
+      github.event_name == 'pull_request' ||
+      github.event_name == 'push' && (
+        contains(github.event.ref, 'main') ||
+        startsWith(github.event.ref, 'refs/heads/fix/') ||
+        startsWith(github.event.ref, 'refs/heads/feat/') ||
+        startsWith(github.event.ref, 'refs/heads/ci/')
+      )
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run PR gate live smoke harness
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pr_gate_live_smoke_ci
+          python scripts/local/pr_gate_controller_live_smoke.py \
+            --repo-owner "$REPO_OWNER" \
+            --repo-name "$REPO_NAME" \
+            --board aed \
+            --output-dir /tmp/pr_gate_live_smoke_ci
+          echo "=== SMOKE REPORT ==="
+          cat /tmp/pr_gate_live_smoke_ci/PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.json || true
+          echo ""
+          echo "=== SMOKE MARKDOWN ==="
+          cat /tmp/pr_gate_live_smoke_ci/PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.md || true
+          # Fail job if smoke did not pass
+          python .github/workflows/ci_check_smoke.py /tmp/pr_gate_live_smoke_ci
+
+      - name: Upload smoke report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-gate-live-smoke-report
+          path: /tmp/pr_gate_live_smoke_ci/PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.*
