@@ -206,3 +206,108 @@ python3 scripts/local/pr_gate_task_draft.py render-md /tmp/PR_GATE_TASK_DRAFT.js
 - `docs/aed_executor_packet_usage.md` — Executor packet format and CLI
 - `docs/merge_authorization_guard.md` — Merge gate guard design
 - `docs/current_project_status.md` — Current project state and PR tracking
+
+---
+
+## PR #198: Kanban Task Creation Dry-Run
+
+> PR #198 adds a safe bridge from `PR_GATE_TASK_DRAFT.json` to Hermes Kanban.
+
+### Overview
+
+`pr_gate_kanban_task_create.py` consumes a `PR_GATE_TASK_DRAFT.json` (from `pr_gate_task_draft.py`) and produces a **Kanban creation plan** — either as a read-only dry-run report, or as an actual `hermes kanban create` call via `--apply`.
+
+**Default mode is always dry-run.** No Kanban mutation happens without `--apply`.
+
+### Why Dry-Run First?
+
+The PR gate controller decides what task should exist next. Before creating anything, operators need to:
+
+1. **Inspect** what the draft proposes (dry-run output)
+2. **Verify** the idempotency key will prevent duplicates
+3. **Confirm** the task title, assignee, and board are correct
+4. **Decide** whether `--apply` is appropriate
+
+This mirrors the PR merge authorization pattern: "I confirm" is required before merge. `--apply` is required before Kanban mutation.
+
+### CLI
+
+Dry-run (default — read-only, no `hermes kanban` calls):
+
+```bash
+python3 scripts/local/pr_gate_kanban_task_create.py \
+  --task-draft /tmp/PR_GATE_TASK_DRAFT.json \
+  --board aed \
+  --output-json /tmp/KANBAN_CREATE_PLAN.json \
+  --output-md /tmp/KANBAN_CREATE_PLAN.md
+```
+
+Explicit apply (creates task once):
+
+```bash
+python3 scripts/local/pr_gate_kanban_task_create.py \
+  --task-draft /tmp/PR_GATE_TASK_DRAFT.json \
+  --board aed \
+  --apply
+```
+
+### Output Schema
+
+The output (`KANBAN_CREATE_PLAN.json`) uses `aed.pr_gate.kanban_create_plan.v1`:
+
+| Field | Description |
+|---|---|
+| `packet_kind` | `aed.pr_gate.kanban_create_plan.v1` |
+| `dry_run` | `true` (dry-run) or `false` (`--apply`) |
+| `source_task_draft` | Path, packet_kind, action, idempotency_key, pr_number, head_sha |
+| `kanban_task` | title, assignee, status, body, idempotency_key, parent_task_id, depends_on |
+| `duplicate_check` | method: `idempotency_key_tag`, duplicate_found, existing_task_id |
+| `apply_result` | applied, created_task_id, command_used, stdout, stderr |
+| `stop_rules` | Always: no_dispatch, no_merge, no_pr_patch, no_codex_request, no_memory_update, no_skill_manage |
+| `recommended_action` | no_action / skip_duplicate / apply_failed |
+
+### Duplicate Prevention
+
+Each task is tagged with the `idempotency_key` from the source `PR_GATE_TASK_DRAFT.json` (format: `pr{N}-{head8?}-{hash}-{action}`).
+
+- **Dry-run**: reports the idempotency key and explains how duplicate check works
+- **--apply**: calls `hermes kanban search --tag idempotency_key={key}` before creating. If an existing task is found, creation is skipped and the existing task ID is returned.
+
+### Stop Rules
+
+The output plan always includes these stop rules regardless of mode:
+
+- `no_dispatch` — does not call `hermes kanban dispatch` or any worker dispatcher
+- `no_merge` — does not call `gh pr merge`
+- `no_pr_patch` — does not patch PRs
+- `no_codex_request` — does not call Codex
+- `no_memory_update` — does not update Hermes memory
+- `no_skill_manage` — does not call `skill_manage`
+
+### Safety
+
+The script validates the task draft body against safety patterns before processing. Rejected patterns include: `gh pr merge`, `gh pr comment`, `gh pr create`, `git push`, `hermes kanban dispatch`, `memory.update`, `fact_store`, `skill_manage`, `delegate_task`, `cronjob`, `live trading`, `broker`.
+
+### Relationship to Future Controller Automation
+
+`pr_gate_kanban_task_create.py` is the final bridge in the AED PR gate pipeline:
+
+```
+classify_pr_gate_state.py → pr_gate_task_draft.py → pr_gate_kanban_task_create.py
+     (classifier)               (task-draft generator)       (kanban creator)
+
+Human reviews dry-run → approves → --apply creates task
+```
+
+Future automation may wire a controller that:
+1. Runs the full chain in dry-run mode
+2. Presents the plan to human for authorization
+3. Runs with `--apply` on explicit confirmation
+
+This keeps human-in-the-loop for all Kanban task creation, just as the merge guard keeps human-in-the-loop for all PR merges.
+
+### See Also
+
+- `docs/pr_gate_task_draft_usage.md` — Task draft generator documentation
+- `docs/merge_authorization_guard.md` — Merge gate guard design
+- `docs/current_project_status.md` — PR tracking
