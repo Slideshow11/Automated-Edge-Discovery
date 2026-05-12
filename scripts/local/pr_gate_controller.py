@@ -155,7 +155,7 @@ def run_controller(
     if base_branch != "main":
         classifier_args += ["--base-branch", base_branch]
 
-    result = _run_child(classifier_args + [str(classifier_json_path)], check=True)
+    result = _run_child(classifier_args, check=True)
     classifier_packet = _load_json(classifier_json_path)
 
     # Step 2: Generate task draft
@@ -207,6 +207,8 @@ def run_controller(
                 str(_resolve_child("pr_gate_kanban_task_create.py")),
                 "--task-draft", str(task_draft_json_path),
                 "--board", board,
+                "--output-json", str(kanban_plan_json_path),
+                "--output-md", str(kanban_plan_md_path),
                 "--apply",
             ]
             result = _run_child(apply_args, check=True)
