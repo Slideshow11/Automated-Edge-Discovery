@@ -29,7 +29,64 @@ SCHEMA_VERSION = 1
 HERMES_KANBAN_BIN = Path.home() / ".local" / "bin" / "hermes"
 KANBAN_BIN_FALLBACK = Path("/usr/local/bin/hermes")
 
-# Safety-grep patterns: any occurrence in task body -> reject
+# Safety-grep helper: scan body for forbidden tokens, skipping lines where
+# a negation context precedes the token.  "Do not call fact_store" is a
+# prohibition warning and must be allowed.  "Call fact_store" must be rejected.
+#
+# Negation rule: a line is skipped when it contains an affirmative action verb
+# between "not " and the forbidden token — indicating the prohibition is about
+# the action (e.g., "Do not call fact_store") rather than the token itself being
+# used in an instruction (e.g., "use fact_store to persist").
+def _body_has_forbidden_pattern(body: str) -> tuple[bool, str]:
+    """
+    Returns (is_forbidden, matched_token).
+    Skips a line when it contains a prohibition warning (e.g.
+    "Do not call fact_store") rather than an affirmative instruction.
+    """
+    for line in body.split("\n"):
+        for pat in SAFETY_PATTERNS:
+            m = pat.search(line)
+            if not m:
+                continue
+
+            token_start = m.start()
+            token_end = m.end()
+
+            # Find "not " before this match
+            not_pos = line.rfind("not ", 0, token_start)
+            if not_pos == -1:
+                # No "not " before token — always forbidden
+                return True, m.group()
+
+            # Examine the segment: "not " ... up to token
+            segment = line[not_pos + 4 : token_start]
+
+            # Look for affirmative action verbs in the segment
+            action_match = re.search(
+                r"\b(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
+                segment,
+                re.IGNORECASE,
+            )
+            if action_match:
+                # Action verb found in segment between "not " and token.
+                # Two sub-cases:
+                #  1. verb appears BEFORE token in the line → "Do not CALL fact_store"
+                #     "not CALL" prohibits the action → token is not being instructed → ALLOWED
+                #  2. verb appears AFTER token in the line → "fact_store... CALL"
+                #     token is being instructed to do something → FORBIDDEN
+                action_global_pos = not_pos + 4 + action_match.start()
+                if action_global_pos < token_start:
+                    # Action (call/use/etc.) appears BEFORE token → prohibition warning
+                    continue
+                # Action appears after token → forbidden instruction
+                return True, m.group()
+            # No action verb in segment → prohibition warning
+    return False, ""
+
+
+# Safety-grep patterns: any occurrence in task body -> reject.
+# Prohibition warnings ("Do not ...") are allowed; the _body_has_forbidden_pattern
+# helper skips a line when "not " immediately precedes the token.
 SAFETY_PATTERNS = [
     re.compile(r"gh\s+pr\s+merge", re.IGNORECASE),
     re.compile(r"gh\s+pr\s+comment", re.IGNORECASE),
@@ -37,9 +94,9 @@ SAFETY_PATTERNS = [
     re.compile(r"git\s+push", re.IGNORECASE),
     re.compile(r"git\s+commit", re.IGNORECASE),
     re.compile(r"hermes\s+kanban\s+dispatch", re.IGNORECASE),
-    re.compile(r"memory\.update", re.IGNORECASE),
-    re.compile(r"fact_store", re.IGNORECASE),
-    re.compile(r"skill_manage", re.IGNORECASE),
+    re.compile(r"(?<!not )memory\.update", re.IGNORECASE),
+    re.compile(r"(?<!not )fact_store", re.IGNORECASE),
+    re.compile(r"(?<!not )skill_manage", re.IGNORECASE),
     re.compile(r"delegate_task", re.IGNORECASE),
     re.compile(r"cronjob", re.IGNORECASE),
     re.compile(r"live\s+trading", re.IGNORECASE),
@@ -131,12 +188,11 @@ def validate_task_draft(draft: dict) -> list[str]:
                 f"task_draft.body must be a string, got {type(body).__name__}"
             )
         elif body:
-            for pat in SAFETY_PATTERNS:
-                m = pat.search(body)
-                if m:
-                    errors.append(
-                        f"task_draft.body contains forbidden pattern: '{m.group()}'"
-                    )
+            forbidden, matched = _body_has_forbidden_pattern(body)
+            if forbidden:
+                errors.append(
+                    f"task_draft.body contains forbidden pattern: '{matched}'"
+                )
 
     return errors
 

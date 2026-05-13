@@ -582,3 +582,79 @@ class TestSafetyGrep:
         ]
         for pat, label in prohibited:
             assert not re.search(pat, clean), f"Prohibited pattern '{label}' found in script"
+
+
+# --------------------------------------------------------------------------
+# Schema contract: top-level fields for kanban consumer
+# -------------------------------------------------------------------------->
+
+class TestKanbanConsumerContract:
+    """Regression: build_task_draft must produce top-level action, pr_number,
+    head_sha, idempotency_key that pr_gate_kanban_task_create.py expects."""
+
+    def test_produces_top_level_action(self):
+        mod = _import_mod()
+        classifier = minimal_classifier(
+            classification="ready_for_reviewer",
+            ci_status="passed",
+            pr_number="197",
+            head_sha="4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+        )
+        packet = mod.build_task_draft(classifier, None)
+        assert "action" in packet
+        assert packet["action"] == "create_reviewer_task_draft"
+
+    def test_produces_top_level_pr_number_as_int(self):
+        mod = _import_mod()
+        classifier = minimal_classifier(
+            classification="ready_for_reviewer",
+            ci_status="passed",
+            pr_number="197",
+            head_sha="4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+        )
+        packet = mod.build_task_draft(classifier, None)
+        assert "pr_number" in packet
+        assert isinstance(packet["pr_number"], int), f"pr_number should be int, got {type(packet['pr_number'])}"
+        assert packet["pr_number"] == 197
+
+    def test_produces_top_level_head_sha_40char(self):
+        mod = _import_mod()
+        classifier = minimal_classifier(
+            classification="ready_for_reviewer",
+            ci_status="passed",
+            pr_number="197",
+            head_sha="4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+        )
+        packet = mod.build_task_draft(classifier, None)
+        assert "head_sha" in packet
+        assert len(packet["head_sha"]) == 40, f"head_sha should be 40 chars, got {len(packet['head_sha'])}"
+        assert packet["head_sha"] == "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c"
+
+    def test_produces_top_level_idempotency_key(self):
+        mod = _import_mod()
+        classifier = minimal_classifier(
+            classification="ready_for_reviewer",
+            ci_status="passed",
+            pr_number="197",
+            head_sha="4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+        )
+        packet = mod.build_task_draft(classifier, None)
+        assert "idempotency_key" in packet
+        import re
+        assert re.match(r"^pr197-[0-9a-f]{8}-[0-9a-f]+-create_reviewer_task_draft$", packet["idempotency_key"]), \
+            f"idempotency_key malformed: {packet['idempotency_key']}"
+
+    def test_task_draft_body_set_for_non_wait_action(self):
+        mod = _import_mod()
+        classifier = minimal_classifier(
+            classification="ready_for_reviewer",
+            ci_status="passed",
+            pr_number="197",
+            head_sha="4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+        )
+        packet = mod.build_task_draft(classifier, None)
+        body = packet.get("task_draft", {}).get("body", "")
+        assert body, "task_draft.body must be populated for non-wait actions"
+        # Safety warning must be present
+        assert "fact_store" in body.lower() or "skill_manage" in body.lower(), \
+            "body should contain standard safety warning about fact_store/skill_manage"

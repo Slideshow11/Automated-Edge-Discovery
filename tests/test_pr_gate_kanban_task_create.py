@@ -577,5 +577,147 @@ class TestSafetyGrep:
         assert any("forbidden" in e.lower() or "merge" in e.lower() for e in errors)
 
 
+# --------------------------------------------------------------------------
+# Safety-pattern negation (prohibition warning allowance)
+# -------------------------------------------------------------------------->
+
+class TestSafetyPatternNegation:
+    """Regression: SAFETY_PATTERNS must not match forbidden tokens when preceded
+    by 'not ' (prohibition warning like 'Do not call fact_store')."""
+
+    def test_prohibition_warning_body_with_fact_store_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Implement the builder patch for PR #197.\n\n"
+                    "Do not update memory, use fact_store, or call skill_manage from inside this task.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_prohibition_warning_body_with_skill_manage_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Do not call skill_manage.\n"
+                    "Do not use fact_store.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_prohibition_warning_body_with_memory_update_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Do not call memory.update.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_affirmative_instruction_to_call_fact_store_rejected(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Call fact_store to persist data.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert len(errors) > 0, "affirmative instruction to call fact_store must be rejected"
+        assert any("fact_store" in e for e in errors), f"errors should mention fact_store: {errors}"
+
+    def test_affirmative_instruction_to_call_skill_manage_rejected(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Use skill_manage to handle this.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert len(errors) > 0, "affirmative instruction to call skill_manage must be rejected"
+        assert any("skill_manage" in e for e in errors), f"errors should mention skill_manage: {errors}"
+
+    def test_task_draft_schema_matches_producer_output(self, mod):
+        """End-to-end: pr_gate_task_draft output must pass validate_task_draft."""
+        import sys
+        import importlib.util
+
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_task_draft.py"
+        spec = importlib.util.spec_from_file_location("pr_gate_task_draft", script)
+        draft_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(draft_mod)
+
+        classifier = {
+            "classification": "ready_for_reviewer",
+            "ci_status": "passed",
+            "codex_status": "clean",
+            "pr_number": "197",
+            "pr_url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/197",
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "changed_files": ["scripts/local/pr_gate_task_draft.py"],
+            "blockers": [],
+        }
+        packet = draft_mod.build_task_draft(classifier, None)
+        errors = mod.validate_task_draft(packet)
+        assert errors == [], f"producer output failed validation: {errors}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
