@@ -204,6 +204,147 @@ def check_workflow(workflow_path: str) -> dict:
         if push_has_paths_ignore:
             blockers.append(f"push has paths-ignore filter: {push_paths_ignore}")
 
+    # ---- concurrency checks ----
+    concurrency = wf.get("concurrency")
+    concurrency_exists = isinstance(concurrency, dict) and len(concurrency) > 0
+    invariants.append({
+        "name": "workflow has top-level concurrency",
+        "passed": concurrency_exists,
+        "details": f"'concurrency' is {type(concurrency).__name__}" if not concurrency_exists else "present",
+    })
+    if not concurrency_exists:
+        blockers.append("workflow is missing top-level 'concurrency' block")
+
+    if concurrency_exists:
+        # 20. concurrency.group exists
+        group = concurrency.get("group")
+        group_valid = isinstance(group, str) and len(group) > 0
+        invariants.append({
+            "name": "concurrency.group exists",
+            "passed": group_valid,
+            "details": f"group: {group}" if group_valid else "group is missing or empty",
+        })
+        if not group_valid:
+            blockers.append("concurrency.group is missing or empty")
+
+        # 21. concurrency.group includes github.workflow AND a branch/PR discriminator
+        # A bare "${{ github.workflow }}" groups ALL runs into one bucket, allowing
+        # non-main runs to cancel unrelated PRs' runs. Must also include a ref/PR
+        # discriminator: github.event.pull_request.number || github.ref (or head_ref,
+        # ref_name) to scope cancellation to runs on the same ref.
+        # Word-boundary discriminator check: must contain one of the real GH ref/PR
+        # context variables. Substring "github.ref" alone is too broad (would match
+        # "github.ref_protected" which is not a real context variable).
+        # We use regex to ensure "github.ref" is a standalone token (not embedded
+        # in a longer identifier) and that the next char is not alphanumeric.
+        import re as _re
+        _REF_TOKEN_RE = _re.compile(
+            r"\bgithub\.ref\b"    # github.ref as a whole word token
+            r"|\bgithub\.head_ref\b"
+            r"|\bgithub\.ref_name\b"
+            r"|\bgithub\.event\.pull_request\.number\b"
+        )
+        group_has_discriminator = bool(_REF_TOKEN_RE.search(group))
+        group_has_workflow = isinstance(group, str) and "github.workflow" in group
+        group_is_valid = group_has_workflow and group_has_discriminator
+        invariants.append({
+            "name": "concurrency.group includes github.workflow AND branch/PR discriminator",
+            "passed": group_is_valid,
+            "details": (
+                f"group: {group}"
+                if group_is_valid
+                else f"group: {group} — has_workflow={group_has_workflow}, has_discriminator={group_has_discriminator}"
+            ),
+        })
+        if not group_is_valid:
+            blockers.append(
+                "concurrency.group must include '${{ github.workflow }}' AND "
+                "a branch/PR discriminator "
+                "(e.g. '${{ github.event.pull_request.number || github.ref }}')"
+            )
+
+        # 22. concurrency.cancel-in-progress exists
+        # GitHub Actions accepts both "cancel-in-progress" (hyphen) and
+        # "cancel_in_progress" (underscore) — yaml.safe_load preserves whichever
+        # form is in the file; GitHub Actions treats them as equivalent.
+        # Value can be a boolean (true/false) or a GitHub Actions expression string.
+        # Check both hyphen and underscore forms explicitly; do NOT use "or" since
+        # "False or fallback" short-circuits to False even when the key exists.
+        cancel_in_progress = concurrency.get("cancel-in-progress")
+        if cancel_in_progress is None:
+            cancel_in_progress = concurrency.get("cancel_in_progress")
+        cancel_exists = cancel_in_progress is not None
+        invariants.append({
+            "name": "concurrency.cancel-in-progress exists",
+            "passed": cancel_exists,
+            "details": f"cancel-in-progress: {cancel_in_progress}" if cancel_exists else "cancel-in-progress is missing",
+        })
+        if not cancel_exists:
+            blockers.append("concurrency.cancel-in-progress is missing")
+
+        # 23. cancel-in-progress does not cancel main branch runs
+        # A safe configuration evaluates to False for main, e.g.:
+        #   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+        #   cancel-in-progress: false
+        #
+        # An UNSAFE configuration evaluates to True for main, e.g.:
+        #   cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}  ← cancels main
+        #   cancel-in-progress: true                                ← cancels all
+        #
+        # We reject:
+        #   - boolean true
+        #   - a string expression that ==-compares github.ref (or head_ref/ref_name)
+        #     directly to 'refs/heads/main' or 'refs/heads/master'
+        #
+        # We accept:
+        #   - boolean false
+        #   - a string containing != against 'refs/heads/main' (inequality guard)
+        #   - any other expression that does not use == with main
+        cancel_is_unsafe = False
+        if cancel_in_progress is True:
+            cancel_is_unsafe = True
+        elif isinstance(cancel_in_progress, str):
+            # Normalize: remove spaces and quotes for analysis
+            norm = cancel_in_progress.replace(" ", "").replace("'", "").replace('"', "")
+            # Check for == equality against main — this cancels main.
+            # Must catch both variable-on-left (github.ref == refs/heads/main)
+            # and literal-on-left (refs/heads/main == github.ref) forms.
+            unsafe_patterns = [
+                # github.ref variants (left side)
+                "github.ref==refs/heads/main",
+                "github.ref==refs/heads/master",
+                "github.head_ref==refs/heads/main",
+                "github.head_ref==refs/heads/master",
+                "github.ref_name==refs/heads/main",
+                "github.ref_name==refs/heads/master",
+                # github.ref variants (right side — reversed operand order)
+                "refs/heads/main==github.ref",
+                "refs/heads/master==github.ref",
+                "refs/heads/main==github.head_ref",
+                "refs/heads/master==github.head_ref",
+                "refs/heads/main==github.ref_name",
+                "refs/heads/master==github.ref_name",
+            ]
+            if any(p in norm for p in unsafe_patterns):
+                cancel_is_unsafe = True
+            # Also catch bare "true" string (all-lowercase or all-uppercase)
+            if norm.lower() == "true":
+                cancel_is_unsafe = True
+        invariants.append({
+            "name": "cancel-in-progress does not cancel main branch runs",
+            "passed": not cancel_is_unsafe,
+            "details": (
+                f"cancel-in-progress: {cancel_in_progress} — evaluates to True for main"
+                if cancel_is_unsafe
+                else f"cancel-in-progress: {cancel_in_progress} — main branch protected"
+            ),
+        })
+        if cancel_is_unsafe:
+            blockers.append(
+                "concurrency.cancel-in-progress must not cancel main branch runs "
+                "(e.g. use: cancel-in-progress: ${{ github.ref != 'refs/heads/main' }})"
+            )
+
     # ---- job checks ----
     jobs = wf.get("jobs", {})
 

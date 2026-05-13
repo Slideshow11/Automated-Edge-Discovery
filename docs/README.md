@@ -34,6 +34,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - PR gate merge-ready notification packet complete (PR #200): consumes controller output, produces Telegram-ready authorization packet; does not send Telegram
 - PR gate controller live-smoke harness complete (PR #201): read-only smoke verifying full chain via 4 synthetic scenarios; prepares future auto-dispatch wiring
 - CI workflow trigger invariant checker complete (PR #204): read-only local checker that validates GitHub Actions CI workflow trigger invariants; detects workflow-level paths filters; YAML 1.1 boolean-`on` quirk handled; 17 invariants
+- CI now cancels stale PR workflow runs (PR #210): GitHub Actions workflow-level concurrency added to ci.yml; stale in-progress runs on PR branches are cancelled to save Actions minutes; main branch runs are never cancelled; 6 new concurrency invariants in validate_ci_workflow_invariants.py; 9 new tests; PR scope: ci.yml, validate_ci_workflow_invariants.py, test_validate_ci_workflow_invariants.py, docs
 
 ## Document groups
 
@@ -93,6 +94,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | scripts/local/build_merge_ready_packet.py | Produces MERGE_READY_PACKET.json/md from PR gate data. No LLM calls, no GitHub mutations, no auto-merge. | Read-only |
 | scripts/local/check_merge_authorization.py | Verifies MERGE_READY_PACKET and exact human phrase before merge. Exits 0 (authorized) or 1 (denied). Does not call gh pr merge. | Read-only |
 | scripts/local/check_pr_scope.py | Mechanical PR scope diff enforcement: compares changed_files against allowed_files and forbidden_files. Glob patterns supported. Packet: aed.pr_gate.scope_check.v1. Exit 0=clean, 1=violation, 2=bad args. No git, no network, no mutation. | Read-only |
+| scripts/local/validate_ci_workflow_invariants.py | Validates GitHub Actions CI workflow trigger invariants: pull_request/push branches, no paths filters, required jobs, concurrency block (group with github.workflow, cancel-in-progress protecting main). Packet: aed.ci.workflow_invariants.v1. Exit 0=pass, 1=fail, 2=parse error. No network, no mutation. | Read-only |
 | scripts/local/run_pr_gate_watchdog_once.py | INI-config-aware wrapper for watch_pr_gate_state.py. Supports summary/compact/json output modes. | Read-only |
 | scripts/local/pr_gate_controller.py | End-to-end PR gate orchestrator: classify → task draft → kanban plan. Dry-run by default; optional --apply-create-task. Consumes PR data, produces CONTROLLER_RUN_PACKET.json. No hermes kanban, no merge, no dispatch. | Read-only |
 | scripts/local/pr_gate_merge_ready_notify.py | Consumes CONTROLLER_RUN_PACKET.json or direct CLI parameters, produces Telegram-ready MERGE_READY_NOTIFICATION.json/md with authorization phrase and merge command. Two input modes. Does NOT send Telegram. | Read-only |
