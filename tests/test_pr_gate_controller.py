@@ -647,6 +647,398 @@ class TestClassifierScenarios:
 
 
 # ---------------------------------------------------------------------------
+# Apply-create-task hardening tests (PR #206)
+# ---------------------------------------------------------------------------
+
+class TestApplyCreateTaskHardening:
+    """Tests for idempotency, no-dispatch, and apply-path hardening."""
+
+    def test_apply_create_task_calls_kanban_helper_once(self, mod, tmp_output_dir):
+        """_apply_create_task invokes kanban helper exactly once."""
+        import unittest.mock as mock
+
+        task_draft = _mock_task_draft(action="create_builder_patch_task_draft")
+        task_draft["source"] = {
+            "repo_owner": "Slideshow11",
+            "repo_name": "Automated-Edge-Discovery",
+        }
+
+        with mock.patch.object(mod, "_run_child") as mock_run:
+            mock_run.return_value = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            with mock.patch.object(mod, "_load_json") as mock_load:
+                mock_load.return_value = _mock_kanban_plan(dry_run=False)
+                dup, tid, ikey, blockers = mod._apply_create_task(
+                    apply_create_task=True,
+                    task_draft_packet=task_draft,
+                    task_draft_json_path=tmp_output_dir / "draft.json",
+                    kanban_plan_json_path=tmp_output_dir / "plan.json",
+                    kanban_plan_md_path=tmp_output_dir / "plan.md",
+                    board="aed",
+                )
+
+        # Exactly one call to kanban helper
+        kanban_calls = [c for c in mock_run.call_args_list
+                        if "pr_gate_kanban_task_create.py" in str(c)]
+        assert len(kanban_calls) == 1
+        assert "--apply" in kanban_calls[0][0][0]
+
+    def test_apply_create_task_passes_apply_flag(self, mod, tmp_output_dir):
+        """--apply is passed to kanban helper when apply_create_task=True."""
+        apply_calls = []
+
+        def mock_run_child(args, *, capture_output=True, check=True):
+            if "pr_gate_kanban_task_create.py" in str(args):
+                # Dry-run call first, then apply call
+                if "--apply" in args:
+                    apply_calls.append(args)
+                # Write plan for both dry-run (without --apply) and apply calls
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan(dry_run=False))
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Kanban Plan")
+            elif "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_run_child):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert len(apply_calls) == 1, f"Expected 1 apply call, got {len(apply_calls)}"
+        assert "--apply" in apply_calls[0]
+
+    def test_dry_run_never_passes_apply_flag(self, mod, tmp_output_dir):
+        """Dry-run never passes --apply to kanban helper."""
+        apply_args = []
+
+        def capture_run_child(args, *, capture_output=True, check=True):
+            if "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan(dry_run=True))
+                )
+                if "--apply" in args:
+                    apply_args.append(args)
+            elif "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", capture_run_child):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                )
+
+        apply_calls_in_dry = [a for a in apply_args if "--apply" in a]
+        assert len(apply_calls_in_dry) == 0
+
+    def test_apply_create_task_uses_deterministic_idempotency_key(self, mod):
+        """Same PR/head/action yields same idempotency key."""
+        key1 = mod._make_controller_idempotency_key(
+            "Slideshow11", "Automated-Edge-Discovery", 199,
+            "abcd1234" + "0" * 32, "create_builder_patch_task_draft"
+        )
+        key2 = mod._make_controller_idempotency_key(
+            "Slideshow11", "Automated-Edge-Discovery", 199,
+            "abcd1234" + "0" * 32, "create_builder_patch_task_draft"
+        )
+        assert key1 == key2
+        assert key1.startswith("aed:Slideshow11/Automated-Edge-Discovery:pr:199:head:abcd1234")
+
+    def test_apply_create_task_different_inputs_produce_different_keys(self, mod):
+        """Different PRs or heads or actions produce different keys."""
+        base_args = ["Slideshow11", "Automated-Edge-Discovery", 199,
+                     "abcd1234" + "0" * 32, "create_builder_patch_task_draft"]
+        key1 = mod._make_controller_idempotency_key(*base_args)
+        # Different PR number
+        key2 = mod._make_controller_idempotency_key(*base_args[:2], 200, *base_args[3:])
+        # Different head SHA
+        key3 = mod._make_controller_idempotency_key(*base_args[:3], "different" + "0" * 32, base_args[4])
+        # Different action
+        key4 = mod._make_controller_idempotency_key(*base_args[:4], "create_reviewer_task_draft")
+
+        assert key1 != key2, "different PR number"
+        assert key1 != key3, "different head SHA"
+        assert key1 != key4, "different action"
+
+    def test_apply_create_task_refuses_missing_head_sha(self, mod):
+        """Missing head_sha blocks apply and returns blocker."""
+        draft = _mock_task_draft()
+        draft["head_sha"] = ""
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+        assert any("head_sha" in b for b in blockers)
+
+    def test_apply_create_task_refuses_missing_pr_number(self, mod):
+        """Missing pr_number blocks apply."""
+        draft = _mock_task_draft()
+        draft["pr_number"] = 0
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+        assert any("pr_number" in b for b in blockers)
+
+    def test_apply_create_task_refuses_no_action_wait(self, mod):
+        """no_action_wait action blocks apply."""
+        draft = _mock_task_draft(action="no_action_wait")
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+        assert any("no_action_wait" in b for b in blockers)
+
+    def test_apply_create_task_refuses_ci_pending(self, mod):
+        """ci_pending action blocks apply."""
+        draft = _mock_task_draft(action="ci_pending")
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+        assert any("ci_pending" in b for b in blockers)
+
+    def test_apply_create_task_refuses_codex_pending(self, mod):
+        """codex_pending action blocks apply."""
+        draft = _mock_task_draft(action="codex_pending")
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+        assert any("codex_pending" in b for b in blockers)
+
+    def test_apply_create_task_refuses_unknown_action(self, mod):
+        """Unknown or empty action blocks apply."""
+        draft = _mock_task_draft(action="unknown")
+        dup, tid, ikey, blockers = mod._apply_create_task(
+            apply_create_task=True,
+            task_draft_packet=draft,
+            task_draft_json_path=Path("/tmp/draft.json"),
+            kanban_plan_json_path=Path("/tmp/plan.json"),
+            kanban_plan_md_path=Path("/tmp/plan.md"),
+            board="aed",
+        )
+        assert len(blockers) > 0
+
+    def test_apply_create_task_records_no_dispatch_guarantee(self, mod, tmp_output_dir):
+        """run_packet contains no_dispatch_guarantee=True."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                td = _mock_task_draft()
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(td))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(_mock_kanban_plan(dry_run=False)))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                    pr_number=199, board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert result.get("no_dispatch_guarantee") is True
+
+    def test_apply_create_task_surfaces_duplicate_found(self, mod, tmp_output_dir):
+        """duplicate_found from downstream is recorded in the packet."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(_mock_task_draft()))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                plan = _mock_kanban_plan(dry_run=False, duplicate_found=True, created_task_id="777")
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(plan))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                    pr_number=199, board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert result["result"]["duplicate_found"] is True
+        assert result["result"]["final_recommendation"] == "duplicate_skipped"
+
+    def test_apply_create_task_records_created_task_id(self, mod, tmp_output_dir):
+        """created_task_id from downstream is recorded."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(_mock_task_draft()))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                plan = _mock_kanban_plan(dry_run=False, created_task_id="999")
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(plan))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                    pr_number=199, board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert result["result"]["created_task_id"] == "999"
+
+    def test_apply_create_task_child_failure_blocks(self, mod, tmp_output_dir):
+        """Downstream helper nonzero exit raises RuntimeError."""
+        def mock_fail(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(_mock_task_draft()))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args) and "--apply" in args:
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan(dry_run=False))
+                )
+                raise RuntimeError("Child script failed")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(_mock_kanban_plan(dry_run=True)))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_fail):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                with pytest.raises(RuntimeError):
+                    mod.run_controller(
+                        repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                        pr_number=199, board="aed",
+                        allowed_files=["docs/README.md"],
+                        output_dir=tmp_output_dir,
+                        apply_create_task=True,
+                    )
+
+    def test_apply_create_task_idempotency_key_in_packet(self, mod, tmp_output_dir):
+        """idempotency_key appears in run_packet for apply_create_task mode."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                td = _mock_task_draft()
+                td["source"] = {
+                    "repo_owner": "Slideshow11",
+                    "repo_name": "Automated-Edge-Discovery",
+                }
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(td))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(_mock_kanban_plan(dry_run=False)))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                    pr_number=199, board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert result.get("idempotency_key", "") != ""
+        assert "aed:Slideshow11" in result["idempotency_key"]
+
+    def test_apply_create_task_downstream_helper_recorded(self, mod, tmp_output_dir):
+        """downstream_helper field names pr_gate_kanban_task_create.py."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(_mock_task_draft()))
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(json.dumps(_mock_kanban_plan(dry_run=False)))
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11", repo_name="Automated-Edge-Discovery",
+                    pr_number=199, board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=True,
+                )
+
+        assert result.get("downstream_helper") == "pr_gate_kanban_task_create.py"
+
+
+# ---------------------------------------------------------------------------
 # Safety grep test
 # ---------------------------------------------------------------------------
 

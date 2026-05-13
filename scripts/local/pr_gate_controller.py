@@ -193,38 +193,26 @@ def run_controller(
     result = _run_child(kanban_plan_args, check=True)
     kanban_plan_packet = _load_json(kanban_plan_json_path)
 
-    created_task_id = None
-    duplicate_found = False
-
-    # Step 4: Optional task creation via --apply on kanban helper
-    created_task_id = None
+    # Step 4: Optional task creation via _apply_create_task
     duplicate_found = kanban_plan_packet.get("duplicate_check", {}).get("duplicate_found", False)
-    existing_id = kanban_plan_packet.get("duplicate_check", {}).get("existing_task_id")
+    created_task_id = None
+    idempotency_key = ""
+    apply_blockers = []
 
     if apply_create_task:
-        task_action = task_draft_packet.get("action", "")
-        if task_action == "no_action_wait":
-            # Downgrade to dry-run: no_action_wait cannot produce a task
-            pass  # apply_create_task is ignored for no_action_wait
-        else:
-            apply_args = [
-                sys.executable,
-                str(_resolve_child("pr_gate_kanban_task_create.py")),
-                "--task-draft", str(task_draft_json_path),
-                "--board", board,
-                "--output-json", str(kanban_plan_json_path),
-                "--output-md", str(kanban_plan_md_path),
-                "--apply",
-            ]
-            result = _run_child(apply_args, check=True)
-            # Re-read plan after apply
-            apply_plan = _load_json(kanban_plan_json_path)
-            duplicate_found = apply_plan.get("duplicate_check", {}).get("duplicate_found", False)
-            existing_id = apply_plan.get("duplicate_check", {}).get("existing_task_id")
-            if duplicate_found and existing_id:
-                created_task_id = existing_id
-            else:
-                created_task_id = apply_plan.get("apply_result", {}).get("created_task_id")
+        dup, tid, ikey, blockers = _apply_create_task(
+            apply_create_task=apply_create_task,
+            task_draft_packet=task_draft_packet,
+            task_draft_json_path=task_draft_json_path,
+            kanban_plan_json_path=kanban_plan_json_path,
+            kanban_plan_md_path=kanban_plan_md_path,
+            board=board,
+        )
+        # Override with _apply_create_task results when in apply mode
+        duplicate_found = dup if dup is not None else duplicate_found
+        created_task_id = tid
+        idempotency_key = ikey
+        apply_blockers = blockers
 
     # Build controller run packet
     classification = classifier_packet.get("classification", "unknown")
@@ -254,7 +242,12 @@ def run_controller(
             "pr_number": pr_number,
         },
         "board": board,
-        "mode": "apply_create_task" if (apply_create_task and task_action != "no_action_wait") else "dry_run",
+        "mode": "apply_create_task" if (apply_create_task and task_action not in ("no_action_wait", "ci_pending", "codex_pending", "unknown", "")) else "dry_run",
+        "apply_create_task_requested": apply_create_task,
+        "apply_create_task_allowed": apply_create_task and task_action not in ("no_action_wait", "ci_pending", "codex_pending", "unknown", ""),
+        "idempotency_key": idempotency_key,
+        "downstream_helper": "pr_gate_kanban_task_create.py",
+        "no_dispatch_guarantee": True,
         "artifacts": {
             "classifier_json": str(classifier_json_path),
             "task_draft_json": str(task_draft_json_path),
@@ -271,7 +264,7 @@ def run_controller(
             "final_recommendation": final_recommendation,
         },
         "stop_rules": STOP_RULES,
-        "blockers_or_uncertainty": [],
+        "blockers_or_uncertainty": apply_blockers,
     }
 
     # Write controller run packet
@@ -284,6 +277,93 @@ def run_controller(
     _write_text(summary_md, controller_summary_path)
 
     return run_packet
+
+
+def _make_controller_idempotency_key(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int,
+    head_sha: str,
+    task_action: str,
+) -> str:
+    """Build a deterministic controller-level idempotency key.
+
+    Format: aed:<owner>/<name>:pr:<pr>:head:<sha>:action:<action>
+
+    Returns empty string if any component is missing or empty.
+    """
+    if not all([repo_owner, repo_name, pr_number, head_sha, task_action]):
+        return ""
+    return f"aed:{repo_owner}/{repo_name}:pr:{pr_number}:head:{head_sha}:action:{task_action}"
+
+
+def _apply_create_task(
+    apply_create_task: bool,
+    task_draft_packet: dict,
+    task_draft_json_path: Path,
+    kanban_plan_json_path: Path,
+    kanban_plan_md_path: Path,
+    board: str,
+) -> tuple[bool | None, bool | None, str | None, list[str]]:
+    """Apply Kanban task creation once.
+
+    Returns (duplicate_found, created_task_id, idempotency_key, blockers).
+    Refuses to apply if task_action is no_action_wait or other unsafe states.
+    """
+    if not apply_create_task:
+        return None, None, "", []
+
+    task_action = task_draft_packet.get("action", "")
+    pr_number = task_draft_packet.get("pr_number", 0)
+    head_sha = task_draft_packet.get("head_sha", "")
+    repo_owner = task_draft_packet.get("source", {}).get("repo_owner", "") or task_draft_packet.get("repo", {}).get("owner", "")
+    repo_name = task_draft_packet.get("source", {}).get("repo_name", "") or task_draft_packet.get("repo", {}).get("name", "")
+
+    # Build idempotency key
+    controller_ikey = _make_controller_idempotency_key(
+        repo_owner, repo_name, pr_number, head_sha, task_action
+    )
+
+    blockers = []
+
+    # Refuse apply if required fields are missing
+    if not head_sha:
+        blockers.append("apply_create_task: head_sha is missing from task draft")
+    if not pr_number:
+        blockers.append("apply_create_task: pr_number is missing from task draft")
+    if not task_action:
+        blockers.append("apply_create_task: task_action is missing from task draft")
+
+    # Refuse apply for no-action states
+    if task_action in ("no_action_wait", "ci_pending", "codex_pending", "unknown", ""):
+        blockers.append(f"apply_create_task: task_action '{task_action}' cannot produce a task")
+
+    if blockers:
+        return None, None, controller_ikey, blockers
+
+    # Exactly one invocation
+    apply_args = [
+        sys.executable,
+        str(_resolve_child("pr_gate_kanban_task_create.py")),
+        "--task-draft", str(task_draft_json_path),
+        "--board", board,
+        "--output-json", str(kanban_plan_json_path),
+        "--output-md", str(kanban_plan_md_path),
+        "--apply",
+    ]
+    result = _run_child(apply_args, check=True)
+
+    # Re-read plan after apply
+    apply_plan = _load_json(kanban_plan_json_path)
+    duplicate_found = apply_plan.get("duplicate_check", {}).get("duplicate_found", False)
+    existing_id = apply_plan.get("duplicate_check", {}).get("existing_task_id")
+
+    if duplicate_found and existing_id:
+        created_task_id = existing_id
+    else:
+        created_task_id = apply_plan.get("apply_result", {}).get("created_task_id")
+
+    return duplicate_found, created_task_id, controller_ikey, []
 
 
 def _render_summary(
@@ -317,7 +397,7 @@ def _render_summary(
         "## Task Draft",
         "",
         f"- **Action:** `{result['task_action']}`",
-        f"- **Idempotency key:** `{task_draft_packet.get('idempotency_key', '')}`",
+        f"- **Idempotency key:** `{run_packet.get('idempotency_key', task_draft_packet.get('idempotency_key', ''))}`",
         f"- **PR head:** `{task_draft_packet.get('head_sha', '')}`",
         "",
         "## Kanban Plan",
