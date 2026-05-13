@@ -37,6 +37,8 @@ from pathlib import Path
 HERMES_PREFIX = "/home/max/.hermes"
 FORBIDDEN_PREFIXES = (HERMES_PREFIX,)
 PACKET_KIND = "aed.merge_ready.v1"
+REVIEW_EVIDENCE_KIND = "aed.pr_gate.review_evidence.v1"
+SCHEMA_VERSION = 1
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -119,6 +121,197 @@ def build_packet(
     }
 
 
+# ── Review Evidence Packet ─────────────────────────────────────────────────────
+
+ALLOWED_REVIEW_SOURCES = ("github_codex", "codex_cli_fallback", "reviewer", "none")
+ALLOWED_REVIEW_STATUSES = ("clean", "suggestions", "pending", "unavailable", "stale", "missing", "unknown")
+ALLOWED_SCOPE_STATUSES = ("clean", "dirty")
+REQUIRED_CI_JOBS = ("test", "validator", "governance-validators", "pr-gate-live-smoke")
+
+
+def build_review_evidence_packet(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int,
+    current_head_sha: str,
+    reviewed_head_sha: str,
+    review_source: str,
+    review_status: str,
+    codex_github_review_id: str | None = None,
+    codex_cli_fallback_id: str | None = None,
+    ci_status: str = "unknown",
+    ci_required_jobs: list[str] | None = None,
+    changed_files: list[str] | None = None,
+    allowed_files: list[str] | None = None,
+    mergeable: bool = True,
+) -> dict:
+    """Build an aed.pr_gate.review_evidence.v1 packet.
+
+    Rules:
+      - review_is_stale is True when reviewed_head_sha != current_head_sha.
+      - merge_allowed is False when review_is_stale is True.
+      - GitHub Codex evidence only counts if review_source==github_codex
+        AND reviewed_head_sha==current_head_sha AND review_status==clean.
+      - Codex CLI fallback evidence only counts if review_source==codex_cli_fallback
+        AND reviewed_head_sha==current_head_sha AND review_status==clean.
+      - Missing/pending/suggestions review evidence sets merge_allowed=False.
+      - ci_all_green must be True for merge_allowed.
+      - scope_status must be clean for merge_allowed.
+      - Any changed file outside allowed_files sets merge_allowed=False.
+    """
+    now = datetime.now(timezone.utc)
+
+    # Derived fields
+    review_is_stale = reviewed_head_sha != current_head_sha
+
+    ci_required_jobs = ci_required_jobs or list(REQUIRED_CI_JOBS)
+    changed_files = changed_files or []
+    allowed_files = allowed_files or []
+
+    # CI: all_green is true only if ci_status is "green" and all required jobs present
+    ci_all_green = ci_status == "green"
+
+    # Scope: clean only if all changed files are in allowed_files
+    scope_dirty_files = [f for f in changed_files if f not in allowed_files]
+    scope_status = "clean" if not scope_dirty_files else "dirty"
+
+    # Merge allowed logic
+    blockers: list[str] = []
+
+    if review_is_stale:
+        blockers.append("review is stale: reviewed_head_sha != current_head_sha")
+
+    if review_source not in ALLOWED_REVIEW_SOURCES:
+        blockers.append(f"review_source '{review_source}' is not valid")
+    elif review_source == "none":
+        blockers.append("missing review evidence: review_source is 'none'")
+    elif review_status == "missing":
+        blockers.append("missing review evidence: review_status is 'missing'")
+    elif review_status == "unknown":
+        blockers.append("missing review evidence: review_status is 'unknown'")
+    elif review_status == "pending":
+        blockers.append("review is pending")
+    elif review_status == "suggestions":
+        blockers.append("review has suggestions")
+
+    if review_source == "github_codex":
+        if review_status not in ("clean",):
+            blockers.append("github_codex review is not clean")
+        elif review_is_stale:
+            blockers.append("github_codex review is stale")
+    elif review_source == "codex_cli_fallback":
+        if review_status not in ("clean",):
+            blockers.append("codex_cli_fallback review is not clean")
+        elif review_is_stale:
+            blockers.append("codex_cli_fallback review is stale")
+
+    if not ci_all_green:
+        blockers.append(f"CI is not all-green: ci_status='{ci_status}'")
+
+    if scope_status != "clean":
+        blockers.append(f"scope is dirty: {scope_dirty_files}")
+
+    if not mergeable:
+        blockers.append("PR is not mergeable")
+
+    merge_allowed = len(blockers) == 0
+
+    # Recommended merge command
+    recommended_merge_command = (
+        f"gh pr merge {pr_number} "
+        f"--repo {repo_owner}/{repo_name} "
+        f"--squash --delete-branch --match-head-commit {current_head_sha}"
+    )
+
+    packet = {
+        "packet_kind": REVIEW_EVIDENCE_KIND,
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": now.strftime("%Y-%m-%dT%H:%M:%S+00:00"),
+        "repo_owner": repo_owner,
+        "repo_name": repo_name,
+        "pr_number": pr_number,
+        "current_head_sha": current_head_sha,
+        "reviewed_head_sha": reviewed_head_sha,
+        "review_source": review_source,
+        "review_status": review_status,
+        "review_is_stale": review_is_stale,
+        "codex_github_review_id": codex_github_review_id,
+        "codex_cli_fallback_id": codex_cli_fallback_id,
+        "ci_status": ci_status,
+        "ci_required_jobs": list(ci_required_jobs),
+        "ci_all_green": ci_all_green,
+        "changed_files": list(changed_files),
+        "allowed_files": list(allowed_files),
+        "scope_status": scope_status,
+        "mergeable": mergeable,
+        "merge_allowed": merge_allowed,
+        "blockers_or_uncertainty": list(blockers),
+        "recommended_merge_command": recommended_merge_command,
+    }
+    return packet
+
+
+def serialize_review_evidence_packet(packet: dict) -> str:
+    """Serialize review evidence packet to stable JSON."""
+    return json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
+def render_review_evidence_markdown(packet: dict) -> str:
+    """Render human-readable review evidence packet."""
+    lines = [
+        "# REVIEW EVIDENCE PACKET",
+        "",
+        f"**Kind:** `{packet.get('packet_kind', '?')}`",
+        f"**Schema:** v{packet.get('schema_version', '?')}",
+        f"**Generated:** {packet.get('generated_at', '?')}",
+        f"**Repo:** `{packet.get('repo_owner', '?')}/{packet.get('repo_name', '?')}`",
+        f"**PR:** #{packet.get('pr_number', '?')}",
+        "",
+        "## Head SHAs",
+        f"- **current_head_sha:** `{packet.get('current_head_sha', '?')}`",
+        f"- **reviewed_head_sha:** `{packet.get('reviewed_head_sha', '?')}`",
+        f"- **review_is_stale:** `{packet.get('review_is_stale', '?')}`",
+        "",
+        "## Review Evidence",
+        f"- **review_source:** `{packet.get('review_source', '?')}`",
+        f"- **review_status:** `{packet.get('review_status', '?')}`",
+        f"- **codex_github_review_id:** `{packet.get('codex_github_review_id', '?')}`",
+        f"- **codex_cli_fallback_id:** `{packet.get('codex_cli_fallback_id', '?')}`",
+        "",
+        "## CI",
+        f"- **ci_status:** `{packet.get('ci_status', '?')}`",
+        f"- **ci_all_green:** `{packet.get('ci_all_green', '?')}`",
+        f"- **ci_required_jobs:** `{', '.join(packet.get('ci_required_jobs', []))}`",
+        "",
+        "## Scope",
+        f"- **scope_status:** `{packet.get('scope_status', '?')}`",
+        f"- **changed_files:** `{len(packet.get('changed_files', []))} files`",
+        f"- **allowed_files:** `{len(packet.get('allowed_files', []))} files`",
+        "",
+        "## Merge Readiness",
+        f"- **mergeable:** `{packet.get('mergeable', '?')}`",
+        f"- **merge_allowed:** `{packet.get('merge_allowed', '?')}`",
+        "",
+    ]
+
+    blockers = packet.get("blockers_or_uncertainty", [])
+    if blockers:
+        lines.append("## Blockers")
+        for b in blockers:
+            lines.append(f"  - ❌ {b}")
+        lines.append("")
+    else:
+        lines.append("## Blockers\n  - (none)\n")
+
+    lines += [
+        "## Merge Command",
+        f"```bash",
+        f"{packet.get('recommended_merge_command', '?')}",
+        f"```",
+    ]
+    return "\n".join(lines)
+
+
 def serialize_packet(packet: dict) -> str:
     """Serialize to stable JSON."""
     return json.dumps(packet, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -184,7 +377,7 @@ def render_markdown(packet: dict) -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Build a MERGE_READY_PACKET from PR gate data. "
+        description="Build a MERGE_READY_PACKET or REVIEW_EVIDENCE_PACKET from PR gate data. "
                     "Does NOT merge. Human must run check_merge_authorization.py.",
     )
     p.add_argument("--pr-number", type=int, required=True)
@@ -200,12 +393,79 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--recommendation", type=str, required=True)
     p.add_argument("--output-json", type=str, default=None)
     p.add_argument("--output-md", type=str, default=None)
+    # Review evidence sub-command
+    p.add_argument("--build-review-evidence", action="store_true",
+                    help="Build a REVIEW_EVIDENCE_PACKET instead of MERGE_READY_PACKET")
+    p.add_argument("--repo-owner", type=str, default="Slideshow11")
+    p.add_argument("--repo-name", type=str, default="Automated-Edge-Discovery")
+    p.add_argument("--reviewed-head-sha", type=str, default=None,
+                    help="SHA that was reviewed (defaults to --head-sha)")
+    p.add_argument("--review-source", type=str, default="none",
+                    choices=list(ALLOWED_REVIEW_SOURCES))
+    p.add_argument("--review-status", type=str, default="unknown",
+                    choices=list(ALLOWED_REVIEW_STATUSES))
+    p.add_argument("--codex-github-review-id", type=str, default=None)
+    p.add_argument("--codex-cli-fallback-id", type=str, default=None)
+    p.add_argument("--review-evidence-output-json", type=str, default=None)
+    p.add_argument("--review-evidence-output-md", type=str, default=None)
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # Handle review evidence packet
+    if args.build_review_evidence:
+        if args.output_json and _is_forbidden_path(args.output_json):
+            print(f"ERROR: Output path may not be inside {HERMES_PREFIX}", file=sys.stderr)
+            return 1
+        if args.output_md and _is_forbidden_path(args.output_md):
+            print(f"ERROR: Output path may not be inside {HERMES_PREFIX}", file=sys.stderr)
+            return 1
+
+        # Parse mergeable
+        mergeable = args.mergeable.lower() in ("true", "1", "yes")
+
+        # Parse comma-separated file lists
+        changed_files = [f.strip() for f in args.changed_files.split(",") if f.strip()]
+        allowed_files = [f.strip() for f in args.allowed_files.split(",") if f.strip()]
+
+        current_head_sha = args.head_sha
+        reviewed_head_sha = args.reviewed_head_sha if args.reviewed_head_sha else current_head_sha
+
+        packet = build_review_evidence_packet(
+            repo_owner=args.repo_owner,
+            repo_name=args.repo_name,
+            pr_number=args.pr_number,
+            current_head_sha=current_head_sha,
+            reviewed_head_sha=reviewed_head_sha,
+            review_source=args.review_source,
+            review_status=args.review_status,
+            codex_github_review_id=args.codex_github_review_id,
+            codex_cli_fallback_id=args.codex_cli_fallback_id,
+            ci_status=args.ci_status,
+            ci_required_jobs=list(REQUIRED_CI_JOBS),
+            changed_files=changed_files,
+            allowed_files=allowed_files,
+            mergeable=mergeable,
+        )
+
+        json_bytes = serialize_review_evidence_packet(packet).encode("utf-8")
+
+        if args.review_evidence_output_json:
+            Path(args.review_evidence_output_json).write_bytes(json_bytes)
+            print(f"Review evidence JSON written to {args.review_evidence_output_json}", file=sys.stderr)
+
+        if args.review_evidence_output_md:
+            md = render_review_evidence_markdown(packet)
+            Path(args.review_evidence_output_md).write_text(md + "\n", encoding="utf-8")
+            print(f"Review evidence Markdown written to {args.review_evidence_output_md}", file=sys.stderr)
+
+        if not args.review_evidence_output_json and not args.review_evidence_output_md:
+            print(serialize_review_evidence_packet(packet))
+
+        return 0
 
     # Validate output paths
     if args.output_json and _is_forbidden_path(args.output_json):

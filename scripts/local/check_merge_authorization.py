@@ -22,11 +22,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 
 PACKET_KIND = "aed.merge_ready.v1"
+REVIEW_EVIDENCE_KIND = "aed.pr_gate.review_evidence.v1"
 
 
 # ── Validation helpers ────────────────────────────────────────────────────────
@@ -116,6 +118,90 @@ def check_required_fields(packet: dict) -> tuple[bool, str]:
     return True, ""
 
 
+# ── Review Evidence Packet checks ─────────────────────────────────────────────
+
+def _is_valid_sha(sha: str) -> bool:
+    return bool(re.fullmatch(r"[0-9a-f]{40}", sha))
+
+
+def load_review_evidence(path: str) -> tuple[dict | None, str]:
+    """Load and parse a REVIEW_EVIDENCE_PACKET JSON file."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            packet = json.load(fh)
+    except FileNotFoundError:
+        return None, f"review evidence file not found: {path}"
+    except json.JSONDecodeError as e:
+        return None, f"invalid JSON in review evidence: {e}"
+    except Exception as e:
+        return None, f"failed to read review evidence: {e}"
+
+    kind = packet.get("packet_kind", "")
+    if kind != REVIEW_EVIDENCE_KIND:
+        return None, f"packet_kind is '{kind}', expected '{REVIEW_EVIDENCE_KIND}'"
+    return packet, ""
+
+
+def check_review_evidence(packet: dict, current_head_sha: str | None = None) -> list[tuple[str, bool, str]]:
+    """Check a review evidence packet.
+
+    Returns list of (check_name, passed, message).
+    Rejects when:
+      - review_is_stale is True
+      - merge_allowed is False
+      - current_head_sha does not match the authorization SHA
+      - ci_all_green is False
+      - scope_status is not clean
+      - review_status is not clean
+    """
+    checks = []
+
+    # Packet kind
+    kind = packet.get("packet_kind", "")
+    ok = kind == REVIEW_EVIDENCE_KIND
+    checks.append(("review_evidence_packet_kind", ok,
+                    "" if ok else f"packet_kind is '{kind}', expected '{REVIEW_EVIDENCE_KIND}'"))
+
+    # review_is_stale
+    review_is_stale = packet.get("review_is_stale")
+    ok = review_is_stale is not True
+    checks.append(("review_not_stale", ok,
+                    "" if ok else "review_is_stale is True — review is stale"))
+
+    # merge_allowed
+    merge_allowed = packet.get("merge_allowed")
+    ok = merge_allowed is True
+    checks.append(("merge_allowed", ok,
+                    "" if ok else f"merge_allowed is False: {packet.get('blockers_or_uncertainty', [])}"))
+
+    # current_head_sha match
+    if current_head_sha:
+        packet_head = packet.get("current_head_sha", "")
+        ok = bool(packet_head) and current_head_sha == packet_head
+        checks.append(("current_head_sha_match", ok,
+                        "" if ok else f"HEAD mismatch: packet={packet_head}, current={current_head_sha}"))
+
+    # ci_all_green
+    ci_all_green = packet.get("ci_all_green")
+    ok = ci_all_green is True
+    checks.append(("ci_all_green", ok,
+                    "" if ok else f"ci_all_green is {ci_all_green}"))
+
+    # scope_status clean
+    scope_status = packet.get("scope_status", "")
+    ok = scope_status == "clean"
+    checks.append(("scope_clean", ok,
+                    "" if ok else f"scope_status is '{scope_status}', not 'clean'"))
+
+    # review_status clean
+    review_status = packet.get("review_status", "")
+    ok = review_status == "clean"
+    checks.append(("review_status_clean", ok,
+                    "" if ok else f"review_status is '{review_status}', not 'clean'"))
+
+    return checks
+
+
 def load_packet(path: str) -> tuple[dict | None, str]:
     try:
         with open(path, encoding="utf-8") as fh:
@@ -155,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--current-head", type=str, default=None,
         help="Optional: verify current HEAD matches packet head_sha"
     )
+    p.add_argument(
+        "--review-evidence", type=str, default=None,
+        help="Path to REVIEW_EVIDENCE_PACKET.json (optional). "
+             "If supplied, review evidence checks are run."
+    )
     return p
 
 
@@ -162,14 +253,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # Load packet
+    # Load MERGE_READY_PACKET
     packet, load_err = load_packet(args.packet)
     if packet is None:
         print(f"ERROR: {load_err}", file=sys.stderr)
         return 1
 
-    # Run all checks
+    # Run all MERGE_READY_PACKET checks
     results = run_all_checks(packet, args.phrase, args.current_head)
+
+    # Load and check review evidence if provided
+    if args.review_evidence:
+        rev_packet, rev_err = load_review_evidence(args.review_evidence)
+        if rev_packet is None:
+            print(f"ERROR: {rev_err}", file=sys.stderr)
+            return 1
+        rev_results = check_review_evidence(rev_packet, args.current_head)
+        results.extend(rev_results)
+    else:
+        rev_packet = None
 
     # Print results
     all_passed = all(passed for _, passed, _ in results)
@@ -179,6 +281,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"PR: {packet.get('pr_number', '?')} | {packet.get('pr_url', '?')}")
     print(f"Packet head: {packet.get('head_sha', '?')[:8]}")
     print(f"Recommendation: {packet.get('recommendation', '?')}")
+    if rev_packet:
+        print(f"Review evidence: {rev_packet.get('current_head_sha', '?')[:8]} "
+              f"[{rev_packet.get('review_source', '?')}] "
+              f"stale={rev_packet.get('review_is_stale', '?')} "
+              f"merge_allowed={rev_packet.get('merge_allowed', '?')}")
     print()
 
     for name, passed, msg in results:

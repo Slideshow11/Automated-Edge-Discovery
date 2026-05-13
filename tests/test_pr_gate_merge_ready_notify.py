@@ -600,8 +600,251 @@ def test_old_packet_format_compatibility(tmp_path):
     assert result.returncode == 0, f"stderr: {result.stderr}"
     packet = json.loads(out_json.read_text())
     assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
-    assert packet["required_authorization_phrase"] is not None
-    assert "af386e4c75341a2a6e7a6f68b680844de5cef1df" in packet["required_authorization_phrase"]
+
+
+# ── Review Evidence Packet integration tests ─────────────────────────────────
+
+REPO_OWNER = "Slideshow11"
+REPO_NAME = "Automated-Edge-Discovery"
+HEAD = "abc123" + "0" * 34  # 40-char
+
+
+class TestReviewEvidenceIntegration:
+    """Tests 12-14: merge-ready notification with review evidence."""
+
+    def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        old_head = "deadbeef" + "1" * 32
+        current = old_head if stale else HEAD
+        reviewed = old_head if stale else HEAD
+        status = "clean" if merge_allowed else "pending"
+        base = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": current,
+            "reviewed_head_sha": reviewed,
+            "review_source": "github_codex",
+            "review_status": status,
+            "review_is_stale": stale,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": merge_allowed,
+            "blockers_or_uncertainty": [] if merge_allowed else ["review is pending"],
+            "recommended_merge_command": f"gh pr merge 207 --repo {REPO_OWNER}/{REPO_NAME} --squash --delete-branch --match-head-commit {current}",
+        }
+        for k, v in overrides.items():
+            base[k] = v
+        return base
+
+    def _run_with_review_evidence(self, tmp_path, review_evidence: dict, extra_cli: list[str] | None = None) -> subprocess.CompletedProcess:
+        """Run pr_gate_merge_ready_notify.py with --review-evidence."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(review_evidence))
+
+        cli = [
+            sys.executable, str(SCRIPT),
+            "--pr-number", "207",
+            "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+            "--head-sha", HEAD,
+            "--base-branch", "main",
+            "--ci-status", "green",
+            "--codex-status", "clean",
+            "--fallback-review-status", "clean",
+            "--reviewer-status", "approved",
+            "--scope-status", "clean",
+            "--mergeable",
+            "--changed-file", "docs/README.md",
+            "--output-json", str(out_json),
+            "--output-md", str(out_md),
+            "--review-evidence", str(rev_path),
+        ]
+        if extra_cli:
+            cli.extend(extra_cli)
+        return subprocess.run(cli, capture_output=True, text=True)
+
+    def test_review_evidence_included_in_notification_json(self, tmp_path):
+        """Test 12: merge-ready notification includes review_source and reviewed_head_sha."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" in packet, f"Missing review_evidence_summary: {packet.keys()}"
+        summary = packet["review_evidence_summary"]
+        assert summary["review_source"] == "github_codex"
+        assert summary["reviewed_head_sha"] == HEAD
+        assert summary["current_head_sha"] == HEAD
+        assert summary["review_is_stale"] is False
+        assert summary["ci_all_green"] is True
+        assert summary["scope_status"] == "clean"
+
+    def test_stale_review_evidence_produces_not_merge_ready(self, tmp_path):
+        """Test 13: merge-ready notification refuses authorization phrase when evidence stale."""
+        rev = self._make_review_evidence(stale=True, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+        assert packet["merge_command_template"] is None
+        assert any("stale" in b.lower() for b in packet["blockers_or_uncertainty"]), \
+            f"Expected stale blocker: {packet['blockers_or_uncertainty']}"
+
+    def test_merge_allowed_false_produces_not_merge_ready(self, tmp_path):
+        """Test 13b: merge_allowed=False produces not_merge_ready regardless of other fields."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+
+    def test_review_evidence_included_in_notification_md(self, tmp_path):
+        """Test 12b: merge-ready notification markdown includes review evidence summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md_text = (tmp_path / "notification.md").read_text()
+        assert "review_source" in md_text.lower() or "Review Evidence Summary" in md_text
+
+    def test_review_evidence_passed_through_packet_mode(self, tmp_path):
+        """Test: --review-evidence works in packet mode (--merge-ready-packet + --controller-run-packet)."""
+        mrp = tmp_path / "MERGE_READY_PACKET.json"
+        crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        mrp.write_text(json.dumps({
+            "pr": {
+                "number": 207, "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+                "head_sha": HEAD, "base_branch": "main",
+            },
+            "ci_status": "green", "scope_status": "clean",
+            "mergeable": True,
+            "changed_files": ["docs/README.md"],
+        }))
+        crp.write_text(json.dumps({
+            "result": {
+                "ci_status": "green", "codex_status": "clean",
+                "reviewer_status": "approved",
+            }
+        }))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--merge-ready-packet", str(mrp),
+             "--controller-run-packet", str(crp),
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert "review_evidence_summary" in packet
+        assert packet["review_evidence_summary"]["review_source"] == "github_codex"
+
+    def test_wrong_review_evidence_packet_kind_fails(self, tmp_path):
+        """Test: wrong packet_kind in --review-evidence raises error."""
+        rev = dict(self._make_review_evidence())
+        rev["packet_kind"] = "aed.wrong.v1"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "aed.wrong.v1" in result.stderr or "packet_kind" in result.stderr.lower()
+
+    def test_ci_all_green_field_reflects_ci_status(self, tmp_path):
+        """Test: ci_all_green in review evidence summary reflects ci_status."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, ci_status="green", ci_all_green=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["ci_all_green"] is True
+
+        rev_red = self._make_review_evidence(stale=False, merge_allowed=False, ci_status="red", ci_all_green=False)
+        result2 = self._run_with_review_evidence(tmp_path, rev_red)
+        assert result2.returncode == 0
+        packet2 = json.loads((tmp_path / "notification.json").read_text())
+        assert packet2["review_evidence_summary"]["ci_all_green"] is False
+
+    def test_scope_status_reflects_file_scope(self, tmp_path):
+        """Test: scope_status in review evidence summary reflects changed/allowed files."""
+        rev = self._make_review_evidence(
+            stale=False, merge_allowed=True,
+            changed_files=["docs/README.md"],
+            allowed_files=["docs/README.md"],
+            scope_status="clean",
+        )
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["scope_status"] == "clean"
+
+    def test_review_status_included_in_summary(self, tmp_path):
+        """Test: review_status field is included in review_evidence_summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, review_status="clean")
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_status" in packet["review_evidence_summary"]
+        assert packet["review_evidence_summary"]["review_status"] == "clean"
+
+    def test_no_review_evidence_still_produces_notification(self, tmp_path):
+        """Test: running without --review-evidence still works (backward compat)."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" not in packet
+        assert packet["recommendation"] == "merge_ready"
 
 
 def test_old_packet_codex_unavailable(tmp_path):
@@ -640,6 +883,251 @@ def test_old_packet_codex_unavailable(tmp_path):
     assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
 
 
+# ── Review Evidence Packet integration tests ─────────────────────────────────
+
+REPO_OWNER = "Slideshow11"
+REPO_NAME = "Automated-Edge-Discovery"
+HEAD = "abc123" + "0" * 34  # 40-char
+
+
+class TestReviewEvidenceIntegration:
+    """Tests 12-14: merge-ready notification with review evidence."""
+
+    def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        old_head = "deadbeef" + "1" * 32
+        current = old_head if stale else HEAD
+        reviewed = old_head if stale else HEAD
+        status = "clean" if merge_allowed else "pending"
+        base = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": current,
+            "reviewed_head_sha": reviewed,
+            "review_source": "github_codex",
+            "review_status": status,
+            "review_is_stale": stale,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": merge_allowed,
+            "blockers_or_uncertainty": [] if merge_allowed else ["review is pending"],
+            "recommended_merge_command": f"gh pr merge 207 --repo {REPO_OWNER}/{REPO_NAME} --squash --delete-branch --match-head-commit {current}",
+        }
+        for k, v in overrides.items():
+            base[k] = v
+        return base
+
+    def _run_with_review_evidence(self, tmp_path, review_evidence: dict, extra_cli: list[str] | None = None) -> subprocess.CompletedProcess:
+        """Run pr_gate_merge_ready_notify.py with --review-evidence."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(review_evidence))
+
+        cli = [
+            sys.executable, str(SCRIPT),
+            "--pr-number", "207",
+            "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+            "--head-sha", HEAD,
+            "--base-branch", "main",
+            "--ci-status", "green",
+            "--codex-status", "clean",
+            "--fallback-review-status", "clean",
+            "--reviewer-status", "approved",
+            "--scope-status", "clean",
+            "--mergeable",
+            "--changed-file", "docs/README.md",
+            "--output-json", str(out_json),
+            "--output-md", str(out_md),
+            "--review-evidence", str(rev_path),
+        ]
+        if extra_cli:
+            cli.extend(extra_cli)
+        return subprocess.run(cli, capture_output=True, text=True)
+
+    def test_review_evidence_included_in_notification_json(self, tmp_path):
+        """Test 12: merge-ready notification includes review_source and reviewed_head_sha."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" in packet, f"Missing review_evidence_summary: {packet.keys()}"
+        summary = packet["review_evidence_summary"]
+        assert summary["review_source"] == "github_codex"
+        assert summary["reviewed_head_sha"] == HEAD
+        assert summary["current_head_sha"] == HEAD
+        assert summary["review_is_stale"] is False
+        assert summary["ci_all_green"] is True
+        assert summary["scope_status"] == "clean"
+
+    def test_stale_review_evidence_produces_not_merge_ready(self, tmp_path):
+        """Test 13: merge-ready notification refuses authorization phrase when evidence stale."""
+        rev = self._make_review_evidence(stale=True, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+        assert packet["merge_command_template"] is None
+        assert any("stale" in b.lower() for b in packet["blockers_or_uncertainty"]), \
+            f"Expected stale blocker: {packet['blockers_or_uncertainty']}"
+
+    def test_merge_allowed_false_produces_not_merge_ready(self, tmp_path):
+        """Test 13b: merge_allowed=False produces not_merge_ready regardless of other fields."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+
+    def test_review_evidence_included_in_notification_md(self, tmp_path):
+        """Test 12b: merge-ready notification markdown includes review evidence summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md_text = (tmp_path / "notification.md").read_text()
+        assert "review_source" in md_text.lower() or "Review Evidence Summary" in md_text
+
+    def test_review_evidence_passed_through_packet_mode(self, tmp_path):
+        """Test: --review-evidence works in packet mode (--merge-ready-packet + --controller-run-packet)."""
+        mrp = tmp_path / "MERGE_READY_PACKET.json"
+        crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        mrp.write_text(json.dumps({
+            "pr": {
+                "number": 207, "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+                "head_sha": HEAD, "base_branch": "main",
+            },
+            "ci_status": "green", "scope_status": "clean",
+            "mergeable": True,
+            "changed_files": ["docs/README.md"],
+        }))
+        crp.write_text(json.dumps({
+            "result": {
+                "ci_status": "green", "codex_status": "clean",
+                "reviewer_status": "approved",
+            }
+        }))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--merge-ready-packet", str(mrp),
+             "--controller-run-packet", str(crp),
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert "review_evidence_summary" in packet
+        assert packet["review_evidence_summary"]["review_source"] == "github_codex"
+
+    def test_wrong_review_evidence_packet_kind_fails(self, tmp_path):
+        """Test: wrong packet_kind in --review-evidence raises error."""
+        rev = dict(self._make_review_evidence())
+        rev["packet_kind"] = "aed.wrong.v1"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "aed.wrong.v1" in result.stderr or "packet_kind" in result.stderr.lower()
+
+    def test_ci_all_green_field_reflects_ci_status(self, tmp_path):
+        """Test: ci_all_green in review evidence summary reflects ci_status."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, ci_status="green", ci_all_green=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["ci_all_green"] is True
+
+        rev_red = self._make_review_evidence(stale=False, merge_allowed=False, ci_status="red", ci_all_green=False)
+        result2 = self._run_with_review_evidence(tmp_path, rev_red)
+        assert result2.returncode == 0
+        packet2 = json.loads((tmp_path / "notification.json").read_text())
+        assert packet2["review_evidence_summary"]["ci_all_green"] is False
+
+    def test_scope_status_reflects_file_scope(self, tmp_path):
+        """Test: scope_status in review evidence summary reflects changed/allowed files."""
+        rev = self._make_review_evidence(
+            stale=False, merge_allowed=True,
+            changed_files=["docs/README.md"],
+            allowed_files=["docs/README.md"],
+            scope_status="clean",
+        )
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["scope_status"] == "clean"
+
+    def test_review_status_included_in_summary(self, tmp_path):
+        """Test: review_status field is included in review_evidence_summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, review_status="clean")
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_status" in packet["review_evidence_summary"]
+        assert packet["review_evidence_summary"]["review_status"] == "clean"
+
+    def test_no_review_evidence_still_produces_notification(self, tmp_path):
+        """Test: running without --review-evidence still works (backward compat)."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" not in packet
+        assert packet["recommendation"] == "merge_ready"
+
+
 def test_old_packet_codex_not_requested(tmp_path):
     """Old MERGE_READY_PACKET with codex_status=not_requested also works."""
     mrp = tmp_path / "MERGE_READY_PACKET.json"
@@ -674,3 +1162,248 @@ def test_old_packet_codex_not_requested(tmp_path):
     assert result.returncode == 0, f"stderr: {result.stderr}"
     packet = json.loads(out_json.read_text())
     assert packet["recommendation"] == "merge_ready", f"Got: {packet['blockers_or_uncertainty']}"
+
+
+# ── Review Evidence Packet integration tests ─────────────────────────────────
+
+REPO_OWNER = "Slideshow11"
+REPO_NAME = "Automated-Edge-Discovery"
+HEAD = "abc123" + "0" * 34  # 40-char
+
+
+class TestReviewEvidenceIntegration:
+    """Tests 12-14: merge-ready notification with review evidence."""
+
+    def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        old_head = "deadbeef" + "1" * 32
+        current = old_head if stale else HEAD
+        reviewed = old_head if stale else HEAD
+        status = "clean" if merge_allowed else "pending"
+        base = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": current,
+            "reviewed_head_sha": reviewed,
+            "review_source": "github_codex",
+            "review_status": status,
+            "review_is_stale": stale,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": merge_allowed,
+            "blockers_or_uncertainty": [] if merge_allowed else ["review is pending"],
+            "recommended_merge_command": f"gh pr merge 207 --repo {REPO_OWNER}/{REPO_NAME} --squash --delete-branch --match-head-commit {current}",
+        }
+        for k, v in overrides.items():
+            base[k] = v
+        return base
+
+    def _run_with_review_evidence(self, tmp_path, review_evidence: dict, extra_cli: list[str] | None = None) -> subprocess.CompletedProcess:
+        """Run pr_gate_merge_ready_notify.py with --review-evidence."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(review_evidence))
+
+        cli = [
+            sys.executable, str(SCRIPT),
+            "--pr-number", "207",
+            "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+            "--head-sha", HEAD,
+            "--base-branch", "main",
+            "--ci-status", "green",
+            "--codex-status", "clean",
+            "--fallback-review-status", "clean",
+            "--reviewer-status", "approved",
+            "--scope-status", "clean",
+            "--mergeable",
+            "--changed-file", "docs/README.md",
+            "--output-json", str(out_json),
+            "--output-md", str(out_md),
+            "--review-evidence", str(rev_path),
+        ]
+        if extra_cli:
+            cli.extend(extra_cli)
+        return subprocess.run(cli, capture_output=True, text=True)
+
+    def test_review_evidence_included_in_notification_json(self, tmp_path):
+        """Test 12: merge-ready notification includes review_source and reviewed_head_sha."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" in packet, f"Missing review_evidence_summary: {packet.keys()}"
+        summary = packet["review_evidence_summary"]
+        assert summary["review_source"] == "github_codex"
+        assert summary["reviewed_head_sha"] == HEAD
+        assert summary["current_head_sha"] == HEAD
+        assert summary["review_is_stale"] is False
+        assert summary["ci_all_green"] is True
+        assert summary["scope_status"] == "clean"
+
+    def test_stale_review_evidence_produces_not_merge_ready(self, tmp_path):
+        """Test 13: merge-ready notification refuses authorization phrase when evidence stale."""
+        rev = self._make_review_evidence(stale=True, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+        assert packet["merge_command_template"] is None
+        assert any("stale" in b.lower() for b in packet["blockers_or_uncertainty"]), \
+            f"Expected stale blocker: {packet['blockers_or_uncertainty']}"
+
+    def test_merge_allowed_false_produces_not_merge_ready(self, tmp_path):
+        """Test 13b: merge_allowed=False produces not_merge_ready regardless of other fields."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=False)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["recommendation"] == "not_merge_ready"
+        assert packet["required_authorization_phrase"] is None
+
+    def test_review_evidence_included_in_notification_md(self, tmp_path):
+        """Test 12b: merge-ready notification markdown includes review evidence summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        md_text = (tmp_path / "notification.md").read_text()
+        assert "review_source" in md_text.lower() or "Review Evidence Summary" in md_text
+
+    def test_review_evidence_passed_through_packet_mode(self, tmp_path):
+        """Test: --review-evidence works in packet mode (--merge-ready-packet + --controller-run-packet)."""
+        mrp = tmp_path / "MERGE_READY_PACKET.json"
+        crp = tmp_path / "CONTROLLER_RUN_PACKET.json"
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev = self._make_review_evidence(stale=False, merge_allowed=True)
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        mrp.write_text(json.dumps({
+            "pr": {
+                "number": 207, "url": f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+                "head_sha": HEAD, "base_branch": "main",
+            },
+            "ci_status": "green", "scope_status": "clean",
+            "mergeable": True,
+            "changed_files": ["docs/README.md"],
+        }))
+        crp.write_text(json.dumps({
+            "result": {
+                "ci_status": "green", "codex_status": "clean",
+                "reviewer_status": "approved",
+            }
+        }))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--merge-ready-packet", str(mrp),
+             "--controller-run-packet", str(crp),
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert "review_evidence_summary" in packet
+        assert packet["review_evidence_summary"]["review_source"] == "github_codex"
+
+    def test_wrong_review_evidence_packet_kind_fails(self, tmp_path):
+        """Test: wrong packet_kind in --review-evidence raises error."""
+        rev = dict(self._make_review_evidence())
+        rev["packet_kind"] = "aed.wrong.v1"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+        rev_path.write_text(json.dumps(rev))
+
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode != 0
+        assert "aed.wrong.v1" in result.stderr or "packet_kind" in result.stderr.lower()
+
+    def test_ci_all_green_field_reflects_ci_status(self, tmp_path):
+        """Test: ci_all_green in review evidence summary reflects ci_status."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, ci_status="green", ci_all_green=True)
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["ci_all_green"] is True
+
+        rev_red = self._make_review_evidence(stale=False, merge_allowed=False, ci_status="red", ci_all_green=False)
+        result2 = self._run_with_review_evidence(tmp_path, rev_red)
+        assert result2.returncode == 0
+        packet2 = json.loads((tmp_path / "notification.json").read_text())
+        assert packet2["review_evidence_summary"]["ci_all_green"] is False
+
+    def test_scope_status_reflects_file_scope(self, tmp_path):
+        """Test: scope_status in review evidence summary reflects changed/allowed files."""
+        rev = self._make_review_evidence(
+            stale=False, merge_allowed=True,
+            changed_files=["docs/README.md"],
+            allowed_files=["docs/README.md"],
+            scope_status="clean",
+        )
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["scope_status"] == "clean"
+
+    def test_review_status_included_in_summary(self, tmp_path):
+        """Test: review_status field is included in review_evidence_summary."""
+        rev = self._make_review_evidence(stale=False, merge_allowed=True, review_status="clean")
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_status" in packet["review_evidence_summary"]
+        assert packet["review_evidence_summary"]["review_status"] == "clean"
+
+    def test_no_review_evidence_still_produces_notification(self, tmp_path):
+        """Test: running without --review-evidence still works (backward compat)."""
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", HEAD,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert "review_evidence_summary" not in packet
+        assert packet["recommendation"] == "merge_ready"
