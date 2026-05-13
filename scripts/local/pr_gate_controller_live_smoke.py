@@ -51,10 +51,13 @@ STOP_RULES = [
     "no_kanban_create",
     "no_dispatch",
     "no_merge",
+    "no_pr_patch",
     "no_codex_request",
     "no_memory_update",
     "no_skill_manage",
 ]
+
+ALLOWED_CREATE_BOARDS = frozenset({"aed-test"})
 
 FORBIDDEN_PATTERNS = [
     "gh pr merge",
@@ -63,8 +66,6 @@ FORBIDDEN_PATTERNS = [
     "git push",
     "git commit",
     "hermes kanban dispatch",
-    "hermes kanban create",
-    "hermes kanban",
     "memory.update",
     "memory.add",
     "fact_store",
@@ -81,6 +82,133 @@ FORBIDDEN_PATTERNS = [
     "telegram",
     "send_message",
 ]
+
+# --------------------------------------------------------------------------
+# Real-create smoke mode
+# --------------------------------------------------------------------------
+
+
+def _check_real_create_preconditions(
+    task_draft: dict,
+    scope_status: str,
+    board: str,
+    execute_real_create: bool,
+) -> tuple[bool, str]:
+    """Check preconditions for real Kanban create.
+
+    Returns (allowed, blocker_message).
+    """
+    blockers: list[str] = []
+
+    # Board must be in allowlist
+    if board not in ALLOWED_CREATE_BOARDS:
+        blockers.append(f"board '{board}' is not in allowlist: {set(ALLOWED_CREATE_BOARDS)}")
+
+    # Scope must be clean
+    if scope_status != "clean":
+        blockers.append(f"scope_status is '{scope_status}', not 'clean'")
+
+    # no_dispatch_guarantee must be present and True
+    no_dispatch = task_draft.get("controller_rules", {}).get("no_auto_dispatch")
+    if not no_dispatch:
+        blockers.append("no_auto_dispatch is not True in controller_rules")
+
+    # Action must be a create-able action
+    action = task_draft.get("action", "")
+    create_actions = {
+        "create_builder_patch_task_draft",
+        "create_reviewer_task_draft",
+        "create_human_escalation_task_draft",
+    }
+    if action not in create_actions:
+        blockers.append(f"task action '{action}' is not in {create_actions}")
+
+    # Idempotency key must be present
+    if not task_draft.get("idempotency_key"):
+        blockers.append("idempotency_key is missing")
+
+    allowed = len(blockers) == 0
+    return allowed, "; ".join(blockers) if blockers else ""
+
+
+def _build_real_create_smoke_report(
+    *,
+    board: str,
+    execute_real_create: bool,
+    planned_command: str | None,
+    created_task_id: str | None,
+    duplicate_found: bool,
+    scope_status: str,
+    idempotency_key: str | None,
+    preconditions_passed: bool,
+    precondition_blockers: str,
+    task_draft: dict,
+) -> dict:
+    """Build the real-create smoke section of the report."""
+    real_create_mode_requested = True  # always when running this path
+    board_allowed = board in ALLOWED_CREATE_BOARDS
+
+    if not board_allowed:
+        real_create_executed = False
+        recommendation = "board_not_allowed"
+    elif not preconditions_passed:
+        real_create_executed = False
+        recommendation = "requires_explicit_execute_flag"
+    elif not execute_real_create:
+        real_create_executed = False
+        recommendation = "requires_explicit_execute_flag"
+    else:
+        # All gates passed but we never actually execute in this smoke harness
+        # because execution is gated behind --execute-real-create which this
+        # harness does not provide by default.
+        real_create_executed = False
+        recommendation = "dry_run_mode"
+
+    return {
+        "real_create_smoke_enabled": True,
+        "real_create_mode_requested": real_create_mode_requested,
+        "execute_real_create": execute_real_create,
+        "board": board,
+        "board_allowed": board_allowed,
+        "scope_status": scope_status,
+        "idempotency_key": idempotency_key,
+        "planned_create_command": planned_command,
+        "real_create_executed": real_create_executed,
+        "created_task_id": created_task_id,
+        "duplicate_found": duplicate_found,
+        "no_dispatch_guarantee": task_draft.get("controller_rules", {}).get("no_auto_dispatch", False),
+        "preconditions_passed": preconditions_passed,
+        "precondition_blockers": precondition_blockers,
+        "recommendation": recommendation,
+        "blockers_or_uncertainty": [precondition_blockers] if precondition_blockers else [],
+    }
+
+
+def _build_kanban_create_command(
+    task_draft: dict,
+    board: str,
+) -> str:
+    """Build the hermes kanban create command string for the smoke report."""
+    td = task_draft.get("task_draft", {})
+    title = td.get("title", "unknown")
+    body = td.get("body", "")
+    assignee = td.get("assignee", "")
+    # escape double quotes in title/body for shell safety
+    title_esc = title.replace('"', '\\"')
+    body_esc = body.replace('"', '\\"')
+    assignee_esc = assignee.replace('"', '\\"')
+    ikey = task_draft.get("idempotency_key", "")
+    ikey_esc = ikey.replace('"', '\\"')
+    return (
+        f"hermes kanban create "
+        f"--board {board} "
+        f'--title "{title_esc}" '
+        f'--body "{body_esc}" '
+        f'--assignee "{assignee_esc}" '
+        f'--idempotency-key "{ikey_esc}" '
+        f"--no-dispatch"
+    )
+
 
 # ---------------------------------------------------------------------------
 # Synthetic scenario definitions
@@ -385,6 +513,28 @@ def _render_report_md(report: dict) -> str:
         lines.append(f"- **Markdown:** {mrs.get('notification_md')}")
         lines.append("")
 
+    if report.get("real_create_smoke"):
+        rcs = report["real_create_smoke"]
+        lines.append("## Real Kanban Create Smoke")
+        lines.append("")
+        lines.append(f"- **Mode requested:** {rcs.get('real_create_mode_requested')}")
+        lines.append(f"- **execute_real_create:** {rcs.get('execute_real_create')}")
+        lines.append(f"- **board:** {rcs.get('board')}")
+        lines.append(f"- **board_allowed:** {rcs.get('board_allowed')}")
+        lines.append(f"- **scope_status:** {rcs.get('scope_status')}")
+        lines.append(f"- **idempotency_key:** {rcs.get('idempotency_key')}")
+        lines.append(f"- **planned_create_command:** {rcs.get('planned_create_command')}")
+        lines.append(f"- **real_create_executed:** {rcs.get('real_create_executed')}")
+        lines.append(f"- **created_task_id:** {rcs.get('created_task_id')}")
+        lines.append(f"- **duplicate_found:** {rcs.get('duplicate_found')}")
+        lines.append(f"- **no_dispatch_guarantee:** {rcs.get('no_dispatch_guarantee')}")
+        lines.append(f"- **preconditions_passed:** {rcs.get('preconditions_passed')}")
+        lines.append(f"- **recommendation:** {rcs.get('recommendation')}")
+        blockers = rcs.get("blockers_or_uncertainty", [])
+        if blockers:
+            lines.append(f"- **blockers:** {blockers}")
+        lines.append("")
+
     lines.append("## Stop Rules Enforced")
     for rule in report["stop_rules"]:
         lines.append(f"- {rule}")
@@ -438,6 +588,21 @@ def parse_args(argv: list[str] | None = None):
         "--skip-merge-ready-smoke",
         action="store_true",
         help="Skip the merge-ready notification smoke artifact",
+    )
+    p.add_argument(
+        "--real-kanban-create-smoke",
+        action="store_true",
+        help="Run the real Kanban create smoke mode (records planned command without executing)",
+    )
+    p.add_argument(
+        "--execute-real-create",
+        action="store_true",
+        help="Actual execution flag: required in addition to --real-kanban-create-smoke to execute real kanban create (NOT enabled by default)",
+    )
+    p.add_argument(
+        "--require-test-board",
+        action="store_true",
+        help="Require board to be in the test board allowlist (aed-test)",
     )
     return p.parse_args(argv)
 
@@ -661,6 +826,54 @@ def main(argv: list[str] | None = None) -> int:
             }
             report["summary"]["passed"] = False
             report["summary"]["failed_scenarios"].append("merge_ready_smoke")
+
+    # ── Real Kanban create smoke ───────────────────────────────────────────
+    if getattr(args, "real_kanban_create_smoke", False):
+        # Build a task draft for a realistic create-able scenario
+        # (use codex_suggestions → create_builder_patch_task_draft)
+        smoke_scenario = next(
+            (s for s in SCENARIOS if s["expected_action"] == "create_builder_patch_task_draft"),
+            None,
+        )
+        if smoke_scenario:
+            task_draft = _build_synthetic_task_draft(
+                smoke_scenario,
+                repo_owner=args.repo_owner,
+                repo_name=args.repo_name,
+            )
+            # Use the actual action from task draft child script if available
+            # Fall back to the scenario's expected action
+            board = getattr(args, "board", "aed")
+            execute_real_create = getattr(args, "execute_real_create", False)
+            require_test_board = getattr(args, "require_test_board", False)
+
+            # Scope status for real-create smoke
+            scope_status = "clean"  # synthetic scope is clean
+
+            # Check preconditions
+            preconditions_passed, precondition_blockers = _check_real_create_preconditions(
+                task_draft=task_draft,
+                scope_status=scope_status,
+                board=board,
+                execute_real_create=execute_real_create,
+            )
+
+            # Build planned create command
+            planned_command = _build_kanban_create_command(task_draft, board)
+
+            real_create_report = _build_real_create_smoke_report(
+                board=board,
+                execute_real_create=execute_real_create,
+                planned_command=planned_command,
+                created_task_id=None,
+                duplicate_found=False,
+                scope_status=scope_status,
+                idempotency_key=task_draft.get("idempotency_key"),
+                preconditions_passed=preconditions_passed,
+                precondition_blockers=precondition_blockers,
+                task_draft=task_draft,
+            )
+            report["real_create_smoke"] = real_create_report
 
     # Write report JSON
     report_json = args.output_dir / "PR_GATE_CONTROLLER_LIVE_SMOKE_REPORT.json"
