@@ -1,210 +1,346 @@
 # Merge Authorization Guard
 
-## Purpose
+Read-only authorization system that verifies MERGE_READY_PACKET and optional REVIEW_EVIDENCE_PACKET before merge. Does NOT merge, does NOT post comments, does NOT update memory.
 
-This tool prevents accidental or ambiguous merge authorization. It makes the human authorization phrase explicit, recorded, and verifiable — closing the gap between "report says ready to merge" and "human said go."
-
-## What this tool does
-
-`build_merge_ready_packet.py` reads PR gate data and produces:
-- `MERGE_READY_PACKET.json` — machine-readable record
-- `MERGE_READY_PACKET.md` — human-readable record
-
-`check_merge_authorization.py` verifies:
-- Packet is a valid `aed.merge_ready.v1`
-- Packet has not expired (default 72h TTL)
-- Provided phrase exactly matches `required_authorization_phrase`
-- Current HEAD matches packet head_sha (if `--current-head` supplied)
-- No blockers exist
-- `recommendation` is exactly `merge`
-
-It exits **0 (authorized)** or **1 (denied)**. It does not merge.
-
-## Why this exists: PR #193 lesson
-
-PR #193 went through a full review cycle. The final gate report ended with:
-
-> "Waiting for Tom's explicit merge authorization before merging."
-
-This phrase was clear in context, but:
-- It was a natural-language statement, not a structured artifact
-- It could not be programmatically verified
-- It did not encode the exact PR number, HEAD SHA, or action
-- A future system reading the transcript could not distinguish "I confirm" in a casual discussion from an explicit merge authorization
-
-The authorization guard closes this gap by producing a packet with a specific required phrase that encodes PR number, HEAD, and action.
-
-## The exact authorization phrase
+## Overview
 
 ```
-I confirm merge PR #<number> at <head_sha>
+                    ┌─────────────────────────────────────────┐
+                    │  MERGE_READY_PACKET.json                │
+                    │  (from build_merge_ready_packet.py)     │
+                    └──────────────┬──────────────────────────┘
+                                   │ check_merge_authorization.py
+                    ┌──────────────▼──────────────────────────┐
+                    │  Human phrase:                          │
+                    │  "I confirm merge PR #N at <sha>"       │
+                    └──────────────┬──────────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────────────────┐
+                    │  ✅ AUTHORIZED  ──►  gh pr merge ...    │
+                    │  ❌ DENIED      ──►  Fix failures first  │
+                    └─────────────────────────────────────────┘
 ```
 
-Example:
+When a REVIEW_EVIDENCE_PACKET.json is also supplied, additional checks are run to ensure the review was performed on the exact current HEAD (not a stale commit) before presenting the PR for merge authorization.
+
+---
+
+## REVIEW_EVIDENCE_PACKET
+
+**Packet kind:** `aed.pr_gate.review_evidence.v1`
+
+### Purpose
+
+Removes ambiguity between:
+- GitHub Codex review on the final head
+- Codex CLI fallback review on the final head
+- Stale review on an older commit
+- Current PR head
+- CI status on the current head
+- Changed-file scope
+
+### Required fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `packet_kind` | string | Must be `aed.pr_gate.review_evidence.v1` |
+| `schema_version` | int | Must be `1` |
+| `generated_at` | string | ISO 8601 timestamp |
+| `repo_owner` | string | e.g. `Slideshow11` |
+| `repo_name` | string | e.g. `Automated-Edge-Discovery` |
+| `pr_number` | int | PR number |
+| `current_head_sha` | string | Full 40-char SHA of current HEAD |
+| `reviewed_head_sha` | string | Full 40-char SHA that was reviewed |
+| `review_source` | string | One of: `github_codex`, `codex_cli_fallback`, `reviewer`, `none` |
+| `review_status` | string | One of: `clean`, `suggestions`, `pending`, `unavailable`, `stale`, `missing`, `unknown` |
+| `review_is_stale` | bool | `true` if `reviewed_head_sha != current_head_sha` |
+| `codex_github_review_id` | string? | Optional GitHub Codex review ID |
+| `codex_cli_fallback_id` | string? | Optional Codex CLI fallback ID |
+| `ci_status` | string | CI status (e.g. `green`, `red`) |
+| `ci_required_jobs` | list[str] | Required CI job names |
+| `ci_all_green` | bool | `true` only if `ci_status == "green"` |
+| `changed_files` | list[str] | Files changed in this PR |
+| `allowed_files` | list[str] | Files permitted by PR scope |
+| `scope_status` | string | `clean` or `dirty` |
+| `mergeable` | bool | Whether PR has no merge conflicts |
+| `merge_allowed` | bool | Derived: all gates pass |
+| `blockers_or_uncertainty` | list[str] | List of blockers if `merge_allowed` is false |
+| `recommended_merge_command` | string | Full `gh pr merge` command with `--match-head-commit` |
+
+### Allowed values
+
+**`review_source`:** `github_codex`, `codex_cli_fallback`, `reviewer`, `none`
+
+**`review_status`:** `clean`, `suggestions`, `pending`, `unavailable`, `stale`, `missing`, `unknown`
+
+**`scope_status`:** `clean`, `dirty`
+
+### Required CI jobs
+
+By default, the following jobs are required:
+- `test`
+- `validator`
+- `governance-validators`
+- `pr-gate-live-smoke`
+
+### Merge allowed logic
+
+`merge_allowed = True` only when ALL of the following are true:
+
+1. `review_is_stale == False` (i.e., `reviewed_head_sha == current_head_sha`)
+2. `review_source` is one of: `github_codex`, `codex_cli_fallback`, `reviewer`
+3. `review_status == "clean"`
+4. `ci_all_green == True`
+5. `scope_status == "clean"`
+6. `mergeable == True`
+
+### Stale review behavior
+
+When `reviewed_head_sha != current_head_sha`, `review_is_stale` is set to `true` and `merge_allowed` is set to `false`.
+
+This means:
+- GitHub Codex review that was done on an older commit does not count for the current HEAD
+- A new review must be performed on the exact final HEAD before merge authorization can be given
+
+### Recommended merge command
+
+```bash
+gh pr merge {pr_number} \
+  --repo {repo_owner}/{repo_name} \
+  --squash --delete-branch --match-head-commit {current_head_sha}
 ```
-I confirm merge PR #193 at af386e4c75341a2a6e7a6f68b680844de5cef1df
+
+The `--match-head-commit` flag ensures GitHub rejects the merge if the PR head has changed since the authorization was given.
+
+---
+
+## check_merge_authorization.py
+
+### Usage
+
+```bash
+python3 scripts/local/check_merge_authorization.py \
+  --packet /tmp/MERGE_READY_PACKET.json \
+  --phrase "I confirm merge PR #207 at abc1230000000000000000000000000000000000" \
+  [--current-head abc1230000000000000000000000000000000000] \
+  [--review-evidence /tmp/REVIEW_EVIDENCE.json]
 ```
 
-### Why this specific format
+### Arguments
 
-The phrase encodes three facts:
-1. **Which PR** — `PR #193`
-2. **Which exact HEAD** — `at <sha>` (cannot be inferred from PR number alone; HEAD changes between pushes)
-3. **The action** — `merge`
+| Argument | Required | Description |
+|----------|----------|-------------|
+| `--packet` | Yes | Path to `MERGE_READY_PACKET.json` |
+| `--phrase` | Yes | Exact authorization phrase |
+| `--current-head` | No | Verify current HEAD matches packet SHA |
+| `--review-evidence` | No | Path to `REVIEW_EVIDENCE_PACKET.json` |
 
-Saying only `"I confirm"` or `"merge"` is ambiguous. It could apply to any PR at any HEAD. The guard rejects partial phrases.
+### Exit codes
 
-### Why "I confirm" alone is too ambiguous
+- `0` — All checks passed, merge authorized
+- `1` — One or more checks failed, merge denied
 
-- "I confirm" could mean "I confirm the tests passed" — not the merge itself
-- "I confirm merge" could be read as a general statement of approval, not an authorization
-- Without the PR number and HEAD SHA, the phrase cannot be linked to a specific state
-- Any paraphrasing — "confirmed merge for PR 193" — is also rejected because it cannot be machine-verified
+### Checks run
 
-The guard requires the exact phrase. No aliases, no paraphrase, no natural language.
+**Without `--review-evidence`:**
+- `packet_kind` — correct packet kind
+- `required_fields` — all required fields present
+- `not_expired` — packet has not expired
+- `phrase_match` — exact phrase match
+- `head_sha_match` — HEAD SHA matches (if `--current-head` provided)
+- `no_blockers` — no blockers in packet
+- `recommendation_is_merge` — recommendation is `merge`
 
-## No auto-merge in this PR
+**With `--review-evidence` (additional checks):**
+- `review_evidence_packet_kind` — correct packet kind
+- `review_not_stale` — `review_is_stale != True`
+- `merge_allowed` — `merge_allowed == True`
+- `current_head_sha_match` — current HEAD matches packet (if `--current-head` provided)
+- `ci_all_green` — `ci_all_green == True`
+- `scope_clean` — `scope_status == "clean"`
+- `review_status_clean` — `review_status == "clean"`
 
-These scripts do not:
-- Call `gh pr merge`
-- Call `gh pr comment`
-- Call GitHub mutation APIs
-- Call `hermes kanban`
-- Push or commit
-- Update memory or create skills
+---
 
-The output of `check_merge_authorization.py` is a human-readable result and an exit code. The actual merge is performed by the human operator using `gh pr merge`.
+## build_merge_ready_packet.py
 
-## Flow: final merge-ready packet
+Can build both MERGE_READY_PACKET and REVIEW_EVIDENCE_PACKET.
 
-```
-1. build_merge_ready_packet.py (or manual construction)
-   → MERGE_READY_PACKET.json + MERGE_READY_PACKET.md
-
-2. Human reviews MERGE_READY_PACKET.md
-   → copies exact phrase
-
-3. check_merge_authorization.py --packet /tmp/MERGE_READY_PACKET.json --phrase "I confirm merge PR #N at <sha>"
-   → exits 0 = authorized, exits 1 = denied
-
-4. Human runs: gh pr merge --squash <pr-number>
-   (the guard does not call gh pr merge)
-```
-
-## Packet fields
-
-| Field | Description |
-|-------|-------------|
-| `packet_kind` | Must be `aed.merge_ready.v1` |
-| `pr_number` | GitHub PR number |
-| `pr_url` | Full GitHub PR URL |
-| `base_branch` | Target branch (e.g. `main`) |
-| `head_sha` | Exact git SHA at time of packet creation |
-| `mergeable` | Boolean — is PR mergeable right now? |
-| `ci_status` | e.g. `green`, `pending`, `red` |
-| `codex_status` | e.g. `reviewed_clean`, `needs_review`, `unavailable` |
-| `reviewer_status` | e.g. `approved`, `pending`, `changes_requested` |
-| `changed_files` | List of files changed in this PR |
-| `allowed_files` | List of files the PR is permitted to change |
-| `generated_at` | UTC timestamp of packet creation |
-| `expires_at` | UTC timestamp when packet becomes invalid (default +72h) |
-| `required_authorization_phrase` | The exact phrase to pass to the guard |
-| `blockers` | List of blocker strings; empty = no blockers |
-| `recommendation` | `merge`, `patch`, `block`, or `wait` |
-
-## Building a packet
+### Build MERGE_READY_PACKET (existing behavior)
 
 ```bash
 python3 scripts/local/build_merge_ready_packet.py \
-  --pr-number 194 \
-  --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/194 \
+  --pr-number 207 \
+  --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/207 \
   --base-branch main \
-  --head-sha abc123def... \
+  --head-sha abc1230000000000000000000000000000000000 \
   --mergeable true \
   --ci-status green \
   --codex-status reviewed_clean \
   --reviewer-status approved \
-  --changed-files "docs/README.md,scripts/local/new_script.py" \
-  --allowed-files "docs/README.md,scripts/local/new_script.py" \
+  --changed-files "docs/README.md" \
+  --allowed-files "docs/README.md" \
   --recommendation merge \
   --output-json /tmp/MERGE_READY_PACKET.json \
   --output-md /tmp/MERGE_READY_PACKET.md
 ```
 
-## Running the guard
+### Build REVIEW_EVIDENCE_PACKET
 
 ```bash
+python3 scripts/local/build_merge_ready_packet.py \
+  --build-review-evidence \
+  --pr-number 207 \
+  --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/207 \
+  --base-branch main \
+  --head-sha abc1230000000000000000000000000000000000 \
+  --mergeable true \
+  --ci-status green \
+  --codex-status reviewed_clean \
+  --reviewer-status approved \
+  --changed-files "docs/README.md" \
+  --allowed-files "docs/README.md" \
+  --recommendation merge \
+  --review-source github_codex \
+  --review-status clean \
+  --review-evidence-output-json /tmp/REVIEW_EVIDENCE.json \
+  --review-evidence-output-md /tmp/REVIEW_EVIDENCE.md
+```
+
+### Build both in one run
+
+```bash
+python3 scripts/local/build_merge_ready_packet.py \
+  --pr-number 207 \
+  --pr-url ... \
+  # ... MERGE_READY_PACKET args ... \
+  --build-review-evidence \
+  --review-source github_codex \
+  --review-status clean \
+  --review-evidence-output-json /tmp/REVIEW_EVIDENCE.json
+```
+
+---
+
+## pr_gate_merge_ready_notify.py
+
+Supports `--review-evidence` in both CLI parameter mode and packet mode.
+
+### CLI parameter mode
+
+```bash
+python3 scripts/local/pr_gate_merge_ready_notify.py \
+  --pr-number 207 \
+  --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/207 \
+  --head-sha abc1230000000000000000000000000000000000 \
+  --ci-status green \
+  --codex-status clean \
+  --fallback-review-status clean \
+  --reviewer-status approved \
+  --scope-status clean \
+  --mergeable \
+  --changed-file docs/README.md \
+  --output-json /tmp/notification.json \
+  --output-md /tmp/notification.md \
+  --review-evidence /tmp/REVIEW_EVIDENCE.json
+```
+
+### Packet mode
+
+```bash
+python3 scripts/local/pr_gate_merge_ready_notify.py \
+  --merge-ready-packet /tmp/MERGE_READY_PACKET.json \
+  --controller-run-packet /tmp/CONTROLLER_RUN_PACKET.json \
+  --output-json /tmp/notification.json \
+  --output-md /tmp/notification.md \
+  --review-evidence /tmp/REVIEW_EVIDENCE.json
+```
+
+### Review evidence in notification output
+
+When `--review-evidence` is supplied, the output JSON includes a `review_evidence_summary` field:
+
+```json
+{
+  "packet_kind": "aed.pr_gate.merge_ready_notification.v1",
+  "review_evidence_summary": {
+    "review_source": "github_codex",
+    "reviewed_head_sha": "abc1230000000000000000000000000000000000",
+    "current_head_sha": "abc1230000000000000000000000000000000000",
+    "review_is_stale": false,
+    "ci_all_green": true,
+    "scope_status": "clean",
+    "merge_allowed": true,
+    "review_status": "clean"
+  },
+  ...
+}
+```
+
+If `merge_allowed` is `false` or `review_is_stale` is `true`, the notification sets `recommendation` to `not_merge_ready` and omits the authorization phrase.
+
+---
+
+## Workflow
+
+1. Build `MERGE_READY_PACKET.json` with `build_merge_ready_packet.py`
+2. Build `REVIEW_EVIDENCE_PACKET.json` with `build_merge_ready_packet.py --build-review-evidence`
+3. Run `check_merge_authorization.py --packet MERGE_READY_PACKET.json --phrase "<phrase>" --review-evidence REVIEW_EVIDENCE_PACKET.json`
+4. If all checks pass, run the `recommended_merge_command` manually
+
+---
+
+## Backward compatibility
+
+Without `--review-evidence`, `check_merge_authorization.py` behaves exactly as before — all existing checks run, and no new behavior is introduced.
+
+Without `--review-evidence`, `pr_gate_merge_ready_notify.py` produces the same notification as before, without the `review_evidence_summary` field.
+
+---
+
+## Stop rules (enforced in pr_gate_merge_ready_notify.py)
+
+- `no_auto_merge` — never auto-merge
+- `no_dispatch` — never dispatch workers
+- `no_patch` — never auto-patch
+- `no_memory_update` — never update memory
+- `no_skill_manage` — never modify skills
+
+---
+
+## Example: Full workflow
+
+```bash
+# 1. Build merge ready packet
+python3 scripts/local/build_merge_ready_packet.py \
+  --pr-number 207 --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/207 \
+  --base-branch main --head-sha abc1230000000000000000000000000000000000 \
+  --mergeable true --ci-status green --codex-status reviewed_clean \
+  --reviewer-status approved --changed-files "docs/README.md" \
+  --allowed-files "docs/README.md" --recommendation merge \
+  --output-json /tmp/MERGE_READY_PACKET.json
+
+# 2. Build review evidence packet
+python3 scripts/local/build_merge_ready_packet.py \
+  --build-review-evidence \
+  --pr-number 207 --pr-url https://github.com/Slideshow11/Automated-Edge-Discovery/pull/207 \
+  --base-branch main --head-sha abc1230000000000000000000000000000000000 \
+  --mergeable true --ci-status green --codex-status reviewed_clean \
+  --reviewer-status approved --changed-files "docs/README.md" \
+  --allowed-files "docs/README.md" --recommendation merge \
+  --review-source github_codex --review-status clean \
+  --review-evidence-output-json /tmp/REVIEW_EVIDENCE.json
+
+# 3. Verify authorization
 python3 scripts/local/check_merge_authorization.py \
   --packet /tmp/MERGE_READY_PACKET.json \
-  --phrase "I confirm merge PR #194 at abc123def..."
+  --phrase "I confirm merge PR #207 at abc1230000000000000000000000000000000000" \
+  --current-head abc1230000000000000000000000000000000000 \
+  --review-evidence /tmp/REVIEW_EVIDENCE.json
 
-# With current HEAD verification:
-python3 scripts/local/check_merge_authorization.py \
-  --packet /tmp/MERGE_READY_PACKET.json \
-  --phrase "I confirm merge PR #194 at abc123def..." \
-  --current-head abc123def...
+# 4. If authorized, merge manually
+gh pr merge 207 \
+  --repo Slideshow11/Automated-Edge-Discovery \
+  --squash --delete-branch \
+  --match-head-commit abc1230000000000000000000000000000000000
 ```
-
-## Exit codes
-
-| Code | Meaning |
-|------|---------|
-| 0 | All checks passed — authorized to merge |
-| 1 | One or more checks failed — denied |
-
-## Packet expiration
-
-Default TTL is 72 hours. After `expires_at`, the guard rejects the packet even if the phrase is correct and all other checks pass. This prevents stale authorizations from being reused.
-
-To re-authorize after expiration, rebuild the packet (step 1 above) with a fresh timestamp and new phrase.
-
-## Relationship to PR #200: Merge-Ready Notification Packet
-
-PR #200 adds `pr_gate_merge_ready_notify.py` — the final bridge in the PR gate chain. While PR #193's guard (`build_merge_ready_packet.py`) required manual assembly of gate data, PR #200's notify script can consume the full output of `pr_gate_controller.py` (`CONTROLLER_RUN_PACKET.json`) directly and produce a Telegram-ready notification packet.
-
-Key capabilities:
-- **Two input modes**: direct CLI parameters (`--ci-status`, `--codex-status`, etc.) or merged-packet mode (`--merge-ready-packet` + `--controller-run-packet`)
-- **Outputs**: `MERGE_READY_NOTIFICATION.json` + `MERGE_READY_NOTIFICATION.md`
-- **Packet kind**: `aed.pr_gate.merge_ready_notification.v1`
-- **Authorization phrase**: produced automatically when gates are clean
-- **Blockers**: produced automatically when gates are not clean
-
-The notify script does NOT send Telegram messages. It only produces the packet and markdown. A future controller or gateway will handle delivery.
-
-### Why the 40-character SHA is required
-
-PR numbers alone are insufficient for merge authorization because:
-- HEAD changes between pushes — the same PR number can point to different SHAs
-- `--match-head-commit` prevents merging a different commit after authorization was given
-- Stale authorizations become invalid if HEAD changes
-
-The required phrase `I confirm merge PR #<number> at <full_sha>` binds authorization to a specific commit.
-
-### Why `--match-head-commit` is required
-
-`gh pr merge --match-head-commit <sha>` fails if the PR HEAD has changed since the authorization was given. This prevents:
-- A push that changes HEAD after authorization
-- A force-push that rewrites history after authorization
-- Accidental merge of a different commit than the one authorized
-
-### Relationship to future Telegram delivery
-
-`pr_gate_merge_ready_notify.py` produces `user_message` — Telegram-ready text containing the authorization phrase and merge command template. A future gateway or cron job will consume this packet and send it to Tom via Telegram. The current script is intentionally read-only with respect to Telegram.
-
-## Relationship to PR #193
-
-PR #193 built the Tasker input collector. This PR (#200) adds the merge-ready notification bridge. The full chain is:
-
-```
-pr_gate_controller.py (classify → draft → kanban plan)
-  ↓
-pr_gate_merge_ready_notify.py (builds Telegram-ready notification)
-  ↓
-Telegram delivery (future — not implemented in this PR)
-  ↓
-Tom reviews and types exact authorization phrase
-  ↓
-gh pr merge --squash --delete-branch --match-head-commit <sha>
-```
-
-PR #200 does not change the authorization phrase format or the guard script. It only automates the construction of the notification packet.

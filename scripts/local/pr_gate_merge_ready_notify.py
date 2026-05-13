@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 PACKET_KIND = "aed.pr_gate.merge_ready_notification.v1"
+REVIEW_EVIDENCE_KIND = "aed.pr_gate.review_evidence.v1"
 SCHEMA_VERSION = 1
 
 STOP_RULES = [
@@ -80,6 +81,16 @@ def _is_valid_sha(sha: str) -> bool:
 def _load_json(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
+
+
+def _load_review_evidence(path: Path | None) -> dict | None:
+    """Load REVIEW_EVIDENCE_PACKET.json if provided, else None."""
+    if path is None:
+        return None
+    data = _load_json(path)
+    if data.get("packet_kind") != REVIEW_EVIDENCE_KIND:
+        raise ValueError(f"Expected packet_kind '{REVIEW_EVIDENCE_KIND}', got '{data.get('packet_kind')}'")
+    return data
 
 
 def _write_json(data: dict, path: Path) -> None:
@@ -193,6 +204,7 @@ def _render_markdown(
     merge_cmd: str,
     blockers: list[str],
     recommendation: str,
+    review_evidence_summary: dict[str, Any] | None = None,
 ) -> str:
     lines = [
         f"# PR #{pr_number} — Merge-Ready Notification",
@@ -247,6 +259,20 @@ def _render_markdown(
             f"`{recommendation}` — all gates clean.",
         ]
 
+    if review_evidence_summary:
+        lines += [
+            "",
+            "## Review Evidence Summary",
+            f"- **review_source:** `{review_evidence_summary.get('review_source', 'unknown')}`",
+            f"- **reviewed_head_sha:** `{review_evidence_summary.get('reviewed_head_sha', 'unknown')}`",
+            f"- **current_head_sha:** `{review_evidence_summary.get('current_head_sha', 'unknown')}`",
+            f"- **review_is_stale:** `{review_evidence_summary.get('review_is_stale', 'unknown')}`",
+            f"- **ci_all_green:** `{review_evidence_summary.get('ci_all_green', 'unknown')}`",
+            f"- **scope_status:** `{review_evidence_summary.get('scope_status', 'unknown')}`",
+            f"- **merge_allowed:** `{review_evidence_summary.get('merge_allowed', 'unknown')}`",
+            f"- **review_status:** `{review_evidence_summary.get('review_status', 'unknown')}`",
+        ]
+
     lines += [
         "",
         "## Stop Rules",
@@ -293,8 +319,16 @@ def build_notification(
     changed_files: list[str],
     output_json_path: Path,
     output_md_path: Path,
+    review_evidence: dict | None = None,
 ) -> dict[str, Any]:
-    """Build merge-ready notification packet and markdown."""
+    """Build merge-ready notification packet and markdown.
+
+    Args:
+        review_evidence: optional REVIEW_EVIDENCE_PACKET dict. If provided,
+            review_source, reviewed_head_sha, current_head_sha, review_is_stale,
+            ci_all_green, scope_status fields are included. If review evidence
+            is stale or missing, no merge_ready authorization phrase is produced.
+    """
 
     gate_summary = _build_gate_summary(
         ci_status=ci_status,
@@ -307,6 +341,51 @@ def build_notification(
     )
 
     blockers = _collect_blockers(gate_summary)
+
+    # PATCH-3: review evidence must be tied to the exact notification head_sha
+    if review_evidence:
+        rev_current = review_evidence.get("current_head_sha", "")
+        if not rev_current or rev_current != head_sha:
+            blockers.append(
+                f"review evidence head mismatch: evidence current_head_sha='{rev_current}' "
+                f"!= notification head_sha='{head_sha}'"
+            )
+
+    # If review evidence is provided, recompute merge_allowed from raw fields
+    # (do not trust the packet's merge_allowed boolean — it may be forged)
+    if review_evidence:
+        rev_reviewed = review_evidence.get("reviewed_head_sha", "")
+        rev_current = review_evidence.get("current_head_sha", "")
+        actual_stale = bool(rev_current) and bool(rev_reviewed) and rev_current != rev_reviewed
+        if actual_stale:
+            blockers.append("review evidence is stale: reviewed_head_sha != current_head_sha")
+        # Recompute from raw fields, not from packet boolean
+        rev_source = review_evidence.get("review_source", "")
+        rev_status = review_evidence.get("review_status", "")
+        ci_green = review_evidence.get("ci_all_green") is True
+        scope_clean = review_evidence.get("scope_status") == "clean"
+        missing_source = rev_source in ("none", "", None) or not rev_source
+        allowed_sources = ("github_codex", "codex_cli_fallback", "reviewer")
+        valid_source = rev_source in allowed_sources
+        rev_mergeable = review_evidence.get("mergeable") is True
+        raw_merge_allowed = (
+            valid_source
+            and not missing_source
+            and rev_status == "clean"
+            and not actual_stale
+            and bool(rev_current)
+            and ci_green
+            and scope_clean
+            and rev_mergeable
+            and (not rev_current or rev_current == head_sha)
+        )
+        if not raw_merge_allowed:
+            blockers.append(
+                f"review evidence recomputed merge_allowed=False: "
+                f"source='{rev_source}', status='{rev_status}', "
+                f"stale={actual_stale}, ci={ci_green}, scope={scope_clean}"
+            )
+
     is_ready = _is_merge_ready(gate_summary) and not blockers
 
     required_phrase = _build_required_phrase(pr_number, head_sha)
@@ -331,7 +410,21 @@ def build_notification(
             + "\n".join(f"- {b}" for b in blockers)
         )
 
-    packet = {
+    # Build review evidence summary for output packet
+    review_evidence_summary: dict[str, Any] | None = None
+    if review_evidence:
+        review_evidence_summary = {
+            "review_source": review_evidence.get("review_source"),
+            "reviewed_head_sha": review_evidence.get("reviewed_head_sha"),
+            "current_head_sha": review_evidence.get("current_head_sha"),
+            "review_is_stale": review_evidence.get("review_is_stale"),
+            "ci_all_green": review_evidence.get("ci_all_green"),
+            "scope_status": review_evidence.get("scope_status"),
+            "merge_allowed": review_evidence.get("merge_allowed"),
+            "review_status": review_evidence.get("review_status"),
+        }
+
+    packet: dict[str, Any] = {
         "packet_kind": PACKET_KIND,
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -350,6 +443,9 @@ def build_notification(
         "blockers_or_uncertainty": blockers,
     }
 
+    if review_evidence_summary is not None:
+        packet["review_evidence_summary"] = review_evidence_summary
+
     _write_json(packet, output_json_path)
     md = _render_markdown(
         pr_number=pr_number,
@@ -361,6 +457,7 @@ def build_notification(
         merge_cmd=merge_cmd if is_ready else "(blocked)",
         blockers=blockers,
         recommendation=recommendation,
+        review_evidence_summary=review_evidence_summary,
     )
     _write_text(md, output_md_path)
 
@@ -387,6 +484,13 @@ def _build_argparser() -> argparse.ArgumentParser:
         type=Path,
         help="Path to CONTROLLER_RUN_PACKET.json from pr_gate_controller.py "
              "(used to extract gate summary in merge-ready-packet mode).",
+    )
+    p.add_argument(
+        "--review-evidence",
+        type=Path,
+        default=None,
+        help="Path to REVIEW_EVIDENCE_PACKET.json. "
+             "If supplied, review evidence fields are included in the notification.",
     )
     p.add_argument("--pr-number", type=int, help="PR number")
     p.add_argument("--pr-url", help="Full PR URL")
@@ -438,6 +542,7 @@ def _packet_mode(args: argparse.Namespace) -> int:
 
     mrp = _load_json(args.merge_ready_packet)
     crp = _load_json(args.controller_run_packet)
+    review_evidence = _load_review_evidence(args.review_evidence)
 
     pr_info = mrp.get("pr", {})
     gate = crp.get("result", {})
@@ -477,6 +582,7 @@ def _packet_mode(args: argparse.Namespace) -> int:
             changed_files=changed_files,
             output_json_path=args.output_json,
             output_md_path=args.output_md,
+            review_evidence=review_evidence,
         )
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -536,6 +642,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    review_evidence = _load_review_evidence(args.review_evidence)
+
     try:
         packet = build_notification(
             pr_number=args.pr_number,
@@ -551,6 +659,7 @@ def main(argv: list[str] | None = None) -> int:
             changed_files=args.changed_files,
             output_json_path=args.output_json,
             output_md_path=args.output_md,
+            review_evidence=review_evidence,
         )
         print(f"[notify] output: {args.output_json}")
         print(f"[notify] recommendation: {packet['recommendation']}")
