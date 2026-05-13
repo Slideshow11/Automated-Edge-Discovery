@@ -344,6 +344,76 @@ Without `--review-evidence`, `pr_gate_merge_ready_notify.py` produces the same n
 
 ---
 
+## PR scope diff enforcement
+
+The merge gate includes a mechanical scope check that compares actual changed files against `allowed_files` and `forbidden_files`. **Prompts are not enforcement.** The AED control plane preserves `allowed_files` and `forbidden_files` in Kanban task plans, but the merge gate must verify scope mechanically.
+
+### check_pr_scope.py
+
+```
+python3 scripts/local/check_pr_scope.py \
+  --changed-files "scripts/local/foo.py,tests/test_foo.py" \
+  --allowed-files "scripts/local/foo.py,tests/test_foo.py" \
+  --forbidden-files ".github/workflows/**,engine/**,schemas/**" \
+  --output-json /tmp/PR_SCOPE_CHECK.json
+```
+
+Or with JSON file inputs:
+
+```
+python3 scripts/local/check_pr_scope.py \
+  --changed-files-json /tmp/changed_files.json \
+  --allowed-files-json /tmp/allowed_files.json \
+  --forbidden-files-json /tmp/forbidden_files.json \
+  --output-json /tmp/PR_SCOPE_CHECK.json
+```
+
+### Packet: aed.pr_gate.scope_check.v1
+
+| Field | Type | Description |
+|---|---|---|
+| `packet_kind` | string | `aed.pr_gate.scope_check.v1` |
+| `schema_version` | int | `1` |
+| `generated_at` | string | ISO 8601 timestamp |
+| `changed_files` | list[str] | Files that differ from base |
+| `allowed_files` | list[str] | Allowed file patterns (glob) |
+| `forbidden_files` | list[str] | Forbidden file patterns (glob) |
+| `scope_status` | string | `clean`, `violation`, or `unknown` |
+| `out_of_scope_files` | list[str] | Changed files not matched by allowed |
+| `forbidden_files_touched` | list[str] | Changed files matching forbidden |
+| `blockers` | list[str] | List of blockers if scope_status != clean |
+| `passed` | bool | `true` only when `scope_status == clean` |
+
+### Matching rules
+
+**Glob patterns supported:**
+- `docs/**` — matches `docs/` and all subdirectories
+- `scripts/local/*.py` — matches `scripts/local/foo.py`
+- `*.md` — matches any `.md` file at the root
+
+**Normalization:** `./` prefix stripped, `\` converted to `/`.
+
+**Blockers:**
+- `allowed_files_missing` — `allowed_files` is empty
+- `changed_file_outside_allowed_scope` — one or more changed files not matched by allowed
+- `forbidden_file_touched` — one or more changed files match forbidden patterns
+
+### Exit codes
+
+- `0` — `scope_status == clean`, merge-ready
+- `1` — `scope_status == violation` or `unknown`, merge blocked
+- `2` — invalid arguments, missing file, malformed JSON
+
+### Example scope violation output
+
+```
+scope_status=violation passed=False
+  blocker: changed_file_outside_allowed_scope
+  blocker: forbidden_file_touched
+```
+
+---
+
 ## Stop rules (enforced in pr_gate_merge_ready_notify.py)
 
 - `no_auto_merge` — never auto-merge
