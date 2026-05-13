@@ -260,7 +260,9 @@ The output (`KANBAN_CREATE_PLAN.json`) uses `aed.pr_gate.kanban_create_plan.v1`:
 | `packet_kind` | `aed.pr_gate.kanban_create_plan.v1` |
 | `dry_run` | `true` (dry-run) or `false` (`--apply`) |
 | `source_task_draft` | Path, packet_kind, action, idempotency_key, pr_number, head_sha |
-| `kanban_task` | title, assignee, status, body, idempotency_key, parent_task_id, depends_on |
+| `kanban_task` | title, assignee, status, body, idempotency_key, parent_task_id, depends_on, metadata |
+
+`metadata` contains `allowed_files` (list or null) and `forbidden_files` (list or null) from the task draft. These constrain which files a Builder or Reviewer may touch. The constraints are also embedded in the task `body` under `## File Scope` when present.
 | `duplicate_check` | method: `idempotency_key_tag`, duplicate_found, existing_task_id |
 | `apply_result` | applied, created_task_id, command_used, stdout, stderr |
 | `stop_rules` | Always: no_dispatch, no_merge, no_pr_patch, no_codex_request, no_memory_update, no_skill_manage |
