@@ -30,6 +30,9 @@ from pathlib import Path
 PACKET_KIND = "aed.merge_ready.v1"
 REVIEW_EVIDENCE_KIND = "aed.pr_gate.review_evidence.v1"
 
+# Full 40-char SHA pattern — no prefix matching, no close-enough
+SHA_FULL_PATTERN = re.compile(r"^[0-9a-f]{40}$")
+
 
 # ── Validation helpers ────────────────────────────────────────────────────────
 
@@ -115,6 +118,75 @@ def check_required_fields(packet: dict) -> tuple[bool, str]:
     missing = [f for f in required_fields if f not in packet]
     if missing:
         return False, f"missing required fields: {', '.join(missing)}"
+    return True, ""
+
+
+# ── Exact SHA Authorization enforcement ────────────────────────────────────────
+
+def extract_sha_from_phrase(phrase: str) -> str | None:
+    """Extract a full 40-char hex SHA from an authorization phrase.
+
+    Looks for a 40-character hex string anywhere in the phrase.
+    Returns None if no full SHA is found.
+    Short prefixes (7, 39, etc.) are not accepted — only exactly 40 chars.
+    """
+    match = re.search(r"\b([0-9a-f]{40})\b", phrase)
+    return match.group(1) if match else None
+
+
+def check_authorization_sha_match(
+    phrase: str,
+    packet: dict,
+    current_head: str | None,
+) -> tuple[bool, str]:
+    """Enforce exact full-SHA authorization matching.
+
+    The SHA embedded in the authorization phrase must exactly equal the
+    confirmed PR head (--current-head if provided, else packet head_sha).
+    Agents must NEVER substitute, infer, or correct a mismatched SHA.
+
+    Blocker returned: authorization_sha_mismatch
+    """
+    auth_sha = extract_sha_from_phrase(phrase)
+
+    # Reject if phrase contains no full 40-char SHA
+    if auth_sha is None:
+        return False, (
+            "authorization_sha_mismatch: "
+            "phrase contains no valid full 40-character SHA. "
+            "Short SHA prefixes are not accepted. "
+            "A fresh authorization phrase with the exact full SHA is required."
+        )
+
+    # Require exactly 40 hex chars — enforced by extract_sha_from_phrase,
+    # but double-check here to make the requirement explicit in the error.
+    if not SHA_FULL_PATTERN.match(auth_sha):
+        return False, (
+            f"authorization_sha_mismatch: "
+            f"'{auth_sha[:7]}...' is not a full 40-character SHA. "
+            f"Short SHA prefixes are not accepted. "
+            f"A fresh authorization phrase with the exact full SHA is required."
+        )
+
+    # Determine the required SHA: --current-head takes precedence,
+    # otherwise fall back to authorization_head_sha (or head_sha for backward compat).
+    required_sha = (
+        current_head
+        if current_head is not None
+        else packet.get("authorization_head_sha", packet.get("head_sha", ""))
+    )
+
+    if auth_sha != required_sha:
+        return False, (
+            f"authorization_sha_mismatch: "
+            f"phrase SHA '{auth_sha[:8]}...' does not equal "
+            f"confirmed head '{required_sha[:8]}...'. "
+            f"The agent must never substitute the confirmed PR head SHA "
+            f"for the user-provided SHA. "
+            f"A fresh authorization phrase using the exact full current "
+            f"head SHA is required."
+        )
+
     return True, ""
 
 
@@ -272,6 +344,7 @@ def run_all_checks(packet: dict, provided_phrase: str, current_head: str | None)
         ("required_fields", *check_required_fields(packet)),
         ("not_expired", *check_not_expired(packet)),
         ("phrase_match", *check_phrase_match(packet, provided_phrase)),
+        ("authorization_sha_match", *check_authorization_sha_match(provided_phrase, packet, current_head)),
         ("head_sha_match", *check_head_sha_match(packet, current_head)),
         ("no_blockers", *check_no_blockers(packet)),
         ("recommendation_is_merge", *check_recommendation_merge(packet)),
@@ -319,7 +392,11 @@ def main(argv: list[str] | None = None) -> int:
         if rev_packet is None:
             print(f"ERROR: {rev_err}", file=sys.stderr)
             return 1
-        rev_results = check_review_evidence(rev_packet, auth_head_sha=packet.get("head_sha"), current_head=args.current_head)
+        rev_results = check_review_evidence(
+            rev_packet,
+            auth_head_sha=packet.get("authorization_head_sha", packet.get("head_sha")),
+            current_head=args.current_head,
+        )
         results.extend(rev_results)
     else:
         rev_packet = None
@@ -331,6 +408,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'='*50}")
     print(f"PR: {packet.get('pr_number', '?')} | {packet.get('pr_url', '?')}")
     print(f"Packet head: {packet.get('head_sha', '?')[:8]}")
+    auth_sha = extract_sha_from_phrase(args.phrase)
+    print(f"Phrase SHA:  {auth_sha[:8] if auth_sha else '(none/found)'}")
+    if args.current_head:
+        print(f"--current-head: {args.current_head[:8]}")
     print(f"Recommendation: {packet.get('recommendation', '?')}")
     if rev_packet:
         print(f"Review evidence: {rev_packet.get('current_head_sha', '?')[:8]} "

@@ -107,6 +107,8 @@ def build_packet(
         "pr_url": pr_url,
         "base_branch": base_branch,
         "head_sha": head_sha,
+        "authorization_head_sha": head_sha,
+        "head_sha_source": "packet",
         "mergeable": mergeable,
         "ci_status": ci_status,
         "codex_status": codex_status,
