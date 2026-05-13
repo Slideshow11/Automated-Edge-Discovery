@@ -441,6 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reviewer-status", type=str, required=True)
     p.add_argument("--changed-files", type=str, required=True)
     p.add_argument("--allowed-files", type=str, required=True)
+    p.add_argument("--forbidden-files", type=str, default="",
+                   help="Comma-separated list of forbidden file patterns (for --build-review-evidence)")
     p.add_argument("--recommendation", type=str, required=True)
     p.add_argument("--output-json", type=str, default=None)
     p.add_argument("--output-md", type=str, default=None)
@@ -481,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         # Parse comma-separated file lists
         changed_files = [f.strip() for f in args.changed_files.split(",") if f.strip()]
         allowed_files = [f.strip() for f in args.allowed_files.split(",") if f.strip()]
+        forbidden_files = [f.strip() for f in args.forbidden_files.split(",") if f.strip()] if args.forbidden_files else []
 
         current_head_sha = args.head_sha
         reviewed_head_sha = args.reviewed_head_sha if args.reviewed_head_sha else current_head_sha
@@ -499,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
             ci_required_jobs=list(REQUIRED_CI_JOBS),
             changed_files=changed_files,
             allowed_files=allowed_files,
+            forbidden_files=forbidden_files,
             mergeable=mergeable,
         )
 
