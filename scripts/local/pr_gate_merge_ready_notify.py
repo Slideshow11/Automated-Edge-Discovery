@@ -351,16 +351,38 @@ def build_notification(
                 f"!= notification head_sha='{head_sha}'"
             )
 
-    # If review evidence is provided and stale or missing merge_allowed, block
+    # If review evidence is provided, recompute merge_allowed from raw fields
+    # (do not trust the packet's merge_allowed boolean — it may be forged)
     if review_evidence:
-        # Recompute staleness from raw SHA fields (trust raw data, not derived boolean)
         rev_reviewed = review_evidence.get("reviewed_head_sha", "")
         rev_current = review_evidence.get("current_head_sha", "")
         actual_stale = bool(rev_current) and bool(rev_reviewed) and rev_current != rev_reviewed
         if actual_stale:
             blockers.append("review evidence is stale: reviewed_head_sha != current_head_sha")
-        if review_evidence.get("merge_allowed") is not True:
-            blockers.append(f"review evidence merge_allowed=False: {review_evidence.get('blockers_or_uncertainty', [])}")
+        # Recompute from raw fields, not from packet boolean
+        rev_source = review_evidence.get("review_source", "")
+        rev_status = review_evidence.get("review_status", "")
+        ci_green = review_evidence.get("ci_all_green") is True
+        scope_clean = review_evidence.get("scope_status") == "clean"
+        missing_source = rev_source in ("none", "", None) or not rev_source
+        allowed_sources = ("github_codex", "codex_cli_fallback", "reviewer")
+        valid_source = rev_source in allowed_sources
+        raw_merge_allowed = (
+            valid_source
+            and not missing_source
+            and rev_status == "clean"
+            and not actual_stale
+            and bool(rev_current)
+            and ci_green
+            and scope_clean
+            and (not rev_current or rev_current == head_sha)
+        )
+        if not raw_merge_allowed:
+            blockers.append(
+                f"review evidence recomputed merge_allowed=False: "
+                f"source='{rev_source}', status='{rev_status}', "
+                f"stale={actual_stale}, ci={ci_green}, scope={scope_clean}"
+            )
 
     is_ready = _is_merge_ready(gate_summary) and not blockers
 

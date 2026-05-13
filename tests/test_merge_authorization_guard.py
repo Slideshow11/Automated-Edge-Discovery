@@ -1103,3 +1103,22 @@ class TestPatchFixesAuthorization:
         checks = check_review_evidence(packet, auth_head_sha="a" * 40, current_head="a" * 40)
         assert all(passed for _, passed, _ in checks), \
             f"All checks should pass for valid evidence: {checks}"
+
+    def test_authorization_rejects_bogus_review_source(self, tmp_path):
+        """review_source=bogus (not in allowed set) => reject even with clean status."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "bogus",   # not in allowed set
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        source_check = next((r for r in checks if r[0] == "review_source_valid"), None)
+        assert source_check is not None and source_check[1] is False, \
+            f"Expected review_source_valid to fail for bogus: {checks}"

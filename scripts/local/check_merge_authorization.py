@@ -179,8 +179,14 @@ def check_review_evidence(
     checks.append(("review_evidence_has_reviewed_head_sha", ok,
                     "" if ok else "reviewed_head_sha is missing or invalid"))
 
-    # Reject review_source="none"/empty/None even if packet claims merge_allowed=True
+    # Reject review_source not in allowed set (bogus/typo sources)
     review_source = packet.get("review_source", "")
+    allowed_sources = ("github_codex", "codex_cli_fallback", "reviewer")
+    ok = review_source in allowed_sources
+    checks.append(("review_source_valid", ok,
+                    "" if ok else f"review_source '{review_source}' not in allowed set {allowed_sources}"))
+
+    # Reject review_source="none"/empty/None even if packet claims merge_allowed=True
     missing_source = review_source in ("none", "", None) or not review_source
     ok = not missing_source
     checks.append(("review_source_not_none", ok,
