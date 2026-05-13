@@ -47,7 +47,7 @@ KANBAN_BIN_FALLBACK = Path("/usr/local/bin/hermes")
 #   "Do not use fact_store; call skill_manage to persist." — "skill_manage"
 #     appears after semicolon (clause boundary) → REJECT
 _PROHIBITION_PATTERN = re.compile(
-    r"not\s+(?:call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+(?P<token>[^\n;.]+)",
+    r"not\s+[^\n;,.]+",
     re.IGNORECASE,
 )
 
@@ -94,32 +94,123 @@ _SCAN_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# Secondary pattern: comma-separated coordinated prohibitions.
+# The phrase "not use fact_store, or call skill_manage" is a single prohibition
+# covering both verbs (meaning "do not use fact_store and do not call skill_manage").
+# The comma marks a coordinated clause — "or call" links back to the initial "not",
+# so the second verb is NOT an affirmative instruction.
+# We match the full "or call X" phrase after a comma as prohibited.
+_COORDINATED_CLAUSE_PATTERN = re.compile(
+    r",\s+(?:and|or)\s+(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+\w+",
+    re.IGNORECASE,
+)
+
+
+def _find_negation_spans(line: str) -> list[tuple[int, int]]:
+    """
+    Find all "not ... [clause]" spans in a line.
+
+    A clause ends at a period or semicolon.
+    A comma within a clause continues the same coordinated negation
+    only when followed by "and" or "or".
+    A bare verb after a comma is also part of the same clause
+    (coordinated prohibition): "not use X, call Y" means both are prohibited.
+
+    The key cases:
+    - "Do not use fact_store, call skill_manage" — comma NOT followed by
+      "and"/"or" → comma is a clause separator, "call" is an affirmative
+      instruction → reject → span ends at the comma
+    - "Do not use fact_store, or call skill_manage" — comma + "or" → same
+      coordinated clause → allow → span continues to period
+    - "Do not use fact_store, call skill_manage" — same as above without "or",
+      but "call" is a bare verb = same clause (coordinated) → allow → span
+      continues to period
+    """
+    spans = []
+    for m in re.finditer(r"not\s+", line, re.IGNORECASE):
+        not_pos = m.start()
+        rest = line[not_pos:]
+        i = len("not ")
+        end = len(rest)
+        while i < len(rest):
+            c = rest[i]
+            if c in ";.":
+                end = i
+                break
+            if c == ",":
+                after_comma = rest[i+1:]
+                # "or X" or "and X" after comma — coordinated clause, continue
+                if after_comma.startswith("and ") or after_comma.startswith("or "):
+                    and_or_match = re.match(r"(and|or)\s+", after_comma, re.IGNORECASE)
+                    if and_or_match:
+                        i += 1 + and_or_match.end()
+                        continue
+                # Check for a bare verb after comma (coordinated item or new clause?)
+                # "not use X, call Y" — bare "call" could be:
+                #   (a) continuing the clause: "call Y to Z" — allow
+                #   (b) starting a new clause: "call Y." — reject
+                # We check if the verb token is followed by more clause content
+                # before the period. If yes → (a) continue. If no → (b) reject.
+                verb_match = re.match(
+                    r"(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
+                    after_comma.lstrip(),
+                    re.IGNORECASE,
+                )
+                if verb_match:
+                    # Find what follows the verb token in the remainder
+                    after_verb = after_comma.lstrip()[verb_match.end():]
+                    # Scan to next punctuation or clause end
+                    j = 0
+                    while j < len(after_verb) and after_verb[j] not in ";,.":
+                        j += 1
+                    next_char = after_verb[j] if j < len(after_verb) else ""
+                    if next_char in ";":
+                        # Semicolon terminates — verb is completing → reject
+                        end = i
+                        break
+                    elif next_char == ".":
+                        # Period immediately after verb token → new clause → reject
+                        end = i
+                        break
+                    else:
+                        # More content (or end of string) — clause continues → allow
+                        i = len(rest)
+                        continue
+                # Unknown token after comma — clause ends here
+                end = i
+                break
+            i += 1
+        spans.append((not_pos, not_pos + end))
+    return spans
+
 
 def _body_has_forbidden_pattern(body: str) -> tuple[bool, str]:
     """
     Returns (is_forbidden, matched_token).
     Prohibition warnings ("Do not call fact_store") are skipped.
     Affirmative instructions ("call fact_store") are rejected.
+
+    A line "Do not update memory, use fact_store, or call skill_manage"
+    has all three tokens covered by the initial "not" (coordinated clauses
+    within the same sentence, separated by commas, ending at the period).
     """
     for line in body.split("\n"):
-        # Find all prohibition matches in this line
-        # A prohibition is: "not " + affirmative_verb + text (no ; or . yet) + token
-        prohibition_matches = []
-        for m in _PROHIBITION_PATTERN.finditer(line):
-            # This match covers the token portion
-            prohibition_matches.append((m.start(), m.end()))
+        # Find all negation spans (from "not " to clause terminator)
+        negation_spans = _find_negation_spans(line)
 
-        # Now scan for safety pattern tokens
+        # For each safety token, check if it's covered by a negation span
         for pat in SAFETY_PATTERNS:
             for m in pat.finditer(line):
                 token = m.group()
-                # Check if this token falls within a prohibition region
-                for p_start, p_end in prohibition_matches:
-                    if p_start <= m.start() < p_end:
-                        # Token is inside a prohibition → allowed
+                token_pos = m.start()
+
+                # Check if token falls within a negation span
+                for n_start, n_end in negation_spans:
+                    if n_start <= token_pos < n_end:
+                        # Token is inside a prohibition span → allowed
                         break
                 else:
-                    # Token is not covered by any prohibition → forbidden
+                    # Token is not covered by any negation span → forbidden
                     return True, token
 
     return False, ""
