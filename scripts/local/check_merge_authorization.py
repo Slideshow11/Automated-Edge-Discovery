@@ -233,6 +233,7 @@ def check_review_evidence(
                     "" if ok else f"scope_status is '{scope_status}', not 'clean'"))
 
     # Recompute merge_allowed from facts (not from packet boolean)
+    packet_mergeable = packet.get("mergeable") is True
     actual_merge_allowed = (
         not missing_source
         and review_status == "clean"
@@ -240,6 +241,7 @@ def check_review_evidence(
         and bool(current_head_sha)
         and ci_all_green is True
         and scope_status == "clean"
+        and packet_mergeable
         and (not auth_head_sha or current_head_sha == auth_head_sha)
         and (not current_head or current_head_sha == current_head)
     )

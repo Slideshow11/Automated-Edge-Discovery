@@ -1028,6 +1028,63 @@ class TestPatchFixesNotification:
         assert any("merge_allowed=False" in b for b in packet["blockers_or_uncertainty"]), \
             f"Expected recomputed merge_allowed=False blocker: {packet['blockers_or_uncertainty']}"
 
+    def test_notification_rejects_mergeable_false_forged_merge_allowed(self, tmp_path):
+        """mergeable=False with merge_allowed=True (forged) => not_merge_ready via recompute."""
+        sha = "a" * 40
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+
+        rev = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": sha,
+            "reviewed_head_sha": sha,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": False,
+            "merge_allowed": True,
+            "blockers_or_uncertainty": [],
+        }
+        rev_path.write_text(json.dumps(rev))
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", sha,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert packet["recommendation"] == "not_merge_ready", \
+            f"Expected not_merge_ready for mergeable=False: {packet['blockers_or_uncertainty']}"
+        assert packet["required_authorization_phrase"] is None
+        assert any("merge_allowed=False" in b for b in packet["blockers_or_uncertainty"]), \
+            f"Expected recomputed merge_allowed=False: {packet['blockers_or_uncertainty']}"
+
 
 def test_old_packet_codex_unavailable(tmp_path):
     """Old MERGE_READY_PACKET with codex_status=unavailable also works."""

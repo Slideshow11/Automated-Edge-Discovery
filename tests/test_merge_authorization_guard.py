@@ -1049,19 +1049,20 @@ class TestPatchFixesAuthorization:
             "review_source": "github_codex",
             "review_status": "clean",
             "review_is_stale": False,
-            "merge_allowed": True,      # claimed but CI will be red
+            "merge_allowed": True,
             "ci_all_green": True,
             "scope_status": "clean",
+            "mergeable": True,
             "blockers_or_uncertainty": [],
         }
-        # Exact head + clean review + green CI should still work
+        # Exact head + clean review + green CI + mergeable should still work
         checks = check_review_evidence(packet, auth_head_sha="a" * 40)
         merge_check = next((c for c in checks if c[0] == "merge_allowed_accurate"), None)
         assert merge_check is not None and merge_check[1] is True, f"Expected pass: {checks}"
 
         # Now corrupt: ci_all_green=False but merge_allowed=True in packet
         packet["ci_all_green"] = False
-        packet["merge_allowed"] = True   # forged
+        packet["merge_allowed"] = True
         checks = check_review_evidence(packet, auth_head_sha="a" * 40)
         merge_check = next((c for c in checks if c[0] == "merge_allowed_accurate"), None)
         assert merge_check is not None and merge_check[1] is False, \
@@ -1098,6 +1099,7 @@ class TestPatchFixesAuthorization:
             "merge_allowed": True,
             "ci_all_green": True,
             "scope_status": "clean",
+            "mergeable": True,
             "blockers_or_uncertainty": [],
         }
         checks = check_review_evidence(packet, auth_head_sha="a" * 40, current_head="a" * 40)
@@ -1110,7 +1112,7 @@ class TestPatchFixesAuthorization:
             "packet_kind": "aed.pr_gate.review_evidence.v1",
             "current_head_sha": "a" * 40,
             "reviewed_head_sha": "a" * 40,
-            "review_source": "bogus",   # not in allowed set
+            "review_source": "bogus",
             "review_status": "clean",
             "review_is_stale": False,
             "merge_allowed": True,
@@ -1122,3 +1124,23 @@ class TestPatchFixesAuthorization:
         source_check = next((r for r in checks if r[0] == "review_source_valid"), None)
         assert source_check is not None and source_check[1] is False, \
             f"Expected review_source_valid to fail for bogus: {checks}"
+
+    def test_authorization_rejects_mergeable_false_forged(self, tmp_path):
+        """mergeable=False with merge_allowed=True (forged) => reject."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,
+            "mergeable": False,
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        merge_check = next((r for r in checks if r[0] == "merge_allowed_accurate"), None)
+        assert merge_check is not None and merge_check[1] is False, \
+            f"Expected merge_allowed_accurate to fail for mergeable=False: {checks}"

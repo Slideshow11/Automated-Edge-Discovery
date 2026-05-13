@@ -367,6 +367,7 @@ def build_notification(
         missing_source = rev_source in ("none", "", None) or not rev_source
         allowed_sources = ("github_codex", "codex_cli_fallback", "reviewer")
         valid_source = rev_source in allowed_sources
+        rev_mergeable = review_evidence.get("mergeable") is True
         raw_merge_allowed = (
             valid_source
             and not missing_source
@@ -375,6 +376,7 @@ def build_notification(
             and bool(rev_current)
             and ci_green
             and scope_clean
+            and rev_mergeable
             and (not rev_current or rev_current == head_sha)
         )
         if not raw_merge_allowed:
