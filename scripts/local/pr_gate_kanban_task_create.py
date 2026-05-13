@@ -33,54 +33,95 @@ KANBAN_BIN_FALLBACK = Path("/usr/local/bin/hermes")
 # a negation context precedes the token.  "Do not call fact_store" is a
 # prohibition warning and must be allowed.  "Call fact_store" must be rejected.
 #
-# Negation rule: a line is skipped when it contains an affirmative action verb
-# between "not " and the forbidden token — indicating the prohibition is about
-# the action (e.g., "Do not call fact_store") rather than the token itself being
-# used in an instruction (e.g., "use fact_store to persist").
+# Negation rule: "Do not [CALL|USE|...] [token]" is a prohibition (skip).
+# Anything after a clause separator (. ;) or after "not " without an immediate
+# action verb is an affirmative instruction (reject).
+#
+# Examples:
+#   "Do not use fact_store, or call skill_manage" — "fact_store" is in the same
+#     clause as "not use"; "skill_manage" follows a clause separator (comma)
+#     so is NOT covered by the prohibition → REJECT
+#   "Do not update memory. Call fact_store to persist." — "fact_store" appears
+#     after the period with no "not " before it → REJECT
+#   "Do not call fact_store." — pure prohibition → ALLOW
+#   "Do not use fact_store; call skill_manage to persist." — "skill_manage"
+#     appears after semicolon (clause boundary) → REJECT
+_PROHIBITION_PATTERN = re.compile(
+    r"not\s+(?:call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+(?P<token>[^\n;.]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_prohibition_segment(segment: str) -> bool:
+    """
+    Returns True when segment between 'not ' and forbidden token contains
+    an affirmative action verb (call/use/update/etc.), indicating the
+    segment is a prohibition (e.g., 'not call' in 'Do not call fact_store').
+    When segment is empty or contains no affirmative verb, returns False
+    (the token is being instructed directly, e.g., '... call fact_store').
+    """
+    if not segment:
+        return False
+    return bool(
+        re.search(
+            r"\b(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
+            segment,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_clause_boundary(segment: str) -> bool:
+    """Returns True if segment contains a clause separator (; , .)."""
+    return bool(re.search(r"[;,.]", segment))
+
+
+# Combined regex: match prohibition ("not [verb] token") OR bare token.
+# For each match: if it's a prohibition, skip it (allowed).
+# If it's a bare token, it's an affirmative instruction → reject.
+_SCAN_PATTERN = re.compile(
+    r"not\s+(?:call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+[^\n;.]*?"
+    r"|"
+    r"\bfact_store\b|\bskill_manage\b|"
+    r"(?<!not )memory\.update|"
+    r"gh\s+pr\s+merge|gh\s+pr\s+comment|gh\s+pr\s+create|"
+    r"git\s+push|git\s+commit|"
+    r"hermes\s+kanban\s+dispatch|"
+    r"delegate_task|cronjob|"
+    r"live\s+trading|broker|"
+    r"requests\.(get|post|patch|put|delete)|"
+    r"httpx|urllib",
+    re.IGNORECASE,
+)
+
+
 def _body_has_forbidden_pattern(body: str) -> tuple[bool, str]:
     """
     Returns (is_forbidden, matched_token).
-    Skips a line when it contains a prohibition warning (e.g.
-    "Do not call fact_store") rather than an affirmative instruction.
+    Prohibition warnings ("Do not call fact_store") are skipped.
+    Affirmative instructions ("call fact_store") are rejected.
     """
     for line in body.split("\n"):
+        # Find all prohibition matches in this line
+        # A prohibition is: "not " + affirmative_verb + text (no ; or . yet) + token
+        prohibition_matches = []
+        for m in _PROHIBITION_PATTERN.finditer(line):
+            # This match covers the token portion
+            prohibition_matches.append((m.start(), m.end()))
+
+        # Now scan for safety pattern tokens
         for pat in SAFETY_PATTERNS:
-            m = pat.search(line)
-            if not m:
-                continue
+            for m in pat.finditer(line):
+                token = m.group()
+                # Check if this token falls within a prohibition region
+                for p_start, p_end in prohibition_matches:
+                    if p_start <= m.start() < p_end:
+                        # Token is inside a prohibition → allowed
+                        break
+                else:
+                    # Token is not covered by any prohibition → forbidden
+                    return True, token
 
-            token_start = m.start()
-            token_end = m.end()
-
-            # Find "not " before this match
-            not_pos = line.rfind("not ", 0, token_start)
-            if not_pos == -1:
-                # No "not " before token — always forbidden
-                return True, m.group()
-
-            # Examine the segment: "not " ... up to token
-            segment = line[not_pos + 4 : token_start]
-
-            # Look for affirmative action verbs in the segment
-            action_match = re.search(
-                r"\b(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
-                segment,
-                re.IGNORECASE,
-            )
-            if action_match:
-                # Action verb found in segment between "not " and token.
-                # Two sub-cases:
-                #  1. verb appears BEFORE token in the line → "Do not CALL fact_store"
-                #     "not CALL" prohibits the action → token is not being instructed → ALLOWED
-                #  2. verb appears AFTER token in the line → "fact_store... CALL"
-                #     token is being instructed to do something → FORBIDDEN
-                action_global_pos = not_pos + 4 + action_match.start()
-                if action_global_pos < token_start:
-                    # Action (call/use/etc.) appears BEFORE token → prohibition warning
-                    continue
-                # Action appears after token → forbidden instruction
-                return True, m.group()
-            # No action verb in segment → prohibition warning
     return False, ""
 
 
@@ -119,6 +160,7 @@ STOP_RULES = [
 _ACTIONS_WITH_TASK = {
     "create_builder_patch_task_draft",
     "create_reviewer_task_draft",
+    "create_codex_request_task_draft",
     "create_human_escalation_task_draft",
 }
 
