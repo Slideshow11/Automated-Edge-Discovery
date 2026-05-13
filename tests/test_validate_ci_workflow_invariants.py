@@ -602,3 +602,248 @@ def test_bare_boolean_on_is_rejected():
         assert "boolean" in result.stderr.lower() or "not a dict" in result.stderr.lower()
     finally:
         Path(path).unlink()
+
+
+# ---------------------------------------------------------------------------
+# Concurrency tests
+# ---------------------------------------------------------------------------
+
+def _base_workflow(**concurrency_overrides):
+    """Minimal valid workflow base used for concurrency test variants."""
+    return {
+        "on": {
+            "push": {"branches": ["main", "fix/*", "feat/*"]},
+            "pull_request": {"branches": ["main"]},
+        },
+        "jobs": {
+            "test": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo hi"}]},
+            "validator": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo hi"}]},
+            "governance-validators": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo hi"}]},
+            "pr-gate-live-smoke": {"runs-on": "ubuntu-latest", "steps": [{"run": "echo hi"}]},
+        },
+        **concurrency_overrides,
+    }
+
+
+def test_current_ci_yml_has_safe_concurrency():
+    """The real ci.yml must have a safe concurrency block (PR #210 invariant)."""
+    result = run_check(".github/workflows/ci.yml")
+    assert result.returncode == 0, f"Expected exit 0, got {result.returncode}.\nstderr: {result.stderr}"
+    assert "concurrency" in result.stderr
+    assert "cancel-in-progress" in result.stderr
+    assert "PASS" in result.stderr
+    assert "FAIL" not in result.stderr
+
+
+def test_missing_concurrency_fails():
+    """A workflow without a concurrency block must fail invariant."""
+    wf = _base_workflow()  # no concurrency key
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "concurrency" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_missing_group_fails():
+    """A concurrency block without a group key must fail invariant."""
+    wf = _base_workflow(concurrency={"cancel-in-progress": False})
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "group" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_group_missing_discriminator_fails():
+    """A concurrency group that has github.workflow but no ref/PR discriminator fails."""
+    # github.workflow present, but no branch/PR discriminator — all runs would
+    # be grouped together, causing cross-workflow cancellation.
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "discriminator" in result.stderr.lower() or "group" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_group_missing_workflow_fails():
+    """A concurrency group that omits github.workflow must fail invariant."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "github.workflow" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_group_ref_protected_fails():
+    """A concurrency group with github.ref_protected (not a real var) must fail."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.ref_protected }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "discriminator" in result.stderr.lower() or "group" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_missing_cancel_in_progress_fails():
+    """A concurrency block without cancel-in-progress must fail invariant."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "cancel-in-progress" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_cancel_main_runs_fails():
+    """cancel-in-progress: true (hard-coded) must fail invariant — main would be cancelled."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": True,
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "main" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_concurrency_cancel_eq_reversed_operand_fails():
+    """cancel-in-progress with reversed == operand (literal on left) must fail."""
+    # refs/heads/main == github.ref — GitHub Actions evaluates this as True on main
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "'refs/heads/main' == github.ref",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 1, f"Expected exit 1, got {result.returncode}"
+        assert "main" in result.stderr.lower()
+    finally:
+        Path(path).unlink()
+
+
+def test_pull_request_still_has_no_paths_filter():
+    """pull_request trigger must not have paths/paths-ignore (regression check)."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 0, f"Expected exit 0, got {result.returncode}"
+        # Also assert paths-related FAILs are not present
+        assert "pull_request" in result.stderr
+        # The invariant check is in stderr; confirm no paths blocker surfaced
+        blockers_lower = [b.lower() for b in result.stderr.split("\n") if "paths" in b.lower()]
+        # Should have "no paths filter" pass lines, not "has paths filter" fail lines
+        assert not any("paths filter" in b and "FAIL" in b for b in blockers_lower), \
+            f"Unexpected paths filter blocker: {blockers_lower}"
+    finally:
+        Path(path).unlink()
+
+
+def test_push_still_has_no_paths_filter():
+    """push trigger must not have paths/paths-ignore (regression check)."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 0, f"Expected exit 0, got {result.returncode}"
+        blockers_lower = [b.lower() for b in result.stderr.split("\n") if "paths" in b.lower()]
+        assert not any("paths filter" in b and "FAIL" in b for b in blockers_lower), \
+            f"Unexpected paths filter blocker: {blockers_lower}"
+    finally:
+        Path(path).unlink()
+
+
+def test_required_jobs_still_present():
+    """All four required jobs must still be present after concurrency addition."""
+    wf = _base_workflow(concurrency={
+        "group": "${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}",
+        "cancel-in-progress": "${{ github.ref != 'refs/heads/main' }}",
+    })
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as f:
+        yaml.dump(wf, f)
+        f.flush()
+        path = f.name
+
+    try:
+        result = run_check(path)
+        assert result.returncode == 0, f"Expected exit 0, got {result.returncode}"
+        for job in ("test", "validator", "governance-validators", "pr-gate-live-smoke"):
+            assert job in result.stderr, f"Job '{job}' missing from output"
+    finally:
+        Path(path).unlink()
