@@ -851,6 +851,44 @@ class TestReviewEvidenceIntegration:
         assert packet["recommendation"] == "merge_ready"
 
 
+    def test_forbidden_files_touched_withholds_auth_phrase(self, tmp_path):
+        """Test: forbidden_files_touched non-empty → authorization phrase withheld."""
+        rev = self._make_review_evidence(
+            stale=False, merge_allowed=True,
+            changed_files=[".github/workflows/ci.yml"],
+            allowed_files=[".github/workflows/**"],
+            scope_status="violation",
+            scope_passed=False,
+            forbidden_files_touched=[".github/workflows/ci.yml"],
+            blockers_or_uncertainty=["scope: forbidden_file_touched"],
+        )
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        # scope_status != clean → authorization phrase must be withheld
+        assert packet["review_evidence_summary"]["scope_status"] == "violation"
+        assert ".github/workflows/ci.yml" in packet["review_evidence_summary"]["forbidden_files_touched"]
+        # The notification should show not_merge_ready or auth phrase absent
+        assert packet["recommendation"] in ("not_merge_ready",)
+
+    def test_clean_scope_with_forbidden_file_param_still_passes(self, tmp_path):
+        """Test: clean allowed_files with empty forbidden_files → passes."""
+        rev = self._make_review_evidence(
+            stale=False, merge_allowed=True,
+            changed_files=["docs/README.md"],
+            allowed_files=["docs/**"],
+            forbidden_files=[],
+            scope_status="clean",
+            scope_passed=True,
+            forbidden_files_touched=[],
+        )
+        result = self._run_with_review_evidence(tmp_path, rev)
+        assert result.returncode == 0
+        packet = json.loads((tmp_path / "notification.json").read_text())
+        assert packet["review_evidence_summary"]["scope_status"] == "clean"
+        assert packet["review_evidence_summary"]["forbidden_files_touched"] == []
+
+
 # ── PATCH-3 notification tests ───────────────────────────────────────────────
 
 class TestPatchFixesNotification:

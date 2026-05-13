@@ -26,6 +26,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import sys
 from datetime import datetime, timezone, timedelta
@@ -127,8 +128,50 @@ def build_packet(
 
 ALLOWED_REVIEW_SOURCES = ("github_codex", "codex_cli_fallback", "reviewer", "none")
 ALLOWED_REVIEW_STATUSES = ("clean", "suggestions", "pending", "unavailable", "stale", "missing", "unknown")
-ALLOWED_SCOPE_STATUSES = ("clean", "dirty")
+ALLOWED_SCOPE_STATUSES = ("clean", "dirty", "unknown")
 REQUIRED_CI_JOBS = ("test", "validator", "governance-validators", "pr-gate-live-smoke")
+
+
+# ── Scope checker ─────────────────────────────────────────────────────────────
+
+def _run_scope_check(
+    changed_files: list[str],
+    allowed_files: list[str],
+    forbidden_files: list[str],
+) -> dict:
+    """Run check_pr_scope.py as an imported module and return its result dict.
+
+    Falls back to a synthetic error packet if the module cannot be loaded
+    or check_scope() raises — never lets a scope-check failure silently pass.
+    """
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "check_pr_scope",
+            str(Path(__file__).parent / "check_pr_scope.py"),
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError("spec is None")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.check_scope(
+            changed_files=list(changed_files),
+            allowed_files=list(allowed_files),
+            forbidden_files=list(forbidden_files),
+        )
+    except Exception:
+        # scope check unavailable — return a blocking packet so merge_allowed=False
+        return {
+            "packet_kind": "aed.pr_gate.scope_check.v1",
+            "schema_version": 1,
+            "scope_status": "unknown",
+            "passed": False,
+            "blockers": ["scope_check_unavailable"],
+            "out_of_scope_files": [],
+            "forbidden_files_touched": [],
+            "changed_files": list(changed_files),
+            "allowed_files": list(allowed_files),
+            "forbidden_files": list(forbidden_files),
+        }
 
 
 def build_review_evidence_packet(
@@ -145,6 +188,7 @@ def build_review_evidence_packet(
     ci_required_jobs: list[str] | None = None,
     changed_files: list[str] | None = None,
     allowed_files: list[str] | None = None,
+    forbidden_files: list[str] | None = None,
     mergeable: bool = True,
 ) -> dict:
     """Build an aed.pr_gate.review_evidence.v1 packet.
@@ -169,13 +213,18 @@ def build_review_evidence_packet(
     ci_required_jobs = ci_required_jobs or list(REQUIRED_CI_JOBS)
     changed_files = changed_files or []
     allowed_files = allowed_files or []
+    forbidden_files = forbidden_files or []
 
     # CI: all_green is true only if ci_status is "green" and all required jobs present
     ci_all_green = ci_status == "green"
 
-    # Scope: clean only if all changed files are in allowed_files
-    scope_dirty_files = [f for f in changed_files if f not in allowed_files]
-    scope_status = "clean" if not scope_dirty_files else "dirty"
+    # Scope: use the authoritative mechanical scope checker
+    scope_result = _run_scope_check(changed_files, allowed_files, forbidden_files)
+    scope_status = scope_result.get("scope_status", "unknown")
+    scope_passed = scope_result.get("passed", False)
+    scope_blockers = scope_result.get("blockers", [])
+    out_of_scope_files = scope_result.get("out_of_scope_files", [])
+    forbidden_files_touched = scope_result.get("forbidden_files_touched", [])
 
     # Merge allowed logic
     blockers: list[str] = []
@@ -206,7 +255,8 @@ def build_review_evidence_packet(
         blockers.append(f"CI is not all-green: ci_status='{ci_status}'")
 
     if scope_status != "clean":
-        blockers.append(f"scope is dirty: {scope_dirty_files}")
+        for b in scope_blockers:
+            blockers.append(f"scope: {b}")
 
     if not mergeable:
         blockers.append("PR is not mergeable")
@@ -240,6 +290,10 @@ def build_review_evidence_packet(
         "changed_files": list(changed_files),
         "allowed_files": list(allowed_files),
         "scope_status": scope_status,
+        "scope_passed": scope_passed,
+        "scope_blockers": list(scope_blockers),
+        "out_of_scope_files": list(out_of_scope_files),
+        "forbidden_files_touched": list(forbidden_files_touched),
         "mergeable": mergeable,
         "merge_allowed": merge_allowed,
         "blockers_or_uncertainty": list(blockers),
@@ -387,6 +441,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reviewer-status", type=str, required=True)
     p.add_argument("--changed-files", type=str, required=True)
     p.add_argument("--allowed-files", type=str, required=True)
+    p.add_argument("--forbidden-files", type=str, default="",
+                   help="Comma-separated list of forbidden file patterns (for --build-review-evidence)")
     p.add_argument("--recommendation", type=str, required=True)
     p.add_argument("--output-json", type=str, default=None)
     p.add_argument("--output-md", type=str, default=None)
@@ -427,6 +483,7 @@ def main(argv: list[str] | None = None) -> int:
         # Parse comma-separated file lists
         changed_files = [f.strip() for f in args.changed_files.split(",") if f.strip()]
         allowed_files = [f.strip() for f in args.allowed_files.split(",") if f.strip()]
+        forbidden_files = [f.strip() for f in args.forbidden_files.split(",") if f.strip()] if args.forbidden_files else []
 
         current_head_sha = args.head_sha
         reviewed_head_sha = args.reviewed_head_sha if args.reviewed_head_sha else current_head_sha
@@ -445,6 +502,7 @@ def main(argv: list[str] | None = None) -> int:
             ci_required_jobs=list(REQUIRED_CI_JOBS),
             changed_files=changed_files,
             allowed_files=allowed_files,
+            forbidden_files=forbidden_files,
             mergeable=mergeable,
         )
 
