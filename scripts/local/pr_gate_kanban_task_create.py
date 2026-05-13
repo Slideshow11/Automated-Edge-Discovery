@@ -139,11 +139,16 @@ def _find_negation_spans(line: str) -> list[tuple[int, int]]:
                 break
             if c == ",":
                 after_comma = rest[i+1:]
+                # Strip leading whitespace — "  or call" is the same as "or call"
+                after_comma_stripped = after_comma.lstrip()
                 # "or X" or "and X" after comma — coordinated clause, continue
-                if after_comma.startswith("and ") or after_comma.startswith("or "):
-                    and_or_match = re.match(r"(and|or)\s+", after_comma, re.IGNORECASE)
+                # Track stripped chars so i advances past comma + whitespace + and/or token
+                stripped_chars = len(after_comma) - len(after_comma_stripped)
+                if after_comma_stripped.startswith("and ") or after_comma_stripped.startswith("or "):
+                    and_or_match = re.match(r"(and|or)\s+", after_comma_stripped, re.IGNORECASE)
                     if and_or_match:
-                        i += 1 + and_or_match.end()
+                        # i advances: comma (1) + stripped whitespace + and/or token length
+                        i += 1 + stripped_chars + and_or_match.end()
                         continue
                 # Check for a bare verb after comma (coordinated item or new clause?)
                 # "not use X, call Y" — bare "call" could be:
@@ -168,8 +173,11 @@ def _find_negation_spans(line: str) -> list[tuple[int, int]]:
                         # Semicolon terminates — verb is completing → reject
                         end = i
                         break
-                    elif next_char == ".":
+                    elif next_char == "." and j == 0:
                         # Period immediately after verb token → new clause → reject
+                        # j==0 means period is at the START of after_verb,
+                        # i.e., nothing between verb and period (e.g., "call Y.")
+                        # vs "call Y to persist." where period is after content
                         end = i
                         break
                     else:
@@ -747,17 +755,16 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    # Safety body check (extra layer)
+    # Safety body check (extra layer — uses negation-aware helper)
     body = draft.get("task_draft", {}).get("body", "")
     if not isinstance(body, str):
         print(f"ERROR: task_draft.body must be a string, got {type(body).__name__}", file=sys.stderr)
         return 1
     if body:
-        for pat in SAFETY_PATTERNS:
-            m = pat.search(body)
-            if m:
-                print(f"ERROR: task_draft.body contains forbidden pattern: '{m.group()}'", file=sys.stderr)
-                return 1
+        forbidden, matched = _body_has_forbidden_pattern(body)
+        if forbidden:
+            print(f"ERROR: task_draft.body contains forbidden pattern: '{matched}'", file=sys.stderr)
+            return 1
 
     dry_run = not args.apply
 

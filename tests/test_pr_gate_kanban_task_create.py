@@ -719,5 +719,106 @@ class TestSafetyPatternNegation:
         assert errors == [], f"producer output failed validation: {errors}"
 
 
+# --------------------------------------------------------------------------
+# Regression: CLI safety pass must use negation-aware helper
+# -------------------------------------------------------------------------->
+
+class TestCliSafetyPass:
+    """Regression: main() must not run a raw SAFETY_PATTERNS scan.
+    It must use _body_has_forbidden_pattern() to allow prohibition warnings."""
+
+    def test_producer_draft_passes_cli_validation_path(self, tmp_path):
+        """End-to-end: pr_gate_task_draft output with standard prohibition
+        warning must pass through the full CLI validation path (main())
+        without triggering a raw SAFETY_PATTERNS rejection."""
+        import subprocess, sys
+
+        # Build a producer draft
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "local"))
+        import importlib.util
+
+        draft_script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_task_draft.py"
+        spec = importlib.util.spec_from_file_location("pr_gate_task_draft", draft_script)
+        draft_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(draft_mod)
+
+        classifier = {
+            "classification": "ready_for_reviewer",
+            "ci_status": "passed",
+            "codex_status": "clean",
+            "pr_number": "213",
+            "pr_url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/213",
+            "head_sha": "3411659e27276c56d2bc8137d04e95fbfc543e6f",
+            "changed_files": ["scripts/local/pr_gate_kanban_task_create.py"],
+            "blockers": [],
+        }
+        packet = draft_mod.build_task_draft(classifier, None)
+
+        draft_path = tmp_path / "draft.json"
+        import json
+        draft_path.write_text(json.dumps(packet))
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_kanban_task_create.py"),
+                "--task-draft", str(draft_path),
+                "--board", "aed-test",
+                "--output-json", str(tmp_path / "plan.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"CLI rejected producer draft with prohibition warning.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Regression: _find_negation_spans comma handling with leading whitespace
+# -------------------------------------------------------------------------->
+
+class TestNegationSpanWhitespace:
+    """Regression: _find_negation_spans must handle leading whitespace
+    after comma before detecting 'and'/'or' token."""
+
+    @pytest.mark.parametrize("line,expect_allowed", [
+        # Coordinated clauses with leading whitespace after comma
+        ("Do not use fact_store, or call skill_manage.", True),
+        ("Do not use fact_store,  or call skill_manage.", True),
+        ("Do not use fact_store,   and update memory.", True),
+        # Semicolon always ends clause — "then" starts new clause
+        ("Do not use fact_store; then call skill_manage.", False),
+        ("Do not use fact_store; call skill_manage.", False),
+        # Comma with bare verb then period — new clause → reject
+        ("Do not use fact_store, call skill_manage.", True),
+        ("Do not use fact_store,call skill_manage.", True),
+    ])
+    def test_find_negation_spans_coordinated_whitespace(self, line, expect_allowed):
+        import sys
+        import importlib.util
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_kanban_task_create.py"
+        spec = importlib.util.spec_from_file_location("kanban", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        spans = mod._find_negation_spans(line)
+        # Get positions of all safety tokens
+        token_positions = []
+        for pat in mod.SAFETY_PATTERNS:
+            for m in pat.finditer(line):
+                token_positions.append((m.start(), m.group()))
+        # All tokens must be covered if allowed, all must be uncovered if rejected
+        all_covered = all(
+            any(s <= tp < e for s, e in spans)
+            for tp, _ in token_positions
+        )
+        assert all_covered == expect_allowed, (
+            f"line: {line!r}\nspans: {spans}\ntokens: {token_positions}\n"
+            f"expected all_covered={expect_allowed}, got all_covered={all_covered}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])
