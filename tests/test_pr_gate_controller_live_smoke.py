@@ -789,6 +789,121 @@ def test_real_create_never_dispatches():
         )
 
 
+def test_synthetic_task_draft_includes_forbidden_files_empty():
+    """Regression: synthetic smoke drafts must include forbidden_files: []
+    so that _check_real_create_preconditions can reach its success path.
+    Without this field, the precondition blocks with 'forbidden_files is null'
+    even though the smoke harness only calls _build_kanban_plan (not real create).
+    """
+    import sys, importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+    spec = importlib.util.spec_from_file_location("smoke_mod", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    scenario = {
+        "classification": "refactor",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "expected_action": "create_builder_patch_task_draft",
+        "expected_kanban": "builder",
+    }
+    draft = mod._build_synthetic_task_draft(scenario, repo_owner="test", repo_name="test")
+
+    # The smoke draft MUST include task_draft.forbidden_files
+    task_draft_body = draft.get("task_draft", {})
+    assert "forbidden_files" in task_draft_body, (
+        "synthetic task draft must include 'forbidden_files' key in task_draft; "
+        "otherwise _check_real_create_preconditions blocks with 'forbidden_files is null'"
+    )
+    assert task_draft_body["forbidden_files"] == [], (
+        f"forbidden_files must be [], got {task_draft_body['forbidden_files']}"
+    )
+
+
+def test_real_create_preconditions_pass_with_empty_forbidden_files():
+    """Verify that forbidden_files = [] passes preconditions (explicit empty is OK)."""
+    import sys, importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+    spec = importlib.util.spec_from_file_location("smoke_mod2", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    task_draft = {
+        "action": "create_builder_patch_task_draft",
+        "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+        "controller_rules": {"no_auto_dispatch": True},
+        "task_draft": {
+            "forbidden_files": [],  # explicitly empty — should pass
+        },
+    }
+    allowed, blockers = mod._check_real_create_preconditions(
+        task_draft=task_draft,
+        scope_status="clean",
+        board="aed-test",
+        execute_real_create=True,
+    )
+    assert allowed, f"forbidden_files=[] should pass preconditions, got blockers: {blockers}"
+
+
+def test_real_create_preconditions_block_on_missing_forbidden_files():
+    """Verify missing forbidden_files key blocks preconditions."""
+    import sys, importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+    spec = importlib.util.spec_from_file_location("smoke_mod3", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    task_draft = {
+        "action": "create_builder_patch_task_draft",
+        "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+        "controller_rules": {"no_auto_dispatch": True},
+        "task_draft": {
+            # no forbidden_files key at all
+        },
+    }
+    allowed, blockers = mod._check_real_create_preconditions(
+        task_draft=task_draft,
+        scope_status="clean",
+        board="aed-test",
+        execute_real_create=True,
+    )
+    assert not allowed, "missing forbidden_files key should block preconditions"
+
+
+def test_real_create_preconditions_block_on_null_forbidden_files():
+    """Verify null forbidden_files blocks preconditions."""
+    import sys, importlib.util
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+    spec = importlib.util.spec_from_file_location("smoke_mod4", script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    task_draft = {
+        "action": "create_builder_patch_task_draft",
+        "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+        "controller_rules": {"no_auto_dispatch": True},
+        "task_draft": {
+            "forbidden_files": None,  # null — should block
+        },
+    }
+    allowed, blockers = mod._check_real_create_preconditions(
+        task_draft=task_draft,
+        scope_status="clean",
+        board="aed-test",
+        execute_real_create=True,
+    )
+    assert not allowed, "forbidden_files=None should block preconditions"
+
+
 def test_real_create_records_idempotency_key():
     """Verify idempotency_key appears in the report."""
     with tempfile.TemporaryDirectory() as tmpdir:

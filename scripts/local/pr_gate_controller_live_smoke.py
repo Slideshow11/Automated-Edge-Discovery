@@ -378,6 +378,7 @@ def _build_synthetic_task_draft(scenario: dict, *, repo_owner: str, repo_name: s
             "body": body_map.get(action, "Task body."),
             "assignee": assignee,
             "status": "todo",
+            "forbidden_files": [],
         },
         "source": {
             "pr_number": str(pr_num),
