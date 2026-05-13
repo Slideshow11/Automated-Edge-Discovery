@@ -704,6 +704,40 @@ class TestBuildReviewEvidencePacket:
         for job in ["test", "validator", "governance-validators", "pr-gate-live-smoke"]:
             assert job in packet["ci_required_jobs"]
 
+    def test_forbidden_files_produces_violation(self):
+        """Test: changed file matching forbidden_files produces violation, blocks merge."""
+        packet = build_review_evidence_packet(
+            repo_owner=REPO_OWNER, repo_name=REPO_NAME, pr_number=PR_NUM,
+            current_head_sha=HEAD, reviewed_head_sha=HEAD,
+            review_source="github_codex", review_status="clean",
+            ci_status="green",
+            changed_files=[".github/workflows/ci.yml"],
+            allowed_files=[".github/workflows/**"],
+            forbidden_files=[".github/workflows/**"],
+            mergeable=True,
+        )
+        assert packet["scope_status"] == "violation"
+        assert packet["scope_passed"] is False
+        assert ".github/workflows/ci.yml" in packet["forbidden_files_touched"]
+        assert packet["merge_allowed"] is False
+
+    def test_forbidden_files_empty_does_not_break_clean_scope(self):
+        """Test: no forbidden_files → clean allowed_files still passes."""
+        packet = build_review_evidence_packet(
+            repo_owner=REPO_OWNER, repo_name=REPO_NAME, pr_number=PR_NUM,
+            current_head_sha=HEAD, reviewed_head_sha=HEAD,
+            review_source="github_codex", review_status="clean",
+            ci_status="green",
+            changed_files=["docs/README.md"],
+            allowed_files=["docs/**"],
+            forbidden_files=[],
+            mergeable=True,
+        )
+        assert packet["scope_status"] == "clean"
+        assert packet["scope_passed"] is True
+        assert packet["forbidden_files_touched"] == []
+        assert packet["merge_allowed"] is True
+
 
 class TestCheckReviewEvidence:
     """Tests for check_review_evidence() function."""

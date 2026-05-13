@@ -188,6 +188,7 @@ def build_review_evidence_packet(
     ci_required_jobs: list[str] | None = None,
     changed_files: list[str] | None = None,
     allowed_files: list[str] | None = None,
+    forbidden_files: list[str] | None = None,
     mergeable: bool = True,
 ) -> dict:
     """Build an aed.pr_gate.review_evidence.v1 packet.
@@ -212,12 +213,13 @@ def build_review_evidence_packet(
     ci_required_jobs = ci_required_jobs or list(REQUIRED_CI_JOBS)
     changed_files = changed_files or []
     allowed_files = allowed_files or []
+    forbidden_files = forbidden_files or []
 
     # CI: all_green is true only if ci_status is "green" and all required jobs present
     ci_all_green = ci_status == "green"
 
     # Scope: use the authoritative mechanical scope checker
-    scope_result = _run_scope_check(changed_files, allowed_files, forbidden_files=[])
+    scope_result = _run_scope_check(changed_files, allowed_files, forbidden_files)
     scope_status = scope_result.get("scope_status", "unknown")
     scope_passed = scope_result.get("passed", False)
     scope_blockers = scope_result.get("blockers", [])
