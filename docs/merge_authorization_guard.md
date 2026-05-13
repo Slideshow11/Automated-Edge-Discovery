@@ -290,6 +290,52 @@ If `merge_allowed` is `false` or `review_is_stale` is `true`, the notification s
 
 ---
 
+## Authorization phrase
+
+The authorization phrase must include the **exact full 40-character SHA** of the confirmed PR head:
+
+```
+I confirm merge PR #207 at abc1230000000000000000000000000000000000
+```
+
+### Exact SHA requirement
+
+The agent must **never** substitute, infer, correct, or use the confirmed PR head SHA in place of the user-provided SHA.
+
+If the authorization phrase SHA does not exactly equal the current PR head SHA, the merge must be **blocked**.
+
+**Required:** A fresh authorization phrase using the exact full 40-character current head SHA.
+
+Specific rules:
+- **Short SHA prefixes (7 characters) are not accepted.** A 7-character SHA is insufficient — only a full 40-character SHA is valid.
+- **39-character SHAs are not accepted.** The SHA must be exactly 40 hex characters.
+- **One wrong character is not acceptable.** A 40-character SHA that differs by a single character from the current head is rejected.
+- **Substitution is forbidden.** If Tom authorizes SHA A but the PR head is now SHA B, the agent must not use SHA B. A new authorization phrase with the exact SHA B is required.
+
+### SHA sources and priority
+
+When checking authorization:
+
+1. `--current-head` (CLI argument) is the **primary authority** — if provided, the phrase SHA must match this exactly
+2. `packet.authorization_head_sha` is the **packet authority** — if `--current-head` is absent, the phrase SHA must match this
+3. `packet.head_sha` is the **backward-compat fallback** — used if `authorization_head_sha` is absent
+
+The merge packet also includes:
+- `authorization_head_sha` — the SHA that must appear in the authorization phrase
+- `head_sha_source` — `"packet"` when sourced from the packet (or `"current_head_cli"` if from `--current-head`)
+
+### Why this prevents the PR #207 failure mode
+
+In the PR #207 incident, Tom provided an authorization phrase for SHA A, but the PR head had moved to SHA B. The agent substituted SHA B and proceeded.
+
+With exact-SHA enforcement:
+- The authorization phrase contains SHA A
+- The guard checks: does phrase SHA == current head SHA?
+- They differ → blocker `authorization_sha_mismatch`
+- Merge denied, fresh authorization with SHA B required
+
+---
+
 ## Backward compatibility
 
 Without `--review-evidence`, `check_merge_authorization.py` behaves exactly as before — all existing checks run, and no new behavior is introduced.

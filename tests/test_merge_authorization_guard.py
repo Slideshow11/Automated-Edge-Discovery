@@ -28,11 +28,14 @@ from check_merge_authorization import (
     check_no_blockers,
     check_recommendation_merge,
     check_required_fields,
+    check_authorization_sha_match,
     load_packet,
     run_all_checks,
     PACKET_KIND,
     load_review_evidence,
     check_review_evidence,
+    extract_sha_from_phrase,
+    SHA_FULL_PATTERN,
 )
 import check_merge_authorization
 
@@ -1144,3 +1147,157 @@ class TestPatchFixesAuthorization:
         merge_check = next((r for r in checks if r[0] == "merge_allowed_accurate"), None)
         assert merge_check is not None and merge_check[1] is False, \
             f"Expected merge_allowed_accurate to fail for mergeable=False: {checks}"
+
+
+# ── Exact SHA Authorization Enforcement Tests ────────────────────────────────────
+
+HEAD = "a" * 40
+OLD_HEAD = "b" * 40
+VALID_PHRASE = f"I confirm merge PR #207 at {HEAD}"
+
+
+class TestExtractShaFromPhrase:
+    def test_exact_40_char_sha_extracted(self):
+        sha = extract_sha_from_phrase(f"I confirm merge PR #207 at {HEAD}")
+        assert sha == HEAD
+
+    def test_7_char_prefix_not_extracted(self):
+        sha = extract_sha_from_phrase(f"I confirm merge PR #207 at {HEAD[:7]}")
+        assert sha is None
+
+    def test_39_char_not_extracted(self):
+        sha = extract_sha_from_phrase(f"I confirm merge PR #207 at {HEAD[:39]}")
+        assert sha is None
+
+    def test_no_sha_in_phrase(self):
+        sha = extract_sha_from_phrase("I confirm merge PR #207")
+        assert sha is None
+
+    def test_40_char_middle_of_phrase(self):
+        phrase = f"PR #207 — SHA is {HEAD} — confirmed"
+        sha = extract_sha_from_phrase(phrase)
+        assert sha == HEAD
+
+
+class TestExactShaAuthorization:
+    def test_exact_full_sha_authorization_passes(self):
+        """Full 40-char SHA in phrase equals current head => pass."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        ok, msg = check_authorization_sha_match(VALID_PHRASE, packet, current_head=HEAD)
+        assert ok is True, msg
+
+    def test_short_sha_authorization_fails(self):
+        """7-char prefix in phrase => reject with authorization_sha_mismatch."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = f"I confirm merge PR #207 at {HEAD[:7]}"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert "Short SHA prefixes are not accepted" in msg
+
+    def test_39_char_sha_authorization_fails(self):
+        """39-char SHA in phrase => reject with authorization_sha_mismatch."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = f"I confirm merge PR #207 at {HEAD[:39]}"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+
+    def test_one_character_mismatch_fails(self):
+        """40-char SHA differs by one char from current head => reject."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        wrong_sha = HEAD[:-1] + "1"  # one character different
+        phrase = f"I confirm merge PR #207 at {wrong_sha}"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert "does not equal" in msg
+
+    def test_agent_substitution_pattern_fails(self):
+        """Phrase SHA A, current head SHA B, guard blocks rather than using B."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase_a = f"I confirm merge PR #207 at {OLD_HEAD}"  # A != B
+        ok, msg = check_authorization_sha_match(phrase_a, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert "must never substitute" in msg
+
+    def test_current_head_must_match_packet_head(self):
+        """--current-head differs from packet head_sha => reject."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = f"I confirm merge PR #207 at {HEAD}"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=OLD_HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+
+    def test_authorization_sha_must_match_review_evidence_head(self):
+        """Authorization phrase SHA differs from review evidence current_head_sha => reject."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase_wrong = f"I confirm merge PR #207 at {OLD_HEAD}"
+        ok, msg = check_authorization_sha_match(phrase_wrong, packet, current_head=None)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+
+    def test_stale_review_plus_matching_authorization_still_fails(self):
+        """Even if phrase SHA matches current head, stale review evidence blocks."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = f"I confirm merge PR #207 at {HEAD}"
+        # Stale review evidence: reviewed != current
+        rev_packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": HEAD,
+            "reviewed_head_sha": OLD_HEAD,  # stale
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": True,
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": False,
+            "blockers_or_uncertainty": ["review is stale: reviewed_head_sha != current_head_sha"],
+        }
+        checks = check_review_evidence(rev_packet, auth_head_sha=HEAD, current_head=HEAD)
+        stale_check = next((r for r in checks if r[0] == "review_not_stale"), None)
+        assert stale_check is not None and stale_check[1] is False
+
+    def test_missing_current_head_uses_packet_head(self):
+        """Without --current-head, packet authorization_head_sha is used as required SHA."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase_wrong = f"I confirm merge PR #207 at {OLD_HEAD}"
+        ok, msg = check_authorization_sha_match(phrase_wrong, packet, current_head=None)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert OLD_HEAD[:8] in msg
+
+    def test_error_message_mentions_fresh_authorization_required(self):
+        """Mismatch blocker text clearly requires fresh authorization."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase_wrong = f"I confirm merge PR #207 at {OLD_HEAD}"
+        ok, msg = check_authorization_sha_match(phrase_wrong, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert "fresh authorization" in msg.lower() or "new" in msg.lower()
+
+    def test_no_sha_at_all_fails(self):
+        """Phrase with no SHA at all => reject."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = "I confirm merge PR #207"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=HEAD)
+        assert ok is False
+        assert "authorization_sha_mismatch" in msg
+        assert "no valid full 40-character SHA" in msg
+
+    def test_backward_compat_full_sha_in_packet_head_fallback(self):
+        """Without authorization_head_sha field, head_sha is used as fallback."""
+        packet = make_valid_packet({"head_sha": HEAD})  # no authorization_head_sha
+        phrase = f"I confirm merge PR #207 at {HEAD}"
+        ok, msg = check_authorization_sha_match(phrase, packet, current_head=None)
+        assert ok is True, msg
+
+    def test_run_all_checks_includes_authorization_sha_match(self):
+        """run_all_checks includes authorization_sha_match check."""
+        packet = make_valid_packet({"head_sha": HEAD, "authorization_head_sha": HEAD})
+        phrase = f"I confirm merge PR #207 at {HEAD}"
+        checks = run_all_checks(packet, phrase, current_head=HEAD)
+        names = [n for n, _, _ in checks]
+        assert "authorization_sha_match" in names
