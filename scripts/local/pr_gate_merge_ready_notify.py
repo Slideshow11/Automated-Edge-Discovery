@@ -386,6 +386,22 @@ def build_notification(
                 f"stale={actual_stale}, ci={ci_green}, scope={scope_clean}"
             )
 
+    # Pull authoritative scope evidence from review_evidence (if available)
+    # so the notification packet includes scope_blockers, out_of_scope_files,
+    # and forbidden_files_touched for forensic completeness.
+    scope_evidence: dict[str, Any] = {}
+    if review_evidence:
+        scope_evidence = {
+            "scope_status": review_evidence.get("scope_status", "unknown"),
+            "scope_passed": review_evidence.get("scope_passed", False),
+            "scope_blockers": review_evidence.get("scope_blockers", []),
+            "out_of_scope_files": review_evidence.get("out_of_scope_files", []),
+            "forbidden_files_touched": review_evidence.get("forbidden_files_touched", []),
+        }
+        # Suppress authorization phrase if scope is not clean
+        if scope_evidence.get("scope_status") != "clean":
+            blockers.append(f"scope: {scope_evidence.get('scope_status')} — authorization withheld")
+
     is_ready = _is_merge_ready(gate_summary) and not blockers
 
     required_phrase = _build_required_phrase(pr_number, head_sha)
@@ -435,6 +451,7 @@ def build_notification(
             "base_branch": base_branch,
         },
         "gate_summary": gate_summary,
+        "scope_evidence": scope_evidence,
         "required_authorization_phrase": required_phrase if is_ready else None,
         "user_message": telegram_text,
         "merge_command_template": merge_cmd if is_ready else None,

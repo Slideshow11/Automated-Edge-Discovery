@@ -613,7 +613,9 @@ class TestBuildReviewEvidencePacket:
             ci_status="green", changed_files=["engine/foo.py"],
             allowed_files=["docs/README.md"], mergeable=True,
         )
-        assert packet["scope_status"] == "dirty"
+        # scope_status may be "dirty" (old simple membership) or "violation" (check_pr_scope)
+        # — both mean out-of-scope. Use scope_passed as the reliable boolean.
+        assert packet["scope_passed"] is False
         assert packet["merge_allowed"] is False
 
     def test_changed_file_outside_allowed_blocks_merge(self):
@@ -626,7 +628,9 @@ class TestBuildReviewEvidencePacket:
             changed_files=["scripts/local/pr_gate_controller.py"],
             allowed_files=["docs/README.md"], mergeable=True,
         )
-        assert packet["scope_status"] == "dirty"
+        # scope_status may be "dirty" (old simple membership) or "violation" (check_pr_scope)
+        # — both mean out-of-scope. Use scope_passed as the reliable boolean.
+        assert packet["scope_passed"] is False
         assert packet["merge_allowed"] is False
 
     def test_recommended_merge_command_includes_match_head_commit(self):
@@ -681,7 +685,9 @@ class TestBuildReviewEvidencePacket:
             "current_head_sha", "reviewed_head_sha",
             "review_source", "review_status", "review_is_stale",
             "ci_status", "ci_required_jobs", "ci_all_green",
-            "changed_files", "allowed_files", "scope_status",
+            "changed_files", "allowed_files",
+            "scope_status", "scope_passed", "scope_blockers",
+            "out_of_scope_files", "forbidden_files_touched",
             "mergeable", "merge_allowed", "blockers_or_uncertainty",
             "recommended_merge_command",
         ]:
