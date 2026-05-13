@@ -405,3 +405,54 @@ Exit codes: 0 = pass, 1 = invariant failure, 2 = parse error
 - `docs/pr_gate_task_draft_usage.md` — Task draft generator documentation
 - `docs/merge_authorization_guard.md` — Merge gate guard design
 - `docs/current_project_status.md` — PR tracking
+
+---
+
+## PR #206: Controller `--apply-create-task` Hardening
+
+> PR #206 hardens the controller's `--apply-create-task` path against unsafe states and ensures deterministic idempotency guarantees.
+
+### What Was Added
+
+Two new functions in `pr_gate_controller.py`:
+
+**`_make_controller_idempotency_key(owner, repo, pr_number, head_sha, task_action)`** produces a deterministic string of the form:
+```
+aed:{repo_owner}/{repo_name}:pr:{pr_number}:head:{head_sha}:action:{task_action}
+```
+Returns `""` if any component is missing or falsy, preventing invalid keys from propagating into the Kanban layer.
+
+**`_apply_create_task(...)`** is the extracted and hardened apply path. It:
+- Refuses to apply for `no_action_wait`, `ci_pending`, `codex_pending`, `unknown`, or `""` task actions
+- Refuses if `pr_number` or `head_sha` is missing
+- Calls `pr_gate_kanban_task_create.py` **exactly once** with `--apply`
+- Returns `(duplicate_found, created_task_id, idempotency_key, blockers)`
+
+### Run Packet Fields Added
+
+When `--apply-create-task` is requested, the controller run packet gains:
+
+| Field | Type | Description |
+|---|---|---|
+| `apply_create_task_requested` | bool | `--apply-create-task` was passed |
+| `apply_create_task_allowed` | bool | Task action is safe to apply |
+| `idempotency_key` | string | Deterministic AED key, or `""` if unsafe |
+| `downstream_helper` | string | `pr_gate_kanban_task_create.py` |
+| `no_dispatch_guarantee` | bool | Always `True` in apply mode |
+| `blockers_or_uncertainty` | list | Refusal reasons if action was blocked |
+
+### No-Dispatch Invariant
+
+The controller never calls `hermes kanban dispatch`, `hermes merge`, `gh api`, or any Codex endpoint from within its own process. All Kanban mutations go through `pr_gate_kanban_task_create.py` via a single `subprocess.run` call, and only when `--apply` is explicitly passed. The controller records what *would* have been created in dry-run mode, and what *was* created in apply mode.
+
+### Idempotency in the Kanban Layer
+
+The `idempotency_key` produced by `_make_controller_idempotency_key` is embedded in the Kanban task body as an `aed:idempotency_key` tag. `pr_gate_kanban_task_create.py` checks for existing tasks with the same tag before creating a new one. If a duplicate is found, the creation is skipped and `duplicate_found=True` is returned in the plan packet.
+
+### How This Enables Safe Auto-Dispatch
+
+With the idempotency key, refusal logic, and no-dispatch guarantee in place, a future dispatch controller can:
+1. Run `--apply-create-task` in dry-run mode first
+2. Present the plan to human for authorization
+3. Run with `--apply` on explicit confirmation
+4. Trust that the same idempotency key will never create a duplicate task
