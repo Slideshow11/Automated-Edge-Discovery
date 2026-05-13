@@ -183,8 +183,8 @@ def build_review_evidence_packet(
 
     if review_source not in ALLOWED_REVIEW_SOURCES:
         blockers.append(f"review_source '{review_source}' is not valid")
-    elif review_source == "none":
-        blockers.append("missing review evidence: review_source is 'none'")
+    elif review_source in ("none", "", None):
+        blockers.append("missing review evidence: review_source is 'none' or empty")
     elif review_status == "missing":
         blockers.append("missing review evidence: review_status is 'missing'")
     elif review_status == "unknown":
@@ -193,17 +193,12 @@ def build_review_evidence_packet(
         blockers.append("review is pending")
     elif review_status == "suggestions":
         blockers.append("review has suggestions")
+    elif review_status == "stale":
+        blockers.append("review status is stale")
 
-    if review_source == "github_codex":
-        if review_status not in ("clean",):
-            blockers.append("github_codex review is not clean")
-        elif review_is_stale:
-            blockers.append("github_codex review is stale")
-    elif review_source == "codex_cli_fallback":
-        if review_status not in ("clean",):
-            blockers.append("codex_cli_fallback review is not clean")
-        elif review_is_stale:
-            blockers.append("codex_cli_fallback review is stale")
+    # merge_allowed requires review_status == "clean" regardless of source
+    if review_status != "clean":
+        blockers.append(f"review_status is '{review_status}', not 'clean' — merge_allowed=False for all sources")
 
     if not ci_all_green:
         blockers.append(f"CI is not all-green: ci_status='{ci_status}'")

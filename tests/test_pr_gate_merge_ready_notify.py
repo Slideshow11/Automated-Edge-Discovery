@@ -613,9 +613,13 @@ class TestReviewEvidenceIntegration:
     """Tests 12-14: merge-ready notification with review evidence."""
 
     def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
-        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing.
+
+        When stale=True: current_head_sha=HEAD, reviewed_head_sha=old_head (stale by SHA mismatch).
+        This tests stale detection without triggering the PATCH-3 head-mismatch block.
+        """
         old_head = "deadbeef" + "1" * 32
-        current = old_head if stale else HEAD
+        current = HEAD
         reviewed = old_head if stale else HEAD
         status = "clean" if merge_allowed else "pending"
         base = {
@@ -847,6 +851,127 @@ class TestReviewEvidenceIntegration:
         assert packet["recommendation"] == "merge_ready"
 
 
+# ── PATCH-3 notification tests ───────────────────────────────────────────────
+
+class TestPatchFixesNotification:
+    """Tests for PATCH-3 in pr_gate_merge_ready_notify.py."""
+
+    def test_notification_rejects_review_evidence_for_different_head(self, tmp_path):
+        """merge packet head is new_sha but review evidence current_head_sha is old_sha => not_merge_ready."""
+        new_sha = "a" * 40
+        old_sha = "b" * 40
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+
+        rev = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": old_sha,
+            "reviewed_head_sha": old_sha,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": True,
+            "blockers_or_uncertainty": [],
+        }
+        rev_path.write_text(json.dumps(rev))
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", new_sha,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert packet["recommendation"] == "not_merge_ready", \
+            f"Expected not_merge_ready for head mismatch: {packet['blockers_or_uncertainty']}"
+        assert packet["required_authorization_phrase"] is None
+        assert packet["merge_command_template"] is None
+        head_mismatch = any("head mismatch" in b.lower() for b in packet["blockers_or_uncertainty"])
+        assert head_mismatch, f"Expected head mismatch blocker: {packet['blockers_or_uncertainty']}"
+
+    def test_notification_with_matching_head_produces_merge_ready(self, tmp_path):
+        """review evidence current_head_sha matches notification head_sha => merge_ready."""
+        sha = "a" * 40
+        out_json = tmp_path / "notification.json"
+        out_md = tmp_path / "notification.md"
+        rev_path = tmp_path / "REVIEW_EVIDENCE.json"
+
+        rev = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "schema_version": 1,
+            "generated_at": "2026-05-13T00:00:00+00:00",
+            "repo_owner": REPO_OWNER,
+            "repo_name": REPO_NAME,
+            "pr_number": 207,
+            "current_head_sha": sha,
+            "reviewed_head_sha": sha,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "ci_status": "green",
+            "ci_required_jobs": ["test", "validator", "governance-validators", "pr-gate-live-smoke"],
+            "ci_all_green": True,
+            "changed_files": ["docs/README.md"],
+            "allowed_files": ["docs/README.md"],
+            "scope_status": "clean",
+            "mergeable": True,
+            "merge_allowed": True,
+            "blockers_or_uncertainty": [],
+        }
+        rev_path.write_text(json.dumps(rev))
+
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT),
+             "--pr-number", "207",
+             "--pr-url", f"https://github.com/{REPO_OWNER}/{REPO_NAME}/pull/207",
+             "--head-sha", sha,
+             "--base-branch", "main",
+             "--ci-status", "green",
+             "--codex-status", "clean",
+             "--fallback-review-status", "clean",
+             "--reviewer-status", "approved",
+             "--scope-status", "clean",
+             "--mergeable",
+             "--changed-file", "docs/README.md",
+             "--output-json", str(out_json),
+             "--output-md", str(out_md),
+             "--review-evidence", str(rev_path)],
+            capture_output=True, text=True,
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        packet = json.loads(out_json.read_text())
+        assert packet["recommendation"] == "merge_ready", \
+            f"Expected merge_ready for matching head: {packet['blockers_or_uncertainty']}"
+        assert packet["required_authorization_phrase"] is not None
+        assert sha in packet["required_authorization_phrase"]
+
+
 def test_old_packet_codex_unavailable(tmp_path):
     """Old MERGE_READY_PACKET with codex_status=unavailable also works."""
     mrp = tmp_path / "MERGE_READY_PACKET.json"
@@ -894,9 +1019,13 @@ class TestReviewEvidenceIntegration:
     """Tests 12-14: merge-ready notification with review evidence."""
 
     def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
-        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing.
+
+        When stale=True: current_head_sha=HEAD, reviewed_head_sha=old_head (stale by SHA mismatch).
+        This tests stale detection without triggering the PATCH-3 head-mismatch block.
+        """
         old_head = "deadbeef" + "1" * 32
-        current = old_head if stale else HEAD
+        current = HEAD
         reviewed = old_head if stale else HEAD
         status = "clean" if merge_allowed else "pending"
         base = {
@@ -1175,9 +1304,13 @@ class TestReviewEvidenceIntegration:
     """Tests 12-14: merge-ready notification with review evidence."""
 
     def _make_review_evidence(self, stale: bool = False, merge_allowed: bool = True, **overrides) -> dict:
-        """Build a REVIEW_EVIDENCE_PACKET dict for testing."""
+        """Build a REVIEW_EVIDENCE_PACKET dict for testing.
+
+        When stale=True: current_head_sha=HEAD, reviewed_head_sha=old_head (stale by SHA mismatch).
+        This tests stale detection without triggering the PATCH-3 head-mismatch block.
+        """
         old_head = "deadbeef" + "1" * 32
-        current = old_head if stale else HEAD
+        current = HEAD
         reviewed = old_head if stale else HEAD
         status = "clean" if merge_allowed else "pending"
         base = {

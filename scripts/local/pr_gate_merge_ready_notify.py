@@ -342,9 +342,22 @@ def build_notification(
 
     blockers = _collect_blockers(gate_summary)
 
+    # PATCH-3: review evidence must be tied to the exact notification head_sha
+    if review_evidence:
+        rev_current = review_evidence.get("current_head_sha", "")
+        if not rev_current or rev_current != head_sha:
+            blockers.append(
+                f"review evidence head mismatch: evidence current_head_sha='{rev_current}' "
+                f"!= notification head_sha='{head_sha}'"
+            )
+
     # If review evidence is provided and stale or missing merge_allowed, block
     if review_evidence:
-        if review_evidence.get("review_is_stale") is True:
+        # Recompute staleness from raw SHA fields (trust raw data, not derived boolean)
+        rev_reviewed = review_evidence.get("reviewed_head_sha", "")
+        rev_current = review_evidence.get("current_head_sha", "")
+        actual_stale = bool(rev_current) and bool(rev_reviewed) and rev_current != rev_reviewed
+        if actual_stale:
             blockers.append("review evidence is stale: reviewed_head_sha != current_head_sha")
         if review_evidence.get("merge_allowed") is not True:
             blockers.append(f"review evidence merge_allowed=False: {review_evidence.get('blockers_or_uncertainty', [])}")

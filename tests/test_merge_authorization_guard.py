@@ -708,7 +708,7 @@ class TestCheckReviewEvidence:
             ci_status="green", changed_files=["docs/README.md"],
             allowed_files=["docs/README.md"], mergeable=True,
         )
-        results = check_review_evidence(packet, current_head_sha=HEAD)
+        results = check_review_evidence(packet, auth_head_sha=HEAD, current_head=HEAD)
         assert all(passed for _, passed, _ in results), f"Failed: {[r for r in results if not r[1]]}"
 
     def test_rejects_stale_evidence(self):
@@ -721,24 +721,36 @@ class TestCheckReviewEvidence:
             ci_status="green", changed_files=["docs/README.md"],
             allowed_files=["docs/README.md"], mergeable=True,
         )
-        results = check_review_evidence(packet, current_head_sha=HEAD)
+        results = check_review_evidence(packet, auth_head_sha=HEAD)
         stale_check = [r for r in results if r[0] == "review_not_stale"]
         assert len(stale_check) == 1
         assert stale_check[0][1] is False
 
-    def test_rejects_merge_allowed_false(self):
-        """Test 14b: check_review_evidence rejects when merge_allowed=False."""
-        packet = build_review_evidence_packet(
-            repo_owner=REPO_OWNER, repo_name=REPO_NAME, pr_number=PR_NUM,
-            current_head_sha=HEAD, reviewed_head_sha=HEAD,
-            review_source="none", review_status="unknown",
-            ci_status="green", changed_files=["docs/README.md"],
-            allowed_files=["docs/README.md"], mergeable=True,
-        )
-        results = check_review_evidence(packet)
-        allowed_checks = [r for r in results if r[0] == "merge_allowed"]
-        assert len(allowed_checks) == 1
-        assert allowed_checks[0][1] is False
+    def test_rejects_merge_allowed_false_when_packet_disagrees(self):
+        """Test 14b: check_review_evidence rejects when packet claims merge_allowed=True but facts say False.
+        
+        Note: when build_review_evidence_packet legitimately produces merge_allowed=False (e.g. review_source=none),
+        check_review_evidence passes because packet and recomputed agree. The rejection is for forged packets
+        that claim merge_allowed=True despite missing evidence.
+        """
+        # Forge: packet claims merge_allowed=True but review_source=none (missing)
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": HEAD,
+            "reviewed_head_sha": HEAD,
+            "review_source": "none",   # missing evidence
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,     # FORGED - should be False
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        results = check_review_evidence(packet, auth_head_sha=HEAD)
+        # Should detect that review_source=none is missing (fails review_source_not_none check)
+        # AND that actual_merge_allowed=False (fails merge_allowed_accurate check)
+        source_check = next((r for r in results if r[0] == "review_source_not_none"), None)
+        assert source_check is not None and source_check[1] is False,             f"Expected review_source_not_none to fail: {results}"
 
     def test_rejects_ci_not_all_green(self):
         """Test 8b: check_review_evidence rejects when ci_all_green=False."""
@@ -945,4 +957,149 @@ class TestBackwardCompatibility:
         """Without --review-evidence arg, existing behavior is preserved."""
         # This is tested by all the existing tests remaining passing.
         # This class just documents the requirement.
-        pass
+
+
+# ── PATCH correctness tests ─────────────────────────────────────────────────
+
+REPO_OWNER = "Slideshow11"
+REPO_NAME = "Automated-Edge-Discovery"
+HEAD = "abc123" + "0" * 34  # 40-char SHA constant
+
+
+class TestPatchFixesBuildPacket:
+    """Tests for PATCH-1 in build_merge_ready_packet.py."""
+
+    def test_build_review_evidence_blocks_unavailable_reviewer(self):
+        """reviewer + unavailable => merge_allowed=false."""
+        packet = build_review_evidence_packet(
+            repo_owner=REPO_OWNER, repo_name=REPO_NAME, pr_number=207,
+            current_head_sha=HEAD, reviewed_head_sha=HEAD,
+            review_source="reviewer", review_status="unavailable",
+            ci_status="green", changed_files=["docs/README.md"],
+            allowed_files=["docs/README.md"], mergeable=True,
+        )
+        assert packet["merge_allowed"] is False
+        assert any("unavailable" in b or "not 'clean'" in b for b in packet["blockers_or_uncertainty"]), \
+            f"Expected blocker for unavailable status: {packet['blockers_or_uncertainty']}"
+
+    def test_build_review_evidence_requires_clean_status_for_all_sources(self):
+        """reviewer/github_codex/codex_cli_fallback all require review_status=clean."""
+        for source in ("github_codex", "codex_cli_fallback", "reviewer"):
+            for bad_status in ("unavailable", "pending", "suggestions", "stale", "unknown", "missing"):
+                packet = build_review_evidence_packet(
+                    repo_owner=REPO_OWNER, repo_name=REPO_NAME, pr_number=207,
+                    current_head_sha=HEAD, reviewed_head_sha=HEAD,
+                    review_source=source, review_status=bad_status,
+                    ci_status="green", changed_files=["docs/README.md"],
+                    allowed_files=["docs/README.md"], mergeable=True,
+                )
+                assert packet["merge_allowed"] is False, \
+                    f"{source}/{bad_status}: expected merge_allowed=False, got {packet['merge_allowed']}"
+                assert any("not 'clean'" in b for b in packet["blockers_or_uncertainty"]), \
+                    f"{source}/{bad_status}: expected 'not clean' blocker: {packet['blockers_or_uncertainty']}"
+
+
+class TestPatchFixesAuthorization:
+    """Tests for PATCH-2 / PATCH-3 correctness fixes in check_merge_authorization.py."""
+
+    def test_authorization_recomputes_staleness(self, tmp_path):
+        """Packet claims review_is_stale=false but reviewed_head_sha != current_head_sha => reject."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "b" * 40,  # different = stale
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,  # packet LIES
+            "merge_allowed": True,     # packet LIES
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        stale_check = next((c for c in checks if c[0] == "review_not_stale"), None)
+        assert stale_check is not None and stale_check[1] is False, \
+            f"Expected staleness detection to fail: {checks}"
+
+    def test_authorization_rejects_forged_merge_allowed(self, tmp_path):
+        """review_source=none with merge_allowed=True => reject even if review_status=clean."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "none",   # missing source
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,     # forged
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        source_check = next((c for c in checks if c[0] == "review_source_not_none"), None)
+        assert source_check is not None and source_check[1] is False, \
+            f"Expected source check to fail: {checks}"
+
+    def test_authorization_rejects_packet_boolean_disagreement(self, tmp_path):
+        """Packet merge_allowed=True but recomputed facts say false => reject."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,      # claimed but CI will be red
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        # Exact head + clean review + green CI should still work
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        merge_check = next((c for c in checks if c[0] == "merge_allowed_accurate"), None)
+        assert merge_check is not None and merge_check[1] is True, f"Expected pass: {checks}"
+
+        # Now corrupt: ci_all_green=False but merge_allowed=True in packet
+        packet["ci_all_green"] = False
+        packet["merge_allowed"] = True   # forged
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40)
+        merge_check = next((c for c in checks if c[0] == "merge_allowed_accurate"), None)
+        assert merge_check is not None and merge_check[1] is False, \
+            f"Expected merge_allowed disagreement to fail: {checks}"
+
+    def test_authorization_rejects_review_evidence_for_different_head(self, tmp_path):
+        """Authorization packet head_sha differs from review_evidence.current_head_sha => reject."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,  # evidence is for old head
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="b" * 40)  # auth is for new head
+        auth_check = next((c for c in checks if c[0] == "auth_head_sha_matches_review_evidence"), None)
+        assert auth_check is not None and auth_check[1] is False, \
+            f"Expected auth head mismatch to fail: {checks}"
+
+    def test_exact_head_clean_review_still_passes(self, tmp_path):
+        """Valid exact-head clean review evidence still works."""
+        packet = {
+            "packet_kind": "aed.pr_gate.review_evidence.v1",
+            "current_head_sha": "a" * 40,
+            "reviewed_head_sha": "a" * 40,
+            "review_source": "github_codex",
+            "review_status": "clean",
+            "review_is_stale": False,
+            "merge_allowed": True,
+            "ci_all_green": True,
+            "scope_status": "clean",
+            "blockers_or_uncertainty": [],
+        }
+        checks = check_review_evidence(packet, auth_head_sha="a" * 40, current_head="a" * 40)
+        assert all(passed for _, passed, _ in checks), \
+            f"All checks should pass for valid evidence: {checks}"

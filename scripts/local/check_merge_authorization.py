@@ -121,7 +121,7 @@ def check_required_fields(packet: dict) -> tuple[bool, str]:
 # ── Review Evidence Packet checks ─────────────────────────────────────────────
 
 def _is_valid_sha(sha: str) -> bool:
-    return bool(re.fullmatch(r"[0-9a-f]{40}", sha))
+    return bool(re.fullmatch(r"[0-9a-f]{40}", sha)) if sha else False
 
 
 def load_review_evidence(path: str) -> tuple[dict | None, str]:
@@ -142,17 +142,24 @@ def load_review_evidence(path: str) -> tuple[dict | None, str]:
     return packet, ""
 
 
-def check_review_evidence(packet: dict, current_head_sha: str | None = None) -> list[tuple[str, bool, str]]:
-    """Check a review evidence packet.
+def check_review_evidence(
+    packet: dict,
+    auth_head_sha: str | None = None,
+    current_head: str | None = None,
+) -> list[tuple[str, bool, str]]:
+    """Check a review evidence packet against the authorization packet head_sha.
 
     Returns list of (check_name, passed, message).
     Rejects when:
-      - review_is_stale is True
-      - merge_allowed is False
-      - current_head_sha does not match the authorization SHA
-      - ci_all_green is False
-      - scope_status is not clean
-      - review_status is not clean
+      - review_source is "none", empty, or missing
+      - review_status is not "clean"
+      - reviewed_head_sha != current_head_sha (stale)
+      - current_head_sha missing or empty
+      - review evidence current_head_sha != authorization packet head_sha
+      - --current-head is supplied and does not match review evidence current_head_sha
+      - ci_all_green is not True
+      - scope_status is not "clean"
+      - packet's merge_allowed disagrees with recomputed facts
     """
     checks = []
 
@@ -162,24 +169,50 @@ def check_review_evidence(packet: dict, current_head_sha: str | None = None) -> 
     checks.append(("review_evidence_packet_kind", ok,
                     "" if ok else f"packet_kind is '{kind}', expected '{REVIEW_EVIDENCE_KIND}'"))
 
-    # review_is_stale
-    review_is_stale = packet.get("review_is_stale")
-    ok = review_is_stale is not True
+    # Required SHA fields must be present
+    reviewed_head_sha = packet.get("reviewed_head_sha", "")
+    current_head_sha = packet.get("current_head_sha", "")
+    ok = bool(current_head_sha) and _is_valid_sha(current_head_sha)
+    checks.append(("review_evidence_has_current_head_sha", ok,
+                    "" if ok else "current_head_sha is missing or invalid"))
+    ok = bool(reviewed_head_sha) and _is_valid_sha(reviewed_head_sha)
+    checks.append(("review_evidence_has_reviewed_head_sha", ok,
+                    "" if ok else "reviewed_head_sha is missing or invalid"))
+
+    # Reject review_source="none"/empty/None even if packet claims merge_allowed=True
+    review_source = packet.get("review_source", "")
+    missing_source = review_source in ("none", "", None) or not review_source
+    ok = not missing_source
+    checks.append(("review_source_not_none", ok,
+                    "" if ok else f"review_source is '{review_source}' — evidence is missing"))
+
+    # review_status must be "clean"
+    review_status = packet.get("review_status", "")
+    ok = review_status == "clean"
+    checks.append(("review_status_clean", ok,
+                    "" if ok else f"review_status is '{review_status}', not 'clean'"))
+
+    # Recompute staleness from raw SHA fields
+    actual_stale = (
+        bool(current_head_sha)
+        and bool(reviewed_head_sha)
+        and current_head_sha != reviewed_head_sha
+    )
+    ok = not actual_stale
     checks.append(("review_not_stale", ok,
-                    "" if ok else "review_is_stale is True — review is stale"))
+                    "" if ok else "review is stale: reviewed_head_sha != current_head_sha"))
 
-    # merge_allowed
-    merge_allowed = packet.get("merge_allowed")
-    ok = merge_allowed is True
-    checks.append(("merge_allowed", ok,
-                    "" if ok else f"merge_allowed is False: {packet.get('blockers_or_uncertainty', [])}"))
+    # Authorization packet head_sha must match review evidence current_head_sha
+    if auth_head_sha:
+        ok = bool(current_head_sha) and current_head_sha == auth_head_sha
+        checks.append(("auth_head_sha_matches_review_evidence", ok,
+                        "" if ok else f"auth head {auth_head_sha[:8]} != review evidence current_head_sha {current_head_sha[:8]}"))
 
-    # current_head_sha match
-    if current_head_sha:
-        packet_head = packet.get("current_head_sha", "")
-        ok = bool(packet_head) and current_head_sha == packet_head
-        checks.append(("current_head_sha_match", ok,
-                        "" if ok else f"HEAD mismatch: packet={packet_head}, current={current_head_sha}"))
+    # --current-head must match review evidence current_head_sha
+    if current_head:
+        ok = bool(current_head_sha) and current_head == current_head_sha
+        checks.append(("current_head_matches_review_evidence", ok,
+                        "" if ok else f"--current-head {current_head[:8]} != review evidence current_head_sha {current_head_sha[:8]}"))
 
     # ci_all_green
     ci_all_green = packet.get("ci_all_green")
@@ -193,11 +226,21 @@ def check_review_evidence(packet: dict, current_head_sha: str | None = None) -> 
     checks.append(("scope_clean", ok,
                     "" if ok else f"scope_status is '{scope_status}', not 'clean'"))
 
-    # review_status clean
-    review_status = packet.get("review_status", "")
-    ok = review_status == "clean"
-    checks.append(("review_status_clean", ok,
-                    "" if ok else f"review_status is '{review_status}', not 'clean'"))
+    # Recompute merge_allowed from facts (not from packet boolean)
+    actual_merge_allowed = (
+        not missing_source
+        and review_status == "clean"
+        and not actual_stale
+        and bool(current_head_sha)
+        and ci_all_green is True
+        and scope_status == "clean"
+        and (not auth_head_sha or current_head_sha == auth_head_sha)
+        and (not current_head or current_head_sha == current_head)
+    )
+    packet_merge_allowed = packet.get("merge_allowed")
+    ok = packet_merge_allowed is actual_merge_allowed or (actual_merge_allowed and packet_merge_allowed is True)
+    checks.append(("merge_allowed_accurate", ok,
+                    "" if ok else f"packet merge_allowed={packet_merge_allowed} disagrees with recomputed {actual_merge_allowed}"))
 
     return checks
 
@@ -268,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
         if rev_packet is None:
             print(f"ERROR: {rev_err}", file=sys.stderr)
             return 1
-        rev_results = check_review_evidence(rev_packet, args.current_head)
+        rev_results = check_review_evidence(rev_packet, auth_head_sha=packet.get("head_sha"), current_head=args.current_head)
         results.extend(rev_results)
     else:
         rev_packet = None
