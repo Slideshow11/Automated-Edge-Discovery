@@ -216,7 +216,7 @@ def run_controller(
 
     # Build controller run packet
     classification = classifier_packet.get("classification", "unknown")
-    task_action = task_draft_packet.get("action", "")
+    task_action = task_draft_packet.get("task_draft", {}).get("action", "")
     kanban_action = kanban_plan_packet.get("recommended_action") or (
         "no_action" if kanban_plan_packet.get("kanban_task") is None else "create_task"
     )
@@ -313,11 +313,17 @@ def _apply_create_task(
     if not apply_create_task:
         return None, None, "", []
 
-    task_action = task_draft_packet.get("action", "")
-    pr_number = task_draft_packet.get("pr_number", 0)
-    head_sha = task_draft_packet.get("head_sha", "")
-    repo_owner = task_draft_packet.get("source", {}).get("repo_owner", "") or task_draft_packet.get("repo", {}).get("owner", "")
-    repo_name = task_draft_packet.get("source", {}).get("repo_name", "") or task_draft_packet.get("repo", {}).get("name", "")
+    task_action = task_draft_packet.get("task_draft", {}).get("action", "")
+    source = task_draft_packet.get("source", {})
+    pr_number_raw = source.get("pr_number", "") or task_draft_packet.get("pr_number", "")
+    # Normalize: classifier provides int, schema uses string
+    try:
+        pr_number = int(pr_number_raw) if pr_number_raw else 0
+    except (ValueError, TypeError):
+        pr_number = 0
+    head_sha = source.get("head_sha", "") or task_draft_packet.get("head_sha", "")
+    repo_owner = source.get("repo_owner", "") or task_draft_packet.get("repo", {}).get("owner", "")
+    repo_name = source.get("repo_name", "") or task_draft_packet.get("repo", {}).get("name", "")
 
     # Build idempotency key
     controller_ikey = _make_controller_idempotency_key(
@@ -328,9 +334,9 @@ def _apply_create_task(
 
     # Refuse apply if required fields are missing
     if not head_sha:
-        blockers.append("apply_create_task: head_sha is missing from task draft")
+        blockers.append("apply_create_task: head_sha is missing from task draft source")
     if not pr_number:
-        blockers.append("apply_create_task: pr_number is missing from task draft")
+        blockers.append("apply_create_task: pr_number is missing from task draft source")
     if not task_action:
         blockers.append("apply_create_task: task_action is missing from task draft")
 
@@ -340,6 +346,12 @@ def _apply_create_task(
 
     if blockers:
         return None, None, controller_ikey, blockers
+
+    # Write controller idempotency key into task draft so kanban helper uses it
+    # for duplicate detection (P2 fix: align controller key with downstream key)
+    task_draft_packet["idempotency_key"] = controller_ikey
+    with open(task_draft_json_path, "w") as f:
+        json.dump(task_draft_packet, f, indent=2)
 
     # Exactly one invocation
     apply_args = [

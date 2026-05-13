@@ -54,14 +54,24 @@ def _mock_classifier_packet(classification="ready_for_reviewer", codex_status="c
 
 
 def _mock_task_draft(action="create_reviewer_task_draft", pr_number=199):
+    head_sha = "head8" + "0" * 32
     return {
         "packet_kind": "aed.pr_gate.task_draft.v1",
         "schema_version": 1,
         "idempotency_key": f"pr{pr_number}-head8-hash-{action}",
-        "action": action,
-        "pr_number": pr_number,
-        "head_sha": "head8" + "0" * 32,
+        "source": {
+            "repo_owner": "Slideshow11",
+            "repo_name": "Automated-Edge-Discovery",
+            "pr_number": str(pr_number),
+            "pr_url": f"https://github.com/Slideshow11/Automated-Edge-Discovery/pull/{pr_number}",
+            "head_sha": head_sha,
+            "classification": "ready_for_reviewer",
+            "ci_status": "green",
+            "codex_status": "clean",
+            "changed_files": [],
+        },
         "task_draft": {
+            "action": action,
             "title": f"[PR #{pr_number}] Task",
             "body": "## Goal\n\nTest task.",
             "assignee": "",
@@ -658,10 +668,9 @@ class TestApplyCreateTaskHardening:
         import unittest.mock as mock
 
         task_draft = _mock_task_draft(action="create_builder_patch_task_draft")
-        task_draft["source"] = {
-            "repo_owner": "Slideshow11",
-            "repo_name": "Automated-Edge-Discovery",
-        }
+        draft_path = tmp_output_dir / "draft.json"
+        draft_path.parent.mkdir(parents=True, exist_ok=True)
+        draft_path.write_text(json.dumps(task_draft))
 
         with mock.patch.object(mod, "_run_child") as mock_run:
             mock_run.return_value = type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
@@ -670,7 +679,7 @@ class TestApplyCreateTaskHardening:
                 dup, tid, ikey, blockers = mod._apply_create_task(
                     apply_create_task=True,
                     task_draft_packet=task_draft,
-                    task_draft_json_path=tmp_output_dir / "draft.json",
+                    task_draft_json_path=draft_path,
                     kanban_plan_json_path=tmp_output_dir / "plan.json",
                     kanban_plan_md_path=tmp_output_dir / "plan.md",
                     board="aed",
@@ -791,7 +800,7 @@ class TestApplyCreateTaskHardening:
     def test_apply_create_task_refuses_missing_head_sha(self, mod):
         """Missing head_sha blocks apply and returns blocker."""
         draft = _mock_task_draft()
-        draft["head_sha"] = ""
+        draft["source"]["head_sha"] = ""
         dup, tid, ikey, blockers = mod._apply_create_task(
             apply_create_task=True,
             task_draft_packet=draft,
@@ -806,7 +815,7 @@ class TestApplyCreateTaskHardening:
     def test_apply_create_task_refuses_missing_pr_number(self, mod):
         """Missing pr_number blocks apply."""
         draft = _mock_task_draft()
-        draft["pr_number"] = 0
+        draft["source"]["pr_number"] = ""
         dup, tid, ikey, blockers = mod._apply_create_task(
             apply_create_task=True,
             task_draft_packet=draft,
@@ -988,10 +997,6 @@ class TestApplyCreateTaskHardening:
                 (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(json.dumps(_mock_classifier_packet()))
             elif "pr_gate_task_draft.py" in str(args):
                 td = _mock_task_draft()
-                td["source"] = {
-                    "repo_owner": "Slideshow11",
-                    "repo_name": "Automated-Edge-Discovery",
-                }
                 (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(json.dumps(td))
                 (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
             elif "pr_gate_kanban_task_create.py" in str(args):
