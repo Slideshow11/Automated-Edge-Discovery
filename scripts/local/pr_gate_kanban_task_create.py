@@ -386,10 +386,14 @@ def _build_kanban_create_command(
     assignee: str,
     idempotency_key: str,
 ) -> list[str]:
-    """Build hermes kanban task-create arguments."""
-    # Use JSON body mode for precision
+    """Build hermes kanban create arguments.
+
+    Uses 'kanban create' (not 'kanban task create').
+    --no-dispatch is NOT a valid Hermes flag — no-dispatch is enforced
+    as a local invariant (STOP_RULES + plan field), not as a CLI flag.
+    """
     cmd = [
-        "kanban", "task", "create",
+        "kanban", "create",
         "--board", board,
         "--title", title,
         "--status", status,

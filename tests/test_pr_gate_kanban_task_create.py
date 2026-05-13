@@ -820,5 +820,189 @@ class TestNegationSpanWhitespace:
         )
 
 
+class TestHermesCommandSyntax:
+    """Regression: planned and executed Hermes commands must use
+    'hermes kanban create' (not 'kanban task create'), and must not
+    include --no-dispatch (not a valid Hermes flag)."""
+
+    def test_build_kanban_create_command_uses_kanban_create_not_task_create(self, mod):
+        """The _build_kanban_create_command function must produce
+        ['kanban', 'create', ...] not ['kanban', 'task', 'create', ...]"""
+        cmd = mod._build_kanban_create_command(
+            board="aed-test",
+            title="Test task",
+            body="Test body",
+            status="TODO",
+            assignee="aed-builder",
+            idempotency_key="pr123-abcdef12-12345678-create_builder_patch",
+        )
+        assert "kanban" in cmd and "create" in cmd, f"cmd must contain kanban+create: {cmd}"
+        assert "task" not in cmd, f"cmd must not contain 'task' subcommand: {cmd}"
+        assert cmd[0] == "kanban"
+        assert cmd[1] == "create"
+        assert cmd[2] == "--board"  # verify structure
+        # Verify no --no-dispatch (invalid Hermes flag)
+        assert "--no-dispatch" not in cmd, f"--no-dispatch is not a valid Hermes flag: {cmd}"
+
+    def test_built_command_has_no_task_subcommand(self, mod):
+        """No variant of the create command may contain 'task' between 'kanban' and 'create'."""
+        variations = [
+            {"board": "aed-test", "title": "T", "body": "B", "status": "TODO", "assignee": "", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch"},
+            {"board": "aed-test", "title": "T", "body": "B", "status": "TODO", "assignee": "aed-builder", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch"},
+        ]
+        for kwargs in variations:
+            cmd = mod._build_kanban_create_command(**kwargs)
+            cmd_str = " ".join(cmd)
+            assert "kanban task create" not in cmd_str, f"forbidden 'kanban task create' in: {cmd_str}"
+            assert "kanban create" in cmd_str, f"required 'kanban create' missing from: {cmd_str}"
+
+    def test_apply_command_list_matches_hermes_create_help_flags(self, mod, tmp_path):
+        """The command list passed to hermes must only contain flags supported by
+        'hermes kanban create --help' (--board, --title, --body, --status,
+        --assignee, --tag, --idempotency-key)."""
+        valid_flags = {
+            "--board", "--title", "--body", "--status",
+            "--assignee", "--parent", "--workspace", "--tenant",
+            "--priority", "--triage", "--idempotency-key",
+            "--max-runtime", "--created-by", "--skill", "--max-retries", "--json",
+            "--help",  # -h always allowed
+        }
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 1,
+            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "task_draft": {
+                "title": "Test",
+                "body": "Body",
+                "assignee": "aed-builder",
+                "status": "TODO",
+                "allowed_files": ["scripts/local/pr_gate_kanban_task_create.py"],
+                "forbidden_files": [],
+            },
+        }
+        draft_path = tmp_path / "draft.json"
+        import json
+        draft_path.write_text(json.dumps(draft))
+
+        # First call (search): no existing task → proceed to create
+        # Second call (create): success with task ID
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            mock_call.side_effect = [
+                (0, "", ""),       # duplicate check: no existing task (empty stdout = not found)
+                (0, "task-123", ""),  # create: succeeded
+            ]
+            with mock.patch("sys.argv", [
+                "pr_gate_kanban_task_create.py",
+                "--task-draft", str(draft_path),
+                "--board", "aed-test",
+                "--apply",
+                "--output-json", str(tmp_path / "plan.json"),
+            ]):
+                mod.main()
+
+            # Get the create command (second call)
+            create_call = mock_call.call_args_list[1][0][0]  # args of second call (create)
+            create_cmd_str = " ".join(create_call)
+            assert "kanban task create" not in create_cmd_str
+            assert "kanban create" in create_cmd_str
+
+        # Check all flags are known Hermes flags
+        known_flags = {"--board", "--title", "--body", "--status", "--assignee",
+                       "--idempotency-key", "--tag", "--help", "-h"}
+        present_flags = {f for f in create_call if f.startswith("-") and "=" not in f}
+        unknown = present_flags - known_flags
+        assert not unknown, f"unknown Hermes flags in command: {unknown} cmd={create_cmd_str}"
+
+    def test_stop_rules_in_plan_no_dispatch(self, mod, valid_draft_builder):
+        """Plan STOP_RULES must include no_dispatch as a local invariant, not a CLI flag."""
+        plan = mod.build_plan(valid_draft_builder, board="aed", dry_run=True, apply_mode=False)
+        assert "no_dispatch" in plan.get("stop_rules", []), \
+            f"stop_rules must include no_dispatch: {plan.get('stop_rules')}"
+
+
+class TestForbiddenFilesPreconditions:
+    """Regression: null/missing forbidden_files blocks real-create preconditions;
+    explicitly empty [] is accepted."""
+
+    def test_null_forbidden_files_blocks_preconditions(self):
+        """null forbidden_files (None) must block _check_real_create_preconditions."""
+        import sys, importlib.util
+        from pathlib import Path
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+        spec = importlib.util.spec_from_file_location("smoke", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        task_draft = {
+            "action": "create_builder_patch_task_draft",
+            "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+            "controller_rules": {"no_auto_dispatch": True},
+            "task_draft": {
+                "forbidden_files": None,  # null — should block
+            },
+        }
+        allowed, blockers = mod._check_real_create_preconditions(
+            task_draft=task_draft,
+            scope_status="clean",
+            board="aed-test",
+            execute_real_create=True,
+        )
+        assert not allowed, "null forbidden_files should block preconditions"
+        assert "forbidden_files is null" in blockers
+
+    def test_explicitly_empty_forbidden_files_passes(self):
+        """forbidden_files = [] (explicitly empty) must pass preconditions."""
+        import sys, importlib.util
+        from pathlib import Path
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+        spec = importlib.util.spec_from_file_location("smoke", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        task_draft = {
+            "action": "create_builder_patch_task_draft",
+            "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+            "controller_rules": {"no_auto_dispatch": True},
+            "task_draft": {
+                "forbidden_files": [],  # explicitly empty — should pass
+            },
+        }
+        allowed, blockers = mod._check_real_create_preconditions(
+            task_draft=task_draft,
+            scope_status="clean",
+            board="aed-test",
+            execute_real_create=True,
+        )
+        assert allowed, f"empty forbidden_files [] should pass preconditions, got blockers: {blockers}"
+
+    def test_missing_forbidden_files_key_blocks_preconditions(self):
+        """forbidden_files key absent entirely must block preconditions."""
+        import sys, importlib.util
+        from pathlib import Path
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_controller_live_smoke.py"
+        spec = importlib.util.spec_from_file_location("smoke", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        task_draft = {
+            "action": "create_builder_patch_task_draft",
+            "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch",
+            "controller_rules": {"no_auto_dispatch": True},
+            "task_draft": {
+                # no forbidden_files key at all
+            },
+        }
+        allowed, blockers = mod._check_real_create_preconditions(
+            task_draft=task_draft,
+            scope_status="clean",
+            board="aed-test",
+            execute_real_create=True,
+        )
+        assert not allowed, f"missing forbidden_files key should block preconditions, got blockers: {blockers}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

@@ -127,6 +127,15 @@ def _check_real_create_preconditions(
     if not task_draft.get("idempotency_key"):
         blockers.append("idempotency_key is missing")
 
+    # forbidden_files must be present (explicitly empty [] is OK; null/missing blocks)
+    task_draft_body = task_draft.get("task_draft", {})
+    forbidden_files = task_draft_body.get("forbidden_files")
+    if forbidden_files is None:
+        blockers.append(
+            "forbidden_files is null (not explicitly []); "
+            "real create requires explicit empty list to confirm no scope restriction"
+        )
+
     allowed = len(blockers) == 0
     return allowed, "; ".join(blockers) if blockers else ""
 
@@ -188,7 +197,12 @@ def _build_kanban_create_command(
     task_draft: dict,
     board: str,
 ) -> str:
-    """Build the hermes kanban create command string for the smoke report."""
+    """Build the hermes kanban create command string for the smoke report.
+
+    Uses 'kanban create' (not 'kanban task create').
+    --no-dispatch is NOT a valid Hermes flag — no-dispatch is enforced
+    as a local invariant (STOP_RULES + plan field), not as a CLI flag.
+    """
     td = task_draft.get("task_draft", {})
     title = td.get("title", "unknown")
     body = td.get("body", "")
@@ -205,8 +219,7 @@ def _build_kanban_create_command(
         f'--title "{title_esc}" '
         f'--body "{body_esc}" '
         f'--assignee "{assignee_esc}" '
-        f'--idempotency-key "{ikey_esc}" '
-        f"--no-dispatch"
+        f'--idempotency-key "{ikey_esc}"'
     )
 
 

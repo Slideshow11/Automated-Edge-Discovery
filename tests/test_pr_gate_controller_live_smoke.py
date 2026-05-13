@@ -761,7 +761,14 @@ def test_real_create_planned_command_recorded():
 
 
 def test_real_create_never_dispatches():
-    """Verify hermes kanban dispatch is never called in real-create smoke."""
+    """Verify hermes kanban dispatch is never called in real-create smoke.
+
+    --no-dispatch is NOT a valid Hermes CLI flag. No-dispatch is enforced
+    as a local invariant: STOP_RULES contains 'no_dispatch', and the
+    no_dispatch_guarantee field in the report is True. The planned command
+    must not contain 'hermes kanban dispatch' and must not include any
+    dispatch-related flag (--no-dispatch is invalid for 'kanban create').
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
         result = run_smoke_real_create(out, extra_args=["--board", "aed-test"])
@@ -772,9 +779,10 @@ def test_real_create_never_dispatches():
         assert "hermes kanban dispatch" not in cmd, (
             f"planned_create_command must not invoke 'hermes kanban dispatch': {cmd}"
         )
-        # Must contain --no-dispatch flag
-        assert "--no-dispatch" in cmd, (
-            f"planned_create_command must include --no-dispatch flag: {cmd}"
+        # Must NOT include --no-dispatch (not a valid Hermes flag)
+        assert "--no-dispatch" not in cmd, (
+            f"--no-dispatch is not a valid Hermes flag; no-dispatch is enforced "
+            f"as a local STOP_RULES invariant: {cmd}"
         )
         assert rcs.get("no_dispatch_guarantee") is True, (
             f"no_dispatch_guarantee must be True, got {rcs.get('no_dispatch_guarantee')}"
