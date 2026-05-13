@@ -453,6 +453,14 @@ def build_task_draft(
         "blockers_or_uncertainty": [],
     }
 
+    # Promote task_draft fields to top-level for kanban consumer contract
+    packet["action"] = action
+    packet["pr_number"] = int(pr_number)
+    packet["head_sha"] = head_sha
+    packet["idempotency_key"] = idempotency_key
+    # Ensure task_draft.body is set (body already built above with safety warnings)
+    task_draft["body"] = body
+
     return packet
 
 

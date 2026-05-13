@@ -577,5 +577,248 @@ class TestSafetyGrep:
         assert any("forbidden" in e.lower() or "merge" in e.lower() for e in errors)
 
 
+# --------------------------------------------------------------------------
+# Safety-pattern negation (prohibition warning allowance)
+# -------------------------------------------------------------------------->
+
+class TestSafetyPatternNegation:
+    """Regression: SAFETY_PATTERNS must not match forbidden tokens when preceded
+    by 'not ' (prohibition warning like 'Do not call fact_store')."""
+
+    def test_prohibition_warning_body_with_fact_store_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Implement the builder patch for PR #197.\n\n"
+                    "Do not update memory, use fact_store, or call skill_manage from inside this task.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_prohibition_warning_body_with_skill_manage_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Do not call skill_manage.\n"
+                    "Do not use fact_store.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_prohibition_warning_body_with_memory_update_allowed(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Do not call memory.update.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert errors == [], f"prohibition warning should be allowed, got: {errors}"
+
+    def test_affirmative_instruction_to_call_fact_store_rejected(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Call fact_store to persist data.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert len(errors) > 0, "affirmative instruction to call fact_store must be rejected"
+        assert any("fact_store" in e for e in errors), f"errors should mention fact_store: {errors}"
+
+    def test_affirmative_instruction_to_call_skill_manage_rejected(self, mod):
+        draft = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr197-4e5f25f-a1b2c3d4-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 197,
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "task_draft": {
+                "title": "[PR #197] Builder patch task",
+                "body": (
+                    "## Goal\n\n"
+                    "Use skill_manage to handle this.\n"
+                ),
+                "assignee": "",
+                "status": "TODO",
+            },
+        }
+        errors = mod.validate_task_draft(draft)
+        assert len(errors) > 0, "affirmative instruction to call skill_manage must be rejected"
+        assert any("skill_manage" in e for e in errors), f"errors should mention skill_manage: {errors}"
+
+    def test_task_draft_schema_matches_producer_output(self, mod):
+        """End-to-end: pr_gate_task_draft output must pass validate_task_draft."""
+        import sys
+        import importlib.util
+
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_task_draft.py"
+        spec = importlib.util.spec_from_file_location("pr_gate_task_draft", script)
+        draft_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(draft_mod)
+
+        classifier = {
+            "classification": "ready_for_reviewer",
+            "ci_status": "passed",
+            "codex_status": "clean",
+            "pr_number": "197",
+            "pr_url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/197",
+            "head_sha": "4e5f25f0eef1a33c1c7a48cdeb73d61a7dfb363c",
+            "changed_files": ["scripts/local/pr_gate_task_draft.py"],
+            "blockers": [],
+        }
+        packet = draft_mod.build_task_draft(classifier, None)
+        errors = mod.validate_task_draft(packet)
+        assert errors == [], f"producer output failed validation: {errors}"
+
+
+# --------------------------------------------------------------------------
+# Regression: CLI safety pass must use negation-aware helper
+# -------------------------------------------------------------------------->
+
+class TestCliSafetyPass:
+    """Regression: main() must not run a raw SAFETY_PATTERNS scan.
+    It must use _body_has_forbidden_pattern() to allow prohibition warnings."""
+
+    def test_producer_draft_passes_cli_validation_path(self, tmp_path):
+        """End-to-end: pr_gate_task_draft output with standard prohibition
+        warning must pass through the full CLI validation path (main())
+        without triggering a raw SAFETY_PATTERNS rejection."""
+        import subprocess, sys
+
+        # Build a producer draft
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts" / "local"))
+        import importlib.util
+
+        draft_script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_task_draft.py"
+        spec = importlib.util.spec_from_file_location("pr_gate_task_draft", draft_script)
+        draft_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(draft_mod)
+
+        classifier = {
+            "classification": "ready_for_reviewer",
+            "ci_status": "passed",
+            "codex_status": "clean",
+            "pr_number": "213",
+            "pr_url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/213",
+            "head_sha": "3411659e27276c56d2bc8137d04e95fbfc543e6f",
+            "changed_files": ["scripts/local/pr_gate_kanban_task_create.py"],
+            "blockers": [],
+        }
+        packet = draft_mod.build_task_draft(classifier, None)
+
+        draft_path = tmp_path / "draft.json"
+        import json
+        draft_path.write_text(json.dumps(packet))
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_kanban_task_create.py"),
+                "--task-draft", str(draft_path),
+                "--board", "aed-test",
+                "--output-json", str(tmp_path / "plan.json"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"CLI rejected producer draft with prohibition warning.\n"
+            f"stdout: {result.stdout}\nstderr: {result.stderr}"
+        )
+
+
+# --------------------------------------------------------------------------
+# Regression: _find_negation_spans comma handling with leading whitespace
+# -------------------------------------------------------------------------->
+
+class TestNegationSpanWhitespace:
+    """Regression: _find_negation_spans must handle leading whitespace
+    after comma before detecting 'and'/'or' token."""
+
+    @pytest.mark.parametrize("line,expect_allowed", [
+        # Coordinated clauses with leading whitespace after comma
+        ("Do not use fact_store, or call skill_manage.", True),
+        ("Do not use fact_store,  or call skill_manage.", True),
+        ("Do not use fact_store,   and update memory.", True),
+        # Semicolon always ends clause — "then" starts new clause
+        ("Do not use fact_store; then call skill_manage.", False),
+        ("Do not use fact_store; call skill_manage.", False),
+        # Comma with bare verb then period — new clause → reject
+        ("Do not use fact_store, call skill_manage.", True),
+        ("Do not use fact_store,call skill_manage.", True),
+    ])
+    def test_find_negation_spans_coordinated_whitespace(self, line, expect_allowed):
+        import sys
+        import importlib.util
+        script = Path(__file__).resolve().parent.parent / "scripts" / "local" / "pr_gate_kanban_task_create.py"
+        spec = importlib.util.spec_from_file_location("kanban", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        spans = mod._find_negation_spans(line)
+        # Get positions of all safety tokens
+        token_positions = []
+        for pat in mod.SAFETY_PATTERNS:
+            for m in pat.finditer(line):
+                token_positions.append((m.start(), m.group()))
+        # All tokens must be covered if allowed, all must be uncovered if rejected
+        all_covered = all(
+            any(s <= tp < e for s, e in spans)
+            for tp, _ in token_positions
+        )
+        assert all_covered == expect_allowed, (
+            f"line: {line!r}\nspans: {spans}\ntokens: {token_positions}\n"
+            f"expected all_covered={expect_allowed}, got all_covered={all_covered}"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-q"])

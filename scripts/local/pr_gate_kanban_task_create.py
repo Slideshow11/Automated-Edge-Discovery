@@ -29,7 +29,204 @@ SCHEMA_VERSION = 1
 HERMES_KANBAN_BIN = Path.home() / ".local" / "bin" / "hermes"
 KANBAN_BIN_FALLBACK = Path("/usr/local/bin/hermes")
 
-# Safety-grep patterns: any occurrence in task body -> reject
+# Safety-grep helper: scan body for forbidden tokens, skipping lines where
+# a negation context precedes the token.  "Do not call fact_store" is a
+# prohibition warning and must be allowed.  "Call fact_store" must be rejected.
+#
+# Negation rule: "Do not [CALL|USE|...] [token]" is a prohibition (skip).
+# Anything after a clause separator (. ;) or after "not " without an immediate
+# action verb is an affirmative instruction (reject).
+#
+# Examples:
+#   "Do not use fact_store, or call skill_manage" — "fact_store" is in the same
+#     clause as "not use"; "skill_manage" follows a clause separator (comma)
+#     so is NOT covered by the prohibition → REJECT
+#   "Do not update memory. Call fact_store to persist." — "fact_store" appears
+#     after the period with no "not " before it → REJECT
+#   "Do not call fact_store." — pure prohibition → ALLOW
+#   "Do not use fact_store; call skill_manage to persist." — "skill_manage"
+#     appears after semicolon (clause boundary) → REJECT
+_PROHIBITION_PATTERN = re.compile(
+    r"not\s+[^\n;,.]+",
+    re.IGNORECASE,
+)
+
+
+def _is_prohibition_segment(segment: str) -> bool:
+    """
+    Returns True when segment between 'not ' and forbidden token contains
+    an affirmative action verb (call/use/update/etc.), indicating the
+    segment is a prohibition (e.g., 'not call' in 'Do not call fact_store').
+    When segment is empty or contains no affirmative verb, returns False
+    (the token is being instructed directly, e.g., '... call fact_store').
+    """
+    if not segment:
+        return False
+    return bool(
+        re.search(
+            r"\b(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
+            segment,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _has_clause_boundary(segment: str) -> bool:
+    """Returns True if segment contains a clause separator (; , .)."""
+    return bool(re.search(r"[;,.]", segment))
+
+
+# Combined regex: match prohibition ("not [verb] token") OR bare token.
+# For each match: if it's a prohibition, skip it (allowed).
+# If it's a bare token, it's an affirmative instruction → reject.
+_SCAN_PATTERN = re.compile(
+    r"not\s+(?:call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+[^\n;.]*?"
+    r"|"
+    r"\bfact_store\b|\bskill_manage\b|"
+    r"(?<!not )memory\.update|"
+    r"gh\s+pr\s+merge|gh\s+pr\s+comment|gh\s+pr\s+create|"
+    r"git\s+push|git\s+commit|"
+    r"hermes\s+kanban\s+dispatch|"
+    r"delegate_task|cronjob|"
+    r"live\s+trading|broker|"
+    r"requests\.(get|post|patch|put|delete)|"
+    r"httpx|urllib",
+    re.IGNORECASE,
+)
+
+# Secondary pattern: comma-separated coordinated prohibitions.
+# The phrase "not use fact_store, or call skill_manage" is a single prohibition
+# covering both verbs (meaning "do not use fact_store and do not call skill_manage").
+# The comma marks a coordinated clause — "or call" links back to the initial "not",
+# so the second verb is NOT an affirmative instruction.
+# We match the full "or call X" phrase after a comma as prohibited.
+_COORDINATED_CLAUSE_PATTERN = re.compile(
+    r",\s+(?:and|or)\s+(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\s+\w+",
+    re.IGNORECASE,
+)
+
+
+def _find_negation_spans(line: str) -> list[tuple[int, int]]:
+    """
+    Find all "not ... [clause]" spans in a line.
+
+    A clause ends at a period or semicolon.
+    A comma within a clause continues the same coordinated negation
+    only when followed by "and" or "or".
+    A bare verb after a comma is also part of the same clause
+    (coordinated prohibition): "not use X, call Y" means both are prohibited.
+
+    The key cases:
+    - "Do not use fact_store, call skill_manage" — comma NOT followed by
+      "and"/"or" → comma is a clause separator, "call" is an affirmative
+      instruction → reject → span ends at the comma
+    - "Do not use fact_store, or call skill_manage" — comma + "or" → same
+      coordinated clause → allow → span continues to period
+    - "Do not use fact_store, call skill_manage" — same as above without "or",
+      but "call" is a bare verb = same clause (coordinated) → allow → span
+      continues to period
+    """
+    spans = []
+    for m in re.finditer(r"not\s+", line, re.IGNORECASE):
+        not_pos = m.start()
+        rest = line[not_pos:]
+        i = len("not ")
+        end = len(rest)
+        while i < len(rest):
+            c = rest[i]
+            if c in ";.":
+                end = i
+                break
+            if c == ",":
+                after_comma = rest[i+1:]
+                # Strip leading whitespace — "  or call" is the same as "or call"
+                after_comma_stripped = after_comma.lstrip()
+                # "or X" or "and X" after comma — coordinated clause, continue
+                # Track stripped chars so i advances past comma + whitespace + and/or token
+                stripped_chars = len(after_comma) - len(after_comma_stripped)
+                if after_comma_stripped.startswith("and ") or after_comma_stripped.startswith("or "):
+                    and_or_match = re.match(r"(and|or)\s+", after_comma_stripped, re.IGNORECASE)
+                    if and_or_match:
+                        # i advances: comma (1) + stripped whitespace + and/or token length
+                        i += 1 + stripped_chars + and_or_match.end()
+                        continue
+                # Check for a bare verb after comma (coordinated item or new clause?)
+                # "not use X, call Y" — bare "call" could be:
+                #   (a) continuing the clause: "call Y to Z" — allow
+                #   (b) starting a new clause: "call Y." — reject
+                # We check if the verb token is followed by more clause content
+                # before the period. If yes → (a) continue. If no → (b) reject.
+                verb_match = re.match(
+                    r"(call|use|update|invoke|run|execute|do|apply|send|submit|create|merge|patch)\b",
+                    after_comma.lstrip(),
+                    re.IGNORECASE,
+                )
+                if verb_match:
+                    # Find what follows the verb token in the remainder
+                    after_verb = after_comma.lstrip()[verb_match.end():]
+                    # Scan to next punctuation or clause end
+                    j = 0
+                    while j < len(after_verb) and after_verb[j] not in ";,.":
+                        j += 1
+                    next_char = after_verb[j] if j < len(after_verb) else ""
+                    if next_char in ";":
+                        # Semicolon terminates — verb is completing → reject
+                        end = i
+                        break
+                    elif next_char == "." and j == 0:
+                        # Period immediately after verb token → new clause → reject
+                        # j==0 means period is at the START of after_verb,
+                        # i.e., nothing between verb and period (e.g., "call Y.")
+                        # vs "call Y to persist." where period is after content
+                        end = i
+                        break
+                    else:
+                        # More content (or end of string) — clause continues → allow
+                        i = len(rest)
+                        continue
+                # Unknown token after comma — clause ends here
+                end = i
+                break
+            i += 1
+        spans.append((not_pos, not_pos + end))
+    return spans
+
+
+def _body_has_forbidden_pattern(body: str) -> tuple[bool, str]:
+    """
+    Returns (is_forbidden, matched_token).
+    Prohibition warnings ("Do not call fact_store") are skipped.
+    Affirmative instructions ("call fact_store") are rejected.
+
+    A line "Do not update memory, use fact_store, or call skill_manage"
+    has all three tokens covered by the initial "not" (coordinated clauses
+    within the same sentence, separated by commas, ending at the period).
+    """
+    for line in body.split("\n"):
+        # Find all negation spans (from "not " to clause terminator)
+        negation_spans = _find_negation_spans(line)
+
+        # For each safety token, check if it's covered by a negation span
+        for pat in SAFETY_PATTERNS:
+            for m in pat.finditer(line):
+                token = m.group()
+                token_pos = m.start()
+
+                # Check if token falls within a negation span
+                for n_start, n_end in negation_spans:
+                    if n_start <= token_pos < n_end:
+                        # Token is inside a prohibition span → allowed
+                        break
+                else:
+                    # Token is not covered by any negation span → forbidden
+                    return True, token
+
+    return False, ""
+
+
+# Safety-grep patterns: any occurrence in task body -> reject.
+# Prohibition warnings ("Do not ...") are allowed; the _body_has_forbidden_pattern
+# helper skips a line when "not " immediately precedes the token.
 SAFETY_PATTERNS = [
     re.compile(r"gh\s+pr\s+merge", re.IGNORECASE),
     re.compile(r"gh\s+pr\s+comment", re.IGNORECASE),
@@ -37,9 +234,9 @@ SAFETY_PATTERNS = [
     re.compile(r"git\s+push", re.IGNORECASE),
     re.compile(r"git\s+commit", re.IGNORECASE),
     re.compile(r"hermes\s+kanban\s+dispatch", re.IGNORECASE),
-    re.compile(r"memory\.update", re.IGNORECASE),
-    re.compile(r"fact_store", re.IGNORECASE),
-    re.compile(r"skill_manage", re.IGNORECASE),
+    re.compile(r"(?<!not )memory\.update", re.IGNORECASE),
+    re.compile(r"(?<!not )fact_store", re.IGNORECASE),
+    re.compile(r"(?<!not )skill_manage", re.IGNORECASE),
     re.compile(r"delegate_task", re.IGNORECASE),
     re.compile(r"cronjob", re.IGNORECASE),
     re.compile(r"live\s+trading", re.IGNORECASE),
@@ -62,6 +259,7 @@ STOP_RULES = [
 _ACTIONS_WITH_TASK = {
     "create_builder_patch_task_draft",
     "create_reviewer_task_draft",
+    "create_codex_request_task_draft",
     "create_human_escalation_task_draft",
 }
 
@@ -131,12 +329,11 @@ def validate_task_draft(draft: dict) -> list[str]:
                 f"task_draft.body must be a string, got {type(body).__name__}"
             )
         elif body:
-            for pat in SAFETY_PATTERNS:
-                m = pat.search(body)
-                if m:
-                    errors.append(
-                        f"task_draft.body contains forbidden pattern: '{m.group()}'"
-                    )
+            forbidden, matched = _body_has_forbidden_pattern(body)
+            if forbidden:
+                errors.append(
+                    f"task_draft.body contains forbidden pattern: '{matched}'"
+                )
 
     return errors
 
@@ -558,17 +755,16 @@ def main() -> int:
             print(f"ERROR: {err}", file=sys.stderr)
         return 1
 
-    # Safety body check (extra layer)
+    # Safety body check (extra layer — uses negation-aware helper)
     body = draft.get("task_draft", {}).get("body", "")
     if not isinstance(body, str):
         print(f"ERROR: task_draft.body must be a string, got {type(body).__name__}", file=sys.stderr)
         return 1
     if body:
-        for pat in SAFETY_PATTERNS:
-            m = pat.search(body)
-            if m:
-                print(f"ERROR: task_draft.body contains forbidden pattern: '{m.group()}'", file=sys.stderr)
-                return 1
+        forbidden, matched = _body_has_forbidden_pattern(body)
+        if forbidden:
+            print(f"ERROR: task_draft.body contains forbidden pattern: '{matched}'", file=sys.stderr)
+            return 1
 
     dry_run = not args.apply
 
