@@ -1,11 +1,60 @@
 name: CI
 
-on:
+'on':
   push:
     branches: [ main ]
+    paths:
+      - 'engine/**'
+      - 'scripts/**'
+      - 'src/**'
+      - 'examples/**'
+      - 'tests/**'
+      - 'schemas/**'
+      - 'Makefile'
+      - 'pyproject.toml'
+      - 'requirements.txt'
+      - '.github/workflows/wfa.yml'
   workflow_dispatch: {}
 
+concurrency:
+  group: wfa-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
+  lint-and-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.OS }}-pip-${{ hashFiles('**/pyproject.toml','**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.OS }}-pip-
+
+      - name: Install package (editable) and test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install ruff numpy
+
+      - name: Lint (ruff)
+        # NOTE: ruff is currently advisory-only; pre-existing violations require
+        # a separate cleanup PR before making this a hard gate (see PR #217).
+        run: ruff check . --quiet || true
+
+      - name: Run demo (smoke)
+        run: |
+          make demo-ci
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -32,31 +81,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e .
-          pip install pytest ruff numpy
-
-      - name: Lint (ruff)
-        run: |
-          ruff --version || true
-          ruff check . --quiet || true
-
-      - name: Run demo (smoke)
-        run: |
-          # Run calibrator demo headless (no plotting). Fails CI if demo errors.
-          make demo-ci
+          pip install pytest pytest-cov numpy pandas statsmodels pyyaml
 
       - name: Run tests (pytest + coverage)
         run: |
-          pip install pytest pytest-cov
           pytest -q --cov=engine --cov-report=xml
 
       - name: Upload pytest cache
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pytest-cache
+          name: pytest-cache-${{ matrix.python-version }}
           path: .pytest_cache/
 
       - name: Upload coverage to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        if: success()
         uses: codecov/codecov-action@v4
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
