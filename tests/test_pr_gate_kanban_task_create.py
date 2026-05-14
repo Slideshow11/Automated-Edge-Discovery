@@ -585,6 +585,26 @@ class TestCLI:
                 f"--assignee must NOT be in smoke-apply: {create_call}"
             )
 
+    def test_apply_and_smoke_apply_mutually_exclusive(self, mod, valid_draft_builder, tmp_path):
+        """--apply and --smoke-apply together must exit nonzero with a clear error."""
+        draft_path = tmp_path / "draft.json"
+        draft_path.write_text(json.dumps(valid_draft_builder))
+        out_json = tmp_path / "plan.json"
+
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            with mock.patch("sys.argv", [
+                "pr_gate_kanban_task_create.py",
+                "--task-draft", str(draft_path),
+                "--board", "aed",
+                "--output-json", str(out_json),
+                "--apply",
+                "--smoke-apply",
+            ]):
+                with pytest.raises(SystemExit) as exc_info:
+                    mod.main()
+                assert exc_info.value.code != 0, "CLI must exit nonzero for mutually exclusive flags"
+                mock_call.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # File-scope constraint tests (PR #205)

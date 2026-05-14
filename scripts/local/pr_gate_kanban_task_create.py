@@ -753,11 +753,12 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--output-md", type=Path,
         help="Path to write Markdown plan output"
     )
-    p.add_argument(
+    apply_group = p.add_mutually_exclusive_group()
+    apply_group.add_argument(
         "--apply", action="store_true",
         help="Apply changes: call hermes kanban create once. Without this flag, dry-run only."
     )
-    p.add_argument(
+    apply_group.add_argument(
         "--smoke-apply", action="store_true",
         help="Apply in smoke-safe mode: creates task in triage with no assignee,"
              " preventing dispatcher auto-claim. Use for real-create smoke tests only."
