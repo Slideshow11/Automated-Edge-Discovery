@@ -308,6 +308,97 @@ class TestBuildPlan:
                      "no_memory_update", "no_skill_manage"]:
             assert rule in plan["stop_rules"], f"missing stop rule: {rule}"
 
+    def test_smoke_mode_forces_empty_assignee(self, mod):
+        """smoke_mode=True must force assignee to '' in the kanban_task,
+        regardless of what the task draft specifies.
+
+        This is the core fix: a smoke test task draft may have
+        assignee=aed-builder, but smoke_mode must override it to ""
+        so the dispatcher cannot auto-claim the task.
+
+        Uses a draft with assignee="aed-builder" (not the default fixture
+        which has assignee="") to prove the override is real.
+        """
+        draft_with_assignee = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr999-test-smoke-create",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 999,
+            "head_sha": "aaaabbbbccccddddeeeeffffaaaabbbbccccdddd",
+            "task_draft": {
+                "title": "Smoke override test",
+                "body": "Test body",
+                "assignee": "aed-builder",   # non-empty — the point of this test
+                "status": "TODO",
+            },
+        }
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            mock_call.return_value = (0, "", "")  # no duplicate found
+            plan = mod.build_plan(
+                draft_with_assignee,
+                board="aed-test",
+                dry_run=False,
+                apply_mode=True,
+                smoke_mode=True,
+            )
+        assert plan["smoke_mode"] is True
+        assert plan["kanban_task"]["assignee"] == "", (
+            f"smoke_mode must force assignee to '', got {plan['kanban_task']['assignee']!r}"
+        )
+        # Title, body, idempotency_key must still come from draft
+        assert plan["kanban_task"]["title"] == draft_with_assignee["task_draft"]["title"]
+        assert plan["kanban_task"]["idempotency_key"] == draft_with_assignee["idempotency_key"]
+
+    def test_smoke_mode_passes_smoke_mode_to_create_command(self, mod, valid_draft_builder):
+        """smoke_mode=True must pass smoke_mode=True to _build_kanban_create_command."""
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            mock_call.return_value = (0, "t_new", "")
+            plan = mod.build_plan(
+                valid_draft_builder,
+                board="aed-test",
+                dry_run=False,
+                apply_mode=True,
+                smoke_mode=True,
+            )
+            # Second call is the create call
+            create_call = mock_call.call_args_list[1][0][0]
+            # smoke_mode=True → --triage present, no --assignee
+            assert "--triage" in create_call, f"--triage must be in smoke mode: {create_call}"
+            assert "--assignee" not in create_call, f"--assignee must not be in smoke mode: {create_call}"
+
+    def test_smoke_mode_recorded_in_plan(self, mod, valid_draft_builder):
+        """smoke_mode must appear in the plan output."""
+        plan = mod.build_plan(
+            valid_draft_builder,
+            board="aed-test",
+            dry_run=True,
+            apply_mode=False,
+            smoke_mode=True,
+        )
+        assert plan["smoke_mode"] is True
+        plan_no_smoke = mod.build_plan(
+            valid_draft_builder,
+            board="aed-test",
+            dry_run=True,
+            apply_mode=False,
+            smoke_mode=False,
+        )
+        assert plan_no_smoke["smoke_mode"] is False
+
+    def test_apply_mode_without_smoke_mode_preserves_assignee(self, mod, valid_draft_builder):
+        """apply mode (smoke_mode=False) must preserve the draft's assignee."""
+        plan = mod.build_plan(
+            valid_draft_builder,
+            board="aed",
+            dry_run=False,
+            apply_mode=True,
+            smoke_mode=False,
+        )
+        # Without smoke_mode, assignee comes from draft
+        assert plan["kanban_task"]["assignee"] == valid_draft_builder["task_draft"]["assignee"]
+        assert plan["smoke_mode"] is False
+
 
 # ---------------------------------------------------------------------------
 # Render markdown tests
@@ -439,6 +530,60 @@ class TestCLI:
             ]):
                 rc = mod.main()
                 mock_call.assert_not_called()
+
+    def test_smoke_apply_calls_hermes_with_triage_no_assignee(self, mod, tmp_path):
+        """--smoke-apply must call hermes, use --triage, and omit --assignee.
+
+        Uses a draft with assignee="aed-builder" (non-empty) to prove that
+        --smoke-apply overrides the draft's assignee to "" in the Hermes call,
+        preventing dispatcher auto-claim even when the task draft specifies one.
+        """
+        draft_with_assignee = {
+            "packet_kind": "aed.pr_gate.task_draft.v1",
+            "schema_version": 1,
+            "idempotency_key": "pr999-aaaabbbbccccddddeeeeffffaaaabbbbccccdddd-12345678-create_builder_patch",
+            "action": "create_builder_patch_task_draft",
+            "pr_number": 999,
+            "head_sha": "aaaabbbbccccddddeeeeffffaaaabbbbccccdddd",
+            "task_draft": {
+                "title": "Smoke CLI test",
+                "body": "Test body",
+                "assignee": "aed-builder",   # non-empty — proves override
+                "status": "TODO",
+            },
+        }
+        draft_path = tmp_path / "draft.json"
+        draft_path.write_text(json.dumps(draft_with_assignee))
+        out_json = tmp_path / "plan.json"
+
+        with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
+            # First call (search): no duplicate found
+            # Second call (create): success with task ID
+            mock_call.side_effect = [
+                (0, "", ""),       # duplicate check: no existing task
+                (0, "created task 123", ""),  # create: succeeded
+            ]
+            with mock.patch("sys.argv", [
+                "pr_gate_kanban_task_create.py",
+                "--task-draft", str(draft_path),
+                "--board", "aed-test",
+                "--output-json", str(out_json),
+                "--smoke-apply",
+            ]):
+                rc = mod.main()
+                assert mock_call.call_count == 2  # search + create
+
+            # Verify plan output
+            plan = json.loads(out_json.read_text())
+            assert plan["smoke_mode"] is True
+            assert plan["kanban_task"]["assignee"] == ""
+
+            # Verify create command (second call)
+            create_call = mock_call.call_args_list[1][0][0]
+            assert "--triage" in create_call, f"--triage must be in smoke-apply: {create_call}"
+            assert "--assignee" not in create_call, (
+                f"--assignee must NOT be in smoke-apply: {create_call}"
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -468,8 +468,15 @@ def build_plan(
     board: str,
     dry_run: bool,
     apply_mode: bool,
+    smoke_mode: bool = False,
 ) -> dict:
-    """Build a kanban_create_plan.v1 packet."""
+    """Build a kanban_create_plan.v1 packet.
+
+    smoke_mode: when True, the task is created in triage with no assignee.
+    This is used for smoke tests where the task must not be auto-claimed
+    by the dispatcher. In smoke_mode, assignee is forced to "" regardless
+    of what the task draft specifies.
+    """
 
     action = draft.get("action", "")
     task_draft = draft.get("task_draft", {})
@@ -484,6 +491,7 @@ def build_plan(
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "board": board,
         "dry_run": dry_run,
+        "smoke_mode": smoke_mode,
         "source_task_draft": {
             "packet_kind": packet_kind,
             "action": action,
@@ -522,7 +530,10 @@ def build_plan(
     if action in _ACTIONS_WITH_TASK:
         title = task_draft.get("title", f"[PR #{pr_number}] {action}")
         body = _render_body_from_task_draft(task_draft, draft)
-        assignee = task_draft.get("assignee", "")
+        # In smoke_mode, force assignee to "" so dispatcher cannot auto-claim.
+        # The task will be created with --triage (no status=ready) and
+        # no assignee, making auto-claim impossible.
+        assignee = "" if smoke_mode else task_draft.get("assignee", "")
         status = task_draft.get("status", "TODO")
 
         plan["kanban_task"] = {
@@ -566,7 +577,7 @@ def build_plan(
             body=task["body"],
             assignee=task["assignee"],
             idempotency_key=task["idempotency_key"],
-            smoke_mode=False,
+            smoke_mode=smoke_mode,
         )
 
         rc, stdout, stderr = _call_hermes_kanban(cmd, apply_mode=True)
@@ -633,8 +644,16 @@ def render_markdown(plan: dict) -> str:
         "",
         f"**Generated:** {plan.get('generated_at', 'unknown')}",
         f"**Board:** `{board}`",
-        f"**Mode:** {'`--dry-run`' if dry_run else '`--apply`'}",
-        "",
+    ]
+    smoke_mode = plan.get("smoke_mode", False)
+    if smoke_mode:
+        lines.append(f"**Mode:** `--smoke-apply`")
+    elif dry_run:
+        lines.append(f"**Mode:** `--dry-run`")
+    else:
+        lines.append(f"**Mode:** `--apply`")
+    lines.append("")
+    lines += [
         "## Source Task Draft",
         "",
         f"- **Action:** `{src.get('action', '')}`",
@@ -738,6 +757,11 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--apply", action="store_true",
         help="Apply changes: call hermes kanban create once. Without this flag, dry-run only."
     )
+    p.add_argument(
+        "--smoke-apply", action="store_true",
+        help="Apply in smoke-safe mode: creates task in triage with no assignee,"
+             " preventing dispatcher auto-claim. Use for real-create smoke tests only."
+    )
     return p
 
 
@@ -793,10 +817,11 @@ def main() -> int:
             print(f"ERROR: task_draft.body contains forbidden pattern: '{matched}'", file=sys.stderr)
             return 1
 
-    dry_run = not args.apply
+    dry_run = not args.apply and not args.smoke_apply
+    smoke_mode = bool(args.smoke_apply)
 
     # Build plan
-    plan = build_plan(draft, args.board, dry_run, args.apply)
+    plan = build_plan(draft, args.board, dry_run, args.apply or args.smoke_apply, smoke_mode=smoke_mode)
 
     # Write outputs
     if args.output_json:
@@ -839,12 +864,17 @@ def main() -> int:
         applied = plan.get("apply_result", {}).get("applied", False)
         task_id = plan.get("apply_result", {}).get("created_task_id") or plan.get("duplicate_check", {}).get("existing_task_id")
         dup = plan.get("duplicate_check", {}).get("duplicate_found", False)
+        is_smoke = plan.get("smoke_mode", False)
+        mode_tag = "[smoke-apply]" if is_smoke else "[apply]"
         if dup:
-            print(f"[apply] duplicate found — existing task: {task_id}")
+            print(f"{mode_tag} duplicate found — existing task: {task_id}")
         elif applied:
-            print(f"[apply] task created: {task_id}")
+            task_assignee = plan.get("kanban_task", {}).get("assignee", "")
+            task_status = plan.get("kanban_task", {}).get("status", "")
+            extra = f", assignee={task_assignee!r}, status={task_status}" if is_smoke else ""
+            print(f"{mode_tag} task created: {task_id}{extra}")
         else:
-            print(f"[apply] failed — check plan for details")
+            print(f"{mode_tag} failed — check plan for details")
 
     return 0
 
