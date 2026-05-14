@@ -382,56 +382,79 @@ def _build_kanban_create_command(
     board: str,
     title: str,
     body: str,
-    status: str,
     assignee: str,
     idempotency_key: str,
+    smoke_mode: bool = False,
 ) -> list[str]:
     """Build hermes kanban create arguments.
 
     Uses 'kanban create' (not 'kanban task create').
+    Correct Hermes structure: hermes kanban --board <board> create "title" [options...]
+
+    --board must appear before 'create' as a parent argument to the kanban subparser.
+    title is positional (not --title).
+    --status and --tag are NOT valid Hermes create flags — removed.
     --no-dispatch is NOT a valid Hermes flag — no-dispatch is enforced
     as a local invariant (STOP_RULES + plan field), not as a CLI flag.
+
+    In smoke_mode (no-auto-claim):
+    - Uses --triage so the task lands in triage column and cannot be auto-claimed
+    - Omits --assignee to keep the task unassigned (no auto-claim possible)
     """
     cmd = [
-        "kanban", "create",
+        "kanban",
         "--board", board,
-        "--title", title,
-        "--status", status,
+        "create",
+        title,  # positional
     ]
-    if assignee:
-        cmd += ["--assignee", assignee]
+    if smoke_mode:
+        # smoke_mode: use triage so no dispatcher auto-claim is possible
+        cmd.append("--triage")
+    else:
+        # apply_mode: use normal create with assignee (dispatcher will claim it)
+        if assignee:
+            cmd += ["--assignee", assignee]
     cmd += [
         "--body", body,
-        "--tag", f"idempotency_key={idempotency_key}",
-        "--tag", f"source=pr_gate",
+        "--idempotency-key", idempotency_key,
     ]
     return cmd
 
 
 def _render_body_from_task_draft(task_draft: dict, draft: dict) -> str:
-    """Render task body from task_draft fields, appending file-scope constraints."""
+    """Render task body from task_draft fields, appending file-scope constraints.
+
+    Always includes an explicit scope section even when both allowed_files
+    and forbidden_files are empty lists. This prevents metadata-only
+    preservation from being mistaken for body preservation.
+    """
     body = task_draft.get("body", "")
     if not body:
         # Fallback to title if body is empty
         title = task_draft.get("title", "")
         body = f"# Task\n\n{title}" if title else "# (no body)"
 
-    # Append file-scope constraints if present
+    # Always include explicit scope section — empty lists are explicitly noted
     allowed = task_draft.get("allowed_files")
     forbidden = task_draft.get("forbidden_files")
-    if allowed or forbidden:
-        scope_lines = ["", "## File Scope", ""]
+    scope_lines = ["", "## File Scope", ""]
+    if allowed is not None:
+        scope_lines.append("Allowed files:")
         if allowed:
-            scope_lines.append("Allowed files:")
             for f in allowed:
                 scope_lines.append(f"  - {f}")
-            scope_lines.append("")
+        else:
+            scope_lines.append("  (explicit empty list — no file restrictions)")
+        scope_lines.append("")
+    if forbidden is not None:
+        scope_lines.append("Forbidden files:")
         if forbidden:
-            scope_lines.append("Forbidden files:")
             for f in forbidden:
                 scope_lines.append(f"  - {f}")
-            scope_lines.append("")
-        body += "\n".join(scope_lines)
+        else:
+            scope_lines.append("  (explicit empty list — no forbidden files)")
+        scope_lines.append("")
+    body += "\n".join(scope_lines)
 
     return body
 
@@ -541,9 +564,9 @@ def build_plan(
             board=board,
             title=task["title"],
             body=task["body"],
-            status=task["status"],
             assignee=task["assignee"],
             idempotency_key=task["idempotency_key"],
+            smoke_mode=False,
         )
 
         rc, stdout, stderr = _call_hermes_kanban(cmd, apply_mode=True)

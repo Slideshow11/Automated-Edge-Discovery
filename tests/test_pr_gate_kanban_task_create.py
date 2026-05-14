@@ -823,49 +823,114 @@ class TestNegationSpanWhitespace:
 class TestHermesCommandSyntax:
     """Regression: planned and executed Hermes commands must use
     'hermes kanban create' (not 'kanban task create'), and must not
-    include --no-dispatch (not a valid Hermes flag)."""
+    include --no-dispatch (not a valid Hermes flag).
 
-    def test_build_kanban_create_command_uses_kanban_create_not_task_create(self, mod):
-        """The _build_kanban_create_command function must produce
-        ['kanban', 'create', ...] not ['kanban', 'task', 'create', ...]"""
+    Correct Hermes structure: hermes kanban --board <board> create "title" [options...]
+    --board must appear before 'create' as a parent argument to the kanban subparser.
+    title is positional (not --title flag).
+    --status and --tag are NOT valid Hermes create flags.
+    """
+
+    def test_build_kanban_create_command_apply_mode_correct_structure(self, mod):
+        """Apply mode: ['kanban', '--board', board, 'create', title, '--body', body,
+        '--idempotency-key', key, '--assignee', assignee]
+
+        Verifies:
+        - 'kanban' first, 'create' second, --board before 'create'
+        - title is positional (not --title)
+        - no --title, --status, --tag, --no-dispatch
+        """
         cmd = mod._build_kanban_create_command(
             board="aed-test",
             title="Test task",
             body="Test body",
-            status="TODO",
             assignee="aed-builder",
             idempotency_key="pr123-abcdef12-12345678-create_builder_patch",
+            smoke_mode=False,
         )
-        assert "kanban" in cmd and "create" in cmd, f"cmd must contain kanban+create: {cmd}"
-        assert "task" not in cmd, f"cmd must not contain 'task' subcommand: {cmd}"
-        assert cmd[0] == "kanban"
-        assert cmd[1] == "create"
-        assert cmd[2] == "--board"  # verify structure
-        # Verify no --no-dispatch (invalid Hermes flag)
+        # Basic structure
+        assert cmd[0] == "kanban", f"cmd[0] must be 'kanban': {cmd}"
+        assert cmd[1] == "--board", f"cmd[1] must be '--board': {cmd}"
+        assert cmd[2] == "aed-test", f"cmd[2] must be 'aed-test': {cmd}"
+        assert cmd[3] == "create", f"cmd[3] must be 'create': {cmd}"
+        # title is positional (no --title flag)
+        assert cmd[4] == "Test task", f"cmd[4] must be positional title, got {cmd[4]}"
+        # no forbidden flags
+        assert "--title" not in cmd, f"--title is not valid Hermes create flag: {cmd}"
+        assert "--status" not in cmd, f"--status is not valid Hermes create flag: {cmd}"
+        assert "--tag" not in cmd, f"--tag is not valid Hermes create flag: {cmd}"
         assert "--no-dispatch" not in cmd, f"--no-dispatch is not a valid Hermes flag: {cmd}"
+        assert "task" not in cmd, f"'task' must not appear in command: {cmd}"
+        # assignee in apply mode
+        assert "--assignee" in cmd, f"--assignee must be in apply mode command: {cmd}"
+
+    def test_build_kanban_create_command_smoke_mode_triage_no_assignee(self, mod):
+        """Smoke mode: uses --triage, no --assignee (cannot be auto-claimed).
+
+        smoke_mode=True → adds --triage, omits --assignee.
+        """
+        cmd = mod._build_kanban_create_command(
+            board="aed-test",
+            title="Smoke test task",
+            body="Test body",
+            assignee="aed-builder",
+            idempotency_key="pr1-abcdef12-12345678-create_builder_patch",
+            smoke_mode=True,
+        )
+        # --triage present, no --assignee
+        assert "--triage" in cmd, f"--triage must be in smoke mode command: {cmd}"
+        assert "--assignee" not in cmd, f"--assignee must NOT be in smoke mode: {cmd}"
+        # title is positional
+        assert "--title" not in cmd, f"--title is not valid Hermes create flag: {cmd}"
+        # correct structure
+        assert cmd[0] == "kanban"
+        assert cmd[1] == "--board"
+        assert cmd[3] == "create"
+        # --board before 'create' (index 1 is --board, index 3 is create)
+        assert cmd.index("--board") < cmd.index("create"), (
+            f"--board must appear before 'create' in argv: {cmd}"
+        )
+
+    def test_apply_command_has_no_invalid_flags(self, mod):
+        """Apply mode command must not contain --title, --status, --tag, --no-dispatch."""
+        cmd = mod._build_kanban_create_command(
+            board="aed",
+            title="X",
+            body="Y",
+            assignee="aed-builder",
+            idempotency_key="pr1-abcdef12-12345678-create_builder_patch",
+            smoke_mode=False,
+        )
+        invalid = {"--title", "--status", "--tag", "--no-dispatch", "task"}
+        present = {f for f in cmd if f in invalid}
+        assert not present, f"invalid flags in apply command: {present} cmd={cmd}"
 
     def test_built_command_has_no_task_subcommand(self, mod):
         """No variant of the create command may contain 'task' between 'kanban' and 'create'."""
         variations = [
-            {"board": "aed-test", "title": "T", "body": "B", "status": "TODO", "assignee": "", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch"},
-            {"board": "aed-test", "title": "T", "body": "B", "status": "TODO", "assignee": "aed-builder", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch"},
+            {"board": "aed-test", "title": "T", "body": "B", "assignee": "", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch", "smoke_mode": False},
+            {"board": "aed-test", "title": "T", "body": "B", "assignee": "aed-builder", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch", "smoke_mode": False},
+            {"board": "aed-test", "title": "T", "body": "B", "assignee": "aed-builder", "idempotency_key": "pr1-abcdef12-12345678-create_builder_patch", "smoke_mode": True},
         ]
         for kwargs in variations:
             cmd = mod._build_kanban_create_command(**kwargs)
             cmd_str = " ".join(cmd)
             assert "kanban task create" not in cmd_str, f"forbidden 'kanban task create' in: {cmd_str}"
-            assert "kanban create" in cmd_str, f"required 'kanban create' missing from: {cmd_str}"
+            assert "kanban --board" in cmd_str, f"required 'kanban --board' missing from: {cmd_str}"
+            # board must come before create in the argv sequence
+            board_idx = cmd.index("--board")
+            create_idx = cmd.index("create")
+            assert board_idx < create_idx, f"--board must be before 'create': {cmd}"
 
     def test_apply_command_list_matches_hermes_create_help_flags(self, mod, tmp_path):
         """The command list passed to hermes must only contain flags supported by
-        'hermes kanban create --help' (--board, --title, --body, --status,
-        --assignee, --tag, --idempotency-key)."""
+        'hermes kanban create --help' (--board as parent arg, --body, --assignee,
+        --idempotency-key, --triage, etc.). --title and --status are NOT valid."""
         valid_flags = {
-            "--board", "--title", "--body", "--status",
-            "--assignee", "--parent", "--workspace", "--tenant",
-            "--priority", "--triage", "--idempotency-key",
+            "--board", "--body", "--assignee", "--parent", "--workspace",
+            "--tenant", "--priority", "--triage", "--idempotency-key",
             "--max-runtime", "--created-by", "--skill", "--max-retries", "--json",
-            "--help",  # -h always allowed
+            "--help", "-h",
         }
         draft = {
             "packet_kind": "aed.pr_gate.task_draft.v1",
@@ -887,11 +952,9 @@ class TestHermesCommandSyntax:
         import json
         draft_path.write_text(json.dumps(draft))
 
-        # First call (search): no existing task → proceed to create
-        # Second call (create): success with task ID
         with mock.patch.object(mod, "_call_hermes_kanban") as mock_call:
             mock_call.side_effect = [
-                (0, "", ""),       # duplicate check: no existing task (empty stdout = not found)
+                (0, "", ""),       # duplicate check: no existing task
                 (0, "task-123", ""),  # create: succeeded
             ]
             with mock.patch("sys.argv", [
@@ -904,17 +967,23 @@ class TestHermesCommandSyntax:
                 mod.main()
 
             # Get the create command (second call)
-            create_call = mock_call.call_args_list[1][0][0]  # args of second call (create)
+            create_call = mock_call.call_args_list[1][0][0]
             create_cmd_str = " ".join(create_call)
             assert "kanban task create" not in create_cmd_str
-            assert "kanban create" in create_cmd_str
-
-        # Check all flags are known Hermes flags
-        known_flags = {"--board", "--title", "--body", "--status", "--assignee",
-                       "--idempotency-key", "--tag", "--help", "-h"}
-        present_flags = {f for f in create_call if f.startswith("-") and "=" not in f}
-        unknown = present_flags - known_flags
-        assert not unknown, f"unknown Hermes flags in command: {unknown} cmd={create_cmd_str}"
+            assert "kanban --board" in create_cmd_str, (
+                f"'kanban --board' must appear in command: {create_cmd_str}"
+            )
+            # Check all flags are known Hermes flags
+            known_flags = {"--board", "--body", "--assignee", "--idempotency-key",
+                           "--parent", "--workspace", "--tenant", "--priority",
+                           "--triage", "--max-runtime", "--created-by", "--skill",
+                           "--max-retries", "--json", "--help", "-h"}
+            present_flags = {f for f in create_call if f.startswith("-") and "=" not in f}
+            unknown = present_flags - known_flags
+            assert not unknown, f"unknown Hermes flags in command: {unknown} cmd={create_cmd_str}"
+            # Verify --title and --status are absent
+            assert "--title" not in create_call, f"--title must not appear: {create_call}"
+            assert "--status" not in create_call, f"--status must not appear: {create_call}"
 
     def test_stop_rules_in_plan_no_dispatch(self, mod, valid_draft_builder):
         """Plan STOP_RULES must include no_dispatch as a local invariant, not a CLI flag."""

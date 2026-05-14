@@ -144,7 +144,8 @@ def _build_real_create_smoke_report(
     *,
     board: str,
     execute_real_create: bool,
-    planned_command: str | None,
+    planned_command: list[str] | None,
+    planned_create_command_display: str | None,
     created_task_id: str | None,
     duplicate_found: bool,
     scope_status: str,
@@ -152,6 +153,9 @@ def _build_real_create_smoke_report(
     preconditions_passed: bool,
     precondition_blockers: str,
     task_draft: dict,
+    create_mode: str = "triage",
+    auto_claim_risk: str = "blocked",
+    no_dispatch_call_made: bool = True,
 ) -> dict:
     """Build the real-create smoke section of the report."""
     real_create_mode_requested = True  # always when running this path
@@ -181,10 +185,14 @@ def _build_real_create_smoke_report(
         "board_allowed": board_allowed,
         "scope_status": scope_status,
         "idempotency_key": idempotency_key,
-        "planned_create_command": planned_command,
+        "exact_create_argv": planned_command,
+        "exact_create_command_display": planned_create_command_display,
+        "create_mode": create_mode,
+        "auto_claim_risk": auto_claim_risk,
         "real_create_executed": real_create_executed,
         "created_task_id": created_task_id,
         "duplicate_found": duplicate_found,
+        "no_dispatch_call_made": no_dispatch_call_made,
         "no_dispatch_guarantee": task_draft.get("controller_rules", {}).get("no_auto_dispatch", False),
         "preconditions_passed": preconditions_passed,
         "precondition_blockers": precondition_blockers,
@@ -196,31 +204,65 @@ def _build_real_create_smoke_report(
 def _build_kanban_create_command(
     task_draft: dict,
     board: str,
-) -> str:
-    """Build the hermes kanban create command string for the smoke report.
+    smoke_mode: bool = True,
+) -> list[str]:
+    """Build the hermes kanban create argv for smoke or apply.
 
     Uses 'kanban create' (not 'kanban task create').
+    Correct Hermes structure: hermes kanban --board <board> create "title" [options...]
+
+    In smoke_mode (default for this harness):
+    - Uses --triage so the task lands in triage column and cannot be auto-claimed
+    - Omits --assignee to keep the task unassigned
+    - Uses --idempotency-key flag
+
+    In apply_mode (smoke_mode=False):
+    - Uses --assignee if present (dispatcher will claim it)
+    - Uses --idempotency-key flag
+
     --no-dispatch is NOT a valid Hermes flag — no-dispatch is enforced
     as a local invariant (STOP_RULES + plan field), not as a CLI flag.
+    --title, --status, --tag are NOT valid Hermes create flags.
     """
     td = task_draft.get("task_draft", {})
     title = td.get("title", "unknown")
     body = td.get("body", "")
     assignee = td.get("assignee", "")
-    # escape double quotes in title/body for shell safety
-    title_esc = title.replace('"', '\\"')
-    body_esc = body.replace('"', '\\"')
-    assignee_esc = assignee.replace('"', '\\"')
-    ikey = task_draft.get("idempotency_key", "")
-    ikey_esc = ikey.replace('"', '\\"')
-    return (
-        f"hermes kanban create "
-        f"--board {board} "
-        f'--title "{title_esc}" '
-        f'--body "{body_esc}" '
-        f'--assignee "{assignee_esc}" '
-        f'--idempotency-key "{ikey_esc}"'
-    )
+    idempotency_key = task_draft.get("idempotency_key", "")
+
+    cmd = [
+        "kanban",
+        "--board", board,
+        "create",
+        title,  # positional
+    ]
+    if smoke_mode:
+        # smoke_mode: triage + no assignee → no auto-claim possible
+        cmd.append("--triage")
+    else:
+        # apply_mode: assignee if present (dispatcher will claim)
+        if assignee:
+            cmd += ["--assignee", assignee]
+    cmd += [
+        "--body", body,
+        "--idempotency-key", idempotency_key,
+    ]
+    return cmd
+
+
+def _build_kanban_create_command_display(cmd_argv: list[str]) -> str:
+    """Build a shell-safe display string from an argv list.
+
+    Used for the smoke report so the planned command is visible as text.
+    """
+    parts = []
+    for part in cmd_argv:
+        if " " in part or '"' in part or "\\" in part:
+            safe = part.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'"{safe}"')
+        else:
+            parts.append(part)
+    return "hermes " + " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -537,7 +579,10 @@ def _render_report_md(report: dict) -> str:
         lines.append(f"- **board_allowed:** {rcs.get('board_allowed')}")
         lines.append(f"- **scope_status:** {rcs.get('scope_status')}")
         lines.append(f"- **idempotency_key:** {rcs.get('idempotency_key')}")
-        lines.append(f"- **planned_create_command:** {rcs.get('planned_create_command')}")
+        lines.append(f"- **exact_create_argv:** {rcs.get('exact_create_argv')}")
+        lines.append(f"- **exact_create_command_display:** {rcs.get('exact_create_command_display')}")
+        lines.append(f"- **create_mode:** {rcs.get('create_mode')}")
+        lines.append(f"- **auto_claim_risk:** {rcs.get('auto_claim_risk')}")
         lines.append(f"- **real_create_executed:** {rcs.get('real_create_executed')}")
         lines.append(f"- **created_task_id:** {rcs.get('created_task_id')}")
         lines.append(f"- **duplicate_found:** {rcs.get('duplicate_found')}")
@@ -872,13 +917,15 @@ def main(argv: list[str] | None = None) -> int:
                 execute_real_create=execute_real_create,
             )
 
-            # Build planned create command
-            planned_command = _build_kanban_create_command(task_draft, board)
+            # Build planned create command (smoke_mode=True → uses --triage, no assignee)
+            planned_argv = _build_kanban_create_command(task_draft, board, smoke_mode=True)
+            planned_create_command_display = _build_kanban_create_command_display(planned_argv)
 
             real_create_report = _build_real_create_smoke_report(
                 board=board,
                 execute_real_create=execute_real_create,
-                planned_command=planned_command,
+                planned_command=planned_argv,
+                planned_create_command_display=planned_create_command_display,
                 created_task_id=None,
                 duplicate_found=False,
                 scope_status=scope_status,

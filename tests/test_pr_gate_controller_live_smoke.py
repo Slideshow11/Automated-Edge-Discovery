@@ -674,7 +674,11 @@ def run_smoke_real_create(
 
 
 def test_real_create_smoke_defaults_to_dry_run():
-    """Verify no real kanban create executes without --execute-real-create."""
+    """Verify no real kanban create executes without --execute-real-create.
+
+    Uses default --board aed (not in allowlist) → board_allowed=False.
+    The report must still contain real_create_smoke section with new field names.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
         result = run_smoke_real_create(out)
@@ -684,9 +688,12 @@ def test_real_create_smoke_defaults_to_dry_run():
         assert rcs.get("real_create_executed") is False, (
             f"real_create_executed must be False (default dry-run), got {rcs.get('real_create_executed')}"
         )
-        assert rcs.get("planned_create_command") is not None, (
-            "planned_create_command must be present"
+        # With board=aed (not allowed), planned_command is None
+        # exact_create_argv is used instead of planned_create_command
+        assert rcs.get("board_allowed") is False, (
+            f"board 'aed' must not be allowed (only aed-test), got board_allowed={rcs.get('board_allowed')}"
         )
+        assert rcs.get("recommendation") == "board_not_allowed"
 
 
 def test_real_create_requires_execute_flag():
@@ -746,17 +753,42 @@ def test_real_create_requires_clean_scope():
 
 
 def test_real_create_planned_command_recorded():
-    """Verify planned_create_command appears in the report."""
+    """Verify planned_create_command appears in the report.
+
+    Updated to use exact_create_argv + exact_create_command_display fields.
+    Smoke mode creates: hermes kanban --board aed-test create "title" --triage --body ... --idempotency-key ...
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         out = Path(tmpdir)
         result = run_smoke_real_create(out, extra_args=["--board", "aed-test"])
         report = _load_report(out)
         rcs = report.get("real_create_smoke", {})
-        assert rcs.get("planned_create_command"), (
-            f"planned_create_command must be present, got: {rcs.get('planned_create_command')}"
+        # exact_create_argv must be a list (not a string)
+        assert rcs.get("exact_create_argv") is not None, (
+            f"exact_create_argv must be present, got: {rcs.get('exact_create_argv')}"
         )
-        assert "hermes kanban create" in rcs.get("planned_create_command", ""), (
-            "planned_create_command must contain 'hermes kanban create'"
+        assert isinstance(rcs.get("exact_create_argv"), list), (
+            f"exact_create_argv must be a list, got {type(rcs.get('exact_create_argv'))}"
+        )
+        # exact_create_command_display must be a string
+        assert isinstance(rcs.get("exact_create_command_display"), str), (
+            f"exact_create_command_display must be a string, got {type(rcs.get('exact_create_command_display'))}"
+        )
+        # argv must start with ["kanban", "--board", "aed-test", "create", ...]
+        argv = rcs.get("exact_create_argv", [])
+        assert argv[0] == "kanban", f"argv[0] must be 'kanban', got {argv[0]}"
+        assert "--board" in argv, f"--board must be in argv: {argv}"
+        assert "create" in argv, f"create must be in argv: {argv}"
+        assert "--title" not in argv, f"--title is not a valid Hermes create flag: {argv}"
+        assert "--status" not in argv, f"--status is not a valid Hermes create flag: {argv}"
+        # --board must appear before 'create' (not after)
+        assert argv.index("--board") < argv.index("create"), (
+            f"--board must appear before 'create' in argv: {argv}"
+        )
+        # display string must contain "hermes kanban --board ... create"
+        display = rcs.get("exact_create_command_display", "")
+        assert "hermes kanban --board" in display, (
+            f"exact_create_command_display must contain 'hermes kanban --board': {display}"
         )
 
 
