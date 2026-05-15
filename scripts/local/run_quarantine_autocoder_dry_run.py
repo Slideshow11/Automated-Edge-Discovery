@@ -117,14 +117,56 @@ def safety_grep_content(content: str) -> list[str]:
 # Read-only collection helpers
 # ---------------------------------------------------------------------------
 
+# Git env vars that can cause external command execution during diff operations.
+# Stripping these prevents Git config or environment from triggering external
+# diff drivers or textconv filters, preserving the read-only invariant.
+_SANITIZED_GIT_ENV_VARS = frozenset([
+    "GIT_EXTERNAL_DIFF",
+    "GIT_DIFF_OPTS",
+    "GIT_TEXTCONV",
+    "GIT_DIFF_TOOL",
+    "GIT_DIFFTOOL",
+    "GIT_DIFFTOOL_CMD",
+    "GIT_DIFFTOOL_PROMPT",
+])
+
+
+def _build_sanitized_env() -> dict:
+    """Build a sanitized environment that blocks external diff execution.
+
+    Returns a copy of os.environ with all known external-diff-triggering git
+    vars removed.  This prevents Git config or environment from triggering
+    external diff drivers or textconv filters, preserving the read-only
+    invariant.
+    """
+    import os
+    env = dict(os.environ)
+    for var in _SANITIZED_GIT_ENV_VARS:
+        env.pop(var, None)
+    return env
+
+
 def _run_git(repo_path: str, *args, timeout: int = 30) -> tuple[int, str, str]:
-    """Run a read-only git command. Returns (returncode, stdout, stderr)."""
+    """Run a read-only git command. Returns (returncode, stdout, stderr).
+
+    Hardened against external diff execution:
+    - GIT_EXTERNAL_DIFF, GIT_DIFF_OPTS, GIT_TEXTCONV, and related vars are
+      explicitly unset before the subprocess starts.
+    - All diff invocations include --no-ext-diff and --no-textconv flags.
+    """
+    # Always add hardened diff flags for diff-family commands to guard against
+    # GIT_EXTERNAL_DIFF / GIT_TEXTCONV even if the caller forgets them.
+    _args = list(args)
+    if _args and _args[0] == "diff":
+        _args.extend(["--no-ext-diff", "--no-textconv"])
+
     try:
         result = subprocess.run(
-            ["git", "-C", repo_path] + list(args),
+            ["git", "-C", repo_path] + _args,
             capture_output=True,
             text=True,
             timeout=timeout,
+            env=_build_sanitized_env(),
         )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
@@ -145,21 +187,39 @@ def collect_git_status(repo_path: str) -> dict:
 
 
 def collect_git_diff(repo_path: str, base_sha: str) -> dict:
-    """Read-only: git diff <base_sha>..HEAD"""
+    """Read-only: git diff <base_sha>..HEAD
+
+    On failure (nonzero rc), returns explicit failure state:
+    - patch = ""
+    - has_changes = null
+    - git_rc = nonzero
+    - git_error = truncated stderr
+    Callers must NOT treat failure as "no changes".
+    """
     rc, stdout, stderr = _run_git(repo_path, "diff", f"{base_sha}..HEAD")
     return {
         "command": f"git diff {base_sha}..HEAD",
-        "returncode": rc,
-        "stderr": stderr[:500] if stderr else "",
+        "git_rc": rc,
+        "git_error": stderr[:500] if stderr else "",
         "patch": stdout if rc == 0 else "",
-        "has_changes": bool(stdout.strip()),
+        "has_changes": bool(stdout.strip()) if rc == 0 else None,
+        "failed": rc != 0,
     }
 
 
-def collect_git_diff_name_only(repo_path: str, base_sha: str) -> list[str]:
-    """Read-only: git diff --name-only <base_sha>..HEAD"""
+def collect_git_diff_name_only(repo_path: str, base_sha: str) -> tuple[list[str], dict]:
+    """Read-only: git diff --name-only <base_sha>..HEAD
+
+    Returns (files, meta) where meta contains git_rc, git_error, and failed.
+    Callers must check meta['failed'] rather than treating [] as "no changes".
+    """
     rc, stdout, stderr = _run_git(repo_path, "diff", "--name-only", f"{base_sha}..HEAD")
-    return stdout.splitlines() if rc == 0 else []
+    meta = {
+        "git_rc": rc,
+        "git_error": stderr[:500] if stderr else "",
+        "failed": rc != 0,
+    }
+    return (stdout.splitlines() if rc == 0 else [], meta)
 
 
 def collect_git_rev_parse(repo_path: str, ref: str = "HEAD") -> str:
@@ -168,16 +228,23 @@ def collect_git_rev_parse(repo_path: str, ref: str = "HEAD") -> str:
     return stdout.strip() if rc == 0 else ""
 
 
-def collect_changed_files_list(repo_path: str, base_sha: str) -> tuple[int, list[str]]:
-    """Read-only: get changed file count and list."""
-    files = collect_git_diff_name_only(repo_path, base_sha)
-    return len(files), files
+def collect_changed_files_list(repo_path: str, base_sha: str) -> tuple[int, list[str], dict]:
+    """Read-only: get changed file count, list, and git meta.
+
+    Returns (count, files, meta) where meta contains git_rc, git_error, failed.
+    Callers must check meta['failed'] instead of treating count==0 as "no changes".
+    """
+    files, meta = collect_git_diff_name_only(repo_path, base_sha)
+    return len(files), files, meta
 
 
 def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dict:
     """
     Read-only scope check using git commands.
     Uses resolved paths for symlink safety.
+
+    On git failure, scope_clean is set to None (explicit unknown), not True.
+    Callers must not treat git failure as "scope is clean".
     """
     source_resolved = Path(source_repo).resolve()
     bundle_resolved = Path(bundle_dir).resolve()
@@ -185,7 +252,7 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
     repo_root_resolved = repo_root.resolve()
 
     current_head = collect_git_rev_parse(source_repo, "HEAD")
-    files_count, changed_files = collect_changed_files_list(source_repo, base_sha)
+    files_count, changed_files, git_meta = collect_changed_files_list(source_repo, base_sha)
 
     # Check whether bundle dir is outside repo root
     try:
@@ -199,6 +266,17 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
     # but we verify with resolved path here for the record)
     bundle_in_git = ".git" in str(bundle_resolved)
 
+    # Explicit failure: do NOT set scope_clean=true when git failed
+    if git_meta["failed"]:
+        scope_clean = None
+        scope_status = "failed"
+    elif files_count == 0:
+        scope_clean = True
+        scope_status = "clean"
+    else:
+        scope_clean = False
+        scope_status = "changed"
+
     return {
         "source_repo": str(source_resolved),
         "bundle_dir": str(bundle_resolved),
@@ -208,7 +286,10 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
         "changed_files": changed_files[:100],  # cap at 100 for readability
         "bundle_dir_outside_repo_root": bundle_outside_repo_root,
         "bundle_dir_inside_git": bundle_in_git,
-        "scope_clean": files_count == 0 or changed_files is not None,
+        "scope_clean": scope_clean,
+        "scope_status": scope_status,
+        "git_rc": git_meta["git_rc"],
+        "git_error": git_meta["git_error"],
     }
 
 
@@ -638,7 +719,15 @@ def main(argv=None):
     if args.collect_git_diff:
         diff_result = collect_git_diff(args.source_repo, args.base_sha)
         diff_content = diff_result.get("patch", "")
-        if not diff_content:
+        if diff_result.get("failed"):
+            # Explicit failure: report it, do not claim "no changes"
+            diff_content = (
+                f"# git diff {args.base_sha}..HEAD FAILED\n"
+                f"# git_rc={diff_result.get('git_rc')}\n"
+                f"# git_error={diff_result.get('git_error')!r}\n"
+                f"# Collection failed — check git_rc and git_error above.\n"
+            )
+        elif not diff_content:
             diff_content = (
                 f"# git diff {args.base_sha}..HEAD returned no output\n"
                 f"# No changes between {args.base_sha} and HEAD\n"
@@ -647,8 +736,11 @@ def main(argv=None):
         print(f"[Phase 2] Wrote diff.patch (read-only git diff, {len(diff_content)} chars)")
 
         # changed_files.txt from git diff --name-only
-        files_count, changed_files = collect_changed_files_list(args.source_repo, args.base_sha)
-        changed_files_content = "\n".join(changed_files) if changed_files else "(no changed files)"
+        files_count, changed_files, _ = collect_changed_files_list(args.source_repo, args.base_sha)
+        if changed_files:
+            changed_files_content = "\n".join(changed_files)
+        else:
+            changed_files_content = "(no changed files)"
         write_text_file(args.bundle_dir, "changed_files.txt", changed_files_content)
         print(f"[Phase 2] Wrote changed_files.txt ({files_count} files)")
     else:

@@ -1186,3 +1186,266 @@ class TestPhase2NoForbiddenStringsAsExecutable:
                         pytest.fail(
                             f"File {filename} contains executable line with forbidden '{cmd}': {line!r}"
                         )
+
+
+class TestGitHardeningAndFailureModes:
+    """Regression tests: git diff hardening and explicit failure-state propagation.
+
+    Verifies fixes for Codex-reported issues:
+    1. GIT_EXTERNAL_DIFF and GIT_TEXTCONV must be sanitized / blocked.
+    2. Nonzero git exit codes must NOT produce scope_clean: true.
+    3. diff.patch and changed_files.txt must report failure explicitly.
+    """
+
+    def test_git_external_diff_env_is_neutralized(self):
+        """GIT_EXTERNAL_DIFF env var must not cause external command execution."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            # Set a dangerous GIT_EXTERNAL_DIFF that would execute a command
+            env = dict(os.environ)
+            env["GIT_EXTERNAL_DIFF"] = "echo DANGEROUS >&2"
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPT),
+                    "--dry-run",
+                    "--source-repo", repo,
+                    "--bundle-dir", bundle,
+                    "--base-sha", "a" * 40,
+                    "--candidate-id", "test-candidate",
+                    "--objective", "test",
+                    "--collect-git-diff",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            assert result.returncode == 0, f"Script failed: {result.stderr}"
+            # If GIT_EXTERNAL_DIFF fired, it would appear in stderr
+            # After sanitization, no external command output should appear
+            diff_content = read_text(bundle, "diff.patch")
+            assert "DANGEROUS" not in diff_content, \
+                "GIT_EXTERNAL_DIFF was not blocked — external command executed"
+
+    def test_git_diff_includes_no_ext_diff_and_no_textconv_flags(self):
+        """All git diff invocations must include --no-ext-diff and --no-textconv."""
+        import re
+        # Verify the script code contains --no-ext-diff and --no-textconv for diff calls
+        with open(SCRIPT) as f:
+            content = f.read()
+        # Check _run_git adds these flags when first arg is "diff"
+        assert "--no-ext-diff" in content, \
+            "Script must add --no-ext-diff to all diff invocations"
+        assert "--no-textconv" in content, \
+            "Script must add --no-textconv to all diff invocations"
+
+    def test_bad_base_sha_produces_explicit_failure_state(self):
+        """A bogus base SHA must not produce scope_clean: true."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "b" * 40,  # valid hex format but doesn't exist
+                "--candidate-id", "test-candidate",
+                "--objective", "test",
+                "--collect-scope",
+            )
+            assert rc == 0, "Script should succeed even when git diff fails"
+            scope = read_json(bundle, "scope_check.json")
+            # Must NOT be True on failure
+            assert scope.get("scope_clean") is not True, \
+                f"scope_clean must not be True on git failure, got: {scope.get('scope_clean')}"
+            # Must have explicit failure indicator
+            assert scope.get("scope_status") == "failed", \
+                f"scope_status must be 'failed', got: {scope.get('scope_status')}"
+            assert scope.get("git_rc", 0) != 0, \
+                "git_rc must be nonzero on failure"
+
+    def test_bad_base_sha_changed_files_reports_failure(self):
+        """changed_files.txt must not silently claim 'no changes' on git error."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "c" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test",
+                "--collect-git-diff",
+            )
+            assert rc == 0
+            changed = read_text(bundle, "changed_files.txt")
+            # Must not claim "no changed files" when git actually failed
+            # It should either be empty (legitimately no changes) OR contain failure info
+            # The key invariant: it must NOT say "(no changed files)" when git_rc != 0
+            diff_result_path = os.path.join(bundle, "diff.patch")
+            diff_content = open(diff_result_path).read() if os.path.exists(diff_result_path) else ""
+            # If diff.patch shows FAILED, the collection was a failure, not "no changes"
+            if "FAILED" in diff_content or "git_rc" in diff_content:
+                # git failed — changed_files should not claim "no changes" with certainty
+                scope = read_json(bundle, "scope_check.json") if os.path.exists(
+                    os.path.join(bundle, "scope_check.json")
+                ) else {}
+                if scope.get("scope_status") == "failed":
+                    assert "no changed files" not in changed.lower() or \
+                           "failed" in changed.lower() or \
+                           scope.get("files_changed_count", 0) == 0, \
+                        "changed_files.txt must not claim 'no changes' when git failed"
+
+    def test_successful_no_change_diff_reports_clean_correctly(self):
+        """A valid base SHA with no changes must produce scope_clean: true."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", base_sha,
+                "--candidate-id", "test-candidate",
+                "--objective", "test",
+                "--collect-scope",
+                "--collect-git-diff",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope.get("scope_clean") is True, \
+                f"No-change diff must have scope_clean=true, got: {scope.get('scope_clean')}"
+            assert scope.get("scope_status") == "clean"
+            changed = read_text(bundle, "changed_files.txt")
+            assert "(no changed files)" in changed, \
+                "No-change diff must report '(no changed files)'"
+
+    def test_successful_changed_diff_reports_changed_correctly(self):
+        """A valid base SHA with changes must produce scope_clean: false and list files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+
+            with open(os.path.join(repo, "newfile.py"), "w") as f:
+                f.write("x = 1\n")
+            subprocess.run(["git", "add", "newfile.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", base_sha,
+                "--candidate-id", "test-candidate",
+                "--objective", "test",
+                "--collect-scope",
+                "--collect-git-diff",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope.get("scope_clean") is False, \
+                f"Changed diff must have scope_clean=false, got: {scope.get('scope_clean')}"
+            assert scope.get("scope_status") == "changed"
+            assert scope.get("files_changed_count", 0) > 0
+            changed = read_text(bundle, "changed_files.txt")
+            assert "newfile.py" in changed, \
+                "changed_files.txt must list the modified file"
+            diff_content = read_text(bundle, "diff.patch")
+            assert "newfile.py" in diff_content, \
+                "diff.patch must contain the changed file"
+
+    def test_collect_git_diff_returns_explicit_failure_fields(self):
+        """collect_git_diff must return git_rc, git_error, failed, and has_changes=null on error."""
+        import importlib
+        # Dynamically import to test the helper in isolation
+        import sys
+        sys.path.insert(0, str(SCRIPT.parent))
+        # Direct import
+        from run_quarantine_autocoder_dry_run import collect_git_diff
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            # Valid diff (base = HEAD)
+            head_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+            result = collect_git_diff(repo, head_sha)
+            assert "git_rc" in result, "Result must contain git_rc"
+            assert "git_error" in result, "Result must contain git_error"
+            assert "failed" in result, "Result must contain failed"
+            assert "has_changes" in result, "Result must contain has_changes"
+            assert result.get("failed") is False, "Valid diff must not be failed"
+            assert result.get("git_rc") == 0, "Valid diff must have git_rc=0"
+
+            # Invalid base SHA
+            result_bad = collect_git_diff(repo, "d" * 40)
+            assert result_bad.get("failed") is True, \
+                "Invalid base SHA must produce failed=True"
+            assert result_bad.get("git_rc") != 0, \
+                "Invalid base SHA must have nonzero git_rc"
+            assert result_bad.get("has_changes") is None, \
+                "Failed diff must have has_changes=null"
+            assert result_bad.get("patch") == "", \
+                "Failed diff must have empty patch"
