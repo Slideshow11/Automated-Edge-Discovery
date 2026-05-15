@@ -144,7 +144,39 @@ Together they form the complete operating contract. The charter says what you ma
 
 ---
 
-## 8. Amendment
+## 8. Current Implementation Status
+
+This policy defines the target governance contract for AED trace recording. It states what the audit log *should* require. This section documents where the current implementation stands relative to that target.
+
+### What PR #219 Introduced
+
+PR #219 (`scripts/local/append_merge_action_audit.py`) introduced the first audit appender. The appender currently supports the core JSONL format, the `pr_merge` and `controlled_smoke_create` event types, and the governance fields (`hermes_touched`, `dispatch_occurred`, `production_board_touched`). It is functional for recording clean PR merges and smoke creates.
+
+### What This Policy Requires
+
+This Trace Policy V1 defines fields that are required for governance completeness. The target is full schema alignment between the policy and the appender. Some fields that the policy marks as required are not yet fully enforced by the current appender implementation.
+
+### Known Implementation Gaps
+
+The following items require a follow-up implementation PR to align `append_merge_action_audit.py` with this policy:
+
+| Gap | Detail |
+|---|---|
+| `authorization_phrase` vs `authorization` | The appender currently writes `authorization` as the field name. Trace Policy V1 requires `authorization_phrase`. A follow-up PR will rename the field (with a backward-compatibility alias for existing entries). |
+| `gate_catches` | The policy requires a `gate_catches` object identifying which gate caught a real issue. The appender currently has no support for this field. |
+| `blocked_action` required fields | The policy requires seven fields for `blocked_action` entries: `action_requested`, `blocked_reason`, `stop_rule_triggered`, `files_or_boards_involved`, and `remediation_path`. The appender currently accepts `--event-type blocked_action` with no event-specific required fields. A follow-up PR will add these as mandatory arguments when that event type is selected. |
+
+### Follow-Up PR Note
+
+The next implementation PR should align `append_merge_action_audit.py` with Trace Policy V1 before any gate is added that depends on these fields. This documentation PR does not modify the appender and does not claim these fields are already enforced. The policy remains the target; the implementation is the gap being tracked.
+
+### Policy Stance
+
+The target policy stance is unchanged: no incomplete trace entry may be emitted. The trace completeness rule (Section 6) is in force. The follow-up implementation PR will bring the appender into compliance with it.
+
+---
+
+## 9. Amendment
 
 This policy may be amended by any PR that:
 1. Modifies this file (`docs/trace_policy_v1.md`) or the companion `harness_charter_v1.md`
