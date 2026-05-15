@@ -416,7 +416,21 @@ def _build_argparser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--gate-catches",
-        help="Comma-separated list of gate names that caught issues, e.g. codex,scope,ci"
+        help=(
+            "Comma-separated gate names that caught issues, e.g. codex,ci,scope. "
+            "Produces {\"codex\":\"\",\"ci\":\"\",\"scope\":\"\"}. "
+            "For full descriptions use --gate-catches-json instead."
+        ),
+    )
+    p.add_argument(
+        "--gate-catches-json",
+        dest="gate_catches_json",
+        help=(
+            "gate_catches as a JSON object, e.g. "
+            "'{\"codex\":\"caught git diff external command risk\"}'. "
+            "Required: valid JSON object with str keys and str values. "
+            "Use this when descriptions are needed."
+        ),
     )
     p.add_argument(
         "--hermes-touched",
@@ -544,13 +558,45 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    # Parse --gate-catches: comma-separated string -> list of strings -> object
+    # Parse --gate-catches and --gate-catches-json into a dict
     # Trace Policy V1 defines gate_catches as an object: {"gate_name": "description"} or {} when empty
-    # CLI accepts comma-separated names for convenience (descriptions not provided via CLI)
+    # --gate-catches-json accepts full JSON objects with descriptions
+    # --gate-catches accepts comma-separated names (descriptions set to "")
     gate_catches: dict | None = None
-    if getattr(args, "gate_catches", None):
-        names = [g.strip() for g in args.gate_catches.split(",") if g.strip()]
-        gate_catches = {name: "" for name in names}  # empty description for CLI-provided values
+    raw_json = getattr(args, "gate_catches_json", None)
+    raw_comma = getattr(args, "gate_catches", None)
+
+    if raw_json is not None:
+        try:
+            parsed = json.loads(raw_json)
+        except json.JSONDecodeError as e:
+            print(f"ERROR: --gate-catches-json is not valid JSON: {e}", file=sys.stderr)
+            return 1
+        if not isinstance(parsed, dict):
+            print(
+                f"ERROR: --gate-catches-json must be a JSON object, got {type(parsed).__name__}. "
+                "Use --gate-catches for a comma-separated list of gate names.",
+                file=sys.stderr,
+            )
+            return 1
+        for k, v in parsed.items():
+            if not isinstance(k, str):
+                print(
+                    f"ERROR: --gate-catches-json keys must be str, got {type(k).__name__} for key {k!r}.",
+                    file=sys.stderr,
+                )
+                return 1
+            if not isinstance(v, str):
+                print(
+                    f"ERROR: --gate-catches-json values must be str, got {type(v).__name__} for key {k!r}.",
+                    file=sys.stderr,
+                )
+                return 1
+        gate_catches = parsed
+    elif raw_comma is not None:
+        names = [g.strip() for g in raw_comma.split(",") if g.strip()]
+        gate_catches = {name: "" for name in names}
+
     # Emit gate_catches even when empty: Trace Policy V1 requires it on every PR trace
     if gate_catches is None:
         gate_catches = {}
