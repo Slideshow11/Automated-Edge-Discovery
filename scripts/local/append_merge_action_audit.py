@@ -65,7 +65,7 @@ Usage:
     --action-requested "hermes kanban dispatch t_abc123" \
     --blocked-reason "dispatch requires explicit authorization" \
     --stop-rule-triggered "unreviewed_external_mutation" \
-    --files-or-boards-involved aed,t_abc123 \
+    --files-or-boards-involved aed t_abc123 \
     --remediation-path "Obtain explicit dispatch authorization from human operator" \
     --no-dispatch-occurred \
     --no-production-board-touched \
@@ -542,6 +542,9 @@ def main() -> int:
     gate_catches: list[str] | None = None
     if getattr(args, "gate_catches", None):
         gate_catches = [g.strip() for g in args.gate_catches.split(",") if g.strip()]
+    # Emit gate_catches even when empty: Trace Policy V1 requires it on every PR trace
+    if gate_catches is None:
+        gate_catches = []
 
     entry = build_entry(
         event_type=args.event_type,

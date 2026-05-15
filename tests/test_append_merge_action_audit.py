@@ -848,6 +848,25 @@ class TestCLIIntegration:
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["gate_catches"] == ["codex", "ci", "scope"]
 
+    def test_gate_catches_emits_empty_list_when_not_provided(self, capsys, monkeypatch):
+        """--gate-catches absent: emit gate_catches=[] per Trace Policy V1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert "gate_catches" in parsed
+        assert parsed["gate_catches"] == []
+
     def test_gate_catches_single_value(self, capsys, monkeypatch):
         """--gate-catches codex emits ["codex"]."""
         monkeypatch.setattr("sys.argv", [
