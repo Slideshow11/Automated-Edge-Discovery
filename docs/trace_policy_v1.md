@@ -164,7 +164,7 @@ The following items require a follow-up implementation PR to align `append_merge
 |---|---|
 | `authorization_phrase` vs `authorization` | The appender currently writes `authorization` as the field name. Trace Policy V1 requires `authorization_phrase`. A follow-up PR will rename the field (with a backward-compatibility alias for existing entries). |
 | `gate_catches` | The policy requires a `gate_catches` object identifying which gate caught a real issue. The appender currently has no support for this field. |
-| `blocked_action` required fields | The policy requires seven fields for `blocked_action` entries: `action_requested`, `blocked_reason`, `stop_rule_triggered`, `files_or_boards_involved`, and `remediation_path`. The appender currently accepts `--event-type blocked_action` with no event-specific required fields. A follow-up PR will add these as mandatory arguments when that event type is selected. |
+| `blocked_action` required fields | The policy requires five event-specific fields for `blocked_action` entries: `action_requested`, `blocked_reason`, `stop_rule_triggered`, `files_or_boards_involved`, and `remediation_path`. Combined with the three common fields (`audit_log_version`, `event_type`, `timestamp`) this is eight total. The appender currently accepts `--event-type blocked_action` with no event-specific required fields. A follow-up PR will add these as mandatory arguments when that event type is selected. |
 
 ### Follow-Up PR Note
 
