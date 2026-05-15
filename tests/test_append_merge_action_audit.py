@@ -143,7 +143,16 @@ class TestValidateEntry:
         assert _validate_entry(entry) == []
 
     def test_valid_blocked_action(self):
-        entry = {"event_type": "blocked_action", "blocker_or_exception": "CI failure"}
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "gh pr merge",
+            "blocked_reason": "CI failure",
+            "stop_rule_triggered": "ci_not_green",
+            "files_or_boards_involved": ["main"],
+            "remediation_path": "Wait for CI to pass",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
         assert _validate_entry(entry) == []
 
     def test_valid_external_action(self):
@@ -475,13 +484,18 @@ class TestMainCLI:
         assert parsed["event_type"] == "external_action"
 
     def test_blocked_action_event_type(self, tmp_path, capsys, monkeypatch):
-        """blocked_action is a valid event type."""
+        """blocked_action is a valid event type when all required fields are provided."""
         log_path = tmp_path / "blocked.jsonl"
         monkeypatch.setattr("sys.argv", [
             "append_merge_action_audit.py",
             "--event-type", "blocked_action",
-            "--blocker-or-exception", "CI failure",
+            "--action-requested", "gh pr merge",
+            "--blocked-reason", "CI not green",
+            "--stop-rule-triggered", "ci_not_green",
+            "--files-or-boards-involved", "main",
+            "--remediation-path", "Wait for CI to pass",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--output", str(log_path),
         ])
         rc = main()
@@ -489,6 +503,414 @@ class TestMainCLI:
         with open(log_path) as f:
             parsed = json.loads(f.readline())
         assert parsed["event_type"] == "blocked_action"
+        assert parsed["dispatch_occurred"] is False
+        assert parsed["production_board_touched"] is False
+
+
+# ---------------------------------------------------------------------------
+# Authorization phrase — Trace Policy V1 alignment tests
+# ---------------------------------------------------------------------------
+
+class TestAuthorizationPhrase:
+    """Tests for --authorization-phrase / authorization_phrase field."""
+
+    def test_build_entry_authorization_phrase_emits_authorization_phrase(self):
+        """build_entry with authorization_phrase emits authorization_phrase field."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+            authorization_phrase="MERGE SHA 31a35db from branch fix/audit ...",
+        )
+        assert "authorization_phrase" in entry
+        assert entry["authorization_phrase"] == "MERGE SHA 31a35db from branch fix/audit ..."
+        assert "authorization" not in entry  # canonical field only
+
+    def test_build_entry_authorization_alias_converts_to_authorization_phrase(self):
+        """build_entry with authorization (alias) emits authorization_phrase."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+            authorization="legacy auth phrase",
+        )
+        assert "authorization_phrase" in entry
+        assert entry["authorization_phrase"] == "legacy auth phrase"
+        assert "authorization" not in entry  # canonical field only
+
+    def test_authorization_phrase_takes_precedence_over_authorization(self):
+        """When both are passed, authorization_phrase wins."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+            authorization_phrase="canonical phrase",
+            authorization="alias phrase",
+        )
+        # build_entry does not raise; it just uses authorization_phrase
+        assert entry["authorization_phrase"] == "canonical phrase"
+        assert "authorization" not in entry
+
+
+class TestGateCatches:
+    """Tests for --gate-catches / gate_catches field."""
+
+    def test_gate_catches_empty_by_default(self):
+        """gate_catches is absent when not provided."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+        )
+        assert "gate_catches" not in entry
+
+    def test_gate_catches_list_emitted(self):
+        """gate_catches list is passed through as-is."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+            gate_catches=["codex", "scope", "ci"],
+        )
+        assert entry["gate_catches"] == ["codex", "scope", "ci"]
+
+    def test_gate_catches_default_empty_list(self):
+        """gate_catches defaults to [] when explicitly passed as empty-like."""
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=220,
+            head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            merged_at="2026-05-15T04:03:20Z",
+            gate_catches=[],
+        )
+        assert entry["gate_catches"] == []
+
+
+class TestBlockedActionValidation:
+    """Tests for blocked_action event validation."""
+
+    def test_blocked_action_valid_full_entry(self):
+        """Complete blocked_action entry passes validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "hermes kanban dispatch t_abc123",
+            "blocked_reason": "dispatch requires explicit authorization",
+            "stop_rule_triggered": "unreviewed_external_mutation",
+            "files_or_boards_involved": ["aed", "t_abc123"],
+            "remediation_path": "Obtain explicit dispatch authorization from human operator",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert errors == [], f"Expected no errors, got {errors}"
+
+    def test_blocked_action_missing_action_requested(self):
+        """Missing action_requested fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "blocked_reason": "some reason",
+            "stop_rule_triggered": "ci_not_green",
+            "files_or_boards_involved": ["aed"],
+            "remediation_path": "fix CI",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("action_requested" in e for e in errors)
+
+    def test_blocked_action_missing_blocked_reason(self):
+        """Missing blocked_reason fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "gh pr merge",
+            "stop_rule_triggered": "ci_not_green",
+            "files_or_boards_involved": [],
+            "remediation_path": "wait for CI",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("blocked_reason" in e for e in errors)
+
+    def test_blocked_action_missing_stop_rule_triggered(self):
+        """Missing stop_rule_triggered fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "gh pr merge",
+            "blocked_reason": "CI not green",
+            "files_or_boards_involved": ["main"],
+            "remediation_path": "wait",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("stop_rule_triggered" in e for e in errors)
+
+    def test_blocked_action_missing_files_or_boards_involved(self):
+        """Missing files_or_boards_involved fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "gh pr merge",
+            "blocked_reason": "CI not green",
+            "stop_rule_triggered": "ci_not_green",
+            "remediation_path": "wait",
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("files_or_boards_involved" in e for e in errors)
+
+    def test_blocked_action_missing_remediation_path(self):
+        """Missing remediation_path fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "gh pr merge",
+            "blocked_reason": "CI not green",
+            "stop_rule_triggered": "ci_not_green",
+            "files_or_boards_involved": ["main"],
+            "dispatch_occurred": False,
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("remediation_path" in e for e in errors)
+
+    def test_blocked_action_dispatch_occurred_true_rejected(self):
+        """blocked_action with dispatch_occurred=True fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "dispatch",
+            "blocked_reason": "reason",
+            "stop_rule_triggered": "rule",
+            "files_or_boards_involved": [],
+            "remediation_path": "fix",
+            "dispatch_occurred": True,  # must be False
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("dispatch_occurred" in e and "False" in e for e in errors)
+
+    def test_blocked_action_production_board_true_rejected(self):
+        """blocked_action with production_board_touched=True fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "dispatch",
+            "blocked_reason": "reason",
+            "stop_rule_triggered": "rule",
+            "files_or_boards_involved": [],
+            "remediation_path": "fix",
+            "dispatch_occurred": False,
+            "production_board_touched": True,  # must be False
+        }
+        errors = _validate_entry(entry)
+        assert any("production_board_touched" in e and "False" in e for e in errors)
+
+    def test_blocked_action_missing_dispatch_occurred(self):
+        """blocked_action without dispatch_occurred fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "dispatch",
+            "blocked_reason": "reason",
+            "stop_rule_triggered": "rule",
+            "files_or_boards_involved": [],
+            "remediation_path": "fix",
+            "production_board_touched": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("dispatch_occurred" in e for e in errors)
+
+    def test_blocked_action_missing_production_board_touched(self):
+        """blocked_action without production_board_touched fails validation."""
+        entry = {
+            "event_type": "blocked_action",
+            "action_requested": "dispatch",
+            "blocked_reason": "reason",
+            "stop_rule_triggered": "rule",
+            "files_or_boards_involved": [],
+            "remediation_path": "fix",
+            "dispatch_occurred": False,
+        }
+        errors = _validate_entry(entry)
+        assert any("production_board_touched" in e for e in errors)
+
+
+class TestCLIIntegration:
+    """CLI-level integration tests via sys.argv."""
+
+    def test_authorization_phrase_cli_emits_authorization_phrase(self, capsys, monkeypatch):
+        """--authorization-phrase emits authorization_phrase in JSON."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--authorization-phrase", "MERGE SHA 31a35db from branch fix/audit ...",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert "authorization_phrase" in parsed
+        assert parsed["authorization_phrase"] == "MERGE SHA 31a35db from branch fix/audit ..."
+        assert "authorization" not in parsed
+
+    def test_authorization_alias_cli_emits_authorization_phrase(self, capsys, monkeypatch):
+        """--authorization emits authorization_phrase (alias converts)."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--authorization", "legacy auth phrase",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert "authorization_phrase" in parsed
+        assert parsed["authorization_phrase"] == "legacy auth phrase"
+        assert "authorization" not in parsed
+
+    def test_conflicting_authorization_and_phrase_fails(self, capsys, monkeypatch):
+        """--authorization and --authorization-phrase with different values exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--authorization", "phrase one",
+            "--authorization-phrase", "phrase two",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "different values" in err
+
+    def test_matching_authorization_and_phrase_succeeds(self, capsys, monkeypatch):
+        """--authorization and --authorization-phrase with same value exits 0."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--authorization", "same phrase",
+            "--authorization-phrase", "same phrase",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["authorization_phrase"] == "same phrase"
+
+    def test_gate_catches_comma_separated(self, capsys, monkeypatch):
+        """--gate-catches codex,ci,scope emits ["codex","ci","scope"]."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--gate-catches", "codex,ci,scope",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["gate_catches"] == ["codex", "ci", "scope"]
+
+    def test_gate_catches_single_value(self, capsys, monkeypatch):
+        """--gate-catches codex emits ["codex"]."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "220",
+            "--head-sha", "9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+            "--merge-sha", "31a35dbb1b181554ebde85c2ff6f3837d949430c",
+            "--merged-at", "2026-05-15T04:03:20Z",
+            "--gate-catches", "codex",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["gate_catches"] == ["codex"]
+
+    def test_blocked_action_cli_full_entry(self, capsys, monkeypatch):
+        """Full blocked_action CLI invocation passes validation."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "blocked_action",
+            "--action-requested", "hermes kanban dispatch t_abc123",
+            "--blocked-reason", "dispatch requires explicit authorization",
+            "--stop-rule-triggered", "unreviewed_external_mutation",
+            "--files-or-boards-involved", "aed", "t_abc123",
+            "--remediation-path", "Obtain explicit dispatch authorization",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["event_type"] == "blocked_action"
+        assert parsed["action_requested"] == "hermes kanban dispatch t_abc123"
+        assert parsed["blocked_reason"] == "dispatch requires explicit authorization"
+        assert parsed["stop_rule_triggered"] == "unreviewed_external_mutation"
+        assert parsed["files_or_boards_involved"] == ["aed", "t_abc123"]
+        assert parsed["remediation_path"] == "Obtain explicit dispatch authorization"
+        assert parsed["dispatch_occurred"] is False
+        assert parsed["production_board_touched"] is False
+
+    def test_blocked_action_cli_missing_required_field(self, capsys, monkeypatch):
+        """blocked_action missing required field exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "blocked_action",
+            # missing --action-requested
+            "--blocked-reason", "some reason",
+            "--stop-rule-triggered", "rule",
+            "--files-or-boards-involved", "aed",
+            "--remediation-path", "fix it",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "action_requested" in err
 
 
 # ---------------------------------------------------------------------------

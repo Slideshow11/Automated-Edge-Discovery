@@ -18,16 +18,27 @@ V1 scope (deliberately minimal):
 
 Usage:
   # Dry-run (print to stdout):
-  python scripts/local/append_merge_action_audit.py \\
-    --event-type pr_merge \\
-    --pr-number 217 \\
-    --head-sha 62e602e374cf666cf63e29de3bd28acb0fae97ea \\
-    --merge-sha d3de12a348da42009767887d05ff6dcd66b1c900 \\
-    --merged-at 2026-05-14T20:09:40Z \\
-    --ci-status success \\
-    --codex-status clean \\
-    --scope-status clean \\
-    --authorization "I confirm merge PR #217 ..." \\
+  python scripts/local/append_merge_action_audit.py \
+    --event-type pr_merge \
+    --pr-number 217 \
+    --head-sha 62e602e374cf666cf63e29de3bd28acb0fae97ea \
+    --merge-sha d3de12a348da42009767887d05ff6dcd66b1c900 \
+    --merged-at 2026-05-14T20:09:40Z \
+    --ci-status success \
+    --codex-status clean \
+    --scope-status clean \
+    --authorization-phrase "I confirm merge PR #217 ..." \
+    --gate-catches codex,scope \
+    --dry-run
+
+  # Backward-compatible --authorization (emits authorization_phrase):
+  python scripts/local/append_merge_action_audit.py \
+    --event-type pr_merge \
+    --pr-number 217 \
+    --head-sha 62e602e374cf666cf63e29de3bd28acb0fae97ea \
+    --merge-sha d3de12a348da42009767887d05ff6dcd66b1c900 \
+    --merged-at 2026-05-14T20:09:40Z \
+    --authorization "I confirm merge PR #217 ..." \
     --dry-run
 
   # Append to default log (~/.hermes/aed/audit/log.jsonl):
@@ -37,16 +48,28 @@ Usage:
   python scripts/local/append_merge_action_audit.py --output /path/to/log.jsonl ...
 
   # Controlled smoke create event:
-python scripts/local/append_merge_action_audit.py \\
-  --event-type controlled_smoke_create \\
-  --board aed-test \\
-  --task-id t_58d1338c \\
-  --status triage \\
-  --assignee "" \\
-  --no-dispatch-occurred \\
-  --no-worker-run-spawned \\
-  --no-production-board-touched \\
-  --dry-run
+  python scripts/local/append_merge_action_audit.py \
+    --event-type controlled_smoke_create \
+    --board aed-test \
+    --task-id t_58d1338c \
+    --status triage \
+    --assignee "" \
+    --no-dispatch-occurred \
+    --no-worker-run-spawned \
+    --no-production-board-touched \
+    --dry-run
+
+  # Blocked action event:
+  python scripts/local/append_merge_action_audit.py \
+    --event-type blocked_action \
+    --action-requested "hermes kanban dispatch t_abc123" \
+    --blocked-reason "dispatch requires explicit authorization" \
+    --stop-rule-triggered "unreviewed_external_mutation" \
+    --files-or-boards-involved aed,t_abc123 \
+    --remediation-path "Obtain explicit dispatch authorization from human operator" \
+    --no-dispatch-occurred \
+    --no-production-board-touched \
+    --dry-run
 """
 
 from __future__ import annotations
@@ -78,9 +101,46 @@ DEFAULT_LOG_PATH = Path(os.environ.get(
     str(Path.home() / ".hermes" / "aed" / "audit" / "log.jsonl"),
 ))
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Authorization resolution helpers
+# -----------------------------------------------------------------------------
+
+def _resolve_authorization(
+    authorization_arg: str | None,
+    authorization_phrase_arg: str | None,
+) -> tuple[str | None, str | None]:
+    """
+    Resolve authorization field handling for Trace Policy V1 alignment.
+
+    Returns (value_to_emit, deprecation_warning_or_none).
+    - Prefers authorization_phrase when available.
+    - Keeps --authorization as a backward-compatible CLI alias.
+    - Fails if both are provided and differ.
+    - If both match, emits only authorization_phrase.
+    """
+    if authorization_arg is None and authorization_phrase_arg is None:
+        return None, None
+    if authorization_arg is not None and authorization_phrase_arg is None:
+        return authorization_arg, None
+    if authorization_arg is None and authorization_phrase_arg is not None:
+        return authorization_phrase_arg, None
+    # Both provided
+    if authorization_arg != authorization_phrase_arg:
+        raise ValueError(
+            "--authorization and --authorization-phrase were both provided "
+            "but have different values. Use only --authorization-phrase, "
+            "or remove --authorization to avoid ambiguity."
+        )
+    # Both provided and identical — emit authorization_phrase, drop the alias
+    return authorization_phrase_arg, (
+        "note: --authorization is deprecated; --authorization-phrase will be "
+        "used going forward"
+    )
+
+
+# -----------------------------------------------------------------------------
 # Validation helpers
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _is_valid_sha(value: str) -> bool:
     """Return True if value is a 40-character hexadecimal string."""
@@ -134,6 +194,31 @@ def _validate_controlled_smoke_create_fields(entry: dict[str, Any]) -> list[str]
     return errors
 
 
+def _validate_blocked_action_fields(entry: dict[str, Any]) -> list[str]:
+    """Return list of error messages for a blocked_action event."""
+    errors = []
+    required_event_fields = [
+        ("action_requested", "action_requested is required for blocked_action events"),
+        ("blocked_reason", "blocked_reason is required for blocked_action events"),
+        ("stop_rule_triggered", "stop_rule_triggered is required for blocked_action events"),
+        ("files_or_boards_involved", "files_or_boards_involved is required for blocked_action events"),
+        ("remediation_path", "remediation_path is required for blocked_action events"),
+    ]
+    for field, msg in required_event_fields:
+        if field not in entry or not entry[field]:
+            errors.append(msg)
+    # Governance booleans — must be present and False when applicable
+    if "dispatch_occurred" not in entry:
+        errors.append("dispatch_occurred is required for blocked_action events")
+    elif entry["dispatch_occurred"] is not False:
+        errors.append("dispatch_occurred must be False for blocked_action events")
+    if "production_board_touched" not in entry:
+        errors.append("production_board_touched is required for blocked_action events")
+    elif entry["production_board_touched"] is not False:
+        errors.append("production_board_touched must be False for blocked_action events")
+    return errors
+
+
 def _validate_entry(entry: dict[str, Any]) -> list[str]:
     """Return list of error messages for a complete audit entry."""
     errors = []
@@ -147,6 +232,8 @@ def _validate_entry(entry: dict[str, Any]) -> list[str]:
         errors.extend(_validate_pr_merge_fields(entry))
     elif entry["event_type"] == "controlled_smoke_create":
         errors.extend(_validate_controlled_smoke_create_fields(entry))
+    elif entry["event_type"] == "blocked_action":
+        errors.extend(_validate_blocked_action_fields(entry))
     return errors
 
 
@@ -166,6 +253,7 @@ def build_entry(
     codex_status: str | None = None,
     scope_status: str | None = None,
     authorization: str | None = None,
+    authorization_phrase: str | None = None,
     hermes_touched: bool | None = None,
     dispatch_occurred: bool | None = None,
     board: str | None = None,
@@ -177,6 +265,12 @@ def build_entry(
     worker_run_spawned: bool | None = None,
     production_board_touched: bool | None = None,
     blocker_or_exception: str | None = None,
+    gate_catches: list[str] | None = None,
+    action_requested: str | None = None,
+    blocked_reason: str | None = None,
+    stop_rule_triggered: str | None = None,
+    files_or_boards_involved: list[str] | None = None,
+    remediation_path: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
@@ -184,6 +278,11 @@ def build_entry(
 
     All keyword arguments are optional except where required by event_type.
     Unknown extra keys are passed through as-is for forward compatibility.
+
+    authorization_phrase is the canonical field for Trace Policy V1.
+    authorization is accepted as a backward-compatible alias and is converted
+    to authorization_phrase internally.
+    gate_catches is a list of gate names that caught real issues.
     """
     entry: dict[str, Any] = {
         "audit_log_version": AUDIT_LOG_VERSION,
@@ -206,8 +305,11 @@ def build_entry(
         entry["codex_status"] = codex_status
     if scope_status is not None:
         entry["scope_status"] = scope_status
-    if authorization is not None:
-        entry["authorization"] = authorization
+    # authorization_phrase is canonical; authorization is backward-compat alias
+    if authorization_phrase is not None:
+        entry["authorization_phrase"] = authorization_phrase
+    elif authorization is not None:
+        entry["authorization_phrase"] = authorization
     if hermes_touched is not None:
         entry["hermes_touched"] = hermes_touched
     if dispatch_occurred is not None:
@@ -230,6 +332,18 @@ def build_entry(
         entry["production_board_touched"] = production_board_touched
     if blocker_or_exception is not None:
         entry["blocker_or_exception"] = blocker_or_exception
+    if gate_catches is not None:
+        entry["gate_catches"] = gate_catches
+    if action_requested is not None:
+        entry["action_requested"] = action_requested
+    if blocked_reason is not None:
+        entry["blocked_reason"] = blocked_reason
+    if stop_rule_triggered is not None:
+        entry["stop_rule_triggered"] = stop_rule_triggered
+    if files_or_boards_involved is not None:
+        entry["files_or_boards_involved"] = files_or_boards_involved
+    if remediation_path is not None:
+        entry["remediation_path"] = remediation_path
     if extra is not None:
         entry.update(extra)
     return entry
@@ -287,7 +401,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         choices=sorted(VALID_SCOPE_STATUSES),
         help="Scope review status"
     )
-    p.add_argument("--authorization", help="Authorization phrase or source")
+    p.add_argument(
+        "--authorization-phrase", dest="authorization_phrase",
+        help="Authorization phrase (canonical, Trace Policy V1)"
+    )
+    p.add_argument(
+        "--authorization", help="Authorization phrase (backward-compatible alias for --authorization-phrase)"
+    )
+    p.add_argument(
+        "--gate-catches",
+        help="Comma-separated list of gate names that caught issues, e.g. codex,scope,ci"
+    )
     p.add_argument(
         "--hermes-touched",
         dest="hermes_touched",
@@ -365,6 +489,26 @@ def _build_argparser() -> argparse.ArgumentParser:
         help="Blocker or exception note"
     )
     p.add_argument(
+        "--action-requested", dest="action_requested",
+        help="Action that was requested (for blocked_action events)"
+    )
+    p.add_argument(
+        "--blocked-reason", dest="blocked_reason",
+        help="Reason the action was blocked (for blocked_action events)"
+    )
+    p.add_argument(
+        "--stop-rule-triggered", dest="stop_rule_triggered",
+        help="Name of the stop rule that fired (for blocked_action events)"
+    )
+    p.add_argument(
+        "--files-or-boards-involved", dest="files_or_boards_involved", nargs="+",
+        help="File paths or board names involved (for blocked_action events)"
+    )
+    p.add_argument(
+        "--remediation-path", dest="remediation_path",
+        help="How to unblock the action (for blocked_action events)"
+    )
+    p.add_argument(
         "--output", "-o",
         default=str(DEFAULT_LOG_PATH),
         help=f"Path to JSONL audit log (default: {DEFAULT_LOG_PATH})"
@@ -383,6 +527,22 @@ def main() -> int:
     task_ids = args.task_ids if args.task_ids else None
     smoke_ids = args.smoke_artifact_ids if args.smoke_artifact_ids else None
 
+    # Resolve authorization: --authorization-phrase canonical, --authorization alias
+    # Fails fast if both differ
+    try:
+        resolved_auth, _ = _resolve_authorization(
+            getattr(args, "authorization", None),
+            getattr(args, "authorization_phrase", None),
+        )
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+
+    # Parse --gate-catches: comma-separated string -> list of strings
+    gate_catches: list[str] | None = None
+    if getattr(args, "gate_catches", None):
+        gate_catches = [g.strip() for g in args.gate_catches.split(",") if g.strip()]
+
     entry = build_entry(
         event_type=args.event_type,
         pr_number=args.pr_number,
@@ -393,7 +553,7 @@ def main() -> int:
         ci_status=args.ci_status,
         codex_status=args.codex_status,
         scope_status=args.scope_status,
-        authorization=args.authorization,
+        authorization_phrase=resolved_auth,
         hermes_touched=args.hermes_touched,
         dispatch_occurred=args.dispatch_occurred,
         board=args.board,
@@ -405,6 +565,12 @@ def main() -> int:
         worker_run_spawned=args.worker_run_spawned,
         production_board_touched=args.production_board_touched,
         blocker_or_exception=args.blocker_or_exception,
+        gate_catches=gate_catches,
+        action_requested=getattr(args, "action_requested", None),
+        blocked_reason=getattr(args, "blocked_reason", None),
+        stop_rule_triggered=getattr(args, "stop_rule_triggered", None),
+        files_or_boards_involved=getattr(args, "files_or_boards_involved", None),
+        remediation_path=getattr(args, "remediation_path", None),
     )
 
     errors = _validate_entry(entry)
