@@ -596,6 +596,18 @@ class TestGateCatches:
         )
         assert entry["gate_catches"] == {}
 
+    def test_gate_catches_list_rejected_at_runtime(self):
+        """build_entry raises TypeError when gate_catches is a list, not a dict."""
+        with pytest.raises(TypeError, match=r"dict\[str, str\]"):
+            build_entry(
+                event_type="pr_merge",
+                pr_number=220,
+                head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
+                merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
+                merged_at="2026-05-15T04:03:20Z",
+                gate_catches=["codex", "scope"],
+            )
+
 
 class TestBlockedActionValidation:
     """Tests for blocked_action event validation."""

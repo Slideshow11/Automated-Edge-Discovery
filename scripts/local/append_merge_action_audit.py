@@ -282,7 +282,8 @@ def build_entry(
     authorization_phrase is the canonical field for Trace Policy V1.
     authorization is accepted as a backward-compatible alias and is converted
     to authorization_phrase internally.
-    gate_catches is a list of gate names that caught real issues.
+    gate_catches must be a dict[str, str] per Trace Policy V1 (empty dict `{}`
+    when no gate caught anything). Lists are rejected with a TypeError.
     """
     entry: dict[str, Any] = {
         "audit_log_version": AUDIT_LOG_VERSION,
@@ -332,6 +333,11 @@ def build_entry(
         entry["production_board_touched"] = production_board_touched
     if blocker_or_exception is not None:
         entry["blocker_or_exception"] = blocker_or_exception
+    if gate_catches is not None and not isinstance(gate_catches, dict):
+        raise TypeError(
+            f"gate_catches must be a dict[str, str] per Trace Policy V1, "
+            f"got {type(gate_catches).__name__}. Use {{}} for no gates caught."
+        )
     if gate_catches is not None:
         entry["gate_catches"] = gate_catches
     if action_requested is not None:
