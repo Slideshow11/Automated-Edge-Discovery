@@ -265,7 +265,7 @@ def build_entry(
     worker_run_spawned: bool | None = None,
     production_board_touched: bool | None = None,
     blocker_or_exception: str | None = None,
-    gate_catches: list[str] | dict | None = None,
+    gate_catches: dict[str, str] | None = None,
     action_requested: str | None = None,
     blocked_reason: str | None = None,
     stop_rule_triggered: str | None = None,
