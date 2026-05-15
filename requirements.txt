@@ -1,42 +1,65 @@
-# NOTE: This file is maintained for convenience only.
-# The canonical dependency list is in pyproject.toml.
-# Preferred install: pip install -e .[dev]
+# AED Requirements — Operational Dependency Manifest
+# ===================================================
+#
+# This file is the operational dependency list used by CI.
+# Install: pip install -r requirements.txt
+#
+# NOTE ON PYPROJECT.TOML: The pyproject.toml [project.optional-dependencies]
+# section declares only test/dev extras (pytest, numpy, pandas, statsmodels,
+# patsy, matplotlib). It does NOT declare runtime dependencies.
+# pyproject.toml install_requires is empty. The earlier note claiming
+# pyproject.toml was "canonical" was misleading — this file is canonical
+# for CI and runtime installs.
+#
+# NOTE ON VENV: The token "venv" does not appear as a package declaration
+# in this file. GitHub Dependency Graph may have reported it from a stale
+# build artifact (automated_edge_discovery.egg-info/top_level.txt), which
+# is gitignored and regenerated on each pip install -e. It is a build
+# artifact, not a declared dependency.
+#
+# Classification key:
+#   [runtime]  — required for normal operation; imported by engine/scripts
+#   [dev]      — needed only for testing or local development
+#   [both]     — imported by both engine (runtime) and tests/dev scripts
+#   [optional] — integration tool; present but not yet confirmed in source imports
+#   [workflow] — present in this file; not imported in source but installed by CI
 
-# Core dependencies
-openai
-python-dotenv
-fire
-httpx
-rich
-tenacity
-prompt_toolkit
-pyyaml
-requests
-jinja2
-pydantic>=2.0
-PyJWT[crypto]
-debugpy
+# === [runtime] — Core dependencies for engine and scripts ===
 
-# Web tools
-firecrawl-py
-parallel-web>=0.4.2
+openai                        # LLM calls throughout
+httpx                         # HTTP client in PR gate scripts
+rich                          # CLI output formatting
+pyyaml                        # config/schema file parsing
+pydantic>=2.0                  # data validation schemas
+patsy                         # formula parsing in calibrate_costs
+PyJWT[crypto]                 # JWT decode in auth flows
+aiohttp>=3.9.0                # async HTTP for gateway integrations
+prometheus_client             # metrics server (engine/edge_discovery/metrics.py)
+boto3                         # S3 upload (lazy import in auditor.py, optional at runtime)
 
-# Image generation
-fal-client
+# === [dev] — Data, stats, and testing (not imported by engine core) ===
 
-# Text-to-speech (Edge TTS is free, no API key needed)
-edge-tts
+pandas                        # both: test fixtures + engine modules (features, schema, etc.)
+statsmodels                   # both: calibrate_costs + diagnostics/inference
+matplotlib                    # calibrate_costs plotting
+numpy                         # both: test fixtures + throughout engine
 
-# Optional: For cron expression parsing (cronjob scheduling)
-croniter
+# === [optional] — Integration tools (planned / unconfirmed source imports) ===
 
-# Optional: For messaging platform integrations (gateway)
-python-telegram-bot[webhooks]>=22.6
-discord.py>=2.0
-aiohttp>=3.9.0
+python-dotenv                 # environment variable loading (no source imports found)
+fire                          # CLI argument parsing (no source imports found)
+tenacity                      # retry logic (no source imports found)
+prompt_toolkit                # terminal UI components (no source imports found)
+jinja2                        # templating (no source imports found)
+debugpy                       # debugger support (no source imports found)
+firecrawl-py                  # web scraping (no source imports found)
+parallel-web>=0.4.2           # parallel web fetching (no source imports found)
+fal-client                    # image generation API client (no source imports found)
+edge-tts                      # text-to-speech (no source imports found)
+croniter                      # cron expression parsing (no source imports found)
+python-telegram-bot[webhooks]>=22.6   # Telegram integration (no source imports found)
+discord.py>=2.0               # Discord integration (no source imports found)
 
-# Data & stats for calibrator v2 (dev/test extras)
-pandas
-statsmodels
-patsy
-matplotlib
+# === [workflow] — Installed by CI but not imported in source ===
+
+requests                      # HTTP library; installed by CI; no source imports confirmed
