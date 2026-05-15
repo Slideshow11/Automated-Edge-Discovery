@@ -265,7 +265,7 @@ def build_entry(
     worker_run_spawned: bool | None = None,
     production_board_touched: bool | None = None,
     blocker_or_exception: str | None = None,
-    gate_catches: list[str] | None = None,
+    gate_catches: list[str] | dict | None = None,
     action_requested: str | None = None,
     blocked_reason: str | None = None,
     stop_rule_triggered: str | None = None,
@@ -538,13 +538,16 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    # Parse --gate-catches: comma-separated string -> list of strings
-    gate_catches: list[str] | None = None
+    # Parse --gate-catches: comma-separated string -> list of strings -> object
+    # Trace Policy V1 defines gate_catches as an object: {"gate_name": "description"} or {} when empty
+    # CLI accepts comma-separated names for convenience (descriptions not provided via CLI)
+    gate_catches: dict | None = None
     if getattr(args, "gate_catches", None):
-        gate_catches = [g.strip() for g in args.gate_catches.split(",") if g.strip()]
+        names = [g.strip() for g in args.gate_catches.split(",") if g.strip()]
+        gate_catches = {name: "" for name in names}  # empty description for CLI-provided values
     # Emit gate_catches even when empty: Trace Policy V1 requires it on every PR trace
     if gate_catches is None:
-        gate_catches = []
+        gate_catches = {}
 
     entry = build_entry(
         event_type=args.event_type,

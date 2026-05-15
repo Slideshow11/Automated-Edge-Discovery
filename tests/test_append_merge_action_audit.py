@@ -572,29 +572,29 @@ class TestGateCatches:
         )
         assert "gate_catches" not in entry
 
-    def test_gate_catches_list_emitted(self):
-        """gate_catches list is passed through as-is."""
+    def test_gate_catches_dict_emitted(self):
+        """gate_catches dict is passed through as-is (Trace Policy V1 object format)."""
         entry = build_entry(
             event_type="pr_merge",
             pr_number=220,
             head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
             merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
             merged_at="2026-05-15T04:03:20Z",
-            gate_catches=["codex", "scope", "ci"],
+            gate_catches={"codex": "", "scope": "style suggestion", "ci": ""},
         )
-        assert entry["gate_catches"] == ["codex", "scope", "ci"]
+        assert entry["gate_catches"] == {"codex": "", "scope": "style suggestion", "ci": ""}
 
-    def test_gate_catches_default_empty_list(self):
-        """gate_catches defaults to [] when explicitly passed as empty-like."""
+    def test_gate_catches_default_empty_dict(self):
+        """gate_catches defaults to {} when explicitly passed as empty-like."""
         entry = build_entry(
             event_type="pr_merge",
             pr_number=220,
             head_sha="9de6857f2aa27d0e4e27ff3f87357dec517ddf90",
             merge_sha="31a35dbb1b181554ebde85c2ff6f3837d949430c",
             merged_at="2026-05-15T04:03:20Z",
-            gate_catches=[],
+            gate_catches={},
         )
-        assert entry["gate_catches"] == []
+        assert entry["gate_catches"] == {}
 
 
 class TestBlockedActionValidation:
@@ -830,7 +830,7 @@ class TestCLIIntegration:
         assert parsed["authorization_phrase"] == "same phrase"
 
     def test_gate_catches_comma_separated(self, capsys, monkeypatch):
-        """--gate-catches codex,ci,scope emits ["codex","ci","scope"]."""
+        """--gate-catches codex,ci,scope emits {"codex":"","ci":"","scope":""}."""
         monkeypatch.setattr("sys.argv", [
             "append_merge_action_audit.py",
             "--event-type", "pr_merge",
@@ -846,10 +846,10 @@ class TestCLIIntegration:
         rc = main()
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out.strip())
-        assert parsed["gate_catches"] == ["codex", "ci", "scope"]
+        assert parsed["gate_catches"] == {"codex": "", "ci": "", "scope": ""}
 
-    def test_gate_catches_emits_empty_list_when_not_provided(self, capsys, monkeypatch):
-        """--gate-catches absent: emit gate_catches=[] per Trace Policy V1."""
+    def test_gate_catches_emits_empty_dict_when_not_provided(self, capsys, monkeypatch):
+        """--gate-catches absent: emit gate_catches={} per Trace Policy V1."""
         monkeypatch.setattr("sys.argv", [
             "append_merge_action_audit.py",
             "--event-type", "pr_merge",
@@ -865,10 +865,10 @@ class TestCLIIntegration:
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out.strip())
         assert "gate_catches" in parsed
-        assert parsed["gate_catches"] == []
+        assert parsed["gate_catches"] == {}
 
     def test_gate_catches_single_value(self, capsys, monkeypatch):
-        """--gate-catches codex emits ["codex"]."""
+        """--gate-catches codex emits {"codex":""}."""
         monkeypatch.setattr("sys.argv", [
             "append_merge_action_audit.py",
             "--event-type", "pr_merge",
@@ -884,7 +884,7 @@ class TestCLIIntegration:
         rc = main()
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out.strip())
-        assert parsed["gate_catches"] == ["codex"]
+        assert parsed["gate_catches"] == {"codex": ""}
 
     def test_blocked_action_cli_full_entry(self, capsys, monkeypatch):
         """Full blocked_action CLI invocation passes validation."""
