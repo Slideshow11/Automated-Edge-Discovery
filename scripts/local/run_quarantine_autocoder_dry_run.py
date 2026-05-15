@@ -736,8 +736,15 @@ def main(argv=None):
         print(f"[Phase 2] Wrote diff.patch (read-only git diff, {len(diff_content)} chars)")
 
         # changed_files.txt from git diff --name-only
-        files_count, changed_files, _ = collect_changed_files_list(args.source_repo, args.base_sha)
-        if changed_files:
+        files_count, changed_files, git_meta = collect_changed_files_list(args.source_repo, args.base_sha)
+        if git_meta.get("failed"):
+            changed_files_content = (
+                f"# git diff --name-only FAILED\n"
+                f"# git_rc={git_meta.get('git_rc')}\n"
+                f"# git_error={git_meta.get('git_error')!r}\n"
+                f"# changed_files could not be enumerated.\n"
+            )
+        elif changed_files:
             changed_files_content = "\n".join(changed_files)
         else:
             changed_files_content = "(no changed files)"
