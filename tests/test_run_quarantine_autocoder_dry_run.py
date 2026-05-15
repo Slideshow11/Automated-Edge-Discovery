@@ -266,6 +266,30 @@ class TestBundleDirValidation:
             assert rc != 0
             assert "root" in out + err or "production" in out + err
 
+    @pytest.mark.parametrize("prefix", ["hermes", "workflows", ".hermes", ".github"])
+    def test_rejects_forbidden_prefix_inside_repo(self, prefix):
+        """Forbidden prefix dirs (hermes/, workflows/, .hermes/) must be rejected.
+
+        Regression: the relative_to try/except pattern had reversed logic —
+        ValueError was raised when bundle WAS inside (not-raise expected),
+        so the except branch ran and passed even for inside dirs.
+        The is_inside flag pattern fixes this.
+        """
+        aed_root = Path(__file__).resolve().parents[1]
+        bundle = aed_root / prefix / "test-bundle"
+        rc, out, err = run_script(
+            "--dry-run",
+            "--source-repo", str(aed_root),
+            "--bundle-dir", str(bundle),
+            "--base-sha", "a" * 40,
+            "--candidate-id", "test-candidate",
+            "--objective", "test",
+        )
+        assert rc != 0, f"bundle_dir inside {prefix}/ should be rejected but rc={rc}"
+        combined = out + err
+        assert "production directory" in combined or prefix in combined, \
+            f"Expected rejection message for {prefix}, got: {combined!r}"
+
 
 class TestBundleFilesCreated:
     """Test that all expected bundle files are created in temp dir."""

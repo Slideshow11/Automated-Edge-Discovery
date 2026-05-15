@@ -80,13 +80,19 @@ def validate_bundle_dir(bundle_dir: str, force: bool) -> None:
     # Check against forbidden production directories under repo root
     for prefix in FORBIDDEN_BUNDLE_PREFIXES:
         protected = (repo_root_resolved / prefix).resolve()
+        # relative_to raises ValueError when bundle is NOT inside protected.
+        # is_relative_to() (Python 3.9+) returns True when bundle IS inside.
+        # Use the flag pattern to correctly handle the try/except logic.
+        is_inside = False
         try:
             bundle_dir_resolved.relative_to(protected)
+            is_inside = True
+        except ValueError:
+            pass  # not inside this prefix, continue
+        if is_inside:
             raise ValueError(
                 f"bundle_dir cannot be inside production directory: {prefix}"
             )
-        except ValueError:
-            pass  # not inside this prefix, continue
 
     # Reject if bundle dir IS the repo root
     if bundle_dir_resolved == repo_root_resolved:
