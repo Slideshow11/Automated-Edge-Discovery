@@ -490,9 +490,12 @@ def collect_safety_grep(
         else:  # outside_allowed_scope
             out_of_scope_violations.append(m)
 
-    # clean_for_task: true only when no violations in allowed scope AND no forbidden scope violations
-    # out-of-scope violations in non-forbidden areas do not make a task dirty
-    clean_for_task = len(allowed_scope_violations) == 0 and len(forbidden_scope_violations) == 0
+    # clean_for_task: true only when allowed scope has no violations.
+    # Forbidden-scope violations and out-of-scope violations are bucketed
+    # separately and do not affect the task-specific cleanliness signal.
+    # A reviewer checking "does this task's scope have violations?" gets
+    # a direct answer: allowed_scope violations == 0 → clean.
+    clean_for_task = len(allowed_scope_violations) == 0
 
     # Compute files_in_scope (files scanned that are in allowed scope)
     files_in_allowed_scope = set()
@@ -1052,6 +1055,37 @@ def main(argv=None):
     # ---- Read-only: scope check ----
     if args.collect_scope:
         scope_result = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
+        # Echo scope params into scope_check.json for reviewer convenience
+        # Validate scope args with same rigor as the safety-grep path (fail fast)
+        # so malformed scope args do not silently produce unscoped scope_check.json
+        if args.allowed_files_json is not None or args.forbidden_files_json is not None:
+            allowed_echo = []
+            forbidden_echo = []
+            try:
+                if args.allowed_files_json is not None:
+                    parsed = json.loads(args.allowed_files_json)
+                    if not isinstance(parsed, list):
+                        raise ValueError("allowed_files_json must be a JSON array")
+                    _validate_scope_path_list(parsed, "allowed_files")
+                    allowed_echo = parsed
+                if args.forbidden_files_json is not None:
+                    parsed = json.loads(args.forbidden_files_json)
+                    if not isinstance(parsed, list):
+                        raise ValueError("forbidden_files_json must be a JSON array")
+                    _validate_scope_path_list(parsed, "forbidden_files")
+                    forbidden_echo = parsed
+                scope_result["allowed_files"] = allowed_echo
+                scope_result["forbidden_files"] = forbidden_echo
+                scope_result["scope_applied"] = bool(allowed_echo or forbidden_echo)
+            except json.JSONDecodeError as e:
+                print(f"VALIDATION ERROR: scope JSON is not valid JSON: {e}")
+                sys.exit(1)
+            except ValueError as e:
+                print(f"VALIDATION ERROR: {e}")
+                sys.exit(1)
+            except Exception as e:
+                print(f"ERROR: failed to echo scope params into scope_check.json: {e}")
+                sys.exit(1)
         scope_check_path = os.path.join(args.bundle_dir, "scope_check.json")
         with open(scope_check_path, "w") as f:
             json.dump(scope_result, f, indent=2)
@@ -1136,21 +1170,54 @@ def main(argv=None):
         # Plus backward-compatible `actionable_violations` and `violations` keys for existing tests
         matches_by_scope = safety_grep_result.get("matches_by_scope", {})
         allowed_violations = matches_by_scope.get("allowed_scope_violations", [])
+        forbidden_violations = matches_by_scope.get("forbidden_scope_violations", [])
+        out_of_scope_violations = matches_by_scope.get("out_of_scope_violations", [])
+
+        # Scoped counts for violations_only.json top-level
+        executable_matches_in_allowed_scope = safety_grep_result.get("executable_matches_in_allowed_scope", 0)
+        executable_matches_in_forbidden_scope = safety_grep_result.get("executable_matches_in_forbidden_scope", 0)
+        executable_matches_out_of_scope = len(out_of_scope_violations)
+        scope_applied_val = safety_grep_result.get("scope_applied", False)
+        clean_for_task_val = safety_grep_result.get("clean_for_task", True)
+
+        # Determine allowed/forbidden cleanliness for summary
+        allowed_scope_status = "clean" if len(allowed_violations) == 0 else "dirty"
+        forbidden_scope_status = (
+            "clean" if len(forbidden_violations) == 0
+            else ("dirty" if scope_applied_val else "n/a")
+        )
+
         violations_only_payload = {
             # Backward-compatible keys (used by existing tests)
             "actionable_violations": len(allowed_violations),
             "violations": allowed_violations,
-            # New bucket format
-            "scope_applied": safety_grep_result.get("scope_applied", False),
-            "clean_for_task": safety_grep_result.get("clean_for_task", True),
+            # Backward-compatible cleanliness signal — mirrors clean_for_task
+            # when scope is applied, otherwise legacy repo-wide clean
+            "clean": clean_for_task_val,
+            # Scoped counts — single source of truth for review
+            "scope_applied": scope_applied_val,
+            "clean_for_task": clean_for_task_val,
+            "allowed_files": safety_grep_result.get("allowed_files", []),
+            "forbidden_files": safety_grep_result.get("forbidden_files", []),
+            "executable_matches_in_allowed_scope": executable_matches_in_allowed_scope,
+            "executable_matches_in_forbidden_scope": executable_matches_in_forbidden_scope,
+            "executable_matches_out_of_scope": executable_matches_out_of_scope,
+            # Violation buckets
             "allowed_scope_violations": allowed_violations,
-            "forbidden_scope_violations": matches_by_scope.get("forbidden_scope_violations", []),
-            "out_of_scope_violations": matches_by_scope.get("out_of_scope_violations", []),
+            "forbidden_scope_violations": forbidden_violations,
+            "out_of_scope_violations": out_of_scope_violations,
+            # Summary object
+            "task_clean_summary": {
+                "allowed_scope": allowed_scope_status,
+                "forbidden_scope": forbidden_scope_status,
+                "out_of_scope_suppressed": executable_matches_out_of_scope,
+                "clean_for_task": clean_for_task_val,
+            },
             "summary": {
                 "total": safety_grep_result.get("executable_matches_total", 0),
-                "in_allowed_scope": safety_grep_result.get("executable_matches_in_allowed_scope", 0),
-                "in_forbidden_scope": safety_grep_result.get("executable_matches_in_forbidden_scope", 0),
-                "out_of_scope": len(matches_by_scope.get("out_of_scope_violations", [])),
+                "in_allowed_scope": executable_matches_in_allowed_scope,
+                "in_forbidden_scope": executable_matches_in_forbidden_scope,
+                "out_of_scope": executable_matches_out_of_scope,
             },
         }
         violations_only_path = os.path.join(args.bundle_dir, "violations_only.json")
