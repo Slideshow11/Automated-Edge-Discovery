@@ -78,6 +78,7 @@ Without any `--collect-*` flags, Phase 2 produces the same placeholder bundle as
 ```json
 {
   "phase": "Phase 2",
+  "mode": "read_only_trace_collection",
   "dry_run": true,
   "agent_executed": false,
   "patch_applied": false,
@@ -95,47 +96,69 @@ Without any `--collect-*` flags, Phase 2 produces the same placeholder bundle as
 }
 ```
 
+**mode field values:**
+- `"placeholder_bundle"` — no `--collect-*` flags used; all bundle files are placeholders (Phase 1 style)
+- `"read_only_trace_collection"` — one or more `--collect-*` flags used; bundle contains real read-only evidence
+
+**Without any `--collect-*` flags, `mode` is `"placeholder_bundle"`** — same output as Phase 1. Using any collection flag switches `mode` to `"read_only_trace_collection"`.
+
 ## Phase 2 `scope_check.json` (with `--collect-scope`)
 
 ```json
 {
   "source_repo": "/path/to/repo",
   "bundle_dir": "/tmp/candidate-bundle",
-  "base_sha": "367ecdb1...",
+  "base_sha": "367ecdb...",
   "current_head": "abc123...",
   "files_changed_count": 5,
   "changed_files": ["file_a.py", "file_b.py"],
   "bundle_dir_outside_repo_root": false,
   "bundle_dir_inside_git": false,
-  "scope_clean": true
+  "scope_clean": true,
+  "scope_status": "clean",
+  "diff_status": "dirty"
 }
 ```
 
+**`diff_status` values:** `clean` (no changes), `dirty` (has changes), `failed` (git error), `unknown` (not computed)
+
 ## Phase 2 `safety_grep.txt` (with `--collect-safety-grep`)
 
-Distinguishes policy mentions (comments/docstrings) from executable usage:
+Starts with a human-readable summary header for quick review:
+
+```
+# Safety Grep Summary
+files_scanned: 42
+executable_matches: 0
+policy_mentions: 3
+clean: true
+details_format: json_below
+
+<JSON body follows>
+```
+
+**JSON body fields:**
 
 ```json
 {
   "patterns_checked": ["hermes kanban create", "gh pr merge", ...],
   "files_scanned": 42,
-  "forbidden_executable_matches": {
-    "scripts/bad.py": [
-      {"pattern": "gh pr merge", "line": 10, "text": "os.system(\"gh pr merge\")"}
-    ]
-  },
-  "forbidden_policy_mentions": {
-    "docs/policy.md": [
-      {"pattern": "hermes kanban create", "line": 5, "text": "# hermes kanban create is forbidden"}
-    ]
-  },
-  "total_executable_matches": 1,
-  "total_policy_mentions": 1,
-  "clean": false
+  "executable_matches_count": 0,
+  "policy_mentions_count": 3,
+  "forbidden_executable_matches": { ... },
+  "forbidden_policy_mentions": { ... },
+  "total_executable_matches": 0,
+  "total_policy_mentions": 3,
+  "clean": false,
+  "generated_at": "2026-05-16T00:32:24+00:00"
 }
 ```
 
-Policy mentions (lines starting with `#` or docstrings) are recorded separately from executable matches.
+**`clean` field logic:**
+- `true` — zero executable matches (policy mentions are allowed)
+- `false` — one or more executable matches found
+
+Policy mentions (lines starting with `#` or docstrings) are recorded separately from executable matches and do NOT affect the `clean` field.
 
 ## Phase 2 `local_gate.txt` (with `--collect-local-gate-preview`)
 

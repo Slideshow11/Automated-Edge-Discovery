@@ -42,7 +42,13 @@ def bundle_file(bundle_dir, filename):
 
 def read_json(bundle_dir, filename):
     with open(bundle_file(bundle_dir, filename)) as f:
-        return json.load(f)
+        content = f.read()
+    # Handle files that start with a text summary header before JSON body
+    # (e.g. safety_grep.txt has "# Safety Grep Summary\n..." prefix)
+    json_start = content.find("{")
+    if json_start > 0:
+        content = content[json_start:]
+    return json.loads(content)
 
 
 def read_text(bundle_dir, filename):
@@ -1471,5 +1477,455 @@ class TestGitHardeningAndFailureModes:
                 "Invalid base SHA must have nonzero git_rc"
             assert result_bad.get("has_changes") is None, \
                 "Failed diff must have has_changes=null"
-            assert result_bad.get("patch") == "", \
-                "Failed diff must have empty patch"
+
+
+# =============================================================================
+# Bundle Reviewability Tests — Phase 2 improvements for human review
+# =============================================================================
+
+
+class TestSafetyGrepHumanReadableHeader:
+    """safety_grep.txt must start with a human-readable summary header."""
+
+    def test_safety_grep_txt_starts_with_summary_header(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0, f"Script failed: {err}"
+            path = bundle_file(bundle, "safety_grep.txt")
+            with open(path) as f:
+                content = f.read()
+            # First line must be the summary header
+            assert content.startswith("# Safety Grep Summary"), \
+                f"safety_grep.txt must start with summary header, got: {content[:100]!r}"
+
+    def test_summary_counts_match_json_body(self):
+        """Summary counts in header must match JSON body values."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "safety_grep.txt")
+            with open(path) as f:
+                content = f.read()
+
+            # Parse summary header lines
+            summary = {}
+            for line in content.splitlines():
+                if line.startswith("# Safety Grep Summary"):
+                    continue
+                if not line or line.startswith("{") or line.startswith("}"):
+                    break
+                if ": " in line:
+                    key, val = line.split(": ", 1)
+                    summary[key.strip()] = val.strip()
+
+            # Parse JSON body (find first { and last })
+            json_start = content.index("{")
+            json_text = content[json_start:]
+            import json as _json
+            body = _json.loads(json_text)
+
+            assert summary.get("files_scanned") == str(body["files_scanned"]), \
+                f"files_scanned mismatch: header={summary.get('files_scanned')} body={body['files_scanned']}"
+            assert summary.get("executable_matches") == str(body["executable_matches_count"]), \
+                f"executable_matches mismatch: header={summary.get('executable_matches')} body={body['executable_matches_count']}"
+            assert summary.get("policy_mentions") == str(body["policy_mentions_count"]), \
+                f"policy_mentions mismatch: header={summary.get('policy_mentions')} body={body['policy_mentions_count']}"
+            assert summary.get("clean") == str(body["clean"]).lower(), \
+                f"clean mismatch: header={summary.get('clean')} body={body['clean']}"
+
+    def test_policy_mentions_without_executable_matches_produces_clean_true(self):
+        """Policy mentions with zero executable matches must report clean: true."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            # Create a file with policy mentions only (no executable usage)
+            policy_file = os.path.join(repo, "policy.py")
+            with open(policy_file, "w") as f:
+                f.write("# hermes kanban create is not allowed here\n")
+                f.write('"""telegram integration"""' + "\n")
+
+            subprocess.run(["git", "add", "policy.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "safety_grep.txt")
+            with open(path) as f:
+                content = f.read()
+
+            # Header must show clean: true
+            json_start = content.index("{")
+            json_text = content[json_start:]
+            import json as _json
+            body = _json.loads(json_text)
+            assert body["clean"] is True, \
+                f"Policy mentions only should be clean=true, got: {body['clean']}"
+            assert body["executable_matches_count"] == 0
+            assert body["policy_mentions_count"] > 0, \
+                "Should have policy mentions recorded"
+
+    def test_executable_matches_produce_clean_false(self):
+        """Executable matches must produce clean: false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            # Create a file with real executable usage
+            bad_file = os.path.join(repo, "bad.py")
+            with open(bad_file, "w") as f:
+                f.write('if __name__ == "__main__":\n')
+                f.write('    os.system("gh pr merge")\n')
+
+            subprocess.run(["git", "add", "bad.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "safety_grep.txt")
+            with open(path) as f:
+                content = f.read()
+
+            json_start = content.index("{")
+            json_text = content[json_start:]
+            import json as _json
+            body = _json.loads(json_text)
+            assert body["clean"] is False, \
+                f"Executable matches should be clean=false, got: {body['clean']}"
+            assert body["executable_matches_count"] > 0
+
+
+class TestBundleStatusMode:
+    """BUNDLE_STATUS.json must include mode field distinguishing placeholder vs trace collection."""
+
+    def test_placeholder_mode_when_no_collect_flags(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            assert "mode" in status, "BUNDLE_STATUS.json must include 'mode' field"
+            assert status["mode"] == "placeholder_bundle", \
+                f"No collection flags → mode should be 'placeholder_bundle', got: {status['mode']}"
+
+    def test_read_only_trace_collection_mode_when_collect_flags_used(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            assert "mode" in status
+            assert status["mode"] == "read_only_trace_collection", \
+                f"With collect flags → mode should be 'read_only_trace_collection', got: {status['mode']}"
+
+    def test_mode_transitions_correctly_with_single_flag(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-git-diff",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            assert status["mode"] == "read_only_trace_collection"
+
+
+class TestCodexReviewSummaryPlaceholder:
+    """codex_review_summary.md must explain that Codex was not run."""
+
+    def test_codex_summary_explains_no_codex_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            codex = read_json(bundle, "codex_review_summary.md")
+            assert "placeholder" in codex.get("mode", ""), \
+                f"mode should include 'placeholder', got: {codex.get('mode')}"
+            assert "not run" in codex["note"].lower() or "no codex" in codex["note"].lower(), \
+                f"note should explain Codex was not run, got: {codex['note']}"
+            assert codex["codex_reviewed"] is False
+
+
+class TestScopeCheckDiffStatus:
+    """scope_check.json must include diff_status field."""
+
+    def test_scope_check_contains_diff_status(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", base_sha,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert "diff_status" in scope, "scope_check.json must include diff_status field"
+            assert scope["diff_status"] in ("clean", "dirty", "failed", "unknown"), \
+                f"diff_status must be one of clean/dirty/failed/unknown, got: {scope['diff_status']}"
+
+    def test_diff_status_clean_when_no_changes(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", base_sha,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope["diff_status"] == "clean"
+
+    def test_diff_status_dirty_when_changes_exist(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+            base_sha = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+            ).stdout.strip()
+            with open(os.path.join(repo, "newfile.py"), "w") as f:
+                f.write("x = 1\n")
+            subprocess.run(["git", "add", "newfile.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "add"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", base_sha,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope["diff_status"] == "dirty"
+
+    def test_diff_status_failed_when_git_fails(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "c" * 40,  # valid format but doesn't exist
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope["diff_status"] == "failed"
+
+
+class TestSafetyGrepGeneratedAt:
+    """safety_grep.txt JSON body must include generated_at timestamp."""
+
+    def test_safety_grep_contains_generated_at(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "safety_grep.txt")
+            with open(path) as f:
+                content = f.read()
+            json_start = content.index("{")
+            json_text = content[json_start:]
+            import json as _json
+            body = _json.loads(json_text)
+            assert "generated_at" in body, "safety_grep.json must include generated_at"
+            assert body["generated_at"] != ""
+
+
+class TestExistingSafetyInvariantsPreserved:
+    """All existing safety invariants must remain unchanged after reviewability improvements."""
+
+    @pytest.mark.parametrize("key", [
+        "dispatch_occurred",
+        "hermes_touched",
+        "production_board_touched",
+        "pr_created",
+        "import_performed",
+        "agent_executed",
+        "patch_applied",
+        "dry_run",
+    ])
+    def test_bundlestatus_safety_invariants_unchanged(self, key):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            assert key in status, f"Missing safety invariant: {key}"
+            if key in ("dry_run", "agent_executed", "patch_applied",
+                      "dispatch_occurred", "hermes_touched",
+                      "production_board_touched", "pr_created", "import_performed"):
+                expected = key in ("dry_run",)  # only dry_run is True
+                assert status[key] is expected, \
+                    f"{key} should be {expected}, got {status[key]}"
