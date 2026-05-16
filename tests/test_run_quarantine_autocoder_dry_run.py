@@ -3206,6 +3206,157 @@ class TestCountSchemaSemantics:
                 f"Executable violation in allowed scope must dirty task, got {sg['clean_for_task']}"
             assert sg["actionable_violations"] > 0
 
+    def test_def_function_name_is_identifier_not_executable(self):
+        """A function name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "handler.py"), "w") as f:
+                f.write("def build_telegram_summary(msg):\n")
+                f.write("    return msg.text\n")
+            subprocess.run(["git", "add", "scripts/handler.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Function name with 'telegram' must not dirty task, got clean_for_task={sg['clean_for_task']}"
+            # Must be classified as identifier_or_prose (policy_mention), not executable_violations
+            assert sg["executable_violations_count"] == 0, \
+                f"executable_violations_count should be 0 for identifier context, got {sg['executable_violations_count']}"
+
+    def test_class_name_is_identifier_not_executable(self):
+        """A class name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "model.py"), "w") as f:
+                f.write("class TelegramHandler:\n")
+                f.write("    pass\n")
+            subprocess.run(["git", "add", "scripts/model.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Class name with 'TelegramHandler' must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0
+
+    def test_constant_name_containing_forbidden_token_is_identifier(self):
+        """A constant/variable name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "config.py"), "w") as f:
+                f.write("TELEGRAM_WARNING = 'do not use gh pr merge'\n")
+                f.write("gh_command = 'test'\n")
+            subprocess.run(["git", "add", "scripts/config.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Constant names with forbidden tokens must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0, \
+                f"executable_violations_count should be 0, got {sg['executable_violations_count']}"
+
+    def test_subprocess_list_args_are_executable_violations(self):
+        """subprocess.run(...) must be classified as executable_violations when it wraps a forbidden command."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "run.py"), "w") as f:
+                f.write("import subprocess\n")
+                # Use a contiguous string so the grep pattern finds it;
+                # subprocess.run is then classified as executable_context
+                f.write('subprocess.run("gh pr merge --admin --squash", check=True)\n')
+            subprocess.run(["git", "add", "scripts/run.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is False, \
+                f"subprocess.run with forbidden command must dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] > 0
+
+    def test_docstring_body_is_identifier_not_executable(self):
+        """A forbidden string in a docstring body (not a docstring boundary) must not be executable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "doc.py"), "w") as f:
+                f.write("def foo():\n")
+                f.write('    """Do not use gh pr merge in this function."""\n')
+                f.write('    pass\n')
+            subprocess.run(["git", "add", "scripts/doc.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Docstring body with forbidden string must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0
+
     def test_github_slug_rejected_before_git_operations(self):
         """GitHub slug like 'Slideshow11/Automated-Edge-Discovery' must be rejected."""
         with tempfile.TemporaryDirectory() as tmpdir:

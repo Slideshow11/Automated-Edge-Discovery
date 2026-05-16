@@ -104,6 +104,32 @@ EXECUTABLE_CONTEXT_PATTERNS = frozenset([
 ])
 
 
+def _is_inside_docstring(line: str) -> bool:
+    """
+    Return True if the line is inside a multi-line triple-quote docstring.
+
+    Detects whether a line is between an opening triple-quote and its closing
+    triple-quote by counting unescaped triple-quote occurrences on the line.
+    An odd count means the line is inside (not at boundary or outside).
+    Lines that START a docstring (open or close) are treated as the boundary
+    and return False (they are handled separately).
+    """
+    # Count occurrences of triple-quote patterns on this line
+    # We look for both styles: triple-single and triple-double
+    count_double = line.count('"""')
+    count_single = line.count("'''")
+
+    # Simple heuristic: if line contains triple-quote delimiters, odd count
+    # means we're inside (not at boundary, not outside)
+    # If no triple-quotes at all, line cannot be inside a docstring by this check
+    total = count_double + count_single
+    if total == 0:
+        return False
+
+    # If total is odd, we're inside the docstring (not at a boundary)
+    return total % 2 == 1
+
+
 def is_suppressed_context(line: str, pattern: str) -> tuple[bool, str]:
     """
     Determine whether a pattern match in a line is in a suppressed context.
@@ -131,10 +157,9 @@ def is_suppressed_context(line: str, pattern: str) -> tuple[bool, str]:
             stripped.startswith('r"""') or stripped.startswith("r'''"):
         return (True, "docstring")
 
-    # Check if inside a docstring (simple heuristic: line contains the pattern
-    # but the preceding non-blank line was a docstring opener not yet closed)
-    # For simplicity: if line contains '"""' or "'''" and pattern is in a
-    # string context (line has odd quote count), treat as docstring
+    # Check if line is inside a multi-line docstring (not at boundary)
+    if _is_inside_docstring(line):
+        return (True, "docstring")
 
     # Check argparse help pattern
     if "--" in stripped and any(cmd in stripped for cmd in EXECUTABLE_MUTATION_COMMANDS):
@@ -160,6 +185,104 @@ def is_suppressed_context(line: str, pattern: str) -> tuple[bool, str]:
     return (False, "executable_context")
 
 
+# Lines that START a new code/identifier context (not executable, not suppressed).
+# If a forbidden token appears here, it's an identifier/prose reference, not execution.
+IDENTIFIER_CONTEXT_PATTERNS = frozenset([
+    "def ",     # function definition — token appears in function name, not execution
+    "class ",   # class definition — token appears in class name, not execution
+    "async def ",
+    "async class ",
+    "import ",  # import statement — token is module name, not execution
+    "from ",    # from-import statement
+    "async for ",
+    "async with ",
+    "async if ",
+    "async def ",  # already covered but explicit
+])
+
+# Regex to detect assignment to a name (variable/constant/class attribute)
+# Token appears in LHS of assignment, not execution
+# e.g. TELEGRAM_WARNING = "..." → identifier (constant name)
+# e.g. telegram_handler = func() → identifier (variable name)
+# e.g. self.telegram = x → identifier (attribute name)
+# e.g. result = subprocess.run(...) → executable (RHS has execution)
+# e.g. x = os.system(...) → executable (RHS has execution)
+# e.g. x = "gh pr merge" → identifier (string literal, no execution)
+# e.g. x = "telegram" → identifier (string literal, no execution)
+
+
+def _token_appears_in_identifier(token: str, identifier: str) -> bool:
+    """
+    Return True if token or any of its words appear in identifier as a word-level match.
+
+    E.g.:
+    - token="gh", identifier="gh_command" → True (gh is a word-level match)
+    - token="gh pr create", identifier="gh_command" → True (gh is a word-level match)
+    - token="gh pr create", identifier="pr_handler" → True (pr is a word-level match)
+    - token="telegram", identifier="TELEGRAM_WARNING" → True (case-insensitive)
+    - token="telegram", identifier="telegram_msg" → True
+    """
+    identifier_lower = identifier.lower()
+
+    # For multi-token commands, check if ANY word of the token appears as identifier word
+    token_words = token.lower().split()
+    for word in token_words:
+        # Word-level check: split identifier by common separators
+        parts = re.split(r'[_\-\.]', identifier_lower)
+        if word in parts:
+            return True
+
+    # Also check whole token as substring (for exact multi-token command match in identifier)
+    if token in identifier_lower:
+        return True
+
+    return False
+
+
+def is_identifier_or_prose_context(line: str) -> bool:
+    """
+    Return True if the line is a definition/identifier context rather than execution.
+
+    These contexts mean a forbidden token appears in a name (function, class, variable,
+    constant, attribute) or as a prose/documentation reference, NOT as an
+    executable command invocation.
+    """
+    stripped = line.strip()
+
+    # Definition lines: def, class, import, async variants
+    for pattern in IDENTIFIER_CONTEXT_PATTERNS:
+        if pattern in stripped:
+            idx = stripped.find(pattern)
+            if idx == 0 or (idx > 0 and stripped[idx - 1] in " \t("):
+                return True
+
+    # Assignment where forbidden token is in the variable name (LHS of =)
+    # e.g. gh_command = "test" → yes (gh is in identifier)
+    # e.g. TELEGRAM_WARNING = "..." → yes (telegram is in identifier)
+    # e.g. x = "forbidden" → no (token is in string value on RHS)
+    # e.g. result = subprocess.run(...) → no (token is in RHS execution)
+    # e.g. "hermes kanban create", → no (token is a value in a list, not identifier)
+    if "=" in line:
+        lhs = line.split("=", 1)[0]
+        if "(" not in lhs:
+            lhs_stripped = lhs.strip()
+            # Only consider it an identifier if LHS looks like a Python identifier name
+            # (alphanumeric, underscore, dot for attributes) — not a string literal
+            # e.g. "gh_command" → yes
+            # e.g. "TELEGRAM_WARNING" → yes
+            # e.g. '"hermes kanban create"' → no (string literal in LHS)
+            import re as _re
+            # A valid identifier LHS: starts with letter or underscore, may contain dots
+            # Does NOT contain quotes, brackets, or operators
+            if _re.match(r'^[a-zA-Z_][a-zA-Z0-9_\.]*$', lhs_stripped):
+                # Check each EXECUTABLE_MUTATION_COMMANDS token as word-level identifier match
+                for token in EXECUTABLE_MUTATION_COMMANDS:
+                    if _token_appears_in_identifier(token, lhs_stripped):
+                        return True
+
+    return False
+
+
 def is_executable_context(line: str) -> bool:
     """Return True if the line contains executable-context patterns."""
     for pattern in EXECUTABLE_CONTEXT_PATTERNS:
@@ -176,6 +299,53 @@ def is_test_file(path: str) -> bool:
     """
     name = os.path.basename(path)
     return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _is_policy_description_tuple(line: str, pattern: str) -> bool:
+    """
+    Return True if the line looks like a policy-description tuple or list-item entry.
+
+    Policy-description entries are metadata describing what constitutes a policy
+    mention. They appear in structured data (frozenset, list, dict) and have forms like:
+        ("gh pr merge", "argparse_help"),  → tuple entry
+        ("hermes kanban create", "docstring"), → tuple entry
+        "gh pr merge",  → list item (single pattern string, no context label)
+        ("git push", "comment"), → tuple entry
+
+    These are NOT executable code — they are documentation/metadata about the policy.
+    """
+    stripped = line.strip()
+
+    # Must contain the pattern as a quoted string
+    if f'"{pattern}"' not in line and f"'{pattern}'" not in line:
+        return False
+
+    # Count quoted strings in line
+    import re as _re
+    quoted_count = len(_re.findall(r'"[^"]*"|' + "'" + r"[^']*'" + "'", line))
+
+    # Tuple entry: 2 quoted strings — ("pattern", "context_label"),
+    if quoted_count == 2:
+        # Tuple: has opening paren, then pattern, then comma, then context, then close paren
+        tuple_pattern = _re.search(r'\(\s*"[^"]+"\s*,\s*"[^"]+"\s*\)', line)
+        if tuple_pattern:
+            return True
+        # Tuple entry ending with comma (multi-entry frozenset/list)
+        tuple_pattern_end = _re.search(r'\(\s*"[^"]+"\s*,\s*"[^"]+"\s*\)\s*,', line)
+        if tuple_pattern_end:
+            return True
+
+    # Single-item list entry: 1 quoted string — "pattern", (list item)
+    # This is a pattern string in a list (like EXECUTABLE_MUTATION_COMMANDS list)
+    if quoted_count == 1:
+        # Check if line looks like a list item with a single quoted pattern string
+        # e.g. '    "gh pr merge",' or '    "telegram",'
+        # Should have: optional whitespace, comma, quotes, comma at end
+        if stripped.startswith('"') or stripped.startswith(","):
+            # Line is a single-item string entry (no context label tuple)
+            return True
+
+    return False
 
 
 def validate_scope_json_args(
@@ -624,6 +794,8 @@ def collect_safety_grep(
         "suppressed_contexts": [],
     }
 
+    in_docstring = False  # tracks whether we're currently inside a triple-quote docstring
+
     for fpath in py_files:
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as f:
@@ -632,32 +804,72 @@ def collect_safety_grep(
             continue
 
         rel_path = os.path.relpath(fpath, source_resolved)
+        in_docstring = False  # reset per file
 
         for lineno, line in enumerate(lines, 1):
+            # Track docstring state
+            # Count triple-quote occurrences on this line to detect open/close boundaries
+            triple_double = line.count('"""') + line.count('r"""')
+            triple_single = line.count("'''") + line.count("r'''")
+            triple_total = triple_double + triple_single
+
+            # Update in_docstring based on triple-quote count on this line
+            # Only toggle on ODD counts (1, 3, ...): one net boundary transition per line
+            # Even counts (2, 4, ...): balanced open+close on same line → no net change
+            # For count=1: one boundary transition — enter if outside, exit if inside
+            # This correctly handles:
+            #   - single-line docstrings: """text""" (count=2, even → no change)
+            #   - opening line when outside: """ (count=1, outside → toggle on/enter)
+            #   - closing line when inside: """ (count=1, inside → toggle off/exit)
+            #   - body lines: no triple quotes (count=0, no change)
+            #   - adjacent function docstrings: close (count=1, inside → exit) then open (count=1, outside → enter)
+            if triple_total > 0 and triple_total % 2 == 1:
+                in_docstring = not in_docstring
+
             for pattern in patterns:
                 if pattern not in line:
                     continue
 
-                # Determine if this match is in a suppressed/policy context
-                suppressed, reason = is_suppressed_context(line, pattern)
-                # Override: if the line has executable-context patterns, it is
-                # always an executable violation, not a policy mention
+                # ---- Classification ladder ----
+                # A. Executable context: always a violation (wins over all other classifications)
                 is_exec_ctx = is_executable_context(line)
-
                 if is_exec_ctx:
                     classification = "executable_violations"
                     reason = "executable_context"
-                elif suppressed:
-                    if reason in ("comment", "docstring"):
-                        classification = "policy_mentions"
-                    else:
-                        classification = "suppressed_contexts"
+
+                # B. Identifier or prose context: policy mention, not executable
+                #    e.g. def build_telegram_summary(...), TELEGRAM_WARNING = "...", import telegram
+                elif is_identifier_or_prose_context(line):
+                    classification = "policy_mentions"
+                    reason = "identifier_or_prose"
+
+                # C. Suppressed context: comment, docstring, argparse help, generated example
                 else:
-                    # Not suppressed, not in executable context
-                    # Check if it's in a non-test file that is clearly code
-                    # (not a docstring or comment)
-                    classification = "executable_violations"
-                    reason = "unknown"
+                    suppressed, reason = is_suppressed_context(line, pattern)
+                    if suppressed:
+                        if reason in ("comment", "docstring"):
+                            classification = "policy_mentions"
+                        else:
+                            classification = "suppressed_contexts"
+
+                    # D. Policy-description tuple in a frozenset/list context
+                    #    e.g. ("gh pr merge", "argparse_help"), — these are metadata describing
+                    #    what constitutes a policy mention, not executable violations
+                    elif _is_policy_description_tuple(line, pattern):
+                        classification = "suppressed_contexts"
+                        reason = "policy_description_tuple"
+
+                    # E. Unknown: not executable, not suppressed, not identifier
+                    #    Conservative — classify as executable violation rather than silently passing
+                    else:
+                        classification = "executable_violations"
+                        reason = "unknown"
+
+                # Override for docstring lines: suppress any match inside a docstring
+                # (handles lines in middle of multi-line docstrings that have no triple quotes)
+                if in_docstring and classification == "executable_violations":
+                    classification = "policy_mentions"
+                    reason = "docstring"
 
                 match_entry = {
                     "pattern": pattern,
