@@ -811,6 +811,11 @@ def collect_safety_grep(
         in_docstring = False  # reset per file
 
         for lineno, line in enumerate(lines, 1):
+            # Capture docstring state BEFORE updating it for this line.
+            # The classification ladder needs to know whether the current line
+            # started inside a docstring (before any close toggle fires), not after.
+            was_in_docstring = in_docstring
+
             # Track docstring state
             # Count triple-quote occurrences on this line to detect open/close boundaries
             triple_double = line.count('"""') + line.count('r"""')
@@ -903,11 +908,15 @@ def collect_safety_grep(
                 classification = None
                 reason = None
 
-                # A. Executable context: always a violation (wins over all other classifications)
-                is_exec_ctx = is_executable_context(line)
-                if is_exec_ctx:
-                    classification = "executable_violations"
-                    reason = "executable_context"
+                # A. Suppressed context (docstring boundary line): lines STARTING with
+                # triple quotes are policy/documentation, not executable. Check BEFORE
+                # executable context to handle docstring open/close lines correctly.
+                #    e.g. """Example: subprocess.run("gh pr merge", shell=True)"""
+                #    e.g. r"""Policy: hermes kanban create"""
+                stripped_line = line.lstrip()
+                if stripped_line.startswith('"""') or stripped_line.startswith("'''"):
+                    classification = "policy_mentions"
+                    reason = "docstring"
 
                 # B. Raw docstring boundary (single-line raw docstring open+close on same line):
                 #    r"""...""" or R'''...''' → policy mention, not executable violation.
@@ -924,6 +933,32 @@ def collect_safety_grep(
                         if not after_close:
                             classification = "policy_mentions"
                             reason = "docstring"
+
+                # C. Docstring-ending line: if the line STARTED inside a docstring
+                #    (was_in_docstring=True) and this line closes it (content before
+                #    closing triple-quote), treat as docstring even if the line also
+                #    contains executable-context patterns.
+                #    e.g. 'Example: os.system("git push")"""' — the os.system is part
+                #    of the docstring content, not executable code after the docstring.
+                #    Detected by: was_in_docstring=True AND line has content before closing triple.
+                elif was_in_docstring:
+                    # Check if line has content before the closing triple-quote
+                    # (meaning this is a docstring-closing line, not code after the docstring)
+                    try:
+                        tp = stripped_line.index('"""') if '"""' in stripped_line else stripped_line.index("'''")
+                        if tp > 0:  # content before triple → docstring close line
+                            classification = "policy_mentions"
+                            reason = "docstring"
+                    except ValueError:
+                        pass
+
+                # D. Executable context: always a violation (wins over all other
+                #    non-suppressed classifications)
+                if classification is None:
+                    is_exec_ctx = is_executable_context(line)
+                    if is_exec_ctx:
+                        classification = "executable_violations"
+                        reason = "executable_context"
 
                 # C. Identifier or prose context: policy mention, not executable
                 #    e.g. def build_telegram_summary(...), TELEGRAM_WARNING = "...", import telegram
