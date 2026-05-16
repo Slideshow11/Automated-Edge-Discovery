@@ -97,10 +97,24 @@ def gh_pr_info(pr_number: int, repo: str) -> dict:
 
 
 def gh_runs_for_sha(sha: str, repo: str) -> list[dict]:
-    """Get CI runs for a specific SHA via GitHub Actions API."""
+    """Get CI runs for a specific SHA via GitHub Actions API.
+
+    Uses --method GET to ensure gh sends the query parameters as a URL-encoded
+    GET request rather than switching to POST (which the Actions runs endpoint rejects).
+    """
     result = subprocess.run(
-        ["gh", "api", f"repos/{repo}/actions/runs", "--paginate", "-f", "head_sha=" + sha],
-        capture_output=True, text=True
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/actions/runs",
+            "--method",
+            "GET",
+            "--paginate",
+            "-f",
+            "head_sha=" + sha,
+        ],
+        capture_output=True,
+        text=True,
     )
     if result.returncode != 0:
         return []

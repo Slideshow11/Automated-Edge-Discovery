@@ -116,8 +116,12 @@ class TestValidateCiGreen:
 
 
 class TestGhRunsPagination:
-    def test_actions_runs_endpoint_used(self):
-        """Verify gh_runs_for_sha uses the GitHub Actions API endpoint."""
+    def test_actions_runs_endpoint_used_with_get_method(self):
+        """Verify gh_runs_for_sha uses the GitHub Actions API endpoint with --method GET.
+
+        The -f flag without --method GET causes gh to use POST, which the read-only
+        Actions runs endpoint rejects. The --method GET flag is required.
+        """
         import aed_final_gate as gate
         import subprocess
         from unittest.mock import MagicMock, patch
@@ -128,8 +132,13 @@ class TestGhRunsPagination:
             mock_run.assert_called_once()
             mock_call_args = str(mock_run.call_args[0][0])
             # Must use actions/runs endpoint, not commits/{sha}/runs
-            assert "actions/runs" in mock_call_args
-            assert "commits/" not in mock_call_args
+            assert "actions/runs" in mock_call_args, "Must use actions/runs endpoint"
+            assert "commits/" not in mock_call_args, "Must not use commits/{sha}/runs"
+            # Must include --method GET to avoid gh switching to POST
+            assert "--method" in mock_call_args, "Must specify --method"
+            assert "GET" in mock_call_args, "Must use GET method"
+            # Must pass head_sha correctly
+            assert "head_sha=abc123" in mock_call_args, "Must pass head_sha parameter"
 
 
 class TestValidateCodexArtifactHead:
