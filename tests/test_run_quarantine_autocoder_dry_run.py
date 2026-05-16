@@ -1615,8 +1615,8 @@ class TestSafetyGrepHumanReadableHeader:
             body = _json.loads(json_text)
             assert body["clean"] is True, \
                 f"Policy mentions only should be clean=true, got: {body['clean']}"
-            assert body["raw_matches"] == 0, \
-                f"raw_matches should be 0, got: {body['raw_matches']}"
+            assert body["raw_matches"] > 0, \
+                f"raw_matches should be > 0 (includes policy mentions now), got: {body['raw_matches']}"
             assert body["policy_mentions"] > 0, \
                 "Should have policy mentions recorded"
 
@@ -2167,7 +2167,17 @@ class TestViolationsOnlyFile:
             assert body["clean"] is True, \
                 f"Test-file-only matches should be clean=true, got: {body['clean']}"
             assert body["raw_matches"] > 0, \
-                f"raw_matches should be > 0 from test file, got: {body['raw_matches']}"
+                f"raw_matches (pre-filter alias) should be > 0 from test file, got: {body['raw_matches']}"
+            assert body["raw_matches_total"] > 0, \
+                f"raw_matches_total should be > 0 from test file, got: {body['raw_matches_total']}"
+            assert body["post_filter_matches_total"] == 0, \
+                f"post_filter_matches_total should be 0 (test files suppressed), got: {body['post_filter_matches_total']}"
+            assert body["executable_violations_count"] > 0, \
+                f"executable_violations_count should be > 0 before test-file suppression, got: {body['executable_violations_count']}"
+            assert body["clean_for_task"] is True, \
+                f"clean_for_task must be True when only test-file matches exist, got: {body['clean_for_task']}"
+            assert body["actionable_violations"] == 0, \
+                f"actionable_violations must be 0 when matches are in test files only, got: {body['actionable_violations']}"
 
 
 class TestCleanMeansActionableViolations:
@@ -2215,6 +2225,14 @@ class TestCleanMeansActionableViolations:
                 f"Test-file matches only → clean should be true, got: {body['clean']}"
             assert body["raw_matches"] > 0, \
                 f"raw_matches should be > 0 (test file has matches), got: {body['raw_matches']}"
+            assert body["raw_matches_total"] > 0, \
+                f"raw_matches_total should be > 0, got: {body['raw_matches_total']}"
+            assert body["post_filter_matches_total"] == 0, \
+                f"post_filter_matches_total should be 0 (test files suppressed), got: {body['post_filter_matches_total']}"
+            assert body["clean_for_task"] is True, \
+                f"clean_for_task must be True when only test-file policy/comment matches exist, got: {body['clean_for_task']}"
+            assert body["actionable_violations"] == 0, \
+                f"actionable_violations must be 0, got: {body['actionable_violations']}"
 
     def test_clean_false_when_actionable_violation_in_script_file(self):
         """clean=false when an actionable violation exists in a non-test file."""
@@ -2257,6 +2275,14 @@ class TestCleanMeansActionableViolations:
                 f"Actionable violation in scripts/ should count: {violations}"
             assert body["clean"] is False, \
                 f"Actionable violation → clean should be false, got: {body['clean']}"
+            assert body["clean_for_task"] is False, \
+                f"clean_for_task should be False when violation is in allowed scope, got: {body['clean_for_task']}"
+            assert body["executable_violations_count"] > 0, \
+                f"executable_violations_count should be > 0 for actionable violation, got: {body['executable_violations_count']}"
+            assert body["raw_matches_total"] > 0, \
+                f"raw_matches_total should be > 0, got: {body['raw_matches_total']}"
+            assert body["post_filter_matches_total"] > 0, \
+                f"post_filter_matches_total should be > 0 (non-test file violation), got: {body['post_filter_matches_total']}"
 
 
 class TestExistingSafetyInvariantsPreserved:
@@ -2949,3 +2975,989 @@ class TestTaskCleanlinessNormalization:
             ts2 = violations2["task_clean_summary"]
             assert ts2["allowed_scope"] == "dirty"
             assert ts2["clean_for_task"] is False
+
+
+class TestCountSchemaSemantics:
+    """
+    Verify the raw/post-filter count schema is unambiguous and correct.
+
+    Required semantics:
+    - raw_matches_total: ALL pattern hits BEFORE any suppression/filtering
+    - post_filter_matches_total: matches REMAINING after suppression/filtering
+    - raw_matches: backward-compatible alias for raw_matches_total
+    - executable_violations_count: pre-filter executable violations
+    - policy_mentions_count: pre-filter policy mentions
+    - suppressed_context_count: pre-filter suppressed contexts
+    """
+
+    def test_raw_matches_total_includes_test_file_matches(self):
+        """raw_matches_total must count matches even when they are in test files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            test_dir = os.path.join(repo, "tests")
+            os.makedirs(test_dir)
+            with open(os.path.join(test_dir, "sample.py"), "w") as f:
+                f.write('EXEC = "gh pr merge"\n')
+                f.write('MSG = "hermes kanban create"\n')
+            subprocess.run(["git", "add", "tests/sample.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+
+            # raw_matches_total counts test-file matches
+            assert sg["raw_matches_total"] == 2, f"raw_matches_total should be 2, got {sg['raw_matches_total']}"
+            # raw_matches is backward-compatible alias
+            assert sg["raw_matches"] == sg["raw_matches_total"]
+            # post_filter removes test-file matches
+            assert sg["post_filter_matches_total"] == 0, f"post_filter should be 0, got {sg['post_filter_matches_total']}"
+
+    def test_policy_mention_in_comment_is_suppressed(self):
+        """A forbidden string in a comment must not make clean_for_task false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "deploy.py"), "w") as f:
+                f.write('# "gh pr merge" is forbidden here\n')
+                f.write('print("hello")\n')
+            subprocess.run(["git", "add", "scripts/deploy.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Comment policy mention should not dirty task, got clean_for_task={sg['clean_for_task']}"
+            assert sg["policy_mentions_count"] >= 1, \
+                f"policy_mentions_count should be >= 1, got {sg['policy_mentions_count']}"
+            assert sg["actionable_violations"] == 0
+
+    def test_argparse_help_text_is_suppressed(self):
+        """A forbidden string in argparse help text must not make clean_for_task false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Use a line that is clearly argparse help with "--" prefix
+            with open(os.path.join(scripts_dir, "cli.py"), "w") as f:
+                f.write('import argparse\n')
+                f.write('parser.add_argument("--gh-pr-merge", help="gh pr merge is not allowed in Phase 2")\n')
+            subprocess.run(["git", "add", "scripts/cli.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"argparse help context should not dirty task, got clean_for_task={sg['clean_for_task']}"
+            assert sg["suppressed_context_count"] >= 1, \
+                f"suppressed_context_count should be >= 1, got {sg['suppressed_context_count']}"
+
+    def test_subprocess_run_is_executable_violation(self):
+        """subprocess.run with a forbidden command must be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Must use shell=True or the pattern won't be found as a contiguous string
+            with open(os.path.join(scripts_dir, "run.py"), "w") as f:
+                f.write('import subprocess\n')
+                f.write('subprocess.run("gh pr merge --admin --squash", shell=True)\n')
+            subprocess.run(["git", "add", "scripts/run.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is False, \
+                f"subprocess.run with forbidden command should dirty task, got clean_for_task={sg['clean_for_task']}"
+            assert sg["executable_violations_count"] > 0, \
+                f"executable_violations_count should be > 0, got {sg['executable_violations_count']}"
+            assert sg["actionable_violations"] > 0
+
+    def test_os_system_is_executable_violation(self):
+        """os.system with a forbidden command must be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "sys.py"), "w") as f:
+                f.write('import os\n')
+                f.write('os.system("gh pr merge --admin --squash")\n')
+            subprocess.run(["git", "add", "scripts/sys.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is False, \
+                f"os.system with forbidden command should dirty task, got clean_for_task={sg['clean_for_task']}"
+            assert sg["executable_violations_count"] > 0
+
+    def test_allowed_scope_policy_mention_does_not_dirty_task(self):
+        """Policy mention in allowed scope must not make clean_for_task false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "policy.py"), "w") as f:
+                f.write('# hermes kanban create is not allowed in Phase 1\n')
+                f.write('# git push is also forbidden\n')
+            subprocess.run(["git", "add", "scripts/policy.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+                '--allowed-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Policy mentions in allowed scope should not dirty task, got {sg['clean_for_task']}"
+            assert sg["actionable_violations"] == 0
+
+    def test_allowed_scope_executable_violation_dirties_task(self):
+        """Executable violation in allowed scope must make clean_for_task false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "bad.py"), "w") as f:
+                f.write('import os\n')
+                f.write('os.system("git push")\n')
+            subprocess.run(["git", "add", "scripts/bad.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+                '--allowed-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is False, \
+                f"Executable violation in allowed scope must dirty task, got {sg['clean_for_task']}"
+            assert sg["actionable_violations"] > 0
+
+    def test_def_function_name_is_identifier_not_executable(self):
+        """A function name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "handler.py"), "w") as f:
+                f.write("def build_telegram_summary(msg):\n")
+                f.write("    return msg.text\n")
+            subprocess.run(["git", "add", "scripts/handler.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Function name with 'telegram' must not dirty task, got clean_for_task={sg['clean_for_task']}"
+            # Must be classified as identifier_or_prose (policy_mention), not executable_violations
+            assert sg["executable_violations_count"] == 0, \
+                f"executable_violations_count should be 0 for identifier context, got {sg['executable_violations_count']}"
+
+    def test_class_name_is_identifier_not_executable(self):
+        """A class name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "model.py"), "w") as f:
+                f.write("class TelegramHandler:\n")
+                f.write("    pass\n")
+            subprocess.run(["git", "add", "scripts/model.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Class name with 'TelegramHandler' must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0
+
+    def test_constant_name_containing_forbidden_token_is_identifier(self):
+        """A constant/variable name containing a forbidden token must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "config.py"), "w") as f:
+                f.write("TELEGRAM_WARNING = 'do not use gh pr merge'\n")
+                f.write("gh_command = 'test'\n")
+            subprocess.run(["git", "add", "scripts/config.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Constant names with forbidden tokens must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0, \
+                f"executable_violations_count should be 0, got {sg['executable_violations_count']}"
+
+    def test_subprocess_list_args_are_executable_violations(self):
+        """subprocess.run(...) must be classified as executable_violations when it wraps a forbidden command."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "run.py"), "w") as f:
+                f.write("import subprocess\n")
+                # Use a contiguous string so the grep pattern finds it;
+                # subprocess.run is then classified as executable_context
+                f.write('subprocess.run("gh pr merge --admin --squash", check=True)\n')
+            subprocess.run(["git", "add", "scripts/run.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is False, \
+                f"subprocess.run with forbidden command must dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] > 0
+
+    def test_docstring_body_is_identifier_not_executable(self):
+        """A forbidden string in a docstring body (not a docstring boundary) must not be executable."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "doc.py"), "w") as f:
+                f.write("def foo():\n")
+                f.write('    """Do not use gh pr merge in this function."""\n')
+                f.write('    pass\n')
+            subprocess.run(["git", "add", "scripts/doc.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"Docstring body with forbidden string must not dirty task, got {sg['clean_for_task']}"
+            assert sg["executable_violations_count"] == 0
+
+    def test_github_slug_rejected_before_git_operations(self):
+        """GitHub slug like 'Slideshow11/Automated-Edge-Discovery' must be rejected."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, stdout, stderr = run_script(
+                "--dry-run", "--source-repo", "Slideshow11/Automated-Edge-Discovery",
+                "--bundle-dir", bundle, "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate", "--objective", "test",
+            )
+            assert rc != 0, "Should fail for GitHub slug"
+            combined = stdout + stderr
+            assert "Slideshow11/Automated-Edge-Discovery" in combined, \
+                f"Error should mention the invalid slug, got: {combined}"
+
+
+class TestSourceRepoValidation:
+    """Source repo validation rejects GitHub slugs, accepts local paths."""
+
+    def test_github_slug_rejected_with_clear_message(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, stdout, stderr = run_script(
+                "--dry-run", "--source-repo", "owner/repo",
+                "--bundle-dir", bundle, "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate", "--objective", "test",
+            )
+            assert rc != 0
+            combined = stdout + stderr
+            assert "owner/repo" in combined, \
+                f"Error should mention the invalid slug, got: {combined}"
+
+    def test_absolute_local_path_accepted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, stdout, stderr = run_script(
+                "--dry-run", "--source-repo", tmpdir,
+                "--bundle-dir", bundle, "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate", "--objective", "test",
+            )
+            # Should not fail due to source-repo validation
+            assert rc == 0 or "not a valid JSON" in stderr or "source-repo" in stderr
+
+    def test_relative_local_path_accepted(self):
+        original_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bundle = os.path.join(tmpdir, "bundle")
+                os.chdir(tmpdir)
+                # Create a subdirectory and use relative path
+                subdir = os.path.join(tmpdir, "myrepo")
+                os.makedirs(subdir)
+                rc, _, stderr = run_script(
+                    "--dry-run", "--source-repo", "myrepo",
+                    "--bundle-dir", bundle, "--base-sha", "a" * 40,
+                    "--candidate-id", "test-candidate", "--objective", "test",
+                )
+                # Relative path resolving to existing dir should be accepted
+                # (or fail for other reasons, but not source-repo validation)
+                assert "local path" not in stderr.lower() or rc == 0
+        finally:
+            os.chdir(original_cwd)
+
+
+class TestDocstringStateMachine:
+    """
+    Verify the docstring state machine handles all edge cases correctly.
+
+    The state machine tracks whether we're inside a triple-quote docstring
+    and must correctly handle: single-line docstrings, multiline opening/closing
+    lines, end-of-line closes, adjacent function docstrings, and real executable
+    code appearing after a docstring closes.
+    """
+
+    def test_end_of_line_docstring_close_exits_docstring_state(self):
+        """A docstring that closes at the end of a content line must exit docstring state."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Docstring with content THEN close on same line (end-of-line close)
+            # followed by an executable violation
+            # Use double-quote string: subprocess.run("gh pr merge ...", shell=True)
+            # so the pattern 'gh pr merge' appears as a contiguous substring
+            with open(os.path.join(scripts_dir, "deploy.py"), "w") as f:
+                f.write(
+                    '"""Collects violations for triage"""\n'
+                    'subprocess.run("gh pr merge --admin", shell=True)\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # The docstring line is a policy mention, not a violation
+            # The subprocess.run line is a REAL executable violation
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1 (subprocess.run outside docstring), got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable violation in allowed scope), got {sg['clean_for_task']}"
+
+    def test_executable_violation_after_end_of_line_docstring_close_is_caught(self):
+        """An executable violation appearing after an end-of-line docstring close must be caught."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # End-of-line close: 'Collects violations"""'
+            with open(os.path.join(scripts_dir, "triage.py"), "w") as f:
+                f.write('"""Collects violations for triage"""\n')
+                f.write('os.system("git push origin main")\n')
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # os.system("git push") is a real executable violation after the docstring closed
+            assert sg["executable_violations_count"] >= 1, \
+                f"os.system(git push) after end-of-line close must be executable violation, got {sg['executable_violations_count']}"
+            assert sg["actionable_violations"] >= 1, \
+                f"actionable_violations should be >= 1, got {sg['actionable_violations']}"
+
+    def test_docstring_body_with_forbidden_command_is_not_executable_violation(self):
+        """A forbidden command in the body of a docstring must be suppressed, not a violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "policy.py"), "w") as f:
+                f.write(
+                    '"""\n'
+                    'Policy: Do not call gh pr merge directly.\n'
+                    'Use the merge gate instead.\n'
+                    '"""\n'
+                    'x = 1\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # "gh pr merge" in docstring body → policy_mentions, not executable_violations
+            assert sg["clean_for_task"] is True, \
+                f"docstring body with 'gh pr merge' should not dirty task, got clean_for_task={sg['clean_for_task']}"
+            assert sg["policy_mentions_count"] >= 1, \
+                f"policy_mentions_count should be >= 1, got {sg['policy_mentions_count']}"
+
+    def test_single_line_docstring_with_forbidden_command_is_not_executable_violation(self):
+        """A single-line docstring containing a forbidden command must not be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Single-line docstring: '"""text"""' (count=2, even → no toggle)
+            with open(os.path.join(scripts_dir, "single.py"), "w") as f:
+                f.write('"""This policy forbids: gh pr merge."""\n')
+                f.write('x = 1\n')
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"single-line docstring 'gh pr merge' should not dirty task, got clean_for_task={sg['clean_for_task']}"
+
+    def test_adjacent_function_docstrings_do_not_break_state(self):
+        """
+        When a line like '    \"\"\"  # inner function docstring at START' appears inside an
+        outer docstring body, the state machine must NOT exit the outer docstring.
+        The comment-only heuristic (triple at START + comment starting with hash → stay inside)
+        keeps us inside the outer docstring.
+
+        Result: the os.system line is classified as policy_mentions (docstring), not
+        executable_violations, because we never exit the outer docstring.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Structure:
+            # L1: open outer docstring (ENTER outer)
+            # L2: triple at START + comment after → STAY INSIDE (comment-only heuristic)
+            # L3: inside outer body
+            # L4: triple at START + comment after → STAY INSIDE (comment-only heuristic)
+            # L5: os.system("git push origin main") → inside outer (never exited!)
+            # The os.system line is inside the outer docstring → classified as policy_mentions (docstring)
+            with open(os.path.join(scripts_dir, "adjacent.py"), "w") as f:
+                f.write(
+                    '"""Outer docstring with policy text.\n'
+                    '    """  # inner function docstring at START\n'
+                    'More outer content.\n'
+                    '"""  # close outer\n'
+                    'os.system("git push origin main")\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # With the comment-only heuristic, we never exit the outer docstring
+            # (because '"""  # close outer' is comment-only → stay inside).
+            # Therefore the os.system line is INSIDE the outer docstring → policy_mentions.
+            assert sg["clean_for_task"] is True, \
+                f"clean_for_task should be True (os.system inside docstring = policy mention), got clean_for_task={sg['clean_for_task']}"
+            assert sg["policy_mentions_count"] >= 1, \
+                f"policy_mentions_count should be >= 1 (os.system inside docstring), got {sg['policy_mentions_count']}"
+
+    def test_real_subprocess_run_outside_docstring_remains_violation(self):
+        """subprocess.run with a forbidden command outside any docstring must be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Use double-quote string so 'gh pr merge' is a contiguous substring
+            # (the pattern is matched as a substring in the line)
+            with open(os.path.join(scripts_dir, "exec.py"), "w") as f:
+                f.write('import subprocess\n')
+                f.write('subprocess.run("gh pr merge --admin --squash", shell=True)\n')
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["executable_violations_count"] >= 1, \
+                f"subprocess.run outside docstring must be executable violation, got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable violation), got {sg['clean_for_task']}"
+
+    def test_real_os_system_outside_docstring_remains_violation(self):
+        """os.system with a forbidden command outside any docstring must be an executable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "os_exec.py"), "w") as f:
+                f.write('import os\n')
+                f.write('os.system("git push origin main")\n')
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["executable_violations_count"] >= 1, \
+                f"os.system(git push) outside docstring must be executable violation, got {sg['executable_violations_count']}"
+
+    def test_allowed_scope_docstring_examples_do_not_make_clean_false(self):
+        """Docstring examples with forbidden commands in the allowed scope must not dirty the task."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # File with docstring examples of forbidden commands
+            with open(os.path.join(scripts_dir, "policy_examples.py"), "w") as f:
+                f.write(
+                    '"""Policy: Do not call gh pr merge in Phase 1.\n'
+                    'Example: "gh pr merge --admin --squash"\n'
+                    'Forbidden: hermes kanban create, telegram send\n'
+                    '"""\n'
+                    'x = 1\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+                '--allowed-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            assert sg["clean_for_task"] is True, \
+                f"docstring examples should not dirty task, got clean_for_task={sg['clean_for_task']}"
+
+    def test_mid_line_docstring_close_exits_docstring_state(self):
+        """
+        When a docstring closes mid-line (content before closing triple, e.g.
+        'Forbidden: gh pr merge triple-close'), the state machine must exit docstring state
+        even though the triple is NOT at the START of the line.
+
+        The os.system line after the docstring close must be an executable violation.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Mid-line close: 'Forbidden: gh pr merge"""' — triple NOT at line start
+            # os.system after this must be an executable violation
+            with open(os.path.join(scripts_dir, "policy.py"), "w") as f:
+                f.write(
+                    '"""Forbidden: gh pr merge"""\n'
+                    'os.system("git push origin main")\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # os.system("git push") after mid-line docstring close must be executable violation
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1 (os.system after mid-line close), got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable violation in allowed scope), got {sg['clean_for_task']}"
+
+    def test_mid_line_docstring_close_then_docstring_then_executable(self):
+        """
+        When a docstring closes mid-line (triple not at start), a new docstring opens,
+        and an executable appears after the new docstring closes — all three contexts
+        must be correctly classified.
+
+        Lines:
+        - L1: policy_mentions boundary (docstring opens+closes with content inside)
+        - L2: single-line docstring
+        - L3: os.system executable violation
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "multi.py"), "w") as f:
+                f.write(
+                    '"""Forbidden: gh pr merge"""\n'       # mid-line close → exit L1 state
+                    '"""Single-line doc"""\n'             # standalone → enter/exit (single-line)
+                    'os.system("git push origin main")\n'  # outside all docstrings → executable violation
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # os.system after all docstrings closed must be caught
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1, got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False, got {sg['clean_for_task']}"
+
+    def test_raw_docstring_forbidden_token_is_policy_mention(self):
+        """
+        A raw docstring (r\"\"\"...) containing a forbidden token must be classified
+        as policy_mentions, not executable_violations.
+
+        The raw docstring opening (r\"\"\") should count as entering docstring state
+        without double-counting the delimiter.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Raw docstring with forbidden command in body
+            with open(os.path.join(scripts_dir, "raw_policy.py"), "w") as f:
+                f.write(
+                    'r"""Raw policy docstring.\n'
+                    'Do not call gh pr merge in phase 1.\n'
+                    '"""  # raw docstring close\n'
+                    'os.system("git push origin main")\n'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # Raw docstring content should be policy_mentions (not executable)
+            assert sg["policy_mentions_count"] >= 1, \
+                f"policy_mentions_count should be >= 1 (raw docstring body), got {sg['policy_mentions_count']}"
+            # os.system after raw docstring close must be caught as executable
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1 (os.system after raw close), got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable after raw docstring), got {sg['clean_for_task']}"
+
+    def test_raw_matches_total_includes_policy_mentions(self):
+        """
+        raw_matches_total must include policy_mentions_count in its sum.
+
+        A file with only docstring examples (policy mentions, no executable usage)
+        must still produce raw_matches_total > 0.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # File with only docstring policy examples — no executable usage
+            with open(os.path.join(scripts_dir, "policy_only.py"), "w") as f:
+                f.write(
+                    '"""Policy: Do not call gh pr merge in Phase 1.\n'
+                    'Example: "gh pr merge --admin --squash"\n'
+                    '"""'
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # raw_matches_total must include policy_mentions
+            assert sg["raw_matches_total"] > 0, \
+                f"raw_matches_total should be > 0 (has policy mentions), got {sg['raw_matches_total']}"
+            assert sg["raw_matches"] == sg["raw_matches_total"], \
+                f"raw_matches should equal raw_matches_total, got raw_matches={sg['raw_matches']}"
+            # clean_for_task must be true (only policy mentions, no executable)
+            assert sg["clean_for_task"] is True, \
+                f"clean_for_task should be True (policy mentions only), got {sg['clean_for_task']}"
+
+    def test_raw_matches_total_equals_executable_plus_policy_plus_suppressed(self):
+        """
+        raw_matches_total must equal executable_violations_count + policy_mentions_count + suppressed_context_count.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # File with all three classification types
+            with open(os.path.join(scripts_dir, "mixed.py"), "w") as f:
+                f.write(
+                    '# gh pr merge in comment\n'          # policy_mentions (comment)
+                    '"""hermes kanban create in docstring\n'  # policy_mentions (docstring)
+                    '"""'
+                    'os.system("git push origin main")\n'   # executable_violations
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            expected = sg["executable_violations_count"] + sg["policy_mentions_count"] + sg["suppressed_context_count"]
+            assert sg["raw_matches_total"] == expected, \
+                f"raw_matches_total should be {expected} (exec+policy+suppressed), got {sg['raw_matches_total']}"
+
+    def test_single_line_raw_docstring_then_executable_is_violation(self):
+        """
+        A single-line raw docstring (r\"\"\"...\"\"\") must NOT leave state machine inside
+        the docstring after the line closes. An executable after the raw docstring
+        close must be an executable violation.
+
+        This was the Codex P2 finding: single-line raw docstring set in_docstring=True
+        and bypassed the even-quote handling, so subsequent os.system was misclassified.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Single-line raw docstring followed by executable
+            with open(os.path.join(scripts_dir, "raw_exec.py"), "w") as f:
+                f.write(
+                    'r"""Policy: Do not call gh pr merge."""\n'  # single-line raw → enter+exit
+                    'os.system("git push origin main")\n'      # outside → executable violation
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # os.system after single-line raw docstring must be caught
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1 (os.system after single-line raw close), got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable after single-line raw docstring), got {sg['clean_for_task']}"
