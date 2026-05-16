@@ -2527,3 +2527,425 @@ class TestEarlyScopeJsonValidation:
             scope = read_json(bundle, "scope_check.json")
             assert "scope_applied" in scope
             assert scope["scope_applied"] is False
+
+
+class TestTaskCleanlinessNormalization:
+    """Task cleanliness fields must be unambiguous and machine-parseable.
+
+    clean_for_task is based ONLY on allowed_scope violations.
+    Forbidden-scope and out-of-scope findings are visible separately
+    and do NOT make clean_for_task = false.
+    """
+
+    def test_clean_for_task_true_when_allowed_scope_clean(self):
+        """clean_for_task=true when allowed scope has zero violations,
+        even when forbidden scope has violations (they don't dirty the task)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Create a violation in scripts/ (forbidden scope)
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "bad.py"), "w") as f:
+                f.write("os.system('hermes kanban create')\n")
+            # Create clean docs/ file (allowed scope)
+            docs_dir = os.path.join(repo, "docs")
+            os.makedirs(docs_dir)
+            with open(os.path.join(docs_dir, "good.md"), "w") as f:
+                f.write("# Just a doc\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0, f"Script should succeed: rc={rc}"
+            violations = read_json(bundle, "violations_only.json")
+            assert violations["clean_for_task"] is True, \
+                f"Allowed scope clean → clean_for_task=true, got: {violations['clean_for_task']}"
+            assert violations["executable_matches_in_allowed_scope"] == 0, \
+                f"Allowed scope should have 0 matches, got: {violations['executable_matches_in_allowed_scope']}"
+            assert violations["executable_matches_in_forbidden_scope"] > 0, \
+                f"Forbidden scope should have matches, got: {violations['executable_matches_in_forbidden_scope']}"
+            assert violations["task_clean_summary"]["clean_for_task"] is True
+
+    def test_clean_for_task_false_when_allowed_scope_has_violation(self):
+        """clean_for_task=false when allowed scope has an actionable violation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Create violation in docs/ (allowed scope)
+            docs_dir = os.path.join(repo, "docs")
+            os.makedirs(docs_dir)
+            with open(os.path.join(docs_dir, "bad.py"), "w") as f:
+                f.write("os.system('gh pr merge')\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            assert violations["clean_for_task"] is False, \
+                f"Allowed scope has violation → clean_for_task=false, got: {violations['clean_for_task']}"
+            assert violations["executable_matches_in_allowed_scope"] > 0
+            assert violations["task_clean_summary"]["allowed_scope"] == "dirty"
+
+    def test_clean_for_task_false_when_executable_in_allowed_scope(self):
+        """Executable match in allowed scope makes clean_for_task=false."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Put forbidden command in a scripts/ file but allow scripts/
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "check.py"), "w") as f:
+                f.write("os.system('gh pr merge --admin')\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            assert violations["clean_for_task"] is False, \
+                f"Executable in allowed scope → clean_for_task=false, got: {violations['clean_for_task']}"
+            assert violations["executable_matches_in_allowed_scope"] > 0
+
+    def test_clean_for_task_not_affected_by_out_of_scope_matches(self):
+        """Out-of-scope violations do not affect clean_for_task."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Create violation in scripts/ (out of allowed scope, not forbidden)
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "bad.py"), "w") as f:
+                f.write("os.system('gh pr merge')\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            # docs/ is clean, scripts/ is out of scope — clean_for_task should be true
+            assert violations["clean_for_task"] is True, \
+                f"Out-of-scope violation should NOT affect clean_for_task, got: {violations['clean_for_task']}"
+            assert violations["executable_matches_out_of_scope"] > 0
+            assert violations["executable_matches_in_allowed_scope"] == 0
+
+    def test_normalized_count_fields_are_explicit_integers_not_null(self):
+        """Count fields must be explicit integers (0), never null, when scope applied."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            for field in (
+                "executable_matches_in_allowed_scope",
+                "executable_matches_in_forbidden_scope",
+                "executable_matches_out_of_scope",
+                "allowed_scope_violations_count",
+                "forbidden_scope_violations_count",
+                "out_of_scope_violations_count",
+            ):
+                assert field in violations, f"Missing field: {field}"
+                assert violations[field] == 0, \
+                    f"{field} should be 0 (not null), got: {repr(violations[field])}"
+
+    def test_normalized_array_fields_are_empty_arrays_not_null(self):
+        """Array fields must be empty arrays ([]), never null, when scope applied."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            for field in (
+                "allowed_scope_violations",
+                "forbidden_scope_violations",
+                "out_of_scope_violations",
+            ):
+                assert field in violations, f"Missing field: {field}"
+                assert isinstance(violations[field], list), \
+                    f"{field} should be list, got: {type(violations[field]).__name__}"
+                assert violations[field] == [], \
+                    f"{field} should be [] (not null), got: {repr(violations[field])}"
+
+    def test_violations_only_and_safety_grep_agree_on_scope_counts(self):
+        """safety_grep.txt and violations_only.json must agree on scoped counts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            # Read safety_grep.txt text format
+            import json as _json
+            sg_path = bundle_file(bundle, "safety_grep.txt")
+            sg_text = open(sg_path).read()
+            json_start = sg_text.index("{")
+            sg_body = _json.loads(sg_text[json_start:])
+
+            violations = read_json(bundle, "violations_only.json")
+            for field in (
+                "executable_matches_in_allowed_scope",
+                "executable_matches_in_forbidden_scope",
+                "executable_matches_out_of_scope",
+            ):
+                assert sg_body.get(field) == violations.get(field), \
+                    f"safety_grep.txt[{field}]={sg_body.get(field)} != violations_only[{field}]={violations.get(field)}"
+
+    def test_scope_check_echoes_scope_args_without_null_fields(self):
+        """scope_check.json echoes scope args; no null match count fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            scope = read_json(bundle, "scope_check.json")
+            assert scope.get("allowed_files") == ["docs/"]
+            assert scope.get("forbidden_files") == ["scripts/"]
+            assert scope.get("scope_applied") is True
+            # No null match fields in scope_check — scope_check is about git diff,
+            # not about executable match counts
+            for key in scope:
+                assert scope[key] is not None or key in (
+                    "scope_clean", "diff_status", "git_error",
+                    "files_changed_count", "bundle_dir_outside_repo_root",
+                    "bundle_dir_inside_git", "git_rc",
+                ), f"Unexpected null field in scope_check: {key} = {scope[key]}"
+
+    def test_summary_total_equals_bucket_sum_post_filter(self):
+        """summary.total must equal in_allowed_scope + in_forbidden_scope + out_of_scope
+        (total is post-test-file-filter sum, not executable_matches_total).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Create violation in scripts/ (forbidden scope)
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "bad.py"), "w") as f:
+                f.write("os.system('gh pr merge')\n")
+            # Create clean docs/ file (allowed scope)
+            docs_dir = os.path.join(repo, "docs")
+            os.makedirs(docs_dir)
+            with open(os.path.join(docs_dir, "good.md"), "w") as f:
+                f.write("# Doc\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            total = violations["summary"]["total"]
+            bucket_sum = (
+                violations["summary"]["in_allowed_scope"]
+                + violations["summary"]["in_forbidden_scope"]
+                + violations["summary"]["out_of_scope"]
+            )
+            assert total == bucket_sum, \
+                f"summary.total={total} must equal sum of buckets={bucket_sum}"
+
+    def test_task_clean_summary_schema_complete(self):
+        """task_clean_summary must contain all required fields in both clean/dirty states."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Case 1: allowed_scope clean
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "bad.py"), "w") as f:
+                f.write("os.system('gh pr merge')\n")
+            docs_dir = os.path.join(repo, "docs")
+            os.makedirs(docs_dir)
+            with open(os.path.join(docs_dir, "good.md"), "w") as f:
+                f.write("# Doc\n")
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            ts = violations["task_clean_summary"]
+            for field in ("allowed_scope", "forbidden_scope", "out_of_scope_suppressed", "clean_for_task"):
+                assert field in ts, f"task_clean_summary missing: {field}"
+            assert ts["allowed_scope"] == "clean"
+            assert ts["forbidden_scope"] == "dirty"
+            assert ts["out_of_scope_suppressed"] == 0
+            assert ts["clean_for_task"] is True
+
+            # Case 2: allowed_scope dirty
+            repo2 = os.path.join(tmpdir, "repo2")
+            os.makedirs(repo2)
+            subprocess.run(["git", "init"], cwd=repo2, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo2, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo2, capture_output=True)
+            docs2_dir = os.path.join(repo2, "docs")
+            os.makedirs(docs2_dir)
+            with open(os.path.join(docs2_dir, "bad.py"), "w") as f:
+                f.write("os.system('gh pr merge')\n")
+            subprocess.run(["git", "add", "."], cwd=repo2, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo2, capture_output=True)
+
+            bundle2 = os.path.join(tmpdir, "bundle2")
+            rc2, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo2,
+                "--bundle-dir", bundle2,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+            )
+            assert rc2 == 0
+            violations2 = read_json(bundle2, "violations_only.json")
+            ts2 = violations2["task_clean_summary"]
+            assert ts2["allowed_scope"] == "dirty"
+            assert ts2["clean_for_task"] is False
