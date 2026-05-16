@@ -2292,3 +2292,238 @@ class TestExistingSafetyInvariantsPreserved:
                 expected = key in ("dry_run",)  # only dry_run is True
                 assert status[key] is expected, \
                     f"{key} should be {expected}, got {status[key]}"
+
+
+class TestEarlyScopeJsonValidation:
+    """Scope JSON must be validated BEFORE any bundle files are written.
+
+    Malformed scope JSON (invalid JSON, non-list, invalid paths) must exit(1)
+    before the bundle directory is created or modified, preventing partial bundles
+    and blocking re-runs that would require --force.
+    """
+
+    def test_malformed_allowed_files_json_with_collect_scope_exits_before_bundle(
+        self,
+    ):
+        """Malformed --allowed-files-json with --collect-scope exits nonzero before any bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '{ invalid json }',
+            )
+            assert rc != 0, "Must exit nonzero for malformed JSON"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle), (
+                "Bundle dir must NOT be created when scope JSON is malformed"
+            )
+
+    def test_malformed_forbidden_files_json_with_collect_scope_exits_before_bundle(
+        self,
+    ):
+        """Malformed --forbidden-files-json with --collect-scope exits nonzero before any bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--forbidden-files-json', '["scripts/", --invalid]',
+            )
+            assert rc != 0, "Must exit nonzero for malformed JSON"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle), (
+                "Bundle dir must NOT be created when scope JSON is malformed"
+            )
+
+    def test_malformed_scope_json_with_collect_safety_grep_exits_before_bundle(
+        self,
+    ):
+        """Malformed scope JSON with --collect-safety-grep still fails early."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '{"not": "a list"}',
+            )
+            assert rc != 0, "Must exit nonzero for non-list JSON"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle), (
+                "Bundle dir must NOT be created when scope JSON is malformed"
+            )
+
+    def test_valid_scope_json_with_collect_scope_writes_scope_check_json(
+        self,
+    ):
+        """Valid scope JSON with --collect-scope writes scope_check.json with scope fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '["docs/", "schemas/"]',
+                '--forbidden-files-json', '["scripts/", ".github/"]',
+            )
+            assert rc == 0, f"Must succeed with valid scope JSON: {out}\n{err}"
+            scope = read_json(bundle, "scope_check.json")
+            assert "allowed_files" in scope, "scope_check.json must include allowed_files"
+            assert "forbidden_files" in scope, "scope_check.json must include forbidden_files"
+            assert "scope_applied" in scope, "scope_check.json must include scope_applied"
+            assert scope["allowed_files"] == ["docs/", "schemas/"]
+            assert scope["forbidden_files"] == ["scripts/", ".github/"]
+            assert scope["scope_applied"] is True
+
+    def test_valid_scope_json_with_collect_safety_grep_writes_safety_grep_with_scope(
+        self,
+    ):
+        """Valid scope JSON with --collect-safety-grep writes safety_grep.txt with scope-scoped fields."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+                '--allowed-files-json', '["docs/"]',
+                '--forbidden-files-json', '["scripts/"]',
+            )
+            assert rc == 0, f"Must succeed with valid scope JSON: {out}\n{err}"
+            safety = read_json(bundle, "safety_grep.txt")
+            assert safety.get("scope_applied") is True
+            assert safety.get("allowed_files") == ["docs/"]
+            assert safety.get("forbidden_files") == ["scripts/"]
+            assert "clean_for_task" in safety
+
+    def test_invalid_path_entry_exits_before_bundle(self):
+        """Absolute path entry in scope JSON fails before bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '["/absolute/path"]',
+            )
+            assert rc != 0, "Must exit nonzero for absolute path"
+            assert "VALIDATION ERROR" in out + err
+            assert "absolute paths" in (out + err).lower() or "invalid path" in (out + err).lower()
+            assert not os.path.exists(bundle)
+
+    def test_double_dot_path_entry_exits_before_bundle(self):
+        """'..' in scope path entry fails before bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '["../escape"]',
+            )
+            assert rc != 0, "Must exit nonzero for '..' path"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle)
+
+    def test_empty_string_entry_exits_before_bundle(self):
+        """Empty string in scope list fails before bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '["docs/", ""]',
+            )
+            assert rc != 0, "Must exit nonzero for empty string entry"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle)
+
+    def test_non_list_json_exits_before_bundle(self):
+        """Non-list JSON (dict, string, number) fails before bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '"docs/"',
+            )
+            assert rc != 0, "Must exit nonzero for non-array JSON"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle)
+
+    def test_non_string_list_items_exits_before_bundle(self):
+        """Non-string items in scope JSON array fail before bundle writes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+                '--allowed-files-json', '[123]',
+            )
+            assert rc != 0, "Must exit nonzero for non-string array item"
+            assert "VALIDATION ERROR" in out + err
+            assert not os.path.exists(bundle)
+
+    def test_no_scope_mode_still_works(self):
+        """Running without any scope JSON still creates bundle successfully."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, out, err = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-scope",
+            )
+            assert rc == 0, f"No-scope mode must succeed: {out}\n{err}"
+            assert os.path.isdir(bundle), "Bundle must be created"
+            scope = read_json(bundle, "scope_check.json")
+            assert "scope_applied" in scope
+            assert scope["scope_applied"] is False
