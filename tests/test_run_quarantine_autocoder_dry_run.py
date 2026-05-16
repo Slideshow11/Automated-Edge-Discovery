@@ -3400,20 +3400,24 @@ class TestSourceRepoValidation:
             assert rc == 0 or "not a valid JSON" in stderr or "source-repo" in stderr
 
     def test_relative_local_path_accepted(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bundle = os.path.join(tmpdir, "bundle")
-            os.chdir(tmpdir)
-            # Create a subdirectory and use relative path
-            subdir = os.path.join(tmpdir, "myrepo")
-            os.makedirs(subdir)
-            rc, _, stderr = run_script(
-                "--dry-run", "--source-repo", "myrepo",
-                "--bundle-dir", bundle, "--base-sha", "a" * 40,
-                "--candidate-id", "test-candidate", "--objective", "test",
-            )
-            # Relative path resolving to existing dir should be accepted
-            # (or fail for other reasons, but not source-repo validation)
-            assert "local path" not in stderr.lower() or rc == 0
+        original_cwd = os.getcwd()
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                bundle = os.path.join(tmpdir, "bundle")
+                os.chdir(tmpdir)
+                # Create a subdirectory and use relative path
+                subdir = os.path.join(tmpdir, "myrepo")
+                os.makedirs(subdir)
+                rc, _, stderr = run_script(
+                    "--dry-run", "--source-repo", "myrepo",
+                    "--bundle-dir", bundle, "--base-sha", "a" * 40,
+                    "--candidate-id", "test-candidate", "--objective", "test",
+                )
+                # Relative path resolving to existing dir should be accepted
+                # (or fail for other reasons, but not source-repo validation)
+                assert "local path" not in stderr.lower() or rc == 0
+        finally:
+            os.chdir(original_cwd)
 
 
 class TestDocstringStateMachine:
