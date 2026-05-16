@@ -543,9 +543,10 @@ def collect_safety_grep(
         else:  # outside_allowed_scope
             out_of_scope_violations.append(m)
 
-    # clean_for_task: true only when no violations in allowed scope AND no forbidden scope violations
-    # out-of-scope violations in non-forbidden areas do not make a task dirty
-    clean_for_task = len(allowed_scope_violations) == 0 and len(forbidden_scope_violations) == 0
+    # clean_for_task: true only when allowed scope has zero violations.
+    # Forbidden-scope findings are reported separately and do NOT dirty the task.
+    # Out-of-scope findings are also reported separately and do NOT dirty the task.
+    clean_for_task = len(allowed_scope_violations) == 0
 
     # Compute files_in_scope (files scanned that are in allowed scope)
     files_in_allowed_scope = set()
@@ -580,6 +581,7 @@ def collect_safety_grep(
         "executable_matches_total": total_executable,
         "executable_matches_in_allowed_scope": len(allowed_scope_violations),
         "executable_matches_in_forbidden_scope": len(forbidden_scope_violations),
+        "executable_matches_out_of_scope": len(out_of_scope_violations),
         "policy_mentions_total": total_policy,
         "clean_for_task": clean_for_task,
         "violations": [
@@ -1162,6 +1164,7 @@ def main(argv=None):
             f.write(f"executable_matches_total: {safety_grep_result.get('executable_matches_total', 0)}\n")
             f.write(f"executable_matches_in_allowed_scope: {safety_grep_result.get('executable_matches_in_allowed_scope', 0)}\n")
             f.write(f"executable_matches_in_forbidden_scope: {safety_grep_result.get('executable_matches_in_forbidden_scope', 0)}\n")
+            f.write(f"executable_matches_out_of_scope: {len(safety_grep_result.get('matches_by_scope', {}).get('out_of_scope_violations', []))}\n")
             f.write(f"policy_mentions: {safety_grep_result.get('policy_mentions_total', 0)}\n")
             f.write(f"test_or_context_matches: {safety_grep_result.get('policy_mentions_total', 0)}\n")
             f.write(f"actionable_violations: {safety_grep_result.get('actionable_violations', 0)}\n")
@@ -1177,25 +1180,49 @@ def main(argv=None):
               f"{safety_grep_result.get('files_scanned_total', 0)} files total, "
               f"{safety_grep_result.get('executable_matches_in_allowed_scope', 0)} in allowed scope, "
               f"{safety_grep_result.get('executable_matches_in_forbidden_scope', 0)} in forbidden scope)")
-        # Write violations_only.json — bucket format with scope classification
-        # Plus backward-compatible `actionable_violations` and `violations` keys for existing tests
+        # Write violations_only.json — normalized bucket format with scope classification
+        # All count fields are always explicit integers (0, never null).
+        # All array fields are always arrays ([] if empty).
+        # clean_for_task is based on allowed_scope only — forbidden and out-of-scope
+        # findings are visible but do not dirty the task.
         matches_by_scope = safety_grep_result.get("matches_by_scope", {})
         allowed_violations = matches_by_scope.get("allowed_scope_violations", [])
+        forbidden_violations = matches_by_scope.get("forbidden_scope_violations", [])
+        oos_violations = matches_by_scope.get("out_of_scope_violations", [])
         violations_only_payload = {
             # Backward-compatible keys (used by existing tests)
             "actionable_violations": len(allowed_violations),
             "violations": allowed_violations,
-            # New bucket format
+            # Scope classification
             "scope_applied": safety_grep_result.get("scope_applied", False),
             "clean_for_task": safety_grep_result.get("clean_for_task", True),
+            # Normalized explicit count fields — always present, never null
+            "executable_matches_in_allowed_scope": len(allowed_violations),
+            "executable_matches_in_forbidden_scope": len(forbidden_violations),
+            "executable_matches_out_of_scope": len(oos_violations),
+            "allowed_scope_violations_count": len(allowed_violations),
+            "forbidden_scope_violations_count": len(forbidden_violations),
+            "out_of_scope_violations_count": len(oos_violations),
+            # Normalized explicit arrays — always present, never null
             "allowed_scope_violations": allowed_violations,
-            "forbidden_scope_violations": matches_by_scope.get("forbidden_scope_violations", []),
-            "out_of_scope_violations": matches_by_scope.get("out_of_scope_violations", []),
+            "forbidden_scope_violations": forbidden_violations,
+            "out_of_scope_violations": oos_violations,
+            # Task cleanliness summary
+            "task_clean_summary": {
+                "allowed_scope": "clean" if len(allowed_violations) == 0 else "dirty",
+                "forbidden_scope": "dirty" if len(forbidden_violations) > 0 else "clean",
+                "out_of_scope_suppressed": len(oos_violations),
+                "clean_for_task": safety_grep_result.get("clean_for_task", True),
+            },
+            # Aggregated counts for the summary
             "summary": {
-                "total": safety_grep_result.get("executable_matches_total", 0),
-                "in_allowed_scope": safety_grep_result.get("executable_matches_in_allowed_scope", 0),
-                "in_forbidden_scope": safety_grep_result.get("executable_matches_in_forbidden_scope", 0),
-                "out_of_scope": len(matches_by_scope.get("out_of_scope_violations", [])),
+                # total is the sum of scoped buckets (post-test-file-filter),
+                # so total == in_allowed_scope + in_forbidden_scope + out_of_scope
+                # (unlike executable_matches_total which is pre-filter).
+                "total": len(allowed_violations) + len(forbidden_violations) + len(oos_violations),
+                "in_allowed_scope": len(allowed_violations),
+                "in_forbidden_scope": len(forbidden_violations),
+                "out_of_scope": len(oos_violations),
             },
         }
         violations_only_path = os.path.join(args.bundle_dir, "violations_only.json")
