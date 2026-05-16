@@ -928,7 +928,14 @@ def collect_safety_grep(
                         )
                         if last_triple >= 0:
                             after_close = stripped_line[last_triple + 3:].strip()
-                            if not after_close:
+                            # after_close is non-suppressed if:
+                            # - empty (docstring ends at line end)
+                            # - only a comment (starts with #)
+                            # - only a docstring continuation (starts with \)
+                            # Otherwise it contains executable code → do not suppress
+                            is_comment_only = after_close.startswith('#')
+                            is_docstring_continuation = after_close.startswith('\\')
+                            if not after_close or is_comment_only or is_docstring_continuation:
                                 classification = "policy_mentions"
                                 reason = "docstring"
                     except ValueError:
@@ -963,7 +970,9 @@ def collect_safety_grep(
                         tp = stripped_line.index('"""') if '"""' in stripped_line else stripped_line.index("'''")
                         if tp > 0:  # content before triple
                             after_close = stripped_line[tp + 3:].strip()
-                            if not after_close:
+                            is_comment_only = after_close.startswith('#')
+                            is_docstring_continuation = after_close.startswith('\\')
+                            if not after_close or is_comment_only or is_docstring_continuation:
                                 classification = "policy_mentions"
                                 reason = "docstring"
                     except ValueError:
