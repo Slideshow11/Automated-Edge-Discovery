@@ -833,9 +833,9 @@ def collect_safety_grep(
             raw_prefix = stripped_line[:4]  # r"""
             raw_prefix_single = stripped_line[:4]  # r'''
             is_single_line_raw = (
-                (stripped_line.startswith('r"""') and '"""' in stripped_line[3:] and
+                ((stripped_line.startswith('r"""') or stripped_line.startswith('R"""')) and '"""' in stripped_line[3:] and
                  stripped_line[3:].find('"""') == stripped_line[3:].rfind('"""')) or
-                (stripped_line.startswith("r'''") and "'''" in stripped_line[3:] and
+                ((stripped_line.startswith("r'''") or stripped_line.startswith("R'''")) and "'''" in stripped_line[3:] and
                  stripped_line[3:].find("'''") == stripped_line[3:].rfind("'''"))
             )
 
@@ -897,21 +897,42 @@ def collect_safety_grep(
                 if pattern not in line:
                     continue
 
-                # ---- Classification ladder ----
+# ---- Classification ladder ----
+                # Set default classification (None = not yet classified).
+                # Each branch below sets this to a non-None value or leaves it.
+                classification = None
+                reason = None
+
                 # A. Executable context: always a violation (wins over all other classifications)
                 is_exec_ctx = is_executable_context(line)
                 if is_exec_ctx:
                     classification = "executable_violations"
                     reason = "executable_context"
 
-                # B. Identifier or prose context: policy mention, not executable
+                # B. Raw docstring boundary (single-line raw docstring open+close on same line):
+                #    r"""...""" or R'''...''' → policy mention, not executable violation.
+                #    Check BEFORE identifier/prose to prevent suppression via LHS token match.
+                #    A single-line raw docstring has the form: r"""...content...""" where the
+                #    closing triple-quote appears on the same line with no content after it
+                #    (besides possible whitespace).
+                elif is_single_line_raw and raw_docstring_start:
+                    raw_body = stripped_line[4:]  # skip past r""" or r'''
+                    quote = '"""' if raw_body.startswith('"""') or stripped_line.startswith('r"""') or stripped_line.startswith('R"""') else "'''"
+                    if quote in raw_body:
+                        close_pos = raw_body.index(quote)
+                        after_close = raw_body[close_pos + 3:].strip()
+                        if not after_close:
+                            classification = "policy_mentions"
+                            reason = "docstring"
+
+                # C. Identifier or prose context: policy mention, not executable
                 #    e.g. def build_telegram_summary(...), TELEGRAM_WARNING = "...", import telegram
-                elif is_identifier_or_prose_context(line):
+                if classification is None and is_identifier_or_prose_context(line):
                     classification = "policy_mentions"
                     reason = "identifier_or_prose"
 
-                # C. Suppressed context: comment, docstring, argparse help, generated example
-                else:
+                # D. Suppressed context: comment, docstring, argparse help, generated example
+                if classification is None:
                     suppressed, reason = is_suppressed_context(line, pattern)
                     if suppressed:
                         if reason in ("comment", "docstring"):
@@ -919,18 +940,18 @@ def collect_safety_grep(
                         else:
                             classification = "suppressed_contexts"
 
-                    # D. Policy-description tuple in a frozenset/list context
-                    #    e.g. ("gh pr merge", "argparse_help"), — these are metadata describing
-                    #    what constitutes a policy mention, not executable violations
-                    elif _is_policy_description_tuple(line, pattern):
-                        classification = "suppressed_contexts"
-                        reason = "policy_description_tuple"
+                # E. Policy-description tuple in a frozenset/list context
+                #    e.g. ("gh pr merge", "argparse_help"), — these are metadata describing
+                #    what constitutes a policy mention, not executable violations
+                if classification is None and _is_policy_description_tuple(line, pattern):
+                    classification = "suppressed_contexts"
+                    reason = "policy_description_tuple"
 
-                    # E. Unknown: not executable, not suppressed, not identifier
-                    #    Conservative — classify as executable violation rather than silently passing
-                    else:
-                        classification = "executable_violations"
-                        reason = "unknown"
+                # F. Unknown: not executable, not suppressed, not identifier
+                #    Conservative — classify as executable violation rather than silently passing
+                if classification is None:
+                    classification = "executable_violations"
+                    reason = "unknown"
 
                 # Override for docstring lines: suppress any match inside a docstring
                 # (handles lines in middle of multi-line docstrings that have no triple quotes)
@@ -1111,7 +1132,7 @@ def collect_safety_grep(
         "policy_mentions_count": raw_policy_mentions,  # pre-filter: all policy mentions before test-file suppression
         "suppressed_context_count": raw_suppressed_contexts,  # pre-filter: all suppressed contexts before test-file suppression
         "raw_matches_total": raw_matches_total,  # pre-filter: all pattern hits before any suppression/filtering
-        "post_filter_matches_total": post_executable_violations + post_suppressed_contexts,  # post-filter: remaining after test-file suppression,
+        "post_filter_matches_total": post_executable_violations + post_policy_mentions + post_suppressed_contexts,  # post-filter: remaining after test-file suppression,
         "executable_violations_in_allowed_scope": len(allowed_scope_executable_violations),
         "executable_violations_in_forbidden_scope": len(forbidden_scope_executable_violations),
         "executable_violations_out_of_scope": len(oos_scope_executable_violations),
