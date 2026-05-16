@@ -814,19 +814,48 @@ def collect_safety_grep(
             triple_total = triple_double + triple_single
 
             # Update in_docstring based on triple-quote count on this line.
+            # Only toggle on ODD counts (1, 3, ...): one net boundary transition per line.
+            # Even counts (2, 4, ...): balanced open+close on same line → no net change.
+            #
+            # Triple at START of stripped line + content_after (not a comment):
+            # - When OUTSIDE: this is an OPENING (the docstring content starts on same line)
+            #   e.g. '"""Policy: Do not call gh pr merge...'
+            #   → enter docstring
+            # - When INSIDE: this is an END-OF-LINE CLOSE (docstring ends on same line)
+            #   e.g. 'Forbidden: hermes kanban create, telegram send"""'
+            #   → exit docstring
+            # Triple at START with NO content_after (or only a comment):
+            # - When OUTSIDE: standalone opening/closing """ → enter
+            # - When INSIDE: standalone closing """ → exit
+            # Triple MID-LINE (not at start): always an OPENING when outside
+            #   → enter docstring
             if triple_total > 0 and triple_total % 2 == 1:
+                stripped_line = line.lstrip()
+                starts_with = stripped_line.startswith('"""') or stripped_line.startswith("'''")
                 if not in_docstring:
-                    # Currently outside: this is an opening """ → enter docstring
-                    in_docstring = not in_docstring
-                elif in_docstring:
-                    # Currently inside: this might be a closing """ → exit docstring
-                    # If triple-quote is NOT at start of line, it's an adjacent function
-                    # docstring opening (not a close) → don't toggle, stay inside
-                    stripped_line = line.lstrip()
-                    if stripped_line.startswith('"""') or stripped_line.startswith("'''"):
-                        # Triple-quote at START of line → close → toggle off
+                    # Outside + odd count: entering a docstring
+                    if starts_with:
+                        content_after = stripped_line[3:].strip()
+                        if content_after and not content_after.startswith('#'):
+                            # Text after (not comment) → opening line → enter
+                            in_docstring = not in_docstring
+                        else:
+                            # Standalone """ or """ with comment-only → enter
+                            in_docstring = not in_docstring
+                    else:
+                        # Mid-line triple → opening → enter
                         in_docstring = not in_docstring
-                    # else: triple-quote not at start → adjacent open → don't toggle
+                elif in_docstring:
+                    # Inside + odd count: might be closing
+                    if starts_with:
+                        content_after = stripped_line[3:].strip()
+                        if content_after and not content_after.startswith('#'):
+                            # Text after (not comment) → end-of-line close → exit
+                            in_docstring = not in_docstring
+                        else:
+                            # Standalone """ or """ with comment-only → close → exit
+                            in_docstring = not in_docstring
+                    # else: mid-line triple → adjacent open → stay inside
 
             for pattern in patterns:
                 if pattern not in line:
