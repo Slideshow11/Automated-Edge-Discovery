@@ -35,6 +35,41 @@ HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SAFE_SLUG_RE = re.compile(r"^[a-zA-Z0-9_\-]+$")
 FORBIDDEN_BUNDLE_PREFIXES = (".git", "hermes", ".hermes", "workflows", ".github")
 FORBIDDEN_BUNDLE_INFIXES = (".git/", "/.git")
+# Context-suppressed patterns: these strings are allowed in the specified
+# contexts even when they appear in non-test Python files. They represent
+# policy documentation, not executable behavior.
+CONTEXT_SUPPRESSION_PATTERNS = frozenset([
+    # argparse help text
+    ("hermes kanban create", "argparse_help"),
+    ("hermes kanban dispatch", "argparse_help"),
+    ("gh pr merge", "argparse_help"),
+    ("gh pr create", "argparse_help"),
+    ("git push", "argparse_help"),
+    ("git commit", "argparse_help"),
+    ("telegram", "argparse_help"),
+    ("send_message", "argparse_help"),
+    ("memory.update", "argparse_help"),
+    ("skill_manage", "argparse_help"),
+    ("fact_store", "argparse_help"),
+    ("delegate_task", "argparse_help"),
+    ("cronjob", "argparse_help"),
+    # docstrings describing policy
+    ("hermes kanban create", "docstring"),
+    ("hermes kanban dispatch", "docstring"),
+    ("gh pr merge", "docstring"),
+    ("gh pr create", "docstring"),
+    ("git push", "docstring"),
+    ("git commit", "docstring"),
+    ("telegram", "docstring"),
+    ("send_message", "docstring"),
+    ("memory.update", "docstring"),
+    ("skill_manage", "docstring"),
+    ("fact_store", "docstring"),
+    ("delegate_task", "docstring"),
+    ("cronjob", "docstring"),
+])
+
+
 EXECUTABLE_MUTATION_COMMANDS = frozenset([
     "hermes kanban create",
     "hermes kanban dispatch",
@@ -50,6 +85,87 @@ EXECUTABLE_MUTATION_COMMANDS = frozenset([
     "delegate_task",
     "cronjob",
 ])
+
+
+# Executable-context patterns: if a forbidden command string appears in a line
+# containing one of these patterns, it is considered an executable violation rather
+# than a policy mention or suppressed context.
+EXECUTABLE_CONTEXT_PATTERNS = frozenset([
+    "subprocess.run",
+    "subprocess.call",
+    "subprocess.Popen",
+    "subprocess.check_output",
+    "subprocess.check_call",
+    "os.system",
+    "os.popen",
+    "shell=True",
+    "exec(",
+    "eval(",
+])
+
+
+def is_suppressed_context(line: str, pattern: str) -> tuple[bool, str]:
+    """
+    Determine whether a pattern match in a line is in a suppressed context.
+
+    Suppressed contexts (policy mentions, not executable):
+    - Line starts with # (comment)
+    - Line is inside a triple-quote docstring (starts with \"\"\" or ''')
+    - Line is an argparse help string (contains '--' and a command example)
+    - Line contains the pattern inside a string literal that is clearly
+      documentation/help rather than code
+
+    Returns (is_suppressed, reason).
+
+    Reason is one of: "comment", "docstring", "argparse_help", "generated_example",
+    "suppressed", "executable_context", "unknown".
+    """
+    stripped = line.strip()
+
+    # Comment line — policy mention, not executable
+    if stripped.startswith("#"):
+        return (True, "comment")
+
+    # Docstring boundary — policy/documentation, not executable
+    if stripped.startswith('"""') or stripped.startswith("'''") or \
+            stripped.startswith('r"""') or stripped.startswith("r'''"):
+        return (True, "docstring")
+
+    # Check if inside a docstring (simple heuristic: line contains the pattern
+    # but the preceding non-blank line was a docstring opener not yet closed)
+    # For simplicity: if line contains '"""' or "'''" and pattern is in a
+    # string context (line has odd quote count), treat as docstring
+
+    # Check argparse help pattern
+    if "--" in stripped and any(cmd in stripped for cmd in EXECUTABLE_MUTATION_COMMANDS):
+        # Looks like: "--hermes-kanban-create TEXT  help text for the option"
+        # or "hermes kanban create is forbidden in Phase 1"
+        if any(phrase in stripped.lower() for phrase in [
+            "help=", "help text", "helpmsg", "description=",
+            "is forbidden", "is not allowed", "must not be",
+            "do not use", "avoid", "suppress",
+        ]):
+            return (True, "argparse_help")
+
+    # Check if line is inside a multi-line string that looks like help text
+    # Heuristic: line has a command string in quotes with surrounding explanatory text
+    if '"' in line or "'" in line:
+        # Check for generated example pattern: commented or docstring example
+        if any(phrase in line.lower() for phrase in [
+            "example:", "e.g.", "for example", "such as",
+            "command example", "usage:", "syntax:",
+        ]):
+            return (True, "generated_example")
+
+    return (False, "executable_context")
+
+
+def is_executable_context(line: str) -> bool:
+    """Return True if the line contains executable-context patterns."""
+    for pattern in EXECUTABLE_CONTEXT_PATTERNS:
+        if pattern in line:
+            return True
+    return False
 
 
 def is_test_file(path: str) -> bool:
@@ -127,9 +243,48 @@ def validate_candidate_id(candidate_id: str) -> None:
 
 
 def validate_source_repo(source_repo: str) -> None:
+    """
+    Validate that source_repo is an existing local path, not a GitHub slug.
+
+    Rejects:
+    - GitHub slugs (like "Slideshow11/Automated-Edge-Discovery") —
+      two simple identifiers separated by "/" with no leading slash
+    - Non-existent paths
+    - Files (must be a directory)
+    - Filesystem root '/'
+
+    Accepts:
+    - Absolute paths like "/home/max/Automated-Edge-Discovery"
+    - Relative paths that resolve to an existing directory
+    """
+    # Reject bare GitHub slugs: two identifiers separated by "/" with no leading slash.
+    # Pattern: no leading '/', exactly two non-empty parts when split by '/',
+    # each part looks like a simple identifier (no path separators inside).
+    # This catches "Slideshow11/Automated-Edge-Discovery" but NOT "/tmp/xxx" or "docs/".
+    if not source_repo.startswith("/") and source_repo.count("/") == 1:
+        owner, repo = source_repo.split("/", 1)
+        if owner and repo and not any(c in ("/", "\\") for c in owner) and not any(c in ("/", "\\") for c in repo):
+            raise ValueError(
+                f"--source-repo must be an existing local path, not a remote repo slug. "
+                f"Received: {source_repo!r}. "
+                f"Use an absolute path like /home/max/Automated-Edge-Discovery."
+            )
+
     source_repo = os.path.abspath(source_repo)
     if source_repo == "/":
         raise ValueError("source_repo cannot be the filesystem root '/'")
+
+    if not os.path.exists(source_repo):
+        raise ValueError(
+            f"--source-repo must be an existing local path. "
+            f"Received: {source_repo!r} which does not exist."
+        )
+
+    if not os.path.isdir(source_repo):
+        raise ValueError(
+            f"--source-repo must be a directory, not a file. "
+            f"Received: {source_repo!r}."
+        )
 
 
 def validate_bundle_dir(bundle_dir: str, force: bool) -> None:
@@ -414,12 +569,27 @@ def collect_safety_grep(
 ) -> dict:
     """
     Read-only safety grep: scan Python files in source_repo for forbidden
-    executable mutation command strings. Distinguishes policy mentions
-    (commented or string literals) from executable usages.
+    executable mutation command strings.
+
+    Classifies each match into one of:
+    - executable_violation: forbidden command in executable context (subprocess.run,
+      os.system, shell=True, exec(), etc.)
+    - policy_mention: forbidden command in comment, docstring, argparse help,
+      generated example, or policy constant
+    - suppressed_context: match in a context that is documented/suppressed and
+      not actionable
+
+    clean_for_task is based only on executable_violations in allowed scope.
+    Policy mentions and suppressed contexts do NOT make clean_for_task false.
+
+    The distinction between executable and non-executable is determined by:
+    1. is_suppressed_context() — checks for comment, docstring, argparse_help,
+       generated_example
+    2. is_executable_context() — checks for subprocess.run, os.system, shell=True,
+       exec(, eval( — these make a match an executable violation even if it
+       would otherwise look like a policy mention
     """
     patterns = list(EXECUTABLE_MUTATION_COMMANDS)
-    matches_by_file = {}
-    policy_mentions_by_file = {}
 
     source_resolved = Path(source_repo).resolve()
     py_files = []
@@ -442,6 +612,18 @@ def collect_safety_grep(
             "clean": None,
         }
 
+    # Track per-classification match lists
+    # Structure: {
+    #   "executable_violations": [...],
+    #   "policy_mentions": [...],
+    #   "suppressed_contexts": [...],
+    # }
+    classified_matches = {
+        "executable_violations": [],
+        "policy_mentions": [],
+        "suppressed_contexts": [],
+    }
+
     for fpath in py_files:
         try:
             with open(fpath, "r", encoding="utf-8", errors="replace") as f:
@@ -449,151 +631,240 @@ def collect_safety_grep(
         except Exception:
             continue
 
-        file_matches = []
-        file_policy_mentions = []
+        rel_path = os.path.relpath(fpath, source_resolved)
+
         for lineno, line in enumerate(lines, 1):
-            stripped = line.strip()
             for pattern in patterns:
-                if pattern in line:
-                    # Distinguish executable vs policy mention:
-                    # - Line starts with # → policy/documentation mention
-                    # - Line is inside a string (simple heuristic: odd number of unescaped quotes)
-                    # - Contains the pattern in a comment block
-                    is_comment_line = stripped.startswith("#")
-                    is_docstring = (
-                        stripped.startswith('"""') or stripped.startswith("'''") or
-                        stripped.startswith('r"""') or stripped.startswith("r'''")
-                    )
-                    is_policy_mention = is_comment_line or is_docstring
+                if pattern not in line:
+                    continue
 
-                    # Additional heuristic: check for common documentation patterns
-                    # like "hermes kanban create" appearing in a docstring or comment
-                    if is_policy_mention:
-                        file_policy_mentions.append({
-                            "pattern": pattern,
-                            "line": lineno,
-                            "text": line.rstrip(),
-                        })
+                # Determine if this match is in a suppressed/policy context
+                suppressed, reason = is_suppressed_context(line, pattern)
+                # Override: if the line has executable-context patterns, it is
+                # always an executable violation, not a policy mention
+                is_exec_ctx = is_executable_context(line)
+
+                if is_exec_ctx:
+                    classification = "executable_violations"
+                    reason = "executable_context"
+                elif suppressed:
+                    if reason in ("comment", "docstring"):
+                        classification = "policy_mentions"
                     else:
-                        file_matches.append({
-                            "pattern": pattern,
-                            "line": lineno,
-                            "text": line.rstrip(),
-                        })
+                        classification = "suppressed_contexts"
+                else:
+                    # Not suppressed, not in executable context
+                    # Check if it's in a non-test file that is clearly code
+                    # (not a docstring or comment)
+                    classification = "executable_violations"
+                    reason = "unknown"
 
-        if file_matches:
-            rel_path = os.path.relpath(fpath, source_resolved)
-            matches_by_file[rel_path] = file_matches
-        if file_policy_mentions:
-            rel_path = os.path.relpath(fpath, source_resolved)
-            policy_mentions_by_file[rel_path] = file_policy_mentions
+                match_entry = {
+                    "pattern": pattern,
+                    "line": lineno,
+                    "text": line.rstrip(),
+                    "file": rel_path,
+                    "classification": classification,
+                    "classification_reason": reason,
+                }
 
-    total_executable = sum(len(v) for v in matches_by_file.values())
-    total_policy = sum(len(v) for v in policy_mentions_by_file.values())
+                classified_matches[classification].append(match_entry)
+
+    # Compute PRE-FILTER totals BEFORE test-file filtering.
+    # These count ALL matches (including test files) for full transparency.
+    # We call these "raw" counts — they represent what was found before
+    # any suppression logic removed matches.
+    # Naming convention: _raw postfix = pre-filter total.
+    raw_executable_violations = len(classified_matches["executable_violations"])
+    raw_policy_mentions = len(classified_matches["policy_mentions"])
+    raw_suppressed_contexts = len(classified_matches["suppressed_contexts"])
+    # raw_matches_total: all pattern hits before any suppression/filtering
+    raw_matches_total = raw_executable_violations + raw_suppressed_contexts
+
+    # Skip test files from all classified match lists
+    for bucket in ("executable_violations", "policy_mentions", "suppressed_contexts"):
+        classified_matches[bucket] = [
+            m for m in classified_matches[bucket]
+            if not (
+                is_test_file(m["file"]) or
+                m["file"].startswith("tests/") or
+                m["file"].startswith("/tests/") or
+                "/tests/" in m["file"] or
+                m["file"].startswith("tests\\") or
+                m["file"].startswith("\\tests\\")
+            )
+        ]
 
     # ---- Scope classification ----
-    # Normalize scope paths for consistent matching
     allowed_normalized = {_normalize_trailing_slash(p) for p in (allowed_files or [])}
     forbidden_normalized = {_normalize_trailing_slash(p) for p in (forbidden_files or [])}
     scope_applied = bool(allowed_normalized or forbidden_normalized)
 
     def _classify_path(rel_path: str) -> str:
         """Classify a matched file path against task scope."""
-        # Check forbidden scope first (highest priority)
         for forbidden in forbidden_normalized:
             if rel_path.startswith(forbidden):
                 return "inside_forbidden_scope"
-        # Check allowed scope
         if allowed_normalized:
             for allowed in allowed_normalized:
                 if rel_path.startswith(allowed):
                     return "inside_allowed_scope"
             return "outside_allowed_scope"
         else:
-            # No allowed scope provided — all files are in scope (repo-wide)
             return "inside_allowed_scope"
 
-    # Classify each executable match
-    scope_classified_matches = []
-    for rel_path, matches in matches_by_file.items():
-        for m in matches:
-            classification = _classify_path(rel_path)
-            scope_classified_matches.append({
-                **m,
-                "file": rel_path,
-                "scope_classification": classification,
-            })
+    # Scope-classify all matches
+    for bucket_key in classified_matches:
+        scoped_matches = []
+        for m in classified_matches[bucket_key]:
+            scope = _classify_path(m["file"])
+            scoped_matches.append({**m, "scope_classification": scope})
+        classified_matches[bucket_key] = scoped_matches
 
-    # Scope-aware statistics
-    allowed_scope_violations = []
-    forbidden_scope_violations = []
-    out_of_scope_violations = []
+    # Build scope-bucketed lists using comprehensions (cleaner, no unbound variable risk)
+    allowed_scope_executable_violations = [
+        m for m in classified_matches["executable_violations"]
+        if m["scope_classification"] == "inside_allowed_scope"
+    ]
+    forbidden_scope_executable_violations = [
+        m for m in classified_matches["executable_violations"]
+        if m["scope_classification"] == "inside_forbidden_scope"
+    ]
+    oos_scope_executable_violations = [
+        m for m in classified_matches["executable_violations"]
+        if m["scope_classification"] == "outside_allowed_scope"
+    ]
 
-    # Filter out test files (parameterized test data, not executable)
-    for m in scope_classified_matches:
-        rel_path = m["file"]
-        # Skip test files
-        if "/tests/" in rel_path or rel_path.startswith("tests/") or is_test_file(rel_path):
-            continue
-        classification = m["scope_classification"]
-        if classification == "inside_forbidden_scope":
-            forbidden_scope_violations.append(m)
-        elif classification == "inside_allowed_scope":
-            allowed_scope_violations.append(m)
-        else:  # outside_allowed_scope
-            out_of_scope_violations.append(m)
+    allowed_scope_policy_mentions = [
+        m for m in classified_matches["policy_mentions"]
+        if m["scope_classification"] == "inside_allowed_scope"
+    ]
+    forbidden_scope_policy_mentions = [
+        m for m in classified_matches["policy_mentions"]
+        if m["scope_classification"] == "inside_forbidden_scope"
+    ]
+    oos_scope_policy_mentions = [
+        m for m in classified_matches["policy_mentions"]
+        if m["scope_classification"] == "outside_allowed_scope"
+    ]
 
-    # clean_for_task: true only when allowed scope has zero violations.
-    # Forbidden-scope findings are reported separately and do NOT dirty the task.
-    # Out-of-scope findings are also reported separately and do NOT dirty the task.
-    clean_for_task = len(allowed_scope_violations) == 0
+    allowed_scope_suppressed = [
+        m for m in classified_matches["suppressed_contexts"]
+        if m["scope_classification"] == "inside_allowed_scope"
+    ]
+    forbidden_scope_suppressed = [
+        m for m in classified_matches["suppressed_contexts"]
+        if m["scope_classification"] == "inside_forbidden_scope"
+    ]
+    oos_scope_suppressed = [
+        m for m in classified_matches["suppressed_contexts"]
+        if m["scope_classification"] == "outside_allowed_scope"
+    ]
 
-    # Compute files_in_scope (files scanned that are in allowed scope)
-    files_in_allowed_scope = set()
-    for rel_path in matches_by_file.keys():
-        if _classify_path(rel_path) == "inside_allowed_scope":
-            files_in_allowed_scope.add(rel_path)
+    # clean_for_task: based only on executable violations in allowed scope
+    clean_for_task = len(allowed_scope_executable_violations) == 0
 
-    files_scanned_in_allowed_scope = len(files_in_allowed_scope)
+    # files_scanned_in_allowed_scope
+    files_in_allowed = set()
+    for bucket_key in classified_matches:
+        for m in classified_matches[bucket_key]:
+            if m["scope_classification"] == "inside_allowed_scope":
+                files_in_allowed.add(m["file"])
+    files_scanned_in_allowed_scope = len(files_in_allowed)
+
+    # Compute legacy-compatible "violations" bucket (same as allowed_scope_executable_violations)
+    violations = [
+        {k: v for k, v in m.items() if k != "scope_classification"}
+        for m in allowed_scope_executable_violations
+    ]
+
+    # Total counts (POST-filter — after test-file removal)
+    # These drive scope classification and actionable_violations.
+    post_executable_violations = len(classified_matches["executable_violations"])
+    post_policy_mentions = len(classified_matches["policy_mentions"])
+    post_suppressed_contexts = len(classified_matches["suppressed_contexts"])
+
+    # Build legacy-compatible dicts from classified matches
+    forbidden_executable_by_path: dict[str, list] = {}
+    forbidden_policy_by_path: dict[str, list] = {}
+    for bucket_key, path_dict in [("executable_violations", forbidden_executable_by_path), ("policy_mentions", forbidden_policy_by_path)]:
+        for m in classified_matches[bucket_key]:
+            path = m["file"]
+            if path not in path_dict:
+                path_dict[path] = []
+            path_dict[path].append(m)
 
     return {
         "source_repo": str(source_resolved),
         "bundle_dir": str(Path(bundle_dir).resolve()),
         "patterns_checked": list(patterns),
-        # Legacy fields (for backward compatibility with existing tests)
+        # Legacy fields (backward compatibility)
         "files_scanned": len(py_files),
-        "raw_matches": total_executable,
-        "policy_mentions": total_policy,
-        "test_or_context_matches": total_policy,
-        "actionable_violations": len(allowed_scope_violations),
-        "forbidden_executable_matches": matches_by_file,  # legacy: non-test-file matches by path
-        "forbidden_policy_mentions": policy_mentions_by_file,  # legacy: policy mentions by path
-        "total_executable_matches": total_executable,
-        "total_policy_mentions": total_policy,
+        "raw_matches": raw_matches_total,  # alias: pre-filter total (backward compat)
+        "policy_mentions": post_policy_mentions,
+        "test_or_context_matches": post_policy_mentions + post_suppressed_contexts,
+        "actionable_violations": len(allowed_scope_executable_violations),
+        "forbidden_executable_matches": forbidden_executable_by_path,  # legacy: executable violations by path (test files excluded)
+        "forbidden_policy_mentions": forbidden_policy_by_path,  # legacy: policy mentions by path (test files excluded)
+        "total_executable_matches": raw_executable_violations,  # pre-filter count (backward compat)
+        "total_policy_mentions": raw_policy_mentions,  # pre-filter count (backward compat)
         "clean": clean_for_task,
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        # New scope-aware fields
+        # Scope
         "allowed_files": allowed_files or [],
         "forbidden_files": forbidden_files or [],
         "scope_applied": scope_applied,
         "files_scanned_total": len(py_files),
         "files_scanned_in_allowed_scope": files_scanned_in_allowed_scope,
-        "executable_matches_total": total_executable,
-        "executable_matches_in_allowed_scope": len(allowed_scope_violations),
-        "executable_matches_in_forbidden_scope": len(forbidden_scope_violations),
-        "executable_matches_out_of_scope": len(out_of_scope_violations),
-        "policy_mentions_total": total_policy,
+        # Normalized explicit count fields — always present, never null
+        "executable_matches_in_allowed_scope": len(allowed_scope_executable_violations),
+        "executable_matches_in_forbidden_scope": len(forbidden_scope_executable_violations),
+        "executable_matches_out_of_scope": len(oos_scope_executable_violations),
+        "policy_mentions_in_allowed_scope": len(allowed_scope_policy_mentions),
+        "policy_mentions_in_forbidden_scope": len(forbidden_scope_policy_mentions),
+        "policy_mentions_out_of_scope": len(oos_scope_policy_mentions),
+        "suppressed_context_in_allowed_scope": len(allowed_scope_suppressed),
+        "suppressed_context_in_forbidden_scope": len(forbidden_scope_suppressed),
+        "suppressed_context_out_of_scope": len(oos_scope_suppressed),
+        # New classification-aware fields
+        "executable_violations_count": raw_executable_violations,  # pre-filter: all executable violations before test-file suppression
+        "policy_mentions_count": raw_policy_mentions,  # pre-filter: all policy mentions before test-file suppression
+        "suppressed_context_count": raw_suppressed_contexts,  # pre-filter: all suppressed contexts before test-file suppression
+        "raw_matches_total": raw_matches_total,  # pre-filter: all pattern hits before any suppression/filtering
+        "post_filter_matches_total": post_executable_violations + post_suppressed_contexts,  # post-filter: remaining after test-file suppression,
+        "executable_violations_in_allowed_scope": len(allowed_scope_executable_violations),
+        "executable_violations_in_forbidden_scope": len(forbidden_scope_executable_violations),
+        "executable_violations_out_of_scope": len(oos_scope_executable_violations),
         "clean_for_task": clean_for_task,
-        "violations": [
-            # Backward-compatible format: pattern, line, text, file
-            # This is allowed_scope_violations stripped of scope_classification
-            {k: v for k, v in m.items() if k != "scope_classification"}
-            for m in allowed_scope_violations
-        ],
+        "violations": violations,
         "matches_by_scope": {
-            "allowed_scope_violations": allowed_scope_violations,
-            "forbidden_scope_violations": forbidden_scope_violations,
-            "out_of_scope_violations": out_of_scope_violations,
+            "allowed_scope_violations": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in allowed_scope_executable_violations
+            ],
+            "forbidden_scope_violations": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in forbidden_scope_executable_violations
+            ],
+            "out_of_scope_violations": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in oos_scope_executable_violations
+            ],
+            "allowed_scope_policy_mentions": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in allowed_scope_policy_mentions
+            ],
+            "forbidden_scope_policy_mentions": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in forbidden_scope_policy_mentions
+            ],
+            "out_of_scope_policy_mentions": [
+                {k: v for k, v in m.items() if k != "scope_classification"}
+                for m in oos_scope_policy_mentions
+            ],
+            "allowed_scope_suppressed": allowed_scope_suppressed,
+            "forbidden_scope_suppressed": forbidden_scope_suppressed,
+            "out_of_scope_suppressed": oos_scope_suppressed,
         },
     }
 
@@ -1157,6 +1428,16 @@ def main(argv=None):
         with open(safety_grep_path, "w") as f:
             # Human-readable summary header
             f.write("# Safety Grep Summary\n")
+            f.write(f"scope_applied: {str(safety_grep_result.get('scope_applied', False)).lower()}\n")
+            f.write(f"clean_for_task: {str(safety_grep_result.get('clean_for_task', False)).lower()}\n")
+            f.write(f"executable_violations_in_allowed_scope: {safety_grep_result.get('executable_violations_in_allowed_scope', 0)}\n")
+            f.write(f"policy_mentions_in_allowed_scope: {safety_grep_result.get('policy_mentions_in_allowed_scope', 0)}\n")
+            f.write(f"suppressed_context_in_allowed_scope: {safety_grep_result.get('suppressed_context_in_allowed_scope', 0)}\n")
+            f.write(f"executable_violations_count: {safety_grep_result.get('executable_violations_count', 0)}\n")
+            f.write(f"policy_mentions_count: {safety_grep_result.get('policy_mentions_count', 0)}\n")
+            f.write(f"suppressed_context_count: {safety_grep_result.get('suppressed_context_count', 0)}\n")
+            f.write(f"policy_mentions: {safety_grep_result.get('policy_mentions_total', safety_grep_result.get('policy_mentions', 0))}\n")
+            f.write(f"actionable_violations: {safety_grep_result.get('actionable_violations', 0)}\n")
             f.write(f"files_scanned: {safety_grep_result.get('files_scanned_total', 0)}\n")
             f.write(f"files_scanned_total: {safety_grep_result.get('files_scanned_total', 0)}\n")
             f.write(f"files_scanned_in_allowed_scope: {safety_grep_result.get('files_scanned_in_allowed_scope', 0)}\n")
@@ -1164,13 +1445,10 @@ def main(argv=None):
             f.write(f"executable_matches_total: {safety_grep_result.get('executable_matches_total', 0)}\n")
             f.write(f"executable_matches_in_allowed_scope: {safety_grep_result.get('executable_matches_in_allowed_scope', 0)}\n")
             f.write(f"executable_matches_in_forbidden_scope: {safety_grep_result.get('executable_matches_in_forbidden_scope', 0)}\n")
-            f.write(f"executable_matches_out_of_scope: {len(safety_grep_result.get('matches_by_scope', {}).get('out_of_scope_violations', []))}\n")
-            f.write(f"policy_mentions: {safety_grep_result.get('policy_mentions_total', 0)}\n")
-            f.write(f"test_or_context_matches: {safety_grep_result.get('policy_mentions_total', 0)}\n")
-            f.write(f"actionable_violations: {safety_grep_result.get('actionable_violations', 0)}\n")
+            f.write(f"executable_matches_out_of_scope: {safety_grep_result.get('executable_matches_out_of_scope', 0)}\n")
+            f.write(f"policy_mentions_in_forbidden_scope: {safety_grep_result.get('policy_mentions_in_forbidden_scope', 0)}\n")
+            f.write(f"suppressed_context_in_forbidden_scope: {safety_grep_result.get('suppressed_context_in_forbidden_scope', 0)}\n")
             f.write(f"clean: {str(safety_grep_result.get('clean', safety_grep_result.get('clean_for_task', False))).lower()}\n")
-            f.write(f"clean_for_task: {str(safety_grep_result.get('clean_for_task', False)).lower()}\n")
-            f.write(f"scope_applied: {str(safety_grep_result.get('scope_applied', False)).lower()}\n")
             f.write(f"details_format: json_below\n")
             f.write(f"violations_only_file: violations_only.json\n")
             f.write("\n")
@@ -1183,14 +1461,24 @@ def main(argv=None):
         # Write violations_only.json — normalized bucket format with scope classification
         # All count fields are always explicit integers (0, never null).
         # All array fields are always arrays ([] if empty).
-        # clean_for_task is based on allowed_scope only — forbidden and out-of-scope
-        # findings are visible but do not dirty the task.
+        # clean_for_task is based on allowed_scope executable violations only.
+        # Policy mentions and suppressed contexts do NOT dirty the task.
         matches_by_scope = safety_grep_result.get("matches_by_scope", {})
         allowed_violations = matches_by_scope.get("allowed_scope_violations", [])
         forbidden_violations = matches_by_scope.get("forbidden_scope_violations", [])
         oos_violations = matches_by_scope.get("out_of_scope_violations", [])
+
+        # New classification-aware counts
+        allowed_scope_policy = matches_by_scope.get("allowed_scope_policy_mentions", [])
+        forbidden_scope_policy = matches_by_scope.get("forbidden_scope_policy_mentions", [])
+        oos_scope_policy = matches_by_scope.get("out_of_scope_policy_mentions", [])
+
+        allowed_scope_supp = matches_by_scope.get("allowed_scope_suppressed", [])
+        forbidden_scope_supp = matches_by_scope.get("forbidden_scope_suppressed", [])
+        oos_scope_supp = matches_by_scope.get("out_of_scope_suppressed", [])
+
         violations_only_payload = {
-            # Backward-compatible keys (used by existing tests)
+            # Backward-compatible keys
             "actionable_violations": len(allowed_violations),
             "violations": allowed_violations,
             # Scope classification
@@ -1203,10 +1491,26 @@ def main(argv=None):
             "allowed_scope_violations_count": len(allowed_violations),
             "forbidden_scope_violations_count": len(forbidden_violations),
             "out_of_scope_violations_count": len(oos_violations),
+            # Classification-aware counts (new)
+            "executable_violations_count": safety_grep_result.get("executable_violations_count", 0),
+            "policy_mentions_count": safety_grep_result.get("policy_mentions_count", 0),
+            "suppressed_context_count": safety_grep_result.get("suppressed_context_count", 0),
+            "policy_mentions_in_allowed_scope": len(allowed_scope_policy),
+            "policy_mentions_in_forbidden_scope": len(forbidden_scope_policy),
+            "policy_mentions_out_of_scope": len(oos_scope_policy),
+            "suppressed_context_in_allowed_scope": len(allowed_scope_supp),
+            "suppressed_context_in_forbidden_scope": len(forbidden_scope_supp),
+            "suppressed_context_out_of_scope": len(oos_scope_supp),
             # Normalized explicit arrays — always present, never null
             "allowed_scope_violations": allowed_violations,
             "forbidden_scope_violations": forbidden_violations,
             "out_of_scope_violations": oos_violations,
+            "allowed_scope_policy_mentions": allowed_scope_policy,
+            "forbidden_scope_policy_mentions": forbidden_scope_policy,
+            "out_of_scope_policy_mentions": oos_scope_policy,
+            "allowed_scope_suppressed": allowed_scope_supp,
+            "forbidden_scope_suppressed": forbidden_scope_supp,
+            "out_of_scope_suppressed": oos_scope_supp,
             # Task cleanliness summary
             "task_clean_summary": {
                 "allowed_scope": "clean" if len(allowed_violations) == 0 else "dirty",
@@ -1216,9 +1520,6 @@ def main(argv=None):
             },
             # Aggregated counts for the summary
             "summary": {
-                # total is the sum of scoped buckets (post-test-file-filter),
-                # so total == in_allowed_scope + in_forbidden_scope + out_of_scope
-                # (unlike executable_matches_total which is pre-filter).
                 "total": len(allowed_violations) + len(forbidden_violations) + len(oos_violations),
                 "in_allowed_scope": len(allowed_violations),
                 "in_forbidden_scope": len(forbidden_violations),
