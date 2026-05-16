@@ -25,7 +25,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -126,6 +126,32 @@ def validate_bundle_dir(bundle_dir: str, force: bool) -> None:
         raise ValueError(
             f"bundle_dir is not empty. Use --force to overwrite or re-run."
         )
+
+
+def _normalize_trailing_slash(path: str) -> str:
+    """Normalize a scope path: strip trailing slashes for consistent comparison."""
+    return path.rstrip("/")
+
+
+def _is_absolute_or_parent_ref(path: str) -> bool:
+    """Return True if path is absolute or contains '..' or is empty."""
+    if not path:
+        return True
+    if os.path.isabs(path):
+        return True
+    if ".." in path.split(os.sep):
+        return True
+    return False
+
+
+def _validate_scope_path_list(paths: list[str], name: str) -> None:
+    """Validate a list of scope paths. Raises ValueError on first invalid entry."""
+    for p in paths:
+        normalized = _normalize_trailing_slash(p)
+        if not normalized:
+            raise ValueError(f"{name} contains empty string entry")
+        if _is_absolute_or_parent_ref(normalized):
+            raise ValueError(f"{name} contains invalid path: {p!r} (absolute paths and '..' are forbidden)")
 
 
 def safety_grep_content(content: str) -> list[str]:
@@ -327,7 +353,12 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
     }
 
 
-def collect_safety_grep(source_repo: str, bundle_dir: str) -> dict:
+def collect_safety_grep(
+    source_repo: str,
+    bundle_dir: str,
+    allowed_files: list[str] | None = None,
+    forbidden_files: list[str] | None = None,
+) -> dict:
     """
     Read-only safety grep: scan Python files in source_repo for forbidden
     executable mutation command strings. Distinguishes policy mentions
@@ -407,44 +438,108 @@ def collect_safety_grep(source_repo: str, bundle_dir: str) -> dict:
     total_executable = sum(len(v) for v in matches_by_file.values())
     total_policy = sum(len(v) for v in policy_mentions_by_file.values())
 
-    # Distinguish test/context matches from real actionable violations.
-    # Files under tests/ or containing policy-mention patterns are non-actionable.
-    # actionable_violations = executable matches that are NOT in test files
-    # AND NOT already classified as policy mentions.
-    # Key insight: in AED, forbidden strings in tests are parameterized test data,
-    # not executable violations. Only non-test files with executable usage count.
-    actionable_violations = 0
-    violations_list = []
+    # ---- Scope classification ----
+    # Normalize scope paths for consistent matching
+    allowed_normalized = {_normalize_trailing_slash(p) for p in (allowed_files or [])}
+    forbidden_normalized = {_normalize_trailing_slash(p) for p in (forbidden_files or [])}
+    scope_applied = bool(allowed_normalized or forbidden_normalized)
+
+    def _classify_path(rel_path: str) -> str:
+        """Classify a matched file path against task scope."""
+        # Check forbidden scope first (highest priority)
+        for forbidden in forbidden_normalized:
+            if rel_path.startswith(forbidden):
+                return "inside_forbidden_scope"
+        # Check allowed scope
+        if allowed_normalized:
+            for allowed in allowed_normalized:
+                if rel_path.startswith(allowed):
+                    return "inside_allowed_scope"
+            return "outside_allowed_scope"
+        else:
+            # No allowed scope provided — all files are in scope (repo-wide)
+            return "inside_allowed_scope"
+
+    # Classify each executable match
+    scope_classified_matches = []
     for rel_path, matches in matches_by_file.items():
-        # Skip test files — parameterizing forbidden strings in tests is safe
-        # Also skip files named test_*.py or *_test.py at root level
+        for m in matches:
+            classification = _classify_path(rel_path)
+            scope_classified_matches.append({
+                **m,
+                "file": rel_path,
+                "scope_classification": classification,
+            })
+
+    # Scope-aware statistics
+    allowed_scope_violations = []
+    forbidden_scope_violations = []
+    out_of_scope_violations = []
+
+    # Filter out test files (parameterized test data, not executable)
+    for m in scope_classified_matches:
+        rel_path = m["file"]
+        # Skip test files
         if "/tests/" in rel_path or rel_path.startswith("tests/") or is_test_file(rel_path):
             continue
-        for m in matches:
-            actionable_violations += 1
-            violations_list.append({
-                "pattern": m["pattern"],
-                "line": m["line"],
-                "text": m["text"],
-                "file": rel_path,
-            })
+        classification = m["scope_classification"]
+        if classification == "inside_forbidden_scope":
+            forbidden_scope_violations.append(m)
+        elif classification == "inside_allowed_scope":
+            allowed_scope_violations.append(m)
+        else:  # outside_allowed_scope
+            out_of_scope_violations.append(m)
+
+    # clean_for_task: true only when no violations in allowed scope AND no forbidden scope violations
+    # out-of-scope violations in non-forbidden areas do not make a task dirty
+    clean_for_task = len(allowed_scope_violations) == 0 and len(forbidden_scope_violations) == 0
+
+    # Compute files_in_scope (files scanned that are in allowed scope)
+    files_in_allowed_scope = set()
+    for rel_path in matches_by_file.keys():
+        if _classify_path(rel_path) == "inside_allowed_scope":
+            files_in_allowed_scope.add(rel_path)
+
+    files_scanned_in_allowed_scope = len(files_in_allowed_scope)
 
     return {
         "source_repo": str(source_resolved),
         "bundle_dir": str(Path(bundle_dir).resolve()),
         "patterns_checked": list(patterns),
+        # Legacy fields (for backward compatibility with existing tests)
         "files_scanned": len(py_files),
         "raw_matches": total_executable,
         "policy_mentions": total_policy,
         "test_or_context_matches": total_policy,
-        "actionable_violations": actionable_violations,
-        "violations": violations_list,
-        "forbidden_executable_matches": matches_by_file,
-        "forbidden_policy_mentions": policy_mentions_by_file,
+        "actionable_violations": len(allowed_scope_violations),
+        "forbidden_executable_matches": matches_by_file,  # legacy: non-test-file matches by path
+        "forbidden_policy_mentions": policy_mentions_by_file,  # legacy: policy mentions by path
         "total_executable_matches": total_executable,
         "total_policy_mentions": total_policy,
-        "clean": actionable_violations == 0,
+        "clean": clean_for_task,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        # New scope-aware fields
+        "allowed_files": allowed_files or [],
+        "forbidden_files": forbidden_files or [],
+        "scope_applied": scope_applied,
+        "files_scanned_total": len(py_files),
+        "files_scanned_in_allowed_scope": files_scanned_in_allowed_scope,
+        "executable_matches_total": total_executable,
+        "executable_matches_in_allowed_scope": len(allowed_scope_violations),
+        "executable_matches_in_forbidden_scope": len(forbidden_scope_violations),
+        "policy_mentions_total": total_policy,
+        "clean_for_task": clean_for_task,
+        "violations": [
+            # Backward-compatible format: pattern, line, text, file
+            # This is allowed_scope_violations stripped of scope_classification
+            {k: v for k, v in m.items() if k != "scope_classification"}
+            for m in allowed_scope_violations
+        ],
+        "matches_by_scope": {
+            "allowed_scope_violations": allowed_scope_violations,
+            "forbidden_scope_violations": forbidden_scope_violations,
+            "out_of_scope_violations": out_of_scope_violations,
+        },
     }
 
 
@@ -582,7 +677,10 @@ def write_bundle_status(bundle_dir: str, read_only_collections: dict,
         diff_status = scope_check.get("diff_status", None)
     safety_clean = None
     if safety_grep:
-        safety_clean = safety_grep.get("clean", None)
+        if safety_grep.get("scope_applied"):
+            safety_clean = safety_grep.get("clean_for_task", None)
+        else:
+            safety_clean = safety_grep.get("clean", None)
 
     patch_applied = False  # Phase 2 never applies a patch
 
@@ -778,6 +876,18 @@ def main(argv=None):
         action="store_true",
         help="Run read-only git diff (populate diff.patch and changed_files.txt)",
     )
+    parser.add_argument(
+        "--allowed-files-json",
+        type=str,
+        default=None,
+        help="JSON-encoded list of allowed file patterns, e.g. '[\"docs/\", \"scripts/\"]'",
+    )
+    parser.add_argument(
+        "--forbidden-files-json",
+        type=str,
+        default=None,
+        help="JSON-encoded list of forbidden file patterns, e.g. '[\"scripts/\", \".github/\"]'",
+    )
     args = parser.parse_args(argv)
 
     # ---- Dry-run enforcement ----
@@ -840,7 +950,40 @@ def main(argv=None):
     if args.collect_scope:
         scope_check = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
     if args.collect_safety_grep:
-        safety_grep = collect_safety_grep(args.source_repo, args.bundle_dir)
+        # Parse allowed/forbidden scope from JSON args (before BUNDLE_STATUS.json computation)
+        parsed_allowed = None
+        parsed_forbidden = None
+        if args.allowed_files_json is not None:
+            try:
+                parsed_allowed = json.loads(args.allowed_files_json)
+                if not isinstance(parsed_allowed, list):
+                    raise ValueError("allowed_files_json must be a JSON array")
+                _validate_scope_path_list(parsed_allowed, "allowed_files")
+            except json.JSONDecodeError as e:
+                print(f"VALIDATION ERROR: --allowed-files-json is not valid JSON: {e}")
+                sys.exit(1)
+            except ValueError as e:
+                print(f"VALIDATION ERROR: {e}")
+                sys.exit(1)
+        if args.forbidden_files_json is not None:
+            try:
+                parsed_forbidden = json.loads(args.forbidden_files_json)
+                if not isinstance(parsed_forbidden, list):
+                    raise ValueError("forbidden_files_json must be a JSON array")
+                _validate_scope_path_list(parsed_forbidden, "forbidden_files")
+            except json.JSONDecodeError as e:
+                print(f"VALIDATION ERROR: --forbidden-files-json is not valid JSON: {e}")
+                sys.exit(1)
+            except ValueError as e:
+                print(f"VALIDATION ERROR: {e}")
+                sys.exit(1)
+
+        safety_grep = collect_safety_grep(
+            args.source_repo,
+            args.bundle_dir,
+            allowed_files=parsed_allowed,
+            forbidden_files=parsed_forbidden,
+        )
     status = write_bundle_status(args.bundle_dir, read_only_collections,
                                   scope_check=scope_check, safety_grep=safety_grep)
     print(f"[Phase 2] Wrote BUNDLE_STATUS.json (read_only_collections={read_only_collections})")
@@ -929,38 +1072,94 @@ def main(argv=None):
 
     # ---- Read-only: safety grep ----
     if args.collect_safety_grep:
-        safety_grep_result = collect_safety_grep(args.source_repo, args.bundle_dir)
+        # Parse allowed/forbidden scope from JSON args
+        parsed_allowed = None
+        parsed_forbidden = None
+        if args.allowed_files_json is not None:
+            try:
+                parsed_allowed = json.loads(args.allowed_files_json)
+                if not isinstance(parsed_allowed, list):
+                    raise ValueError("allowed_files_json must be a JSON array")
+                _validate_scope_path_list(parsed_allowed, "allowed_files")
+            except json.JSONDecodeError as e:
+                print(f"VALIDATION ERROR: --allowed-files-json is not valid JSON: {e}")
+                sys.exit(1)
+            except ValueError as e:
+                print(f"VALIDATION ERROR: {e}")
+                sys.exit(1)
+        if args.forbidden_files_json is not None:
+            try:
+                parsed_forbidden = json.loads(args.forbidden_files_json)
+                if not isinstance(parsed_forbidden, list):
+                    raise ValueError("forbidden_files_json must be a JSON array")
+                _validate_scope_path_list(parsed_forbidden, "forbidden_files")
+            except json.JSONDecodeError as e:
+                print(f"VALIDATION ERROR: --forbidden-files-json is not valid JSON: {e}")
+                sys.exit(1)
+            except ValueError as e:
+                print(f"VALIDATION ERROR: {e}")
+                sys.exit(1)
+
+        safety_grep_result = collect_safety_grep(
+            args.source_repo,
+            args.bundle_dir,
+            allowed_files=parsed_allowed,
+            forbidden_files=parsed_forbidden,
+        )
         safety_grep_path = os.path.join(args.bundle_dir, "safety_grep.txt")
         with open(safety_grep_path, "w") as f:
-            # Human-readable summary header first
-            exec_count = safety_grep_result.get("raw_matches", 0)
-            policy_count = safety_grep_result.get("policy_mentions", 0)
-            files_scanned = safety_grep_result.get("files_scanned", 0)
-            is_clean = safety_grep_result.get("clean", False)
-            actionable = safety_grep_result.get("actionable_violations", 0)
+            # Human-readable summary header
             f.write("# Safety Grep Summary\n")
-            f.write(f"files_scanned: {files_scanned}\n")
-            f.write(f"raw_matches: {exec_count}\n")
-            f.write(f"policy_mentions: {policy_count}\n")
-            f.write(f"test_or_context_matches: {policy_count}\n")
-            f.write(f"actionable_violations: {actionable}\n")
-            f.write(f"clean: {str(is_clean).lower()}\n")
+            f.write(f"files_scanned: {safety_grep_result.get('files_scanned_total', 0)}\n")
+            f.write(f"files_scanned_total: {safety_grep_result.get('files_scanned_total', 0)}\n")
+            f.write(f"files_scanned_in_allowed_scope: {safety_grep_result.get('files_scanned_in_allowed_scope', 0)}\n")
+            f.write(f"raw_matches: {safety_grep_result.get('raw_matches', 0)}\n")
+            f.write(f"executable_matches_total: {safety_grep_result.get('executable_matches_total', 0)}\n")
+            f.write(f"executable_matches_in_allowed_scope: {safety_grep_result.get('executable_matches_in_allowed_scope', 0)}\n")
+            f.write(f"executable_matches_in_forbidden_scope: {safety_grep_result.get('executable_matches_in_forbidden_scope', 0)}\n")
+            f.write(f"policy_mentions: {safety_grep_result.get('policy_mentions_total', 0)}\n")
+            f.write(f"test_or_context_matches: {safety_grep_result.get('policy_mentions_total', 0)}\n")
+            f.write(f"actionable_violations: {safety_grep_result.get('actionable_violations', 0)}\n")
+            f.write(f"clean: {str(safety_grep_result.get('clean', safety_grep_result.get('clean_for_task', False))).lower()}\n")
+            f.write(f"clean_for_task: {str(safety_grep_result.get('clean_for_task', False)).lower()}\n")
+            f.write(f"scope_applied: {str(safety_grep_result.get('scope_applied', False)).lower()}\n")
             f.write(f"details_format: json_below\n")
             f.write(f"violations_only_file: violations_only.json\n")
             f.write("\n")
             # Then full JSON
             json.dump(safety_grep_result, f, indent=2)
-        print(f"[Phase 2] Wrote safety_grep.txt (read-only scan, {files_scanned} files, "
-              f"{exec_count} raw matches, {safety_grep_result.get('actionable_violations', 0)} actionable)")
-        # Write violations_only.json — empty when clean, populated when violations exist
-        violations_only_path = os.path.join(args.bundle_dir, "violations_only.json")
-        violations_payload = {
-            "actionable_violations": safety_grep_result.get("actionable_violations", 0),
-            "violations": safety_grep_result.get("violations", []),
+        print(f"[Phase 2] Wrote safety_grep.txt (read-only scan, "
+              f"{safety_grep_result.get('files_scanned_total', 0)} files total, "
+              f"{safety_grep_result.get('executable_matches_in_allowed_scope', 0)} in allowed scope, "
+              f"{safety_grep_result.get('executable_matches_in_forbidden_scope', 0)} in forbidden scope)")
+        # Write violations_only.json — bucket format with scope classification
+        # Plus backward-compatible `actionable_violations` and `violations` keys for existing tests
+        matches_by_scope = safety_grep_result.get("matches_by_scope", {})
+        allowed_violations = matches_by_scope.get("allowed_scope_violations", [])
+        violations_only_payload = {
+            # Backward-compatible keys (used by existing tests)
+            "actionable_violations": len(allowed_violations),
+            "violations": allowed_violations,
+            # New bucket format
+            "scope_applied": safety_grep_result.get("scope_applied", False),
+            "clean_for_task": safety_grep_result.get("clean_for_task", True),
+            "allowed_scope_violations": allowed_violations,
+            "forbidden_scope_violations": matches_by_scope.get("forbidden_scope_violations", []),
+            "out_of_scope_violations": matches_by_scope.get("out_of_scope_violations", []),
+            "summary": {
+                "total": safety_grep_result.get("executable_matches_total", 0),
+                "in_allowed_scope": safety_grep_result.get("executable_matches_in_allowed_scope", 0),
+                "in_forbidden_scope": safety_grep_result.get("executable_matches_in_forbidden_scope", 0),
+                "out_of_scope": len(matches_by_scope.get("out_of_scope_violations", [])),
+            },
         }
+        violations_only_path = os.path.join(args.bundle_dir, "violations_only.json")
         with open(violations_only_path, "w") as f:
-            json.dump(violations_payload, f, indent=2)
-        print(f"[Phase 2] Wrote violations_only.json ({safety_grep_result.get('actionable_violations', 0)} actionable violations)")
+            json.dump(violations_only_payload, f, indent=2)
+        print(f"[Phase 2] Wrote violations_only.json "
+              f"(clean_for_task={safety_grep_result.get('clean_for_task', True)}, "
+              f"allowed_scope={len(matches_by_scope.get('allowed_scope_violations', []))}, "
+              f"forbidden_scope={len(matches_by_scope.get('forbidden_scope_violations', []))})")
     else:
         # Placeholder
         safety_grep_placeholder = {
