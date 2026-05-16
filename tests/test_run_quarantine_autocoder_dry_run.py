@@ -1564,12 +1564,16 @@ class TestSafetyGrepHumanReadableHeader:
 
             assert summary.get("files_scanned") == str(body["files_scanned"]), \
                 f"files_scanned mismatch: header={summary.get('files_scanned')} body={body['files_scanned']}"
-            assert summary.get("executable_matches") == str(body["executable_matches_count"]), \
-                f"executable_matches mismatch: header={summary.get('executable_matches')} body={body['executable_matches_count']}"
-            assert summary.get("policy_mentions") == str(body["policy_mentions_count"]), \
-                f"policy_mentions mismatch: header={summary.get('policy_mentions')} body={body['policy_mentions_count']}"
+            assert summary.get("raw_matches") == str(body["raw_matches"]), \
+                f"raw_matches mismatch: header={summary.get('raw_matches')} body={body['raw_matches']}"
+            assert summary.get("policy_mentions") == str(body["policy_mentions"]), \
+                f"policy_mentions mismatch: header={summary.get('policy_mentions')} body={body['policy_mentions']}"
+            assert summary.get("actionable_violations") == str(body["actionable_violations"]), \
+                f"actionable_violations mismatch: header={summary.get('actionable_violations')} body={body['actionable_violations']}"
             assert summary.get("clean") == str(body["clean"]).lower(), \
                 f"clean mismatch: header={summary.get('clean')} body={body['clean']}"
+            assert summary.get("violations_only_file") == "violations_only.json", \
+                f"violations_only_file should be 'violations_only.json', got: {summary.get('violations_only_file')}"
 
     def test_policy_mentions_without_executable_matches_produces_clean_true(self):
         """Policy mentions with zero executable matches must report clean: true."""
@@ -1611,8 +1615,9 @@ class TestSafetyGrepHumanReadableHeader:
             body = _json.loads(json_text)
             assert body["clean"] is True, \
                 f"Policy mentions only should be clean=true, got: {body['clean']}"
-            assert body["executable_matches_count"] == 0
-            assert body["policy_mentions_count"] > 0, \
+            assert body["raw_matches"] == 0, \
+                f"raw_matches should be 0, got: {body['raw_matches']}"
+            assert body["policy_mentions"] > 0, \
                 "Should have policy mentions recorded"
 
     def test_executable_matches_produce_clean_false(self):
@@ -1654,7 +1659,10 @@ class TestSafetyGrepHumanReadableHeader:
             body = _json.loads(json_text)
             assert body["clean"] is False, \
                 f"Executable matches should be clean=false, got: {body['clean']}"
-            assert body["executable_matches_count"] > 0
+            assert body["raw_matches"] > 0, \
+                f"raw_matches should be > 0, got: {body['raw_matches']}"
+            assert body["actionable_violations"] >= 0
+            assert isinstance(body["violations"], list)
 
 
 class TestBundleStatusMode:
@@ -1894,6 +1902,361 @@ class TestSafetyGrepGeneratedAt:
             body = _json.loads(json_text)
             assert "generated_at" in body, "safety_grep.json must include generated_at"
             assert body["generated_at"] != ""
+
+
+# =============================================================================
+# Reviewability Improvements — reviewer_summary, violations_only.json
+# =============================================================================
+
+
+class TestReviewerSummary:
+    """BUNDLE_STATUS.json must include reviewer_summary field."""
+
+    def test_reviewbundlestatus_contains_reviewer_summary(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            assert "reviewer_summary" in status, \
+                "BUNDLE_STATUS.json must include 'reviewer_summary' field"
+
+    def test_reviewer_summary_mentions_mode(self):
+        """reviewer_summary must mention the bundle mode."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            summary = status["reviewer_summary"]
+            # Must mention mode (placeholder_bundle or read_only_trace_collection)
+            assert any(m in summary for m in ("placeholder", "read-only", "trace", "bundle")), \
+                f"reviewer_summary must mention mode: {summary!r}"
+
+    def test_reviewer_summary_mentions_diff_status(self):
+        """reviewer_summary must mention diff_status or changes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            summary = status["reviewer_summary"]
+            # Must mention diff status or changes status
+            assert any(m in summary.lower() for m in
+                      ("diff", "changes", "clean", "dirty", "status")), \
+                f"reviewer_summary must mention diff_status or changes: {summary!r}"
+
+    def test_reviewer_summary_mentions_safety_result(self):
+        """reviewer_summary must mention safety result (violations or clean)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            summary = status["reviewer_summary"]
+            # Must mention safety result
+            assert any(m in summary.lower() for m in
+                      ("safety", "violation", "clean", "actionable", "no")), \
+                f"reviewer_summary must mention safety result: {summary!r}"
+
+    def test_reviewer_summary_mentions_mutation_status(self):
+        """reviewer_summary must mention mutation status (patch/change/no change)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+            )
+            assert rc == 0
+            status = read_json(bundle, "BUNDLE_STATUS.json")
+            summary = status["reviewer_summary"]
+            # Must mention mutation or patch status
+            assert any(m in summary.lower() for m in
+                      ("patch", "applied", "mutation", "change", "detected")), \
+                f"reviewer_summary must mention mutation status: {summary!r}"
+
+
+class TestViolationsOnlyFile:
+    """violations_only.json must be written when --collect-safety-grep is used."""
+
+    def test_violations_only_file_exists_when_safety_grep_run(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "violations_only.json")
+            assert os.path.exists(path), \
+                "violations_only.json must exist when --collect-safety-grep is used"
+
+    def test_violations_only_empty_when_clean_repo(self):
+        """violations_only.json must be empty when no actionable violations."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            with open(os.path.join(repo, "README.md"), "w") as f:
+                f.write("# Test\n")
+            subprocess.run(["git", "add", "README.md"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            assert violations["actionable_violations"] == 0, \
+                f"Clean repo should have 0 actionable_violations, got: {violations['actionable_violations']}"
+            assert violations["violations"] == [], \
+                f"Clean repo should have empty violations list, got: {violations['violations']}"
+
+    def test_violations_only_contains_violations_when_real_violation(self):
+        """violations_only.json must contain violations when an actionable violation exists."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+            # Create a real actionable violation in a non-test file
+            bad_file = os.path.join(repo, "bad.py")
+            with open(bad_file, "w") as f:
+                f.write('if __name__ == "__main__":\n')
+                f.write('    os.system("gh pr merge")\n')
+            subprocess.run(["git", "add", "bad.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            assert violations["actionable_violations"] > 0, \
+                f"Real violation should produce actionable_violations > 0, got: {violations['actionable_violations']}"
+            assert len(violations["violations"]) > 0, \
+                f"Real violation should produce non-empty violations list, got: {violations['violations']}"
+            # Each violation should have pattern, line, text, file
+            for v in violations["violations"]:
+                assert "pattern" in v
+                assert "line" in v
+                assert "text" in v
+                assert "file" in v
+
+    def test_violations_only_not_created_without_safety_grep_flag(self):
+        """violations_only.json must NOT be created when --collect-safety-grep is not used."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", tmpdir,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                # Note: NO --collect-safety-grep
+            )
+            assert rc == 0
+            path = bundle_file(bundle, "violations_only.json")
+            assert not os.path.exists(path), \
+                "violations_only.json must NOT be created without --collect-safety-grep"
+
+    def test_clean_true_when_forbidden_string_in_test_file(self):
+        """Forbidden strings in test files must NOT count as actionable violations."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            # Create test file with parameterized forbidden strings
+            test_dir = os.path.join(repo, "tests")
+            os.makedirs(test_dir, exist_ok=True)
+            with open(os.path.join(test_dir, "test_forbidden.py"), "w") as f:
+                f.write('EXEC = "gh pr merge"\n')
+                f.write('MSG = "hermes kanban create"\n')
+            subprocess.run(["git", "add", "tests/test_forbidden.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            # Test files are non-actionable, so violations should be 0
+            assert violations["actionable_violations"] == 0, \
+                f"Forbidden strings in test files should not count as actionable: {violations}"
+            safety_grep_path = bundle_file(bundle, "safety_grep.txt")
+            with open(safety_grep_path) as f:
+                content = f.read()
+            json_start = content.index("{")
+            import json as _json
+            body = _json.loads(content[json_start:])
+            assert body["clean"] is True, \
+                f"Test-file-only matches should be clean=true, got: {body['clean']}"
+            assert body["raw_matches"] > 0, \
+                f"raw_matches should be > 0 from test file, got: {body['raw_matches']}"
+
+
+class TestCleanMeansActionableViolations:
+    """clean: true must mean actionable_violations == 0, not raw_matches == 0."""
+
+    def test_clean_true_when_raw_matches_only_in_test_files(self):
+        """clean=true when all raw matches are in test files (non-actionable)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            test_dir = os.path.join(repo, "tests")
+            os.makedirs(test_dir)
+            with open(os.path.join(test_dir, "check.py"), "w") as f:
+                f.write('# "gh pr merge" in a comment\n')
+                f.write('# "hermes kanban dispatch" here too\n')
+                f.write('FORBIDDEN = ["git push", "git commit"]\n')
+            subprocess.run(["git", "add", "tests/check.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            # All matches are in test files → 0 actionable → clean: true
+            assert violations["actionable_violations"] == 0
+            safety_grep_path = bundle_file(bundle, "safety_grep.txt")
+            with open(safety_grep_path) as f:
+                content = f.read()
+            json_start = content.index("{")
+            import json as _json
+            body = _json.loads(content[json_start:])
+            assert body["clean"] is True, \
+                f"Test-file matches only → clean should be true, got: {body['clean']}"
+            assert body["raw_matches"] > 0, \
+                f"raw_matches should be > 0 (test file has matches), got: {body['raw_matches']}"
+
+    def test_clean_false_when_actionable_violation_in_script_file(self):
+        """clean=false when an actionable violation exists in a non-test file."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            # Create a production script file with actionable violation
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            with open(os.path.join(scripts_dir, "deploy.py"), "w") as f:
+                f.write("#!/usr/bin/env python3\n")
+                f.write('import os\n')
+                f.write('os.system("gh pr merge --admin --squash")\n')
+            subprocess.run(["git", "add", "scripts/deploy.py"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run",
+                "--source-repo", repo,
+                "--bundle-dir", bundle,
+                "--base-sha", "a" * 40,
+                "--candidate-id", "test-candidate",
+                "--objective", "test objective",
+                "--collect-safety-grep",
+            )
+            assert rc == 0
+            violations = read_json(bundle, "violations_only.json")
+            safety_grep_path = bundle_file(bundle, "safety_grep.txt")
+            with open(safety_grep_path) as f:
+                content = f.read()
+            json_start = content.index("{")
+            import json as _json
+            body = _json.loads(content[json_start:])
+            assert violations["actionable_violations"] > 0, \
+                f"Actionable violation in scripts/ should count: {violations}"
+            assert body["clean"] is False, \
+                f"Actionable violation → clean should be false, got: {body['clean']}"
 
 
 class TestExistingSafetyInvariantsPreserved:
