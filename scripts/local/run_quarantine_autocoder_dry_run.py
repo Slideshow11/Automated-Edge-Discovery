@@ -913,10 +913,26 @@ def collect_safety_grep(
                 # executable context to handle docstring open/close lines correctly.
                 #    e.g. """Example: subprocess.run("gh pr merge", shell=True)"""
                 #    e.g. r"""Policy: hermes kanban create"""
+                # NOTE: only suppress if the closing triple ends the line (no executable
+                # code after). e.g. '"""doc""" ; os.system("git push")' → executable
                 stripped_line = line.lstrip()
                 if stripped_line.startswith('"""') or stripped_line.startswith("'''"):
-                    classification = "policy_mentions"
-                    reason = "docstring"
+                    # Check: is this a single-line docstring with nothing after the close?
+                    # Use rfind to find the LAST triple on the line (not the first).
+                    # For '"""Example: subprocess.run("gh pr merge")"""',
+                    # first triple is at 0, last triple is at the end.
+                    try:
+                        last_triple = max(
+                            stripped_line.rindex('"""') if '"""' in stripped_line else -1,
+                            stripped_line.rindex("'''") if "'''" in stripped_line else -1
+                        )
+                        if last_triple >= 0:
+                            after_close = stripped_line[last_triple + 3:].strip()
+                            if not after_close:
+                                classification = "policy_mentions"
+                                reason = "docstring"
+                    except ValueError:
+                        pass
 
                 # B. Raw docstring boundary (single-line raw docstring open+close on same line):
                 #    r"""...""" or R'''...''' → policy mention, not executable violation.
@@ -936,19 +952,20 @@ def collect_safety_grep(
 
                 # C. Docstring-ending line: if the line STARTED inside a docstring
                 #    (was_in_docstring=True) and this line closes it (content before
-                #    closing triple-quote), treat as docstring even if the line also
-                #    contains executable-context patterns.
+                #    closing triple-quote AND nothing executable after), treat as docstring.
                 #    e.g. 'Example: os.system("git push")"""' — the os.system is part
                 #    of the docstring content, not executable code after the docstring.
-                #    Detected by: was_in_docstring=True AND line has content before closing triple.
+                #    BUT: 'Doc""" ; os.system("git push")' → os.system is a real violation.
+                #    Detected by: was_in_docstring=True AND content before triple AND
+                #    nothing meaningful after closing triple.
                 elif was_in_docstring:
-                    # Check if line has content before the closing triple-quote
-                    # (meaning this is a docstring-closing line, not code after the docstring)
                     try:
                         tp = stripped_line.index('"""') if '"""' in stripped_line else stripped_line.index("'''")
-                        if tp > 0:  # content before triple → docstring close line
-                            classification = "policy_mentions"
-                            reason = "docstring"
+                        if tp > 0:  # content before triple
+                            after_close = stripped_line[tp + 3:].strip()
+                            if not after_close:
+                                classification = "policy_mentions"
+                                reason = "docstring"
                     except ValueError:
                         pass
 
