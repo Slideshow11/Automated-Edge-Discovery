@@ -272,6 +272,15 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
     # but we verify with resolved path here for the record)
     bundle_in_git = ".git" in str(bundle_resolved)
 
+    # Determine diff_status from git result and scope status
+    diff_status = "unknown"
+    if git_meta["failed"]:
+        diff_status = "failed"
+    elif files_count == 0:
+        diff_status = "clean"
+    else:
+        diff_status = "dirty"
+
     # Explicit failure: do NOT set scope_clean=true when git failed
     if git_meta["failed"]:
         scope_clean = None
@@ -294,6 +303,7 @@ def collect_scope_check(source_repo: str, bundle_dir: str, base_sha: str) -> dic
         "bundle_dir_inside_git": bundle_in_git,
         "scope_clean": scope_clean,
         "scope_status": scope_status,
+        "diff_status": diff_status,
         "git_rc": git_meta["git_rc"],
         "git_error": git_meta["git_error"],
     }
@@ -384,11 +394,14 @@ def collect_safety_grep(source_repo: str, bundle_dir: str) -> dict:
         "bundle_dir": str(Path(bundle_dir).resolve()),
         "patterns_checked": list(patterns),
         "files_scanned": len(py_files),
+        "executable_matches_count": total_executable,
+        "policy_mentions_count": total_policy,
         "forbidden_executable_matches": matches_by_file,
         "forbidden_policy_mentions": policy_mentions_by_file,
         "total_executable_matches": total_executable,
         "total_policy_mentions": total_policy,
         "clean": total_executable == 0,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -466,8 +479,13 @@ def collect_local_gate_preview(source_repo: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def write_bundle_status(bundle_dir: str, read_only_collections: dict) -> dict:
+    # Determine mode: if any collection flag is True, mode is read_only_trace_collection;
+    # otherwise mode is placeholder_bundle (Phase 1 style output)
+    has_any_collection = any(read_only_collections.values())
+    mode = "read_only_trace_collection" if has_any_collection else "placeholder_bundle"
     status = {
         "phase": "Phase 2",
+        "mode": mode,
         "dry_run": True,
         "agent_executed": False,
         "patch_applied": False,
@@ -506,9 +524,11 @@ def write_markdown_file(bundle_dir: str, filename: str, content: str) -> str:
 def generate_codex_review_summary() -> dict:
     return {
         "phase": "Phase 2",
+        "mode": "placeholder",
         "codex_reviewed": False,
         "note": (
-            "Phase 2 does NOT run Codex. Read-only trace collection only. "
+            "Codex was not run in Phase 2. Read-only trace collection only. "
+            "This file is a placeholder for future phases or manual review output. "
             "Codex review may be added in Phase 3 or later."
         ),
         "clean": None,
@@ -798,9 +818,22 @@ def main(argv=None):
         safety_grep_result = collect_safety_grep(args.source_repo, args.bundle_dir)
         safety_grep_path = os.path.join(args.bundle_dir, "safety_grep.txt")
         with open(safety_grep_path, "w") as f:
+            # Human-readable summary header first
+            exec_count = safety_grep_result.get("executable_matches_count", 0)
+            policy_count = safety_grep_result.get("policy_mentions_count", 0)
+            files_scanned = safety_grep_result.get("files_scanned", 0)
+            is_clean = safety_grep_result.get("clean", False)
+            f.write("# Safety Grep Summary\n")
+            f.write(f"files_scanned: {files_scanned}\n")
+            f.write(f"executable_matches: {exec_count}\n")
+            f.write(f"policy_mentions: {policy_count}\n")
+            f.write(f"clean: {str(is_clean).lower()}\n")
+            f.write(f"details_format: json_below\n")
+            f.write("\n")
+            # Then full JSON
             json.dump(safety_grep_result, f, indent=2)
-        print(f"[Phase 2] Wrote safety_grep.txt (read-only scan, {safety_grep_result.get('files_scanned', 0)} files, "
-              f"{safety_grep_result.get('total_executable_matches', 0)} exec matches)")
+        print(f"[Phase 2] Wrote safety_grep.txt (read-only scan, {files_scanned} files, "
+              f"{exec_count} exec matches)")
     else:
         # Placeholder
         safety_grep_placeholder = {
