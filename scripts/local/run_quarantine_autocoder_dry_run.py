@@ -25,6 +25,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Validation helpers
@@ -49,6 +50,16 @@ EXECUTABLE_MUTATION_COMMANDS = frozenset([
     "delegate_task",
     "cronjob",
 ])
+
+
+def is_test_file(path: str) -> bool:
+    """Return True if the file is a test file (test_ prefix or _test.py suffix).
+
+    Test files parameterize forbidden strings as test data — these are not
+    executable violations even when they contain forbidden command strings.
+    """
+    name = os.path.basename(path)
+    return name.startswith("test_") or name.endswith("_test.py")
 
 
 def validate_base_sha(sha: str) -> None:
@@ -103,6 +114,13 @@ def validate_bundle_dir(bundle_dir: str, force: bool) -> None:
     for infix in FORBIDDEN_BUNDLE_INFIXES:
         if infix in resolved_str:
             raise ValueError(f"bundle_dir cannot contain: {infix}")
+
+    # Test file detection: skip files whose basename starts with "test_" or ends
+    # with "_test.py" — these are test files and forbidden strings within them
+    # are parameterized test data, not executable violations.
+    def is_test_file(path: str) -> bool:
+        name = os.path.basename(path)
+        return name.startswith("test_") or name.endswith("_test.py")
 
     if not force and any(Path(bundle_dir).iterdir() if Path(bundle_dir).is_dir() else []):
         raise ValueError(
@@ -389,18 +407,43 @@ def collect_safety_grep(source_repo: str, bundle_dir: str) -> dict:
     total_executable = sum(len(v) for v in matches_by_file.values())
     total_policy = sum(len(v) for v in policy_mentions_by_file.values())
 
+    # Distinguish test/context matches from real actionable violations.
+    # Files under tests/ or containing policy-mention patterns are non-actionable.
+    # actionable_violations = executable matches that are NOT in test files
+    # AND NOT already classified as policy mentions.
+    # Key insight: in AED, forbidden strings in tests are parameterized test data,
+    # not executable violations. Only non-test files with executable usage count.
+    actionable_violations = 0
+    violations_list = []
+    for rel_path, matches in matches_by_file.items():
+        # Skip test files — parameterizing forbidden strings in tests is safe
+        # Also skip files named test_*.py or *_test.py at root level
+        if "/tests/" in rel_path or rel_path.startswith("tests/") or is_test_file(rel_path):
+            continue
+        for m in matches:
+            actionable_violations += 1
+            violations_list.append({
+                "pattern": m["pattern"],
+                "line": m["line"],
+                "text": m["text"],
+                "file": rel_path,
+            })
+
     return {
         "source_repo": str(source_resolved),
         "bundle_dir": str(Path(bundle_dir).resolve()),
         "patterns_checked": list(patterns),
         "files_scanned": len(py_files),
-        "executable_matches_count": total_executable,
-        "policy_mentions_count": total_policy,
+        "raw_matches": total_executable,
+        "policy_mentions": total_policy,
+        "test_or_context_matches": total_policy,
+        "actionable_violations": actionable_violations,
+        "violations": violations_list,
         "forbidden_executable_matches": matches_by_file,
         "forbidden_policy_mentions": policy_mentions_by_file,
         "total_executable_matches": total_executable,
         "total_policy_mentions": total_policy,
-        "clean": total_executable == 0,
+        "clean": actionable_violations == 0,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -478,14 +521,77 @@ def collect_local_gate_preview(source_repo: str) -> dict:
 # Bundle file generators
 # ---------------------------------------------------------------------------
 
-def write_bundle_status(bundle_dir: str, read_only_collections: dict) -> dict:
+def compute_reviewer_summary(mode: str, diff_status: str, safety_clean: bool,
+                              patch_applied: bool) -> str:
+    """Generate a one-line reviewer summary for BUNDLE_STATUS.json."""
+    if mode == "placeholder_bundle":
+        patch_str = "patch not applied." if not patch_applied else "patch applied."
+        diff_str = f"diff_status={diff_status}" if diff_status is not None else "no git diff run"
+        return (
+            f"Placeholder bundle. No read-only traces collected yet. "
+            f"{diff_str}. {patch_str}"
+        )
+    # read_only_trace_collection
+    if diff_status == "clean" and safety_clean and not patch_applied:
+        return (
+            "Read-only trace bundle. No repo changes detected. "
+            "No actionable safety violations found."
+        )
+    elif diff_status == "clean" and safety_clean and patch_applied:
+        return (
+            "Read-only trace bundle. No repo changes. No actionable safety violations. "
+            "Patch applied."
+        )
+    elif diff_status == "dirty":
+        if safety_clean is None:
+            safety_str = "safety status unknown"
+        else:
+            safety_str = f"actionable safety violations: {'yes' if not safety_clean else 'none'}"
+        return (
+            f"Read-only trace bundle. Repo changes detected. "
+            f"{safety_str}."
+        )
+    elif diff_status in ("failed", "unknown"):
+        if safety_clean is None:
+            safety_str = "safety status unknown"
+        else:
+            safety_str = f"actionable safety violations: {'yes' if not safety_clean else 'none'}"
+        return (
+            f"Read-only trace bundle. git diff {diff_status}. "
+            f"{safety_str}."
+        )
+    # safety_grep without scope collection (diff_status=None)
+    if safety_clean is None:
+        safety_str = "safety status unknown"
+    else:
+        safety_str = f"actionable safety violations: {'yes' if not safety_clean else 'none'}"
+    return (
+        f"Read-only trace bundle. {safety_str}."
+    )
+
+
+def write_bundle_status(bundle_dir: str, read_only_collections: dict,
+                        scope_check: dict = None, safety_grep: dict = None) -> dict:
     # Determine mode: if any collection flag is True, mode is read_only_trace_collection;
     # otherwise mode is placeholder_bundle (Phase 1 style output)
     has_any_collection = any(read_only_collections.values())
     mode = "read_only_trace_collection" if has_any_collection else "placeholder_bundle"
+
+    diff_status = None
+    if scope_check:
+        diff_status = scope_check.get("diff_status", None)
+    safety_clean = None
+    if safety_grep:
+        safety_clean = safety_grep.get("clean", None)
+
+    patch_applied = False  # Phase 2 never applies a patch
+
+    reviewer_summary = compute_reviewer_summary(mode, diff_status, safety_clean, patch_applied)
+
     status = {
         "phase": "Phase 2",
         "mode": mode,
+        "reviewer_summary": reviewer_summary,
         "dry_run": True,
         "agent_executed": False,
         "patch_applied": False,
@@ -728,7 +834,15 @@ def main(argv=None):
     }
 
     # ---- BUNDLE_STATUS.json ----
-    status = write_bundle_status(args.bundle_dir, read_only_collections)
+    # Collect scope_check and safety_grep results first so we can compute reviewer_summary
+    scope_check = None
+    safety_grep = None
+    if args.collect_scope:
+        scope_check = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
+    if args.collect_safety_grep:
+        safety_grep = collect_safety_grep(args.source_repo, args.bundle_dir)
+    status = write_bundle_status(args.bundle_dir, read_only_collections,
+                                  scope_check=scope_check, safety_grep=safety_grep)
     print(f"[Phase 2] Wrote BUNDLE_STATUS.json (read_only_collections={read_only_collections})")
 
     # ---- Static text files ----
@@ -794,11 +908,11 @@ def main(argv=None):
 
     # ---- Read-only: scope check ----
     if args.collect_scope:
-        scope_check = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
+        scope_result = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
         scope_check_path = os.path.join(args.bundle_dir, "scope_check.json")
         with open(scope_check_path, "w") as f:
-            json.dump(scope_check, f, indent=2)
-        print(f"[Phase 2] Wrote scope_check.json (read-only git, {scope_check.get('files_changed_count', 0)} files)")
+            json.dump(scope_result, f, indent=2)
+        print(f"[Phase 2] Wrote scope_check.json (read-only git, {scope_result.get('files_changed_count', 0)} files)")
     else:
         # Placeholder
         scope_check = {
@@ -819,21 +933,34 @@ def main(argv=None):
         safety_grep_path = os.path.join(args.bundle_dir, "safety_grep.txt")
         with open(safety_grep_path, "w") as f:
             # Human-readable summary header first
-            exec_count = safety_grep_result.get("executable_matches_count", 0)
-            policy_count = safety_grep_result.get("policy_mentions_count", 0)
+            exec_count = safety_grep_result.get("raw_matches", 0)
+            policy_count = safety_grep_result.get("policy_mentions", 0)
             files_scanned = safety_grep_result.get("files_scanned", 0)
             is_clean = safety_grep_result.get("clean", False)
+            actionable = safety_grep_result.get("actionable_violations", 0)
             f.write("# Safety Grep Summary\n")
             f.write(f"files_scanned: {files_scanned}\n")
-            f.write(f"executable_matches: {exec_count}\n")
+            f.write(f"raw_matches: {exec_count}\n")
             f.write(f"policy_mentions: {policy_count}\n")
+            f.write(f"test_or_context_matches: {policy_count}\n")
+            f.write(f"actionable_violations: {actionable}\n")
             f.write(f"clean: {str(is_clean).lower()}\n")
             f.write(f"details_format: json_below\n")
+            f.write(f"violations_only_file: violations_only.json\n")
             f.write("\n")
             # Then full JSON
             json.dump(safety_grep_result, f, indent=2)
         print(f"[Phase 2] Wrote safety_grep.txt (read-only scan, {files_scanned} files, "
-              f"{exec_count} exec matches)")
+              f"{exec_count} raw matches, {safety_grep_result.get('actionable_violations', 0)} actionable)")
+        # Write violations_only.json — empty when clean, populated when violations exist
+        violations_only_path = os.path.join(args.bundle_dir, "violations_only.json")
+        violations_payload = {
+            "actionable_violations": safety_grep_result.get("actionable_violations", 0),
+            "violations": safety_grep_result.get("violations", []),
+        }
+        with open(violations_only_path, "w") as f:
+            json.dump(violations_payload, f, indent=2)
+        print(f"[Phase 2] Wrote violations_only.json ({safety_grep_result.get('actionable_violations', 0)} actionable violations)")
     else:
         # Placeholder
         safety_grep_placeholder = {

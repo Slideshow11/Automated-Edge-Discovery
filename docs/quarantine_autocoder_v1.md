@@ -57,16 +57,17 @@ Without any `--collect-*` flags, Phase 2 produces the same placeholder bundle as
 
 ## Bundle Format
 
-| File | Phase 1 | Phase 2 (with --collect-*) |
+|| File | Phase 1 | Phase 2 (with --collect-*) |
 |------|---------|---------------------------|
-| `BUNDLE_STATUS.json` | Safety booleans (Phase 1) | Safety booleans (Phase 2) + `read_only_collections` |
+| `BUNDLE_STATUS.json` | Safety booleans (Phase 1) | Safety booleans (Phase 2) + `read_only_collections` + `reviewer_summary` |
 | `base_sha.txt` | Base SHA | Base SHA |
 | `candidate_id.txt` | Candidate ID | Candidate ID |
 | `objective.md` | Objective | Objective |
 | `changed_files.txt` | Placeholder | Real `git diff --name-only` output (with `--collect-git-diff`) |
 | `diff.patch` | Placeholder | Real `git diff <base>..HEAD` output (with `--collect-git-diff`) |
 | `scope_check.json` | Placeholder | Real scope check with file count + list + HEAD (with `--collect-scope`) |
-| `safety_grep.txt` | Placeholder | Scan results: patterns checked, files scanned, executable vs policy matches (with `--collect-safety-grep`) |
+| `safety_grep.txt` | Placeholder | Scan results: raw vs actionable matches + human-readable header (with `--collect-safety-grep`) |
+| `violations_only.json` | Not created | Triage file: only actionable violations (with `--collect-safety-grep`) |
 | `local_gate.txt` | Placeholder | Preview of commands that would run — NOT executed in Phase 2 (with `--collect-local-gate-preview`) |
 | `codex_review_summary.md` | Placeholder | Placeholder (Codex not run in Phase 2) |
 | `risk_notes.md` | Phase 1 disclaimer | Phase 2 disclaimer + which collectors ran |
@@ -79,6 +80,7 @@ Without any `--collect-*` flags, Phase 2 produces the same placeholder bundle as
 {
   "phase": "Phase 2",
   "mode": "read_only_trace_collection",
+  "reviewer_summary": "Read-only trace bundle. No repo changes detected. No actionable safety violations found.",
   "dry_run": true,
   "agent_executed": false,
   "patch_applied": false,
@@ -96,7 +98,13 @@ Without any `--collect-*` flags, Phase 2 produces the same placeholder bundle as
 }
 ```
 
-**mode field values:**
+**`reviewer_summary` field:** A human-readable one-line summary for next-morning review. Mentions:
+- Bundle mode (`placeholder_bundle` or `read_only_trace_collection`)
+- diff status or changes detected
+- Safety result (actionable violations or clean)
+- Mutation status (patch applied or not)
+
+**`mode` field values:**
 - `"placeholder_bundle"` — no `--collect-*` flags used; all bundle files are placeholders (Phase 1 style)
 - `"read_only_trace_collection"` — one or more `--collect-*` flags used; bundle contains real read-only evidence
 
@@ -128,37 +136,96 @@ Starts with a human-readable summary header for quick review:
 
 ```
 # Safety Grep Summary
-files_scanned: 42
-executable_matches: 0
-policy_mentions: 3
+files_scanned: 150
+raw_matches: 362
+policy_mentions: 30
+test_or_context_matches: 30
+actionable_violations: 0
 clean: true
 details_format: json_below
+violations_only_file: violations_only.json
 
 <JSON body follows>
 ```
+
+**Header fields:**
+- `files_scanned` — number of `.py` files scanned
+- `raw_matches` — total raw pattern matches (all contexts)
+- `policy_mentions` — matches in comments/docstrings (non-actionable)
+- `test_or_context_matches` — same as `policy_mentions`; matches in test files or policy contexts
+- `actionable_violations` — matches in non-test files that are real executable usage (this is what `clean` is based on)
+- `clean: true` — zero actionable violations (all forbidden strings are in tests/comments/docs)
+- `clean: false` — one or more actionable violations in non-test files
+- `violations_only_file` — always `violations_only.json`; the morning-review triage file
 
 **JSON body fields:**
 
 ```json
 {
   "patterns_checked": ["hermes kanban create", "gh pr merge", ...],
-  "files_scanned": 42,
-  "executable_matches_count": 0,
-  "policy_mentions_count": 3,
+  "files_scanned": 150,
+  "raw_matches": 362,
+  "policy_mentions": 30,
+  "test_or_context_matches": 30,
+  "actionable_violations": 0,
+  "violations": [],
   "forbidden_executable_matches": { ... },
   "forbidden_policy_mentions": { ... },
-  "total_executable_matches": 0,
-  "total_policy_mentions": 3,
-  "clean": false,
+  "total_executable_matches": 362,
+  "total_policy_mentions": 30,
+  "clean": true,
   "generated_at": "2026-05-16T00:32:24+00:00"
 }
 ```
 
 **`clean` field logic:**
-- `true` — zero executable matches (policy mentions are allowed)
-- `false` — one or more executable matches found
+- `clean: true` — `actionable_violations == 0`. All raw matches are in test files, comments, or docstrings. No executable usage of forbidden commands in production code.
+- `clean: false` — `actionable_violations > 0`. One or more forbidden command strings appear as real executable usage in non-test files (scripts, modules, etc.).
 
-Policy mentions (lines starting with `#` or docstrings) are recorded separately from executable matches and do NOT affect the `clean` field.
+**Key distinction: raw_matches vs actionable_violations:**
+- `raw_matches` = all pattern hits, including those in test files, string literals, comments, and docstrings
+- `actionable_violations` = raw matches that are NOT in test files AND NOT policy mentions — i.e., real executable usage of a forbidden command
+
+**Policy mentions** (lines starting with `#` or inside docstrings `"""`/`'''`) are recorded in `forbidden_policy_mentions` and do NOT affect the `clean` field.
+
+**Test file matches** are in `forbidden_executable_matches` but are excluded from `actionable_violations` and `clean` calculation. A forbidden string in `tests/test_pr_gate.py` as a test parameter is not an actionable violation.
+
+## Phase 2 `violations_only.json` (with `--collect-safety-grep`)
+
+A focused triage file for next-morning review — only actionable violations, never policy mentions:
+
+```json
+{
+  "actionable_violations": 0,
+  "violations": []
+}
+```
+
+When `actionable_violations > 0`:
+
+```json
+{
+  "actionable_violations": 2,
+  "violations": [
+    {
+      "pattern": "gh pr merge",
+      "line": 42,
+      "text": "subprocess.run([\"gh\", \"pr\", \"merge\", \"--admin\", \"--squash\"])",
+      "file": "scripts/deploy.py"
+    },
+    {
+      "pattern": "hermes kanban create",
+      "line": 15,
+      "text": "os.system(\"hermes kanban create --board aed\")",
+      "file": "automation/trigger.py"
+    }
+  ]
+}
+```
+
+Each violation entry has: `pattern`, `line`, `text`, `file`.
+
+This file is the morning-review triage companion to `safety_grep.txt` (which has full evidence including test-context matches).
 
 ## Phase 2 `local_gate.txt` (with `--collect-local-gate-preview`)
 
