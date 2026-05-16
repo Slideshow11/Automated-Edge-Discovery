@@ -62,6 +62,57 @@ def is_test_file(path: str) -> bool:
     return name.startswith("test_") or name.endswith("_test.py")
 
 
+def validate_scope_json_args(
+    allowed_files_json: str | None,
+    forbidden_files_json: str | None,
+) -> tuple[list[str] | None, list[str] | None]:
+    """Parse and validate scope JSON arguments.
+
+    Validates both --allowed-files-json and --forbidden-files-json:
+    - Must be valid JSON
+    - Must be a list (not dict, string, number, etc.)
+    - Items must be non-empty strings
+    - No absolute paths, no '..', no empty strings
+
+    Raises SystemExit(1) on any validation failure — called before any bundle
+    files are written so that malformed scope JSON fails fast.
+    """
+    parsed_allowed = None
+    parsed_forbidden = None
+
+    if allowed_files_json is not None:
+        try:
+            parsed_allowed = json.loads(allowed_files_json)
+        except json.JSONDecodeError as e:
+            print(f"VALIDATION ERROR: --allowed-files-json is not valid JSON: {e}")
+            sys.exit(1)
+        if not isinstance(parsed_allowed, list):
+            print("VALIDATION ERROR: --allowed-files-json must be a JSON array")
+            sys.exit(1)
+        try:
+            _validate_scope_path_list(parsed_allowed, "allowed_files")
+        except ValueError as e:
+            print(f"VALIDATION ERROR: {e}")
+            sys.exit(1)
+
+    if forbidden_files_json is not None:
+        try:
+            parsed_forbidden = json.loads(forbidden_files_json)
+        except json.JSONDecodeError as e:
+            print(f"VALIDATION ERROR: --forbidden-files-json is not valid JSON: {e}")
+            sys.exit(1)
+        if not isinstance(parsed_forbidden, list):
+            print("VALIDATION ERROR: --forbidden-files-json must be a JSON array")
+            sys.exit(1)
+        try:
+            _validate_scope_path_list(parsed_forbidden, "forbidden_files")
+        except ValueError as e:
+            print(f"VALIDATION ERROR: {e}")
+            sys.exit(1)
+
+    return parsed_allowed, parsed_forbidden
+
+
 def validate_base_sha(sha: str) -> None:
     if not HEX_SHA_RE.match(sha):
         raise ValueError(f"base_sha must be a 40-char hex string, got: {sha!r}")
@@ -147,6 +198,8 @@ def _is_absolute_or_parent_ref(path: str) -> bool:
 def _validate_scope_path_list(paths: list[str], name: str) -> None:
     """Validate a list of scope paths. Raises ValueError on first invalid entry."""
     for p in paths:
+        if not isinstance(p, str):
+            raise ValueError(f"{name} contains non-string entry: {p!r}")
         normalized = _normalize_trailing_slash(p)
         if not normalized:
             raise ValueError(f"{name} contains empty string entry")
@@ -899,6 +952,18 @@ def main(argv=None):
         )
         sys.exit(1)
 
+    # ---- Early scope JSON validation (before ANY bundle files are written) ----
+    # Validate BEFORE bundle_dir is created so malformed JSON fails fast with no partial bundle.
+    parsed_allowed = None
+    parsed_forbidden = None
+    if args.allowed_files_json is not None or args.forbidden_files_json is not None:
+        try:
+            parsed_allowed, parsed_forbidden = validate_scope_json_args(
+                args.allowed_files_json, args.forbidden_files_json
+            )
+        except SystemExit:
+            raise  # re-raise sys.exit(1) from validate_scope_json_args
+
     # ---- Validations ----
     try:
         validate_base_sha(args.base_sha)
@@ -1052,6 +1117,11 @@ def main(argv=None):
     # ---- Read-only: scope check ----
     if args.collect_scope:
         scope_result = collect_scope_check(args.source_repo, args.bundle_dir, args.base_sha)
+        # Inject scope metadata from early-validated JSON args (available even when
+        # --collect-scope is used without --collect-safety-grep).
+        scope_result["allowed_files"] = parsed_allowed if parsed_allowed is not None else []
+        scope_result["forbidden_files"] = parsed_forbidden if parsed_forbidden is not None else []
+        scope_result["scope_applied"] = bool(parsed_allowed or parsed_forbidden)
         scope_check_path = os.path.join(args.bundle_dir, "scope_check.json")
         with open(scope_check_path, "w") as f:
             json.dump(scope_result, f, indent=2)
@@ -1072,33 +1142,8 @@ def main(argv=None):
 
     # ---- Read-only: safety grep ----
     if args.collect_safety_grep:
-        # Parse allowed/forbidden scope from JSON args
-        parsed_allowed = None
-        parsed_forbidden = None
-        if args.allowed_files_json is not None:
-            try:
-                parsed_allowed = json.loads(args.allowed_files_json)
-                if not isinstance(parsed_allowed, list):
-                    raise ValueError("allowed_files_json must be a JSON array")
-                _validate_scope_path_list(parsed_allowed, "allowed_files")
-            except json.JSONDecodeError as e:
-                print(f"VALIDATION ERROR: --allowed-files-json is not valid JSON: {e}")
-                sys.exit(1)
-            except ValueError as e:
-                print(f"VALIDATION ERROR: {e}")
-                sys.exit(1)
-        if args.forbidden_files_json is not None:
-            try:
-                parsed_forbidden = json.loads(args.forbidden_files_json)
-                if not isinstance(parsed_forbidden, list):
-                    raise ValueError("forbidden_files_json must be a JSON array")
-                _validate_scope_path_list(parsed_forbidden, "forbidden_files")
-            except json.JSONDecodeError as e:
-                print(f"VALIDATION ERROR: --forbidden-files-json is not valid JSON: {e}")
-                sys.exit(1)
-            except ValueError as e:
-                print(f"VALIDATION ERROR: {e}")
-                sys.exit(1)
+        # parsed_allowed / parsed_forbidden already validated in early validation block above.
+        # Reuse them directly — do not re-parse to keep early-validation guarantee.
 
         safety_grep_result = collect_safety_grep(
             args.source_repo,
