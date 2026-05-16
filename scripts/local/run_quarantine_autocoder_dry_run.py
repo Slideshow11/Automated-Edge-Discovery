@@ -813,18 +813,20 @@ def collect_safety_grep(
             triple_single = line.count("'''") + line.count("r'''")
             triple_total = triple_double + triple_single
 
-            # Update in_docstring based on triple-quote count on this line
-            # Only toggle on ODD counts (1, 3, ...): one net boundary transition per line
-            # Even counts (2, 4, ...): balanced open+close on same line → no net change
-            # For count=1: one boundary transition — enter if outside, exit if inside
-            # This correctly handles:
-            #   - single-line docstrings: """text""" (count=2, even → no change)
-            #   - opening line when outside: """ (count=1, outside → toggle on/enter)
-            #   - closing line when inside: """ (count=1, inside → toggle off/exit)
-            #   - body lines: no triple quotes (count=0, no change)
-            #   - adjacent function docstrings: close (count=1, inside → exit) then open (count=1, outside → enter)
+            # Update in_docstring based on triple-quote count on this line.
             if triple_total > 0 and triple_total % 2 == 1:
-                in_docstring = not in_docstring
+                if not in_docstring:
+                    # Currently outside: this is an opening """ → enter docstring
+                    in_docstring = not in_docstring
+                elif in_docstring:
+                    # Currently inside: this might be a closing """ → exit docstring
+                    # If triple-quote is NOT at start of line, it's an adjacent function
+                    # docstring opening (not a close) → don't toggle, stay inside
+                    stripped_line = line.lstrip()
+                    if stripped_line.startswith('"""') or stripped_line.startswith("'''"):
+                        # Triple-quote at START of line → close → toggle off
+                        in_docstring = not in_docstring
+                    # else: triple-quote not at start → adjacent open → don't toggle
 
             for pattern in patterns:
                 if pattern not in line:
