@@ -431,14 +431,18 @@ def validate_source_repo(source_repo: str) -> None:
     # Pattern: no leading '/', exactly two non-empty parts when split by '/',
     # each part looks like a simple identifier (no path separators inside).
     # This catches "Slideshow11/Automated-Edge-Discovery" but NOT "/tmp/xxx" or "docs/".
+    # Only reject if the path does NOT exist as a local directory.
     if not source_repo.startswith("/") and source_repo.count("/") == 1:
         owner, repo = source_repo.split("/", 1)
         if owner and repo and not any(c in ("/", "\\") for c in owner) and not any(c in ("/", "\\") for c in repo):
-            raise ValueError(
-                f"--source-repo must be an existing local path, not a remote repo slug. "
-                f"Received: {source_repo!r}. "
-                f"Use an absolute path like /home/max/Automated-Edge-Discovery."
-            )
+            # Check if it's an existing local path before rejecting
+            abs_path = os.path.abspath(source_repo)
+            if not os.path.exists(abs_path):
+                raise ValueError(
+                    f"--source-repo must be an existing local path, not a remote repo slug. "
+                    f"Received: {source_repo!r}. "
+                    f"Use an absolute path like /home/max/Automated-Edge-Discovery."
+                )
 
     source_repo = os.path.abspath(source_repo)
     if source_repo == "/":
@@ -813,24 +817,26 @@ def collect_safety_grep(
             triple_single = line.count("'''") + line.count("r'''")
             triple_total = triple_double + triple_single
 
+            # stripped_line used in multiple branches below
+            stripped_line = line.lstrip()
+
+            # Detect raw docstring opening at line start
+            raw_docstring_start = (
+                stripped_line.startswith('r"""') or
+                stripped_line.startswith("r'''") or
+                stripped_line.startswith('R"""') or
+                stripped_line.startswith("R'''")
+            )
+
             # Update in_docstring based on triple-quote count on this line.
             # Only toggle on ODD counts (1, 3, ...): one net boundary transition per line.
             # Even counts (2, 4, ...): balanced open+close on same line → no net change.
             #
-            # Triple at START of stripped line + content_after (not a comment):
-            # - When OUTSIDE: this is an OPENING (the docstring content starts on same line)
-            #   e.g. '"""Policy: Do not call gh pr merge...'
-            #   → enter docstring
-            # - When INSIDE: this is an END-OF-LINE CLOSE (docstring ends on same line)
-            #   e.g. 'Forbidden: hermes kanban create, telegram send"""'
-            #   → exit docstring
-            # Triple at START with NO content_after (or only a comment):
-            # - When OUTSIDE: standalone opening/closing """ → enter
-            # - When INSIDE: standalone closing """ → exit
-            # Triple MID-LINE (not at start): always an OPENING when outside
-            #   → enter docstring
-            if triple_total > 0 and triple_total % 2 == 1:
-                stripped_line = line.lstrip()
+            # Raw docstring (r""" or R"""): always enter immediately (the triple is not
+            # counted as a standalone boundary — it's the raw string delimiter).
+            if raw_docstring_start:
+                in_docstring = True
+            elif triple_total > 0 and triple_total % 2 == 1:
                 starts_with = stripped_line.startswith('"""') or stripped_line.startswith("'''")
                 if not in_docstring:
                     # Outside + odd count: entering a docstring
@@ -855,7 +861,22 @@ def collect_safety_grep(
                         else:
                             # Standalone """ or """ with comment-only → close → exit
                             in_docstring = not in_docstring
-                    # else: mid-line triple → adjacent open → stay inside
+                    else:
+                        # Triple mid-line: might be adjacent function docstring (stay) or
+                        # end-of-line close (exit).
+                        # If there is meaningful content BEFORE the triple → it's a close
+                        # (the outer docstring ends and the rest of the line is outside).
+                        # If there is NO content before the triple → it's an adjacent open
+                        # (inner docstring opening within the outer) → stay inside.
+                        try:
+                            triple_pos = stripped_line.index('"""') if '"""' in stripped_line else stripped_line.index("'''")
+                            content_before = triple_pos
+                        except ValueError:
+                            content_before = 0
+                        if content_before > 0:
+                            # Content before triple → close the outer docstring
+                            in_docstring = not in_docstring
+                        # else: no content before → adjacent inner open → stay inside
 
             for pattern in patterns:
                 if pattern not in line:
@@ -922,7 +943,7 @@ def collect_safety_grep(
     raw_policy_mentions = len(classified_matches["policy_mentions"])
     raw_suppressed_contexts = len(classified_matches["suppressed_contexts"])
     # raw_matches_total: all pattern hits before any suppression/filtering
-    raw_matches_total = raw_executable_violations + raw_suppressed_contexts
+    raw_matches_total = raw_executable_violations + raw_policy_mentions + raw_suppressed_contexts
 
     # Skip test files from all classified match lists
     for bucket in ("executable_violations", "policy_mentions", "suppressed_contexts"):
