@@ -3916,3 +3916,44 @@ class TestDocstringStateMachine:
             expected = sg["executable_violations_count"] + sg["policy_mentions_count"] + sg["suppressed_context_count"]
             assert sg["raw_matches_total"] == expected, \
                 f"raw_matches_total should be {expected} (exec+policy+suppressed), got {sg['raw_matches_total']}"
+
+    def test_single_line_raw_docstring_then_executable_is_violation(self):
+        """
+        A single-line raw docstring (r\"\"\"...\"\"\") must NOT leave state machine inside
+        the docstring after the line closes. An executable after the raw docstring
+        close must be an executable violation.
+
+        This was the Codex P2 finding: single-line raw docstring set in_docstring=True
+        and bypassed the even-quote handling, so subsequent os.system was misclassified.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = os.path.join(tmpdir, "repo")
+            os.makedirs(repo)
+            subprocess.run(["git", "init"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=repo, capture_output=True)
+            subprocess.run(["git", "config", "user.name", "Test"], cwd=repo, capture_output=True)
+
+            scripts_dir = os.path.join(repo, "scripts")
+            os.makedirs(scripts_dir)
+            # Single-line raw docstring followed by executable
+            with open(os.path.join(scripts_dir, "raw_exec.py"), "w") as f:
+                f.write(
+                    'r"""Policy: Do not call gh pr merge."""\n'  # single-line raw → enter+exit
+                    'os.system("git push origin main")\n'      # outside → executable violation
+                )
+            subprocess.run(["git", "add", "."], cwd=repo, capture_output=True)
+            subprocess.run(["git", "commit", "-m", "init"], cwd=repo, capture_output=True)
+
+            bundle = os.path.join(tmpdir, "bundle")
+            rc, _, _ = run_script(
+                "--dry-run", "--source-repo", repo, "--bundle-dir", bundle,
+                "--base-sha", "a" * 40, "--candidate-id", "test-candidate",
+                "--objective", "test", "--collect-safety-grep",
+            )
+            assert rc == 0
+            sg = read_json(bundle, "safety_grep.txt")
+            # os.system after single-line raw docstring must be caught
+            assert sg["executable_violations_count"] >= 1, \
+                f"executable_violations_count should be >= 1 (os.system after single-line raw close), got {sg['executable_violations_count']}"
+            assert sg["clean_for_task"] is False, \
+                f"clean_for_task should be False (executable after single-line raw docstring), got {sg['clean_for_task']}"

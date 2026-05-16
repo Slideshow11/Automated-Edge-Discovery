@@ -828,14 +828,29 @@ def collect_safety_grep(
                 stripped_line.startswith("R'''")
             )
 
+            # Detect single-line raw docstring: r"""...""" or r'''...'''
+            # Count quotes in the raw prefix portion only (after r)
+            raw_prefix = stripped_line[:4]  # r"""
+            raw_prefix_single = stripped_line[:4]  # r'''
+            is_single_line_raw = (
+                (stripped_line.startswith('r"""') and '"""' in stripped_line[3:] and
+                 stripped_line[3:].find('"""') == stripped_line[3:].rfind('"""')) or
+                (stripped_line.startswith("r'''") and "'''" in stripped_line[3:] and
+                 stripped_line[3:].find("'''") == stripped_line[3:].rfind("'''"))
+            )
+
             # Update in_docstring based on triple-quote count on this line.
             # Only toggle on ODD counts (1, 3, ...): one net boundary transition per line.
             # Even counts (2, 4, ...): balanced open+close on same line → no net change.
             #
-            # Raw docstring (r""" or R"""): always enter immediately (the triple is not
-            # counted as a standalone boundary — it's the raw string delimiter).
+            # Raw docstring (r""" or R"""): for single-line raw docstrings, the line is
+            # a complete docstring (open + close on same line) — do NOT enter state.
+            # For multi-line raw docstrings (no closing on same line), enter and stay.
             if raw_docstring_start:
-                in_docstring = True
+                if not is_single_line_raw:
+                    # Multi-line raw docstring: enter and stay inside
+                    in_docstring = True
+                # else: single-line raw docstring → open+close on same line → stay outside
             elif triple_total > 0 and triple_total % 2 == 1:
                 starts_with = stripped_line.startswith('"""') or stripped_line.startswith("'''")
                 if not in_docstring:
@@ -1072,6 +1087,7 @@ def collect_safety_grep(
         "forbidden_policy_mentions": forbidden_policy_by_path,  # legacy: policy mentions by path (test files excluded)
         "total_executable_matches": raw_executable_violations,  # pre-filter count (backward compat)
         "total_policy_mentions": raw_policy_mentions,  # pre-filter count (backward compat)
+        "executable_matches_total": raw_executable_violations,  # legacy field (backward compat)
         "clean": clean_for_task,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         # Scope
