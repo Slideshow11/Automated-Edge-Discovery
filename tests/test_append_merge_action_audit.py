@@ -898,6 +898,163 @@ class TestCLIIntegration:
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["gate_catches"] == {"codex": ""}
 
+    def test_gate_catches_json_emits_object(self, capsys, monkeypatch):
+        """--gate-catches-json '{"codex":"caught issue"}' emits {"codex":"caught issue"}."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--gate-catches-json", '{"codex":"caught issue"}',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0, capsys.readouterr().err
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["gate_catches"] == {"codex": "caught issue"}
+
+    def test_gate_catches_json_rejects_list(self, capsys, monkeypatch):
+        """--gate-catches-json with a JSON list exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--gate-catches-json", '["codex","ci"]',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "JSON object" in err
+
+    def test_gate_catches_json_rejects_scalar(self, capsys, monkeypatch):
+        """--gate-catches-json with a JSON scalar exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--gate-catches-json", '"codex"',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "JSON object" in err
+
+    def test_gate_catches_json_rejects_malformed_json(self, capsys, monkeypatch):
+        """--gate-catches-json with malformed JSON exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--gate-catches-json", '{invalid}',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "not valid JSON" in err
+
+    def test_gate_catches_json_rejects_non_string_keys(self, capsys, monkeypatch):
+        """--gate-catches-json with non-str values exits 1.
+
+        Note: JSON spec requires all object keys to be strings. Python's json.loads
+        therefore never produces non-str keys — the key-type guard in the script is
+        defensive and unreachable via CLI input. This test verifies the value-type
+        guard fires correctly, which shares the same exit-1 path.
+        """
+        # Verify the value-type guard fires (non-str values are reachable via CLI)
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--gate-catches-json", '{"codex": 42}',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "values must be str" in err
+
+    def test_gate_catches_json_rejects_non_string_values(self, capsys, monkeypatch):
+        """--gate-catches-json with list value exits 1."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--gate-catches-json", '{"codex": ["list_value"]}',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "values must be str" in err
+
+    def test_gate_catches_json_pr224_full(self, capsys, monkeypatch):
+        """Full PR #224 style entry with real Codex catches via --gate-catches-json."""
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "224",
+            "--head-sha", "9dc3e465331c81b52a424543a28979f38765c650",
+            "--merge-sha", "dcc7bf188da873783c9d54e2c901fe175f36a369",
+            "--merged-at", "2026-05-15T22:49:07Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--authorization-phrase",
+            "I confirm merge PR #224 at 9dc3e465331c81b52a424543a28979f38765c650 using final-head reviewed clean state.",
+            "--gate-catches-json",
+            '{"codex":"caught git diff external command risk, git failure false-clean risk, and bundle-dir prefix validation bug"}',
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
+            "--dry-run",
+        ])
+        rc = main()
+        assert rc == 0, capsys.readouterr().err
+        parsed = json.loads(capsys.readouterr().out.strip())
+        assert parsed["pr_number"] == 224
+        assert parsed["gate_catches"] == {
+            "codex": "caught git diff external command risk, git failure false-clean risk, and bundle-dir prefix validation bug"
+        }
+        assert parsed["authorization_phrase"] == "I confirm merge PR #224 at 9dc3e465331c81b52a424543a28979f38765c650 using final-head reviewed clean state."
+        assert parsed["hermes_touched"] is False
+        assert parsed["dispatch_occurred"] is False
+        assert parsed["production_board_touched"] is False
+
     def test_blocked_action_cli_full_entry(self, capsys, monkeypatch):
         """Full blocked_action CLI invocation passes validation."""
         monkeypatch.setattr("sys.argv", [
