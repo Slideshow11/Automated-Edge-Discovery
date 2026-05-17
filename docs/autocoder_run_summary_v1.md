@@ -247,6 +247,63 @@ The tool reads from the `bundle_root` directory, looking for per-task subdirecto
 
 ---
 
+## End-of-Session Usage Example
+
+After a long-running AED session, generate the run summary from completed task bundles:
+
+```bash
+python3 scripts/local/build_autocoder_run_summary.py \
+  --run-id aed-run-2026-05-17-001 \
+  --bundle-index /path/to/BUNDLE_INDEX.json \
+  --bundle-root /path/to/bundles \
+  --output-json /path/to/RUN_SUMMARY.json \
+  --output-md /path/to/RUN_SUMMARY.md \
+  --repo /home/max/Automated-Edge-Discovery \
+  --base-sha a93416482a1b742abba5b7b3051675f69ec5a5fb \
+  --integration-branch integration/aed-run-2026-05-17-001
+```
+
+**Step 1 — Check overall status:**
+
+```bash
+cat RUN_SUMMARY.json | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['overall_status'])"
+# Expected: RUN_READY
+```
+
+**Step 2 — Review promoted tasks:**
+
+```bash
+cat RUN_SUMMARY.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('promoted:', d['tasks_promoted']); print('IDs:', d['promoted_task_ids'])"
+# Expected: promoted: 3, IDs: ['task-a', 'task-b', 'task-c']
+```
+
+**Step 3 — Confirm ready list is empty (no promoted tasks listed as ready):**
+
+```bash
+cat RUN_SUMMARY.json | python3 -c "import sys,json; d=json.load(sys.stdin); print('ready_task_ids:', d['ready_task_ids'])"
+# Expected: ready_task_ids: []  (all promoted tasks are in promoted_task_ids, not ready_task_ids)
+```
+
+**Step 4 — Read the human-readable markdown:**
+
+```bash
+cat RUN_SUMMARY.md | grep -A3 "Promoted task IDs"
+# Promoted task IDs | `task-a`, `task-b`, `task-c`
+
+cat RUN_SUMMARY.md | grep "Ready (not promoted)"
+# Ready (not promoted) | none
+```
+
+**Step 5 — Authorize merge if overall_status is RUN_READY and no blockers:**
+
+```bash
+if [ "$(cat RUN_SUMMARY.json | python3 -c "import sys,json; print(json.load(sys.stdin)['overall_status'])")" = "RUN_READY" ]; then
+  echo "All tasks promoted and clean — authorize merge"
+fi
+```
+
+---
+
 ## Safety Invariants
 
 ### Hard-Fail Booleans (exit code 2)
