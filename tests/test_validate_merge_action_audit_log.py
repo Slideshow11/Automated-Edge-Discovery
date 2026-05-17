@@ -453,7 +453,7 @@ def test_missing_gate_catches_fails_strict(temp_dir):
 
 
 def test_expected_pr_missing_reported(temp_dir):
-    """Expected PR not found should be reported as warning."""
+    """Missing expected PR must be reported as error (not warning) and fail validation."""
     log = temp_dir / "log.jsonl"
     json_out = temp_dir / "report.json"
     md_out = temp_dir / "report.md"
@@ -466,10 +466,14 @@ def test_expected_pr_missing_reported(temp_dir):
     )
 
     report = json.loads(json_content)
+    # Missing expected PR must be an error, not a warning
     assert any(
-        w["code"] == "expected_pr_not_found" and w.get("expected_pr") == 232
-        for w in report["warnings"]
-    )
+        e["code"] == "expected_pr_not_found" and e.get("expected_pr") == 232
+        for e in report["errors"]
+    ), f"expected_pr_not_found not in errors: {[e['code'] for e in report['errors']]}"
+    # Validation must fail
+    assert rc != 0
+    assert report["valid"] is False
 
 
 def test_expected_pr_exactly_once_passes(temp_dir):
