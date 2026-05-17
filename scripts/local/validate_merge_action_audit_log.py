@@ -121,6 +121,35 @@ LEGACY_LEGACY_FLAGS = frozenset([
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_pr_number(value: Any) -> int | None:
+    """
+    Normalize a PR number value to an integer.
+
+    Handles:
+    - int → returned as-is
+    - str like "123" or "#123" or "PR #123" → parsed to int
+    - None or non-numeric string → returns None
+
+    Returns None if the value cannot be normalized.
+    """
+    if value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        value = value.strip()
+        # Strip leading "PR #", "#", "PR-"
+        for prefix in ("PR #", "PR-", "pr #", "pr-", "#"):
+            if value.startswith(prefix):
+                value = value[len(prefix):]
+                break
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
 def is_valid_sha(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -228,6 +257,7 @@ def validate_log(
     merge_sha_seen: dict[str, list[int]] = {}
     head_sha_pr_seen: dict[str, dict[str, list[int]]] = {}  # pr -> head_sha -> [lines]
     valid_row_count = 0
+    parsed_rows: dict[int, dict[str, Any]] = {}  # line_idx -> row for SHA lookups
 
     for idx, raw_line in enumerate(lines):
         line_idx = idx + 1  # 1-indexed
@@ -339,6 +369,21 @@ def validate_log(
                     line_idx, "missing_event_type",
                     "event_type is missing and no legacy codes determined",
                 ))
+            # Store parsed row and track PR number even for legacy rows
+            parsed_rows[line_idx] = row
+            # Track normalized pr_number even when event_type is missing (legacy rows)
+            pr_num_raw = row.get("pr_number")
+            normalized_pr = _normalize_pr_number(pr_num_raw)
+            if normalized_pr is not None:
+                pr_key = str(normalized_pr)
+                if pr_key not in pr_merge_counts:
+                    pr_merge_counts[pr_key] = 0
+                    pr_merge_seen[pr_key] = []
+                pr_merge_counts[pr_key] += 1
+                pr_merge_seen[pr_key].append(line_idx)
+            continue
+            # No legacy codes but event_type is missing -- store row and continue
+            parsed_rows[line_idx] = row
             continue
 
         if not isinstance(event_type, str):
@@ -390,18 +435,35 @@ def validate_log(
                 if not row.get("timestamp"):
                     missing.append("timestamp")
 
-            # Validate pr_number
-            pr_num = row.get("pr_number")
-            if pr_num is None:
-                missing.append("pr_number")
+            # Validate pr_number — use _normalize_pr_number for tracking
+            pr_num_raw = row.get("pr_number")
+            normalized_pr = _normalize_pr_number(pr_num_raw)
+            if normalized_pr is None:
+                # Unparseable pr_number
+                msg = f"pr_number is not a valid integer: {pr_num_raw!r}"
+                if not strict:
+                    warnings.append(build_issue(
+                        line_idx, "malformed_pr_number",
+                        msg,
+                        pr_number=pr_num_raw,
+                        severity="warning",
+                    ))
+                else:
+                    errors.append(build_issue(
+                        line_idx, "malformed_pr_number",
+                        msg,
+                        pr_number=pr_num_raw,
+                    ))
             else:
-                # Track duplicate PR numbers
-                pr_key = str(pr_num)
+                # Track by normalized integer key
+                pr_key = str(normalized_pr)
                 if pr_key not in pr_merge_counts:
                     pr_merge_counts[pr_key] = 0
                     pr_merge_seen[pr_key] = []
                 pr_merge_counts[pr_key] += 1
                 pr_merge_seen[pr_key].append(line_idx)
+                # Store parsed row for SHA lookups in duplicate report
+                parsed_rows[line_idx] = row
 
             # Validate SHA fields
             head_sha = row.get("head_sha")
@@ -438,7 +500,7 @@ def validate_log(
                         line_idx, "legacy_missing_authorization_phrase",
                         "authorization_phrase is missing — legacy row",
                         severity="warning",
-                        pr_number=pr_num,
+                        pr_number=normalized_pr,
                     ))
                 else:
                     missing.append("authorization_phrase")
@@ -485,7 +547,7 @@ def validate_log(
                         line_idx, "legacy_missing_gate_catches",
                         "gate_catches is missing — legacy row",
                         severity="warning",
-                        pr_number=pr_num,
+                        pr_number=normalized_pr,
                     ))
                 else:
                     missing.append("gate_catches")
@@ -496,7 +558,7 @@ def validate_log(
                         line_idx, "legacy_string_gate_catches",
                         f"gate_catches is a string {repr(gc)} — expected dict",
                         severity="warning",
-                        pr_number=pr_num,
+                        pr_number=normalized_pr,
                     ))
                 else:
                     errors.append(build_issue(
@@ -545,30 +607,48 @@ def validate_log(
                 field=field,
             ))
 
+        parsed_rows[line_idx] = row
         valid_row_count += 1
 
-    # Check for duplicate PR merge entries
+    # Check for duplicate PR merge entries — enrich with SHAs
     for pr_key, line_indices in pr_merge_seen.items():
         if len(line_indices) > 1:
-            for line_idx in line_indices[1:]:
+            # Collect SHAs for all occurrences
+            sha_info: list[dict[str, str]] = []
+            for li in line_indices:
+                row_ref = parsed_rows.get(li, {})
+                sha_info.append({
+                    "head_sha": row_ref.get("head_sha", "unknown"),
+                    "merge_sha": row_ref.get("merge_sha", "unknown"),
+                })
+            for li in line_indices[1:]:
+                row_ref = parsed_rows.get(li, {})
                 duplicates.append(build_issue(
-                    line_idx, "duplicate_pr_merge_entry",
+                    li, "duplicate_pr_merge_entry",
                     f"Duplicate pr_merge entry for PR {pr_key} (first seen on line {line_indices[0]})",
                     pr_number=pr_key,
                     duplicate_of_line=line_indices[0],
                     severity="error",
+                    head_sha=row_ref.get("head_sha"),
+                    merge_sha=row_ref.get("merge_sha"),
+                    all_occurrences=sha_info,
                 ))
 
     # Check for duplicate merge_sha values
     for merge_sha, line_indices in merge_sha_seen.items():
         if len(line_indices) > 1:
             for line_idx in line_indices[1:]:
+                row_ref = parsed_rows.get(line_idx, {})
+                pr_ref = row_ref.get("pr_number", "unknown")
+                head_ref = row_ref.get("head_sha", "unknown")
                 duplicates.append(build_issue(
                     line_idx, "duplicate_merge_sha",
                     f"Duplicate merge_sha {merge_sha} (first seen on line {line_indices[0]})",
                     merge_sha=merge_sha,
                     duplicate_of_line=line_indices[0],
                     severity="error",
+                    pr_number=pr_ref,
+                    head_sha=head_ref,
                 ))
 
     # Check expected PRs
@@ -577,16 +657,49 @@ def validate_log(
             pr_key = str(expected_pr)
             count = pr_merge_counts.get(pr_key, 0)
             if count == 0:
-                warnings.append(build_issue(
+                errors.append(build_issue(
                     0, "expected_pr_not_found",
                     f"Expected PR {expected_pr} not found in audit log",
                     expected_pr=expected_pr,
-                    severity="warning",
+                    severity="error",
                 ))
             elif count > 1:
-                # Already captured in duplicate check
-                pass
+                errors.append(build_issue(
+                    0, "expected_pr_duplicate",
+                    f"Expected PR {expected_pr} appears {count} times (expected exactly 1)",
+                    expected_pr=expected_pr,
+                    severity="error",
+                ))
             # count == 1 is OK
+
+    # Build expected_pr_results
+    expected_pr_results: dict[str, dict[str, Any]] = {}
+    if expected_prs is not None:
+        for expected_pr in expected_prs:
+            pr_key = str(expected_pr)
+            count = pr_merge_counts.get(pr_key, 0)
+            lines = pr_merge_seen.get(pr_key, [])
+            shas: list[dict[str, str]] = []
+            if lines:
+                for li in lines:
+                    row_ref = parsed_rows.get(li, {})
+                    shas.append({
+                        "head_sha": row_ref.get("head_sha", ""),
+                        "merge_sha": row_ref.get("merge_sha", ""),
+                    })
+            if count == 0:
+                status = "missing"
+            elif count == 1:
+                status = "present_once"
+            else:
+                status = "duplicate"
+            expected_pr_results[pr_key] = {
+                "count": count,
+                "status": status,
+                "lines": lines,
+                "head_shas": [s["head_sha"] for s in shas],
+                "merge_shas": [s["merge_sha"] for s in shas],
+            }
 
     # Determine validity
     # In non-strict mode: warnings and legacy rows are OK (unless duplicates)
@@ -622,6 +735,7 @@ def validate_log(
         "line_count": line_count,
         "events_by_type": events_by_type,
         "expected_prs": expected_prs or [],
+        "expected_pr_results": expected_pr_results,
         "pr_merge_counts": dict(sorted(pr_merge_counts.items())),
         "errors": errors,
         "warnings": warnings,
@@ -654,6 +768,33 @@ def build_markdown(report: dict[str, Any]) -> str:
             lines.append(f"| #{pr} | {count} |")
         lines.append("")
 
+    if report.get("expected_pr_results"):
+        lines.append("## Expected PR Check")
+        lines.append("")
+        lines.append("| PR | Count | Status | Lines | Notes |")
+        lines.append("|---|---|---|---|---|")
+        for pr, result in sorted(report["expected_pr_results"].items(), key=lambda x: int(x[0])):
+            count = result["count"]
+            status = result["status"]
+            pr_lines = ",".join(str(l) for l in result["lines"]) if result["lines"] else "—"
+            head_shas = result.get("head_shas", [])
+            merge_shas = result.get("merge_shas", [])
+            sha_pairs = []
+            for hs, ms in zip(head_shas, merge_shas):
+                sha_pairs.append(f"{hs[:7]}..→{ms[:7]}..")
+            sha_str = ", ".join(sha_pairs) if sha_pairs else "—"
+            notes = ""
+            if status == "missing":
+                notes = "MISSING — audit log needs append-only correction entry"
+            elif status == "duplicate":
+                notes = f"DUPLICATE — {count} occurrences"
+            elif status == "present_once":
+                notes = "OK"
+            lines.append(f"| #{pr} | {count} | {status} | {pr_lines} | {notes} |")
+            if sha_str != "—":
+                lines.append(f"|   |   |   |   | SHAs: {sha_str} |")
+        lines.append("")
+
     if report["legacy_rows"]:
         lines.append("## Legacy Rows")
         lines.append("")
@@ -683,7 +824,19 @@ def build_markdown(report: dict[str, Any]) -> str:
         lines.append(f"## 🔁 Duplicates ({len(report['duplicates'])})")
         lines.append("")
         for d in report["duplicates"]:
-            lines.append(f"- **Line {d['line']}** `[{d['code']}]` — {d['message']}")
+            sha_part = ""
+            if d.get("head_sha"):
+                sha_part = f" head_sha=`{d['head_sha'][:7]}..`"
+            if d.get("merge_sha"):
+                sha_part += f" merge_sha=`{d['merge_sha'][:7]}..`"
+            all_occ = d.get("all_occurrences")
+            if all_occ and len(all_occ) > 1:
+                sha_details = ", ".join(
+                    f"L{li+1}:{occ['head_sha'][:7]}..→{occ['merge_sha'][:7]}.."
+                    for li, occ in enumerate(all_occ)
+                )
+                sha_part += f"\n  All: {sha_details}"
+            lines.append(f"- **Line {d['line']}** `[{d['code']}]` — {d['message']}{sha_part}")
         lines.append("")
 
     if not report["errors"] and not report["warnings"] and not report["duplicates"]:
