@@ -9,7 +9,7 @@ Purpose:
 
 V1 scope (deliberately minimal):
   - Append one validated JSON object per line.
-  - Support dry-run mode (print without writing).
+  - Guarantee one JSON object per physical line (newline separator safety).
   - Validate required fields: event_type, pr_number (for pr_merge events),
     head_sha, merge_sha (for pr_merge events), timestamp.
   - Reject malformed SHA fields (must be 40-hex characters).
@@ -47,17 +47,22 @@ Usage:
   # Append to custom path:
   python scripts/local/append_merge_action_audit.py --output /path/to/log.jsonl ...
 
-  # Controlled smoke create event:
+  # Append with post-append validation:
   python scripts/local/append_merge_action_audit.py \
-    --event-type controlled_smoke_create \
-    --board aed-test \
-    --task-id t_58d1338c \
-    --status triage \
-    --assignee "" \
-    --no-dispatch-occurred \
-    --no-worker-run-spawned \
-    --no-production-board-touched \
-    --dry-run
+    --event-type pr_merge \
+    --pr-number 217 \
+    --head-sha 62e602e374cf666cf63e29de3bd28acb0fae97ea \
+    --merge-sha d3de12a348da42009767887d05ff6dcd66b1c900 \
+    --merged-at 2026-05-14T20:09:40Z \
+    --ci-status success \
+    --codex-status clean \
+    --scope-status clean \
+    --authorization-phrase "I confirm merge PR #217 ..." \
+    --validate-after-append \
+    --allow-legacy \
+    --validator-output-json /tmp/audit_append_validate.json \
+    --validator-output-md /tmp/audit_append_validate.md \
+    --expected-prs-json '[217,218,219]'
 
   # Blocked action event:
   python scripts/local/append_merge_action_audit.py \
@@ -76,15 +81,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Constants
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 AUDIT_LOG_VERSION = 1
 VALID_EVENT_TYPES = frozenset([
@@ -100,6 +106,7 @@ DEFAULT_LOG_PATH = Path(os.environ.get(
     "AED_AUDIT_LOG",
     str(Path.home() / ".hermes" / "aed" / "audit" / "log.jsonl"),
 ))
+VALIDATOR_SCRIPT = Path(__file__).parent / "validate_merge_action_audit_log.py"
 
 # -----------------------------------------------------------------------------
 # Authorization resolution helpers
@@ -237,9 +244,9 @@ def _validate_entry(entry: dict[str, Any]) -> list[str]:
     return errors
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Entry builder
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def build_entry(
     event_type: str,
@@ -355,23 +362,120 @@ def build_entry(
     return entry
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Duplicate detection helpers
+# -----------------------------------------------------------------------------
+
+def _parse_existing_pr_numbers(path: Path) -> dict[str, tuple[int, str]]:
+    """
+    Parse an existing audit log and return a dict of pr_number -> (line_idx, merge_sha).
+    Used to detect duplicate PR entries before appending.
+    """
+    result: dict[str, tuple[int, str]] = {}
+    if not path.exists():
+        return result
+    lines = path.read_text().splitlines()
+    decoder = json.JSONDecoder()
+    idx = 0
+    for raw_line in lines:
+        idx += 1
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        # Try incremental decode to handle concatenated lines
+        try:
+            obj, end = decoder.raw_decode(stripped)
+            # Check for additional JSON after this one (concatenation)
+            remaining = stripped[end:].strip()
+            if remaining:
+                # Line has concatenated JSON objects — skip the whole line
+                # for duplicate detection (will be caught by validator)
+                continue
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        event_type = obj.get("event_type")
+        pr_num_raw = obj.get("pr_number")
+        if event_type == "pr_merge" and pr_num_raw is not None:
+            pr_key = str(int(pr_num_raw)) if str(pr_num_raw).isdigit() else str(pr_num_raw)
+            merge_sha = obj.get("merge_sha", "")
+            result[pr_key] = (idx, merge_sha)
+    return result
+
+
+def _check_duplicate_pr_merge(
+    existing: dict[str, tuple[int, str]],
+    entry: dict[str, Any],
+) -> str | None:
+    """
+    Check if the entry's PR merge is already in the log.
+    Returns None if no duplicate.
+    Returns an error message if duplicate found with same merge_sha.
+    Raises ValueError if same PR number found with different merge_sha (ambiguous).
+    """
+    pr_num = entry.get("pr_number")
+    if pr_num is None:
+        return None
+    pr_key = str(int(pr_num))  # normalize
+    merge_sha = entry.get("merge_sha", "")
+
+    if pr_key in existing:
+        _, existing_merge_sha = existing[pr_key]
+        if existing_merge_sha == merge_sha:
+            return (
+                f"PR #{pr_key} with merge_sha {merge_sha} already exists "
+                f"in audit log (line {existing[pr_key][0]})."
+            )
+        else:
+            raise ValueError(
+                f"PR #{pr_key} already exists in audit log with merge_sha "
+                f"{existing_merge_sha} but new entry has different merge_sha "
+                f"{merge_sha}. This is ambiguous — refusing to append."
+            )
+    return None
+
+
+# -----------------------------------------------------------------------------
 # File operations
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def append_entry(entry: dict[str, Any], path: Path) -> None:
     """
     Append one JSON-serialized entry to the JSONL file at path.
-    Creates parent directories if they do not exist.
+
+    Guarantees:
+    - One JSON object per physical line.
+    - If the file exists, is non-empty, and does not end with a newline,
+      one newline is inserted before the new entry.
+    - The file always ends with a newline after append.
+    - Parent directories are created if they do not exist.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    json_line = json.dumps(entry, separators=(",", ":"))
+
+    if path.exists() and path.stat().st_size > 0:
+        with open(path, "rb") as f:
+            f.seek(-1, os.SEEK_END)
+            last_byte = f.read(1)
+        if last_byte != b"\n":
+            # File doesn't end with newline — insert separator
+            with open(path, "a", encoding="utf-8") as f:
+                f.write("\n")
+            # Now append the new entry
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json_line + "\n")
+            return
+
+    # File either doesn't exist, is empty, or already ends with newline
     with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        f.write(json_line + "\n")
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # CLI
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def _build_argparser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -423,8 +527,7 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
-        "--gate-catches-json",
-        dest="gate_catches_json",
+        "--gate-catches-json", dest="gate_catches_json",
         help=(
             "gate_catches as a JSON object, e.g. "
             "'{\"codex\":\"caught git diff external command risk\"}'. "
@@ -537,6 +640,28 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--dry-run", action="store_true",
         help="Print entry to stdout without writing to the log file"
     )
+    # Post-append validation flags
+    p.add_argument(
+        "--validate-after-append", action="store_true",
+        help="Run the audit log validator after appending (requires --output to be set)"
+    )
+    p.add_argument(
+        "--validator-output-json", dest="validator_output_json",
+        help="Path for validator JSON report (used with --validate-after-append)"
+    )
+    p.add_argument(
+        "--validator-output-md", dest="validator_output_md",
+        help="Path for validator Markdown report (used with --validate-after-append)"
+    )
+    p.add_argument(
+        "--allow-legacy", action="store_true",
+        help="Pass --allow-legacy to the post-append validator"
+    )
+    p.add_argument(
+        "--expected-prs-json", dest="expected_prs_json",
+        default="[]",
+        help="JSON array of expected PR numbers passed to validator, e.g. '[232,233]'"
+    )
     return p
 
 
@@ -643,8 +768,79 @@ def main() -> int:
         return 0
 
     path = Path(args.output)
+
+    # Duplicate detection (only for pr_merge events that have pr_number and merge_sha)
+    if args.event_type == "pr_merge" and args.pr_number is not None and args.merge_sha is not None:
+        existing = _parse_existing_pr_numbers(path)
+        dup_msg = _check_duplicate_pr_merge(existing, entry)
+        if dup_msg is not None:
+            print(f"ERROR: {dup_msg}", file=sys.stderr)
+            return 1
+
     append_entry(entry, path)
     print(f"Audit entry appended to {path}")
+
+    # Post-append validation
+    if args.validate_after_append:
+        if not VALIDATOR_SCRIPT.exists():
+            print(
+                f"ERROR: --validate-after-append requires {VALIDATOR_SCRIPT} "
+                "to exist, but it was not found.",
+                file=sys.stderr,
+            )
+            return 1
+
+        validator_json_out = args.validator_output_json or str(Path("/tmp") / "audit_append_validate.json")
+        validator_md_out = args.validator_output_md or str(Path("/tmp") / "audit_append_validate.md")
+
+        validator_cmd = [
+            sys.executable, str(VALIDATOR_SCRIPT),
+            "--input", str(path),
+            "--output-json", validator_json_out,
+            "--output-md", validator_md_out,
+        ]
+        if args.allow_legacy:
+            validator_cmd.append("--allow-legacy")
+        if args.expected_prs_json:
+            validator_cmd.extend(["--expected-prs-json", args.expected_prs_json])
+
+        val_result = subprocess.run(validator_cmd, capture_output=True, text=True)
+        val_json_content = Path(validator_json_out).read_text() if Path(validator_json_out).exists() else ""
+
+        if val_result.returncode != 0:
+            print(
+                f"ERROR: post-append validation failed (exit {val_result.returncode}).\n"
+                f"  Stdout: {val_result.stdout}\n"
+                f"  Stderr: {val_result.stderr}",
+                file=sys.stderr,
+            )
+            if val_json_content:
+                try:
+                    val_report = json.loads(val_json_content)
+                    err_count = len(val_report.get("errors", []))
+                    warn_count = len(val_report.get("warnings", []))
+                    dup_count = len(val_report.get("duplicates", []))
+                    print(
+                        f"  Validation report: {err_count} errors, {warn_count} warnings, "
+                        f"{dup_count} duplicates",
+                        file=sys.stderr,
+                    )
+                except Exception:
+                    pass
+            return 1
+
+        # Validation passed
+        val_report = json.loads(val_json_content) if val_json_content else {}
+        err_count = len(val_report.get("errors", []))
+        warn_count = len(val_report.get("warnings", []))
+        dup_count = len(val_report.get("duplicates", []))
+        print(
+            f"Post-append validation passed: "
+            f"{err_count} errors, {warn_count} warnings, {dup_count} duplicates"
+        )
+        print(f"  Validator JSON: {validator_json_out}")
+        print(f"  Validator MD: {validator_md_out}")
+
     return 0
 
 

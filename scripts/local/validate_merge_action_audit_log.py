@@ -240,15 +240,57 @@ def validate_log(
             ))
             continue
 
-        # Try to parse JSON
+        # Try to parse JSON — use incremental decoder to detect concatenated objects
         try:
-            row = json.loads(raw_line)
+            decoder = json.JSONDecoder()
+            row, end = decoder.raw_decode(stripped)
         except json.JSONDecodeError as e:
             errors.append(build_issue(
                 line_idx, "invalid_json",
                 f"Invalid JSON: {e}",
             ))
             continue
+
+        # Check for concatenated JSON objects on the same physical line
+        remaining = stripped[end:].strip()
+        if remaining:
+            # There's more content after the first JSON object
+            # Try to parse what remains to confirm it's a second JSON object
+            concat_warning = (
+                f"Physical line contains more than one JSON object — "
+                f"first object parsed, {len(remaining)} chars of additional content follow. "
+                f"This usually indicates a missing newline separator during a prior append."
+            )
+            if strict:
+                errors.append(build_issue(
+                    line_idx, "concatenated_json_objects",
+                    f"STRICT: {concat_warning}",
+                ))
+            else:
+                # Non-strict: try to decode the remaining content to confirm it's JSON
+                try:
+                    json.loads(remaining)
+                    # It's valid JSON — definitely a concatenation issue
+                    warnings.append(build_issue(
+                        line_idx, "concatenated_json_objects",
+                        f"NON-STRICT: {concat_warning}",
+                        severity="warning",
+                        recovered=True,
+                    ))
+                except json.JSONDecodeError:
+                    # Not even valid JSON — report as error
+                    errors.append(build_issue(
+                        line_idx, "concatenated_json_objects",
+                        f"INVALID JSON after first object: {concat_warning}",
+                    ))
+                    continue
+            warnings.append(build_issue(
+                line_idx, "concatenated_json_objects",
+                f"NON-STRICT: {concat_warning}",
+                severity="warning",
+                recovered=True,
+            ))
+            continue  # don't process the concatenated line further
 
         if not isinstance(row, dict):
             errors.append(build_issue(

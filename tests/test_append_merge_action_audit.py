@@ -1164,3 +1164,423 @@ class TestSpecExampleEntries:
         assert entry["dispatch_occurred"] is False
         assert entry["worker_run_spawned"] is False
         assert entry["production_board_touched"] is False
+
+# -----------------------------------------------------------------------------
+# Newline-safe append tests
+# -----------------------------------------------------------------------------
+
+class TestNewlineSafeAppend:
+    """Tests for guaranteed one-JSON-object-per-line append behavior."""
+
+    def test_append_to_empty_file_writes_json_plus_newline(self, tmp_path):
+        """Appending to a non-existent file creates file with one JSON line + trailing newline."""
+        log_path = tmp_path / "log.jsonl"
+        entry = build_entry(
+            event_type="pr_merge",
+            pr_number=101,
+            head_sha="a" * 40,
+            merge_sha="b" * 40,
+            merged_at="2026-01-01T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry, log_path)
+        data = log_path.read_bytes()
+        # File should end with newline
+        assert data[-1:] == b"\n"
+        # Should be parseable as single line
+        lines = data.splitlines()
+        assert len(lines) == 1
+        parsed = json.loads(lines[0])
+        assert parsed["pr_number"] == 101
+
+    def test_append_to_file_ending_with_newline_keeps_one_object_per_line(self, tmp_path):
+        """Appending to a file already ending with newline adds a new line (not concatenated)."""
+        log_path = tmp_path / "log.jsonl"
+        entry1 = build_entry(
+            event_type="pr_merge",
+            pr_number=102,
+            head_sha="a" * 40,
+            merge_sha="b" * 40,
+            merged_at="2026-01-01T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry1, log_path)
+        entry2 = build_entry(
+            event_type="pr_merge",
+            pr_number=103,
+            head_sha="c" * 40,
+            merge_sha="d" * 40,
+            merged_at="2026-01-02T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry2, log_path)
+        data = log_path.read_bytes()
+        assert data[-1:] == b"\n"
+        lines = data.splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0])["pr_number"] == 102
+        assert json.loads(lines[1])["pr_number"] == 103
+
+    def test_append_to_file_missing_trailing_newline_inserts_separator(self, tmp_path):
+        """
+        Appending to a file that does NOT end with newline inserts a newline separator
+        before the new entry. This is the PR #235/PR #236 fix scenario.
+        """
+        log_path = tmp_path / "log.jsonl"
+        # Simulate PR #235: write a file with no trailing newline (the bug)
+        entry1 = build_entry(
+            event_type="pr_merge",
+            pr_number=235,
+            head_sha="e" * 40,
+            merge_sha="f" * 40,
+            merged_at="2026-01-01T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        json_line1 = json.dumps(entry1, separators=(",", ":"))
+        log_path.write_text(json_line1)  # No trailing newline — simulates the bug
+
+        # Now append PR #236 (or test PR 236)
+        entry2 = build_entry(
+            event_type="pr_merge",
+            pr_number=236,
+            head_sha="1" * 40,
+            merge_sha="2" * 40,
+            merged_at="2026-01-02T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry2, log_path)
+
+        data = log_path.read_bytes()
+        assert data[-1:] == b"\n"
+        lines = data.splitlines()
+        assert len(lines) == 2, f"Expected 2 lines, got {len(lines)}: {lines!r}"
+        assert json.loads(lines[0])["pr_number"] == 235
+        assert json.loads(lines[1])["pr_number"] == 236
+
+    def test_file_always_ends_with_newline_after_append(self, tmp_path):
+        """After any append, the file must end with a newline."""
+        log_path = tmp_path / "log.jsonl"
+        for i in range(5):
+            entry = build_entry(
+                event_type="pr_merge",
+                pr_number=300 + i,
+                head_sha="a" * 40,
+                merge_sha="b" * 40,
+                merged_at="2026-01-01T00:00:00Z",
+                dispatch_occurred=False,
+                hermes_touched=False,
+                production_board_touched=False,
+            )
+            append_entry(entry, log_path)
+        data = log_path.read_bytes()
+        assert data[-1:] == b"\n", "File must end with a trailing newline"
+
+
+class TestDuplicatePrevention:
+    """Tests for duplicate PR merge prevention."""
+
+    def _pr_sha(self, label: str) -> str:
+        """Generate a valid, predictable 40-char hex SHA from a string label."""
+        import hashlib
+        h = hashlib.sha256(label.encode()).hexdigest()
+        return h[:40]
+
+    def _make_pr_row(self, pr, head, merge, **kwargs):
+        merge_sha = self._pr_sha(f"merge-{merge}-{pr}")
+        return build_entry(
+            event_type="pr_merge",
+            pr_number=pr,
+            head_sha=head,
+            merge_sha=merge_sha,
+            merged_at="2026-01-01T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+            **kwargs,
+        )
+
+    def test_append_refuses_duplicate_pr_merge_same_sha(self, tmp_path, capsys, monkeypatch):
+        """Appending a PR that already exists with same merge_sha must refuse."""
+        log_path = tmp_path / "log.jsonl"
+        entry1 = self._make_pr_row(400, "a" * 40, "dup-test")
+        append_entry(entry1, log_path)
+
+        entry2 = self._make_pr_row(400, "b" * 40, "dup-test")  # same merge_sha
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "400",
+            "--head-sha", "b" * 40,
+            "--merge-sha", entry2["merge_sha"],  # use the actual generated SHA
+            "--merged-at", "2026-01-02T00:00:00Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--output", str(log_path),
+        ])
+        rc = main()
+        assert rc == 1
+        err = capsys.readouterr().err
+        assert "400" in err
+        assert "already exists" in err
+
+    def test_append_refuses_same_pr_different_merge_sha_raises_error(self, tmp_path, capsys, monkeypatch):
+        """Appending a PR that exists with a different merge_sha must raise ValueError (ambiguous)."""
+        log_path = tmp_path / "log.jsonl"
+        entry1 = self._make_pr_row(401, "a" * 40, "same-pr")
+        append_entry(entry1, log_path)
+        entry2_merge_sha = self._make_pr_row(401, "c" * 40, "different-pr")["merge_sha"]
+
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "401",
+            "--head-sha", "c" * 40,
+            "--merge-sha", entry2_merge_sha,  # different merge_sha (different label)
+            "--merged-at", "2026-01-02T00:00:00Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--output", str(log_path),
+        ])
+        with pytest.raises(ValueError, match="ambiguous"):
+            main()
+
+    def test_append_allows_new_pr_number(self, tmp_path, capsys, monkeypatch):
+        """Appending a new PR number that doesn't exist in the log must succeed."""
+        log_path = tmp_path / "log.jsonl"
+        entry1 = self._make_pr_row(500, "a" * 40, "x")
+        append_entry(entry1, log_path)
+        entry2_merge_sha = self._make_pr_row(501, "b" * 40, "y")["merge_sha"]
+
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "501",
+            "--head-sha", "b" * 40,
+            "--merge-sha", entry2_merge_sha,
+            "--merged-at", "2026-01-02T00:00:00Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--output", str(log_path),
+        ])
+        rc = main()
+        assert rc == 0
+        lines = log_path.read_bytes().splitlines()
+        assert len(lines) == 2
+
+
+class TestPostAppendValidation:
+    """Tests for --validate-after-append behavior."""
+
+    def _run_append_with_validation(
+        self,
+        tmp_path,
+        monkeypatch,
+        pr_num,
+        validator_pass=True,
+        allow_legacy=True,
+    ):
+        log_path = tmp_path / "log.jsonl"
+        json_out = tmp_path / "val.json"
+        md_out = tmp_path / "val.md"
+
+        # Pre-write a valid row so validator can pass
+        entry0 = build_entry(
+            event_type="pr_merge",
+            pr_number=pr_num - 1,
+            head_sha="a" * 40,
+            merge_sha="b" * 40,
+            merged_at="2026-01-01T00:00:00Z",
+            ci_status="success",
+            codex_status="clean",
+            scope_status="clean",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry0, log_path)
+
+        argv = [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", str(pr_num),
+            "--head-sha", "c" * 40,
+            "--merge-sha", "d" * 40,
+            "--merged-at", "2026-01-02T00:00:00Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--no-dispatch-occurred",
+            "--no-hermes-touched",
+            "--no-production-board-touched",
+            "--output", str(log_path),
+            "--validate-after-append",
+            "--allow-legacy" if allow_legacy else "",
+            "--validator-output-json", str(json_out),
+            "--validator-output-md", str(md_out),
+            "--expected-prs-json", f"[{pr_num - 1},{pr_num}]",
+        ]
+        argv = [a for a in argv if a]  # filter empty strings
+        monkeypatch.setattr("sys.argv", argv)
+        return main()
+
+    def test_append_validates_after_append_in_allow_legacy_mode(self, tmp_path, capsys, monkeypatch):
+        """With --validate-after-append --allow-legacy, append runs validator and passes."""
+        rc = self._run_append_with_validation(tmp_path, monkeypatch, 601, allow_legacy=True)
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "Post-append validation passed" in out or "appended" in out
+
+    def test_append_fails_post_validation_when_validator_reports_structural_errors(
+        self, tmp_path, capsys, monkeypatch,
+    ):
+        """If validator finds errors (e.g. concatenated JSON), append script must exit 1."""
+        log_path = tmp_path / "log.jsonl"
+        json_out = tmp_path / "val.json"
+        md_out = tmp_path / "val.md"
+
+        # Write a file with a concatenated JSON object (simulating the bug)
+        entry1 = build_entry(
+            event_type="pr_merge",
+            pr_number=700,
+            head_sha="a" * 40,
+            merge_sha="b" * 40,
+            merged_at="2026-01-01T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        entry2 = build_entry(
+            event_type="pr_merge",
+            pr_number=701,
+            head_sha="c" * 40,
+            merge_sha="d" * 40,
+            merged_at="2026-01-02T00:00:00Z",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        # Write concatenated (simulate the bug)
+        log_path.write_text(json.dumps(entry1, separators=(",", ":")) + json.dumps(entry2, separators=(",", ":")))
+
+        monkeypatch.setattr("sys.argv", [
+            "append_merge_action_audit.py",
+            "--event-type", "pr_merge",
+            "--pr-number", "702",
+            "--head-sha", "e" * 40,
+            "--merge-sha", "f" * 40,
+            "--merged-at", "2026-01-03T00:00:00Z",
+            "--ci-status", "success",
+            "--codex-status", "clean",
+            "--scope-status", "clean",
+            "--output", str(log_path),
+            "--validate-after-append",
+            "--allow-legacy",
+            "--validator-output-json", str(json_out),
+            "--validator-output-md", str(md_out),
+        ])
+        rc = main()
+        assert rc != 0, "Should fail because validator finds concatenated JSON"
+        err = capsys.readouterr().err
+        assert "validation failed" in err or "ERROR" in err
+
+
+# -----------------------------------------------------------------------------
+# Realistic legacy-plus-modern append simulation
+# -----------------------------------------------------------------------------
+
+class TestRealisticLegacyModernAppend:
+    """Simulate the PR #235 → PR #236 concatenation scenario from the real bug."""
+
+    def test_legacy_modern_append_simulation(self, tmp_path):
+        """
+        Simulate the actual PR #235 to PR #236 problem:
+        Line 1: valid JSON object with no trailing newline (the bug)
+        Line 2: new PR merge object appended with safe writer
+
+        Confirm final file has 2 physical lines, both parse as JSON,
+        validator non-strict passes (with only expected legacy warnings),
+        no data loss, file ends with newline.
+        """
+        import json
+        from scripts.local.validate_merge_action_audit_log import validate_log
+
+        log_path = tmp_path / "log.jsonl"
+
+        # Step 1: Create file with PR #235 entry but NO trailing newline (the bug state)
+        entry_235 = build_entry(
+            event_type="pr_merge",
+            pr_number=235,
+            head_sha="e" * 40,
+            merge_sha="f" * 40,
+            merged_at="2026-05-15T10:00:00Z",
+            ci_status="success",
+            codex_status="clean",
+            scope_status="clean",
+            authorization_phrase="I confirm merge PR #235",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        bug_line = json.dumps(entry_235, separators=(",", ":"))
+        log_path.write_text(bug_line)  # No trailing newline!
+
+        # Verify bug state: file should NOT end with newline
+        assert log_path.read_bytes()[-1:] != b"\n"
+
+        # Step 2: Now use the safe appender to add PR #236
+        entry_236 = build_entry(
+            event_type="pr_merge",
+            pr_number=236,
+            head_sha="1" * 40,
+            merge_sha="2" * 40,
+            merged_at="2026-05-16T00:00:00Z",
+            ci_status="success",
+            codex_status="clean",
+            scope_status="clean",
+            authorization_phrase="I confirm merge PR #236",
+            dispatch_occurred=False,
+            hermes_touched=False,
+            production_board_touched=False,
+        )
+        append_entry(entry_236, log_path)
+
+        # Step 3: Verify final file structure
+        data = log_path.read_bytes()
+        assert data[-1:] == b"\n", "File must end with newline after safe append"
+        lines = data.splitlines()
+        assert len(lines) == 2, f"Expected 2 lines, got {len(lines)}"
+
+        # Both lines must parse as valid JSON
+        parsed_235 = json.loads(lines[0])
+        parsed_236 = json.loads(lines[1])
+        assert parsed_235["pr_number"] == 235
+        assert parsed_236["pr_number"] == 236
+
+        # Step 4: Validator non-strict should pass (with legacy warnings for missing fields)
+        report = validate_log(
+            input_path=str(log_path),
+            strict=False,
+            allow_legacy=True,
+            expected_prs=[235, 236],
+        )
+        # valid=True because only warnings (no errors or duplicates)
+        assert report["valid"] is True, f"Expected valid=True, got errors={report['errors']}, warnings={report['warnings']}"
+        assert report["pr_merge_counts"].get("235") == 1
+        assert report["pr_merge_counts"].get("236") == 1
+
+        # Step 5: No data loss
+        assert parsed_235["head_sha"] == "e" * 40
+        assert parsed_236["head_sha"] == "1" * 40
