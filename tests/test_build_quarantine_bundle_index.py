@@ -702,3 +702,452 @@ class TestNoMutationCommands:
             ]):
                 if "# " not in line[:line.index("subprocess")]:  # not commented
                     pytest.fail(f"Found forbidden command in executable line: {line.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# Tests: v2 dependency fields and integration plan
+# ---------------------------------------------------------------------------
+
+class TestDependencyFields:
+    """Tests for v2 dependency and integration-plan fields in bundle index."""
+
+    def test_depends_on_field_passed_through(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [make_task(
+            task_id="task-a",
+            depends_on=[],
+        )])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        assert data["tasks"][0]["depends_on"] == []
+
+    def test_blocks_field_passed_through(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [make_task(
+            task_id="task-a",
+            blocks=[],
+        )])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        assert data["tasks"][0]["blocks"] == []
+
+    def test_valid_dependency_graph_passes(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="base-helper-001"),
+            make_task(task_id="docs-update-002", depends_on=["base-helper-001"]),
+            make_task(task_id="audit-followup-003", depends_on=["base-helper-001"]),
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        assert data["task_count"] == 3
+        assert "integration_plan" in data
+
+    def test_unknown_dependency_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", depends_on=["nonexistent-task"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "unknown_dependency" in str(exc.value)
+
+    def test_self_dependency_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", depends_on=["task-a"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "self_dependency" in str(exc.value)
+
+    def test_duplicate_dependency_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", depends_on=["base-task", "base-task"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "duplicate_dependency" in str(exc.value)
+
+    def test_dependency_cycle_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", depends_on=["task-b"]),
+            make_task(task_id="task-b", depends_on=["task-a"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "dependency_cycle" in str(exc.value)
+
+    def test_self_block_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", blocks=["task-a"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "self_block" in str(exc.value)
+
+    def test_unknown_block_target_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", blocks=["nonexistent-task"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "unknown_block_target" in str(exc.value)
+
+    def test_duplicate_block_target_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", blocks=["blocked-task", "blocked-task"]),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "duplicate_block_target" in str(exc.value)
+
+    def test_invalid_promotion_group_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", promotion_group="invalid group!"),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "promotion_group" in str(exc.value)
+
+    def test_invalid_pr_group_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", pr_group="invalid/group"),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "pr_group" in str(exc.value)
+
+    def test_invalid_integration_order_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", integration_order="not-an-int"),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "integration_order" in str(exc.value)
+
+    def test_invalid_can_run_in_parallel_fails(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", can_run_in_parallel="yes"),
+        ])
+
+        with pytest.raises(ValueError) as exc:
+            build_index(
+                tasks_jsonl=str(tasks_jsonl),
+                bundle_root=str(bundle_root),
+                repo="Slideshow11/Automated-Edge-Discovery",
+                base_sha=None,
+                output_index=str(output_index),
+                force=False,
+            )
+        assert "can_run_in_parallel" in str(exc.value)
+
+    def test_integration_plan_contains_ordered_task_ids(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="base-helper-001", integration_order=10),
+            make_task(task_id="docs-update-002", depends_on=["base-helper-001"], integration_order=20),
+            make_task(task_id="audit-followup-003", depends_on=["base-helper-001"], integration_order=30),
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        ordered = ip["ordered_task_ids"]
+        # base-helper must come before its dependents
+        assert ordered.index("base-helper-001") < ordered.index("docs-update-002")
+        assert ordered.index("base-helper-001") < ordered.index("audit-followup-003")
+
+    def test_integration_plan_promotion_groups_emitted(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", promotion_group="core"),
+            make_task(task_id="task-b", promotion_group="core"),
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        assert "core" in ip["promotion_groups"]
+        assert set(ip["promotion_groups"]["core"]) == {"task-a", "task-b"}
+
+    def test_integration_plan_pr_groups_emitted(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", pr_group="pr-1"),
+            make_task(task_id="task-b", pr_group="pr-2"),
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        assert "pr-1" in ip["pr_groups"]
+        assert "pr-2" in ip["pr_groups"]
+
+    def test_parallel_group_for_independent_tasks(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", can_run_in_parallel=True),
+            make_task(task_id="task-b", can_run_in_parallel=True),
+            make_task(task_id="task-c", depends_on=["task-a"]),  # not independent
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        # task-a and task-b are independent and parallel-eligible
+        assert ip["parallel_groups"] == [["task-a", "task-b"]]
+
+    def test_integration_plan_dependency_edges_emitted(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a"),
+            make_task(task_id="task-b", depends_on=["task-a"]),
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        edges = ip["dependency_edges"]
+        assert {"from": "task-a", "to": "task-b", "type": "depends_on"} in edges
+
+    def test_integration_plan_block_edges_emitted(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", blocks=["task-b"]),
+            make_task(task_id="task-b"),  # target of the block
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        ip = data["integration_plan"]
+        edges = ip["block_edges"]
+        assert {"from": "task-a", "to": "task-b", "type": "blocks"} in edges
+
+    def test_downstream_blocked_map_populated(self, tmp_path):
+        tasks_jsonl = tmp_path / "TASKS.jsonl"
+        output_index = tmp_path / "BUNDLE_INDEX.json"
+        bundle_root = tmp_path / "bundles"
+
+        write_tasks_jsonl(str(tasks_jsonl), [
+            make_task(task_id="task-a", blocks=["task-b"]),
+            make_task(task_id="task-b"),  # must exist as valid target
+        ])
+
+        rc = main([
+            "--tasks-jsonl", str(tasks_jsonl),
+            "--bundle-root", str(bundle_root),
+            "--output-index", str(output_index),
+            "--dry-run",
+        ])
+        assert rc == 0
+        data = json.loads(output_index.read_text())
+        # task-b has task-a as a blocker
+        task_b_entry = next(t for t in data["tasks"] if t["task_id"] == "task-b")
+        assert "task-a" in task_b_entry.get("blocked_by", [])
