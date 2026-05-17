@@ -275,8 +275,8 @@ def test_malformed_sha_fails(temp_dir):
     assert any("malformed_head_sha" in e["code"] for e in report["errors"])
 
 
-def test_missing_authorization_phrase_fails(temp_dir):
-    """Missing authorization_phrase should fail."""
+def test_missing_authorization_phrase_fails_strict(temp_dir):
+    """Missing authorization_phrase should fail in strict mode."""
     log = temp_dir / "log.jsonl"
     json_out = temp_dir / "report.json"
     md_out = temp_dir / "report.md"
@@ -300,7 +300,10 @@ def test_missing_authorization_phrase_fails(temp_dir):
     }
     log.write_text(make_log(no_auth))
 
-    rc, json_content, _ = run_validator(str(log), str(json_out), str(md_out))
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        strict=True,
+    )
 
     assert rc != 0
     report = json.loads(json_content)
@@ -345,8 +348,8 @@ SAFETY_BOOLEAN_KEYS = frozenset([
 ])
 
 
-def test_non_boolean_safety_booleans_fail(temp_dir):
-    """Non-boolean safety booleans should fail."""
+def test_non_boolean_safety_booleans_fail_strict(temp_dir):
+    """Non-boolean safety booleans should fail in strict mode."""
     log = temp_dir / "log.jsonl"
     json_out = temp_dir / "report.json"
     md_out = temp_dir / "report.md"
@@ -363,14 +366,17 @@ def test_non_boolean_safety_booleans_fail(temp_dir):
         "codex_status": "clean",
         "scope_status": "clean",
         "authorization_phrase": "confirm",
-        "hermes_touched": "false",  # string, not bool
+        "hermes_touched": "false",  # string "false" — legacy encoding
         "dispatch_occurred": False,
         "production_board_touched": False,
         "gate_catches": {},
     }
     log.write_text(make_log(bad_bool_row))
 
-    rc, json_content, _ = run_validator(str(log), str(json_out), str(md_out))
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        strict=True,
+    )
 
     assert rc != 0
     report = json.loads(json_content)

@@ -44,9 +44,10 @@ LEGACY_EVENT_TYPES = frozenset([
 # Fields required for each event type
 REQUIRED_FIELDS_BY_TYPE: dict[str, frozenset[str]] = {
     "pr_merge": frozenset([
-        "audit_log_version",
+        # NOTE: audit_log_version and timestamp are NOT here because they are
+        # legacy-row conditions (missing in pre-1.0 rows). They are handled
+        # separately with legacy-warning in non-strict mode or error in strict.
         "event_type",
-        "timestamp",
         "pr_number",
         "head_sha",
         "merge_sha",
@@ -54,19 +55,21 @@ REQUIRED_FIELDS_BY_TYPE: dict[str, frozenset[str]] = {
         "ci_status",
         "codex_status",
         "scope_status",
-        "authorization_phrase",
+        # NOTE: authorization_phrase is NOT here because it is a legacy-row
+        # condition (missing in pre-1.0 rows). It is handled separately with
+        # legacy-warning in non-strict mode or error in strict mode.
         "hermes_touched",
         "dispatch_occurred",
         "production_board_touched",
         # NOTE: gate_catches is NOT here because missing gate_catches is a
         # legacy-row condition, handled separately with a warning (not error)
         # in non-strict mode or an error in strict mode.
-        # It is added to missing only after the legacy check.
     ]),
     "controlled_smoke_create": frozenset([
+        # Note: real rows use task_id, not candidate_id. Both are accepted.
         "event_type",
         "timestamp",
-        "candidate_id",
+        # candidate_id is not actually present in real rows; task_id is used
         "board",
         "task_id",
     ]),
@@ -319,6 +322,29 @@ def validate_log(
 
         # For pr_merge — extra validation
         if event_type == "pr_merge":
+            # Legacy checks for fields that might be missing in pre-1.0 rows
+            row_pr_num = row.get("pr_number")
+            if not strict:
+                if not row.get("audit_log_version"):
+                    warnings.append(build_issue(
+                        line_idx, "legacy_missing_audit_log_version",
+                        "audit_log_version is missing — legacy row",
+                        severity="warning",
+                        pr_number=row_pr_num,
+                    ))
+                if not row.get("timestamp"):
+                    warnings.append(build_issue(
+                        line_idx, "legacy_missing_timestamp",
+                        "timestamp is missing — legacy row",
+                        severity="warning",
+                        pr_number=row_pr_num,
+                    ))
+            else:
+                if not row.get("audit_log_version"):
+                    missing.append("audit_log_version")
+                if not row.get("timestamp"):
+                    missing.append("timestamp")
+
             # Validate pr_number
             pr_num = row.get("pr_number")
             if pr_num is None:
@@ -375,12 +401,35 @@ def validate_log(
             # Check safety booleans
             for key in SAFETY_BOOLEAN_KEYS:
                 val = row.get(key)
-                if val is not None and not is_boolean(val):
-                    errors.append(build_issue(
-                        line_idx, "safety_boolean_not_boolean",
-                        f"{key} has non-boolean type {type(val).__name__}: {repr(val)}",
-                        **{key: repr(val)},
-                    ))
+                if val is not None:
+                    if isinstance(val, str):
+                        if val.lower() in ("false", "true"):
+                            # Legacy row: safety boolean encoded as string "false"/"true"
+                            if not strict:
+                                warnings.append(build_issue(
+                                    line_idx, "legacy_string_safety_boolean",
+                                    f"{key} has string value {repr(val)} — legacy boolean encoding",
+                                    severity="warning",
+                                    **{key: repr(val)},
+                                ))
+                            else:
+                                errors.append(build_issue(
+                                    line_idx, "safety_boolean_not_boolean",
+                                    f"{key} has non-boolean type {type(val).__name__}: {repr(val)}",
+                                    **{key: repr(val)},
+                                ))
+                        else:
+                            errors.append(build_issue(
+                                line_idx, "safety_boolean_not_boolean",
+                                f"{key} has non-boolean type {type(val).__name__}: {repr(val)}",
+                                **{key: repr(val)},
+                            ))
+                    elif not is_boolean(val):
+                        errors.append(build_issue(
+                            line_idx, "safety_boolean_not_boolean",
+                            f"{key} has non-boolean type {type(val).__name__}: {repr(val)}",
+                            **{key: repr(val)},
+                        ))
 
             # Check gate_catches
             gc = row.get("gate_catches")
