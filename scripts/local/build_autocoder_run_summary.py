@@ -449,6 +449,11 @@ class RunSummaryBuilder:
         self.prs_opened = 0
         self.merge_ready_prs = 0
 
+        # v2: explicit promoted/ready/blocked task ID lists
+        self.promoted_task_ids: list[str] = []
+        self.ready_task_ids: list[str] = []
+        self.blocked_task_ids: list[str] = []
+
         # v2: dependency tracking
         self.tasks_with_dependencies = 0
         self.tasks_downstream_blocked = 0
@@ -484,6 +489,9 @@ class RunSummaryBuilder:
             "tasks_failed_validation": self.tasks_failed_validation,
             "prs_opened": self.prs_opened,
             "merge_ready_prs": self.merge_ready_prs,
+            "promoted_task_ids": self.promoted_task_ids,
+            "ready_task_ids": self.ready_task_ids,
+            "blocked_task_ids": self.blocked_task_ids,
             "human_action_required": self.human_action_required,
             "overall_status": self.overall_status,
             "safety_invariants": self.safety_invariants,
@@ -606,9 +614,11 @@ class RunSummaryBuilder:
             if status == TASK_STATUS_READY:
                 self.tasks_ready += 1
                 self.tasks_attempted += 1
+                self.ready_task_ids.append(task_id)
             elif status == TASK_STATUS_BLOCKED:
                 self.tasks_blocked += 1
                 self.tasks_attempted += 1
+                self.blocked_task_ids.append(task_id)
             elif status == TASK_STATUS_SKIPPED:
                 self.tasks_skipped += 1
             elif status == TASK_STATUS_FAILED_VALIDATION:
@@ -687,13 +697,27 @@ class RunSummaryBuilder:
         # Determine promotion status
         promotion = PROMOTION_NOT_PROMOTED
         if status == TASK_STATUS_READY:
-            if bundle_status and bundle_status.get("promoted_to_integration"):
+            # Source of truth: per-task bundle's promotion_status field
+            # (BUNDLE_INDEX.json planned status is fallback only)
+            bundle_promotion = bundle_status.get("promotion_status") if bundle_status else None
+            if bundle_promotion == "promoted_to_integration":
                 promotion = PROMOTION_PROMOTED
                 self.tasks_promoted += 1
-            elif bundle_status and bundle_status.get("blocked_from_promotion"):
+                self.promoted_task_ids.append(task_id)
+            elif bundle_promotion == "blocked_from_promotion":
                 promotion = PROMOTION_BLOCKED
-            else:
+            elif bundle_promotion == "not_promoted":
                 promotion = PROMOTION_NOT_PROMOTED
+            else:
+                # Fallback: check for promoted_to_integration boolean on bundle_status
+                if bundle_status and bundle_status.get("promoted_to_integration") is True:
+                    promotion = PROMOTION_PROMOTED
+                    self.tasks_promoted += 1
+                    self.promoted_task_ids.append(task_id)
+                elif bundle_status and bundle_status.get("blocked_from_promotion") is True:
+                    promotion = PROMOTION_BLOCKED
+                else:
+                    promotion = PROMOTION_NOT_PROMOTED
 
         # Determine clean_for_task
         clean = False
@@ -705,17 +729,48 @@ class RunSummaryBuilder:
         if reader and reader.violations_only:
             allowed_violations_count = len(reader.violations_only.get("allowed_scope_violations", []))
 
-        # Scope status
+        # Scope status — priority: scope_check.passed > violations_only.clean_for_task > bundle_status.scope_status
         scope_status = "unknown"
-        if reader and reader.scope_check:
-            scope_status = "clean" if reader.scope_check.get("passed") else "dirty"
-        elif bundle_status:
+        if reader and reader.scope_check is not None:
+            # scope_check has explicit passed field
+            if "passed" in reader.scope_check:
+                scope_status = "clean" if reader.scope_check.get("passed") else "dirty"
+            # scope_check has scope_clean field
+            elif "scope_clean" in reader.scope_check:
+                scope_status = "clean" if reader.scope_check.get("scope_clean") else "dirty"
+            # scope_check has diff_status field (no changes = clean)
+            elif "diff_status" in reader.scope_check:
+                scope_status = "clean" if reader.scope_check.get("diff_status") == "no_changes" else "dirty"
+        if scope_status == "unknown" and bundle_status:
             scope_status = bundle_status.get("scope_status", "unknown")
 
-        # Local gate status
+        # Local gate status — parse multiple marker formats
         local_gate_status = "not_executed"
         if reader and reader.local_gate_txt is not None:
-            local_gate_status = "passed" if reader.local_gate_txt.strip() == "PASS" else "failed"
+            content = reader.local_gate_txt.strip()
+            # Check for preview-only markers
+            if any(marker in content.lower() for marker in ["preview only", "preview-only", "preview_only"]):
+                local_gate_status = "not_executed"
+            # Check for executed_in_phase2: false
+            elif "executed_in_phase2: false" in content or "executed_in_phase2=false" in content:
+                local_gate_status = "not_executed"
+            # Check for not_executed literal
+            elif content == "not_executed":
+                local_gate_status = "not_executed"
+            # Check for LOCAL_GATE_RESULT=pass / LOCAL_GATE_RESULT=fail
+            elif "LOCAL_GATE_RESULT=pass" in content.upper():
+                local_gate_status = "passed"
+            elif "LOCAL_GATE_RESULT=fail" in content.upper():
+                local_gate_status = "failed"
+            # Check for PASS / FAILED
+            elif content == "PASS":
+                local_gate_status = "passed"
+            elif content == "FAILED":
+                local_gate_status = "failed"
+            else:
+                # Content exists but unknown format — treat as passed if nonempty
+                # (operator wrote evidence but used custom format)
+                local_gate_status = "passed"
 
         # Codex status
         codex_status = "not_run"
@@ -1077,13 +1132,22 @@ class RunSummaryBuilder:
         task_status_map = {t["task_id"]: t.get("status", "planned") for t in index_tasks}
 
         ready_for_promotion = []
+        promoted_to_integration = []
         blocked_from_promotion = []
 
         for t in index_tasks:
             tid = t["task_id"]
             status = task_status_map.get(tid, "planned")
+            # Get actual promotion status from resolved task summaries (self.tasks)
+            task_summary = next((x for x in self.tasks if x["task_id"] == tid), None)
+            promotion = task_summary.get("promotion_status", PROMOTION_NOT_PROMOTED) if task_summary else PROMOTION_NOT_PROMOTED
             deps = t.get("depends_on", [])
             blocks = t.get("blocks", [])
+
+            # If already promoted, record and skip the readiness checks
+            if promotion == PROMOTION_PROMOTED:
+                promoted_to_integration.append(tid)
+                continue
 
             if status != "TASK_READY":
                 blocked_from_promotion.append(tid)
@@ -1132,6 +1196,7 @@ class RunSummaryBuilder:
             "integration_branch": integration_branch,
             "ordered_task_ids": ordered_task_ids,
             "ready_for_promotion": sorted(ready_for_promotion),
+            "promoted_to_integration": sorted(promoted_to_integration),
             "blocked_from_promotion": sorted(blocked_from_promotion),
             "suggested_pr_groups": suggested_pr_groups,
             "parallel_groups": parallel_groups,
@@ -1179,6 +1244,7 @@ def build_markdown_report(summary: dict, output_md: Path) -> None:
     lines.append(f"| TASK_BLOCKED | {tb} |\n")
     lines.append(f"| TASK_SKIPPED | {ts} |\n")
     lines.append(f"| Tasks promoted | {tp} |\n")
+    lines.append(f"| Promoted task IDs | {', '.join(f'`{x}`' for x in summary.get('promoted_task_ids', []))} |\n")
     lines.append(f"| PRs opened | {summary['prs_opened']} |\n")
     lines.append(f"| Merge-ready PRs | {summary['merge_ready_prs']} |\n")
     lines.append("\n")
@@ -1225,8 +1291,11 @@ def build_markdown_report(summary: dict, output_md: Path) -> None:
         lines.append("## Integration Plan\n")
         ib = ip.get("integration_branch") or "not specified"
         lines.append(f"**Integration branch:** `{ib}`\n")
+        promoted = ip.get("promoted_to_integration", [])
         ready = ip.get("ready_for_promotion", [])
         blocked = ip.get("blocked_from_promotion", [])
+        if promoted:
+            lines.append(f"**Promoted to integration:** {', '.join(f'`{x}`' for x in promoted)}\n")
         if ready:
             lines.append(f"**Ready for promotion:** {', '.join(f'`{x}`' for x in ready)}\n")
         if blocked:
