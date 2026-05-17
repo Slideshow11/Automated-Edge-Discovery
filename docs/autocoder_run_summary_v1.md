@@ -49,7 +49,7 @@ python3 scripts/local/build_autocoder_run_summary.py \
 - `--integration-branch TEXT` — integration branch name (default: none)
 - `--expected-tasks-json JSON` — JSON array of expected task IDs (default: none)
 - `--allow-missing-bundles` — missing bundle directories are warnings, not errors (default: False)
-- `--strict` — missing optional bundle files are errors, not warnings (default: False)
+- `--strict` — missing or malformed contextual-required artifacts (`violations_only.json`, `local_gate.txt`) are treated as `TASK_FAILED_VALIDATION`; missing `BUNDLE_STATUS.json` always fails. Optional files (`risk_notes.md`, `proposed_pr_body.md`, `FINAL_GATE.json`, `codex_review_summary.md`) remain warnings even in strict mode. (default: False)
 
 **Exit codes:**
 - `0` — summary produced successfully
@@ -65,20 +65,27 @@ The tool reads from the `bundle_root` directory, looking for per-task subdirecto
 **Required input:**
 - `BUNDLE_INDEX.json` — the bundle index produced by `build_quarantine_bundle_index.py`
 
-**Per-task optional files read (all non-required):**
+**Per-task artifact files read:**
 
+**Required:**
+| File | When Required | Purpose |
+|------|--------------|---------|
+| `BUNDLE_STATUS.json` | Always | Task status, safety booleans, changed files, promotion status |
+
+**Contextually-required** (required when task was attempted; warnings in non-strict, errors in strict):
+| File | When Required | Purpose |
+|------|--------------|---------|
+| `violations_only.json` | Always in strict mode; optional in non-strict | Allowed scope violations |
+| `scope_check.json` | When scope was checked | Scope validation result |
+| `local_gate.txt` | When local gate was executed | Local gate result (PASS/FAIL content) |
+
+**Optional** (always warnings, even in strict mode):
 | File | Purpose |
 |------|---------|
-| `BUNDLE_STATUS.json` | Task status, safety booleans, changed files, promotion status |
-| `scope_check.json` | Scope validation result |
-| `violations_only.json` | Allowed scope violations (if any) |
-| `local_gate.txt` | Local gate result (PASS/FAIL content) |
 | `risk_notes.md` | Human risk notes |
 | `proposed_pr_body.md` | Proposed PR body text |
 | `FINAL_GATE.json` | Finalization guard output |
 | `codex_review_summary.md` | Codex review summary |
-
-Missing optional files produce **warnings**, not errors (unless `--strict` is set).
 
 ---
 
@@ -100,6 +107,7 @@ Missing optional files produce **warnings**, not errors (unless `--strict` is se
   "tasks_blocked": 1,
   "tasks_skipped": 1,
   "tasks_promoted": 0,
+  "tasks_failed_validation": 0,
   "prs_opened": 0,
   "merge_ready_prs": 0,
   "human_action_required": true,
@@ -138,9 +146,46 @@ Missing optional files produce **warnings**, not errors (unless `--strict` is se
       "blocker_code": null,
       "blocker_summary": null,
       "human_action": "authorize_merge"
+    },
+    {
+      "task_id": "blocked-example-001",
+      "task_type": "test_gap_analysis",
+      "risk_level": "medium",
+      "status": "TASK_BLOCKED",
+      "promotion_status": "not_promoted",
+      "bundle_path": "/path/to/bundles/blocked-example-001",
+      "clean_for_task": false,
+      "allowed_scope_violations_count": 1,
+      "scope_status": "dirty",
+      "local_gate_status": "failed",
+      "codex_status": "not_run",
+      "ci_status": "not_applicable",
+      "finalization_status": "not_applicable",
+      "changed_files_count": 0,
+      "expected_outputs_present": false,
+      "blocker_code": "allowed_scope_violations",
+      "blocker_summary": "Allowed scope contains executable safety violations",
+      "human_action": "resolve_blocker"
     }
   ],
-  "blockers": [],
+  "blockers": [
+    {
+      "task_id": "blocked-example-001",
+      "blocker_code": "allowed_scope_violations",
+      "blocker_summary": "Allowed scope contains executable safety violations",
+      "human_action": "resolve_blocker",
+      "bundle_path": "/path/to/bundles/blocked-example-001",
+      "source": "violations_only.json"
+    },
+    {
+      "task_id": "missing-status-001",
+      "blocker_code": "bundle_missing_required",
+      "blocker_summary": "BUNDLE_STATUS.json missing or malformed — required artifact",
+      "human_action": "resolve_blocker",
+      "bundle_path": "/path/to/bundles/missing-status-001",
+      "source": "BUNDLE_STATUS.json"
+    }
+  ],
   "warnings": [
     {
       "task_id": "docs-example-001",
@@ -310,14 +355,43 @@ Blocked tasks: `blocked-task-001`. Resolve blockers before proceeding.
 
 ## Relationship to Other Tools
 
-| Tool | Purpose |
+|| Tool | Purpose ||
 |------|---------|
 | `build_quarantine_bundle_index.py` | Creates task bundles from TASKS.jsonl (dry-run scaffold) |
 | `build_autocoder_run_summary.py` | Aggregates completed bundles into run summary |
+| `check_hermes_profile_mutation.py` | Read-only sentinel detecting Hermes profile/memory file mutations |
 | `append_merge_action_audit.py` | Appends audit log entries (after real PRs are merged) |
 | `validate_merge_action_audit_log.py` | Validates audit log JSONL consistency |
 
 The run summary does **not** append to the audit log. It is a read-only report tool that complements the audit log by providing a run-level view of what happened during an autocoder session.
+
+---
+
+## Profile Mutation Sentinel
+
+`scripts/local/check_hermes_profile_mutation.py` is a read-only sentinel that detects whether Hermes profile files were mutated during an AED quarantine autocoder run.
+
+**Purpose:** Detect the "Self-improvement review: User profile updated" contradiction — where the run report claims no memory/profile changes, but Hermes actually wrote to `~/.hermes/memories/MEMORY.md` or `~/.hermes/memories/USER.md` during the run.
+
+**Snapshot mode** (before the run):
+```bash
+python3 scripts/local/check_hermes_profile_mutation.py snapshot \
+  --paths-json '["~/.hermes/memories/MEMORY.md", "~/.hermes/memories/USER.md"]' \
+  --snapshot-json /tmp/profile_sentinel_before.json
+```
+
+**Compare mode** (after the run):
+```bash
+python3 scripts/local/check_hermes_profile_mutation.py compare \
+  --before-json /tmp/profile_sentinel_before.json \
+  --after-json /tmp/profile_sentinel_after.json \
+  --output-json /tmp/profile_sentinel_result.json \
+  --output-md /tmp/profile_sentinel_result.md
+```
+
+**Exit codes:** `0` = no mutation, `1` = validation error, `2` = mutation detected (`memory_or_profile_updated: true`)
+
+The sentinel is read-only: it never modifies the files it checks. In the run summary context, the `--profile-sentinel-before` and `--profile-sentinel-after` arguments allow the summary tool to incorporate sentinel results directly into the run report.
 
 ---
 
