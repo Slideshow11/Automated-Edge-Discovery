@@ -64,6 +64,14 @@ OVERALL_FAILED_VALIDATION = "FAILED_VALIDATION"
 OVERALL_NO_TASKS = "NO_TASKS"
 OVERALL_INVALID_INPUT = "INVALID_INPUT"
 
+# Dependency statuses
+DEP_STATUS_NO_DEPENDENCIES = "no_dependencies"
+DEP_STATUS_SATISFIED = "satisfied"
+DEP_STATUS_BLOCKED_BY_DEPENDENCY = "blocked_by_dependency"
+DEP_STATUS_FAILED_VALIDATION = "dependency_failed_validation"
+DEP_STATUS_NOT_EVALUATED = "dependency_not_evaluated"
+DEP_STATUS_INVALID_GRAPH = "invalid_dependency_graph"
+
 # Human actions
 HUMAN_NONE = "none"
 HUMAN_REVIEW = "review_report"
@@ -365,13 +373,14 @@ def load_bundle_index(path: Path) -> tuple[Optional[dict], Optional[str]]:
     if not isinstance(obj, dict):
         return None, f"BUNDLE_INDEX.json must be a JSON object, got: {type(obj).__name__}"
 
-    # Required top-level fields
-    for field in ("version", "bundle_root", "tasks"):
-        if field not in obj:
-            return None, f"BUNDLE_INDEX.json missing required field: '{field}'"
-
-    if not isinstance(obj["tasks"], list):
-        return None, f"BUNDLE_INDEX.json 'tasks' must be a list, got: {type(obj['tasks']).__name__}"
+    # Required top-level fields (support both 'version' and 'index_version' for compatibility)
+    if "version" not in obj and "index_version" not in obj:
+        return None, f"BUNDLE_INDEX.json missing required field: 'version'"
+    if "bundle_root" not in obj:
+        return None, f"BUNDLE_INDEX.json missing required field: 'bundle_root'"
+    tasks_val = obj.get("tasks")
+    if not isinstance(tasks_val, list):
+        return None, f"BUNDLE_INDEX.json 'tasks' must be a list, got: {type(tasks_val).__name__}"
 
     return obj, None
 
@@ -440,6 +449,17 @@ class RunSummaryBuilder:
         self.prs_opened = 0
         self.merge_ready_prs = 0
 
+        # v2: dependency tracking
+        self.tasks_with_dependencies = 0
+        self.tasks_downstream_blocked = 0
+        self.dependency_edges_count = 0
+        self.block_edges_count = 0
+        self.promotion_groups_count = 0
+        self.pr_groups_count = 0
+
+        # Integration plan output
+        self.integration_plan: dict[str, Any] = {}
+
     def build(self) -> dict:
         """Build the full run summary dict."""
         self._process_tasks()
@@ -477,6 +497,16 @@ class RunSummaryBuilder:
                 "json_report": None,  # filled by caller
                 "markdown_report": None,  # filled by caller
             },
+            # v2: dependency and integration plan
+            "dependency_summary": {
+                "tasks_with_dependencies": self.tasks_with_dependencies,
+                "tasks_downstream_blocked": self.tasks_downstream_blocked,
+                "dependency_edges": self.dependency_edges_count,
+                "block_edges": self.block_edges_count,
+                "promotion_groups": self.promotion_groups_count,
+                "pr_groups": self.pr_groups_count,
+            },
+            "integration_plan": self.integration_plan,
         }
 
     def _process_tasks(self) -> None:
@@ -598,6 +628,10 @@ class RunSummaryBuilder:
                         "code": "expected_task_missing",
                         "message": f"Expected task '{expected}' not found in bundle index",
                     })
+
+        # v2: Compute dependency summary and integration plan
+        self._compute_dependency_summary()
+        self._compute_integration_plan()
 
     def _determine_task_status(
         self, task_id: str, task_entry: dict, reader: TaskBundleReader
@@ -748,9 +782,29 @@ class RunSummaryBuilder:
             "blocker_code": blocker_code,
             "blocker_summary": blocker_summary,
             "human_action": task_human_action,
+            # v2: dependency fields
+            # NOTE: dependency_status is computed inline before self.tasks append below.
+            # deferred_patch placeholder to avoid linter error — value set after append.
+            "depends_on": task_entry.get("depends_on", []),
+            "blocks": task_entry.get("blocks", []),
+            "blocked_by": task_entry.get("blocked_by", []),
+            "downstream_blocked": task_entry.get("downstream_blocked", []),
+            "dependency_status": "not_evaluated",  # placeholder — patched below after self.tasks append
+            "can_run_in_parallel": task_entry.get("can_run_in_parallel", False),
+            "integration_order": task_entry.get("integration_order"),
+            "promotion_group": task_entry.get("promotion_group"),
+            "pr_group": task_entry.get("pr_group"),
+            "promotion_target": task_entry.get("promotion_target"),
         }
 
         self.tasks.append(task_summary)
+
+        # PATCH the just-appended task's dependency_status now that self.tasks is complete
+        # so the status map contains all tasks including this one
+        summary_idx = len(self.tasks) - 1
+        self.tasks[summary_idx]["dependency_status"] = self._compute_task_dependency_status(
+            task_id, task_entry, status
+        )
 
         # Update gate summary counters
         if local_gate_status == "passed":
@@ -768,9 +822,37 @@ class RunSummaryBuilder:
             self.gate_summary["finalization_guard_merge_ready"] += 1
             self.merge_ready_prs += 1
 
-        # PR opened check
         if bundle_status and bundle_status.get("pr_created"):
             self.prs_opened += 1
+
+    def _compute_task_dependency_status(
+        self, task_id: str, task_entry: dict, status: str
+    ) -> str:
+        """Compute dependency_status for a single task."""
+        deps = task_entry.get("depends_on", [])
+        blocks = task_entry.get("blocks", [])
+
+        if not deps:
+            return DEP_STATUS_NO_DEPENDENCIES
+
+        # Get all task statuses from resolved bundle statuses (not bundle-index "planned")
+        task_status_map = {t["task_id"]: t.get("status", "planned") for t in self.tasks}
+
+        # If task is not TASK_READY, dependency can't be evaluated
+        if status != TASK_STATUS_READY:
+            return DEP_STATUS_NOT_EVALUATED
+
+        # Check if dependencies are satisfied
+        for dep_tid in deps:
+            dep_status = task_status_map.get(dep_tid, "planned")
+            if dep_status == "TASK_FAILED_VALIDATION":
+                return DEP_STATUS_FAILED_VALIDATION
+            if dep_status == "TASK_BLOCKED":
+                return DEP_STATUS_BLOCKED_BY_DEPENDENCY
+            if dep_status not in ("TASK_READY", "TASK_NOT_EVALUATED"):
+                return DEP_STATUS_NOT_EVALUATED
+
+        return DEP_STATUS_SATISFIED
 
     def _check_safety_invariants(self, task_id: str, reader: TaskBundleReader) -> None:
         """Check safety booleans in bundle and aggregate them."""
@@ -887,6 +969,176 @@ class RunSummaryBuilder:
         self.human_action = HUMAN_NONE
         self.human_action_required = False
 
+    def _compute_dependency_summary(self) -> None:
+        """Compute dependency summary counts from bundle index tasks."""
+        index_tasks = self.bundle_index.get("tasks", [])
+        dep_edges = 0
+        block_edges = 0
+        tasks_with_deps = 0
+        downstream_blocked_count = 0
+        promotion_groups: set[str] = set()
+        pr_groups: set[str] = set()
+
+        for t in index_tasks:
+            deps = t.get("depends_on", [])
+            blocks = t.get("blocks", [])
+            if deps:
+                tasks_with_deps += 1
+                dep_edges += len(deps)
+            if blocks:
+                block_edges += len(blocks)
+            pg = t.get("promotion_group")
+            if pg:
+                promotion_groups.add(pg)
+            prg = t.get("pr_group")
+            if prg:
+                pr_groups.add(prg)
+
+        # Count tasks that are downstream blocked (appear in someone else's blocks list)
+        all_task_ids = {t["task_id"] for t in index_tasks}
+        blocked_task_ids: set[str] = set()
+        for t in index_tasks:
+            for b in t.get("blocks", []):
+                if b in all_task_ids:
+                    blocked_task_ids.add(b)
+        downstream_blocked_count = len(blocked_task_ids)
+
+        self.tasks_with_dependencies = tasks_with_deps
+        self.tasks_downstream_blocked = downstream_blocked_count
+        self.dependency_edges_count = dep_edges
+        self.block_edges_count = block_edges
+        self.promotion_groups_count = len(promotion_groups)
+        self.pr_groups_count = len(pr_groups)
+
+    def _compute_integration_plan(self) -> None:
+        """Build integration_plan from resolved task statuses and bundle-index metadata."""
+        # Use resolved task list (self.tasks) for statuses; bundle_index for metadata
+        index_tasks = self.tasks
+        integration_branch = self.integration_branch
+
+        # Collect promotion and PR groups from bundle index
+        promotion_groups: dict[str, list[str]] = {}
+        pr_groups: dict[str, list[str]] = {}
+        ordered_task_ids: list[str] = []
+        dependency_edges: list[dict] = []
+        block_edges: list[dict] = []
+
+        for t in index_tasks:
+            tid = t["task_id"]
+            pg = t.get("promotion_group")
+            if pg:
+                if pg not in promotion_groups:
+                    promotion_groups[pg] = []
+                promotion_groups[pg].append(tid)
+            prg = t.get("pr_group")
+            if prg:
+                if prg not in pr_groups:
+                    pr_groups[prg] = []
+                pr_groups[prg].append(tid)
+
+        # Build ordered task list respecting dependencies and integration_order
+        dependents = {t["task_id"]: [] for t in index_tasks}
+        in_degree = {t["task_id"]: 0 for t in index_tasks}
+        manifest_order = {t["task_id"]: i for i, t in enumerate(index_tasks)}
+
+        for t in index_tasks:
+            tid = t["task_id"]
+            for dep in t.get("depends_on", []):
+                dependents.setdefault(dep, []).append(tid)
+                in_degree[tid] += 1
+
+        from collections import deque
+        queue = deque([tid for tid, deg in in_degree.items() if deg == 0])
+        topological = []
+        while queue:
+            node = queue.popleft()
+            topological.append(node)
+            for dependent in dependents.get(node, []):
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    queue.append(dependent)
+
+        # Sort: topological order as primary key, integration_order breaks ties
+        topo_index = {tid: i for i, tid in enumerate(topological)}
+        def sort_key(tid):
+            t = next((x for x in index_tasks if x["task_id"] == tid), None)
+            order = t.get("integration_order", 9999) if t else 9999
+            return (topo_index[tid], order, manifest_order.get(tid, 0))
+
+        ordered_task_ids = sorted(topological, key=sort_key)
+
+        for t in index_tasks:
+            tid = t["task_id"]
+            for dep in t.get("depends_on", []):
+                dependency_edges.append({"from": dep, "to": tid, "type": "depends_on"})
+            for blocked in t.get("blocks", []):
+                block_edges.append({"from": tid, "to": blocked, "type": "blocks"})
+
+        task_status_map = {t["task_id"]: t.get("status", "planned") for t in index_tasks}
+
+        ready_for_promotion = []
+        blocked_from_promotion = []
+
+        for t in index_tasks:
+            tid = t["task_id"]
+            status = task_status_map.get(tid, "planned")
+            deps = t.get("depends_on", [])
+            blocks = t.get("blocks", [])
+
+            if status != "TASK_READY":
+                blocked_from_promotion.append(tid)
+                continue
+
+            is_blocked = False
+            for blocked_id in blocks:
+                bs = task_status_map.get(blocked_id, "planned")
+                if bs in ("TASK_FAILED_VALIDATION", "TASK_BLOCKED"):
+                    is_blocked = True
+                    break
+
+            if is_blocked:
+                blocked_from_promotion.append(tid)
+            elif deps:
+                all_deps_satisfied = True
+                for dep_tid in deps:
+                    dep_status = task_status_map.get(dep_tid, "planned")
+                    if dep_status not in ("TASK_READY", "TASK_NOT_EVALUATED"):
+                        all_deps_satisfied = False
+                        break
+                if all_deps_satisfied:
+                    ready_for_promotion.append(tid)
+                else:
+                    blocked_from_promotion.append(tid)
+            else:
+                ready_for_promotion.append(tid)
+
+        parallel_groups: list[list[str]] = []
+        parallel_candidates = [
+            t["task_id"] for t in index_tasks
+            if t.get("can_run_in_parallel") is True
+            and task_status_map.get(t["task_id"], "planned") in ("TASK_READY", "TASK_NOT_EVALUATED")
+            and not t.get("depends_on")
+        ]
+        if parallel_candidates:
+            parallel_groups.append(sorted(parallel_candidates))
+
+        suggested_pr_groups: dict[str, list[str]] = {}
+        for pg, tids in pr_groups.items():
+            filtered = [tid for tid in tids if task_status_map.get(tid) in ("TASK_READY", "TASK_NOT_EVALUATED")]
+            if filtered:
+                suggested_pr_groups[pg] = filtered
+
+        self.integration_plan = {
+            "integration_branch": integration_branch,
+            "ordered_task_ids": ordered_task_ids,
+            "ready_for_promotion": sorted(ready_for_promotion),
+            "blocked_from_promotion": sorted(blocked_from_promotion),
+            "suggested_pr_groups": suggested_pr_groups,
+            "parallel_groups": parallel_groups,
+            "dependency_edges": dependency_edges,
+            "block_edges": block_edges,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Markdown report builder
@@ -952,6 +1204,58 @@ def build_markdown_report(summary: dict, output_md: Path) -> None:
     lines.append(f"| CI green | {gs.get('ci_green', 0)} |\n")
     lines.append(f"| Finalization guard MERGE_READY | {gs.get('finalization_guard_merge_ready', 0)} |\n")
     lines.append("\n")
+
+    # v2: Dependency Summary
+    dep_sum = summary.get("dependency_summary", {})
+    if dep_sum:
+        lines.append("## Dependency Summary\n")
+        lines.append(f"| Metric | Count |\n")
+        lines.append(f"|--------|-------|\n")
+        lines.append(f"| Tasks with dependencies | {dep_sum.get('tasks_with_dependencies', 0)} |\n")
+        lines.append(f"| Tasks downstream blocked | {dep_sum.get('tasks_downstream_blocked', 0)} |\n")
+        lines.append(f"| Dependency edges | {dep_sum.get('dependency_edges', 0)} |\n")
+        lines.append(f"| Block edges | {dep_sum.get('block_edges', 0)} |\n")
+        lines.append(f"| Promotion groups | {dep_sum.get('promotion_groups', 0)} |\n")
+        lines.append(f"| PR groups | {dep_sum.get('pr_groups', 0)} |\n")
+        lines.append("\n")
+
+    # v2: Integration Plan
+    ip = summary.get("integration_plan", {})
+    if ip:
+        lines.append("## Integration Plan\n")
+        ib = ip.get("integration_branch") or "not specified"
+        lines.append(f"**Integration branch:** `{ib}`\n")
+        ready = ip.get("ready_for_promotion", [])
+        blocked = ip.get("blocked_from_promotion", [])
+        if ready:
+            lines.append(f"**Ready for promotion:** {', '.join(f'`{x}`' for x in ready)}\n")
+        if blocked:
+            lines.append(f"**Blocked from promotion:** {', '.join(f'`{x}`' for x in blocked)}\n")
+        lines.append("\n")
+
+        # Promotion groups
+        pg = ip.get("promotion_groups", {})
+        if pg:
+            lines.append("### Promotion Groups\n")
+            for group_name, task_ids in pg.items():
+                lines.append(f"**{group_name}:** {', '.join(f'`{x}`' for x in task_ids)}\n")
+            lines.append("\n")
+
+        # Suggested PR groups
+        sprg = ip.get("suggested_pr_groups", {})
+        if sprg:
+            lines.append("### Suggested PR Groups\n")
+            for group_name, task_ids in sprg.items():
+                lines.append(f"**{group_name}:** {', '.join(f'`{x}`' for x in task_ids)}\n")
+            lines.append("\n")
+
+        # Parallel groups
+        par = ip.get("parallel_groups", [])
+        if par:
+            lines.append("### Parallel Groups\n")
+            for i, group in enumerate(par):
+                lines.append(f"Group {i+1}: {', '.join(f'`{x}`' for x in group)}\n")
+            lines.append("\n")
 
     # Task table
     lines.append("## Task Table\n")

@@ -1481,3 +1481,697 @@ def test_profile_sentinel_readonly_does_not_mutate_inputs(temp_dir):
     # result itself must not have modified snap1 or snap2
     assert "before_snapshot" in result
     assert result["before_snapshot"] == snap1_copy
+
+
+# ---------------------------------------------------------------------------
+# Tests: v2 dependency and integration plan in run summary
+# ---------------------------------------------------------------------------
+
+class TestDependencyInRunSummary:
+    """Tests for v2 dependency and integration plan in run summary."""
+
+    def test_dependency_status_satisfied(self, temp_dir):
+        """Dependency satisfied produces dependency_status: satisfied."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "base-helper-001",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+            {
+                "task_id": "docs-update-002",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["base-helper-001"],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "base-helper-001", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+        make_bundle_dir(bundle_root, "docs-update-002", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-001",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        docs_entry = next(t for t in data["tasks"] if t["task_id"] == "docs-update-002")
+        assert docs_entry["dependency_status"] == "satisfied"
+
+    def test_no_dependencies_no_dependencies_status(self, temp_dir):
+        """No dependencies produces dependency_status: no_dependencies."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "solo-task-001",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "solo-task-001", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-002",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        entry = data["tasks"][0]
+        assert entry["dependency_status"] == "no_dependencies"
+
+    def test_downstream_blocked_task(self, temp_dir):
+        """Downstream blocked task appears in integration plan."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "blocked-core-004",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_BLOCKED",
+                "blocker_code": "allowed_scope_violations",
+            },
+            {
+                "task_id": "downstream-blocked-005",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["blocked-core-004"],
+                "blocks": [],
+                "status": "TASK_BLOCKED",
+            },
+        ]
+        make_bundle_dir(bundle_root, "blocked-core-004", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "allowed_scope_violations",
+                                   "blocker_summary": "violations"},
+            "violations_only.json": {"allowed_scope_violations": [{"file": "x.py"}]},
+        })
+        make_bundle_dir(bundle_root, "downstream-blocked-005", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "blocked_by_dependency",
+                                   "blocker_summary": "dependency blocked"},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-003",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        ip = data.get("integration_plan", {})
+        assert "blocked-core-004" in ip.get("blocked_from_promotion", [])
+        assert "downstream-blocked-005" in ip.get("blocked_from_promotion", [])
+
+    def test_blocked_dependency_blocks_promotion(self, temp_dir):
+        """Failed validation dependency blocks promotion."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "failing-dep",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_FAILED_VALIDATION",
+            },
+            {
+                "task_id": "dependent-task",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["failing-dep"],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "failing-dep", {
+            "BUNDLE_STATUS.json": {"status": "task_failed_validation", "clean_for_task": False},
+        })
+        make_bundle_dir(bundle_root, "dependent-task", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-004",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        dep_entry = next(t for t in data["tasks"] if t["task_id"] == "dependent-task")
+        assert dep_entry["dependency_status"] == "dependency_failed_validation"
+        ip = data.get("integration_plan", {})
+        assert "dependent-task" in ip.get("blocked_from_promotion", [])
+
+    def test_ready_task_with_unsatisfied_dependency_not_in_ready(self, temp_dir):
+        """Ready task with unsatisfied dependency is not in ready_for_promotion."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "base-helper-001",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_BLOCKED",  # not ready
+            },
+            {
+                "task_id": "docs-update-002",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["base-helper-001"],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "base-helper-001", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "allowed_scope_violations"},
+        })
+        make_bundle_dir(bundle_root, "docs-update-002", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-005",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        ip = data.get("integration_plan", {})
+        assert "docs-update-002" in ip.get("blocked_from_promotion", [])
+        assert "docs-update-002" not in ip.get("ready_for_promotion", [])
+
+    def test_suggested_pr_groups_emitted(self, temp_dir):
+        """Suggested PR groups are emitted in integration plan."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "task-a",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "pr_group": "pr-core",
+                "status": "TASK_READY",
+            },
+            {
+                "task_id": "task-b",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "pr_group": "pr-followup",
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "task-a", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+        make_bundle_dir(bundle_root, "task-b", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-006",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        ip = data.get("integration_plan", {})
+        assert "pr-core" in ip.get("suggested_pr_groups", {})
+        assert "task-a" in ip["suggested_pr_groups"]["pr-core"]
+
+    def test_markdown_includes_dependency_summary_section(self, temp_dir):
+        """Markdown includes Dependency Summary section."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "task-a",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "task-a", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-007",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        md_content = output_md.read_text()
+        assert "## Dependency Summary" in md_content
+
+    def test_markdown_includes_integration_plan_section(self, temp_dir):
+        """Markdown includes Integration Plan section."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "task-a",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "task-a", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-008",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        md_content = output_md.read_text()
+        assert "## Integration Plan" in md_content
+
+    def test_markdown_includes_suggested_pr_groups_section(self, temp_dir):
+        """Markdown includes Suggested PR Groups section."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "task-a",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "pr_group": "pr-core",
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "task-a", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-009",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        md_content = output_md.read_text()
+        assert "### Suggested PR Groups" in md_content
+
+    def test_overall_status_partial_ready_with_independent_ready_and_downstream_blocked(self, temp_dir):
+        """Overall status is PARTIAL_READY when one independent task is ready and one downstream is blocked."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "base-helper-001",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_READY",
+            },
+            {
+                "task_id": "downstream-blocked-005",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["base-helper-001"],
+                "blocks": [],
+                "status": "TASK_BLOCKED",  # downstream blocked
+                "blocker_code": "blocked_by_dependency",
+            },
+        ]
+        make_bundle_dir(bundle_root, "base-helper-001", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+        make_bundle_dir(bundle_root, "downstream-blocked-005", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "blocked_by_dependency"},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-010",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        assert data["overall_status"] == "PARTIAL_READY"
+
+    def test_overall_status_blocked_when_all_blocked_by_dependencies(self, temp_dir):
+        """Overall status is BLOCKED when all tasks are blocked by dependencies."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "blocked-core-004",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": [],
+                "blocks": [],
+                "status": "TASK_BLOCKED",
+                "blocker_code": "allowed_scope_violations",
+            },
+            {
+                "task_id": "downstream-blocked-005",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "depends_on": ["blocked-core-004"],
+                "blocks": [],
+                "status": "TASK_BLOCKED",
+                "blocker_code": "blocked_by_dependency",
+            },
+        ]
+        make_bundle_dir(bundle_root, "blocked-core-004", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "allowed_scope_violations"},
+        })
+        make_bundle_dir(bundle_root, "downstream-blocked-005", {
+            "BUNDLE_STATUS.json": {"status": "task_blocked", "clean_for_task": False,
+                                   "blocker_code": "blocked_by_dependency"},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-011",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        assert data["overall_status"] == "BLOCKED"
+
+    def test_integration_plan_readonly_does_not_modify_git_branches(self, temp_dir):
+        """Integration plan is read-only and does not modify git branches."""
+        bundle_root = temp_dir / "bundles"
+        bundle_root.mkdir()
+        index_path = temp_dir / "BUNDLE_INDEX.json"
+        output_json = temp_dir / "RUN_SUMMARY.json"
+        output_md = temp_dir / "RUN_SUMMARY.md"
+
+        tasks = [
+            {
+                "task_id": "task-a",
+                "task_type": "docs_consistency",
+                "risk_level": "low",
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "expected_outputs": ["docs/out.md"],
+                "promotion_target": "integration/test-branch",
+                "status": "TASK_READY",
+            },
+        ]
+        make_bundle_dir(bundle_root, "task-a", {
+            "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        })
+
+        with open(index_path, "w") as f:
+            json.dump(minimal_bundle_index(tasks), f)
+
+        from build_autocoder_run_summary import main as run_main
+        import sys
+        old_argv = sys.argv
+        sys.argv = [
+            "build_autocoder_run_summary.py",
+            "--run-id", "test-dep-012",
+            "--bundle-index", str(index_path),
+            "--bundle-root", str(bundle_root),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--integration-branch", "integration/test-branch",
+        ]
+        try:
+            rc = run_main()
+        finally:
+            sys.argv = old_argv
+        assert rc == 0
+        data = json.loads(output_json.read_text())
+        ip = data.get("integration_plan", {})
+        assert ip.get("integration_branch") == "integration/test-branch"
+        # Verify no git operations were attempted by checking safety invariants
+        assert data["safety_invariants"]["hermes_touched"] is False
