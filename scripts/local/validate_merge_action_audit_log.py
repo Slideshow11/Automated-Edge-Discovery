@@ -469,18 +469,20 @@ def validate_log(
 
         elif event_type == "controlled_smoke_create":
             # Legacy: real rows have task_id but some older rows may have candidate_id
-            has_task_id = "task_id" in row
-            has_candidate_id = "candidate_id" in row
+            task_val = row.get("task_id")
+            candidate_val = row.get("candidate_id")
+            has_task_id = task_val not in (None, "")
+            has_candidate_id = candidate_val not in (None, "")
             if not has_task_id and not has_candidate_id:
                 missing.append("task_id")  # at least one identifier required
             elif has_candidate_id and not has_task_id:
-                # Legacy row: candidate_id present, task_id absent
+                # Legacy row: candidate_id present and non-empty, task_id absent
                 if not strict:
                     warnings.append(build_issue(
                         line_idx, "legacy_candidate_id_only_smoke_row",
                         "controlled_smoke_create row has candidate_id but no task_id — legacy row",
                         severity="warning",
-                        candidate_id=row.get("candidate_id"),
+                        candidate_id=candidate_val,
                     ))
                 else:
                     missing.append("task_id")
