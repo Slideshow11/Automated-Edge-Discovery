@@ -399,7 +399,7 @@ class RunSummaryBuilder:
             "repo": self.repo,
             "base_sha": self.base_sha,
             "integration_branch": self.integration_branch,
-            "bundle_index_path": None,
+            "bundle_index_path": None,  # filled by caller
             "bundle_root": str(self.bundle_root),
             "task_count": self.task_count,
             "tasks_attempted": self.tasks_attempted,
@@ -982,6 +982,7 @@ def main() -> int:
     output_json.parent.mkdir(parents=True, exist_ok=True)
     summary["artifact_index"]["json_report"] = str(output_json)
     summary["artifact_index"]["markdown_report"] = str(Path(args.output_md))
+    summary["bundle_index_path"] = str(bundle_index_path)
     summary["output_json"] = str(output_json)
     summary["output_md"] = str(Path(args.output_md))
 
