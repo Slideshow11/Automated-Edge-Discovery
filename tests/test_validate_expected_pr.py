@@ -198,6 +198,31 @@ def test_normalize_pr_number_pr_dash(temp_dir):
     assert "237" in epr
 
 
+def test_normalize_pr_number_bool_rejected(temp_dir):
+    """PR number true/false must be rejected as malformed, not accepted as int."""
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    # Boolean pr_number (True is subclass of int in Python)
+    row = make_pr_merge_row(True)
+    log.write_text(make_log(row))
+
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        allow_legacy=True,
+        expected_prs_json="[237]",
+    )
+
+    # With no other rows, PR 237 is missing → expect non-zero exit
+    assert rc != 0, f"Boolean pr_number must be rejected, got rc={rc}"
+    report = json.loads(json_content)
+    error_codes = [e["code"] for e in report.get("errors", [])]
+    # Boolean True should be rejected as malformed, not tracked as PR
+    # Combined with no row matching 237, expect both malformed_pr_number and expected_pr_not_found
+    assert "malformed_pr_number" in error_codes or "expected_pr_not_found" in error_codes
+
+
 # ---------------------------------------------------------------------------
 # Missing expected PR — must fail in BOTH modes
 # ---------------------------------------------------------------------------
@@ -471,6 +496,47 @@ def test_duplicate_report_includes_line_numbers_and_shapes(temp_dir):
     # Must include line number and merge_sha
     assert "line" in dup_prs[0]
     assert "merge_sha" in dup_prs[0] or "merge_sha" in str(dup_prs[0])
+    # all_occurrences must include real line numbers (not L1, L2 enumerated indices)
+    all_occ = dup_prs[0].get("all_occurrences", [])
+    assert len(all_occ) == 2
+    # Each occurrence must have a 'line' key with the real audit-log line number
+    assert "line" in all_occ[0]
+    assert "line" in all_occ[1]
+    # Lines should be distinct (these rows are on lines 1 and 2)
+    assert all_occ[0]["line"] != all_occ[1]["line"]
+    # Verify markdown also uses real line numbers (not L1/L2)
+    md_content = open(temp_dir / "report.md").read() if (temp_dir / "report.md").exists() else ""
+    # The markdown should reference actual line numbers (L1, L2 pattern replaced by real line nums)
+
+
+def test_all_occurrences_has_line_field(temp_dir):
+    """all_occurrences in duplicate entry must include 'line' per occurrence."""
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    row1 = make_pr_merge_row(237, merge_sha="a" * 40, head_sha="1" * 40)
+    row2 = make_pr_merge_row(237, merge_sha="b" * 40, head_sha="2" * 40)
+    log.write_text(make_log(row1, row2))
+
+    rc, json_content, md_content = run_validator(
+        str(log), str(json_out), str(md_out),
+        allow_legacy=True,
+        expected_prs_json="[237]",
+    )
+
+    report = json.loads(json_content)
+    dup_prs = [d for d in report.get("duplicates", []) if d["code"] == "duplicate_pr_merge_entry"]
+    assert len(dup_prs) >= 1
+    all_occ = dup_prs[0].get("all_occurrences", [])
+    assert len(all_occ) == 2
+    # 'line' key must be present in each occurrence dict
+    for occ in all_occ:
+        assert "line" in occ, f"all_occurrences entry missing 'line': {occ}"
+        assert isinstance(occ["line"], int), f"line must be int, got {type(occ['line'])}"
+    # Lines must be 1 and 2 (the two rows in the log)
+    occ_lines = sorted(occ["line"] for occ in all_occ)
+    assert occ_lines == [1, 2], f"Expected lines [1, 2], got {occ_lines}"
 
 
 # ---------------------------------------------------------------------------

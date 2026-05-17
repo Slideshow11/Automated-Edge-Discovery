@@ -134,6 +134,8 @@ def _normalize_pr_number(value: Any) -> int | None:
     """
     if value is None:
         return None
+    if isinstance(value, bool):  # bool is subclass of int in Python — reject explicitly
+        return None
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -613,11 +615,12 @@ def validate_log(
     # Check for duplicate PR merge entries — enrich with SHAs
     for pr_key, line_indices in pr_merge_seen.items():
         if len(line_indices) > 1:
-            # Collect SHAs for all occurrences
-            sha_info: list[dict[str, str]] = []
+            # Collect line+SHA for all occurrences
+            sha_info: list[dict[str, Any]] = []
             for li in line_indices:
                 row_ref = parsed_rows.get(li, {})
                 sha_info.append({
+                    "line": li,
                     "head_sha": row_ref.get("head_sha", "unknown"),
                     "merge_sha": row_ref.get("merge_sha", "unknown"),
                 })
@@ -832,8 +835,8 @@ def build_markdown(report: dict[str, Any]) -> str:
             all_occ = d.get("all_occurrences")
             if all_occ and len(all_occ) > 1:
                 sha_details = ", ".join(
-                    f"L{li+1}:{occ['head_sha'][:7]}..→{occ['merge_sha'][:7]}.."
-                    for li, occ in enumerate(all_occ)
+                    f"L{occ['line']}:{occ['head_sha'][:7]}..→{occ['merge_sha'][:7]}.."
+                    for occ in all_occ
                 )
                 sha_part += f"\n  All: {sha_details}"
             lines.append(f"- **Line {d['line']}** `[{d['code']}]` — {d['message']}{sha_part}")
