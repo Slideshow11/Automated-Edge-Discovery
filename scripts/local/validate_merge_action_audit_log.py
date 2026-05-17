@@ -66,12 +66,15 @@ REQUIRED_FIELDS_BY_TYPE: dict[str, frozenset[str]] = {
         # in non-strict mode or an error in strict mode.
     ]),
     "controlled_smoke_create": frozenset([
-        # Note: real rows use task_id, not candidate_id. Both are accepted.
+        # Note: real rows use task_id. Legacy rows may have candidate_id.
+        # At least one of task_id or candidate_id is required.
+        # task_id is preferred; candidate_id-only rows are treated as legacy.
         "event_type",
         "timestamp",
-        # candidate_id is not actually present in real rows; task_id is used
         "board",
-        "task_id",
+        # NOTE: task_id and candidate_id are NOT mandatory here because
+        # some legacy rows have candidate_id but not task_id. The actual
+        # validation is done in the event-type-specific block below.
     ]),
     "external_action": frozenset([
         "event_type",
@@ -463,6 +466,24 @@ def validate_log(
                     line_idx, "gate_catches_not_object",
                     f"gate_catches is {type(gc).__name__}, expected dict",
                 ))
+
+        elif event_type == "controlled_smoke_create":
+            # Legacy: real rows have task_id but some older rows may have candidate_id
+            has_task_id = "task_id" in row
+            has_candidate_id = "candidate_id" in row
+            if not has_task_id and not has_candidate_id:
+                missing.append("task_id")  # at least one identifier required
+            elif has_candidate_id and not has_task_id:
+                # Legacy row: candidate_id present, task_id absent
+                if not strict:
+                    warnings.append(build_issue(
+                        line_idx, "legacy_candidate_id_only_smoke_row",
+                        "controlled_smoke_create row has candidate_id but no task_id — legacy row",
+                        severity="warning",
+                        candidate_id=row.get("candidate_id"),
+                    ))
+                else:
+                    missing.append("task_id")
 
         elif event_type == "audit_correction":
             # Validate correction fields
