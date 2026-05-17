@@ -610,11 +610,25 @@ class RunSummaryBuilder:
             if status == TASK_STATUS_BLOCKED:
                 self._add_blocker_entry(task_id, task_entry, blocker_code, blocker_summary, reader)
 
-            # Update counters
+            # Update counters — but only assign to ready_task_ids / blocked_task_ids
+            # if task is NOT already promoted (promotion is a separate determination made
+            # in _append_task_summary from bundle evidence; promoted tasks must not appear
+            # in ready_task_ids to keep the three buckets disjoint)
             if status == TASK_STATUS_READY:
                 self.tasks_ready += 1
                 self.tasks_attempted += 1
-                self.ready_task_ids.append(task_id)
+                # Check promotion status from bundle to keep buckets disjoint:
+                # promoted tasks go only to promoted_task_ids (set in _append_task_summary)
+                bundle_promo = None
+                if reader and reader.bundle_status:
+                    bundle_promo = reader.bundle_status.get("promotion_status")
+                    if bundle_promo is None:
+                        bundle_promo = "promoted_to_integration" if reader.bundle_status.get("promoted_to_integration") is True else None
+                if bundle_promo == "promoted_to_integration":
+                    # Task is TASK_READY and already promoted — goes to promoted_task_ids only
+                    pass
+                else:
+                    self.ready_task_ids.append(task_id)
             elif status == TASK_STATUS_BLOCKED:
                 self.tasks_blocked += 1
                 self.tasks_attempted += 1
@@ -1245,6 +1259,7 @@ def build_markdown_report(summary: dict, output_md: Path) -> None:
     lines.append(f"| TASK_SKIPPED | {ts} |\n")
     lines.append(f"| Tasks promoted | {tp} |\n")
     lines.append(f"| Promoted task IDs | {', '.join(f'`{x}`' for x in summary.get('promoted_task_ids', []))} |\n")
+    lines.append(f"| Ready (not promoted) | {', '.join(f'`{x}`' for x in summary.get('ready_task_ids', [])) or 'none'} |\n")
     lines.append(f"| PRs opened | {summary['prs_opened']} |\n")
     lines.append(f"| Merge-ready PRs | {summary['merge_ready_prs']} |\n")
     lines.append("\n")
