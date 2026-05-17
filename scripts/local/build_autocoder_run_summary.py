@@ -86,19 +86,26 @@ REPORT_ONLY_BOOLEANS = frozenset([
     "patch_applied",
 ])
 
-OPTIONAL_BUNDLE_FILES = frozenset([
-    "scope_check.json",
-    "violations_only.json",
-    "local_gate.txt",
+# Required bundle artifacts — missing in strict mode upgrades status to TASK_FAILED_VALIDATION
+REQUIRED_BUNDLE_ARTIFACTS = frozenset(["BUNDLE_STATUS.json"])
+
+# Contextually required artifacts — required only when task data is expected
+CONTEXTUAL_REQUIRED_ARTIFACTS = frozenset([
+    "violations_only.json",   # required when scope/violations collection was expected
+    "scope_check.json",        # required when scope check was expected
+    "local_gate.txt",         # required when local_gate status is passed or failed
+])
+
+# Optional bundle artifacts — always warnings, never errors
+OPTIONAL_BUNDLE_ARTIFACTS = frozenset([
     "risk_notes.md",
     "proposed_pr_body.md",
     "FINAL_GATE.json",
     "codex_review_summary.md",
-    "BUNDLE_STATUS.json",
 ])
 
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -127,7 +134,15 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--strict", action="store_true",
-        help="Treat missing optional bundle files as errors instead of warnings"
+        help="Treat missing required bundle files as TASK_FAILED_VALIDATION errors"
+    )
+    parser.add_argument(
+        "--profile-sentinel-before", default=None,
+        help="Path to JSON snapshot of profile file hashes BEFORE the run"
+    )
+    parser.add_argument(
+        "--profile-sentinel-after", default=None,
+        help="Path to JSON snapshot of profile file hashes AFTER the run"
     )
     return parser
 
@@ -186,8 +201,10 @@ class TaskBundleReader:
         self.bundle_root = bundle_root
         self.task_id = task_id
         self.bundle_dir = bundle_root / task_id
-        self.errors: list[str] = []
-        self.warnings: list[str] = []
+        self.errors: list[str] = []      # hard errors (malformed JSON, missing required)
+        self.warnings: list[str] = []     # soft warnings (missing optional/contextual)
+        self._required_errors: list[str] = []  # errors on REQUIRED artifacts only
+        self._contextual_errors: list[str] = []  # errors on CONTEXTUAL artifacts
 
         # Loaded artifact data
         self.bundle_status: Optional[dict] = None
@@ -200,7 +217,7 @@ class TaskBundleReader:
         self.codex_review_md: Optional[str] = None
 
     def load_all(self, strict: bool = False) -> None:
-        """Load all optional and required bundle artifacts."""
+        """Load all bundle artifacts, categorizing errors by severity."""
         self._load_bundle_status(strict)
         self._load_scope_check(strict)
         self._load_violations_only(strict)
@@ -215,16 +232,16 @@ class TaskBundleReader:
         obj, err = read_json_file(path)
         if err:
             msg = f"Task '{self.task_id}': BUNDLE_STATUS.json: {err}"
-            if strict:
-                self.errors.append(msg)
-            else:
-                self.warnings.append(msg)
+            self.errors.append(msg)
+            self._required_errors.append(msg)
             return
         if not isinstance(obj, dict):
-            self.errors.append(
+            msg = (
                 f"Task '{self.task_id}': BUNDLE_STATUS.json must be a JSON object, "
                 f"got: {type(obj).__name__}"
             )
+            self.errors.append(msg)
+            self._required_errors.append(msg)
             return
         self.bundle_status = obj
 
@@ -240,7 +257,13 @@ class TaskBundleReader:
         path = self.bundle_dir / "violations_only.json"
         obj, err = read_json_file(path)
         if err:
-            self.warnings.append(f"Task '{self.task_id}': violations_only.json: {err}")
+            # In strict mode, violations_only.json is always required for attempted tasks
+            # (AED always runs scope checking). Missing it is a contextual error only —
+            # do NOT also append to warnings here to avoid duplicate reporting.
+            if strict:
+                self._contextual_errors.append(err)
+            else:
+                self.warnings.append(f"Task '{self.task_id}': violations_only.json: {err}")
             return
         self.violations_only = obj
 
@@ -249,6 +272,9 @@ class TaskBundleReader:
         content, err = read_text_file(path)
         if err:
             self.warnings.append(f"Task '{self.task_id}': local_gate.txt: {err}")
+            # local_gate.txt is contextually required when task was attempted —
+            # track separately for strict mode
+            self._contextual_errors.append(err)
             return
         self.local_gate_txt = content
 
@@ -298,6 +324,33 @@ class TaskBundleReader:
             if val.lower() in ("true", "false"):
                 return val.lower() == "true"
         return None
+
+    @property
+    def has_required_errors(self) -> bool:
+        """True if any REQUIRED artifact (BUNDLE_STATUS.json) had errors."""
+        return bool(self._required_errors)
+
+    @property
+    def has_contextual_errors(self) -> bool:
+        """True if any contextually-required artifact had errors."""
+        return bool(self._contextual_errors)
+
+    def contextual_errors_for_task(self) -> list[str]:
+        """Return contextual errors; empty list if no errors."""
+        return list(self._contextual_errors)
+
+    def is_contextually_dirty(self) -> bool:
+        """True if scope is dirty or clean_for_task is False — meaning violations_only.json
+        and scope_check.json are required for classification."""
+        if self.bundle_status is None:
+            return False
+        clean = self.bundle_status.get("clean_for_task", True)
+        if not clean:
+            return True
+        # Also require scope_check if scope_status is explicitly dirty
+        if self.scope_check is not None and not self.scope_check.get("passed", True):
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -383,6 +436,7 @@ class RunSummaryBuilder:
         self.tasks_blocked = 0
         self.tasks_skipped = 0
         self.tasks_promoted = 0
+        self.tasks_failed_validation = 0
         self.prs_opened = 0
         self.merge_ready_prs = 0
 
@@ -407,6 +461,7 @@ class RunSummaryBuilder:
             "tasks_blocked": self.tasks_blocked,
             "tasks_skipped": self.tasks_skipped,
             "tasks_promoted": self.tasks_promoted,
+            "tasks_failed_validation": self.tasks_failed_validation,
             "prs_opened": self.prs_opened,
             "merge_ready_prs": self.merge_ready_prs,
             "human_action_required": self.human_action_required,
@@ -490,6 +545,20 @@ class RunSummaryBuilder:
             # mark as TASK_FAILED_VALIDATION
             if self.strict and reader.errors and reader.bundle_status is None:
                 self._append_task_summary(task_id, task_entry, TASK_STATUS_FAILED_VALIDATION, None)
+                self._add_blocker_entry(task_id, task_entry, "bundle_missing_required", "BUNDLE_STATUS.json missing or malformed — required artifact", reader)
+                self.tasks_failed_validation += 1
+                self.tasks_attempted += 1
+                continue
+
+            # In strict mode, contextually-required artifacts missing/malformed also upgrade
+            # status to TASK_FAILED_VALIDATION (but BUNDLE_STATUS.json was present)
+            if self.strict and reader.has_contextual_errors and reader.bundle_status is not None:
+                contextual_msgs = reader.contextual_errors_for_task()
+                summary_text = f"Strict mode: contextually-required artifacts missing or malformed: {'; '.join(contextual_msgs)}"
+                self._append_task_summary(task_id, task_entry, TASK_STATUS_FAILED_VALIDATION, reader)
+                self._add_blocker_entry(task_id, task_entry, "strict_contextual_required", summary_text, reader)
+                self.tasks_failed_validation += 1
+                self.tasks_attempted += 1
                 continue
 
             # Determine task status
@@ -498,6 +567,10 @@ class RunSummaryBuilder:
             )
 
             self._append_task_summary(task_id, task_entry, status, reader, blocker_code, blocker_summary)
+
+            # Populate top-level blockers list for TASK_BLOCKED tasks
+            if status == TASK_STATUS_BLOCKED:
+                self._add_blocker_entry(task_id, task_entry, blocker_code, blocker_summary, reader)
 
             # Update counters
             if status == TASK_STATUS_READY:
@@ -509,7 +582,7 @@ class RunSummaryBuilder:
             elif status == TASK_STATUS_SKIPPED:
                 self.tasks_skipped += 1
             elif status == TASK_STATUS_FAILED_VALIDATION:
-                self.tasks_blocked += 1
+                self.tasks_failed_validation += 1
                 self.tasks_attempted += 1
 
             # Check safety booleans from bundle
@@ -558,11 +631,9 @@ class RunSummaryBuilder:
         blocker_summary = None
         if mapped == TASK_STATUS_BLOCKED:
             bs = bundle_status.get("blocker_summary", "")
-            bb = bundle_status.get("blocker_breakdown", {})
-            if isinstance(bb, dict) and bb:
-                blocker_code = list(bb.keys())[0] if bb else None
-            else:
-                blocker_code = bundle_status.get("blocker_code")
+            # blocker_breakdown is {"file": {rule, severity}} — file-path keys, not codes.
+            # blocker_code always comes from the top-level field.
+            blocker_code = bundle_status.get("blocker_code")
             blocker_summary = bs
 
         return mapped, blocker_code, blocker_summary
@@ -720,6 +791,49 @@ class RunSummaryBuilder:
                     "message": f"Task '{task_id}' has {key}=true",
                 })
 
+    def _add_blocker_entry(
+        self,
+        task_id: str,
+        task_entry: dict,
+        blocker_code: Optional[str],
+        blocker_summary: Optional[str],
+        reader: Optional[TaskBundleReader],
+    ) -> None:
+        """Add a top-level blocker entry for a TASK_BLOCKED or TASK_FAILED_VALIDATION task."""
+        if not blocker_code:
+            self.warnings.append({
+                "task_id": task_id,
+                "code": "blocker_code_missing",
+                "message": f"Task '{task_id}' has status TASK_BLOCKED but blocker_code is null",
+            })
+            blocker_code = "unknown"
+
+        # Build a descriptive blocker summary if none provided
+        if not blocker_summary:
+            code_descriptions = {
+                "allowed_scope_violations": "Allowed scope contains executable safety violations",
+                "bundle_missing_required": "Required bundle artifact BUNDLE_STATUS.json is missing or malformed",
+                "strict_contextual_required": "Strict mode: contextually-required artifact missing or malformed",
+                "unknown": "Unknown blocker — check task bundle",
+            }
+            blocker_summary = code_descriptions.get(blocker_code, f"Blocker: {blocker_code}")
+
+        bundle_path = str(reader.bundle_dir) if reader else str(self.bundle_root / task_id)
+
+        # Determine source: prefer violations_only for allowed_scope_violations
+        source = "BUNDLE_STATUS.json"
+        if reader and reader.violations_only is not None:
+            source = "violations_only.json"
+
+        self.blockers.append({
+            "task_id": task_id,
+            "blocker_code": blocker_code,
+            "blocker_summary": blocker_summary,
+            "human_action": HUMAN_RESOLVE,
+            "bundle_path": bundle_path,
+            "source": source,
+        })
+
     def _compute_overall_status(self) -> None:
         """Compute the overall run status."""
         if self.task_count == 0:
@@ -728,6 +842,11 @@ class RunSummaryBuilder:
 
         if self.tasks_attempted == 0:
             self.overall_status = OVERALL_NO_TASKS
+            return
+
+        # TASK_FAILED_VALIDATION is a hard failure — takes precedence
+        if self.tasks_failed_validation > 0:
+            self.overall_status = OVERALL_FAILED_VALIDATION
             return
 
         all_blocked = (self.tasks_blocked > 0 and self.tasks_ready == 0)

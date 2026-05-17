@@ -889,3 +889,595 @@ def test_read_only_behavior(temp_dir):
 
     # Content must be unchanged
     assert original_content == after_content
+
+
+# ==============================================================================
+# NEW TESTS — Part D (blockers, strict mode, profile sentinel)
+# ==============================================================================
+
+# --------------------------------------------------------------------------
+# Test 22: TASK_BLOCKED creates top-level blockers entry
+# --------------------------------------------------------------------------#
+
+def test_blocked_task_creates_blocker_entry(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    make_bundle_dir(bundle_root, "blocked-task-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_blocked",
+            "clean_for_task": False,
+            "blocker_code": "allowed_scope_violations",
+            "blocker_summary": "Scope violation in allowed scope",
+        },
+        "violations_only.json": {
+            "allowed_scope_violations": [
+                {"file": "scripts/bad.py", "rule": "executable_scope", "severity": "error"}
+            ]
+        },
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "blocked-task-001", "task_type": "test_gap_analysis",
+             "risk_level": "medium", "allowed_files": [], "forbidden_files": [],
+             "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    assert summary["tasks_blocked"] == 1
+    assert len(summary["blockers"]) == 1
+    b = summary["blockers"][0]
+    assert b["task_id"] == "blocked-task-001"
+    assert b["blocker_code"] == "allowed_scope_violations"
+    assert b["human_action"] == HUMAN_RESOLVE
+    assert "allowed scope" in b["blocker_summary"].lower()
+    assert b["source"] == "violations_only.json"
+
+
+# --------------------------------------------------------------------------#
+# Test 23: Markdown blocker count and JSON blocker count agree
+# --------------------------------------------------------------------------#
+
+def test_blocker_count_json_md_agree(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    make_bundle_dir(bundle_root, "blocked-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_blocked", "clean_for_task": False,
+            "blocker_code": "allowed_scope_violations",
+        },
+    })
+    make_bundle_dir(bundle_root, "blocked-002", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_blocked", "clean_for_task": False,
+            "blocker_code": "forbidden_file_access",
+        },
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "blocked-001", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+            {"task_id": "blocked-002", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    assert len(summary["blockers"]) == 2
+    assert summary["tasks_blocked"] == 2
+
+    # Markdown blocker section derived from task data should match
+    md_blocked_count = sum(
+        1 for t in summary["tasks"] if t["status"] == TASK_STATUS_BLOCKED
+    )
+    assert len(summary["blockers"]) == md_blocked_count
+
+
+# --------------------------------------------------------------------------#
+# Test 24: TASK_BLOCKED without blocker_code creates validation warning
+# --------------------------------------------------------------------------#
+
+def test_blocked_without_blocker_code_warning(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # BUNDLE_STATUS has task_blocked but no blocker_code
+    make_bundle_dir(bundle_root, "bad-blocked-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_blocked",
+            "clean_for_task": False,
+            # intentionally no blocker_code
+            "blocker_summary": "something went wrong",
+        },
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "bad-blocked-001", "task_type": "test_gap_analysis",
+             "risk_level": "medium", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    assert summary["tasks_blocked"] == 1
+    # Should produce a blocker_code_missing warning
+    code_warnings = [
+        w for w in summary["warnings"]
+        if w.get("code") == "blocker_code_missing" and w.get("task_id") == "bad-blocked-001"
+    ]
+    assert len(code_warnings) == 1
+
+
+# --------------------------------------------------------------------------#
+# Test 25: Multiple blocked tasks create multiple blocker entries
+# --------------------------------------------------------------------------#
+
+def test_multiple_blocked_tasks_multiple_blockers(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    for i in range(3):
+        make_bundle_dir(bundle_root, f"blocked-multi-{i:03d}", {
+            "BUNDLE_STATUS.json": {
+                "status": "task_blocked", "clean_for_task": False,
+                "blocker_code": f"violation_type_{i}",
+                "blocker_summary": f"Blocker {i}",
+            },
+        })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": f"blocked-multi-{i:03d}", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+            for i in range(3)
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    assert len(summary["blockers"]) == 3
+    blocker_ids = {b["task_id"] for b in summary["blockers"]}
+    assert blocker_ids == {"blocked-multi-000", "blocked-multi-001", "blocked-multi-002"}
+
+
+# --------------------------------------------------------------------------#
+# Test 26: No blocked tasks results in empty blockers list
+# --------------------------------------------------------------------------#
+
+def test_no_blocked_tasks_empty_blockers(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    make_bundle_dir(bundle_root, "clean-001", {
+        "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        "local_gate.txt": "PASS",
+    })
+    make_bundle_dir(bundle_root, "clean-002", {
+        "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        "local_gate.txt": "PASS",
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "clean-001", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+            {"task_id": "clean-002", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    assert len(summary["blockers"]) == 0
+    assert summary["tasks_blocked"] == 0
+
+
+# --------------------------------------------------------------------------#
+# Test 27: Strict mode upgrades missing violations_only.json to TASK_FAILED_VALIDATION
+# --------------------------------------------------------------------------#
+
+def test_strict_missing_violations_only_fails(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # Bundle has BUNDLE_STATUS.json and local_gate.txt but no violations_only.json
+    make_bundle_dir(bundle_root, "strict-fail-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_ready",
+            "clean_for_task": True,
+        },
+        "local_gate.txt": "PASS",
+        # NO violations_only.json
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "strict-fail-001", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=True,
+    )
+    summary = builder.build()
+
+    task = summary["tasks"][0]
+    assert task["status"] == TASK_STATUS_FAILED_VALIDATION
+    # And it should appear as a top-level blocker too
+    assert len(summary["blockers"]) == 1
+    assert summary["blockers"][0]["task_id"] == "strict-fail-001"
+    assert summary["blockers"][0]["blocker_code"] == "strict_contextual_required"
+
+
+# --------------------------------------------------------------------------#
+# Test 28: Strict mode upgrades malformed JSON to TASK_FAILED_VALIDATION
+# --------------------------------------------------------------------------#
+
+def test_strict_malformed_json_fails(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # violations_only.json is malformed
+    bd = bundle_root / "malformed-001"
+    bd.mkdir()
+    with open(bd / "BUNDLE_STATUS.json", "w") as f:
+        json.dump({"status": "task_ready", "clean_for_task": True}, f)
+    with open(bd / "violations_only.json", "w") as f:
+        f.write("{ this is not valid json }")
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "malformed-001", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=True,
+    )
+    summary = builder.build()
+
+    task = summary["tasks"][0]
+    assert task["status"] == TASK_STATUS_FAILED_VALIDATION
+
+
+# --------------------------------------------------------------------------#
+# Test 29: Strict mode does NOT fail for missing optional risk_notes.md
+# --------------------------------------------------------------------------#
+
+def test_strict_missing_optional_risk_notes_still_ready(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # Only BUNDLE_STATUS.json + local_gate.txt — risk_notes.md is optional
+    make_bundle_dir(bundle_root, "optional-missing-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_ready",
+            "clean_for_task": True,
+        },
+        "local_gate.txt": "PASS",
+        # NO risk_notes.md, NO violations_only.json, NO scope_check.json
+        # But in non-strict mode those are warnings, not errors
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "optional-missing-001", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=True,
+    )
+    summary = builder.build()
+
+    # In strict mode, violations_only.json IS contextually required
+    # So we should get TASK_FAILED_VALIDATION
+    task = summary["tasks"][0]
+    assert task["status"] == TASK_STATUS_FAILED_VALIDATION
+
+
+# --------------------------------------------------------------------------#
+# Test 30: Non-strict mode reports missing required artifact as warning, not hard failure
+# --------------------------------------------------------------------------#
+
+def test_nonstrict_missing_contextual_warns_not_fails(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # Only BUNDLE_STATUS.json — violations_only.json is missing
+    make_bundle_dir(bundle_root, "warn-only-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_ready",
+            "clean_for_task": True,
+        },
+        "local_gate.txt": "PASS",
+        # NO violations_only.json
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "warn-only-001", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    # Non-strict: missing violations_only.json is a warning, not a failure
+    task = summary["tasks"][0]
+    assert task["status"] == TASK_STATUS_READY
+    # Should have a warning
+    warns = [w for w in summary["warnings"] if "violations_only" in w.get("message", "")]
+    assert len(warns) >= 1
+
+
+# --------------------------------------------------------------------------#
+# Test 31: Overall FAILED_VALIDATION if any task is TASK_FAILED_VALIDATION
+# --------------------------------------------------------------------------#
+
+def test_overall_failed_validation_when_any_task_fails(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # One TASK_READY + one TASK_FAILED_VALIDATION
+    make_bundle_dir(bundle_root, "ready-001", {
+        "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        "local_gate.txt": "PASS",
+        "violations_only.json": {"violations": [], "executable_violations": []},
+    })
+    # This one fails strict mode due to missing violations_only.json and local_gate.txt
+    make_bundle_dir(bundle_root, "fails-validation-001", {
+        "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        # missing violations_only.json and local_gate.txt
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "ready-001", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+            {"task_id": "fails-validation-001", "task_type": "test_gap_analysis",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=True,
+    )
+    summary = builder.build()
+
+    assert summary["overall_status"] == "FAILED_VALIDATION"
+    assert summary["tasks_failed_validation"] == 1
+
+
+# --------------------------------------------------------------------------#
+# Test 32: Overall PARTIAL_READY if some ready and one blocked (no validation failure)
+# --------------------------------------------------------------------------#
+
+def test_overall_partial_ready_no_validation_failure(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    make_bundle_dir(bundle_root, "ready-001", {
+        "BUNDLE_STATUS.json": {"status": "task_ready", "clean_for_task": True},
+        "local_gate.txt": "PASS",
+    })
+    make_bundle_dir(bundle_root, "blocked-001", {
+        "BUNDLE_STATUS.json": {
+            "status": "task_blocked", "clean_for_task": False,
+            "blocker_code": "allowed_scope_violations",
+            "blocker_summary": "Blocked",
+        },
+    })
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "ready-001", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+            {"task_id": "blocked-001", "task_type": "test_gap_analysis",
+             "risk_level": "medium", "allowed_files": [], "forbidden_files": [], "expected_outputs": []},
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=False,
+    )
+    summary = builder.build()
+
+    # No TASK_FAILED_VALIDATION — so PARTIAL_READY (not FAILED_VALIDATION)
+    assert summary["overall_status"] == OVERALL_PARTIAL_READY
+    assert summary["tasks_ready"] == 1
+    assert summary["tasks_blocked"] == 1
+    assert summary["tasks_failed_validation"] == 0
+
+
+# --------------------------------------------------------------------------#
+# Test 33: TASK_FAILED_VALIDATION task creates top-level blocker entry
+# --------------------------------------------------------------------------#
+
+def test_failed_validation_creates_blocker_entry(temp_dir):
+    bundle_root = temp_dir / "bundles"
+    bundle_root.mkdir()
+
+    # Missing BUNDLE_STATUS.json — strict mode should mark as TASK_FAILED_VALIDATION
+    bd = bundle_root / "missing-status-001"
+    bd.mkdir()
+    with open(bd / "local_gate.txt", "w") as f:
+        f.write("PASS")
+
+    builder = RunSummaryBuilder(
+        run_id="test-run",
+        bundle_index={"version": 1, "bundle_root": str(bundle_root), "tasks": [
+            {"task_id": "missing-status-001", "task_type": "docs_consistency",
+             "risk_level": "low", "allowed_files": [], "forbidden_files": [], "expected_outputs": []}
+        ]},
+        bundle_root=bundle_root,
+        repo=None, base_sha=None, integration_branch=None,
+        expected_task_ids=None, allow_missing=False, strict=True,
+    )
+    summary = builder.build()
+
+    task = summary["tasks"][0]
+    assert task["status"] == TASK_STATUS_FAILED_VALIDATION
+    assert len(summary["blockers"]) == 1
+    assert summary["blockers"][0]["task_id"] == "missing-status-001"
+    assert summary["blockers"][0]["blocker_code"] == "bundle_missing_required"
+
+
+# --------------------------------------------------------------------------#
+# Test 34: Profile sentinel — no file changes produces clean result
+# --------------------------------------------------------------------------#
+
+import sys
+import tempfile as temp_lib
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "local"))
+from check_hermes_profile_mutation import compare_snapshots, compute_file_snapshot
+
+
+def test_profile_sentinel_no_mutation_clean(temp_dir):
+    # Create two identical temp files
+    f1 = temp_dir / "memory.md"
+    f2 = temp_dir / "user.md"
+    f1.write_text("initial content")
+    f2.write_text("user data")
+
+    paths = [str(f1), str(f2)]
+
+    snap1 = {"generated_at": "2026-01-01T00:00:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+    snap2 = {"generated_at": "2026-01-01T00:01:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    result = compare_snapshots(snap1, snap2)
+
+    assert result["memory_or_profile_updated"] is False
+    assert len(result["paths_mutated"]) == 0
+    assert result["checked"] is True
+
+
+# --------------------------------------------------------------------------#
+# Test 35: Changed MEMORY.md hash produces memory_or_profile_updated: true
+# --------------------------------------------------------------------------#
+
+def test_profile_sentinel_memory_changed(temp_dir):
+    f1 = temp_dir / "memory.md"
+    f1.write_text("original content")
+
+    paths = [str(f1)]
+    snap1 = {"generated_at": "2026-01-01T00:00:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    # Mutate the file
+    f1.write_text("mutated content")
+    snap2 = {"generated_at": "2026-01-01T00:01:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    result = compare_snapshots(snap1, snap2)
+
+    assert result["memory_or_profile_updated"] is True
+    assert str(f1) in result["paths_mutated"]
+    assert result["mutations"][0]["type"] == "content_changed"
+
+
+# --------------------------------------------------------------------------#
+# Test 36: Changed USER.md hash produces memory_or_profile_updated: true
+# --------------------------------------------------------------------------#
+
+def test_profile_sentinel_user_changed(temp_dir):
+    f1 = temp_dir / "user.md"
+    f1.write_text("user original")
+
+    paths = [str(f1)]
+    snap1 = {"generated_at": "2026-01-01T00:00:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    f1.write_text("user mutated")
+    snap2 = {"generated_at": "2026-01-01T00:01:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    result = compare_snapshots(snap1, snap2)
+
+    assert result["memory_or_profile_updated"] is True
+    assert str(f1) in result["paths_mutated"]
+    assert result["mutations"][0]["type"] == "content_changed"
+
+
+# --------------------------------------------------------------------------#
+# Test 37: Missing file is deterministic (before=None, after=None => no mutation)
+# --------------------------------------------------------------------------#
+
+def test_profile_sentinel_file_never_existed_no_mutation(temp_dir):
+    never_existed = str(temp_dir / "ghost.txt")
+    paths = [never_existed]
+
+    snap1 = {"generated_at": "2026-01-01T00:00:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+    snap2 = {"generated_at": "2026-01-01T00:01:00+00:00", "paths": paths,
+             "snapshots": compute_file_snapshot(paths)}
+
+    result = compare_snapshots(snap1, snap2)
+
+    # Neither snapshot had the file — no mutation
+    assert result["memory_or_profile_updated"] is False
+    assert never_existed not in result["paths_mutated"]
+
+
+# --------------------------------------------------------------------------#
+# Test 38: Sentinel output is read-only (compare does not modify input snapshots)
+# --------------------------------------------------------------------------#
+
+def test_profile_sentinel_readonly_does_not_mutate_inputs(temp_dir):
+    f1 = temp_dir / "memory.md"
+    f1.write_text("content a")
+
+    paths = [str(f1)]
+    snap1 = {
+        "generated_at": "2026-01-01T00:00:00+00:00",
+        "paths": paths,
+        "snapshots": compute_file_snapshot(paths),
+    }
+    snap1_copy = json.loads(json.dumps(snap1))  # deep copy
+
+    f1.write_text("content b")
+    snap2 = {
+        "generated_at": "2026-01-01T00:01:00+00:00",
+        "paths": paths,
+        "snapshots": compute_file_snapshot(paths),
+    }
+
+    result = compare_snapshots(snap1, snap2)
+
+    # snap1 must be unchanged after comparison
+    assert snap1 == snap1_copy
+    assert result["memory_or_profile_updated"] is True
+    # result itself must not have modified snap1 or snap2
+    assert "before_snapshot" in result
+    assert result["before_snapshot"] == snap1_copy
