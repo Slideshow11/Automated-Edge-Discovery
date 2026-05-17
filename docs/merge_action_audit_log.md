@@ -136,3 +136,45 @@ Flags:
 - `--strict`: Treat warnings and legacy rows as errors
 - `--allow-legacy`: Allow legacy rows without failing (non-strict default)
 - `--expected-prs-json JSON`: PR numbers that must appear in the log
+
+### Expected PR Validation
+
+`--expected-prs-json` hard-requires specified PR numbers to appear in the log:
+
+```bash
+python3 scripts/local/validate_merge_action_audit_log.py \
+  --input /home/max/.hermes/aed/audit/log.jsonl \
+  --output-json /tmp/report.json \
+  --output-md /tmp/report.md \
+  --allow-legacy \
+  --expected-prs-json '[232,233,234,235]'
+```
+
+**Non-strict mode behavior:**
+- Legacy rows (missing `event_type`, `authorization_phrase`, `gate_catches`) generate warnings but not errors.
+- After normalization, legacy PRs count toward the expected-PR set if their PR number matches.
+- All expected PRs must be found (ignoring missing optional fields) to pass.
+
+**Strict mode behavior:**
+- Legacy rows cause validation to fail even if the PR number is correct.
+- Missing required fields (`authorization_phrase`, `gate_catches`, `audit_log_version`, `timestamp`) are always errors.
+- Safety booleans stored as strings (`"false"`) instead of booleans are errors.
+- Strict mode does not count normalized legacy rows toward the expected-PR set.
+
+**Output JSON shape:**
+
+```json
+{
+  "overall_status": "valid_legacy",
+  "expected_pr_results": [
+    {"pr_number": "232", "found": true, "normalized": true},
+    {"pr_number": "233", "found": true, "normalized": false},
+    {"pr_number": "234", "found": true, "normalized": true}
+  ]
+}
+```
+
+**Normalization rules:**
+- PR numbers as integers or strings (`237` vs `"237"`) are equivalent.
+- `#237`, `PR #237`, `PR-237` are all normalized to `237`.
+- Boolean fields must be actual booleans (`true`/`false`), not string `"true"`/`"false"`.

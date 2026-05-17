@@ -61,6 +61,44 @@ Each line is a JSON object:
 | `reviewer_hint` | string | Hint for the morning reviewer. |
 | `promotion_target` | string | Proposed branch name if the bundle is promoted to a PR. |
 
+### Optional Dependency and Promotion Fields
+
+The following fields control task ordering, promotion grouping, and parallel execution:
+
+| Field | Type | Description |
+|---|---|---|
+| `depends_on` | list[string] | Task IDs that must complete and be promoted before this task can be promoted. |
+| `blocks` | list[string] | Task IDs that this task blocks from promotion until this task is resolved. |
+| `promotion_group` | string | Logical group name for tasks that should be reviewed and merged together. |
+| `pr_group` | string | Groups tasks into a single PR when promotion is authorized. |
+| `can_run_in_parallel` | bool | If `true`, this task has no `depends_on` and may run concurrently with other parallel-capable tasks at the same dependency level. |
+| `integration_order` | int | Sort key within a promotion group. Lower values are promoted earlier. |
+| `promotion_target` | string | Proposed branch name if the bundle is promoted to a PR. |
+
+**JSON example:**
+
+```json
+{
+  "task_id": "docs-task-dependency-example-001",
+  "task_type": "docs_consistency",
+  "depends_on": ["docs-autocoder-run-summary-example-001"],
+  "blocks": [],
+  "promotion_group": "docs-task-manifest",
+  "pr_group": "autocoder-docs",
+  "can_run_in_parallel": false,
+  "integration_order": 2,
+  "promotion_target": "integration/aed-patch-rehearsal-003"
+}
+```
+
+**Dependency resolution rules:**
+
+1. A task with `depends_on` cannot be promoted until all dependencies have `promotion_status = promoted_to_integration`.
+2. A task with `blocks` prevents the blocked task from being promoted until the blocking task is resolved (`TASK_READY` or `TASK_BLOCKED`).
+3. `promotion_group` controls which tasks are reviewed together; `pr_group` groups them into a single PR when merging.
+4. `can_run_in_parallel: true` is only valid for tasks with no `depends_on` entries.
+5. `integration_order` is a tiebreaker when multiple tasks are ready for promotion at the same level.
+
 ### Allowed `task_type` Values
 
 - `docs_consistency` — stale links, formatting, internal references
