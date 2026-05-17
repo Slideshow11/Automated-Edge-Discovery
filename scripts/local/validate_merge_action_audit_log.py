@@ -360,7 +360,17 @@ def validate_log(
 
             # Check authorization_phrase
             if not row.get("authorization_phrase"):
-                missing.append("authorization_phrase")
+                # authorization_phrase is required in schema 1.0+ but may be
+                # missing in legacy rows — treat as legacy condition
+                if not strict:
+                    warnings.append(build_issue(
+                        line_idx, "legacy_missing_authorization_phrase",
+                        "authorization_phrase is missing — legacy row",
+                        severity="warning",
+                        pr_number=pr_num,
+                    ))
+                else:
+                    missing.append("authorization_phrase")
 
             # Check safety booleans
             for key in SAFETY_BOOLEAN_KEYS:
@@ -385,6 +395,20 @@ def validate_log(
                     ))
                 else:
                     missing.append("gate_catches")
+            elif isinstance(gc, str):
+                # gate_catches was written as a string (e.g. "{}") in some legacy rows
+                if not strict:
+                    warnings.append(build_issue(
+                        line_idx, "legacy_string_gate_catches",
+                        f"gate_catches is a string {repr(gc)} — expected dict",
+                        severity="warning",
+                        pr_number=pr_num,
+                    ))
+                else:
+                    errors.append(build_issue(
+                        line_idx, "gate_catches_not_object",
+                        f"gate_catches is {type(gc).__name__}, expected dict",
+                    ))
             elif not isinstance(gc, dict):
                 errors.append(build_issue(
                     line_idx, "gate_catches_not_object",
