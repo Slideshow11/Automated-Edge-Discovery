@@ -644,3 +644,217 @@ def test_validator_readonly_does_not_modify_input(temp_dir):
     rc, _, _ = run_validator(str(log), str(json_out), str(md_out))
 
     assert log.read_text() == original, "Input file should not be modified"
+
+# -----------------------------------------------------------------------------
+# Concatenated JSON object detection tests
+# -----------------------------------------------------------------------------
+
+def test_validator_detects_concatenated_json_objects_strict(temp_dir):
+    """Validator strict mode errors on concatenated JSON objects."""
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    # Two JSON objects concatenated on one line (the bug scenario)
+    row1 = {
+        "event_type": "pr_merge",
+        "pr_number": 901,
+        "head_sha": "a" * 40,
+        "merge_sha": "b" * 40,
+        "merged_at": "2026-01-01T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    row2 = {
+        "event_type": "pr_merge",
+        "pr_number": 902,
+        "head_sha": "c" * 40,
+        "merge_sha": "d" * 40,
+        "merged_at": "2026-01-02T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    # Write concatenated (no newline between them)
+    log.write_text(json.dumps(row1, separators=(",", ":")) + json.dumps(row2, separators=(",", ":")))
+
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        strict=True,
+    )
+
+    assert rc != 0
+    report = json.loads(json_content)
+    assert any(
+        "concatenated_json_objects" in e["code"]
+        for e in report["errors"]
+    )
+
+
+def test_validator_reports_concatenation_warning_non_strict(temp_dir):
+    """Validator non-strict mode reports concatenation as warning."""
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    row1 = {
+        "event_type": "pr_merge",
+        "pr_number": 903,
+        "head_sha": "a" * 40,
+        "merge_sha": "b" * 40,
+        "merged_at": "2026-01-01T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    row2 = {
+        "event_type": "pr_merge",
+        "pr_number": 904,
+        "head_sha": "c" * 40,
+        "merge_sha": "d" * 40,
+        "merged_at": "2026-01-02T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    # Write concatenated on one physical line
+    log.write_text(json.dumps(row1, separators=(",", ":")) + json.dumps(row2, separators=(",", ":")))
+
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        allow_legacy=True,
+    )
+
+    # Non-strict should still pass (warnings only) but must emit concatenation warning
+    report = json.loads(json_content)
+    concat_codes = [w["code"] for w in report["warnings"]] + [e["code"] for e in report["errors"]]
+    assert "concatenated_json_objects" in concat_codes, f"Expected concatenated_json_objects warning, got {report['warnings'] + report['errors']}"
+
+
+def test_validator_passes_valid_jsonl_despite_concatenation_in_non_strict(temp_dir):
+    """
+    Even with concatenated JSON on a line, non-strict mode should recover
+    and validate the rest of the file successfully.
+    """
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    row1 = {
+        "event_type": "pr_merge",
+        "pr_number": 905,
+        "head_sha": "a" * 40,
+        "merge_sha": "b" * 40,
+        "merged_at": "2026-01-01T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    row2 = {
+        "event_type": "pr_merge",
+        "pr_number": 906,
+        "head_sha": "c" * 40,
+        "merge_sha": "d" * 40,
+        "merged_at": "2026-01-02T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    valid_row = {
+        "event_type": "pr_merge",
+        "pr_number": 907,
+        "head_sha": "e" * 40,
+        "merge_sha": "f" * 40,
+        "merged_at": "2026-01-03T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    # Write: valid line, concatenated line, valid line
+    content = (
+        json.dumps(row1, separators=(",", ":")) + "\n"
+        + json.dumps(row2, separators=(",", ":")) + json.dumps(valid_row, separators=(",", ":"))
+        + "\n"
+        + json.dumps(valid_row, separators=(",", ":"))
+    )
+    # Fix: write with trailing newline for the first valid row
+    content = json.dumps(row1, separators=(",", ":")) + "\n"
+    content += json.dumps(row2, separators=(",", ":")) + json.dumps(valid_row, separators=(",", ":"))
+    content += "\n"
+    content += json.dumps(valid_row, separators=(",", ":"))
+    log.write_text(content)
+
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        allow_legacy=True,
+    )
+
+    report = json.loads(json_content)
+    concat_warnings = [w for w in report["warnings"] if w["code"] == "concatenated_json_objects"]
+    # Should have exactly 1 concatenation warning for the bad line
+    assert len(concat_warnings) >= 1
+    # The valid rows should still be counted
+    assert report["pr_merge_counts"].get("907") == 1
+
+
+def test_validator_invalid_json_after_concatenation_fails_strict(temp_dir):
+    """If content after first JSON is not valid JSON, strict mode errors."""
+    log = temp_dir / "log.jsonl"
+    json_out = temp_dir / "report.json"
+    md_out = temp_dir / "report.md"
+
+    row1 = {
+        "event_type": "pr_merge",
+        "pr_number": 910,
+        "head_sha": "a" * 40,
+        "merge_sha": "b" * 40,
+        "merged_at": "2026-01-01T00:00:00Z",
+        "ci_status": "success",
+        "codex_status": "clean",
+        "scope_status": "clean",
+        "hermes_touched": False,
+        "dispatch_occurred": False,
+        "production_board_touched": False,
+        "gate_catches": {},
+    }
+    # Write valid JSON + garbage
+    log.write_text(json.dumps(row1, separators=(",", ":")) + "THIS IS NOT JSON")
+
+    rc, json_content, _ = run_validator(
+        str(log), str(json_out), str(md_out),
+        strict=True,
+    )
+
+    assert rc != 0
+    report = json.loads(json_content)
+    codes = [e["code"] for e in report["errors"]]
+    assert "concatenated_json_objects" in codes
