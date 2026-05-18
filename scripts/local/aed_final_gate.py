@@ -174,25 +174,67 @@ def validate_pr_state(pr: dict) -> tuple[bool, str]:
 
 
 def validate_codex_artifact_head(
-    codex_path: Optional[str], current_head: str
+    codex_path: Optional[str], current_head: str, allow_skip: bool = False
 ) -> tuple[bool, str]:
-    """Validate Codex artifact SHA matches current head."""
+    """Validate Codex artifact SHA matches current head exactly.
+
+    Accepts artifact only when it explicitly references the exact expected head SHA.
+    Ancestor SHAs, base SHAs, stale SHAs, or any other SHA in the artifact are NOT
+    valid — exact equality to current_head is required.
+
+    When no artifact is provided:
+      - allow_skip=True  → treated as SKIP (passing=True, skipped=True, skip_authorized=True)
+      - allow_skip=False → treated as FAIL (passing=False, Codex required)
+
+    Accepted SHA fields (exact equality required):
+      head_sha, commit_sha, reviewed_sha, pr_head_sha
+
+    If no usable SHA field exists: BLOCK (passing=False)
+    If SHA field does not match current_head exactly: BLOCK (passing=False)
+    """
     if not codex_path:
-        return True, "codex_artifact not provided — skipped"
+        if allow_skip:
+            return True, "codex_artifact skipped (--allow-codex-skip)"
+        return False, "codex_artifact required but not provided"
     path = Path(codex_path)
     if not path.exists():
         return False, f"Codex artifact not found: {codex_path}"
     content = path.read_text()
+
+    # Supported SHA field names — exact equality to current_head required
+    sha_field_names = ("head_sha", "commit_sha", "reviewed_sha", "pr_head_sha")
+
+    # Try JSON field extraction first
+    try:
+        data = json.loads(content)
+        for field in sha_field_names:
+            if field in data and isinstance(data[field], str):
+                artifact_sha = data[field].strip()
+                if len(artifact_sha) == 40 and all(c in '0123456789abcdef' for c in artifact_sha.lower()):
+                    if artifact_sha == current_head:
+                        return True, f"Codex artifact head_sha matches current head {current_head}"
+                    else:
+                        return False, f"codex_artifact head_sha mismatch: expected={current_head}, artifact has={artifact_sha}"
+        # No recognized SHA field found in JSON
+        return False, "codex_artifact has no recognized SHA field (head_sha, commit_sha, reviewed_sha, pr_head_sha)"
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: regex search for 40-char hex SHA in raw content
+    # Only matches content that looks like a standalone 40-char hex string
     import re
-    # Look for SHA references in artifact
-    shas = re.findall(r'\b([0-9a-f]{40})\b', content)
-    if not shas:
-        return True, "No SHA found in Codex artifact — skipped"
-    # Check if any SHA matches current head
-    for sha in shas:
-        if sha == current_head:
-            return True, f"Codex artifact references current head {current_head}"
-    return False, f"Codex artifact SHA mismatch: artifact contains {shas[0]}, current head is {current_head}"
+    hex_char_set = set('0123456789abcdef')
+    # Find all 40-char hex strings that appear to be SHAs (not embedded in longer strings)
+    # A SHA must be preceded by a field name indicator (", :, =) or start of string
+    # and followed by , " \n } or end of string
+    sha_pattern = r'(?:^|(?<=[^0-9a-f]))([0-9a-f]{40})(?=[\s"]|$)'
+    matches = re.findall(sha_pattern, content, re.IGNORECASE)
+    if not matches:
+        return False, "codex_artifact contains no recognizable SHA reference"
+    for sha in matches:
+        if sha.lower() == current_head.lower():
+            return True, f"Codex artifact SHA matches current head {current_head}"
+    return False, f"codex_artifact head_sha mismatch: artifact contains {matches[0]}, current head is {current_head}"
 
 
 def validate_local_validation(
@@ -267,6 +309,7 @@ def run_final_gate(
     output_json_path: str,
     output_md_path: str,
     allow_admin: bool = False,
+    allow_codex_skip: bool = False,
 ) -> dict:
     # Detect repo from git
     repo_result = subprocess.run(
@@ -406,17 +449,38 @@ def run_final_gate(
         allowed_files
     )
     pr_valid, pr_msg = validate_pr_state(pr_rest)
-    codex_valid, codex_msg = validate_codex_artifact_head(codex_artifact_path, current_head)
+    codex_valid, codex_msg = validate_codex_artifact_head(codex_artifact_path, current_head, allow_codex_skip)
     local_valid, local_msg = validate_local_validation(local_validation_path)
 
-    all_valid = all([
-        head_valid, ci_valid, scope_valid, pr_valid, codex_valid, local_valid
+    all_hard_gates_valid = all([
+        head_valid, ci_valid, scope_valid, pr_valid, local_valid
     ])
 
-    recommendation = "MERGE_READY" if all_valid else "BLOCK"
+    codex_missing = codex_artifact_path is None
 
-    auth_phrase = build_authorization_phrase(pr_number, current_head)
-    merge_cmd = build_merge_command(pr_number, current_head, repo, allow_admin)
+    if not all_hard_gates_valid:
+        # Priority 1: Hard gate failure → BLOCK
+        # Hard gates: head SHA, CI green, scope clean, PR open+mergeable, local validation
+        recommendation = "BLOCK"
+    elif codex_artifact_path and not codex_valid:
+        # Priority 2: Artifact provided but invalid (stale, mismatched, malformed, missing SHA) → BLOCK
+        # allow_codex_skip does NOT override an invalid provided artifact
+        recommendation = "BLOCK"
+    elif codex_missing and not allow_codex_skip:
+        # Priority 3: Artifact missing and skip not authorized → WAIT
+        recommendation = "WAIT"
+    elif codex_missing and allow_codex_skip:
+        # Priority 4: Artifact missing but skip authorized + hard gates pass → MERGE_READY
+        recommendation = "MERGE_READY"
+    else:
+        # Priority 5: Artifact provided and valid + hard gates pass → MERGE_READY
+        recommendation = "MERGE_READY"
+
+    auth_phrase = None
+    merge_cmd = None
+    if recommendation == "MERGE_READY":
+        auth_phrase = build_authorization_phrase(pr_number, current_head)
+        merge_cmd = build_merge_command(pr_number, current_head, repo, allow_admin)
 
     # Build output
     gate = {
@@ -432,6 +496,8 @@ def run_final_gate(
         "codex_status": {
             "passing": codex_valid,
             "message": codex_msg,
+            "skipped": bool(codex_artifact_path is None and allow_codex_skip),
+            "skip_authorized": bool(allow_codex_skip),
         },
         "local_validation_status": {
             "passing": local_valid,
@@ -452,11 +518,14 @@ def run_final_gate(
             "message": head_msg,
         },
         "final_recommendation": recommendation,
-        "authorization_phrase": auth_phrase,
-        "merge_command": merge_cmd,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "allow_admin": allow_admin,
     }
+
+    if auth_phrase:
+        gate["authorization_phrase"] = auth_phrase
+    if merge_cmd:
+        gate["merge_command"] = merge_cmd
 
     # Write JSON
     Path(output_json_path).write_text(json.dumps(gate, indent=2))
@@ -496,6 +565,15 @@ def run_final_gate(
             "---",
             "*This report was generated by aed_final_gate.py. No merge was executed.*",
         ])
+    elif recommendation == "WAIT":
+        md_lines.extend([
+            "## Waiting On",
+            "",
+            "- **Codex evidence required** — provide --codex-artifact to proceed",
+            "",
+            "---",
+            "*This report was generated by aed_final_gate.py. No merge was executed.*",
+        ])
     else:
         md_lines.append("## Blocking Issues\n")
         for key, valid, msg in [
@@ -528,6 +606,13 @@ def main():
     parser.add_argument("--output-json", dest="output_json", required=True)
     parser.add_argument("--output-md", dest="output_md", required=True)
     parser.add_argument("--allow-admin", dest="allow_admin", action="store_true")
+    parser.add_argument(
+        "--allow-codex-skip",
+        dest="allow_codex_skip",
+        action="store_true",
+        help="Allow missing Codex artifact. Skipped Codex is marked as skip_authorized=true. "
+             "Use only when Codex review was performed out-of-band and not captured as artifact.",
+    )
 
     args = parser.parse_args()
 
@@ -545,6 +630,7 @@ def main():
         output_json_path=args.output_json,
         output_md_path=args.output_md,
         allow_admin=args.allow_admin,
+        allow_codex_skip=args.allow_codex_skip,
     )
 
     print(json.dumps(gate, indent=2))

@@ -746,3 +746,100 @@ def test_multiple_repair_events_recorded_in_history(temp_workspace, sample_tasks
     assert state["repair_events"][0]["repair_id"] == "task-001.R1"
     assert state["repair_events"][1]["repair_id"] == "task-001.R2"
     assert state["repair_events"][2]["repair_id"] == "task-001.R3"
+
+
+# ---------------------------------------------------------------------------
+# Tests: run-codex-review command
+# ---------------------------------------------------------------------------
+
+def test_run_codex_review_records_codex_review_in_progress(temp_workspace, sample_tasks_jsonl):
+    """run-codex-review sets state to in_progress with action=run_codex_review."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller(["init", "--run-id", "aed-codex-001", "--tasks-jsonl", str(sample_tasks_jsonl),
+                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-001",
+                    "--output-state", str(state_path)])
+
+    rc, stdout, stderr = run_controller([
+        "run-codex-review", "--state", str(state_path),
+        "--reason", "codex_artifact_required",
+        "--summary", "Finalization guard requires Codex evidence"
+    ])
+    assert rc == 0, f"run-codex-review failed: {stderr}"
+
+    state = json.loads(Path(state_path).read_text())
+    assert state["codex_review"]["status"] == "in_progress"
+    assert state["codex_review"]["reason"] == "codex_artifact_required"
+    assert state["next_action"]["action"] == "run_codex_review"
+    assert state["next_action"]["reason"] == "codex_artifact_required"
+    assert state["human_action_required"] is True
+
+
+def test_run_codex_review_does_not_set_run_to_merge_ready(temp_workspace, sample_tasks_jsonl):
+    """run-codex-review records the step but does not mark overall_status as MERGE_READY."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller(["init", "--run-id", "aed-codex-002", "--tasks-jsonl", str(sample_tasks_jsonl),
+                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-002",
+                    "--output-state", str(state_path)])
+
+    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
+
+    state = json.loads(Path(state_path).read_text())
+    # overall_status should not become MERGE_READY from a codex review step
+    assert state.get("overall_status", "") not in ("MERGE_READY", "RUN_MERGE_READY")
+
+
+def test_run_codex_review_with_custom_reason_preserved_in_state(temp_workspace, sample_tasks_jsonl):
+    """Custom reason passed to run-codex-review is preserved in state and next_action."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller(["init", "--run-id", "aed-codex-003", "--tasks-jsonl", str(sample_tasks_jsonl),
+                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-003",
+                    "--output-state", str(state_path)])
+
+    rc, stdout, stderr = run_controller([
+        "run-codex-review", "--state", str(state_path),
+        "--reason", "scope_expansion_required",
+        "--summary", "Scope expansion needed for new integration files"
+    ])
+    assert rc == 0
+
+    state = json.loads(Path(state_path).read_text())
+    assert state["codex_review"]["reason"] == "scope_expansion_required"
+    assert state["next_action"]["reason"] == "scope_expansion_required"
+
+
+def test_run_codex_review_idempotent_updates_next_action(temp_workspace, sample_tasks_jsonl):
+    """Calling run-codex-review twice updates the next_action each time, not duplicate."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller(["init", "--run-id", "aed-codex-004", "--tasks-jsonl", str(sample_tasks_jsonl),
+                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-004",
+                    "--output-state", str(state_path)])
+
+    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
+    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
+
+    state = json.loads(Path(state_path).read_text())
+    # Only one codex_review entry (no duplicate array, just overwrite)
+    assert "codex_review" in state
+    assert state["codex_review"]["status"] == "in_progress"
+    assert state["next_action"]["action"] == "run_codex_review"
+
+
+def test_run_codex_review_preserves_existing_tasks_and_state(temp_workspace, sample_tasks_jsonl):
+    """run-codex-review does not modify task list or existing state fields."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller(["init", "--run-id", "aed-codex-005", "--tasks-jsonl", str(sample_tasks_jsonl),
+                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-005",
+                    "--output-state", str(state_path)])
+
+    run_controller(["record-task-result", "--state", str(state_path), "--task-id", "task-001",
+                    "--status", "TASK_READY", "--promotion-status", "promoted_to_integration"])
+
+    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
+
+    state = json.loads(Path(state_path).read_text())
+    # Tasks are preserved
+    assert len(state["tasks"]) == 3
+    # task-001 promotion is preserved
+    task_001 = next(t for t in state["tasks"] if t["task_id"] == "task-001")
+    assert task_001["status"] == "TASK_READY"
+    assert task_001["promotion_status"] == "promoted_to_integration"
