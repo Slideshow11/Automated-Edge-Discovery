@@ -77,8 +77,23 @@ REQUIRED_RETURN_FIELDS = [
 # Validation helpers
 # ---------------------------------------------------------------------------
 
-def _is_forbidden_path(path: str) -> bool:
-    abs_path = str(Path(path).resolve())
+def _is_forbidden_path(path: str, *, base: str | None = None) -> bool:
+    """
+    Check whether a path is forbidden.
+
+    Resolves `path` against `base` (or cwd if base is None), then checks
+    whether the resolved absolute path starts with any FORBIDDEN_PREFIX.
+    Also checks raw path components for .hermes.
+
+    Args:
+        path: The path to check (may be absolute or relative).
+        base: Optional base directory to resolve relative paths against.
+              If None, resolves against the current working directory.
+    """
+    if base:
+        abs_path = str((Path(base) / path).resolve())
+    else:
+        abs_path = str(Path(path).resolve())
     # Check resolved absolute path
     for prefix in FORBIDDEN_PREFIXES:
         if abs_path.startswith(prefix) or abs_path == prefix:
@@ -163,13 +178,18 @@ def build_packet(
     tests_to_run = task.get("tests_to_run", [])
     context_files = task.get("context_files", [])
 
-    # Validate task paths — reject any that expose Hermes / forbidden prefixes
+    # Validate task paths — reject any that expose Hermes / forbidden prefixes.
+    # Check both against cwd (base=None) and against workspace (base=workspace).
+    # This catches workspace-relative symlinks such as
+    #   /tmp/aed_run/link_to_hermes -> /home/max/.hermes
+    # where a relative path like "link_to_hermes/secret" resolves to the
+    # forbidden target when anchored to the workspace.
     for f in allowed_files:
-        if _is_forbidden_path(f):
+        if _is_forbidden_path(f) or _is_forbidden_path(f, base=workspace):
             print(f"ERROR: allowed_files contains forbidden path: {f}", file=sys.stderr)
             sys.exit(1)
     for f in context_files:
-        if _is_forbidden_path(f):
+        if _is_forbidden_path(f) or _is_forbidden_path(f, base=workspace):
             print(f"ERROR: context_files contains forbidden path: {f}", file=sys.stderr)
             sys.exit(1)
 
