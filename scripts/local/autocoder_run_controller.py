@@ -87,6 +87,8 @@ HUMAN_ACTION_REASONS = frozenset([
     "external_system_failure",
     "codex_repair_limit_exceeded",
     "same_codex_blocker_repeated",
+    "persistent_mutation_detected",   # persistent mutation guard found unexpected Hermes mutations
+    "persistent_mutation_guard_error",  # guard report missing or malformed
 ])
 
 
@@ -478,6 +480,16 @@ def _init(args: argparse.Namespace) -> None:
             "production_board_touched": False,
             "memory_or_profile_updated": False,
             "skills_created": False,
+        },
+        "persistent_mutation_guard": {
+            "status": "not_started",  # not_started | snapshot_recorded | clean | blocked | error
+            "root": "/home/max/.hermes",
+            "snapshot_path": None,
+            "compare_json_path": None,
+            "compare_md_path": None,
+            "blocked_changes_count": 0,
+            "allowed_changes_count": 0,
+            "last_checked_at": None,
         },
     }
 
@@ -1120,7 +1132,185 @@ def _build_parser() -> argparse.ArgumentParser:
     p_fin = sub.add_parser("finalize-run", help="Mark run as complete")
     p_fin.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
 
+    # record-persistent-guard-snapshot
+    p_pgs = sub.add_parser("record-persistent-guard-snapshot",
+                           help="Record the persistent mutation guard snapshot path after pre-run snapshot")
+    p_pgs.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_pgs.add_argument("--root", default="/home/max/.hermes",
+                       help="Hermes root that was snapshotted (default: /home/max/.hermes)")
+    p_pgs.add_argument("--snapshot-path", required=True,
+                       help="Path to the snapshot JSON file written by the guard")
+
+    # record-persistent-guard-compare
+    p_pgc = sub.add_parser("record-persistent-guard-compare",
+                            help="Record the persistent mutation guard compare result after run")
+    p_pgc.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_pgc.add_argument("--compare-json", required=True,
+                       help="Path to the guard's compare JSON output")
+    p_pgc.add_argument("--compare-md", help="Path to the guard's compare markdown output")
+
     return parser
+
+
+def _record_persistent_guard_snapshot(args: argparse.Namespace) -> None:
+    """Record the persistent mutation guard snapshot path after the pre-run snapshot.
+
+    This is called before AED work starts. The runner should have already run:
+      python3 scripts/local/check_persistent_mutation_guard.py snapshot \
+        --root /home/max/.hermes --output <snapshot-path>
+
+    This function only records the path and updates guard status to snapshot_recorded.
+    It does NOT execute the guard script.
+    """
+    state = _load_state(args.state)
+
+    guard = state.get("persistent_mutation_guard", {})
+    guard["status"] = "snapshot_recorded"
+    guard["root"] = str(args.root)
+    guard["snapshot_path"] = str(args.snapshot_path)
+    guard["last_checked_at"] = _utcnow()
+
+    state["persistent_mutation_guard"] = guard
+    state["updated_at"] = _utcnow()
+
+    _save_state(state, args.state)
+
+    print(f"Recorded persistent mutation guard snapshot")
+    print(f"  status: snapshot_recorded")
+    print(f"  root: {guard['root']}")
+    print(f"  snapshot_path: {guard['snapshot_path']}")
+
+
+def _record_persistent_guard_compare(args: argparse.Namespace) -> None:
+    """Record the persistent mutation guard compare result after AED work completes.
+
+    This reads the guard's compare JSON output and updates controller state accordingly.
+    - If recommendation is PASS → guard status becomes 'clean'
+    - If recommendation is BLOCK → next_action becomes request_human, reason=persistent_mutation_detected
+    - If compare JSON is missing or malformed → next_action becomes request_human, reason=persistent_mutation_guard_error
+
+    The controller does NOT execute the guard script — the runner calls the guard and
+    records the result here. The controller does NOT write to /home/max/.hermes.
+
+    Safety invariants (hermes_touched, dispatch_occurred, production_board_touched) are
+    checked first. If any is already true, RUN_FAILED_SAFETY is set and the guard result
+    does NOT override the hard stop.
+    """
+    state = _load_state(args.state)
+
+    # Safety hard stop: check BEFORE processing guard result.
+    # If Hermes was already touched before this guard check, hard stop wins.
+    safety = state.get("safety_invariants", {})
+    if any(safety.get(k) for k in ("hermes_touched", "dispatch_occurred", "production_board_touched")):
+        state["overall_status"] = "RUN_FAILED_SAFETY"
+        state["next_action"] = {"action": "stop", "task_id": None, "reason": "safety invariant violated"}
+        state["human_action_required"] = False
+        state["updated_at"] = _utcnow()
+        _save_state(state, args.state)
+        print(f"Safety invariant already violated; guard result ignored.")
+        print(f"  overall_status: RUN_FAILED_SAFETY")
+        print(f"  next action: stop — safety invariant violated")
+        return
+
+    compare_json_path = Path(args.compare_json)
+
+    # Read the compare JSON
+    if not compare_json_path.exists():
+        # Missing compare report → error state
+        guard = state.get("persistent_mutation_guard", {})
+        guard["status"] = "error"
+        guard["compare_json_path"] = str(compare_json_path)
+        guard["compare_md_path"] = str(args.compare_md) if args.compare_md else None
+        guard["last_checked_at"] = _utcnow()
+        state["persistent_mutation_guard"] = guard
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "persistent_mutation_guard_error",
+        }
+        state["human_action_required"] = True
+        state["updated_at"] = _utcnow()
+        _save_state(state, args.state)
+        print(f"ERROR: compare JSON not found: {compare_json_path}")
+        print(f"  status: error")
+        print(f"  next action: request_human — persistent_mutation_guard_error")
+        return
+
+    try:
+        with open(compare_json_path) as f:
+            report = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        # Malformed compare JSON → error state
+        guard = state.get("persistent_mutation_guard", {})
+        guard["status"] = "error"
+        guard["compare_json_path"] = str(compare_json_path)
+        guard["compare_md_path"] = str(args.compare_md) if args.compare_md else None
+        guard["last_checked_at"] = _utcnow()
+        state["persistent_mutation_guard"] = guard
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "persistent_mutation_guard_error",
+        }
+        state["human_action_required"] = True
+        state["updated_at"] = _utcnow()
+        _save_state(state, args.state)
+        print(f"ERROR: failed to parse compare JSON: {e}")
+        print(f"  status: error")
+        print(f"  next action: request_human — persistent_mutation_guard_error")
+        return
+
+    recommendation = report.get("recommendation", "")
+    blocked_changes = report.get("blocked_changes", [])
+    allowed_changes = report.get("allowed_changes", [])
+
+    guard = state.get("persistent_mutation_guard", {})
+    guard["compare_json_path"] = str(compare_json_path)
+    guard["compare_md_path"] = str(args.compare_md) if args.compare_md else None
+    guard["blocked_changes_count"] = len(blocked_changes)
+    guard["allowed_changes_count"] = len(allowed_changes)
+    guard["last_checked_at"] = _utcnow()
+
+    if recommendation == "PASS":
+        guard["status"] = "clean"
+        state["persistent_mutation_guard"] = guard
+        state["updated_at"] = _utcnow()
+        # NOTE: clean guard does NOT grant merge authority — run must still complete all tasks
+        _save_state(state, args.state)
+        print(f"Persistent mutation guard: PASS")
+        print(f"  blocked_changes: {len(blocked_changes)}")
+        print(f"  allowed_changes: {len(allowed_changes)}")
+        print(f"  status: clean")
+        print(f"  note: clean guard does not grant merge authority")
+    elif recommendation == "BLOCK":
+        guard["status"] = "blocked"
+        state["persistent_mutation_guard"] = guard
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "persistent_mutation_detected",
+        }
+        state["human_action_required"] = True
+        state["updated_at"] = _utcnow()
+        _save_state(state, args.state)
+        print(f"Persistent mutation guard: BLOCK")
+        print(f"  blocked_changes: {len(blocked_changes)}")
+        print(f"  next action: request_human — persistent_mutation_detected")
+    else:
+        # Unknown recommendation → error
+        guard["status"] = "error"
+        state["persistent_mutation_guard"] = guard
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "persistent_mutation_guard_error",
+        }
+        state["human_action_required"] = True
+        state["updated_at"] = _utcnow()
+        _save_state(state, args.state)
+        print(f"ERROR: unknown guard recommendation: {recommendation!r}")
+        print(f"  status: error")
+        print(f"  next action: request_human — persistent_mutation_guard_error")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -1137,6 +1327,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-codex-review": _record_codex_review,
         "record-codex-repair-result": _record_codex_repair_result,
         "finalize-run": _finalize_run,
+        "record-persistent-guard-snapshot": _record_persistent_guard_snapshot,
+        "record-persistent-guard-compare": _record_persistent_guard_compare,
     }
 
     try:
