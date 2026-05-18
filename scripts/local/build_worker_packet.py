@@ -198,7 +198,7 @@ def _build_dependency_context(task: dict, workspace: str) -> dict:
         "tool": "opensrc",
         "opensrc_home": opensrc_home,
         "packages_to_inspect": packages,
-        "read_only": bool(raw.get("read_only", True)),
+        "read_only": True,  # always read-only — opensrc is never a write tool
         "record_inspected_files": bool(raw.get("record_inspected_files", True)),
         "rules": [
             "read only dependency inspection only",
@@ -517,6 +517,14 @@ def render_markdown(packet: dict) -> str:
         lines.append("")
 
         dip = packet.get("dependency_install_policy", {})
+        lines.append("**Install policy:**")
+        lines.append("")
+        lines.append(f"- **new_dependencies_allowed:** `{dip.get('new_dependencies_allowed', False)}`")
+        lines.append(f"- **requires_human_approval:** `{dip.get('requires_human_approval', True)}`")
+        lines.append(f"- **minimum_package_age_days:** `{dip.get('minimum_package_age_days', 14)}`")
+        lines.append(f"- **lockfile_review_required:** `{dip.get('lockfile_review_required', True)}`")
+        lines.append(f"- **postinstall_scripts_require_approval:** `{dip.get('postinstall_scripts_require_approval', True)}`")
+        lines.append("")
         if not dip.get("new_dependencies_allowed"):
             lines.append("**New dependency installation is not allowed for this task.**")
             lines.append("")
