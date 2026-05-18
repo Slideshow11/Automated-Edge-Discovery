@@ -91,7 +91,11 @@ def _snapshot_file(absolute_path: Path, root: Path) -> dict:
 
 
 def _collect_monitored_files(root: Path) -> list[Path]:
-    """Yield all existing files under the monitored paths within root."""
+    """Yield all existing regular files under the monitored paths within root.
+
+    Symlinks are NOT followed to prevent traversing outside the root tree
+    via malicious symlinks inside the monitored directories.
+    """
     files = []
     for pattern in MONITORED_ROOTS:
         full_pattern = root / pattern
@@ -100,16 +104,33 @@ def _collect_monitored_files(root: Path) -> list[Path]:
             files.extend(matching)
         else:
             if full_pattern.is_dir():
-                files.extend(full_pattern.rglob("*"))
+                # Collect with symlink filter to avoid traversing outside root
+                for item in _safe_rglob(full_pattern):
+                    files.append(item)
             elif full_pattern.exists():
                 files.append(full_pattern)
-    # Deduplicate, keep only regular files
+    # Deduplicate, keep only regular files (skip symlinks entirely)
     seen = set()
     result = []
     for f in files:
-        if f.is_file() and f not in seen:
+        if f.is_file() and not f.is_symlink() and f not in seen:
             seen.add(f)
             result.append(f)
+    return result
+
+
+def _safe_rglob(directory: Path) -> list[Path]:
+    """Recursively list all paths under directory without following symlinks."""
+    # os.walk avoids following symlinks by default; followlinks=False is default
+    # but we explicitly verify each entry is not a symlink to be safe
+    result = []
+    for dirpath, dirnames, filenames in os.walk(directory, followlinks=False):
+        # Prevent descending into symlink directories
+        dirnames[:] = [d for d in dirnames if not Path(dirpath, d).is_symlink()]
+        for fname in filenames:
+            f = Path(dirpath, fname)
+            if not f.is_symlink():
+                result.append(f)
     return result
 
 
