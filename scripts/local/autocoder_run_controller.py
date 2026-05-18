@@ -533,6 +533,25 @@ def _status(args: argparse.Namespace) -> None:
         si = state.get("safety_invariants", {})
         for k, v in si.items():
             lines.append(f"- `{k}`: {'⚠️ true' if v else '✅ false'}")
+
+        guard = state.get("persistent_mutation_guard", {})
+        if guard:
+            lines += ["", "## Persistent Mutation Guard", ""]
+            guard_status = guard.get("status", "unknown")
+            status_icon = "✅" if guard_status == "clean" else ("⚠️" if guard_status in ("blocked", "error") else "🔶")
+            lines.append(f"- **Status:** {status_icon} `{guard_status}`")
+            lines.append(f"- **Root:** `{guard.get('root', '')}`")
+            if guard.get("snapshot_path"):
+                lines.append(f"- **Snapshot:** `{guard['snapshot_path']}`")
+            if guard.get("compare_json_path"):
+                lines.append(f"- **Compare JSON:** `{guard['compare_json_path']}`")
+            if guard.get("compare_md_path"):
+                lines.append(f"- **Compare MD:** `{guard['compare_md_path']}`")
+            lines.append(f"- **Blocked changes:** `{guard.get('blocked_changes_count', 0)}`")
+            lines.append(f"- **Allowed changes:** `{guard.get('allowed_changes_count', 0)}`")
+            if guard.get("last_checked_at"):
+                lines.append(f"- **Last checked:** `{guard['last_checked_at']}`")
+
         lines += ["", "## Task Table", ""]
         lines.append("| Task | Status | Promotion | Dep | Gate | Scope | Repairs | Blocker |")
         lines.append("|------|--------|-----------|-----|------|-------|---------|---------|")
