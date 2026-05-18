@@ -179,6 +179,20 @@ def _validate_pr_merge_fields(entry: dict[str, Any]) -> list[str]:
     for sha_field in ("head_sha", "merge_sha"):
         if sha_field in entry and entry[sha_field] and not _is_valid_sha(entry[sha_field]):
             errors.append(f"{sha_field} must be a 40-hex character SHA (got '{entry[sha_field]}')")
+    # production_board_touched is required for pr_merge events (Trace Policy V1 hardening)
+    if "production_board_touched" not in entry:
+        errors.append("production_board_touched is required for pr_merge events")
+    elif entry["production_board_touched"] is not False:
+        errors.append(
+            "production_board_touched must be False for pr_merge events "
+            "(use --no-production-board-touched, not --board false)"
+        )
+    # Reject legacy "board" key in pr_merge entries (misuse of --board flag)
+    if "board" in entry and entry["board"] is not None:
+        errors.append(
+            "board is not valid for pr_merge events — "
+            "use --no-production-board-touched to set production_board_touched=False"
+        )
     return errors
 
 
