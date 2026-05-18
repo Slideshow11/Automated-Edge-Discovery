@@ -417,23 +417,23 @@ def run_final_gate(
     codex_valid, codex_msg = validate_codex_artifact_head(codex_artifact_path, current_head, allow_codex_skip)
     local_valid, local_msg = validate_local_validation(local_validation_path)
 
-    all_valid = all([
-        head_valid, ci_valid, scope_valid, pr_valid, codex_valid, local_valid
+    all_hard_gates_valid = all([
+        head_valid, ci_valid, scope_valid, pr_valid, local_valid
     ])
 
-    # Determine recommendation: Codex missing without skip → WAIT.
-    # Hard gate failures (BLOCK) take priority over WAIT.
     codex_missing = not codex_artifact_path
     codex_not_skipped = codex_missing and not allow_codex_skip
 
-    if codex_not_skipped:
-        # Codex missing and not authorized to skip → WAIT
-        # (regardless of whether other gates passed)
-        recommendation = "WAIT"
-    elif all_valid:
-        recommendation = "MERGE_READY"
-    else:
+    if not all_hard_gates_valid:
+        # Hard gate failure takes priority — BLOCK even if Codex is also missing
+        # Hard gates are: head SHA, CI green, scope clean, PR open+mergeable, local validation
         recommendation = "BLOCK"
+    elif codex_not_skipped:
+        # All hard gates pass but Codex evidence is missing → WAIT
+        recommendation = "WAIT"
+    else:
+        # All gates pass (including valid Codex artifact) → MERGE_READY
+        recommendation = "MERGE_READY"
 
     auth_phrase = None
     merge_cmd = None

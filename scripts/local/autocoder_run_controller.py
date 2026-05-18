@@ -72,7 +72,7 @@ NEXT_ACTIONS = frozenset([
     "generate_run_summary",
     "prepare_pr",
     "request_human",
-    "run_codex_review",  # reserved: triggers Codex review step (not yet wired to external tool)
+    "run_codex_review",  # triggers Codex review step (wired via run-codex-review command)
     "stop",
 ])
 
@@ -717,6 +717,37 @@ def _record_pr_result(args: argparse.Namespace) -> None:
     print(f"  next action: {state['next_action']['action']} — {state['next_action']['reason']}")
 
 
+def _run_codex_review(args: argparse.Namespace) -> None:
+    """Record that a Codex review step is in progress.
+
+    This command is called when the finalization guard returns WAIT with
+    codex_status.passing=False (codex_artifact_required). The operator runs
+    Codex review and records the review session here before providing the artifact.
+    After the review is complete, the operator reruns the finalization guard with
+    the artifact to determine the final recommendation.
+    """
+    state = _load_state(args.state)
+
+    state["codex_review"] = {
+        "status": "in_progress",
+        "reason": args.reason,
+        "summary": args.summary or "",
+        "recorded_at": _utcnow(),
+    }
+    state["updated_at"] = _utcnow()
+    state["human_action_required"] = True
+    state["next_action"] = {
+        "action": "run_codex_review",
+        "task_id": None,
+        "reason": args.reason,
+    }
+
+    _save_state(state, args.state)
+
+    print(f"Codex review in progress — reason: {args.reason}")
+    print("Complete the review, then rerun the finalization guard with --codex-artifact.")
+
+
 def _finalize_run(args: argparse.Namespace) -> None:
     state = _load_state(args.state)
 
@@ -727,7 +758,7 @@ def _finalize_run(args: argparse.Namespace) -> None:
 
     _save_state(state, args.state)
 
-    print(f"Run finalized: {state['run_id']}")
+    print(f"Run finalized: {state.get('run_id', 'unknown')}")
     print(f"  final status: RUN_COMPLETE")
 
 
@@ -796,6 +827,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--head-sha", help="PR head commit SHA")
     p_pr.add_argument("--merge-sha", help="Merge commit SHA (if merged)")
 
+    # run-codex-review
+    p_codex = sub.add_parser("run-codex-review", help="Record that a Codex review is in progress")
+    p_codex.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_codex.add_argument("--reason", default="codex_artifact_required",
+                        help="Reason for Codex review (default: codex_artifact_required)")
+    p_codex.add_argument("--summary", help="Brief summary of what triggered the review")
+
     # finalize-run
     p_fin = sub.add_parser("finalize-run", help="Mark run as complete")
     p_fin.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
@@ -814,6 +852,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-task-result": _record_task_result,
         "record-repair-result": _record_repair_result,
         "record-pr-result": _record_pr_result,
+        "run-codex-review": _run_codex_review,
         "finalize-run": _finalize_run,
     }
 

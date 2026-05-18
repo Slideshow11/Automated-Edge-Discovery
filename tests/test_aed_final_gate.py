@@ -460,7 +460,8 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        assert gate["final_recommendation"] == "WAIT"
+        # Stale SHA + missing Codex → BLOCK (hard gate failure takes priority over Codex-missing WAIT)
+        assert gate["final_recommendation"] == "BLOCK"
         assert "MISMATCH" in gate["head_sha_validation"]["message"]
 
     def test_missing_codex_artifact_returns_wait(self, tmp_path):
@@ -496,7 +497,7 @@ class TestRunFinalGateBlocks:
                             gate = run_final_gate(
                                 pr_number=231,
                                 expected_head_sha=sha,
-                                allowed_files=["scripts/**"],
+                                allowed_files=None,  # Skip scope check — all hard gates pass except missing Codex
                                 local_validation_path=None,
                                 codex_artifact_path=None,  # MISSING
                                 output_json_path=str(output_json),
@@ -504,7 +505,7 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        # WAIT not MERGE_READY
+        # All hard gates pass but Codex is missing → WAIT (not MERGE_READY)
         assert gate["final_recommendation"] == "WAIT"
         # authorization_phrase must NOT be emitted when Codex missing
         assert "authorization_phrase" not in gate
@@ -626,7 +627,8 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        assert gate["final_recommendation"] == "WAIT"
+        # Scope failure + missing Codex → BLOCK (hard gate failure takes priority)
+        assert gate["final_recommendation"] == "BLOCK"
         assert "outside scope" in gate["scope_status"]["message"]
 
     def test_ci_not_green_blocks(self, tmp_path):
@@ -670,9 +672,147 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        # CI failure + codex missing = WAIT (codex_missing has priority over CI failure)
-        assert gate["final_recommendation"] == "WAIT"
+        # CI failure + missing Codex → BLOCK (hard gate failure takes priority)
+        assert gate["final_recommendation"] == "BLOCK"
         assert "CI failures" in gate["ci_status"]["message"]
+
+    def test_missing_codex_artifact_with_non_mergeable_pr_returns_block(self, tmp_path):
+        """PR not mergeable + missing Codex → BLOCK (hard gate failure takes priority)."""
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        mock_run_inst = MagicMock(
+            stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+            returncode=0
+        )
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": False,
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": 2,
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = MagicMock()
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = MagicMock()
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=None,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                            )
+
+        # Non-mergeable PR + missing Codex → BLOCK
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "not MERGEABLE" in gate["pr_state"]["message"]
+
+    def test_missing_codex_artifact_with_failed_local_validation_returns_block(self, tmp_path):
+        """Local validation failed + missing Codex → BLOCK (hard gate failure takes priority)."""
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        mock_run_inst = MagicMock(
+            stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+            returncode=0
+        )
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": 2,
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        # Directly mock validate_local_validation to return failure
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    with patch("aed_final_gate.validate_local_validation", return_value=(False, "Local validation failed")):
+                        mock_gh = MagicMock()
+                        mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                        with patch("aed_final_gate.gh", mock_gh):
+                            mock_path_inst = MagicMock()
+                            mock_path_inst.write_text = MagicMock()
+                            mock_path_cls = MagicMock(return_value=mock_path_inst)
+                            type(mock_path_inst.parent).mkdir = MagicMock()
+                            with patch("aed_final_gate.Path", mock_path_cls):
+                                gate = run_final_gate(
+                                    pr_number=231,
+                                    expected_head_sha=sha,
+                                    allowed_files=None,
+                                    local_validation_path="/tmp/fake_local_val.json",
+                                    codex_artifact_path=None,
+                                    output_json_path=str(output_json),
+                                    output_md_path=str(output_md),
+                                    allow_admin=False,
+                                )
+
+        # Local validation failure + missing Codex → BLOCK
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["local_validation_status"]["passing"] is False
+
+    def test_allow_codex_skip_does_not_override_hard_gate_failure(self, tmp_path):
+        """--allow-codex-skip cannot override hard gate failures; stale SHA still BLOCKs."""
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        mock_run_inst = MagicMock(
+            stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+            returncode=0
+        )
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": 2,
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = MagicMock()
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = MagicMock()
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha="0000000000000000000000000000000000000000",
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=None,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=True,
+                            )
+
+        # Even with allow_codex_skip=True, stale SHA → BLOCK
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "MISMATCH" in gate["head_sha_validation"]["message"]
 
 
 # ---------------------------------------------------------------------------
