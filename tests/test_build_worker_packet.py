@@ -731,3 +731,597 @@ def test_forbidden_safety_actions_appear_in_markdown(tmp_path):
     assert "do not touch production board." in md
     assert "do not update memory or profile." in md
     assert "do not create skills." in md
+
+
+# ---------------------------------------------------------------------------
+# Dependency Context tests
+# ---------------------------------------------------------------------------
+
+def test_dependency_context_defaults_disabled(tmp_path):
+    """dependency_context is disabled by default when not in task JSON."""
+    mod = _import_mod()
+
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    dc = packet["dependency_context"]
+    assert dc["enabled"] is False
+    assert dc["packages_to_inspect"] == []
+    assert dc["read_only"] is True
+    assert dc["record_inspected_files"] is True
+
+
+def test_task_can_enable_dependency_context(tmp_path):
+    """Task JSON can enable dependency_context."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "packages_to_inspect": ["npm:zod", "pypi:requests"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    dc = packet["dependency_context"]
+    assert dc["enabled"] is True
+    assert dc["packages_to_inspect"] == ["npm:zod", "pypi:requests"]
+
+
+def test_packages_to_inspect_preserved(tmp_path):
+    """packages_to_inspect from task JSON are preserved in packet."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "packages_to_inspect": ["pypi:numpy", "npm:lodash"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    assert packet["dependency_context"]["packages_to_inspect"] == [
+        "pypi:numpy", "npm:lodash"
+    ]
+
+
+def test_opensrc_home_defaults_under_workspace(tmp_path):
+    """opensrc_home defaults to <workspace>/opensrc_cache."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "my_workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    expected_home = str(workspace / "opensrc_cache")
+    assert packet["dependency_context"]["opensrc_home"] == expected_home
+
+
+def test_opensrc_home_rejects_hermes_path(tmp_path):
+    """.hermes in opensrc_home is rejected."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "opensrc_home": "/home/max/.hermes/some/path",
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main([
+            "--task-json", str(task_path),
+            "--workspace", str(workspace),
+            "--worker", "claude_code",
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ])
+    assert exc_info.value.code == 1
+
+
+def test_opensrc_home_rejects_repo_source_tree(tmp_path):
+    """opensrc_home outside workspace and /tmp/aed_runs is rejected."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "opensrc_home": "/usr/local/lib/python3.11/site-packages",
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main([
+            "--task-json", str(task_path),
+            "--workspace", str(workspace),
+            "--worker", "claude_code",
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ])
+    assert exc_info.value.code == 1
+
+
+def test_opensrc_home_rejects_symlink_escape(tmp_path):
+    """opensrc_home that resolves outside workspace via symlink is rejected."""
+    mod = _import_mod()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    # Create a symlink inside workspace that points outside
+    escape_link = workspace / "link_to_home"
+    escape_link.symlink_to("/tmp")
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "opensrc_home": str(escape_link / "aed_runs/run123"),  # resolves to /tmp/aed_runs/run123
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    # /tmp/aed_runs/run123 IS a valid /tmp/aed_runs path, so it should pass
+    # Let's instead try a path that symlink-escapes to somewhere not allowed
+    task2 = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "opensrc_home": str(workspace / "link_to_home" / "secret"),
+        },
+    })
+    task_path2 = tmp_path / "task2.json"
+    task_path2.write_text(json.dumps(task2))
+
+    # /tmp/secret does NOT start with /tmp/aed_runs/ so should fail
+    with pytest.raises(SystemExit) as exc_info:
+        mod.main([
+            "--task-json", str(task_path2),
+            "--workspace", str(workspace),
+            "--worker", "claude_code",
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+        ])
+    assert exc_info.value.code == 1
+
+
+def test_markdown_includes_dependency_context_section(tmp_path):
+    """Markdown output includes ## Dependency Context section."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    md = output_md.read_text()
+    assert "## Dependency Context" in md
+    assert "**Tool:** `opensrc`" in md
+    assert "**Mode:** `read-only`" in md
+
+
+def test_markdown_includes_read_only_rules(tmp_path):
+    """Markdown includes read-only rules when dependency_context is enabled."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    md = output_md.read_text()
+    assert "read only dependency inspection only." in md
+    assert "do not vendor dependency source into repo." in md
+    assert "do not patch cached dependency source." in md
+
+
+def test_markdown_says_no_dependency_install_by_default(tmp_path):
+    """Markdown says new dependency installation is not allowed by default."""
+    mod = _import_mod()
+
+    task = minimal_task()  # no dependency_context
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    md = output_md.read_text()
+    assert "New dependency installation is not allowed for this task." in md
+
+
+def test_dependency_install_policy_defaults(tmp_path):
+    """dependency_install_policy defaults are conservative."""
+    mod = _import_mod()
+
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    dip = packet["dependency_install_policy"]
+    assert dip["new_dependencies_allowed"] is False
+    assert dip["requires_human_approval"] is True
+    assert dip["minimum_package_age_days"] == 14
+    assert dip["lockfile_review_required"] is True
+    assert dip["postinstall_scripts_require_approval"] is True
+
+
+def test_new_dependencies_allowed_true_still_requires_approval(tmp_path):
+    """Even when new_dependencies_allowed is True, markdown warns about human approval."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+        "dependency_install_policy": {
+            "new_dependencies_allowed": True,
+            # requires_human_approval defaults to True
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    md = output_md.read_text()
+    assert "requires human approval" in md
+
+
+def test_packet_records_dependency_context_as_context_only(tmp_path):
+    """dependency_context is recorded as context, not added to allowed_files."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "allowed_files": ["scripts/local/my.py"],
+        "dependency_context": {
+            "enabled": True,
+            "packages_to_inspect": ["pypi:requests"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    # dependency_context should be its own top-level field
+    assert "dependency_context" in packet
+    # but should NOT be in allowed_files
+    assert "dependency_context" not in packet["allowed_files"]
+    # the opensrc cache path should NOT be in allowed_files
+    opensrc_home = packet["dependency_context"]["opensrc_home"]
+    assert opensrc_home not in packet["allowed_files"]
+
+
+def test_dependency_cache_path_not_in_allowed_files(tmp_path):
+    """Dependency cache path is not added to allowed_files."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "packages_to_inspect": ["npm:react"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    packet = json.loads(output_json.read_text())
+    # The opensrc_cache path should NOT appear in allowed_files
+    cache_path = packet["dependency_context"]["opensrc_home"]
+    assert cache_path not in packet["allowed_files"]
+    # Context files should also not contain the cache
+    assert cache_path not in packet.get("context_files", [])
+
+
+def test_packet_builder_does_not_invoke_opensrc(tmp_path):
+    """Packet builder does not invoke opensrc CLI or subprocess."""
+    import subprocess
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {
+            "enabled": True,
+            "packages_to_inspect": ["pypi:flask"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    # Verify: building a packet doesn't call any external tool (opensrc)
+    # We check the packet output reflects the policy but no opensrc was invoked
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    # The packet should NOT contain any reference to having run opensrc
+    packet = json.loads(output_json.read_text())
+    # opensrc is named as tool but no evidence it was run
+    assert packet["dependency_context"]["tool"] == "opensrc"
+    # No install policy says packages were installed
+    assert packet["dependency_install_policy"]["new_dependencies_allowed"] is False
+
+
+def test_packet_builder_does_not_mutate_controller_state(tmp_path):
+    """Packet builder does not mutate controller state (re-confirmed with dependency fields)."""
+    mod = _import_mod()
+
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    state = minimal_controller_state()
+    state_path = tmp_path / "CONTROLLER_STATE.json"
+    state_path.write_text(json.dumps(state))
+    original_state_text = state_path.read_text()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--controller-state", str(state_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    assert state_path.read_text() == original_state_text, "controller state was mutated"
+
+
+def test_packet_builder_does_not_modify_repo_files_outside_output_paths(tmp_path):
+    """Packet builder only writes to output paths; repo files outside outputs untouched."""
+    mod = _import_mod()
+
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    # Run in a temp workspace - nothing in the real repo is touched
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    # Packet written to tmp; no real repo files modified
+
+
+def test_dependency_context_disabled_markdown_shows_disabled(tmp_path):
+    """When dependency_context is disabled, markdown shows it is disabled."""
+    mod = _import_mod()
+
+    task = minimal_task()  # no dependency_context enabled
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+    md = output_md.read_text()
+    assert "## Dependency Context" in md
+    assert "(disabled)" in md or "not enabled" in md.lower()

@@ -119,6 +119,121 @@ def _load_json(path: str) -> dict:
         sys.exit(1)
 
 
+def _is_safe_opensrc_path(opensrc_home: str, workspace: str) -> bool:
+    """
+    Validate that OPENSRC_HOME is safe for a run-scoped workspace.
+
+    Rules:
+    - Must be under the run workspace (or /tmp under /tmp/aed_runs/<run_id>/)
+    - Must not escape to .hermes, repo source tree, or system paths
+    - Must not be a symlink escape from workspace
+
+    Args:
+        opensrc_home: The proposed OPENSRC_HOME path.
+        workspace: Absolute path to the run workspace.
+
+    Returns:
+        True if safe, False otherwise.
+    """
+    abs_ws = Path(workspace).resolve()
+    abs_home = Path(opensrc_home).resolve()
+
+    # Reject .hermes in path
+    if ".hermes" in abs_home.parts:
+        return False
+
+    # Rule: under workspace (normalized)
+    try:
+        abs_home.relative_to(abs_ws)
+        return True
+    except ValueError:
+        pass
+
+    # Rule: absolute /tmp path under /tmp/aed_runs/<run_id>/
+    if str(abs_home).startswith("/tmp/aed_runs/"):
+        return True
+
+    return False
+
+
+def _build_dependency_context(task: dict, workspace: str) -> dict:
+    """
+    Build dependency_context dict from task JSON.
+
+    Defaults are conservative (disabled) when not provided:
+    - enabled: False
+    - packages_to_inspect: []
+    - read_only: True
+    - record_inspected_files: True
+
+    Validates opensrc_home and rejects unsafe paths.
+
+    Does NOT invoke opensrc or install packages.
+    """
+    raw = task.get("dependency_context", {})
+    enabled = bool(raw.get("enabled", False))
+    packages = list(raw.get("packages_to_inspect", []))
+
+    # Build default OPENSRC_HOME: <workspace>/opensrc_cache
+    default_home = str(Path(workspace) / "opensrc_cache")
+    opensrc_home = raw.get("opensrc_home") or default_home
+
+    # Validate safety
+    if not _is_safe_opensrc_path(opensrc_home, workspace):
+        print(
+            f"ERROR: opensrc_home is not safe: {opensrc_home}", file=sys.stderr
+        )
+        print(
+            "ERROR: opensrc_home must be under workspace or /tmp/aed_runs/<run_id>/",
+            file=sys.stderr
+        )
+        print(
+            "ERROR: opensrc_home must not contain .hermes or escape the run workspace",
+            file=sys.stderr
+        )
+        sys.exit(1)
+
+    return {
+        "enabled": enabled,
+        "tool": "opensrc",
+        "opensrc_home": opensrc_home,
+        "packages_to_inspect": packages,
+        "read_only": True,  # always read-only — opensrc is never a write tool
+        "record_inspected_files": bool(raw.get("record_inspected_files", True)),
+        "rules": [
+            "read only dependency inspection only",
+            "do not vendor dependency source into repo",
+            "do not patch cached dependency source",
+            "do not treat dependency cache as allowed source scope",
+            "record package name, version, source, and inspected files",
+        ],
+    }
+
+
+def _build_dependency_install_policy(task: dict) -> dict:
+    """
+    Build dependency_install_policy dict from task JSON.
+
+    Defaults are conservative when not provided:
+    - new_dependencies_allowed: False
+    - requires_human_approval: True
+    - minimum_package_age_days: 14
+    - lockfile_review_required: True
+    - postinstall_scripts_require_approval: True
+    """
+    raw = task.get("dependency_install_policy", {})
+
+    return {
+        "new_dependencies_allowed": bool(raw.get("new_dependencies_allowed", False)),
+        "requires_human_approval": bool(raw.get("requires_human_approval", True)),
+        "minimum_package_age_days": int(raw.get("minimum_package_age_days", 14)),
+        "lockfile_review_required": bool(raw.get("lockfile_review_required", True)),
+        "postinstall_scripts_require_approval": bool(
+            raw.get("postinstall_scripts_require_approval", True)
+        ),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Packet builder
 # ---------------------------------------------------------------------------
@@ -249,6 +364,8 @@ def build_packet(
             "enforced": False,
         },
         "recommended_worker_reason": recommended_worker_reason,
+        "dependency_context": _build_dependency_context(task, workspace),
+        "dependency_install_policy": _build_dependency_install_policy(task),
     }
 
     return packet
@@ -371,6 +488,67 @@ def render_markdown(packet: dict) -> str:
         lines.append(f"- **integration_branch:** `{cc.get('integration_branch', '')}`")
         lines.append(f"- **current_task_id:** `{cc.get('current_task_id', '')}`")
         lines.append(f"- **next_action:** `{cc.get('next_action', '')}`")
+        lines.append("")
+
+    # Dependency Context section
+    dc = packet.get("dependency_context", {})
+    if dc.get("enabled"):
+        lines.append("## Dependency Context")
+        lines.append("")
+        lines.append(f"**Tool:** `{dc.get('tool', 'opensrc')}`")
+        lines.append(f"**OPENSRC_HOME:** `{dc.get('opensrc_home', '')}`")
+        lines.append(f"**Mode:** `read-only`")
+        lines.append("")
+        packages = dc.get("packages_to_inspect", [])
+        if packages:
+            lines.append("**Allowed package inspection:**")
+            lines.append("")
+            for pkg in packages:
+                lines.append(f"- `{pkg}`")
+            lines.append("")
+        else:
+            lines.append("**Allowed package inspection:** _none declared_")
+            lines.append("")
+
+        lines.append("**Rules:**")
+        lines.append("")
+        for rule in dc.get("rules", []):
+            lines.append(f"- {rule}.")
+        lines.append("")
+
+        dip = packet.get("dependency_install_policy", {})
+        lines.append("**Install policy:**")
+        lines.append("")
+        lines.append(f"- **new_dependencies_allowed:** `{dip.get('new_dependencies_allowed', False)}`")
+        lines.append(f"- **requires_human_approval:** `{dip.get('requires_human_approval', True)}`")
+        lines.append(f"- **minimum_package_age_days:** `{dip.get('minimum_package_age_days', 14)}`")
+        lines.append(f"- **lockfile_review_required:** `{dip.get('lockfile_review_required', True)}`")
+        lines.append(f"- **postinstall_scripts_require_approval:** `{dip.get('postinstall_scripts_require_approval', True)}`")
+        lines.append("")
+        if not dip.get("new_dependencies_allowed"):
+            lines.append("**New dependency installation is not allowed for this task.**")
+            lines.append("")
+        else:
+            if dip.get("requires_human_approval"):
+                lines.append(
+                    "New dependency installation requires human approval, "
+                    "package age check, lockfile review, and postinstall-script review."
+                )
+            else:
+                lines.append(
+                    "New dependency installation is allowed by task policy "
+                    "but still requires package age check, lockfile review, "
+                    "and postinstall-script review."
+                )
+            lines.append("")
+    else:
+        lines.append("## Dependency Context")
+        lines.append("")
+        lines.append("**Tool:** `opensrc` (disabled)")
+        lines.append("")
+        lines.append("_dependency inspection is not enabled for this task_")
+        lines.append("")
+        lines.append("**New dependency installation is not allowed for this task.**")
         lines.append("")
 
     lines.append(f"**Packet generated:** `{packet.get('generated_at', '')}`")
