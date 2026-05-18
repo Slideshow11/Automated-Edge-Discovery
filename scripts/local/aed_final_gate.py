@@ -176,11 +176,21 @@ def validate_pr_state(pr: dict) -> tuple[bool, str]:
 def validate_codex_artifact_head(
     codex_path: Optional[str], current_head: str, allow_skip: bool = False
 ) -> tuple[bool, str]:
-    """Validate Codex artifact SHA matches current head.
+    """Validate Codex artifact SHA matches current head exactly.
+
+    Accepts artifact only when it explicitly references the exact expected head SHA.
+    Ancestor SHAs, base SHAs, stale SHAs, or any other SHA in the artifact are NOT
+    valid — exact equality to current_head is required.
 
     When no artifact is provided:
       - allow_skip=True  → treated as SKIP (passing=True, skipped=True, skip_authorized=True)
       - allow_skip=False → treated as FAIL (passing=False, Codex required)
+
+    Accepted SHA fields (exact equality required):
+      head_sha, commit_sha, reviewed_sha, pr_head_sha
+
+    If no usable SHA field exists: BLOCK (passing=False)
+    If SHA field does not match current_head exactly: BLOCK (passing=False)
     """
     if not codex_path:
         if allow_skip:
@@ -190,16 +200,41 @@ def validate_codex_artifact_head(
     if not path.exists():
         return False, f"Codex artifact not found: {codex_path}"
     content = path.read_text()
+
+    # Supported SHA field names — exact equality to current_head required
+    sha_field_names = ("head_sha", "commit_sha", "reviewed_sha", "pr_head_sha")
+
+    # Try JSON field extraction first
+    try:
+        data = json.loads(content)
+        for field in sha_field_names:
+            if field in data and isinstance(data[field], str):
+                artifact_sha = data[field].strip()
+                if len(artifact_sha) == 40 and all(c in '0123456789abcdef' for c in artifact_sha.lower()):
+                    if artifact_sha == current_head:
+                        return True, f"Codex artifact head_sha matches current head {current_head}"
+                    else:
+                        return False, f"codex_artifact head_sha mismatch: expected={current_head}, artifact has={artifact_sha}"
+        # No recognized SHA field found in JSON
+        return False, "codex_artifact has no recognized SHA field (head_sha, commit_sha, reviewed_sha, pr_head_sha)"
+    except json.JSONDecodeError:
+        pass
+
+    # Fallback: regex search for 40-char hex SHA in raw content
+    # Only matches content that looks like a standalone 40-char hex string
     import re
-    # Look for SHA references in artifact
-    shas = re.findall(r'\b([0-9a-f]{40})\b', content)
-    if not shas:
-        return True, "No SHA found in Codex artifact — skipped"
-    # Check if any SHA matches current head
-    for sha in shas:
-        if sha == current_head:
-            return True, f"Codex artifact references current head {current_head}"
-    return False, f"Codex artifact SHA mismatch: artifact contains {shas[0]}, current head is {current_head}"
+    hex_char_set = set('0123456789abcdef')
+    # Find all 40-char hex strings that appear to be SHAs (not embedded in longer strings)
+    # A SHA must be preceded by a field name indicator (", :, =) or start of string
+    # and followed by , " \n } or end of string
+    sha_pattern = r'(?:[":=]\s*|^)([0-9a-f]{40})(?:[",\s\n\[\]{}&]|$)'
+    matches = re.findall(sha_pattern, content, re.IGNORECASE)
+    if not matches:
+        return False, "codex_artifact contains no recognizable SHA reference"
+    for sha in matches:
+        if sha.lower() == current_head.lower():
+            return True, f"Codex artifact SHA matches current head {current_head}"
+    return False, f"codex_artifact head_sha mismatch: artifact contains {matches[0]}, current head is {current_head}"
 
 
 def validate_local_validation(

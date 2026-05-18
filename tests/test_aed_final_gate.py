@@ -156,9 +156,9 @@ class TestValidateCodexArtifactHead:
         assert "--allow-codex-skip" in msg
 
     def test_artifact_wrong_sha_rejected(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            # 40-char hex that does NOT match expected "abc123"
-            f.write("Codex reviewed commit 0000000000000000000000000000000000000000\n")
+        """JSON artifact with wrong 40-char hex SHA → BLOCK."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"pr_number": 247, "head_sha": "0000000000000000000000000000000000000000", "reviewer": "codex", "result": "REVIEW_COMPLETE"}, f)
             f.flush()
             path = f.name
         try:
@@ -169,9 +169,10 @@ class TestValidateCodexArtifactHead:
             Path(path).unlink()
 
     def test_artifact_matching_sha_accepted(self):
+        """JSON artifact with head_sha matching current head → accepted."""
         sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write(f"Codex reviewed commit {sha}\nCLEAN — no issues.\n")
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"pr_number": 247, "head_sha": sha, "reviewer": "codex", "result": "REVIEW_COMPLETE"}, f)
             f.flush()
             path = f.name
         try:
@@ -181,15 +182,16 @@ class TestValidateCodexArtifactHead:
         finally:
             Path(path).unlink()
 
-    def test_no_sha_in_artifact_skipped(self):
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
-            f.write("Codex reviewed — no SHA found\n")
+    def test_artifact_missing_sha_in_json_returns_block(self):
+        """JSON artifact with no recognized SHA field → BLOCK (not skip, under new policy)."""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump({"pr_number": 247, "reviewer": "codex", "result": "REVIEW_COMPLETE"}, f)
             f.flush()
             path = f.name
         try:
             valid, msg = validate_codex_artifact_head(path, "abc123")
-            assert valid is True
-            assert "skipped" in msg
+            assert valid is False
+            assert "no recognized SHA" in msg
         finally:
             Path(path).unlink()
 
