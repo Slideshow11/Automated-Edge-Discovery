@@ -227,7 +227,7 @@ def validate_codex_artifact_head(
     # Find all 40-char hex strings that appear to be SHAs (not embedded in longer strings)
     # A SHA must be preceded by a field name indicator (", :, =) or start of string
     # and followed by , " \n } or end of string
-    sha_pattern = r'(?:[":=]\s*|^)([0-9a-f]{40})(?:[",\s\n\[\]{}&]|$)'
+    sha_pattern = r'(?:^|(?<=[^0-9a-f]))([0-9a-f]{40})(?=[\s"]|$)'
     matches = re.findall(sha_pattern, content, re.IGNORECASE)
     if not matches:
         return False, "codex_artifact contains no recognizable SHA reference"
@@ -456,18 +456,24 @@ def run_final_gate(
         head_valid, ci_valid, scope_valid, pr_valid, local_valid
     ])
 
-    codex_missing = not codex_artifact_path
-    codex_not_skipped = codex_missing and not allow_codex_skip
+    codex_missing = codex_artifact_path is None
 
     if not all_hard_gates_valid:
-        # Hard gate failure takes priority — BLOCK even if Codex is also missing
-        # Hard gates are: head SHA, CI green, scope clean, PR open+mergeable, local validation
+        # Priority 1: Hard gate failure → BLOCK
+        # Hard gates: head SHA, CI green, scope clean, PR open+mergeable, local validation
         recommendation = "BLOCK"
-    elif codex_not_skipped:
-        # All hard gates pass but Codex evidence is missing → WAIT
+    elif codex_artifact_path and not codex_valid:
+        # Priority 2: Artifact provided but invalid (stale, mismatched, malformed, missing SHA) → BLOCK
+        # allow_codex_skip does NOT override an invalid provided artifact
+        recommendation = "BLOCK"
+    elif codex_missing and not allow_codex_skip:
+        # Priority 3: Artifact missing and skip not authorized → WAIT
         recommendation = "WAIT"
+    elif codex_missing and allow_codex_skip:
+        # Priority 4: Artifact missing but skip authorized + hard gates pass → MERGE_READY
+        recommendation = "MERGE_READY"
     else:
-        # All gates pass (including valid Codex artifact) → MERGE_READY
+        # Priority 5: Artifact provided and valid + hard gates pass → MERGE_READY
         recommendation = "MERGE_READY"
 
     auth_phrase = None

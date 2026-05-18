@@ -817,9 +817,160 @@ class TestRunFinalGateBlocks:
         assert "MISMATCH" in gate["head_sha_validation"]["message"]
 
 
-# ---------------------------------------------------------------------------
+class TestInvalidCodexArtifactBlocks:
+    """Invalid provided Codex artifact always → BLOCK, regardless of allow_codex_skip.
+
+    Priority ladder:
+      1. hard gate failure           → BLOCK
+      2. artifact provided & invalid → BLOCK   <-- fixed bug
+      3. artifact missing & skip off → WAIT
+      4. artifact missing & skip on  → MERGE_READY
+      5. artifact provided & valid   → MERGE_READY
+    """
+
+    def _run_gate(self, tmp_path, codex_artifact_path, allow_codex_skip=False,
+                  expected_head_sha=None):
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        if expected_head_sha is None:
+            expected_head_sha = sha
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = MagicMock()
+                        # Proper read_text for each path
+                        def make_read_text(path_str):
+                            def read_text():
+                                p = str(path_str)
+                                if codex_artifact_path and p == codex_artifact_path:
+                                    from pathlib import Path as RP
+                                    return RP(str(codex_artifact_path)).read_text()
+                                return ""
+                            return read_text
+                        mock_path_inst.read_text = make_read_text(str(codex_artifact_path)) if codex_artifact_path else lambda: ""
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = MagicMock()
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            return run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=expected_head_sha,
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=codex_artifact_path,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=allow_codex_skip,
+                            )
+
+    def test_stale_artifact_returns_block(self, tmp_path):
+        """Stale Codex artifact (SHA mismatch) → BLOCK, not WAIT."""
+        stale = tmp_path / "stale.json"
+        stale.write_text(json.dumps({
+            "pr_number": 231, "head_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7",
+            "reviewed_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7", "result": "clean",
+        }))
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(stale))
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["codex_status"]["passing"] is False
+        assert "mismatch" in gate["codex_status"]["message"]
+
+    def test_stale_artifact_emits_no_auth_phrase(self, tmp_path):
+        """Stale artifact → BLOCK → no authorization_phrase."""
+        stale = tmp_path / "stale.json"
+        stale.write_text(json.dumps({
+            "pr_number": 231, "head_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7",
+            "reviewed_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7", "result": "clean",
+        }))
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(stale))
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "authorization_phrase" not in gate
+
+    def test_stale_artifact_emits_no_merge_command(self, tmp_path):
+        """Stale artifact → BLOCK → no merge_command."""
+        stale = tmp_path / "stale.json"
+        stale.write_text(json.dumps({
+            "pr_number": 231, "head_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7",
+            "reviewed_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7", "result": "clean",
+        }))
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(stale))
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "merge_command" not in gate
+
+    def test_ancestor_artifact_returns_block(self, tmp_path):
+        """Artifact with ancestor SHA → BLOCK (exact SHA required)."""
+        anc = tmp_path / "anc.json"
+        anc.write_text(json.dumps({
+            "pr_number": 231, "head_sha": "0000000000000000000000000000000000000001",
+            "result": "clean",
+        }))
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        gate = self._run_gate(tmp_path, str(anc), expected_head_sha=sha)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["codex_status"]["passing"] is False
+
+    def test_artifact_missing_sha_returns_block(self, tmp_path):
+        """Artifact with no recognized SHA field → BLOCK."""
+        no_sha = tmp_path / "no_sha.json"
+        no_sha.write_text(json.dumps({"pr_number": 231, "result": "clean", "scope": "all good"}))
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(no_sha))
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "no recognized SHA" in gate["codex_status"]["message"]
+
+    def test_malformed_artifact_returns_block(self, tmp_path):
+        """Malformed JSON artifact → BLOCK (regex fallback finds no recognizable SHA)."""
+        bad = tmp_path / "bad.json"
+        bad.write_text("{ this is not valid JSON")
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(bad))
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["codex_status"]["passing"] is False
+
+    def test_stale_artifact_with_allow_codex_skip_returns_block(self, tmp_path):
+        """Stale artifact + --allow-codex-skip → BLOCK (skip does NOT override invalid artifact)."""
+        stale = tmp_path / "stale.json"
+        stale.write_text(json.dumps({
+            "pr_number": 231, "head_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7",
+            "reviewed_sha": "02b20cf38f7ab153a0fb241f690fdf9db8b2aae7", "result": "clean",
+        }))
+        gate = self._run_gate(tmp_path, codex_artifact_path=str(stale), allow_codex_skip=True)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["codex_status"]["passing"] is False
+        assert "mismatch" in gate["codex_status"]["message"]
+        assert "authorization_phrase" not in gate
+        assert "merge_command" not in gate
+
+    def test_missing_artifact_no_skip_returns_wait(self, tmp_path):
+        """Missing artifact + no allow_codex_skip → WAIT (not MERGE_READY)."""
+        gate = self._run_gate(tmp_path, codex_artifact_path=None, allow_codex_skip=False)
+        assert gate["final_recommendation"] == "WAIT"
+        assert "authorization_phrase" not in gate
+        assert "merge_command" not in gate
+
+    def test_missing_artifact_with_skip_returns_merge_ready(self, tmp_path):
+        """Missing artifact + allow_codex_skip → MERGE_READY."""
+        gate = self._run_gate(tmp_path, codex_artifact_path=None, allow_codex_skip=True)
+        assert gate["final_recommendation"] == "MERGE_READY"
+        assert gate["codex_status"]["skipped"] is True
+        assert gate["codex_status"]["skip_authorized"] is True
+        assert "authorization_phrase" in gate
+        assert "merge_command" in gate
+
+
+# --------------------------------------------------------------------------
 # Forbidden executable check
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 class TestForbiddenExecutableCalls:
     def test_no_forbidden_executable_calls_in_source(self):
