@@ -466,6 +466,39 @@ Next action: request_human
 Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
 ```
 
+### Example: Human Action Requests
+
+When the controller cannot proceed automatically, it returns `request_human` with a reason:
+
+**Scenario 1: Repair limit exceeded**
+```
+Next action: request_human
+Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
+```
+Resolution: Human reviews the repair history, makes the fix manually, then calls:
+```bash
+python3 scripts/local/autocoder_run_controller.py record-task-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --task-id docs-example-001 \
+  --status TASK_READY \
+  --promotion-status promoted_to_integration
+```
+
+**Scenario 2: Safety invariant triggered**
+```
+Next action: stop
+Reason: safety invariant violated
+overall_status: RUN_FAILED_SAFETY
+```
+Resolution: Human reviews what triggered the invariant (e.g. Hermes create call), then either corrects the issue or abandons the run.
+
+**Scenario 3: Scope expansion required**
+```
+Next action: request_human
+Reason: task requires touching forbidden file: src/core.rs
+```
+Resolution: Human reviews whether to expand the allowed scope or abort the task.
+
 ### Example: Status Report During Run
 
 ```bash
