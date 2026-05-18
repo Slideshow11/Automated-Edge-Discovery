@@ -52,6 +52,7 @@ class TestValidatePrMergeFields:
             "head_sha": "62e602e374cf666cf63e29de3bd28acb0fae97ea",
             "merge_sha": "d3de12a348da42009767887d05ff6dcd66b1c900",
             "merged_at": "2026-05-14T20:09:40Z",
+            "production_board_touched": False,
         }
         assert _validate_pr_merge_fields(entry) == []
 
@@ -61,6 +62,7 @@ class TestValidatePrMergeFields:
             "head_sha": "62e602e374cf666cf63e29de3bd28acb0fae97ea",
             "merge_sha": "d3de12a348da42009767887d05ff6dcd66b1c900",
             "merged_at": "2026-05-14T20:09:40Z",
+            "production_board_touched": False,
         }
         errors = _validate_pr_merge_fields(entry)
         assert any("pr_number" in e for e in errors)
@@ -72,6 +74,7 @@ class TestValidatePrMergeFields:
             "head_sha": "bad_sha",
             "merge_sha": "d3de12a348da42009767887d05ff6dcd66b1c900",
             "merged_at": "2026-05-14T20:09:40Z",
+            "production_board_touched": False,
         }
         errors = _validate_pr_merge_fields(entry)
         assert any("head_sha" in e for e in errors)
@@ -83,6 +86,7 @@ class TestValidatePrMergeFields:
             "head_sha": "62e602e374cf666cf63e29de3bd28acb0fae97ea",
             "merge_sha": "bad",
             "merged_at": "2026-05-14T20:09:40Z",
+            "production_board_touched": False,
         }
         errors = _validate_pr_merge_fields(entry)
         assert any("merge_sha" in e for e in errors)
@@ -129,6 +133,7 @@ class TestValidateEntry:
             "head_sha": "62e602e374cf666cf63e29de3bd28acb0fae97ea",
             "merge_sha": "d3de12a348da42009767887d05ff6dcd66b1c900",
             "merged_at": "2026-05-14T20:09:40Z",
+            "production_board_touched": False,
         }
         assert _validate_entry(entry) == []
 
@@ -168,12 +173,14 @@ class TestBuildEntry:
             head_sha="62e602e374cf666cf63e29de3bd28acb0fae97ea",
             merge_sha="d3de12a348da42009767887d05ff6dcd66b1c900",
             merged_at="2026-05-14T20:09:40Z",
+            production_board_touched=False,
         )
         assert entry["event_type"] == "pr_merge"
         assert entry["pr_number"] == 217
         assert entry["head_sha"] == "62e602e374cf666cf63e29de3bd28acb0fae97ea"
         assert entry["merge_sha"] == "d3de12a348da42009767887d05ff6dcd66b1c900"
         assert entry["audit_log_version"] == AUDIT_LOG_VERSION
+        assert entry["production_board_touched"] is False
         assert "timestamp" in entry
 
     def test_pr_merge_all_fields(self):
@@ -190,9 +197,11 @@ class TestBuildEntry:
             authorization="I confirm merge PR #218 ...",
             hermes_touched=False,
             dispatch_occurred=False,
+            production_board_touched=False,
         )
         assert entry["hermes_touched"] is False
         assert entry["dispatch_occurred"] is False
+        assert entry["production_board_touched"] is False
         assert entry["branch"] == "ci/wfa-minute-optimization"
         assert entry["ci_status"] == "success"
         assert entry["codex_status"] == "clean"
@@ -354,6 +363,7 @@ class TestMainCLI:
             "--authorization", "I confirm",
             "--no-dispatch-occurred",
             "--no-hermes-touched",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -377,6 +387,7 @@ class TestMainCLI:
             "--scope-status", "clean",
             "--no-dispatch-occurred",
             "--no-hermes-touched",
+            "--no-production-board-touched",
             "--output", str(log_path),
         ])
         rc = main()
@@ -772,6 +783,7 @@ class TestCLIIntegration:
             "--no-hermes-touched",
             "--no-dispatch-occurred",
             "--dry-run",
+            "--no-production-board-touched",
         ])
         rc = main()
         assert rc == 0
@@ -792,6 +804,7 @@ class TestCLIIntegration:
             "--authorization", "legacy auth phrase",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -814,6 +827,7 @@ class TestCLIIntegration:
             "--authorization-phrase", "phrase two",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -834,6 +848,7 @@ class TestCLIIntegration:
             "--authorization-phrase", "same phrase",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -853,12 +868,14 @@ class TestCLIIntegration:
             "--gate-catches", "codex,ci,scope",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["gate_catches"] == {"codex": "", "ci": "", "scope": ""}
+        assert parsed["production_board_touched"] is False
 
     def test_gate_catches_emits_empty_dict_when_not_provided(self, capsys, monkeypatch):
         """--gate-catches absent: emit gate_catches={} per Trace Policy V1."""
@@ -871,6 +888,7 @@ class TestCLIIntegration:
             "--merged-at", "2026-05-15T04:03:20Z",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -878,6 +896,7 @@ class TestCLIIntegration:
         parsed = json.loads(capsys.readouterr().out.strip())
         assert "gate_catches" in parsed
         assert parsed["gate_catches"] == {}
+        assert parsed["production_board_touched"] is False
 
     def test_gate_catches_single_value(self, capsys, monkeypatch):
         """--gate-catches codex emits {"codex":""}."""
@@ -891,12 +910,14 @@ class TestCLIIntegration:
             "--gate-catches", "codex",
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
         assert rc == 0
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["gate_catches"] == {"codex": ""}
+        assert parsed["production_board_touched"] is False
 
     def test_gate_catches_json_emits_object(self, capsys, monkeypatch):
         """--gate-catches-json '{"codex":"caught issue"}' emits {"codex":"caught issue"}."""
@@ -913,12 +934,14 @@ class TestCLIIntegration:
             "--gate-catches-json", '{"codex":"caught issue"}',
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
         assert rc == 0, capsys.readouterr().err
         parsed = json.loads(capsys.readouterr().out.strip())
         assert parsed["gate_catches"] == {"codex": "caught issue"}
+        assert parsed["production_board_touched"] is False
 
     def test_gate_catches_json_rejects_list(self, capsys, monkeypatch):
         """--gate-catches-json with a JSON list exits 1."""
@@ -932,6 +955,7 @@ class TestCLIIntegration:
             "--gate-catches-json", '["codex","ci"]',
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -951,6 +975,7 @@ class TestCLIIntegration:
             "--gate-catches-json", '"codex"',
             "--no-hermes-touched",
             "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--dry-run",
         ])
         rc = main()
@@ -1326,6 +1351,9 @@ class TestDuplicatePrevention:
             "--ci-status", "success",
             "--codex-status", "clean",
             "--scope-status", "clean",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--output", str(log_path),
         ])
         rc = main()
@@ -1351,6 +1379,9 @@ class TestDuplicatePrevention:
             "--ci-status", "success",
             "--codex-status", "clean",
             "--scope-status", "clean",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--output", str(log_path),
         ])
         with pytest.raises(ValueError, match="ambiguous"):
@@ -1373,6 +1404,9 @@ class TestDuplicatePrevention:
             "--ci-status", "success",
             "--codex-status", "clean",
             "--scope-status", "clean",
+            "--no-hermes-touched",
+            "--no-dispatch-occurred",
+            "--no-production-board-touched",
             "--output", str(log_path),
         ])
         rc = main()
