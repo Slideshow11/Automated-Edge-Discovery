@@ -15,14 +15,14 @@
 #   openai              : runtime  (LLM calls throughout engine + scripts)
 #   python-dotenv       : optional  (listed; no source imports found)
 #   fire                : optional  (listed; no source imports found)
-#   httpx               : runtime  (HTTP client in PR gate scripts)
+#   httpx               : workflow  (HTTP client in PR gate scripts; no source imports confirmed — commented out in requirements.txt pending verification)
 #   rich                : runtime  (CLI output throughout scripts)
 #   tenacity            : optional  (listed; no source imports found)
 #   prompt_toolkit      : optional  (listed; no source imports found)
 #   pyyaml              : runtime  (config/schema parsing)
-#   requests            : workflow (listed; no source imports; CI installs it anyway)
+#   requests            : workflow (listed; no source imports; commented out in requirements.txt)
 #   jinja2              : optional  (listed; no source imports found)
-#   pydantic>=2.0       : runtime  (schema validation throughout)
+#   pydantic>=2.0       : optional  (listed; no source imports confirmed — commented out in requirements.txt pending verification)
 #   PyJWT[crypto]       : runtime  (JWT decode in auth flows)
 #   debugpy             : optional  (listed; no source imports found)
 #   firecrawl-py        : optional  (listed; no source imports found)
@@ -59,3 +59,34 @@
 #     (automated_edge_discovery.egg-info/top_level.txt) — that file is gitignored
 #     and regenerated on each pip install -e. It is NOT a dependency declaration.
 #   - Dependabot is disabled on this repository. No CVE visibility via gh CLI.
+
+## opensrc dependency audit 002
+
+Report path: /tmp/aed_runs/opensrc-dependency-audit-002/DEPENDENCY_AUDIT.md
+
+Scan: 126 Python files scanned across scripts/, src/, tests/ using AST-based import detection.
+
+### Removed (commented out in requirements.txt)
+
+- pydantic>=2.0 — zero imports found across 126 scanned Python files
+- requests — zero imports found; only referenced in test scope assertions (forbidden/not-used markers)
+- httpx — zero imports found; only referenced in test scope assertions (forbidden/not-used markers)
+
+### Deferred
+
+- patsy: deferred because it may be statsmodels-adjacent and needs separate numeric workflow verification before removal
+- dependency pinning policy (numpy, pandas, pytest, PyYAML, openai): deferred to a separate PR
+
+### Verification method
+
+opensrc v0.7.2 used to inspect package source code at:
+OPENSRC_HOME=/tmp/aed_runs/opensrc-dependency-audit-002/opensrc_cache
+
+Packages inspected: requests (2.34.2), pydantic (2.13.4), httpx, jsonschema (4.26.0), PyYAML (6.0.3), pytest (9.0.3), pandas (3.0.3), numpy (2.4.5 — partial)
+
+### Safety invariants
+
+- No package installed into repo
+- No lockfile modified
+- No opensrc cache committed
+- No production board, dispatch, memory/profile, or skill changes
