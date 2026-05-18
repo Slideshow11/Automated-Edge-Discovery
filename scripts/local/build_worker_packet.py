@@ -70,6 +70,11 @@ REQUIRED_RETURN_FIELDS = [
     "blockers",
     "risk_notes",
     "scope_notes",
+    # existing_code_reuse required return fields
+    "existing_code_searches",
+    "reuse_candidates",
+    "reuse_decision",
+    "service_layer_extraction_notes",
 ]
 
 
@@ -234,6 +239,58 @@ def _build_dependency_install_policy(task: dict) -> dict:
     }
 
 
+def _build_existing_code_reuse(task: dict) -> dict:
+    """
+    Build existing_code_reuse dict from task JSON.
+
+    Defaults are always conservative for harness-controlled fields:
+    - enabled: True
+    - enforced: False (always — cannot be enabled by task JSON)
+    - search_required: True (always — cannot be disabled by task JSON)
+    - reuse_candidates_required: True (always — cannot be disabled by task JSON)
+    - service_layer_extraction_required_when_duplicate_runtime_logic_found: True
+
+    Task JSON may override:
+    - enabled: True/False
+    - instructions: extend the default instructions list
+
+    Task JSON may NOT override:
+    - enforced (always False)
+    - search_required (always True)
+    - reuse_candidates_required (always True)
+
+    This does NOT grant any additional authority to the worker.
+    """
+    raw = task.get("existing_code_reuse", {})
+    enabled = bool(raw.get("enabled", True))
+
+    default_instructions = [
+        "search for existing helpers, services, validators, and utilities before adding new logic",
+        "list candidate reusable modules or explain why none apply",
+        "prefer reusing existing service-layer logic over creating parallel implementations",
+        "if duplication is found, propose extraction or consolidation before adding new code",
+        "record the reuse decision in the worker return",
+    ]
+    task_instructions = raw.get("instructions", [])
+    # Task instructions are appended to defaults (task can add guidance, not remove requirements)
+    instructions = default_instructions + task_instructions
+
+    return {
+        "enabled": enabled,
+        "enforced": False,  # always advisory — cannot be set True by task JSON
+        "search_required": True,  # always required — cannot be disabled by task JSON
+        "reuse_candidates_required": True,  # always required — cannot be disabled by task JSON
+        "service_layer_extraction_required_when_duplicate_runtime_logic_found": True,
+        "instructions": instructions,
+        "required_return_fields": [
+            "existing_code_searches",
+            "reuse_candidates",
+            "reuse_decision",
+            "service_layer_extraction_notes",
+        ],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Packet builder
 # ---------------------------------------------------------------------------
@@ -354,15 +411,7 @@ def build_packet(
         "required_return": list(REQUIRED_RETURN_FIELDS),
         "controller_context": controller_context,
         "safety_invariants": si,
-        "reuse_check": {
-            "instructions": [
-                "1. Search for existing helpers, services, and utilities in the codebase",
-                "2. List any reusable code candidates",
-                "3. Avoid parallel implementations unless justified",
-                "4. Note any service-layer extraction opportunity",
-            ],
-            "enforced": False,
-        },
+        "existing_code_reuse": _build_existing_code_reuse(task),
         "recommended_worker_reason": recommended_worker_reason,
         "dependency_context": _build_dependency_context(task, workspace),
         "dependency_install_policy": _build_dependency_install_policy(task),
@@ -457,12 +506,24 @@ def render_markdown(packet: dict) -> str:
             lines.append(f"- `{c}`")
         lines.append("")
 
-    # Reuse check
-    lines.append("## Reuse check")
+    # Existing Code Reuse Check
+    ecr = packet.get("existing_code_reuse", {})
+    lines.append("## Existing Code Reuse Check")
     lines.append("")
-    for instruction in packet.get("reuse_check", {}).get("instructions", []):
-        lines.append(f"- {instruction}")
-    lines.append("")
+    if ecr.get("enabled"):
+        lines.append("Before implementing:")
+        lines.append("")
+        for i, instruction in enumerate(ecr.get("instructions", []), 1):
+            lines.append(f"{i}. {instruction}")
+        lines.append("")
+        lines.append("This does not grant extra authority. You may only edit `allowed_files`.")
+        lines.append("Service extraction must stay within `allowed_files` or be returned as a blocker.")
+        lines.append("")
+    else:
+        lines.append("_existing code reuse check is not enabled for this task_")
+        lines.append("")
+        lines.append("This does not grant extra authority.")
+        lines.append("")
 
     # Hard constraints
     lines.append("## Hard constraints")
