@@ -1325,3 +1325,539 @@ def test_dependency_context_disabled_markdown_shows_disabled(tmp_path):
     md = output_md.read_text()
     assert "## Dependency Context" in md
     assert "(disabled)" in md or "not enabled" in md.lower()
+
+
+# ---------------------------------------------------------------------------
+# Existing Code Reuse tests
+# ---------------------------------------------------------------------------
+
+def test_existing_code_reuse_defaults_enabled(tmp_path):
+    """existing_code_reuse is enabled by default."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["enabled"] is True
+
+
+def test_existing_code_reuse_defaults_enforced_false(tmp_path):
+    """existing_code_reuse.enforced defaults to False (advisory only)."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["enforced"] is False
+
+
+def test_search_required_defaults_true(tmp_path):
+    """search_required defaults to True."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["search_required"] is True
+
+
+def test_reuse_candidates_required_defaults_true(tmp_path):
+    """reuse_candidates_required defaults to True."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["reuse_candidates_required"] is True
+
+
+def test_service_layer_extraction_flag_defaults_true(tmp_path):
+    """service_layer_extraction_required_when_duplicate_runtime_logic_found defaults to True."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["service_layer_extraction_required_when_duplicate_runtime_logic_found"] is True
+
+
+def test_required_return_fields_in_json(tmp_path):
+    """existing_code_reuse required return fields are in JSON packet."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    required_return = packet["required_return"]
+    assert "existing_code_searches" in required_return
+    assert "reuse_candidates" in required_return
+    assert "reuse_decision" in required_return
+    assert "service_layer_extraction_notes" in required_return
+    ecr = packet["existing_code_reuse"]
+    assert "existing_code_searches" in ecr["required_return_fields"]
+    assert "reuse_candidates" in ecr["required_return_fields"]
+
+
+def test_required_return_fields_in_markdown(tmp_path):
+    """existing_code_reuse required return fields appear in markdown."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    md = output_md.read_text()
+    assert "existing_code_searches" in md
+    assert "reuse_candidates" in md
+    assert "reuse_decision" in md
+    assert "service_layer_extraction_notes" in md
+
+
+def test_markdown_includes_existing_code_reuse_check_section(tmp_path):
+    """Markdown output includes ## Existing Code Reuse Check section."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    md = output_md.read_text()
+    assert "## Existing Code Reuse Check" in md
+    assert "Before implementing:" in md
+
+
+def test_task_json_can_add_extra_instructions(tmp_path):
+    """Task JSON can add extra instructions to existing_code_reuse."""
+    mod = _import_mod()
+    task = minimal_task({
+        "existing_code_reuse": {
+            "enabled": True,
+            "instructions": ["check the engine/ directory first"],
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert "check the engine/ directory first" in ecr["instructions"]
+    assert len(ecr["instructions"]) > 5
+
+
+def test_task_json_cannot_disable_search_required(tmp_path):
+    """Task JSON cannot disable search_required (always True)."""
+    mod = _import_mod()
+    task = minimal_task({
+        "existing_code_reuse": {
+            "enabled": True,
+            "search_required": False,
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["search_required"] is True
+
+
+def test_task_json_cannot_disable_reuse_candidates_required(tmp_path):
+    """Task JSON cannot disable reuse_candidates_required (always True)."""
+    mod = _import_mod()
+    task = minimal_task({
+        "existing_code_reuse": {
+            "enabled": True,
+            "reuse_candidates_required": False,
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["reuse_candidates_required"] is True
+
+
+def test_task_json_cannot_set_enforced_true(tmp_path):
+    """Task JSON cannot set enforced to True (always False)."""
+    mod = _import_mod()
+    task = minimal_task({
+        "existing_code_reuse": {
+            "enabled": True,
+            "enforced": True,
+        },
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["enforced"] is False
+
+
+def test_existing_code_reuse_does_not_modify_allowed_files(tmp_path):
+    """existing_code_reuse does not add paths to allowed_files."""
+    mod = _import_mod()
+    task = minimal_task({"allowed_files": ["scripts/local/my.py"]})
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    assert len(packet["allowed_files"]) == 1
+    assert packet["allowed_files"][0] == "scripts/local/my.py"
+
+
+def test_existing_code_reuse_does_not_add_files_to_scope(tmp_path):
+    """existing_code_reuse does not expand scope beyond allowed_files."""
+    mod = _import_mod()
+    task = minimal_task({"allowed_files": ["scripts/local/my.py"]})
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    assert "existing_code_reuse" in packet
+    assert "existing_code_reuse" not in packet["allowed_files"]
+
+
+def test_service_extraction_instruction_says_scope_expansion_blocker(tmp_path):
+    """Markdown notes that service extraction outside scope must be a blocker."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    md = output_md.read_text()
+    assert "allowed_files" in md
+    assert "blocker" in md.lower()
+
+
+def test_packet_builder_does_not_mutate_controller_state_ecr(tmp_path):
+    """Packet builder does not mutate controller state (re-confirmed with ecr)."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    state = minimal_controller_state()
+    state_path = tmp_path / "CONTROLLER_STATE.json"
+    state_path.write_text(json.dumps(state))
+    original_state_text = state_path.read_text()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--controller-state", str(state_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    assert state_path.read_text() == original_state_text, "controller state was mutated"
+
+
+def test_packet_builder_does_not_modify_repo_files_outside_output_paths_ecr(tmp_path):
+    """Packet builder only writes to output paths; repo files outside outputs untouched (ecr)."""
+    mod = _import_mod()
+    task = minimal_task()
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+
+
+def test_docs_task_still_receives_existing_code_reuse_checklist(tmp_path):
+    """Docs task also receives existing_code_reuse checklist."""
+    mod = _import_mod()
+    task = minimal_task({
+        "task_id": "docs-001",
+        "objective": "Update documentation",
+        "task_type": "docs",
+        "allowed_files": ["docs/readme.md"],
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["enabled"] is True
+    assert ecr["search_required"] is True
+    md = output_md.read_text()
+    assert "## Existing Code Reuse Check" in md
+
+
+def test_multi_file_impl_still_receives_existing_code_reuse_checklist(tmp_path):
+    """Multi-file implementation also receives existing_code_reuse checklist."""
+    mod = _import_mod()
+    task = minimal_task({
+        "task_id": "impl-001",
+        "objective": "Implement multi-file feature",
+        "task_type": "impl",
+        "allowed_files": ["scripts/local/a.py", "scripts/local/b.py"],
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    ecr = packet["existing_code_reuse"]
+    assert ecr["enabled"] is True
+    md = output_md.read_text()
+    assert "## Existing Code Reuse Check" in md
+
+
+def test_existing_code_reuse_coexists_with_dependency_context(tmp_path):
+    """existing_code_reuse and dependency_context from PR #249 coexist without conflict."""
+    mod = _import_mod()
+    task = minimal_task({
+        "dependency_context": {"enabled": True},
+        "existing_code_reuse": {"enabled": True},
+    })
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    packet = json.loads(output_json.read_text())
+    assert "dependency_context" in packet
+    assert "existing_code_reuse" in packet
+    assert packet["dependency_context"]["enabled"] is True
+    assert packet["existing_code_reuse"]["enabled"] is True
+
+
+def test_existing_code_reuse_disabled_shows_not_enabled(tmp_path):
+    """When existing_code_reuse is disabled, markdown shows not enabled."""
+    mod = _import_mod()
+    task = minimal_task({"existing_code_reuse": {"enabled": False}})
+    task_path = tmp_path / "task.json"
+    task_path.write_text(json.dumps(task))
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output_json = tmp_path / "packet.json"
+    output_md = tmp_path / "packet.md"
+    rc = mod.main([
+        "--task-json", str(task_path),
+        "--workspace", str(workspace),
+        "--worker", "claude_code",
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ])
+    assert rc == 0
+    md = output_md.read_text()
+    assert "## Existing Code Reuse Check" in md
+    assert "_existing code reuse check is not enabled" in md
