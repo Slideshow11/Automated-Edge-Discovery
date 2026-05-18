@@ -22,15 +22,13 @@
 #   [dev]      — needed only for testing or local development
 #   [both]     — imported by both engine (runtime) and tests/dev scripts
 #   [optional] — integration tool; present but not yet confirmed in source imports
-#   [workflow] — present in this file; not imported in source but installed by CI
-
+#   [workflow] — installed by CI; not imported in source; kept for reference
+#
 # === [runtime] — Core dependencies for engine and scripts ===
 
 openai                        # LLM calls throughout
-httpx                         # HTTP client in PR gate scripts
 rich                          # CLI output formatting
 pyyaml                        # config/schema file parsing
-pydantic>=2.0                  # data validation schemas
 patsy                         # formula parsing in calibrate_costs
 PyJWT[crypto]                 # JWT decode in auth flows
 aiohttp>=3.9.0                # async HTTP for gateway integrations
@@ -60,6 +58,8 @@ croniter                      # cron expression parsing (no source imports found
 python-telegram-bot[webhooks]>=22.6   # Telegram integration (no source imports found)
 discord.py>=2.0               # Discord integration (no source imports found)
 
-# === [workflow] — Installed by CI but not imported in source ===
+# === [workflow] — Installed by CI; kept for reference; verify before removing ===
 
-requests                      # HTTP library; installed by CI; no source imports confirmed
+# requests                      # HTTP library; installed by CI; no source imports confirmed
+# httpx                         # HTTP client in PR gate scripts; no source imports confirmed
+# pydantic>=2.0                  # data validation schemas; no source imports confirmed
