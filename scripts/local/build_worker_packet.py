@@ -79,9 +79,15 @@ REQUIRED_RETURN_FIELDS = [
 
 def _is_forbidden_path(path: str) -> bool:
     abs_path = str(Path(path).resolve())
+    # Check resolved absolute path
     for prefix in FORBIDDEN_PREFIXES:
         if abs_path.startswith(prefix) or abs_path == prefix:
             return True
+    # Also check raw/original path components (handles relative .hermes, etc.)
+    raw = Path(path)
+    parts = raw.parts
+    if ".hermes" in parts:
+        return True
     return False
 
 
@@ -152,15 +158,24 @@ def build_packet(
     task_type = task.get("task_type", "unknown")
 
     allowed_files = task.get("allowed_files", [])
-    if not allowed_files:
-        print("ERROR: task is missing required field 'allowed_files' (must be non-empty)", file=sys.stderr)
-        sys.exit(1)
-
     forbidden_files = task.get("forbidden_files", [])
-
     expected_outputs = task.get("expected_outputs", [])
     tests_to_run = task.get("tests_to_run", [])
     context_files = task.get("context_files", [])
+
+    # Validate task paths — reject any that expose Hermes / forbidden prefixes
+    for f in allowed_files:
+        if _is_forbidden_path(f):
+            print(f"ERROR: allowed_files contains forbidden path: {f}", file=sys.stderr)
+            sys.exit(1)
+    for f in context_files:
+        if _is_forbidden_path(f):
+            print(f"ERROR: context_files contains forbidden path: {f}", file=sys.stderr)
+            sys.exit(1)
+
+    if not allowed_files:
+        print("ERROR: task is missing required field 'allowed_files' (must be non-empty)", file=sys.stderr)
+        sys.exit(1)
 
     # Derive risk_level from task_type
     risk_level = _derive_risk_level(task_type, allowed_files)
@@ -169,9 +184,18 @@ def build_packet(
     recommended_worker_reason = _derive_worker_reason(task_type, allowed_files)
 
     # Build controller_context from controller_state
-    controller_context: dict = {"run_id": None, "integration_branch": None,
-                                "current_task_id": task_id, "next_action": "run_task"}
+    # NOTE: safety_invariants are copied verbatim from controller_state.
+    # If the controller run has any hard-safety flag set to true,
+    # that information must propagate into the packet so the worker
+    # (and the operator) know a safety boundary was crossed.
+    # We do NOT reset them to false — that would hide a safety violation.
+    si = {"hermes_touched": False, "dispatch_occurred": False,
+          "production_board_touched": False, "memory_or_profile_updated": False,
+          "skills_created": False}
+    controller_context = {"run_id": None, "integration_branch": None,
+                          "current_task_id": task_id, "next_action": "run_task"}
     if controller_state:
+        si = dict(controller_state.get("safety_invariants", si))
         controller_context["run_id"] = controller_state.get("run_id")
         controller_context["integration_branch"] = controller_state.get("integration_branch")
 
@@ -194,13 +218,7 @@ def build_packet(
         "do_not": list(FORBIDDEN_ACTIONS),
         "required_return": list(REQUIRED_RETURN_FIELDS),
         "controller_context": controller_context,
-        "safety_invariants": {
-            "hermes_touched": False,
-            "dispatch_occurred": False,
-            "production_board_touched": False,
-            "memory_or_profile_updated": False,
-            "skills_created": False,
-        },
+        "safety_invariants": si,
         "reuse_check": {
             "instructions": [
                 "1. Search for existing helpers, services, and utilities in the codebase",
