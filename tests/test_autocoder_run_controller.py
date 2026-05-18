@@ -26,6 +26,9 @@ from scripts.local.autocoder_run_controller import (
     _compute_next_action,
     _utcnow,
     DEFAULT_MAX_LOCAL_REPAIR,
+    DEFAULT_MAX_CODEX_REPAIR,
+    CODEX_REVIEW_STATUSES,
+    SEVERITY_ORDER,
 )
 
 
@@ -748,98 +751,502 @@ def test_multiple_repair_events_recorded_in_history(temp_workspace, sample_tasks
     assert state["repair_events"][2]["repair_id"] == "task-001.R3"
 
 
-# ---------------------------------------------------------------------------
-# Tests: run-codex-review command
-# ---------------------------------------------------------------------------
 
-def test_run_codex_review_records_codex_review_in_progress(temp_workspace, sample_tasks_jsonl):
-    """run-codex-review sets state to in_progress with action=run_codex_review."""
+
+# -------------------------------------------------------------------------
+# Tests: Codex repair loop state
+# -------------------------------------------------------------------------
+
+def test_init_codex_review_default_not_started(temp_workspace, sample_tasks_jsonl):
+    """Initial controller state has codex_review with status not_started."""
     state_path = temp_workspace / "CONTROLLER_STATE.json"
-    run_controller(["init", "--run-id", "aed-codex-001", "--tasks-jsonl", str(sample_tasks_jsonl),
-                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-001",
-                    "--output-state", str(state_path)])
-
-    rc, stdout, stderr = run_controller([
-        "run-codex-review", "--state", str(state_path),
-        "--reason", "codex_artifact_required",
-        "--summary", "Finalization guard requires Codex evidence"
+    run_controller([
+        "init", "--run-id", "aed-codex-init-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-init-001",
+        "--output-state", str(state_path),
     ])
-    assert rc == 0, f"run-codex-review failed: {stderr}"
-
     state = json.loads(Path(state_path).read_text())
-    assert state["codex_review"]["status"] == "in_progress"
-    assert state["codex_review"]["reason"] == "codex_artifact_required"
-    assert state["next_action"]["action"] == "run_codex_review"
-    assert state["next_action"]["reason"] == "codex_artifact_required"
-    assert state["human_action_required"] is True
+    assert state["codex_review"]["status"] == "not_started"
+    assert state["codex_review"]["head_sha"] is None
+    assert state["codex_review"]["artifact_path"] is None
+    assert state["codex_review"]["findings_count"] == 0
+    assert state["codex_review"]["highest_severity"] == "none"
+    assert state["codex_review"]["repair_attempts"] == 0
+    assert state["codex_review"]["max_repair_attempts"] == DEFAULT_MAX_CODEX_REPAIR
+    assert state["codex_review"]["same_blocker_count"] == 0
+    assert state["codex_review"]["last_blocker_fingerprint"] is None
+    assert state["codex_repair_events"] == []
 
 
-def test_run_codex_review_does_not_set_run_to_merge_ready(temp_workspace, sample_tasks_jsonl):
-    """run-codex-review records the step but does not mark overall_status as MERGE_READY."""
+def test_record_codex_review_clean_stores_head_sha_and_artifact(temp_workspace, sample_tasks_jsonl):
+    """record-codex-review clean stores head_sha and artifact_path."""
     state_path = temp_workspace / "CONTROLLER_STATE.json"
-    run_controller(["init", "--run-id", "aed-codex-002", "--tasks-jsonl", str(sample_tasks_jsonl),
-                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-002",
-                    "--output-state", str(state_path)])
-
-    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
-
-    state = json.loads(Path(state_path).read_text())
-    # overall_status should not become MERGE_READY from a codex review step
-    assert state.get("overall_status", "") not in ("MERGE_READY", "RUN_MERGE_READY")
-
-
-def test_run_codex_review_with_custom_reason_preserved_in_state(temp_workspace, sample_tasks_jsonl):
-    """Custom reason passed to run-codex-review is preserved in state and next_action."""
-    state_path = temp_workspace / "CONTROLLER_STATE.json"
-    run_controller(["init", "--run-id", "aed-codex-003", "--tasks-jsonl", str(sample_tasks_jsonl),
-                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-003",
-                    "--output-state", str(state_path)])
-
+    run_controller([
+        "init", "--run-id", "aed-codex-clean-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-clean-001",
+        "--output-state", str(state_path),
+    ])
     rc, stdout, stderr = run_controller([
-        "run-codex-review", "--state", str(state_path),
-        "--reason", "scope_expansion_required",
-        "--summary", "Scope expansion needed for new integration files"
+        "record-codex-review", "--state", str(state_path),
+        "--status", "clean", "--head-sha", "abc123",
+        "--artifact-path", "/tmp/codex_artifact.json",
+    ])
+    assert rc == 0, f"record-codex-review clean failed: {stderr}"
+    state = json.loads(Path(state_path).read_text())
+    assert state["codex_review"]["status"] == "clean"
+    assert state["codex_review"]["head_sha"] == "abc123"
+    assert state["codex_review"]["artifact_path"] == "/tmp/codex_artifact.json"
+    assert state["next_action"]["action"] == "run_task"
+    assert state["next_action"]["reason"] == "codex_review_clean"
+
+
+def test_record_codex_review_findings_stores_findings_count_and_severity(temp_workspace, sample_tasks_jsonl):
+    """record-codex-review findings stores findings_count and highest_severity."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-find-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-find-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "3", "--highest-severity", "P1",
+        "--summary", "Found 3 issues",
     ])
     assert rc == 0
-
     state = json.loads(Path(state_path).read_text())
-    assert state["codex_review"]["reason"] == "scope_expansion_required"
+    assert state["codex_review"]["findings_count"] == 3
+    assert state["codex_review"]["highest_severity"] == "P1"
+
+
+def test_record_codex_review_findings_below_limit_produces_repair_task(temp_workspace, sample_tasks_jsonl):
+    """Findings with attempts below limit produces next_action repair_task."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rpair-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rpair-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "Minor formatting issues",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "repair_task"
+    assert state["next_action"]["reason"] == "codex_findings"
+
+
+def test_record_codex_repair_result_increments_repair_attempts(temp_workspace, sample_tasks_jsonl):
+    """record-codex-repair-result increments repair_attempts."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "Formatting issues",
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "repaired", "--summary", "Fixed formatting",
+    ])
+    assert rc == 0, f"record-codex-repair-result failed: {stderr}"
+    state = json.loads(Path(state_path).read_text())
+    assert state["codex_review"]["repair_attempts"] == 1
+
+
+def test_codex_repair_limit_exceeded_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Second failed repair reaches max and requests human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-limit-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-limit-001",
+        "--output-state", str(state_path),
+    ])
+    # Use different blockers per cycle to avoid same_blocker_count escalation
+    for i in range(2):
+        run_controller([
+            "record-codex-review", "--state", str(state_path),
+            "--status", "findings", "--head-sha", "abc123",
+            "--findings-count", "1", "--highest-severity", "P3",
+            "--summary", "Issue persists",
+            "--blocker-fingerprint", f"blocker-cycle-{i}",
+        ])
+        rc, stdout, stderr = run_controller([
+            "record-codex-repair-result", "--state", str(state_path),
+            "--status", "failed", "--summary", "Could not fix",
+            "--blocker-fingerprint", f"blocker-cycle-{i}",
+        ])
+        assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["next_action"]["reason"] == "codex_repair_limit_exceeded"
+
+
+def test_same_blocker_fingerprint_twice_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Same blocker fingerprint in review->repair->review triggers escalation."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-blkfp-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-blkfp-001",
+        "--output-state", str(state_path),
+    ])
+    # First cycle: findings with blocker, failed repair
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P2",
+        "--summary", "Issue with blocker A",
+        "--blocker-fingerprint", "blocker-A",
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "failed", "--summary", "Could not fix",
+        "--blocker-fingerprint", "blocker-A",
+    ])
+    assert rc == 0
+    # Second cycle with same blocker: triggers same_codex_blocker_repeated
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P2",
+        "--summary", "Same issue persists",
+        "--blocker-fingerprint", "blocker-A",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["next_action"]["reason"] == "same_codex_blocker_repeated"
+
+
+def test_scope_expansion_finding_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Scope expansion finding requests human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-scope-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-scope-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P2",
+        "--summary", "Scope expansion needed: new file outside allowed scope",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "request_human"
     assert state["next_action"]["reason"] == "scope_expansion_required"
 
 
-def test_run_codex_review_idempotent_updates_next_action(temp_workspace, sample_tasks_jsonl):
-    """Calling run-codex-review twice updates the next_action each time, not duplicate."""
+def test_dependency_install_finding_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Dependency install finding requests human."""
     state_path = temp_workspace / "CONTROLLER_STATE.json"
-    run_controller(["init", "--run-id", "aed-codex-004", "--tasks-jsonl", str(sample_tasks_jsonl),
-                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-004",
-                    "--output-state", str(state_path)])
-
-    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
-    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
-
+    run_controller([
+        "init", "--run-id", "aed-codex-dep-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-dep-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P1",
+        "--summary", "dependency install required for new package",
+    ])
+    assert rc == 0
     state = json.loads(Path(state_path).read_text())
-    # Only one codex_review entry (no duplicate array, just overwrite)
-    assert "codex_review" in state
-    assert state["codex_review"]["status"] == "in_progress"
-    assert state["next_action"]["action"] == "run_codex_review"
+    assert state["next_action"]["action"] == "request_human"
 
 
-def test_run_codex_review_preserves_existing_tasks_and_state(temp_workspace, sample_tasks_jsonl):
-    """run-codex-review does not modify task list or existing state fields."""
+def test_security_finding_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Security finding requests human."""
     state_path = temp_workspace / "CONTROLLER_STATE.json"
-    run_controller(["init", "--run-id", "aed-codex-005", "--tasks-jsonl", str(sample_tasks_jsonl),
-                    "--workspace", str(temp_workspace), "--integration-branch", "int/codex-005",
-                    "--output-state", str(state_path)])
-
-    run_controller(["record-task-result", "--state", str(state_path), "--task-id", "task-001",
-                    "--status", "TASK_READY", "--promotion-status", "promoted_to_integration"])
-
-    run_controller(["run-codex-review", "--state", str(state_path), "--reason", "codex_artifact_required"])
-
+    run_controller([
+        "init", "--run-id", "aed-codex-sec-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-sec-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "HIGH",
+        "--summary", "Security: exposed API credentials in config file",
+    ])
+    assert rc == 0
     state = json.loads(Path(state_path).read_text())
-    # Tasks are preserved
-    assert len(state["tasks"]) == 3
-    # task-001 promotion is preserved
-    task_001 = next(t for t in state["tasks"] if t["task_id"] == "task-001")
-    assert task_001["status"] == "TASK_READY"
-    assert task_001["promotion_status"] == "promoted_to_integration"
+    assert state["next_action"]["action"] == "request_human"
+
+
+def test_clean_codex_after_repair_clears_repair_next_action(temp_workspace, sample_tasks_jsonl):
+    """Clean Codex after repair clears repair next_action."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-cln-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-cln-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--summary", "Issue",
+    ])
+    run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "repaired", "--summary", "Fixed",
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "clean", "--head-sha", "abc124",
+        "--artifact-path", "/tmp/clean_artifact.json",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["reason"] == "codex_review_clean"
+
+
+def test_codex_repair_events_append_in_order(temp_workspace, sample_tasks_jsonl):
+    """codex_repair_events append in order."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-evt-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-evt-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "First review",
+    ])
+    run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "repaired", "--summary", "First repair",
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc124",
+        "--findings-count", "1", "--highest-severity", "P3",
+        "--summary", "Second review",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    assert len(state["codex_repair_events"]) == 3
+    assert state["codex_repair_events"][0]["status"] == "findings"
+    assert state["codex_repair_events"][1]["status"] == "repaired"
+    assert state["codex_repair_events"][2]["status"] == "findings"
+
+
+def test_malformed_severity_rejected(temp_workspace, sample_tasks_jsonl):
+    """Malformed severity rejected."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-sev-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-sev-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "INVALID",
+    ])
+    assert rc != 0
+    assert "error" in stderr.lower()
+
+
+def test_negative_findings_count_rejected(temp_workspace, sample_tasks_jsonl):
+    """Negative findings_count rejected."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-neg-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-neg-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "-1",
+    ])
+    assert rc != 0
+    assert "error" in stderr.lower()
+
+
+def test_missing_artifact_path_for_clean_review_rejected(temp_workspace, sample_tasks_jsonl):
+    """Missing artifact path for clean review rejected."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-art-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-art-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "clean", "--head-sha", "abc123",
+    ])
+    assert rc != 0
+    assert "artifact-path" in stderr.lower()
+
+
+def test_codex_review_statuses_enum_matches_expected_values():
+    """Codex review statuses enum contains all expected values."""
+    expected = {"not_started", "in_progress", "clean", "findings", "blocked", "repair_limit_exceeded"}
+    assert CODEX_REVIEW_STATUSES == expected
+
+
+def test_severity_order_correct():
+    """Severity order is correct."""
+    assert SEVERITY_ORDER == ["none", "P3", "P2", "P1", "HIGH"]
+
+
+def test_record_codex_review_blocked_status_requests_human(temp_workspace, sample_tasks_jsonl):
+    """Blocked Codex review status requests human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-blk-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-blk-001",
+        "--output-state", str(state_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "blocked", "--head-sha", "abc123",
+        "--summary", "Codex review blocked",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["next_action"]["reason"] == "codex_blocked"
+
+
+def test_record_codex_repair_result_blocked_requests_human(temp_workspace, sample_tasks_jsonl):
+    """record-codex-repair-result blocked requests human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rblk-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rblk-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--summary", "Issue",
+    ])
+    rc, stdout, stderr = run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "blocked", "--summary", "Repair blocked",
+    ])
+    assert rc == 0
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["next_action"]["reason"] == "codex_repair_blocked"
+
+
+def test_safety_invariant_hard_stop_wins_before_codex_repair(temp_workspace, sample_tasks_jsonl):
+    """Safety invariant hard-stop wins before Codex repair actions."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-safety-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-safety-001",
+        "--output-state", str(state_path),
+    ])
+    state = json.loads(Path(state_path).read_text())
+    state["safety_invariants"]["hermes_touched"] = True
+    Path(state_path).write_text(json.dumps(state, indent=2) + "\n")
+    rc, stdout, stderr = run_controller(["next", "--state", str(state_path)])
+    assert rc == 0
+    result = json.loads(stdout)
+    assert result["action"] == "stop"
+    assert "safety" in result["reason"].lower()
+
+
+def test_final_status_not_merge_ready_from_codex_clean_alone(temp_workspace, sample_tasks_jsonl):
+    """Final status does not become merge ready from Codex clean alone."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-nomerge-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-nomerge-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "clean", "--head-sha", "abc123",
+        "--artifact-path", "/tmp/codex.json",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    assert state["overall_status"] not in ("MERGE_READY", "RUN_MERGE_READY")
+
+
+def test_controller_does_not_mutate_repo_files_outside_state(temp_workspace, sample_tasks_jsonl):
+    """Controller does not mutate repo files outside state file."""
+    repo_root = Path(__file__).parent.parent
+    original = {}
+    for f in ["scripts/local/autocoder_run_controller.py", "tests/test_autocoder_run_controller.py"]:
+        p = repo_root / f
+        if p.exists():
+            original[f] = p.read_text()
+
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-mut-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-mut-001",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "Issues found",
+    ])
+    run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "repaired", "--summary", "Fixed",
+    ])
+
+    for f, content in original.items():
+        p = repo_root / f
+        assert p.read_text() == content, f"{f} was modified!"

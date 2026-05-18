@@ -85,6 +85,8 @@ HUMAN_ACTION_REASONS = frozenset([
     "codex_artifact_required",  # finalization guard requires Codex evidence
     "ambiguous_task_decision",
     "external_system_failure",
+    "codex_repair_limit_exceeded",
+    "same_codex_blocker_repeated",
 ])
 
 
@@ -96,6 +98,27 @@ DEFAULT_MAX_LOCAL_REPAIR = 3
 DEFAULT_MAX_CODEX_REPAIR = 2
 DEFAULT_MAX_CI_REPAIR = 2
 DEFAULT_MAX_SCOPE_EXPANSION = 0
+
+CODEX_REVIEW_STATUSES = frozenset([
+    "not_started",
+    "in_progress",
+    "clean",
+    "findings",
+    "blocked",
+    "repair_limit_exceeded",
+])
+
+SEVERITY_ORDER = ["none", "P3", "P2", "P1", "HIGH"]
+
+_CODEX_REPAIR_SENSITIVE_KEYWORDS = frozenset([
+    "dependency", "install", "npm", "pip", "cargo", "gem", "package",
+    "auth", "credential", "secret", "api_key", "apikey", "password", "token",
+    "payment", "billing", "stripe", "charge", "invoice",
+    "production_board", "board:aed", "aed",
+    "dispatch", "hermes create", "hermes dispatch",
+    "memory", "profile", "skill",
+    ".hermes", "~/.hermes", "/hermes",
+])
 
 
 # ---------------------------------------------------------------------------
@@ -430,6 +453,18 @@ def _init(args: argparse.Namespace) -> None:
         "overall_status": "RUN_ACTIVE",
         "tasks": ordered_tasks,
         "repair_events": [],
+        "codex_review": {
+            "status": "not_started",
+            "head_sha": None,
+            "artifact_path": None,
+            "findings_count": 0,
+            "highest_severity": "none",
+            "repair_attempts": 0,
+            "max_repair_attempts": DEFAULT_MAX_CODEX_REPAIR,
+            "same_blocker_count": 0,
+            "last_blocker_fingerprint": None,
+        },
+        "codex_repair_events": [],
         "pr_results": [],
         "human_action_required": False,
         "next_action": {
@@ -717,35 +752,263 @@ def _record_pr_result(args: argparse.Namespace) -> None:
     print(f"  next action: {state['next_action']['action']} — {state['next_action']['reason']}")
 
 
-def _run_codex_review(args: argparse.Namespace) -> None:
-    """Record that a Codex review step is in progress.
+def _record_codex_review(args: argparse.Namespace) -> None:
+    """Record a Codex review result (clean, findings, or blocked).
 
-    This command is called when the finalization guard returns WAIT with
-    codex_status.passing=False (codex_artifact_required). The operator runs
-    Codex review and records the review session here before providing the artifact.
-    After the review is complete, the operator reruns the finalization guard with
-    the artifact to determine the final recommendation.
+    A clean review records head_sha and artifact_path.
+    A findings review additionally records findings_count, highest_severity, and summary.
+    A blocked review triggers request_human immediately.
     """
     state = _load_state(args.state)
 
-    state["codex_review"] = {
-        "status": "in_progress",
-        "reason": args.reason,
+    status = args.status
+    if status not in CODEX_REVIEW_STATUSES:
+        print(f"ERROR: status must be one of {sorted(CODEX_REVIEW_STATUSES)}, got: {status}", file=sys.stderr)
+        sys.exit(1)
+
+    codex = state.get("codex_review", {})
+
+    # Validate: clean status requires artifact_path
+    if status == "clean" and not args.artifact_path:
+        print("ERROR: --artifact-path is required for clean Codex review", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate: negative findings_count
+    if args.findings_count is not None and args.findings_count < 0:
+        print("ERROR: --findings-count must be non-negative, got: {args.findings_count}", file=sys.stderr)
+        sys.exit(1)
+
+    # Validate severity
+    if args.highest_severity is not None and args.highest_severity not in SEVERITY_ORDER:
+        print(f"ERROR: --highest-severity must be one of {sorted(SEVERITY_ORDER)}, got: {args.highest_severity}", file=sys.stderr)
+        sys.exit(1)
+
+    # Check for sensitive findings that require human review
+    findings_requires_human = False
+    findings_reason = None
+    if args.summary:
+        summary_lower = args.summary.lower()
+        for kw in _CODEX_REPAIR_SENSITIVE_KEYWORDS:
+            if kw in summary_lower:
+                findings_requires_human = True
+                findings_reason = kw
+                break
+
+    # Check scope expansion in summary
+    scope_expansion = False
+    if args.summary:
+        summary_lower = args.summary.lower()
+        scope_expansion_kws = ["scope expansion", "new file outside", "file outside scope",
+                               "outside allowed scope", "unbounded scope"]
+        for kw in scope_expansion_kws:
+            if kw in summary_lower:
+                scope_expansion = True
+                break
+
+    # Record the review
+    codex["status"] = status
+    codex["head_sha"] = args.head_sha or codex.get("head_sha")
+    codex["artifact_path"] = args.artifact_path or codex.get("artifact_path")
+
+    if args.findings_count is not None:
+        codex["findings_count"] = args.findings_count
+    if args.highest_severity is not None:
+        codex["highest_severity"] = args.highest_severity
+
+    # Append codex_repair_event
+    codex_repair_event = {
+        "timestamp": _utcnow(),
+        "source": "codex_review",
+        "head_sha": args.head_sha or codex.get("head_sha") or "",
+        "artifact_path": args.artifact_path or codex.get("artifact_path") or "",
+        "status": status,
+        "findings_count": args.findings_count if args.findings_count is not None else 0,
+        "highest_severity": args.highest_severity or codex.get("highest_severity", "none"),
+        "repair_attempt": codex.get("repair_attempts", 0),
+        "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
         "summary": args.summary or "",
-        "recorded_at": _utcnow(),
     }
+    state["codex_repair_events"].append(codex_repair_event)
+
+    # Determine next action based on status
+    if status == "clean":
+        codex["status"] = "clean"
+        # Clean after repair attempts clears the repair loop
+        next_action = {
+            "action": "run_task",
+            "task_id": None,
+            "reason": "codex_review_clean",
+        }
+    elif status == "findings":
+        # Check if this is the same blocker repeated
+        if args.blocker_fingerprint and codex.get("last_blocker_fingerprint") == args.blocker_fingerprint:
+            codex["same_blocker_count"] = codex.get("same_blocker_count", 0) + 1
+        else:
+            codex["same_blocker_count"] = 0
+        codex["last_blocker_fingerprint"] = args.blocker_fingerprint or codex.get("last_blocker_fingerprint")
+
+        if scope_expansion:
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": "scope_expansion_required",
+            }
+        elif findings_requires_human:
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": f"codex_findings_require_human:{findings_reason}",
+            }
+        elif codex.get("repair_attempts", 0) >= codex.get("max_repair_attempts", DEFAULT_MAX_CODEX_REPAIR):
+            codex["status"] = "repair_limit_exceeded"
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": "codex_repair_limit_exceeded",
+            }
+        else:
+            next_action = {
+                "action": "repair_task",
+                "task_id": None,
+                "reason": "codex_findings",
+                "source": "codex_review",
+            }
+    elif status == "blocked":
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "codex_blocked",
+        }
+    elif status == "repair_limit_exceeded":
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "codex_repair_limit_exceeded",
+        }
+    else:
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": f"codex_review_status:{status}",
+        }
+
+    # Same blocker twice without progress → escalate
+    if (codex.get("same_blocker_count", 0) >= 2 and
+            next_action["action"] == "repair_task"):
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "same_codex_blocker_repeated",
+        }
+
+    state["codex_review"] = codex
+    state["next_action"] = next_action
     state["updated_at"] = _utcnow()
-    state["human_action_required"] = True
-    state["next_action"] = {
-        "action": "run_codex_review",
-        "task_id": None,
-        "reason": args.reason,
-    }
+    state["human_action_required"] = (next_action["action"] == "request_human")
 
     _save_state(state, args.state)
 
-    print(f"Codex review in progress — reason: {args.reason}")
-    print("Complete the review, then rerun the finalization guard with --codex-artifact.")
+    print(f"Recorded Codex review: {status}")
+    if args.head_sha:
+        print(f"  head_sha: {args.head_sha}")
+    if args.artifact_path:
+        print(f"  artifact_path: {args.artifact_path}")
+    if args.findings_count is not None:
+        print(f"  findings_count: {args.findings_count}")
+    if args.highest_severity:
+        print(f"  highest_severity: {args.highest_severity}")
+    print(f"  next action: {next_action['action']} — {next_action['reason']}")
+
+
+def _record_codex_repair_result(args: argparse.Namespace) -> None:
+    """Record the result of a Codex repair attempt.
+
+    Increments repair_attempts. If status is 'repaired', resets for a new review cycle.
+    If status is 'failed', checks whether repair limit is exceeded.
+    """
+    state = _load_state(args.state)
+
+    repair_status = args.status
+    if repair_status not in ("repaired", "failed", "blocked"):
+        print(f"ERROR: repair status must be 'repaired', 'failed', or 'blocked', got: {repair_status}", file=sys.stderr)
+        sys.exit(1)
+
+    codex = state.get("codex_review", {})
+
+    # Append codex_repair_event
+    codex_repair_event = {
+        "timestamp": _utcnow(),
+        "source": "codex_review",
+        "head_sha": codex.get("head_sha") or "",
+        "artifact_path": codex.get("artifact_path") or "",
+        "status": repair_status,
+        "findings_count": codex.get("findings_count", 0),
+        "highest_severity": codex.get("highest_severity", "none"),
+        "repair_attempt": codex.get("repair_attempts", 0) + 1,
+        "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
+        "summary": args.summary or "",
+    }
+    state["codex_repair_events"].append(codex_repair_event)
+
+    codex["repair_attempts"] = codex.get("repair_attempts", 0) + 1
+
+    if repair_status == "repaired":
+        # After repair, reset findings state so operator can run a new Codex review
+        codex["status"] = "not_started"
+        codex["findings_count"] = 0
+        codex["highest_severity"] = "none"
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "await_codex_review_after_repair",
+        }
+    elif repair_status == "failed":
+        if codex["repair_attempts"] >= codex.get("max_repair_attempts", DEFAULT_MAX_CODEX_REPAIR):
+            codex["status"] = "repair_limit_exceeded"
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": "codex_repair_limit_exceeded",
+            }
+        else:
+            next_action = {
+                "action": "repair_task",
+                "task_id": None,
+                "reason": "codex_repair_failed_retry",
+                "source": "codex_review",
+            }
+    else:  # blocked
+        codex["status"] = "blocked"
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "codex_repair_blocked",
+        }
+
+    # Same blocker twice → escalate regardless of repair count
+    if args.blocker_fingerprint:
+        if codex.get("last_blocker_fingerprint") == args.blocker_fingerprint:
+            codex["same_blocker_count"] = codex.get("same_blocker_count", 0) + 1
+            if codex["same_blocker_count"] >= 2:
+                next_action = {
+                    "action": "request_human",
+                    "task_id": None,
+                    "reason": "same_codex_blocker_repeated",
+                }
+        else:
+            codex["same_blocker_count"] = 0
+        codex["last_blocker_fingerprint"] = args.blocker_fingerprint
+
+    state["codex_review"] = codex
+    state["next_action"] = next_action
+    state["updated_at"] = _utcnow()
+    state["human_action_required"] = (next_action["action"] == "request_human")
+
+    _save_state(state, args.state)
+
+    print(f"Recorded Codex repair result: {repair_status}")
+    print(f"  repair_attempts: {codex['repair_attempts']}/{codex.get('max_repair_attempts', DEFAULT_MAX_CODEX_REPAIR)}")
+    print(f"  next action: {next_action['action']} — {next_action['reason']}")
 
 
 def _finalize_run(args: argparse.Namespace) -> None:
@@ -827,12 +1090,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pr.add_argument("--head-sha", help="PR head commit SHA")
     p_pr.add_argument("--merge-sha", help="Merge commit SHA (if merged)")
 
-    # run-codex-review
-    p_codex = sub.add_parser("run-codex-review", help="Record that a Codex review is in progress")
-    p_codex.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
-    p_codex.add_argument("--reason", default="codex_artifact_required",
-                        help="Reason for Codex review (default: codex_artifact_required)")
-    p_codex.add_argument("--summary", help="Brief summary of what triggered the review")
+    # record-codex-review
+    p_codex_rev = sub.add_parser("record-codex-review",
+                                  help="Record a Codex review result (clean, findings, or blocked)")
+    p_codex_rev.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_codex_rev.add_argument("--status", required=True,
+                             choices=sorted(CODEX_REVIEW_STATUSES),
+                             help="Codex review status")
+    p_codex_rev.add_argument("--head-sha", required=True, help="PR head commit SHA")
+    p_codex_rev.add_argument("--artifact-path", help="Path to Codex artifact JSON")
+    p_codex_rev.add_argument("--findings-count", type=int, help="Number of findings (required for findings status)")
+    p_codex_rev.add_argument("--highest-severity",
+                             choices=["none", "P3", "P2", "P1", "HIGH"],
+                             help="Highest severity among findings")
+    p_codex_rev.add_argument("--summary", help="Summary text of findings or clean result")
+    p_codex_rev.add_argument("--blocker-fingerprint", help="Fingerprint/hash identifying the blocker")
+
+    # record-codex-repair-result
+    p_codex_rep = sub.add_parser("record-codex-repair-result",
+                                  help="Record the result of a Codex repair attempt")
+    p_codex_rep.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_codex_rep.add_argument("--status", required=True,
+                             choices=["repaired", "failed", "blocked"],
+                             help="Repair outcome")
+    p_codex_rep.add_argument("--summary", help="Brief description of what was done")
+    p_codex_rep.add_argument("--blocker-fingerprint", help="Fingerprint matching the original blocker")
 
     # finalize-run
     p_fin = sub.add_parser("finalize-run", help="Mark run as complete")
@@ -852,7 +1134,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-task-result": _record_task_result,
         "record-repair-result": _record_repair_result,
         "record-pr-result": _record_pr_result,
-        "run-codex-review": _run_codex_review,
+        "record-codex-review": _record_codex_review,
+        "record-codex-repair-result": _record_codex_repair_result,
         "finalize-run": _finalize_run,
     }
 

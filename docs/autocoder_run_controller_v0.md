@@ -473,7 +473,7 @@ When human intervention is required, the controller produces `request_human` or 
 **Scenario 1: Repair limit exceeded**
 ```
 Next action: request_human
-Reason: repair limit exceeded for docs-example-001 (3 attempts)
+Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
 ```
 Resolution: Human reviews the repair history, makes the fix manually, then calls:
 ```bash
@@ -498,6 +498,149 @@ Next action: request_human
 Reason: scope_violation_reported
 ```
 Resolution: Human reviews the scope violation, decides whether to expand the allowed scope or abort the task, then records the updated task status via `record-task-result`.
+
+---
+
+## Codex Repair Loop
+
+The controller supports a bounded Codex repair loop for handling structured Codex review findings. This allows the operator to record Codex review results and let the controller determine the next action based on findings severity, repair attempt count, and blocker identity.
+
+### Codex Review State
+
+Initial state (set by `init`):
+```json
+{
+  "codex_review": {
+    "status": "not_started",
+    "head_sha": null,
+    "artifact_path": null,
+    "findings_count": 0,
+    "highest_severity": "none",
+    "repair_attempts": 0,
+    "max_repair_attempts": 2,
+    "same_blocker_count": 0,
+    "last_blocker_fingerprint": null
+  },
+  "codex_repair_events": []
+}
+```
+
+### CLI Commands
+
+#### record-codex-review
+
+Record a Codex review result (clean, findings, or blocked):
+
+```bash
+python3 scripts/local/autocoder_run_controller.py record-codex-review \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --status findings \
+  --head-sha abc123 \
+  --findings-count 3 \
+  --highest-severity P1 \
+  --summary "Found dependency issue and scope expansion" \
+  --blocker-fingerprint "dep-issue-v1"
+```
+
+For a clean review:
+```bash
+python3 scripts/local/autocoder_run_controller.py record-codex-review \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --status clean \
+  --head-sha abc123 \
+  --artifact-path /tmp/codex_artifact.json
+```
+
+#### record-codex-repair-result
+
+Record the outcome of a repair attempt triggered by Codex findings:
+
+```bash
+python3 scripts/local/autocoder_run_controller.py record-codex-repair-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --status repaired \
+  --summary "Fixed dependency version in requirements.txt" \
+  --blocker-fingerprint "dep-issue-v1"
+```
+
+For a failed repair:
+```bash
+python3 scripts/local/autocoder_run_controller.py record-codex-repair-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --status failed \
+  --summary "Could not resolve dependency conflict" \
+  --blocker-fingerprint "dep-issue-v1"
+```
+
+### Next Action Behavior
+
+After `record-codex-review`:
+
+| Codex Status | Condition | Next Action | Reason |
+|---|---|---|---|
+| `clean` | — | `run_task` | `codex_review_clean` |
+| `findings` | below repair limit | `repair_task` | `codex_findings` |
+| `findings` | repair limit reached | `request_human` | `codex_repair_limit_exceeded` |
+| `findings` | scope expansion keyword | `request_human` | `scope_expansion_required` |
+| `findings` | sensitive keyword found | `request_human` | `codex_findings_require_human:<keyword>` |
+| `findings` | same blocker twice | `request_human` | `same_codex_blocker_repeated` |
+| `blocked` | — | `request_human` | `codex_blocked` |
+| `repair_limit_exceeded` | — | `request_human` | `codex_repair_limit_exceeded` |
+
+After `record-codex-repair-result`:
+
+| Repair Status | Condition | Next Action | Reason |
+|---|---|---|---|
+| `repaired` | — | `request_human` | `await_codex_review_after_repair` |
+| `failed` | below repair limit | `repair_task` | `codex_repair_failed_retry` |
+| `failed` | at repair limit | `request_human` | `codex_repair_limit_exceeded` |
+| `blocked` | — | `request_human` | `codex_repair_blocked` |
+
+### Repair Limits
+
+- `max_repair_attempts`: 2 (set at init via `DEFAULT_MAX_CODEX_REPAIR`)
+- A repair attempt is counted when `record-codex-repair-result` is called with `repaired` or `failed`
+- Same blocker fingerprint appearing twice without a `repaired` status escalates immediately to `request_human`
+
+### Human Escalation Triggers
+
+The following findings automatically trigger `request_human` without consuming a repair attempt:
+
+| Finding | Reason |
+|---------|--------|
+| Scope expansion keyword | `scope_expansion_required` |
+| Dependency install keyword | `codex_findings_require_human:dependency` |
+| Security/credentials/secret keyword | `codex_findings_require_human:<keyword>` |
+| Payment/billing keyword | `codex_findings_require_human:payment` |
+| Production board keyword | `codex_findings_require_human:production_board` |
+| Dispatch/Hermes create keyword | `codex_findings_require_human:dispatch` |
+| Memory/profile/skill keyword | `codex_findings_require_human:<keyword>` |
+| Same blocker twice | `same_codex_blocker_repeated` |
+
+### Codex Repair Events
+
+Each `record-codex-review` and `record-codex-repair-result` call appends an event to `codex_repair_events`:
+
+```json
+{
+  "timestamp": "2026-05-18T16:10:00Z",
+  "source": "codex_review",
+  "head_sha": "abc123",
+  "artifact_path": "/tmp/codex_artifact.json",
+  "status": "findings",
+  "findings_count": 3,
+  "highest_severity": "P1",
+  "repair_attempt": 1,
+  "blocker_fingerprint": "dep-issue-v1",
+  "summary": "Found dependency issue"
+}
+```
+
+Events are append-only. The controller does not invoke Codex itself — it only records the results of Codex reviews run by the operator.
+
+### Controller Does Not Grant Merge Authority
+
+The controller does not become `MERGE_READY` from Codex clean alone. The finalization guard (`aed_final_gate.py`) is the authoritative enforcement point for MERGE_READY. Codex evidence is required by the finalization guard as a precondition, but the controller's Codex state is informational only.
 
 ### Example: Status Report During Run
 
