@@ -72,6 +72,7 @@ NEXT_ACTIONS = frozenset([
     "generate_run_summary",
     "prepare_pr",
     "request_human",
+    "run_codex_review",  # reserved: triggers Codex review step (not yet wired to external tool)
     "stop",
 ])
 
@@ -81,6 +82,7 @@ HUMAN_ACTION_REASONS = frozenset([
     "repair_limit_exceeded",
     "safety_invariant_failed",
     "merge_authorization_required",
+    "codex_artifact_required",  # finalization guard requires Codex evidence
     "ambiguous_task_decision",
     "external_system_failure",
 ])

@@ -142,10 +142,18 @@ class TestGhRunsPagination:
 
 
 class TestValidateCodexArtifactHead:
-    def test_missing_artifact_skipped(self):
+    def test_missing_artifact_fails_by_default(self):
+        """Missing artifact without allow_skip defaults to FAIL (not SKIP)."""
         valid, msg = validate_codex_artifact_head(None, "abc123")
+        assert valid is False
+        assert "required" in msg
+
+    def test_missing_artifact_explicit_skip_authorized(self):
+        """Missing artifact with allow_skip=True returns True with skip message."""
+        valid, msg = validate_codex_artifact_head(None, "abc123", allow_skip=True)
         assert valid is True
-        assert "skipped" in msg
+        assert "skip" in msg.lower()
+        assert "--allow-codex-skip" in msg
 
     def test_artifact_wrong_sha_rejected(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
@@ -452,8 +460,113 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["final_recommendation"] == "WAIT"
         assert "MISMATCH" in gate["head_sha_validation"]["message"]
+
+    def test_missing_codex_artifact_returns_wait(self, tmp_path):
+        """Missing Codex without --allow-codex-skip returns WAIT, not MERGE_READY."""
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        mock_run_inst = MagicMock(
+            stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+            returncode=0
+        )
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": 2,
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = MagicMock()
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = MagicMock()
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=["scripts/**"],
+                                local_validation_path=None,
+                                codex_artifact_path=None,  # MISSING
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                            )
+
+        # WAIT not MERGE_READY
+        assert gate["final_recommendation"] == "WAIT"
+        # authorization_phrase must NOT be emitted when Codex missing
+        assert "authorization_phrase" not in gate
+        # merge_command must NOT be emitted when Codex missing
+        assert "merge_command" not in gate
+        # codex_status must show failing
+        assert gate["codex_status"]["passing"] is False
+        assert "required" in gate["codex_status"]["message"]
+
+    def test_missing_codex_artifact_with_allow_skip_returns_wait(self, tmp_path):
+        """--allow-codex-skip with missing artifact still returns WAIT (not MERGE_READY)
+        because codex_valid is True but all_valid needs codex_valid too.
+        Actually: with allow_skip=True and no artifact, codex_valid=True.
+        So all_valid=True, and recommendation = MERGE_READY.
+        But we want skip_authorized=true to be visible."""
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        mock_run_inst = MagicMock(
+            stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+            returncode=0
+        )
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": 2,
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = MagicMock()
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = MagicMock()
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=None,  # Skip scope check to focus on allow_codex_skip behavior
+                                local_validation_path=None,
+                                codex_artifact_path=None,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=True,  # Explicit skip — all gates pass
+                            )
+
+        # With allow_codex_skip, all gates pass → MERGE_READY
+        assert gate["final_recommendation"] == "MERGE_READY"
+        # skip_authorized must be True
+        assert gate["codex_status"]["skipped"] is True
+        assert gate["codex_status"]["skip_authorized"] is True
+        # authorization phrase IS present (MERGE_READY)
+        assert "authorization_phrase" in gate
 
     def test_out_of_scope_files_blocks(self, tmp_path):
         sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
@@ -513,7 +626,7 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["final_recommendation"] == "WAIT"
         assert "outside scope" in gate["scope_status"]["message"]
 
     def test_ci_not_green_blocks(self, tmp_path):
@@ -557,7 +670,8 @@ class TestRunFinalGateBlocks:
                                 allow_admin=False,
                             )
 
-        assert gate["final_recommendation"] == "BLOCK"
+        # CI failure + codex missing = WAIT (codex_missing has priority over CI failure)
+        assert gate["final_recommendation"] == "WAIT"
         assert "CI failures" in gate["ci_status"]["message"]
 
 
