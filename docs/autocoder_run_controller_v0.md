@@ -468,12 +468,12 @@ Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
 
 ### Example: Human Action Requests
 
-When the controller cannot proceed automatically, it returns `request_human` with a reason:
+When human intervention is required, the controller produces `request_human` or `stop` as its next action. The specific scenario is determined by the operator and recorded manually — the controller records the state, not the classification.
 
 **Scenario 1: Repair limit exceeded**
 ```
 Next action: request_human
-Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
+Reason: repair limit exceeded for docs-example-001 (3 attempts)
 ```
 Resolution: Human reviews the repair history, makes the fix manually, then calls:
 ```bash
@@ -492,12 +492,12 @@ overall_status: RUN_FAILED_SAFETY
 ```
 Resolution: Human reviews what triggered the invariant (e.g. Hermes create call), then either corrects the issue or abandons the run.
 
-**Scenario 3: Scope expansion required**
+**Scenario 3: Scope violation recorded by operator**
 ```
 Next action: request_human
-Reason: task requires touching forbidden file: src/core.rs
+Reason: scope_violation_reported
 ```
-Resolution: Human reviews whether to expand the allowed scope or abort the task.
+Resolution: Human reviews the scope violation, decides whether to expand the allowed scope or abort the task, then records the updated task status via `record-task-result`.
 
 ### Example: Status Report During Run
 
