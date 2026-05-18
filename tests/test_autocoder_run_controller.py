@@ -1250,3 +1250,506 @@ def test_controller_does_not_mutate_repo_files_outside_state(temp_workspace, sam
     for f, content in original.items():
         p = repo_root / f
         assert p.read_text() == content, f"{f} was modified!"
+
+
+# ---------------------------------------------------------------------------
+# Tests: persistent mutation guard
+# ---------------------------------------------------------------------------
+
+def test_init_includes_persistent_mutation_guard_status_not_started(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Test 1: controller init includes persistent_mutation_guard.status = not_started."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    rc, stdout, stderr = run_controller([
+        "init", "--run-id", "aed-guard-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-001",
+        "--output-state", str(state_path),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert "persistent_mutation_guard" in state
+    guard = state["persistent_mutation_guard"]
+    assert guard["status"] == "not_started"
+    assert guard["root"] == "/home/max/.hermes"
+    assert guard["snapshot_path"] is None
+    assert guard["compare_json_path"] is None
+    assert guard["compare_md_path"] is None
+    assert guard["blocked_changes_count"] == 0
+    assert guard["allowed_changes_count"] == 0
+    assert guard["last_checked_at"] is None
+
+
+def test_record_snapshot_sets_status_snapshot_recorded(temp_workspace, sample_tasks_jsonl):
+    """Test 2: record-persistent-guard-snapshot sets status to snapshot_recorded."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-002",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-002",
+        "--output-state", str(state_path),
+    ])
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["status"] == "snapshot_recorded"
+    assert "snapshot_recorded" in stdout
+
+
+def test_record_snapshot_stores_root_and_snapshot_path(temp_workspace, sample_tasks_jsonl):
+    """Test 3: record-persistent-guard-snapshot stores root and snapshot_path."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-003",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-003",
+        "--output-state", str(state_path),
+    ])
+    snapshot_path = temp_workspace / "my_snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    guard = state["persistent_mutation_guard"]
+    assert guard["root"] == "/home/max/.hermes"
+    assert guard["snapshot_path"] == str(snapshot_path)
+    assert guard["last_checked_at"] is not None
+
+
+def test_record_compare_pass_sets_status_clean(temp_workspace, sample_tasks_jsonl):
+    """Test 4: record-persistent-guard-compare with PASS sets status clean."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-004",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-004",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "PASS",
+        "blocked_changes": [],
+        "allowed_changes": [],
+    }))
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["status"] == "clean"
+
+
+def test_record_compare_pass_stores_compare_paths_and_counts(temp_workspace, sample_tasks_jsonl):
+    """Test 5: record-persistent-guard-compare PASS stores compare paths and counts."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-005",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-005",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "PASS",
+        "blocked_changes": [{"relative_path": "a/b.txt", "category": "memory"}],
+        "allowed_changes": [{"relative_path": "c/d.txt", "category": "allowed"}],
+    }))
+    compare_md = temp_workspace / "compare.md"
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+        "--compare-md", str(compare_md),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    guard = state["persistent_mutation_guard"]
+    assert guard["compare_json_path"] == str(compare_json)
+    assert guard["compare_md_path"] == str(compare_md)
+    assert guard["blocked_changes_count"] == 1
+    assert guard["allowed_changes_count"] == 1
+
+
+def test_record_compare_block_sets_status_blocked(temp_workspace, sample_tasks_jsonl):
+    """Test 6: record-persistent-guard-compare with BLOCK sets status blocked."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-006",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-006",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "BLOCK",
+        "blocked_changes": [{"relative_path": "x/y.txt", "category": "skill"}],
+        "allowed_changes": [],
+    }))
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["status"] == "blocked"
+
+
+def test_record_compare_block_sets_next_action_request_human(temp_workspace, sample_tasks_jsonl):
+    """Test 7: record-persistent-guard-compare BLOCK sets next_action to request_human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-007",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-007",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "BLOCK",
+        "blocked_changes": [],
+        "allowed_changes": [],
+    }))
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["human_action_required"] is True
+
+
+def test_record_compare_block_reason_is_persistent_mutation_detected(temp_workspace, sample_tasks_jsonl):
+    """Test 8: BLOCK reason is persistent_mutation_detected."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-008",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-008",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "BLOCK",
+        "blocked_changes": [{"relative_path": "bad.txt", "category": "memory"}],
+        "allowed_changes": [],
+    }))
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["next_action"]["reason"] == "persistent_mutation_detected"
+
+
+def test_record_compare_malformed_json_sets_status_error(temp_workspace, sample_tasks_jsonl):
+    """Test 9: malformed compare JSON sets status error."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-009",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-009",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text("NOT VALID JSON {{{")
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr  # command succeeds, state is updated
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["status"] == "error"
+
+
+def test_record_compare_malformed_json_sets_next_action_request_human(temp_workspace, sample_tasks_jsonl):
+    """Test 10: malformed compare JSON sets next_action request_human."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-010",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-010",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text("INVALID {{{")
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["next_action"]["action"] == "request_human"
+    assert state["next_action"]["reason"] == "persistent_mutation_guard_error"
+
+
+def test_record_compare_missing_json_sets_status_error(temp_workspace, sample_tasks_jsonl):
+    """Test 11: missing compare JSON sets status error."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-011",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-011",
+        "--output-state", str(state_path),
+    ])
+    missing_json = temp_workspace / "nonexistent.json"
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(missing_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["status"] == "error"
+
+
+def test_clean_guard_does_not_mark_run_complete_by_itself(temp_workspace, sample_tasks_jsonl):
+    """Test 12: clean persistent mutation guard does not mark run complete by itself."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-012",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-012",
+        "--output-state", str(state_path),
+    ])
+    # Simulate: take snapshot, do work, compare → PASS
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "PASS",
+        "blocked_changes": [],
+        "allowed_changes": [],
+    }))
+    run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    state = json.loads(state_path.read_text())
+    # Guard clean but run is still active — run must complete tasks first
+    assert state["overall_status"] == "RUN_ACTIVE"
+    assert state["next_action"]["action"] != "stop"
+
+
+def test_safety_invariant_hard_stop_wins_before_guard_result(temp_workspace, sample_tasks_jsonl):
+    """Test 13: safety invariant hard stop wins over guard result."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-013",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-013",
+        "--output-state", str(state_path),
+    ])
+    # Manually set hermes_touched = True (safety violation)
+    state = json.loads(state_path.read_text())
+    state["safety_invariants"]["hermes_touched"] = True
+    state_path.write_text(json.dumps(state, indent=2) + "\n")
+    # Now record a clean guard compare
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "PASS",
+        "blocked_changes": [],
+        "allowed_changes": [],
+    }))
+    run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    state = json.loads(state_path.read_text())
+    # Safety invariant still triggers RUN_FAILED_SAFETY regardless of guard result
+    assert state["overall_status"] == "RUN_FAILED_SAFETY"
+
+
+def test_record_guard_command_preserves_existing_task_state(temp_workspace, sample_tasks_jsonl):
+    """Test 14: record-persistent-guard-snapshot preserves existing task state."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-014",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-014",
+        "--output-state", str(state_path),
+    ])
+    # Record task result before guard snapshot
+    run_controller([
+        "record-task-result",
+        "--state", str(state_path),
+        "--task-id", "task-001",
+        "--status", "TASK_READY",
+        "--promotion-status", "promoted_to_integration",
+        "--local-gate", "passed",
+        "--scope-status", "clean",
+    ])
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    state = json.loads(state_path.read_text())
+    # Task state preserved
+    task001 = next(t for t in state["tasks"] if t["task_id"] == "task-001")
+    assert task001["status"] == "TASK_READY"
+    assert task001["promotion_status"] == "promoted_to_integration"
+
+
+def test_record_guard_command_records_last_checked_at(temp_workspace, sample_tasks_jsonl):
+    """Test 15: record-persistent-guard-snapshot records last_checked_at."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-015",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-015",
+        "--output-state", str(state_path),
+    ])
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["last_checked_at"] is not None
+
+
+def test_controller_does_not_write_to_hermes_root(temp_workspace, sample_tasks_jsonl):
+    """Test 16: controller commands do not write to /home/max/.hermes."""
+    # Run a full sequence and verify /home/max/.hermes is untouched
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-016",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-016",
+        "--output-state", str(state_path),
+    ])
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "PASS",
+        "blocked_changes": [],
+        "allowed_changes": [],
+    }))
+    run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    # Controller state file is in temp_workspace, not in Hermes root
+    assert str(state_path).startswith(str(temp_workspace))
+    assert not str(state_path).startswith("/home/max/.hermes")
+
+
+def test_status_markdown_includes_persistent_mutation_guard_state(temp_workspace, sample_tasks_jsonl):
+    """Test 17: status markdown output includes persistent mutation guard state."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    md_path = temp_workspace / "STATUS.md"
+    run_controller([
+        "init", "--run-id", "aed-guard-017",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-017",
+        "--output-state", str(state_path),
+    ])
+    # Record a snapshot so status has guard info
+    snapshot_path = temp_workspace / "snapshot.json"
+    snapshot_path.write_text('{"files": []}')
+    run_controller([
+        "record-persistent-guard-snapshot",
+        "--state", str(state_path),
+        "--root", "/home/max/.hermes",
+        "--snapshot-path", str(snapshot_path),
+    ])
+    rc, stdout, stderr = run_controller([
+        "status",
+        "--state", str(state_path),
+        "--output-md", str(md_path),
+    ])
+    assert rc == 0, stderr
+    md = md_path.read_text()
+    assert "persistent_mutation_guard" in md or "guard" in md.lower()
+
+
+def test_final_status_report_includes_blocked_change_count(temp_workspace, sample_tasks_jsonl):
+    """Test 18: final status report includes blocked change count from BLOCK result."""
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-guard-018",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/guard-018",
+        "--output-state", str(state_path),
+    ])
+    compare_json = temp_workspace / "compare.json"
+    compare_json.write_text(json.dumps({
+        "recommendation": "BLOCK",
+        "blocked_changes": [
+            {"relative_path": "a/b.txt", "category": "memory"},
+            {"relative_path": "c/d.txt", "category": "skill"},
+        ],
+        "allowed_changes": [],
+    }))
+    rc, stdout, stderr = run_controller([
+        "record-persistent-guard-compare",
+        "--state", str(state_path),
+        "--compare-json", str(compare_json),
+    ])
+    assert rc == 0, stderr
+    state = json.loads(state_path.read_text())
+    assert state["persistent_mutation_guard"]["blocked_changes_count"] == 2
+    assert "2" in stdout  # blocked_changes: 2

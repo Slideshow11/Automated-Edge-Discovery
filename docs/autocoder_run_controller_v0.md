@@ -91,6 +91,16 @@ The controller writes `CONTROLLER_STATE.json` with the following structure:
     "production_board_touched": false,
     "memory_or_profile_updated": false,
     "skills_created": false
+  },
+  "persistent_mutation_guard": {
+    "status": "not_started",
+    "root": "/home/max/.hermes",
+    "snapshot_path": null,
+    "compare_json_path": null,
+    "compare_md_path": null,
+    "blocked_changes_count": 0,
+    "allowed_changes_count": 0,
+    "last_checked_at": null
   }
 }
 ```
@@ -151,6 +161,8 @@ Used when `next_action.action == "request_human"`:
 | `merge_authorization_required` | PR is ready but requires explicit human authorization |
 | `ambiguous_task_decision` | Controller cannot determine the correct path |
 | `external_system_failure` | An external dependency (CI, Codex, etc.) failed |
+| `persistent_mutation_detected` | Persistent mutation guard found unexpected Hermes state changes |
+| `persistent_mutation_guard_error` | Guard compare report missing or malformed |
 
 ---
 
@@ -301,6 +313,33 @@ python3 scripts/local/autocoder_run_controller.py record-pr-result \
 ```bash
 python3 scripts/local/autocoder_run_controller.py finalize-run \
   --state /tmp/aed_run/CONTROLLER_STATE.json
+```
+
+### Record persistent mutation guard snapshot
+
+Record the guard snapshot path before AED work begins. The runner should already
+have executed `check_persistent_mutation_guard.py snapshot --root /home/max/.hermes --output <path>`.
+The controller only records the path — it does NOT execute the guard.
+
+```bash
+python3 scripts/local/autocoder_run_controller.py record-persistent-guard-snapshot \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --root /home/max/.hermes \
+  --snapshot-path /tmp/aed_runs/aed-run-001/persistent_state_before.json
+```
+
+### Record persistent mutation guard compare
+
+Record the guard compare result after AED work completes. Reads the compare JSON
+and updates controller state: PASS → guard clean, BLOCK → request_human, missing/malformed → request_human.
+Safety hard stop (hermes_touched, dispatch_occurred, production_board_touched) is checked first
+and wins over any guard result.
+
+```bash
+python3 scripts/local/autocoder_run_controller.py record-persistent-guard-compare \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --compare-json /tmp/aed_runs/aed-run-001/persistent_state_after.json \
+  --compare-md /tmp/aed_runs/aed-run-001/persistent_state_report.md
 ```
 
 ---
