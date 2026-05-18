@@ -383,6 +383,135 @@ RUN_ACTIVE ──────► RUN_READY_FOR_SUMMARY ────────�
 
 ---
 
+## Usage Examples
+
+### Example: Running a 3-Task Docs Session
+
+This example shows how the controller tracks state across a 3-task chained docs session.
+
+**Initialize:**
+```bash
+python3 scripts/local/autocoder_run_controller.py init \
+  --run-id aed-run-001 \
+  --tasks-jsonl /tmp/aed_run/TASKS.jsonl \
+  --bundle-index /tmp/aed_run/BUNDLE_INDEX.json \
+  --workspace /tmp/aed_run \
+  --integration-branch integration/aed-run-001 \
+  --output-state /tmp/aed_run/CONTROLLER_STATE.json
+```
+
+**Check next action:**
+```bash
+python3 scripts/local/autocoder_run_controller.py next \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --output-md /tmp/aed_run/NEXT_ACTION.md
+```
+
+Initial output:
+```
+Next action: run_task
+Task: docs-example-001
+Reason: next dependency-satisfied pending task
+```
+
+**After completing task 1 and recording:**
+```bash
+python3 scripts/local/autocoder_run_controller.py record-task-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --task-id docs-example-001 \
+  --status TASK_READY \
+  --promotion-status promoted_to_integration \
+  --local-gate passed \
+  --scope-status clean
+```
+
+Controller automatically advances to task 2. Repeat for each task.
+
+**When all tasks are promoted:**
+```
+Next action: generate_run_summary
+Reason: all non-skipped tasks are promoted or ready
+```
+
+### Example: Repair Loop
+
+When a task fails its local gate:
+
+```bash
+# Task blocked — record the failure
+python3 scripts/local/autocoder_run_controller.py record-task-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --task-id docs-example-001 \
+  --status TASK_BLOCKED \
+  --promotion-status not_promoted \
+  --blocker-code local_gate_failed \
+  --blocker-summary "Markdown table lint error at line 42"
+
+# Controller returns: repair_task for docs-example-001
+# ... fix the issue ...
+python3 scripts/local/autocoder_run_controller.py record-repair-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --task-id docs-example-001 \
+  --repair-id docs-example-001.R1 \
+  --source local_gate \
+  --status repaired \
+  --summary "Fixed markdown table alignment"
+
+# Task reset to TASK_PENDING — rerun
+```
+
+If repair limit is exceeded:
+```
+Next action: request_human
+Reason: repair limit exceeded for docs-example-001 (3/3 attempts)
+```
+
+### Example: Human Action Requests
+
+When human intervention is required, the controller produces `request_human` or `stop` as its next action. The specific scenario is determined by the operator and recorded manually — the controller records the state, not the classification.
+
+**Scenario 1: Repair limit exceeded**
+```
+Next action: request_human
+Reason: repair limit exceeded for docs-example-001 (3 attempts)
+```
+Resolution: Human reviews the repair history, makes the fix manually, then calls:
+```bash
+python3 scripts/local/autocoder_run_controller.py record-task-result \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --task-id docs-example-001 \
+  --status TASK_READY \
+  --promotion-status promoted_to_integration
+```
+
+**Scenario 2: Safety invariant triggered**
+```
+Next action: stop
+Reason: safety invariant violated
+overall_status: RUN_FAILED_SAFETY
+```
+Resolution: Human reviews what triggered the invariant (e.g. Hermes create call), then either corrects the issue or abandons the run.
+
+**Scenario 3: Scope violation recorded by operator**
+```
+Next action: request_human
+Reason: scope_violation_reported
+```
+Resolution: Human reviews the scope violation, decides whether to expand the allowed scope or abort the task, then records the updated task status via `record-task-result`.
+
+### Example: Status Report During Run
+
+```bash
+python3 scripts/local/autocoder_run_controller.py status \
+  --state /tmp/aed_run/CONTROLLER_STATE.json \
+  --output-md /tmp/aed_run/STATUS.md
+```
+
+Generates a markdown table showing all tasks, their statuses, promotion states,
+repair counts, and blockers.
+
+---
+
 ## Future V1 Directions
 
 - Automatic promotion of `TASK_READY` tasks to integration branch
