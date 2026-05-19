@@ -484,30 +484,68 @@ def extract_plan_from_stream(stdout: str) -> str:
     """
     Extract plan text from Claude Code --output-format stream-json output.
     Returns the accumulated text content.
+
+    Handles these stream-json shapes:
+    - Delta format:       {"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+    - Tool-use format:    {"type":"message","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"..."}}]}}
+    - Result format:      {"type":"result","subtype":"success","result":"..."}
+    - Simple text delta:  {"text":"..."}
     """
     lines = stdout.splitlines()
     plan_parts: list[str] = []
     for line in lines:
-        if not line.strip():
+        line = line.strip()
+        if not line:
             continue
         try:
             obj = json.loads(line)
-            # Look for text content in streaming JSON
-            if isinstance(obj, dict):
-                # delta format
-                if "content" in obj:
-                    content = obj["content"]
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                plan_parts.append(block.get("text", ""))
-                    elif isinstance(content, str):
-                        plan_parts.append(content)
-                # simple text format
-                elif "text" in obj:
-                    plan_parts.append(obj["text"])
+            if not isinstance(obj, dict):
+                continue
+
+            obj_type = obj.get("type", "")
+
+            # message type: nested content inside message.content
+            # Example: {"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+            if obj_type == "message":
+                msg = obj.get("message", {})
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type", "")
+                        if btype == "text":
+                            text = block.get("text", "")
+                            if text:
+                                plan_parts.append(text)
+                        elif btype == "tool_use":
+                            name = block.get("name", "")
+                            inp = block.get("input", {})
+                            # ExitPlanMode embeds the full markdown plan in the input
+                            if name == "ExitPlanMode" and "plan" in inp:
+                                plan_text = inp["plan"]
+                                if plan_text:
+                                    plan_parts.append(plan_text)
+                elif isinstance(content, str) and content:
+                    # Fallback: content as plain string
+                    plan_parts.append(content)
+
+            # result type: end-of-session summary with plan text
+            # Example: {"type":"result","subtype":"success","result":"The plan file..."}
+            elif obj_type == "result":
+                result_text = obj.get("result", "")
+                if result_text:
+                    plan_parts.append(result_text)
+
+            # Simple text delta format: {"text": "..."}
+            elif "text" in obj:
+                text = obj["text"]
+                if isinstance(text, str) and text:
+                    plan_parts.append(text)
+
         except json.JSONDecodeError:
             continue
+
     return "\n".join(plan_parts)
 
 

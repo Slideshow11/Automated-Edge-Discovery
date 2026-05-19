@@ -458,6 +458,68 @@ class TestInvokeClaudePlan:
                 assert len(snippet) <= 200
 
 
+class TestExtractPlanFromStream:
+    """Test extract_plan_from_stream against actual stream-json shapes."""
+
+    def test_message_with_text_block(self):
+        import run_plan_preview as rpp
+        stream = json.dumps({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "Step 1: Read the file"}]}})
+        result = rpp.extract_plan_from_stream(stream + "\n")
+        assert "Step 1: Read the file" in result
+
+    def test_message_with_exitplanmode_tool_use(self):
+        import run_plan_preview as rpp
+        stream = json.dumps({
+            "type": "message", "message": {"role": "assistant", "content": [{
+                "type": "tool_use", "name": "ExitPlanMode",
+                "input": {"plan": "# Plan\n\n## Step 1\n\nEdit foo.py", "planFilePath": "/tmp/plan.md"}
+            }]}
+        })
+        result = rpp.extract_plan_from_stream(stream + "\n")
+        assert "# Plan" in result
+        assert "Step 1" in result
+
+    def test_result_type_extracts_result_text(self):
+        import run_plan_preview as rpp
+        stream = json.dumps({"type": "result", "subtype": "success", "result": "The plan is ready at /tmp/plan.md"})
+        result = rpp.extract_plan_from_stream(stream + "\n")
+        assert "plan is ready" in result
+
+    def test_simple_text_delta(self):
+        import run_plan_preview as rpp
+        stream = '{"text": "Step 1: Edit config.yaml"}\n'
+        result = rpp.extract_plan_from_stream(stream)
+        assert "Step 1: Edit config.yaml" in result
+
+    def test_skips_malformed_json(self):
+        import run_plan_preview as rpp
+        stream = 'not-json\n{"type": "message", "message": {"content": []}}\n'
+        result = rpp.extract_plan_from_stream(stream)
+        assert result == ""
+
+    def test_skips_non_dict_json(self):
+        import run_plan_preview as rpp
+        stream = '["array", "not", "dict"]\n{"type": "message", "message": {"content": [{"type": "text", "text": "real plan"}]}}'
+        result = rpp.extract_plan_from_stream(stream)
+        assert "real plan" in result
+
+    def test_multiple_plan_blocks_concatenated(self):
+        import run_plan_preview as rpp
+        stream = (
+            '{"type": "message", "message": {"content": [{"type": "text", "text": "Part 1"}]}}\n'
+            '{"type": "result", "result": "Summary line"}\n'
+        )
+        result = rpp.extract_plan_from_stream(stream)
+        assert "Part 1" in result
+        assert "Summary line" in result
+
+    def test_empty_content_block_skipped(self):
+        import run_plan_preview as rpp
+        stream = '{"type": "message", "message": {"content": []}}\n'
+        result = rpp.extract_plan_from_stream(stream)
+        assert result == ""
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 
