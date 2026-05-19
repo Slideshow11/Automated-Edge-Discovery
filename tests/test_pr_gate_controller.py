@@ -1184,6 +1184,8 @@ class TestPersistentMutationGuard:
         block_json.write_text(json.dumps({
             "status": "blocked",
             "recommendation": "BLOCK",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [
                 {"relative_path": "skills/test-skill/SKILL.md", "change": "added"}
             ],
@@ -1214,6 +1216,8 @@ class TestPersistentMutationGuard:
         clean_json.write_text(json.dumps({
             "status": "clean",
             "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [],
             "allowed_changes": [],
         }))
@@ -1261,6 +1265,7 @@ class TestPersistentMutationGuard:
         clean_json = tmp_output_dir / "clean_compare.json"
         clean_json.write_text(json.dumps({
             "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [], "allowed_changes": [],
         }))
 
@@ -1305,6 +1310,7 @@ class TestPersistentMutationGuard:
         clean_json = tmp_output_dir / "clean_compare.json"
         clean_json.write_text(json.dumps({
             "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [], "allowed_changes": [],
         }))
 
@@ -1354,6 +1360,7 @@ class TestPersistentMutationGuard:
         clean_json = tmp_output_dir / "clean_compare.json"
         clean_json.write_text(json.dumps({
             "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [], "allowed_changes": [],
         }))
 
@@ -1401,6 +1408,8 @@ class TestPersistentMutationGuard:
         block_json.write_text(json.dumps({
             "status": "blocked",
             "recommendation": "BLOCK",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [
                 {"relative_path": "skills/new-skill/SKILL.md", "change": "added"}
             ],
@@ -1430,6 +1439,8 @@ class TestPersistentMutationGuard:
         block_json = tmp_output_dir / "block_compare.json"
         block_json.write_text(json.dumps({
             "status": "blocked", "recommendation": "BLOCK",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [{"relative_path": "skills/new-skill/SKILL.md", "change": "added"}],
             "allowed_changes": [],
         }))
@@ -1458,6 +1469,7 @@ class TestPersistentMutationGuard:
         clean_json = tmp_output_dir / "clean_compare.json"
         clean_json.write_text(json.dumps({
             "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [], "allowed_changes": [],
         }))
 
@@ -1501,6 +1513,7 @@ class TestPersistentMutationGuard:
         clean_json = tmp_output_dir / "clean_compare.json"
         clean_json.write_text(json.dumps({
             "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z",
             "blocked_changes": [], "allowed_changes": [],
         }))
 

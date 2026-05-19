@@ -387,6 +387,9 @@ def compare(
         "profile_blocked": profile_blocked,
         "memory_blocked": memory_blocked,
         "recommendation": recommendation,
+        # snapshot metadata for temporal validation
+        "snapshot_at": before_data.get("snapshot_at", ""),
+        "compare_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
     try:

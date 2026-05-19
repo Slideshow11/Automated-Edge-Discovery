@@ -39,6 +39,13 @@ FORBIDDEN_EXECUTABLE_CALLS = [
     "cronjob",
 ]
 
+# Maximum age of a PMG compare JSON before it is considered stale.
+# A clean compare JSON older than this relative to gate execution is rejected.
+# This closes the gap where a Hermes mutation occurs after compare but before
+# finalization — the old clean compare would still appear valid by ordering but
+# is stale by wall-clock age.
+MAX_COMPARE_AGE_SECONDS = 600  # 10 minutes
+
 
 def forbidden_executable_check(code: str) -> list[str]:
     """Return list of forbidden strings found in code (not in comments/constants)."""
@@ -240,9 +247,50 @@ def _run_persistent_guard_validate(
         state["status"] = "error"
         state["message"] = msg
         return state
-
+    # Load compare JSON to extract counts
     with open(compare_json_path) as f:
         data = json.load(f)
+
+    # Temporal validation: compare JSON must carry timestamps proving the compare
+    # ran AFTER the snapshot. A pre-generated clean compare JSON is not acceptable.
+    snapshot_at_str = data.get("snapshot_at", "")
+    compare_at_str = data.get("compare_at", "")
+
+    if not snapshot_at_str:
+        state["status"] = "error"
+        state["message"] = "compare JSON missing snapshot_at: temporal ordering unverifiable"
+        return state
+
+    if not compare_at_str:
+        state["status"] = "error"
+        state["message"] = "compare JSON missing compare_at: temporal ordering unverifiable"
+        return state
+
+    try:
+        snapshot_dt = datetime.fromisoformat(snapshot_at_str.replace("Z", "+00:00"))
+        compare_dt = datetime.fromisoformat(compare_at_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError) as e:
+        state["status"] = "error"
+        state["message"] = f"compare JSON has unparseable timestamp: {e}"
+        return state
+
+    if compare_dt < snapshot_dt:
+        state["status"] = "error"
+        state["message"] = "compare JSON is temporally stale (compare_at < snapshot_at): pre-generated compare rejected"
+        return state
+
+    # Freshness check: compare JSON must be recent relative to gate execution.
+    # A clean compare generated before a Hermes mutation (between compare and gate)
+    # could still have valid ordering but is stale by wall-clock age.
+    gate_dt = datetime.now(timezone.utc)
+    compare_age_seconds = (gate_dt - compare_dt).total_seconds()
+    if compare_age_seconds > MAX_COMPARE_AGE_SECONDS:
+        state["status"] = "error"
+        state["message"] = (
+            f"compare JSON is stale (compare_at is {compare_age_seconds:.0f}s older than "
+            f"gate execution, max {MAX_COMPARE_AGE_SECONDS}s): pre-generated compare rejected"
+        )
+        return state
 
     rec = data.get("recommendation", "UNKNOWN")
     state["status"] = "clean" if rec == "PASS" else "blocked"

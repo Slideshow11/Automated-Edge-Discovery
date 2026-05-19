@@ -1140,6 +1140,8 @@ class TestPersistentMutationGuardFinalGate:
             compare_json_path=cmp_path,
             compare_json_content={
                 "status": "blocked", "recommendation": "BLOCK",
+                "snapshot_at": "2026-05-19T12:34:45Z",
+                "compare_at": "2026-05-19T12:35:15Z",
                 "blocked_changes": [{"relative_path": ".hermes/some_skill", "change_type": "added"}],
                 "allowed_changes": [],
             }
@@ -1158,6 +1160,8 @@ class TestPersistentMutationGuardFinalGate:
             compare_json_path=cmp_path,
             compare_json_content={
                 "status": "clean", "recommendation": "PASS",
+                "snapshot_at": "2026-05-19T12:34:45Z",
+                "compare_at": "2026-05-19T12:35:15Z",
                 "blocked_changes": [],
                 "allowed_changes": [{"relative_path": "scripts/local/a.py", "change_type": "modified"}],
             }
@@ -1174,7 +1178,7 @@ class TestPersistentMutationGuardFinalGate:
         gate = self._run_gate_with_pmg(
             tmp_path, require_pmg=True,
             compare_json_path=cmp_path,
-            compare_json_content={"status": "clean", "recommendation": "PASS"},
+            compare_json_content={"status": "clean", "recommendation": "PASS", "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"},
         )
         # Force stale head by patching expected_head_sha
         output_json = tmp_path / "FINAL_GATE.json"
@@ -1233,7 +1237,7 @@ class TestPersistentMutationGuardFinalGate:
         gate = self._run_gate_with_pmg(
             tmp_path, require_pmg=True,
             compare_json_path=cmp_path,
-            compare_json_content={"status": "clean", "recommendation": "PASS"},
+            compare_json_content={"status": "clean", "recommendation": "PASS", "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"},
         )
         output_json = tmp_path / "FINAL_GATE.json"
         output_md = tmp_path / "FINAL_GATE.md"
@@ -1319,7 +1323,7 @@ class TestPersistentMutationGuardFinalGate:
         gate = self._run_gate_with_pmg(
             tmp_path, require_pmg=True,
             compare_json_path=cmp_path,
-            compare_json_content={"status": "clean", "recommendation": "PASS"},
+            compare_json_content={"status": "clean", "recommendation": "PASS", "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"},
         )
         assert "persistent_mutation_guard" in gate
         pmg = gate["persistent_mutation_guard"]
@@ -1333,7 +1337,7 @@ class TestPersistentMutationGuardFinalGate:
         gate = self._run_gate_with_pmg(
             tmp_path, require_pmg=True,
             compare_json_path=cmp_path,
-            compare_json_content={"status": "clean", "recommendation": "PASS"},
+            compare_json_content={"status": "clean", "recommendation": "PASS", "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"},
         )
         md_path = tmp_path / "FINAL_GATE.md"
         content = md_path.read_text()
@@ -1349,7 +1353,7 @@ class TestPersistentMutationGuardFinalGate:
         gate = self._run_gate_with_pmg(
             tmp_path, require_pmg=True,
             compare_json_path=cmp_path,
-            compare_json_content={"status": "clean", "recommendation": "PASS"},
+            compare_json_content={"status": "clean", "recommendation": "PASS", "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"},
         )
         output_json = tmp_path / "FINAL_GATE.json"
         output_md = tmp_path / "FINAL_GATE.md"
@@ -1407,7 +1411,8 @@ class TestPersistentMutationGuardFinalGate:
         sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
 
         # Write compare JSON fixture to real filesystem
-        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS"}))
+        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"}))
 
         output_json = tmp_path / "FINAL_GATE.json"
         output_md = tmp_path / "FINAL_GATE.md"
@@ -1450,7 +1455,8 @@ class TestPersistentMutationGuardFinalGate:
         sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
 
         # Write compare JSON fixture to real filesystem
-        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS"}))
+        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z", "compare_at": "2026-05-19T12:35:15Z"}))
 
         output_json = tmp_path / "FINAL_GATE.json"
         output_md = tmp_path / "FINAL_GATE.md"
@@ -1493,6 +1499,269 @@ class TestPersistentMutationGuardFinalGate:
         assert gate["final_recommendation"] == "BLOCK"
         assert gate["codex_status"]["passing"] is False
         assert gate["persistent_mutation_guard"]["status"] == "clean"
+
+    # -------------------------------------------------------------------------
+    # Temporal validation tests (PMG compare JSON timestamps)
+    # -------------------------------------------------------------------------
+
+    def test_temporal_missing_snapshot_at_returns_block(self, tmp_path):
+        """Compare JSON missing snapshot_at → BLOCK (temporal ordering unverifiable)."""
+        cmp_path = str(tmp_path / "no_snapshot.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "compare_at": "2026-05-19T12:00:00Z",
+            # snapshot_at deliberately omitted
+        }))
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE",
+            "recommendation": "MERGE_READY",
+        }))
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231, expected_head_sha=sha,
+                            allowed_files=None, local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False, allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "missing snapshot_at" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
+    def test_temporal_missing_compare_at_returns_block(self, tmp_path):
+        """Compare JSON missing compare_at → BLOCK (temporal ordering unverifiable)."""
+        cmp_path = str(tmp_path / "no_compare.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T11:00:00Z",
+            # compare_at deliberately omitted
+        }))
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE",
+            "recommendation": "MERGE_READY",
+        }))
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231, expected_head_sha=sha,
+                            allowed_files=None, local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False, allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "missing compare_at" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
+    def test_temporal_stale_compare_returns_block(self, tmp_path):
+        """compare_at earlier than snapshot_at → BLOCK (pre-generated compare rejected)."""
+        cmp_path = str(tmp_path / "stale_compare.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        # compare was generated BEFORE the snapshot — temporally impossible
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:00:00Z",
+            "compare_at": "2026-05-19T11:00:00Z",  # compare ran before snapshot
+        }))
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE",
+            "recommendation": "MERGE_READY",
+        }))
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231, expected_head_sha=sha,
+                            allowed_files=None, local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False, allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "temporally stale" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
+    def test_temporal_unparseable_timestamp_returns_block(self, tmp_path):
+        """Unparseable timestamp in compare JSON → BLOCK."""
+        cmp_path = str(tmp_path / "bad_timestamp.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "not-a-valid-timestamp",
+            "compare_at": "2026-05-19T12:00:00Z",
+        }))
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE",
+            "recommendation": "MERGE_READY",
+        }))
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231, expected_head_sha=sha,
+                            allowed_files=None, local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False, allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "unparseable timestamp" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
+    def test_temporal_valid_timestamps_pass(self, tmp_path):
+        """Valid snapshot_at + compare_at (compare after snapshot) → clean guard."""
+        cmp_path = str(tmp_path / "valid_temporal.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        # compare_at AFTER snapshot_at — valid temporal ordering
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=True, compare_json_path=cmp_path)
+        assert gate["final_recommendation"] == "MERGE_READY"
+        assert gate["persistent_mutation_guard"]["status"] == "clean"
+        assert "authorization_phrase" in gate
+
+    def test_temporal_block_still_blocks(self, tmp_path):
+        """recommendation=BLOCK + valid temporal → BLOCK (BLOCK takes priority)."""
+        cmp_path = str(tmp_path / "block_temporal.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        Path(cmp_path).write_text(json.dumps({
+            "status": "blocked", "recommendation": "BLOCK",
+            "snapshot_at": "2026-05-19T12:34:45Z",
+            "compare_at": "2026-05-19T12:35:15Z",
+            "blocked_changes": [{"relative_path": "skills/new-skill/SKILL.md", "change": "added"}],
+            "allowed_changes": [],
+        }))
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=True, compare_json_path=cmp_path)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "blocked"
+        assert "authorization_phrase" not in gate
+
+    def test_temporal_stale_compare_too_old(self, tmp_path):
+        """compare_at validly ordered after snapshot_at but too old → BLOCK.
+
+        Scenario: snapshot at 10:00, compare at 10:01 (clean), Hermes mutation at 10:05,
+        gate at 10:30. compare_at >= snapshot_at so ordering check passes, but
+        compare_at is 30+ minutes old relative to gate execution, exceeding the 600s
+        freshness window. Pre-generated clean compare must be rejected.
+        """
+        cmp_path = str(tmp_path / "stale.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        # These timestamps have valid ordering (compare after snapshot) but are
+        # ~30 minutes older than current wall-clock time → freshness check fails
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean",
+            "recommendation": "PASS",
+            "snapshot_at": "2026-05-19T11:00:00Z",
+            "compare_at": "2026-05-19T11:01:00Z",
+            "blocked_changes": [],
+            "allowed_changes": [],
+        }))
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=True, compare_json_path=cmp_path)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "stale" in gate["persistent_mutation_guard"]["message"]
+        assert "merge_command" not in gate
+
+    def test_temporal_merge_command_suppressed_on_block(self, tmp_path):
+        """Temporal block (missing timestamp) → no merge_command emitted."""
+        cmp_path = str(tmp_path / "no_ts.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        Path(cmp_path).write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            # no snapshot_at, no compare_at
+        }))
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=True, compare_json_path=cmp_path)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "merge_command" not in gate
 
 
 # Mock responses shared across integration tests
