@@ -992,3 +992,512 @@ class TestAedFinalGateModuleImport:
         assert hasattr(aed_final_gate, "validate_ci_green")
         assert hasattr(aed_final_gate, "build_authorization_phrase")
         assert hasattr(aed_final_gate, "build_merge_command")
+
+
+# --------------------------------------------------------------------------
+# Persistent Mutation Guard integration
+# --------------------------------------------------------------------------
+
+
+class TestPersistentMutationGuardFinalGate:
+    """PMG integration tests for aed_final_gate.py — record-only guard validation."""
+
+    def _run_gate_with_pmg(self, tmp_path, require_pmg=False,
+                           compare_json_path=None, compare_json_content=None):
+        """Run finalization gate with optional PMG compare JSON.
+
+        Uses real filesystem for all file I/O, mocks only GitHub API calls.
+        """
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+
+        # Write compare JSON fixture to real filesystem
+        if compare_json_content and compare_json_path:
+            p = Path(compare_json_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps(compare_json_content))
+
+        # Write codex artifact to real filesystem
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE",
+            "recommendation": "MERGE_READY",
+        }))
+
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        return run_final_gate(
+                            pr_number=231,
+                            expected_head_sha=sha,
+                            allowed_files=None,
+                            local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False,
+                            allow_codex_skip=False,
+                            require_persistent_guard=require_pmg,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=compare_json_path,
+                            persistent_guard_compare_md=None,
+                        )
+
+    def test_no_require_preserves_existing_merge_ready(self, tmp_path):
+        """Without --require-persistent-guard, behavior is unchanged → MERGE_READY."""
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=False)
+        assert gate["final_recommendation"] == "MERGE_READY"
+        assert "authorization_phrase" in gate
+        assert "merge_command" in gate
+
+    def test_require_missing_compare_returns_block(self, tmp_path):
+        """With --require-persistent-guard but no compare JSON → BLOCK."""
+        gate = self._run_gate_with_pmg(tmp_path, require_pmg=True, compare_json_path=None)
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "not_required"
+        assert "authorization_phrase" not in gate
+        assert "merge_command" not in gate
+
+    def test_nonexistent_compare_json_returns_block(self, tmp_path):
+        """Nonexistent compare JSON path → BLOCK (error)."""
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path="/nonexistent/path/guard.json"
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "not found" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
+    def test_malformed_json_returns_block(self, tmp_path):
+        """Malformed compare JSON → BLOCK (error)."""
+        cmp_path = str(tmp_path / "malformed.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"not": "valid json at all"}
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "authorization_phrase" not in gate
+
+    def test_compare_json_missing_status_returns_block(self, tmp_path):
+        """Compare JSON missing 'status' field → BLOCK (error)."""
+        cmp_path = str(tmp_path / "missing_status.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"recommendation": "PASS"}
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "missing required field" in gate["persistent_mutation_guard"]["message"]
+
+    def test_compare_json_missing_recommendation_returns_block(self, tmp_path):
+        """Compare JSON missing 'recommendation' field → BLOCK (error)."""
+        cmp_path = str(tmp_path / "missing_rec.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean"}
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "missing required field" in gate["persistent_mutation_guard"]["message"]
+
+    def test_recommendation_block_returns_block(self, tmp_path):
+        """recommendation=BLOCK in compare JSON → BLOCK."""
+        cmp_path = str(tmp_path / "block.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={
+                "status": "blocked", "recommendation": "BLOCK",
+                "blocked_changes": [{"relative_path": ".hermes/some_skill", "change_type": "added"}],
+                "allowed_changes": [],
+            }
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "blocked"
+        assert gate["persistent_mutation_guard"]["blocked_changes_count"] == 1
+        assert "authorization_phrase" not in gate
+        assert "merge_command" not in gate
+
+    def test_recommendation_pass_records_clean_guard(self, tmp_path):
+        """recommendation=PASS in compare JSON → clean guard, MERGE_READY unchanged."""
+        cmp_path = str(tmp_path / "pass.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={
+                "status": "clean", "recommendation": "PASS",
+                "blocked_changes": [],
+                "allowed_changes": [{"relative_path": "scripts/local/a.py", "change_type": "modified"}],
+            }
+        )
+        assert gate["final_recommendation"] == "MERGE_READY"
+        assert gate["persistent_mutation_guard"]["status"] == "clean"
+        assert gate["persistent_mutation_guard"]["allowed_changes_count"] == 1
+        assert "authorization_phrase" in gate
+
+    def test_clean_guard_does_not_override_stale_sha(self, tmp_path):
+        """Clean PMG + stale expected SHA → BLOCK (stale SHA takes precedence)."""
+        cmp_path = str(tmp_path / "pass.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean", "recommendation": "PASS"},
+        )
+        # Force stale head by patching expected_head_sha
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE", "recommendation": "MERGE_READY",
+        }))
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        real_path_mock = MagicMock(spec=Path)
+                        real_path_mock.write_text = MagicMock()
+                        real_path_mock.parent.mkdir = MagicMock()
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = real_path_mock.write_text
+                        mock_path_inst.read_text = lambda: Path(cmp_path).read_text()
+                        mock_path_inst.exists = lambda: True
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = real_path_mock.parent.mkdir
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha="STALE0000000000000000000000000000000001",
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=codex_artifact,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=False,
+                                require_persistent_guard=True,
+                                persistent_guard_root="/home/max/.hermes",
+                                persistent_guard_snapshot=None,
+                                persistent_guard_compare_json=cmp_path,
+                                persistent_guard_compare_md=None,
+                            )
+        # Stale SHA should block regardless of clean PMG
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["head_sha_validation"]["passing"] is False
+
+    def test_clean_guard_does_not_override_failed_ci(self, tmp_path):
+        """Clean PMG + failed CI → BLOCK (CI takes precedence)."""
+        cmp_path = str(tmp_path / "pass.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean", "recommendation": "PASS"},
+        )
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "failure"}]
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE", "recommendation": "MERGE_READY",
+        }))
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        real_path_mock = MagicMock(spec=Path)
+                        real_path_mock.write_text = MagicMock()
+                        real_path_mock.parent.mkdir = MagicMock()
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = real_path_mock.write_text
+                        mock_path_inst.read_text = lambda: Path(cmp_path).read_text()
+                        mock_path_inst.exists = lambda: True
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = real_path_mock.parent.mkdir
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=codex_artifact,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=False,
+                                require_persistent_guard=True,
+                                persistent_guard_root="/home/max/.hermes",
+                                persistent_guard_snapshot=None,
+                                persistent_guard_compare_json=cmp_path,
+                                persistent_guard_compare_md=None,
+                            )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["ci_status"]["passing"] is False
+
+    def test_blocked_guard_suppresses_authorization_phrase(self, tmp_path):
+        """BLOCK PMG → no authorization_phrase emitted."""
+        cmp_path = str(tmp_path / "block.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={
+                "status": "blocked", "recommendation": "BLOCK",
+                "blocked_changes": [{"relative_path": ".hermes/new_skill", "change_type": "added"}],
+                "allowed_changes": [],
+            }
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "authorization_phrase" not in gate
+
+    def test_blocked_guard_suppresses_merge_command(self, tmp_path):
+        """BLOCK PMG → no merge_command emitted."""
+        cmp_path = str(tmp_path / "block.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={
+                "status": "blocked", "recommendation": "BLOCK",
+                "blocked_changes": [{"relative_path": ".hermes/new_skill", "change_type": "added"}],
+                "allowed_changes": [],
+            }
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert "merge_command" not in gate
+
+    def test_output_json_includes_persistent_mutation_guard(self, tmp_path):
+        """Output JSON includes persistent_mutation_guard key."""
+        cmp_path = str(tmp_path / "pass.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean", "recommendation": "PASS"},
+        )
+        assert "persistent_mutation_guard" in gate
+        pmg = gate["persistent_mutation_guard"]
+        assert pmg["status"] == "clean"
+        assert pmg["required"] is True
+        assert pmg["compare_json_path"] == cmp_path
+
+    def test_markdown_output_includes_guard_state(self, tmp_path):
+        """Markdown output includes PMG validation result when required."""
+        cmp_path = str(tmp_path / "pass.json")
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean", "recommendation": "PASS"},
+        )
+        md_path = tmp_path / "FINAL_GATE.md"
+        content = md_path.read_text()
+        # Guard status line should appear in the markdown
+        assert "persistent_mutation_guard" in content
+        # PMG clean → ✓ should appear
+        assert "✓" in content
+
+    def test_clean_guard_does_not_override_scope_violation(self, tmp_path):
+        """Clean PMG + scope violation → BLOCK (scope takes precedence)."""
+        cmp_path = str(tmp_path / "pass.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content={"status": "clean", "recommendation": "PASS"},
+        )
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": ["scripts/local/a.py", "some/outside/file.py"],
+            "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        codex_artifact = str(tmp_path / "codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": sha, "result": "REVIEW_COMPLETE", "recommendation": "MERGE_READY",
+        }))
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        real_path_mock = MagicMock(spec=Path)
+                        real_path_mock.write_text = MagicMock()
+                        real_path_mock.parent.mkdir = MagicMock()
+                        mock_path_inst = MagicMock()
+                        mock_path_inst.write_text = real_path_mock.write_text
+                        mock_path_inst.read_text = lambda: Path(cmp_path).read_text()
+                        mock_path_inst.exists = lambda: True
+                        mock_path_cls = MagicMock(return_value=mock_path_inst)
+                        type(mock_path_inst.parent).mkdir = real_path_mock.parent.mkdir
+                        with patch("aed_final_gate.Path", mock_path_cls):
+                            gate = run_final_gate(
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=["scripts/**"],
+                                local_validation_path=None,
+                                codex_artifact_path=codex_artifact,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=False,
+                                require_persistent_guard=True,
+                                persistent_guard_root="/home/max/.hermes",
+                                persistent_guard_snapshot=None,
+                                persistent_guard_compare_json=cmp_path,
+                                persistent_guard_compare_md=None,
+                            )
+        # Scope violation blocks regardless of clean PMG
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["scope_status"]["passing"] is False
+
+    def test_clean_guard_does_not_override_missing_codex(self, tmp_path):
+        """Clean PMG + missing Codex → WAIT (Codex takes precedence, not MERGE_READY)."""
+        cmp_path = str(tmp_path / "pass.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+
+        # Write compare JSON fixture to real filesystem
+        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS"}))
+
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231,
+                            expected_head_sha=sha,
+                            allowed_files=None,
+                            local_validation_path=None,
+                            codex_artifact_path=None,  # no codex
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False,
+                            allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        # Missing Codex → WAIT (not MERGE_READY, not BLOCK)
+        assert gate["final_recommendation"] == "WAIT"
+        assert gate["persistent_mutation_guard"]["status"] == "clean"
+
+    def test_clean_guard_does_not_override_invalid_codex(self, tmp_path):
+        """Clean PMG + invalid Codex artifact → BLOCK (invalid Codex takes precedence)."""
+        cmp_path = str(tmp_path / "pass.json")
+        sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+
+        # Write compare JSON fixture to real filesystem
+        Path(cmp_path).write_text(json.dumps({"status": "clean", "recommendation": "PASS"}))
+
+        output_json = tmp_path / "FINAL_GATE.json"
+        output_md = tmp_path / "FINAL_GATE.md"
+        mock_run_inst = MagicMock(stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git", returncode=0)
+        mock_pr_state = {
+            "number": 231, "state": "open", "mergeable": "MERGEABLE",
+            "head": {"sha": sha}, "headRefOid": sha,
+            "changed_files": 2, "base": {"sha": "76c2d017eba1de4f9ac03a0e7ffe98a83e4e262a"},
+        }
+        mock_ci_runs = [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+        # Stale codex artifact
+        codex_artifact = str(tmp_path / "stale_codex.json")
+        Path(codex_artifact).write_text(json.dumps({
+            "pr_number": 231, "head_sha": "STALE0000000000000000000000000000000001",
+            "result": "REVIEW_COMPLETE", "recommendation": "MERGE_READY",
+        }))
+        with patch("subprocess.run", return_value=mock_run_inst):
+            with patch("aed_final_gate.gh_pr_info", return_value=mock_pr_state):
+                with patch("aed_final_gate.gh_runs_for_sha", return_value=mock_ci_runs):
+                    mock_gh = MagicMock()
+                    mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
+                    with patch("aed_final_gate.gh", mock_gh):
+                        gate = run_final_gate(
+                            pr_number=231,
+                            expected_head_sha=sha,
+                            allowed_files=None,
+                            local_validation_path=None,
+                            codex_artifact_path=codex_artifact,
+                            output_json_path=str(output_json),
+                            output_md_path=str(output_md),
+                            allow_admin=False,
+                            allow_codex_skip=False,
+                            require_persistent_guard=True,
+                            persistent_guard_root="/home/max/.hermes",
+                            persistent_guard_snapshot=None,
+                            persistent_guard_compare_json=cmp_path,
+                            persistent_guard_compare_md=None,
+                        )
+        # Stale Codex → BLOCK regardless of clean PMG
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["codex_status"]["passing"] is False
+        assert gate["persistent_mutation_guard"]["status"] == "clean"
+
+
+# Mock responses shared across integration tests
+_MOCK_PR_FILES_RESPONSE = {
+    "data": {
+        "repository": {
+            "pullRequest": {
+                "files": {
+                    "nodes": [{"path": "scripts/local/a.py"}, {"path": "tests/test_x.py"}],
+                    "pageInfo": {"hasNextPage": False},
+                }
+            }
+        }
+    }
+}
+_MOCK_PR_HEAD_RESPONSE = {
+    "data": {
+        "repository": {
+            "pullRequest": {"headRefOid": "46f3bf2b4fc490f3991409c33448c678c2f6ea10"},
+        }
+    }
+}
