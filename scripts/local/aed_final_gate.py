@@ -173,6 +173,86 @@ def validate_pr_state(pr: dict) -> tuple[bool, str]:
     return True, f"PR open and mergeable (state={pr.get('state')}, mergeable={pr.get('mergeable')})"
 
 
+def _validate_persistent_guard_compare_json(path: Path) -> tuple[bool, str]:
+    """Load and validate a PMG compare JSON.
+
+    Returns (is_valid, message). is_valid is True on clean load.
+    message explains the validation outcome.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, IOError):
+        return False, f"compare JSON not readable: {path}"
+    except json.JSONDecodeError as e:
+        return False, f"malformed JSON in compare JSON: {e}"
+
+    if not isinstance(data, dict):
+        return False, "compare JSON must be a JSON object (not array, string, or number)"
+
+    for field in ("status", "recommendation"):
+        if field not in data:
+            return False, f"compare JSON missing required field: {field}"
+
+    rec = data.get("recommendation", "")
+    if rec not in ("PASS", "BLOCK"):
+        return False, f"compare JSON has unexpected recommendation: {rec}"
+
+    return True, f"valid — recommendation={rec}"
+
+
+def _run_persistent_guard_validate(
+    snapshot_path: Optional[Path],
+    compare_json_path: Optional[Path],
+    compare_md_path: Optional[Path],
+    guard_root: str = "/home/max/.hermes",
+) -> dict:
+    """Record-only persistent mutation guard validation.
+
+    Accepts pre-existing snapshot and compare report paths.
+    Validates compare JSON, checks recommendation, returns guard state dict.
+
+    Returns a guard state dict with keys:
+        required, status, snapshot_path, compare_json_path, compare_md_path,
+        blocked_changes_count, allowed_changes_count, message
+    """
+    state: dict = {
+        "required": False,
+        "status": "not_required",
+        "snapshot_path": str(snapshot_path) if snapshot_path else None,
+        "compare_json_path": str(compare_json_path) if compare_json_path else None,
+        "compare_md_path": str(compare_md_path) if compare_md_path else None,
+        "blocked_changes_count": 0,
+        "allowed_changes_count": 0,
+        "message": "persistent mutation guard not required",
+    }
+
+    if compare_json_path is None:
+        return state
+
+    if not compare_json_path.exists():
+        state["status"] = "error"
+        state["message"] = f"compare JSON not found: {compare_json_path}"
+        return state
+
+    is_valid, msg = _validate_persistent_guard_compare_json(compare_json_path)
+    if not is_valid:
+        state["status"] = "error"
+        state["message"] = msg
+        return state
+
+    with open(compare_json_path) as f:
+        data = json.load(f)
+
+    rec = data.get("recommendation", "UNKNOWN")
+    state["status"] = "clean" if rec == "PASS" else "blocked"
+    state["message"] = f"guard recommendation: {rec}"
+    state["blocked_changes_count"] = len(data.get("blocked_changes", []))
+    state["allowed_changes_count"] = len(data.get("allowed_changes", []))
+
+    return state
+
+
 def validate_codex_artifact_head(
     codex_path: Optional[str], current_head: str, allow_skip: bool = False
 ) -> tuple[bool, str]:
@@ -310,6 +390,11 @@ def run_final_gate(
     output_md_path: str,
     allow_admin: bool = False,
     allow_codex_skip: bool = False,
+    require_persistent_guard: bool = False,
+    persistent_guard_root: str = "/home/max/.hermes",
+    persistent_guard_snapshot: Optional[str] = None,
+    persistent_guard_compare_json: Optional[str] = None,
+    persistent_guard_compare_md: Optional[str] = None,
 ) -> dict:
     # Detect repo from git
     repo_result = subprocess.run(
@@ -452,6 +537,18 @@ def run_final_gate(
     codex_valid, codex_msg = validate_codex_artifact_head(codex_artifact_path, current_head, allow_codex_skip)
     local_valid, local_msg = validate_local_validation(local_validation_path)
 
+    # Run persistent mutation guard validation when required
+    snapshot_path = Path(persistent_guard_snapshot) if persistent_guard_snapshot else None
+    compare_json_path = Path(persistent_guard_compare_json) if persistent_guard_compare_json else None
+    compare_md_path = Path(persistent_guard_compare_md) if persistent_guard_compare_md else None
+    guard_state = _run_persistent_guard_validate(
+        snapshot_path, compare_json_path, compare_md_path, persistent_guard_root
+    )
+    guard_state["required"] = require_persistent_guard
+
+    # PMG BLOCK overrides MERGE_READY but does not override other BLOCK reasons
+    guard_blocked = require_persistent_guard and guard_state["status"] in ("blocked", "error", "not_required")
+
     all_hard_gates_valid = all([
         head_valid, ci_valid, scope_valid, pr_valid, local_valid
     ])
@@ -475,6 +572,10 @@ def run_final_gate(
     else:
         # Priority 5: Artifact provided and valid + hard gates pass → MERGE_READY
         recommendation = "MERGE_READY"
+
+    # PMG BLOCK overrides MERGE_READY but not other BLOCK reasons
+    if recommendation == "MERGE_READY" and guard_blocked:
+        recommendation = "BLOCK"
 
     auth_phrase = None
     merge_cmd = None
@@ -517,6 +618,7 @@ def run_final_gate(
             "passing": head_valid,
             "message": head_msg,
         },
+        "persistent_mutation_guard": guard_state,
         "final_recommendation": recommendation,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "allow_admin": allow_admin,
@@ -547,11 +649,21 @@ def run_final_gate(
         f"- **scope:** {'✓' if scope_valid else '✗'} {scope_msg}",
         f"- **pr_state:** {'✓' if pr_valid else '✗'} {pr_msg}",
         "",
+    ]
+    # PMG validation result for markdown
+    guard_valid = guard_state["status"] == "clean"
+    guard_msg_str = guard_state["message"]
+    if require_persistent_guard:
+        md_lines.append(f"- **persistent_mutation_guard:** {'✓' if guard_valid else '✗'} {guard_msg_str}")
+        md_lines.append("")
+
+    md_lines.extend([
         f"## Final Recommendation",
         "",
         f"**`{recommendation}`**",
         "",
-    ]
+    ])
+
     if recommendation == "MERGE_READY":
         md_lines.extend([
             "## Authorization",
@@ -587,6 +699,9 @@ def run_final_gate(
             if not valid:
                 md_lines.append(f"- **{key}:** {msg}")
 
+        if guard_blocked:
+            md_lines.append(f"- **persistent_mutation_guard:** {guard_state['message']}")
+
     Path(output_md_path).write_text("\n".join(md_lines))
 
     return gate
@@ -613,6 +728,33 @@ def main():
         help="Allow missing Codex artifact. Skipped Codex is marked as skip_authorized=true. "
              "Use only when Codex review was performed out-of-band and not captured as artifact.",
     )
+    parser.add_argument(
+        "--persistent-guard-root",
+        dest="persistent_guard_root",
+        default="/home/max/.hermes",
+        help="Hermes root for persistent mutation guard (default: /home/max/.hermes)",
+    )
+    parser.add_argument(
+        "--persistent-guard-snapshot",
+        dest="persistent_guard_snapshot",
+        help="Path to pre-existing snapshot JSON for record-only guard validation",
+    )
+    parser.add_argument(
+        "--persistent-guard-compare-json",
+        dest="persistent_guard_compare_json",
+        help="Path to pre-existing guard compare JSON report",
+    )
+    parser.add_argument(
+        "--persistent-guard-compare-md",
+        dest="persistent_guard_compare_md",
+        help="Path to pre-existing guard compare markdown report",
+    )
+    parser.add_argument(
+        "--require-persistent-guard",
+        dest="require_persistent_guard",
+        action="store_true",
+        help="Require guard validation — BLOCK if compare JSON is missing, malformed, or recommendation=BLOCK",
+    )
 
     args = parser.parse_args()
 
@@ -631,6 +773,11 @@ def main():
         output_md_path=args.output_md,
         allow_admin=args.allow_admin,
         allow_codex_skip=args.allow_codex_skip,
+        require_persistent_guard=args.require_persistent_guard,
+        persistent_guard_root=args.persistent_guard_root,
+        persistent_guard_snapshot=args.persistent_guard_snapshot,
+        persistent_guard_compare_json=args.persistent_guard_compare_json,
+        persistent_guard_compare_md=args.persistent_guard_compare_md,
     )
 
     print(json.dumps(gate, indent=2))

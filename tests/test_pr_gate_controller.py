@@ -1156,6 +1156,28 @@ class TestPersistentMutationGuard:
         assert guard.get("status") == "error"
         assert "malformed" in guard.get("message", "").lower()
 
+    def test_require_guard_with_non_object_json_returns_block(self, mod, tmp_output_dir):
+        """--require-persistent-guard with a JSON array (not an object) returns BLOCK."""
+        bad_json = tmp_output_dir / "non_object_compare.json"
+        bad_json.write_text(json.dumps(["status", "clean", "recommendation", "PASS"]))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=bad_json,
+            )
+
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "error"
+        assert "must be a JSON object" in guard.get("message", "")
+
     def test_require_guard_recommendation_block_returns_block(self, mod, tmp_output_dir):
         """Compare JSON with recommendation=BLOCK returns BLOCK."""
         block_json = tmp_output_dir / "block_compare.json"
