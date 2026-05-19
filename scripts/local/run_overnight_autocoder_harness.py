@@ -4,23 +4,23 @@ run_overnight_autocoder_harness.py
 
 AED Overnight Autocoder Harness v1 — orchestrates safe AED unattended runs.
 
-v1 scope (dry-run only by default):
-  - Verifies clean repo state before starting
-  - Initializes the autocoder controller
-  - Takes a persistent mutation guard snapshot of Hermes state
-  - Records the snapshot path in the controller
-  - Simulates task processing (dry-run only — no real task execution)
-  - Compares Hermes state post-run and records the result in the controller
-  - Produces a run summary JSON and markdown under the workspace
-  - Stops for human review — does NOT dispatch, create PRs, merge, or append audit
+v1 scope:
+  dry-run    — verifies clean repo, initializes controller, runs guard snapshot/compare,
+               simulates task processing (no real task execution), stops for human review.
+               No Hermes create, no dispatch, no PR, no merge, no audit.
 
-Safety behaviors:
+  packet-prep — same safety preconditions as dry-run, but generates Claude Code worker
+                packets for each dependency-satisfied task using build_worker_packet.py.
+                Does NOT execute Claude Code. Does NOT dispatch. Does NOT create PRs.
+                Does NOT merge. Does NOT append audit logs. Stops for human review.
+
+Safety behaviors (both modes):
   - BLOCK if repo is dirty at start
   - BLOCK if persistent guard compare returns BLOCK
   - BLOCK if controller next_action becomes request_human
   - BLOCK if any safety invariant is already true
   - BLOCK if workspace is inside the repo root
-  - All dry-run — no Hermes create, no dispatch, no PR, no merge, no audit
+  - No Hermes create, no dispatch, no PR, no merge, no audit
 
 Usage:
   python3 scripts/local/run_overnight_autocoder_harness.py \\
@@ -30,6 +30,14 @@ Usage:
     --integration-branch <branch> \\
     --hermes-root /home/max/.hermes \\
     --mode dry-run
+
+  python3 scripts/local/run_overnight_autocoder_harness.py \\
+    --run-id <run_id> \\
+    --tasks-jsonl <tasks.jsonl> \\
+    --workspace /tmp/aed_runs/<run_id> \\
+    --integration-branch <branch> \\
+    --hermes-root /home/max/.hermes \\
+    --mode packet-prep
 """
 
 import argparse
@@ -130,6 +138,7 @@ def _write_early_block_summary(summary: dict) -> None:
     ws = summary.get("workspace")
     if ws:
         summary_json_path = Path(ws) / "OVERNIGHT_RUN_SUMMARY.json"
+        Path(summary_json_path).parent.mkdir(parents=True, exist_ok=True)
         _save_json(summary, str(summary_json_path))
 
 
@@ -162,8 +171,11 @@ def run_harness(args: argparse.Namespace) -> dict:
         "human_action_required": True,
         "recommendation": "BLOCK",
         "blocked_reason": None,
-        "dry_run_only": args.mode == "dry-run",
-        "no_real_work_executed": args.mode == "dry-run",
+        "dry_run_only": args.mode in ("dry-run", "packet-prep"),
+        "no_real_work_executed": args.mode in ("dry-run", "packet-prep"),
+        "claude_code_executed": False,
+        "worker_packets_created": [],
+        "worker_packets_count": 0,
         "timestamp": _utcnow(),
     }
 
@@ -245,23 +257,10 @@ def run_harness(args: argparse.Namespace) -> dict:
     # Reload controller state after snapshot recording
     state = _load_json(str(controller_state_path))
 
-    # --- 8. Simulate task processing (dry-run only) ---
-    # In dry-run mode, we record each task as dry_run_ready without promotion
-    tasks_data = []
-    with open(args.tasks_jsonl) as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            tasks_data.append(json.loads(line))
+    # --- 8a. Task processing dispatch ---
 
-    for task in tasks_data:
-        task_id = task.get("task_id") or task.get("id")
-        if not task_id:
-            continue
-        summary["tasks_seen"].append(task_id)
-
-        # In dry-run: record task result as dry_run_ready (not TASK_READY/promoted)
+    def _record_task_ready(task: dict, task_id: str) -> bool:
+        """Record one task as TASK_READY (not promoted) in controller. Returns True on success."""
         task_result = _run([
             sys.executable, "scripts/local/autocoder_run_controller.py",
             "record-task-result",
@@ -272,12 +271,121 @@ def run_harness(args: argparse.Namespace) -> dict:
             "--local-gate", "passed",
             "--scope-status", "clean",
         ], cwd=AED_REPO_ROOT)
-        if task_result.returncode != 0:
-            summary["blocked_reason"] = f"task_record_failed: {task_result.stderr}"
-            _write_early_block_summary(summary)
-            return summary
+        return task_result.returncode == 0
 
-        summary["tasks_recorded"].append(task_id)
+    def _build_packet_for_task(task: dict, task_id: str) -> tuple[str, str] | None:
+        """
+        Generate a Claude Code worker packet for one task.
+
+        Returns (json_path, md_path) on success, or None on failure.
+        json_path is under: <workspace>/worker_packets/<task_id>.worker_packet.json
+        md_path is under:   <workspace>/worker_packets/<task_id>.worker_packet.md
+        """
+        task_json_path = Path(workspace) / f"task_{task_id}.json"
+        json_out = Path(workspace) / "worker_packets" / f"{task_id}.worker_packet.json"
+        md_out = Path(workspace) / "worker_packets" / f"{task_id}.worker_packet.md"
+
+        # Write temporary task JSON for build_worker_packet.py
+        task_json_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(task_json_path, "w") as f:
+            json.dump(task, f, indent=2)
+            f.write("\n")
+
+        result = _run([
+            sys.executable, "scripts/local/build_worker_packet.py",
+            "--task-json", str(task_json_path),
+            "--controller-state", str(controller_state_path),
+            "--workspace", workspace,
+            "--worker", "claude_code",
+            "--output-json", str(json_out),
+            "--output-md", str(md_out),
+        ], cwd=AED_REPO_ROOT)
+
+        # Remove temp task JSON
+        task_json_path.unlink(missing_ok=True)
+
+        if result.returncode != 0:
+            return None
+        return str(json_out), str(md_out)
+
+    def _is_dependency_satisfied(task: dict, seen: set) -> bool:
+        """Check if all depends_on task IDs have been recorded."""
+        deps = task.get("depends_on", []) or task.get("dependencies", [])
+        return all(dep in seen for dep in deps)
+
+    # Load all tasks from TASKS.jsonl
+    tasks_data = []
+    with open(args.tasks_jsonl) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            tasks_data.append(json.loads(line))
+
+    if args.mode == "dry-run":
+        # dry-run: record each task as TASK_READY without generating packets
+        for task in tasks_data:
+            task_id = task.get("task_id") or task.get("id")
+            if not task_id:
+                continue
+            summary["tasks_seen"].append(task_id)
+            if not _record_task_ready(task, task_id):
+                summary["blocked_reason"] = f"task_record_failed: {task_id}"
+                _write_early_block_summary(summary)
+                return summary
+            summary["tasks_recorded"].append(task_id)
+
+    elif args.mode == "packet-prep":
+        # packet-prep: generate worker packets for each dependency-satisfied task
+        seen = set()
+        packets_dir = Path(workspace) / "worker_packets"
+        packets_dir.mkdir(parents=True, exist_ok=True)
+
+        for task in tasks_data:
+            task_id = task.get("task_id") or task.get("id")
+            if not task_id:
+                continue
+            summary["tasks_seen"].append(task_id)
+
+            # Only process if dependencies are satisfied
+            if not _is_dependency_satisfied(task, seen):
+                # Skip — dependency not yet satisfied
+                continue
+
+            # Build the worker packet
+            result = _build_packet_for_task(task, task_id)
+            if result is None:
+                summary["blocked_reason"] = f"packet_build_failed: {task_id}"
+                _write_early_block_summary(summary)
+                return summary
+
+            json_path, md_path = result
+            if not Path(json_path).exists() or not Path(md_path).exists():
+                summary["blocked_reason"] = f"packet_not_created: {task_id}"
+                _write_early_block_summary(summary)
+                return summary
+
+            # Verify packet output paths are under workspace (safety)
+            wp = Path(workspace).resolve()
+            for p in (Path(json_path), Path(md_path)):
+                try:
+                    p.resolve().relative_to(wp)
+                except ValueError:
+                    summary["blocked_reason"] = f"packet_path_outside_workspace: {p}"
+                    _write_early_block_summary(summary)
+                    return summary
+
+            summary["worker_packets_created"].append(str(json_path))
+            seen.add(task_id)
+
+            # Record as TASK_READY not_promoted
+            if not _record_task_ready(task, task_id):
+                summary["blocked_reason"] = f"task_record_failed: {task_id}"
+                _write_early_block_summary(summary)
+                return summary
+            summary["tasks_recorded"].append(task_id)
+
+        summary["worker_packets_count"] = len(summary["worker_packets_created"])
 
     # --- 9. Compare persistent mutation guard ---
     compare_json_path = Path(workspace) / "persistent_state_after.json"
@@ -372,6 +480,19 @@ def run_harness(args: argparse.Namespace) -> dict:
     blocked_count = summary["persistent_mutation_guard"]["blocked_changes_count"]
     allowed_count = summary["persistent_mutation_guard"]["allowed_changes_count"]
 
+    mode_banner = (
+        "## ⚠️  PACKET-PREP ONLY — NO REAL WORK EXECUTED\n\n"
+        "This run was executed in packet-prep mode. Worker packets were generated\n"
+        "for each dependency-satisfied task, but Claude Code was NOT executed.\n"
+        "No PRs were created, no merges performed, no audit entries appended,\n"
+        "and no Hermes create/dispatch was called."
+        if args.mode == "packet-prep"
+        else "## ⚠️  DRY-RUN ONLY — NO REAL WORK EXECUTED\n\n"
+        "This run was executed in dry-run mode. No tasks were actually executed,\n"
+        "no PRs were created, no merges performed, no audit entries appended,\n"
+        "and no Hermes create/dispatch was called."
+    )
+
     lines = [
         "# AED Overnight Run Harness — Summary",
         "",
@@ -381,11 +502,7 @@ def run_harness(args: argparse.Namespace) -> dict:
         f"**Workspace:** `{summary['workspace']}`",
         f"**Integration branch:** `{summary['integration_branch']}`",
         "",
-        "## ⚠️  DRY-RUN ONLY — NO REAL WORK EXECUTED",
-        "",
-        "This run was executed in dry-run mode. No tasks were actually executed,",
-        "no PRs were created, no merges performed, no audit entries appended,",
-        "and no Hermes create/dispatch was called.",
+        mode_banner,
         "",
         "## Persistent Mutation Guard",
         "",
@@ -407,6 +524,18 @@ def run_harness(args: argparse.Namespace) -> dict:
         lines.append("")
         for tid in summary["tasks_seen"]:
             lines.append(f"- `{tid}`")
+
+    # Worker packets section (packet-prep only)
+    if args.mode == "packet-prep" and summary.get("worker_packets_created"):
+        lines += [
+            "",
+            "## Worker Packets",
+            "",
+            f"- **Count:** `{summary['worker_packets_count']}`",
+            "",
+        ]
+        for pkt in summary["worker_packets_created"]:
+            lines.append(f"- `{pkt}`")
 
     lines += [
         "",
@@ -471,7 +600,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", default="/home/max/Automated-Edge-Discovery",
                         help="Repo root (default: /home/max/Automated-Edge-Discovery)")
     parser.add_argument("--mode", default="dry-run",
-                        help="Mode: dry-run only (v1 default)")
+                        choices=["dry-run", "packet-prep"],
+                        help="Mode: dry-run (default) or packet-prep")
     parser.add_argument("--output-summary-json",
                         help="Override default OVERNIGHT_RUN_SUMMARY.json path")
     return parser
