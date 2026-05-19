@@ -394,11 +394,12 @@ class TestRunPlanPreviewIntegration:
 
     def test_output_dir_in_repo_returns_error(self, tmp_path):
         import run_plan_preview as rpp
-        with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
+        repo = Path(__file__).resolve().parents[1]  # points to Automated-Edge-Discovery
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=repo):
             with mock.patch.object(rpp, "_git_status", return_value="clean"):
                 args = mock.MagicMock()
                 args.packet_json = str(tmp_path / "packet.json")
-                args.output_dir = "/home/max/Automated-Edge-Discovery/.cache/plan_out"  # inside repo
+                args.output_dir = str(repo / ".cache" / "plan_out")  # inside repo
                 args.output_json = str(tmp_path / "result.json")
                 args.output_md = str(tmp_path / "result.md")
                 args.timeout = 120
@@ -443,8 +444,9 @@ class TestRunPlanPreviewIntegration:
 
     def test_repo_mutated_returns_blocked(self, tmp_path):
         import run_plan_preview as rpp
+        repo = Path(__file__).resolve().parents[1]
         git_statuses = ["clean", "dirty: M scripts/local/foo.py"]  # before=clean, after=dirty
-        with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=repo):
             with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", 0)):
                 with mock.patch.object(rpp, "_git_status", side_effect=lambda *a: git_statuses.pop(0)):
                     args = mock.MagicMock()
