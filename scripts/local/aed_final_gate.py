@@ -47,6 +47,16 @@ FORBIDDEN_EXECUTABLE_CALLS = [
 MAX_COMPARE_AGE_SECONDS = 600  # 10 minutes
 
 
+def _get_freshness_reference_time() -> datetime:
+    """Return the current UTC timestamp used for PMG compare freshness validation.
+
+    Patched in tests to provide a deterministic clock. Must be called at validation
+    time (not compare-json authoring time) so that pre-generated stale compares are
+    caught even if the test runner itself is slow.
+    """
+    return datetime.now(timezone.utc)
+
+
 def forbidden_executable_check(code: str) -> list[str]:
     """Return list of forbidden strings found in code (not in comments/constants)."""
     import re
@@ -282,7 +292,7 @@ def _run_persistent_guard_validate(
     # Freshness check: compare JSON must be recent relative to gate execution.
     # A clean compare generated before a Hermes mutation (between compare and gate)
     # could still have valid ordering but is stale by wall-clock age.
-    gate_dt = datetime.now(timezone.utc)
+    gate_dt = _get_freshness_reference_time()
     compare_age_seconds = (gate_dt - compare_dt).total_seconds()
     if compare_age_seconds > MAX_COMPARE_AGE_SECONDS:
         state["status"] = "error"

@@ -10,10 +10,14 @@ import importlib.util
 import json
 import sys
 import textwrap
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
 import pytest
+
+# Fixed reference time for PMG freshness tests — avoids any wall-clock dependency.
+T_REF = datetime(2026, 5, 19, 12, 35, 45, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1056,14 @@ class TestApplyCreateTaskHardening:
 class TestPersistentMutationGuard:
     """Tests for --require-persistent-guard and record-only guard wiring."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_freshness_time(self, mod):
+        """Patch pr_gate_controller._get_freshness_reference_time to T_REF for all tests."""
+        patcher = mock.patch.object(mod, "_get_freshness_reference_time", return_value=T_REF)
+        patcher.start()
+        yield
+        patcher.stop()
+
     def test_without_require_guard_preserves_existing_behavior(self, mod, tmp_output_dir):
         """When --require-persistent-guard is absent, controller runs normally."""
         def mock_all(args, *, capture_output=True, check=True):
@@ -1601,6 +1613,43 @@ class TestPersistentMutationGuard:
 
         assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
         assert result["persistent_mutation_guard"]["status"] == "error"
+
+    def test_require_guard_stale_compare_returns_block(self, mod, tmp_output_dir):
+        """Compare JSON with valid ordering but too old → BLOCK in controller.
+
+        Scenario: snapshot at 10:00, compare at 10:01 (clean), Hermes mutation at 10:05,
+        controller at 10:30. compare_at >= snapshot_at so ordering check passes, but
+        compare_at is 29+ minutes old relative to controller execution, exceeding the
+        600s freshness window. Pre-generated clean compare must be rejected by the
+        PR gate controller just as it is by the finalization gate.
+        """
+        stale_json = tmp_output_dir / "stale_compare.json"
+        stale_json.write_text(json.dumps({
+            "status": "clean",
+            "recommendation": "PASS",
+            # Valid ordering: compare after snapshot
+            "snapshot_at": "2026-05-19T11:00:00Z",
+            "compare_at": "2026-05-19T11:01:00Z",
+            "blocked_changes": [],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=stale_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        assert result["persistent_mutation_guard"]["status"] == "error"
+        assert "stale" in result["persistent_mutation_guard"]["message"]
 
 
 # ---------------------------------------------------------------------------

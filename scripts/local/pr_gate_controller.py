@@ -30,6 +30,17 @@ from typing import Optional
 # A clean compare JSON older than this relative to gate execution is rejected.
 MAX_COMPARE_AGE_SECONDS = 600  # 10 minutes
 
+
+def _get_freshness_reference_time() -> datetime:
+    """Return the current UTC timestamp used for PMG compare freshness validation.
+
+    Patched in tests to provide a deterministic clock. Must be called at validation
+    time (not compare-json authoring time) so that pre-generated stale compares are
+    caught even if the test runner itself is slow.
+    """
+    return datetime.now(timezone.utc)
+
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -202,7 +213,7 @@ def _run_persistent_guard_validate(
         return state
 
     # Freshness check: compare JSON must be recent relative to gate execution.
-    gate_dt = datetime.now(timezone.utc)
+    gate_dt = _get_freshness_reference_time()
     compare_age_seconds = (gate_dt - compare_dt).total_seconds()
     if compare_age_seconds > MAX_COMPARE_AGE_SECONDS:
         state["status"] = "error"

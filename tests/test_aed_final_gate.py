@@ -18,6 +18,7 @@ import json
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,7 @@ import pytest
 # Module under test
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts" / "local"))
 from aed_final_gate import (
+    _get_freshness_reference_time,
     build_authorization_phrase,
     build_merge_command,
     validate_changed_files_in_scope,
@@ -37,6 +39,11 @@ from aed_final_gate import (
     validate_pr_state,
     run_final_gate,
 )
+
+# Fixed reference time for PMG freshness tests — avoids any wall-clock dependency.
+# PASS tests: compare_at is recent (30s old at T_REF); STALE tests: compare_at is
+# old enough (5685s+) to trigger freshness block regardless of when tests run.
+T_REF = datetime(2026, 5, 19, 12, 35, 45, tzinfo=timezone.utc)
 
 
 # ---------------------------------------------------------------------------
@@ -1002,21 +1009,44 @@ class TestAedFinalGateModuleImport:
 class TestPersistentMutationGuardFinalGate:
     """PMG integration tests for aed_final_gate.py — record-only guard validation."""
 
+    @pytest.fixture(autouse=True)
+    def _patch_freshness_time(self):
+        """Patch aed_final_gate._get_freshness_reference_time to T_REF for all tests.
+
+        Uses patch.object on the module to ensure the global name resolution inside
+        _run_persistent_guard_validate() sees the patched value at call time.
+        """
+        import aed_final_gate
+        patcher = patch.object(aed_final_gate, "_get_freshness_reference_time", return_value=T_REF)
+        patcher.start()
+        yield
+        patcher.stop()
+
     def _run_gate_with_pmg(self, tmp_path, require_pmg=False,
-                           compare_json_path=None, compare_json_content=None):
+                           compare_json_path=None, compare_json_content=None,
+                           snap_ts=None, cmp_ts=None):
         """Run finalization gate with optional PMG compare JSON.
 
         Uses real filesystem for all file I/O, mocks only GitHub API calls.
+        snap_ts and cmp_ts override snapshot_at/compare_at in compare_json_content
+        (enables deterministic freshness testing without wall-clock dependency).
         """
         sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
         output_json = tmp_path / "FINAL_GATE.json"
         output_md = tmp_path / "FINAL_GATE.md"
 
-        # Write compare JSON fixture to real filesystem
+        # Write compare JSON fixture to real filesystem, applying timestamp overrides
         if compare_json_content and compare_json_path:
+            content = compare_json_content
+            if isinstance(compare_json_content, dict):
+                content = dict(compare_json_content)
+                if snap_ts is not None:
+                    content["snapshot_at"] = snap_ts
+                if cmp_ts is not None:
+                    content["compare_at"] = cmp_ts
             p = Path(compare_json_path)
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(compare_json_content))
+            p.write_text(json.dumps(content))
 
         # Write codex artifact to real filesystem
         codex_artifact = str(tmp_path / "codex.json")
@@ -1040,21 +1070,21 @@ class TestPersistentMutationGuardFinalGate:
                     mock_gh.side_effect = [_MOCK_PR_FILES_RESPONSE, _MOCK_PR_HEAD_RESPONSE]
                     with patch("aed_final_gate.gh", mock_gh):
                         return run_final_gate(
-                            pr_number=231,
-                            expected_head_sha=sha,
-                            allowed_files=None,
-                            local_validation_path=None,
-                            codex_artifact_path=codex_artifact,
-                            output_json_path=str(output_json),
-                            output_md_path=str(output_md),
-                            allow_admin=False,
-                            allow_codex_skip=False,
-                            require_persistent_guard=require_pmg,
-                            persistent_guard_root="/home/max/.hermes",
-                            persistent_guard_snapshot=None,
-                            persistent_guard_compare_json=compare_json_path,
-                            persistent_guard_compare_md=None,
-                        )
+                                pr_number=231,
+                                expected_head_sha=sha,
+                                allowed_files=None,
+                                local_validation_path=None,
+                                codex_artifact_path=codex_artifact,
+                                output_json_path=str(output_json),
+                                output_md_path=str(output_md),
+                                allow_admin=False,
+                                allow_codex_skip=False,
+                                require_persistent_guard=require_pmg,
+                                persistent_guard_root="/home/max/.hermes",
+                                persistent_guard_snapshot=None,
+                                persistent_guard_compare_json=compare_json_path,
+                                persistent_guard_compare_md=None,
+                            )
 
     def test_no_require_preserves_existing_merge_ready(self, tmp_path):
         """Without --require-persistent-guard, behavior is unchanged → MERGE_READY."""
