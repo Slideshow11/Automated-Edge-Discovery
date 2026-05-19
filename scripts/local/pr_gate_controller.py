@@ -92,6 +92,88 @@ def _run_child(args: list, *, capture_output=True, check=True) -> subprocess.Com
     return result
 
 
+def _validate_guard_compare_json(path: Path) -> tuple[bool, str]:
+    """Load and validate a guard compare JSON.
+
+    Returns (is_valid, message). is_valid is True on clean load.
+    message explains the validation outcome.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, IOError):
+        return False, f"compare JSON not readable: {path}"
+    except json.JSONDecodeError as e:
+        return False, f"malformed JSON in compare JSON: {e}"
+
+    for field in ("status", "recommendation"):
+        if field not in data:
+            return False, f"compare JSON missing required field: {field}"
+
+    rec = data.get("recommendation", "")
+    if rec not in ("PASS", "BLOCK"):
+        return False, f"compare JSON has unexpected recommendation: {rec}"
+
+    return True, f"valid — recommendation={rec}"
+
+
+def _run_persistent_guard_validate(
+    snapshot_path: Path | None,
+    compare_json_path: Path | None,
+    compare_md_path: Path | None,
+    guard_root: Path,
+) -> dict:
+    """Record-only persistent mutation guard validation.
+
+    Accepts pre-existing snapshot and compare report paths.
+    Validates compare JSON, checks recommendation, returns guard state dict.
+
+    Returns a guard state dict with keys:
+        status, snapshot_path, compare_json_path, compare_md_path,
+        blocked_changes_count, allowed_changes_count, message
+    """
+    # snapshot_path may be None in record-only mode — guard just validates reports
+    state: dict = {
+        "required": False,
+        "status": "not_required",
+        "snapshot_path": str(snapshot_path) if snapshot_path else None,
+        "compare_json_path": str(compare_json_path) if compare_json_path else None,
+        "compare_md_path": str(compare_md_path) if compare_md_path else None,
+        "blocked_changes_count": 0,
+        "allowed_changes_count": 0,
+        "message": "persistent mutation guard not required",
+    }
+
+    # record-only: snapshot_path is optional, but if compare_json is provided,
+    # we validate it
+    if compare_json_path is None:
+        return state
+
+    # Validate compare JSON exists and is well-formed
+    if not compare_json_path.exists():
+        state["status"] = "error"
+        state["message"] = f"compare JSON not found: {compare_json_path}"
+        return state
+
+    is_valid, msg = _validate_guard_compare_json(compare_json_path)
+    if not is_valid:
+        state["status"] = "error"
+        state["message"] = msg
+        return state
+
+    # Load compare JSON to extract counts
+    with open(compare_json_path) as f:
+        data = json.load(f)
+
+    rec = data.get("recommendation", "UNKNOWN")
+    state["status"] = "clean" if rec == "PASS" else "blocked"
+    state["message"] = f"guard recommendation: {rec}"
+    state["blocked_changes_count"] = len(data.get("blocked_changes", []))
+    state["allowed_changes_count"] = len(data.get("allowed_changes", []))
+
+    return state
+
+
 def _reject_hermes_path(output_dir: Path) -> None:
     """Reject output-dir under /home/max/.hermes."""
     try:
@@ -133,10 +215,72 @@ def run_controller(
     apply_create_task: bool,
     expected_head: str | None = None,
     base_branch: str = "main",
+    require_persistent_guard: bool = False,
+    persistent_guard_root: str = "/home/max/.hermes",
+    persistent_guard_snapshot: Path | None = None,
+    persistent_guard_compare_json: Path | None = None,
+    persistent_guard_compare_md: Path | None = None,
 ) -> dict:
     """Run the full PR gate chain and produce a controller_run packet."""
 
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persistent mutation guard validation (record-only mode)
+    # Validates pre-existing compare JSON against --require-persistent-guard.
+    # Does NOT mutate Hermes — only reads report files.
+    guard_state: dict = {
+        "required": require_persistent_guard,
+        "status": "not_required",
+        "snapshot_path": str(persistent_guard_snapshot) if persistent_guard_snapshot else None,
+        "compare_json_path": str(persistent_guard_compare_json) if persistent_guard_compare_json else None,
+        "compare_md_path": str(persistent_guard_compare_md) if persistent_guard_compare_md else None,
+        "blocked_changes_count": 0,
+        "allowed_changes_count": 0,
+        "message": "persistent mutation guard not required",
+    }
+
+    if require_persistent_guard or persistent_guard_compare_json is not None:
+        guard_state = _run_persistent_guard_validate(
+            snapshot_path=persistent_guard_snapshot,
+            compare_json_path=persistent_guard_compare_json,
+            compare_md_path=persistent_guard_compare_md,
+            guard_root=Path(persistent_guard_root),
+        )
+        guard_state["required"] = require_persistent_guard
+
+        # BLOCK on guard failure when required
+        if require_persistent_guard and guard_state["status"] in ("blocked", "error", "not_required"):
+            run_packet = {
+                "packet_kind": PACKET_KIND,
+                "schema_version": SCHEMA_VERSION,
+                "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "repo": {
+                    "owner": repo_owner,
+                    "name": repo_name,
+                    "pr_number": pr_number,
+                },
+                "board": board,
+                "mode": "blocked_on_persistent_guard",
+                "apply_create_task_requested": apply_create_task,
+                "persistent_mutation_guard": guard_state,
+                "artifacts": {},
+                "result": {
+                    "final_recommendation": "blocked_on_persistent_guard",
+                    "classification": "guard_blocked",
+                    "task_action": "",
+                    "kanban_recommended_action": "",
+                    "created_task_id": None,
+                    "duplicate_found": False,
+                },
+                "stop_rules": STOP_RULES,
+                "blockers_or_uncertainty": [
+                    f"persistent_mutation_guard: {guard_state['message']}",
+                ],
+            }
+            controller_packet_path = output_dir / "CONTROLLER_RUN_PACKET.json"
+            _write_json(run_packet, controller_packet_path)
+            _write_text(_render_summary(run_packet, {}, {}, {}), output_dir / "CONTROLLER_RUN_SUMMARY.md")
+            return run_packet
 
     # Step 1: Classify PR state
     classifier_json_path = output_dir / "CLASSIFIER_PACKET.json"
@@ -248,6 +392,7 @@ def run_controller(
         "idempotency_key": idempotency_key,
         "downstream_helper": "pr_gate_kanban_task_create.py",
         "no_dispatch_guarantee": True,
+        "persistent_mutation_guard": guard_state,
         "artifacts": {
             "classifier_json": str(classifier_json_path),
             "task_draft_json": str(task_draft_json_path),
@@ -389,7 +534,7 @@ def _render_summary(
     mode = run_packet["mode"]
     repo = run_packet["repo"]
     result = run_packet["result"]
-    artifacts = run_packet["artifacts"]
+    artifacts = run_packet.get("artifacts", {})
     board = run_packet["board"]
 
     lines = [
@@ -402,15 +547,15 @@ def _render_summary(
         "",
         "## Classification",
         "",
-        f"- **Classification:** `{classifier_packet.get('classification', 'unknown')}`",
-        f"- **CI Status:** `{classifier_packet.get('ci_status', 'unknown')}`",
-        f"- **Codex Status:** `{classifier_packet.get('codex_status', 'unknown')}`",
+        f"- **Classification:** `{classifier_packet.get('classification', 'unknown') if classifier_packet else 'unknown'}`",
+        f"- **CI Status:** `{classifier_packet.get('ci_status', 'unknown') if classifier_packet else 'unknown'}`",
+        f"- **Codex Status:** `{classifier_packet.get('codex_status', 'unknown') if classifier_packet else 'unknown'}`",
         "",
         "## Task Draft",
         "",
         f"- **Action:** `{result['task_action']}`",
-        f"- **Idempotency key:** `{run_packet.get('idempotency_key', task_draft_packet.get('idempotency_key', ''))}`",
-        f"- **PR head:** `{task_draft_packet.get('head_sha', '')}`",
+        f"- **Idempotency key:** `{run_packet.get('idempotency_key', task_draft_packet.get('idempotency_key', '') if task_draft_packet else '')}`",
+        f"- **PR head:** `{task_draft_packet.get('head_sha', '') if task_draft_packet else ''}`",
         "",
         "## Kanban Plan",
         "",
@@ -422,17 +567,21 @@ def _render_summary(
         "",
         f"`{result['final_recommendation']}`",
         "",
-        "## Artifacts",
-        "",
-        f"- Classifier: `{artifacts['classifier_json']}`",
-        f"- Task draft JSON: `{artifacts['task_draft_json']}`",
-        f"- Task draft MD: `{artifacts['task_draft_md']}`",
-        f"- Kanban plan JSON: `{artifacts['kanban_plan_json']}`",
-        f"- Kanban plan MD: `{artifacts['kanban_plan_md']}`",
-        "",
-        "## Stop Rules",
-        "",
     ]
+
+    if artifacts:
+        lines += [
+            "## Artifacts",
+            "",
+            f"- Classifier: `{artifacts.get('classifier_json', 'not available')}`",
+            f"- Task draft JSON: `{artifacts.get('task_draft_json', 'not available')}`",
+            f"- Task draft MD: `{artifacts.get('task_draft_md', 'not available')}`",
+            f"- Kanban plan JSON: `{artifacts.get('kanban_plan_json', 'not available')}`",
+            f"- Kanban plan MD: `{artifacts.get('kanban_plan_md', 'not available')}`",
+            "",
+        ]
+
+    lines += ["## Stop Rules", ""]
     for rule in run_packet["stop_rules"]:
         lines.append(f"- `{rule}`")
 
@@ -440,6 +589,17 @@ def _render_summary(
         lines += ["", "## Blockers / Uncertainty", ""]
         for b in run_packet["blockers_or_uncertainty"]:
             lines.append(f"- {b}")
+
+    guard = run_packet.get("persistent_mutation_guard", {})
+    if guard and guard.get("status") != "not_required":
+        lines += ["", "## Persistent Mutation Guard", ""]
+        lines.append(f"- **Required:** `{guard.get('required', False)}`")
+        lines.append(f"- **Status:** `{guard.get('status', 'unknown')}`")
+        lines.append(f"- **Message:** `{guard.get('message', '')}`")
+        lines.append(f"- **Blocked changes:** `{guard.get('blocked_changes_count', 0)}`")
+        lines.append(f"- **Allowed changes:** `{guard.get('allowed_changes_count', 0)}`")
+        if guard.get("compare_json_path"):
+            lines.append(f"- **Compare JSON:** `{guard['compare_json_path']}`")
 
     return "\n".join(lines)
 
@@ -476,6 +636,30 @@ def _build_argparser() -> argparse.ArgumentParser:
         "--base-branch", default="main",
         help="Base branch (default: main)"
     )
+    p.add_argument(
+        "--persistent-guard-root",
+        default="/home/max/.hermes",
+        help="Hermes root for persistent mutation guard (default: /home/max/.hermes)"
+    )
+    p.add_argument(
+        "--persistent-guard-snapshot",
+        type=Path, default=None,
+        help="Path to pre-existing snapshot JSON for record-only guard validation"
+    )
+    p.add_argument(
+        "--persistent-guard-compare-json",
+        type=Path, default=None,
+        help="Path to pre-existing guard compare JSON report"
+    )
+    p.add_argument(
+        "--persistent-guard-compare-md",
+        type=Path, default=None,
+        help="Path to pre-existing guard compare markdown report"
+    )
+    p.add_argument(
+        "--require-persistent-guard", action="store_true",
+        help="Require guard validation — BLOCK if compare JSON is missing, malformed, or recommendation=BLOCK"
+    )
     return p
 
 
@@ -506,6 +690,11 @@ def main() -> int:
             apply_create_task=args.apply_create_task,
             expected_head=args.expected_head,
             base_branch=args.base_branch,
+            require_persistent_guard=args.require_persistent_guard,
+            persistent_guard_root=args.persistent_guard_root,
+            persistent_guard_snapshot=args.persistent_guard_snapshot,
+            persistent_guard_compare_json=args.persistent_guard_compare_json,
+            persistent_guard_compare_md=args.persistent_guard_compare_md,
         )
     except FileNotFoundError as e:
         print(f"ERROR: {e}", file=sys.stderr)

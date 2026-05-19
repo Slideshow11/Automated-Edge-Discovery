@@ -116,7 +116,9 @@ def mod():
 
 @pytest.fixture
 def tmp_output_dir(tmp_path):
-    return tmp_path / "controller_run"
+    d = tmp_path / "controller_run"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 @pytest.fixture
@@ -1041,6 +1043,529 @@ class TestApplyCreateTaskHardening:
                 )
 
         assert result.get("downstream_helper") == "pr_gate_kanban_task_create.py"
+
+
+# ---------------------------------------------------------------------------
+# Persistent mutation guard tests
+# ---------------------------------------------------------------------------
+
+class TestPersistentMutationGuard:
+    """Tests for --require-persistent-guard and record-only guard wiring."""
+
+    def test_without_require_guard_preserves_existing_behavior(self, mod, tmp_output_dir):
+        """When --require-persistent-guard is absent, controller runs normally."""
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=False,
+                )
+
+        assert result["result"]["final_recommendation"] in (
+            "plan_ready_for_review", "no_action", "no_action_wait_downgrade"
+        )
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "not_required"
+        assert guard.get("required") is False
+
+    def test_require_guard_with_missing_compare_json_returns_block(self, mod, tmp_output_dir):
+        """--require-persistent-guard with compare_json=None returns BLOCK with not_required."""
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=None,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "not_required"
+        assert guard.get("required") is True
+        assert "not required" in guard.get("message", "").lower()
+
+    def test_require_guard_with_nonexistent_compare_path_returns_error(self, mod, tmp_output_dir):
+        """--require-persistent-guard with a path that doesn't exist returns BLOCK with error."""
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=Path("/tmp/nonexistent/compare.json"),
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "error"
+        assert guard.get("required") is True
+        assert "not found" in guard.get("message", "")
+
+    def test_require_guard_with_malformed_compare_json_returns_block(self, mod, tmp_output_dir):
+        """--require-persistent-guard with malformed compare JSON returns BLOCK."""
+        bad_json = tmp_output_dir / "malformed_compare.json"
+        bad_json.write_text("{ this is not json }")
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=bad_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "error"
+        assert "malformed" in guard.get("message", "").lower()
+
+    def test_require_guard_recommendation_block_returns_block(self, mod, tmp_output_dir):
+        """Compare JSON with recommendation=BLOCK returns BLOCK."""
+        block_json = tmp_output_dir / "block_compare.json"
+        block_json.write_text(json.dumps({
+            "status": "blocked",
+            "recommendation": "BLOCK",
+            "blocked_changes": [
+                {"relative_path": "skills/test-skill/SKILL.md", "change": "added"}
+            ],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=block_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "blocked"
+        assert guard.get("blocked_changes_count") == 1
+
+    def test_require_guard_recommendation_pass_records_clean(self, mod, tmp_output_dir):
+        """Compare JSON with recommendation=PASS records guard clean in packet."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean",
+            "recommendation": "PASS",
+            "blocked_changes": [],
+            "allowed_changes": [],
+        }))
+
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        assert result["result"]["final_recommendation"] in (
+            "plan_ready_for_review", "no_action", "no_action_wait_downgrade"
+        )
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "clean"
+        assert guard.get("required") is True
+
+    def test_clean_guard_does_not_override_stale_sha(self, mod, tmp_output_dir):
+        """A clean guard does not override stale head SHA detection."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+
+        def mock_classifier_mismatch(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                out = tmp_output_dir / "CLASSIFIER_PACKET.json"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(_mock_classifier_packet(
+                    classification="head_mismatch"
+                )))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_classifier_mismatch):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        assert result["persistent_mutation_guard"]["status"] == "clean"
+        assert result["result"]["classification"] == "head_mismatch"
+
+    def test_clean_guard_does_not_override_failed_ci(self, mod, tmp_output_dir):
+        """A clean guard does not override failed CI status."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+
+        def mock_classifier_ci_fail(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                out = tmp_output_dir / "CLASSIFIER_PACKET.json"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(_mock_classifier_packet(
+                    classification="ready_for_reviewer", codex_status="clean"
+                )))
+                # Override ci_status to red
+                data = json.loads(out.read_text())
+                data["ci_status"] = "red"
+                out.write_text(json.dumps(data))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_classifier_ci_fail):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        assert result["persistent_mutation_guard"]["status"] == "clean"
+        assert "red" in result["result"]["classification"] or \
+               result["result"]["task_action"] != ""
+
+    def test_clean_guard_does_not_override_scope_violation(self, mod, tmp_output_dir):
+        """A clean guard does not override scope violation — classifier reports it."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+
+        def mock_classifier_scope_violation(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                out = tmp_output_dir / "CLASSIFIER_PACKET.json"
+                out.parent.mkdir(parents=True, exist_ok=True)
+                out.write_text(json.dumps(_mock_classifier_packet(
+                    classification="scope_violation"
+                )))
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft(action="no_action_wait"))
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan(recommended_action="no_action"))
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_classifier_scope_violation):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        assert result["persistent_mutation_guard"]["status"] == "clean"
+        assert result["result"]["final_recommendation"] in (
+            "no_action", "no_action_wait_downgrade", "plan_ready_for_review"
+        )
+
+    def test_blocked_guard_suppresses_merge_authorization(self, mod, tmp_output_dir):
+        """A blocked guard produces final_recommendation=blocked_on_persistent_guard."""
+        block_json = tmp_output_dir / "block_compare.json"
+        block_json.write_text(json.dumps({
+            "status": "blocked",
+            "recommendation": "BLOCK",
+            "blocked_changes": [
+                {"relative_path": "skills/new-skill/SKILL.md", "change": "added"}
+            ],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=block_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        assert "blocked_on_persistent_guard" in result["mode"]
+        blockers = result.get("blockers_or_uncertainty", [])
+        assert any("persistent_mutation_guard" in b for b in blockers)
+
+    def test_blocked_guard_writes_blocked_packet_and_summary(self, mod, tmp_output_dir):
+        """A blocked guard writes CONTROLLER_RUN_PACKET.json and CONTROLLER_RUN_SUMMARY.md."""
+        block_json = tmp_output_dir / "block_compare.json"
+        block_json.write_text(json.dumps({
+            "status": "blocked", "recommendation": "BLOCK",
+            "blocked_changes": [{"relative_path": "skills/new-skill/SKILL.md", "change": "added"}],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=block_json,
+            )
+
+        assert (tmp_output_dir / "CONTROLLER_RUN_PACKET.json").exists()
+        assert (tmp_output_dir / "CONTROLLER_RUN_SUMMARY.md").exists()
+        packet = json.loads((tmp_output_dir / "CONTROLLER_RUN_PACKET.json").read_text())
+        assert packet["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        assert "persistent_mutation_guard" in packet
+
+    def test_markdown_report_includes_guard_state(self, mod, tmp_output_dir):
+        """CONTROLLER_RUN_SUMMARY.md includes persistent mutation guard section."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        summary = (tmp_output_dir / "CONTROLLER_RUN_SUMMARY.md").read_text()
+        assert "Persistent Mutation Guard" in summary
+        assert "clean" in summary
+
+    def test_json_report_includes_guard_state(self, mod, tmp_output_dir):
+        """CONTROLLER_RUN_PACKET.json includes persistent_mutation_guard key."""
+        clean_json = tmp_output_dir / "clean_compare.json"
+        clean_json.write_text(json.dumps({
+            "status": "clean", "recommendation": "PASS",
+            "blocked_changes": [], "allowed_changes": [],
+        }))
+
+        def mock_all(args, *, capture_output=True, check=True):
+            if "classify_pr_gate_state.py" in str(args):
+                (tmp_output_dir / "CLASSIFIER_PACKET.json").write_text(
+                    json.dumps(_mock_classifier_packet())
+                )
+            elif "pr_gate_task_draft.py" in str(args):
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.json").write_text(
+                    json.dumps(_mock_task_draft())
+                )
+                (tmp_output_dir / "PR_GATE_TASK_DRAFT.md").write_text("# Task Draft")
+            elif "pr_gate_kanban_task_create.py" in str(args):
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.json").write_text(
+                    json.dumps(_mock_kanban_plan())
+                )
+                (tmp_output_dir / "KANBAN_CREATE_PLAN.md").write_text("# Plan")
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        with mock.patch.object(mod, "_run_child", mock_all):
+            with mock.patch.object(mod, "_reject_hermes_path"):
+                result = mod.run_controller(
+                    repo_owner="Slideshow11",
+                    repo_name="Automated-Edge-Discovery",
+                    pr_number=199,
+                    board="aed",
+                    allowed_files=["docs/README.md"],
+                    output_dir=tmp_output_dir,
+                    apply_create_task=False,
+                    require_persistent_guard=True,
+                    persistent_guard_compare_json=clean_json,
+                )
+
+        packet = json.loads((tmp_output_dir / "CONTROLLER_RUN_PACKET.json").read_text())
+        assert "persistent_mutation_guard" in packet
+        assert packet["persistent_mutation_guard"]["status"] == "clean"
+
+    def test_guard_compare_json_missing_field_returns_block(self, mod, tmp_output_dir):
+        """Compare JSON missing 'status' field returns BLOCK when required."""
+        bad_json = tmp_output_dir / "missing_status.json"
+        bad_json.write_text(json.dumps({
+            "recommendation": "PASS",
+            "blocked_changes": [],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=bad_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        assert result["persistent_mutation_guard"]["status"] == "error"
+
+    def test_guard_compare_json_missing_recommendation_returns_block(self, mod, tmp_output_dir):
+        """Compare JSON missing 'recommendation' field returns BLOCK when required."""
+        bad_json = tmp_output_dir / "missing_rec.json"
+        bad_json.write_text(json.dumps({
+            "status": "clean",
+            "blocked_changes": [],
+            "allowed_changes": [],
+        }))
+
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=bad_json,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        assert result["persistent_mutation_guard"]["status"] == "error"
 
 
 # ---------------------------------------------------------------------------

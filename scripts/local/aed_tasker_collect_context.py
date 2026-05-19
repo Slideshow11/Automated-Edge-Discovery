@@ -314,8 +314,10 @@ def collect_context(
 
 def deterministic_json(packet: dict) -> str:
     """Serialize context to JSON with stable key ordering."""
+    # Exclude volatile timestamp fields that would make identical runs compare unequal
+    packet_copy = {k: v for k, v in packet.items() if k != "collected_at"}
     return json.dumps(
-        packet,
+        packet_copy,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
