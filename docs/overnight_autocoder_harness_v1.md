@@ -1,7 +1,7 @@
 # AED Overnight Autocoder Harness v1
 
 **Version:** 1
-**Status:** Experimental — dry-run only, no real task execution
+**Status:** Experimental — dry-run and packet-prep modes, no real task execution
 
 ---
 
@@ -10,12 +10,16 @@
 The Overnight Autocoder Harness v1 orchestrates safe AED unattended runs by
 wrapping the autocoder controller and persistent mutation guard into a single
 deterministic script. It is intended to be run by a scheduler (cron, systemd
-timer, etc.) overnight. It does **not** execute real tasks, dispatch work, create
-PRs, merge, or append audit entries.
+timer, etc.) overnight.
 
-v1 is strictly a **dry-run harness**. It validates the preconditions for an AED
-run and produces a human-reviewable summary. A human must then authorize any
-real execution.
+Two modes are available:
+
+| Mode | Description |
+|------|-------------|
+| `dry-run` | Verifies preconditions; simulates task processing; produces human-reviewable summary. No real execution. |
+| `packet-prep` | Same safety preconditions as dry-run, but generates Claude Code worker packets for each dependency-satisfied task. No execution, no dispatch, no PR, no merge, no audit. |
+
+Neither mode executes real tasks, dispatches work, creates PRs, merges, or appends audit entries.
 
 ---
 
@@ -30,13 +34,15 @@ real execution.
 | Stop for human review | Append audit log |
 | Verify clean repo state | Hermes create/dispatch |
 | Block on any safety violation | Modify memory/profile |
-| | Create skills |
+| Generate worker packets (packet-prep only) | Create skills |
+| Stop for human review (packet-prep only) | Execute Claude Code (packet-prep only) |
 
 ---
 
 ## CLI
 
 ```bash
+# Dry-run mode
 python3 scripts/local/run_overnight_autocoder_harness.py \
   --run-id <run_id> \
   --tasks-jsonl <tasks.jsonl> \
@@ -45,6 +51,16 @@ python3 scripts/local/run_overnight_autocoder_harness.py \
   --hermes-root /home/max/.hermes \
   --repo-root /home/max/Automated-Edge-Discovery \
   --mode dry-run
+
+# Packet-prep mode
+python3 scripts/local/run_overnight_autocoder_harness.py \
+  --run-id <run_id> \
+  --tasks-jsonl <tasks.jsonl> \
+  --workspace /tmp/aed_runs/<run_id> \
+  --integration-branch <branch> \
+  --hermes-root /home/max/.hermes \
+  --repo-root /home/max/Automated-Edge-Discovery \
+  --mode packet-prep
 ```
 
 All arguments required except `--mode` (default: `dry-run`).
@@ -76,7 +92,7 @@ All arguments required except `--mode` (default: `dry-run`).
    → BLOCK if record fails
 
 8. For each task in TASKS.jsonl:
-     record-task-result (TASK_READY, not_promoted) in dry-run mode
+     record-task-result (TASK_READY, not_promoted)
    → BLOCK if any task record fails
 
 9. Compare Hermes state (post-run snapshot vs pre-run)
@@ -98,6 +114,86 @@ All arguments required except `--mode` (default: `dry-run`).
 
 ---
 
+## Packet-Prep Sequence
+
+```
+1. Verify repo working tree is clean
+   → BLOCK if dirty
+
+2. Verify workspace is not inside repo root
+   → BLOCK if workspace ⊆ repo
+
+3. Verify TASKS.jsonl exists and has valid JSON lines
+   → BLOCK if missing or malformed
+
+4. Initialize autocoder controller state
+   → BLOCK if controller init fails
+
+5. Check safety invariants in controller state
+   → BLOCK if hermes_touched, dispatch_occurred, or production_board_touched
+
+6. Take persistent mutation guard snapshot of Hermes state
+   → BLOCK if guard snapshot fails
+
+7. Record snapshot path in controller
+   → BLOCK if record fails
+
+8. Load all tasks from TASKS.jsonl
+
+9. For each dependency-satisfied task (in dependency order):
+   a. Build Claude Code worker packet via build_worker_packet.py
+      → BLOCK if packet build fails
+   b. Verify packet output paths are under workspace
+      → BLOCK if any path escapes workspace
+   c. Record packet path in summary
+   d. record-task-result (TASK_READY, not_promoted)
+      → BLOCK if record fails
+
+10. Compare Hermes state (post-run snapshot vs pre-run)
+    → BLOCK if compare fails
+    → BLOCK if recommendation == BLOCK
+
+11. Record compare result in controller
+    → BLOCK if record fails
+
+12. Get next_action from controller
+    → BLOCK if next_action is request_human
+
+13. Produce OVERNIGHT_RUN_SUMMARY.json and .md under workspace
+
+14. Exit with:
+    - exit code 0 if recommendation == READY_FOR_REVIEW
+    - exit code 2 if recommendation == BLOCK
+```
+
+Dependency order: a task is processed only when all `depends_on` task IDs have
+already been recorded. This produces a topologically sorted packet sequence.
+
+---
+
+## Worker Packets (packet-prep only)
+
+For each dependency-satisfied task, the harness generates two files under
+`<workspace>/worker_packets/`:
+
+| File | Content |
+|------|---------|
+| `<task_id>.worker_packet.json` | Complete worker handoff packet (JSON) |
+| `<task_id>.worker_packet.md` | Human-readable packet (markdown) |
+
+The packet is built by `scripts/local/build_worker_packet.py` with:
+- `--task-json` — temporary per-task JSON written then deleted
+- `--controller-state` — the harness's `CONTROLLER_STATE.json`
+- `--workspace` — the run workspace
+- `--worker claude_code`
+- `--output-json` / `--output-md` — paths under `<workspace>/worker_packets/`
+
+Packets are NOT authority grants. They do not let Claude Code push, create PRs,
+merge, append audit logs, dispatch, create boards, update memory/profile, or
+create skills.
+
+---
+
 ## Output Files
 
 All output files are written under `--workspace`:
@@ -105,11 +201,13 @@ All output files are written under `--workspace`:
 | File | Content |
 |------|---------|
 | `CONTROLLER_STATE.json` | Full controller state |
-| `persistent_state_before.json` | Guard snapshot (3711+ files of Hermes state) |
+| `persistent_state_before.json` | Guard snapshot (pre-run Hermes state) |
 | `persistent_state_after.json` | Guard compare result (JSON) |
 | `persistent_state_report.md` | Guard compare report (markdown) |
 | `OVERNIGHT_RUN_SUMMARY.json` | Run summary (JSON) |
 | `OVERNIGHT_RUN_SUMMARY.md` | Run summary (markdown, human-readable) |
+| `worker_packets/<task_id>.worker_packet.json` | Worker packet (packet-prep only) |
+| `worker_packets/<task_id>.worker_packet.md` | Worker packet markdown (packet-prep only) |
 
 ---
 
@@ -118,7 +216,7 @@ All output files are written under `--workspace`:
 ```json
 {
   "run_id": "aed-overnight-001",
-  "mode": "dry-run",
+  "mode": "packet-prep",
   "repo_head": "9ae6dcc...",
   "workspace": "/tmp/aed_runs/aed-overnight-001",
   "integration_branch": "integration/aed-overnight-001",
@@ -130,6 +228,12 @@ All output files are written under `--workspace`:
   },
   "tasks_seen": ["task-001", "task-002"],
   "tasks_recorded": ["task-001", "task-002"],
+  "worker_packets_created": [
+    "/tmp/aed_runs/aed-overnight-001/worker_packets/task-001.worker_packet.json",
+    "/tmp/aed_runs/aed-overnight-001/worker_packets/task-002.worker_packet.json"
+  ],
+  "worker_packets_count": 2,
+  "claude_code_executed": false,
   "human_action_required": true,
   "recommendation": "READY_FOR_REVIEW",
   "blocked_reason": null,
@@ -138,6 +242,11 @@ All output files are written under `--workspace`:
   "timestamp": "2026-05-18T23:30:00Z"
 }
 ```
+
+New fields in `packet-prep` mode:
+- `worker_packets_created` — array of absolute paths to generated `.worker_packet.json` files
+- `worker_packets_count` — integer count of packets generated
+- `claude_code_executed` — always `false` in both modes (packet-prep generates packets but never invokes Claude Code)
 
 `recommendation` values:
 - `READY_FOR_REVIEW` — preconditions met, safe for human to review and authorize real execution
@@ -158,7 +267,9 @@ The harness blocks and exits code 2 if any of the following occur:
 | Safety invariant already true | `safety_invariant_violated` |
 | Guard snapshot fails | `guard_snapshot_failed` |
 | Record snapshot fails | `record_snapshot_failed` |
-| Any task record fails | `task_record_failed` |
+| Worker packet build fails (packet-prep) | `packet_build_failed:{task_id}` |
+| Worker packet output path escapes workspace (packet-prep) | `packet_path_outside_workspace:{path}` |
+| Any task record fails | `task_record_failed:{task_id}` |
 | Guard compare fails | `guard_compare_failed` |
 | Guard compare recommendation == BLOCK | `persistent_mutation_guard_blocked` |
 | Record compare fails | `record_compare_failed` |
@@ -168,7 +279,7 @@ The harness blocks and exits code 2 if any of the following occur:
 
 ## Persistent Mutation Guard Integration
 
-The harness runs two guard commands:
+The harness runs two guard commands in both modes:
 
 **Snapshot (pre-run):**
 ```bash
@@ -208,6 +319,11 @@ Both paths are recorded in the controller state via:
 8. **No PR creation**: The harness never calls `gh pr create`.
 9. **No merge**: The harness never calls `gh pr merge`.
 10. **No skill creation**: The harness never calls `skill_manage create`.
+11. **Packet path containment**: In packet-prep mode, any worker packet output
+    path that escapes the workspace triggers BLOCK.
+12. **Task promotion blocked**: In packet-prep mode, tasks are recorded as
+    `TASK_READY` with `promotion_status=not_promoted`. Packets do not grant
+    merge authority.
 
 ---
 
@@ -217,6 +333,9 @@ Both paths are recorded in the controller state via:
   record task results, record guard snapshot/compare, and compute next actions.
 - **`check_persistent_mutation_guard.py`**: Called by the harness to snapshot
   and compare Hermes state before and after the (simulated) run.
+- **`build_worker_packet.py`**: Called by the harness in packet-prep mode to
+  generate worker packets for each dependency-satisfied task. Never called
+  with the intent to execute the packet.
 - **`build_autocoder_run_summary.py`**: Not called by the harness. The harness
   produces its own `OVERNIGHT_RUN_SUMMARY.md` from scratch.
 - **`append_merge_action_audit.py`**: Not called by the harness. Audit append
@@ -226,13 +345,15 @@ Both paths are recorded in the controller state via:
 
 ## v1 Limitations
 
-- Only `dry-run` mode is implemented. Real task execution requires a separate
-  authorized run step.
+- Only `dry-run` and `packet-prep` modes are implemented. Real task execution
+  requires a separate authorized run step.
 - No scheduling integration (cron, systemd timer) is provided. The operator
   invokes the harness manually or via an external scheduler.
 - The harness does not retry failed steps. A failure blocks the entire run.
 - No email/webhook notification is produced on BLOCK. The operator must check
   the summary files after each run.
+- packet-prep does not execute Claude Code — packets are generated but must be
+  reviewed and executed manually (or via a future authorized run step).
 
 ---
 
@@ -241,11 +362,17 @@ Both paths are recorded in the controller state via:
 ```bash
 # Create TASKS.jsonl for the overnight run
 cat > /tmp/aed_runs/overnight-001/TASKS.jsonl <<'EOF'
-{"task_id": "task-001", "task_type": "docs_consistency", "depends_on": [], "blocks": []}
-{"task_id": "task-002", "task_type": "docs_consistency", "depends_on": ["task-001"], "blocks": []}
+{"task_id": "task-001", "task_type": "docs", "depends_on": [], "blocks": [],
+ "allowed_files": ["README.md"], "objective": "Update README",
+ "existing_code_reuse": {"enabled": true, "instructions": []},
+ "dependency_context": {"enabled": false}}
+{"task_id": "task-002", "task_type": "docs", "depends_on": ["task-001"], "blocks": [],
+ "allowed_files": ["CONTRIBUTING.md"], "objective": "Update CONTRIBUTING",
+ "existing_code_reuse": {"enabled": false},
+ "dependency_context": {"enabled": false}}
 EOF
 
-# Run the dry-run harness
+# Run packet-prep to generate worker packets
 python3 scripts/local/run_overnight_autocoder_harness.py \
   --run-id overnight-001 \
   --tasks-jsonl /tmp/aed_runs/overnight-001/TASKS.jsonl \
@@ -253,11 +380,14 @@ python3 scripts/local/run_overnight_autocoder_harness.py \
   --integration-branch integration/overnight-001 \
   --hermes-root /home/max/.hermes \
   --repo-root /home/max/Automated-Edge-Discovery \
-  --mode dry-run
+  --mode packet-prep
 
 # Inspect result
 cat /tmp/aed_runs/overnight-001/OVERNIGHT_RUN_SUMMARY.md
 
-# If recommendation is READY_FOR_REVIEW, human reviews and triggers real run
+# Review generated packets
+ls /tmp/aed_runs/overnight-001/worker_packets/
+
+# If recommendation is READY_FOR_REVIEW, human reviews packets and proceeds
 # If recommendation is BLOCK, operator resolves the blocking condition first
 ```
