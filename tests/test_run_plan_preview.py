@@ -225,6 +225,20 @@ class TestValidatePlanOnlyAllowedFiles:
         violations = validate_plan_only_allowed_files(plan, pkt)
         assert len(violations) == 0
 
+    def test_wildcard_dir_edit_outside_allowed_blocked(self):
+        # A plan proposing "Edit scripts/*" where only "tests/" is allowed
+        plan = "1. Edit scripts/*.py to add new feature"
+        pkt = make_packet(allowed_files=["tests/"])
+        violations = validate_plan_only_allowed_files(plan, pkt)
+        assert len(violations) > 0, "wildcard dir edit outside allowed_files must block"
+
+    def test_broad_directory_edit_blocked(self):
+        # A plan proposing edits to a whole directory outside allowed scope
+        plan = "1. Refactor all files in src/ directory to use new patterns"
+        pkt = make_packet(allowed_files=["tests/test_foo.py"])
+        violations = validate_plan_only_allowed_files(plan, pkt)
+        assert len(violations) > 0, "broad directory-level edit must block when outside allowed_files"
+
 
 # ---------------------------------------------------------------------------
 # Tests: _is_forbidden_path
@@ -365,6 +379,117 @@ class TestNoMutationPaths:
         # Only flag actual "git push" invocations, not git status/rev-parse
         git_push_calls = re.findall(r'["\']git["\'].*?["\']push["\']', src)
         assert len(git_push_calls) == 0, f"found git push calls: {git_push_calls}"
+
+
+# ---------------------------------------------------------------------------
+# Tests: run() — integration-style via patching (no actual Claude invocation)
+# ---------------------------------------------------------------------------
+
+import unittest.mock as mock
+
+
+class TestRunPlanPreviewIntegration:
+    """Test run() function paths via targeted patching of external calls."""
+
+    def test_output_dir_in_repo_returns_error(self, tmp_path):
+        # Patch _resolve_git_root to return the repo
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "rpp",
+            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
+        )
+        rpp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rpp)
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
+            with mock.patch.object(rpp, "_git_status", return_value="clean"):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = "/home/max/Automated-Edge-Discovery/.cache/plan_out"  # inside repo
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = str(tmp_path / "result.md")
+                args.timeout = 120
+                # Write valid packet
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x"}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 1
+
+    def test_nonzero_claude_exit_returns_error(self, tmp_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "rpp",
+            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
+        )
+        rpp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rpp)
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", 127)):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 120
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x"}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 1
+
+    def test_empty_plan_returns_error(self, tmp_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "rpp",
+            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
+        )
+        rpp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rpp)
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", 0)):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 120
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x"}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 1
+
+    def test_repo_mutated_returns_blocked(self, tmp_path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "rpp",
+            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
+        )
+        rpp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rpp)
+        git_statuses = ["clean", "dirty: M scripts/local/foo.py"]  # before=clean, after=dirty
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", 0)):
+                with mock.patch.object(rpp, "_git_status", side_effect=lambda *a: git_statuses.pop(0)):
+                    args = mock.MagicMock()
+                    args.packet_json = str(tmp_path / "packet.json")
+                    args.output_dir = str(tmp_path / "out")
+                    args.output_json = str(tmp_path / "result.json")
+                    args.output_md = None
+                    args.timeout = 120
+                    import json
+                    with open(args.packet_json, "w") as f:
+                        json.dump({
+                            "packet_kind": "aed.worker.packet.v1",
+                            "task": {
+                                "description": "x",
+                                "allowed_files": ["scripts/local/foo.py"],
+                                "forbidden_files": [],
+                                "do_not": [],
+                            }
+                        }, f)
+                    result_code = rpp.run(args)
+                    assert result_code == 1
 
 
 # ---------------------------------------------------------------------------

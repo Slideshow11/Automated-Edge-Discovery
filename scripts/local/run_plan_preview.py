@@ -435,12 +435,14 @@ def invoke_claude_plan(
         stdout_fd = proc.stdout.fileno()
         stderr_fd = proc.stderr.fileno() if proc.stderr else None
 
+        elapsed = 0
+        interval = 0.5
         while True:
             reads = [stdout_fd]
             if stderr_fd is not None:
                 reads.append(stderr_fd)
             try:
-                readable, _, _ = select.select(reads, [], [], 1.0)
+                readable, _, _ = select.select(reads, [], [], interval)
             except OSError:
                 break
             if stdout_fd in readable:
@@ -453,7 +455,13 @@ def invoke_claude_plan(
                 if data:
                     stderr_parts.append(data)
             # Check if process exited
-            if proc.poll() is not None:
+            poll_result = proc.poll()
+            if poll_result is not None:
+                break
+            elapsed += interval
+            if timeout > 0 and elapsed >= timeout:
+                proc.kill()
+                proc.wait()
                 break
 
         exit_code = proc.wait()
@@ -595,11 +603,42 @@ def run(args: argparse.Namespace) -> int:
     # Extract plan
     plan_text = extract_plan_from_stream(stdout)
 
-    # Git status after
+    # Git status after — always checked, even on Claude failure/timeout
     git_status_after = _git_status(repo_root) if repo_root else "not_in_repo"
 
-    # Detect repo mutation
-    if git_status_before != git_status_after and git_status_after != "clean":
+    # Fail closed on Claude errors: nonzero exit, empty output, or timeout
+    # timeout is detected by checking if elapsed >= timeout in invoke_claude_plan
+    # which results in partial/empty output. Treat these as PLAN_PREVIEW_ERROR.
+    if exit_code != 0:
+        result = build_result(
+            "PLAN_PREVIEW_ERROR",
+            args.packet_json,
+            output_dir,
+            plan_text,
+            [f"claude exited with code {exit_code}"],
+            git_status_before,
+            git_status_after,
+            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code},
+        )
+        _write_result(result, args)
+        return 1
+
+    if not plan_text or not plan_text.strip():
+        result = build_result(
+            "PLAN_PREVIEW_ERROR",
+            args.packet_json,
+            output_dir,
+            plan_text,
+            ["claude returned empty plan output"],
+            git_status_before,
+            git_status_after,
+            {"error_type": "empty_plan_output"},
+        )
+        _write_result(result, args)
+        return 1
+
+    # Detect repo mutation — any change from before is a block
+    if git_status_before != git_status_after:
         result = build_result(
             "PLAN_PREVIEW_BLOCKED",
             args.packet_json,
