@@ -520,6 +520,55 @@ class TestExtractPlanFromStream:
         assert result == ""
 
 
+class TestIsClaudeArtifactPath:
+    """Test is_claude_artifact_path and its effect on validation."""
+
+    def test_claude_plans_path_is_artifact(self):
+        import run_plan_preview as rpp
+        assert rpp.is_claude_artifact_path("/home/max/.claude/plans/foo.md") is True
+        assert rpp.is_claude_artifact_path("/tmp/claude/plans/bar.md") is True
+        assert rpp.is_claude_artifact_path("/home/max/.claude/") is True
+
+    def test_hermes_path_is_not_artifact(self):
+        import run_plan_preview as rpp
+        assert rpp.is_claude_artifact_path("/home/max/.hermes/something") is False
+
+    def test_repo_path_is_not_artifact(self):
+        import run_plan_preview as rpp
+        assert rpp.is_claude_artifact_path("/home/max/Automated-Edge-Discovery/scripts/foo.py") is False
+
+    def test_plan_referencing_claude_artifact_not_blocked(self):
+        """Regression: informative Claude artifact paths must not count as repo edits."""
+        import run_plan_preview as rpp
+        # A plan that mentions the Claude plan file path should not be blocked
+        # when the allowed_files do not include .claude paths
+        plan = 'The plan file at `/home/max/.claude/plans/temporal-watching-crab.md` is ready.'
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/", "tests/", "docs/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Expected no errors, got: {errors}"
+
+    def test_plan_proposing_repo_edit_still_blocked(self):
+        """Real repo edit proposals must still be blocked."""
+        import run_plan_preview as rpp
+        plan = '1. Edit /home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py'
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/", "tests/", "docs/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Expected violation for repo edit outside allowed scope"
+        assert "run_plan_preview.py" in errors[0]
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 

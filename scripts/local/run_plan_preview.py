@@ -41,6 +41,10 @@ import select
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+def _now_iso() -> str:
+    """Return current UTC timestamp in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -85,8 +89,19 @@ def _load_json(path: str | Path) -> dict:
         return {}
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Paths never allowed as plan targets
+FORBIDDEN_PATH_PREFIXES = (
+    "/home/max/.hermes",
+    "/tmp/hermes",
+)
+
+# Path components that indicate Claude-internal artifact directories.
+# Plans may reference these informatively (e.g. "plan saved to ~/.claude/plans/x.md")
+# but they are never external repo mutations.
+FORBIDDEN_CLAUDE_PREFIXES = (
+    "/home/max/.claude",
+    "/tmp/claude",
+)
 
 
 def _is_forbidden_path(path: str) -> bool:
@@ -105,6 +120,15 @@ def _is_forbidden_path(path: str) -> bool:
             for pat in FORBIDDEN_FILENAME_PATTERNS:
                 if part.startswith(pat):
                     return True
+    return False
+
+
+def is_claude_artifact_path(path: str) -> bool:
+    """Return True if path is a Claude-internal artifact (not a repo mutation)."""
+    p = Path(path)
+    for prefix in FORBIDDEN_CLAUDE_PREFIXES:
+        if str(p).startswith(prefix):
+            return True
     return False
 
 
@@ -257,11 +281,23 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
             for word in words:
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
-                        path_part = word.rstrip(".,;:").split("<")[0].split(">")[0]
-                        if path_part and not _is_forbidden_path(path_part):
+                        # Strip surrounding backticks BEFORE punctuation rstrip
+                        # (punctuation rstrip would otherwise remove trailing backtick,
+                        #  making the endswith check fail)
+                        if word.startswith("`") and word.endswith("`"):
+                            word = word[1:-1]
+                        path_part = word.rstrip(".,;:`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                        if path_part.startswith("`") and path_part.endswith("`"):
+                            path_part = path_part[1:-1]
+                        if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
                             matched = False
+                            # Be strict: require the path to START with an allowed prefix,
+                            # not just contain the prefix string somewhere.
+                            # (The "or allowed in path_part" check was too loose and caused
+                            # /home/max/Automated-Edge-Discovery/scripts/... to match "scripts/"
+                            # because "scripts/" is contained in the longer path.)
                             for allowed in allowed_files:
-                                if path_part.startswith(allowed) or allowed in path_part:
+                                if path_part.startswith(allowed):
                                     matched = True
                                     break
                             if not matched:
