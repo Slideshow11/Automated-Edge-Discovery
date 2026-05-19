@@ -141,7 +141,9 @@ def run_harness(args: argparse.Namespace) -> dict:
 
     # All subprocess calls that invoke AED scripts must run from the AED repo,
     # not from the temp --repo-root (which is only used for git operations).
-    AED_REPO_ROOT = "/home/max/Automated-Edge-Discovery"
+    # The script is at scripts/local/run_overnight_autocoder_harness.py, so three
+    # parent steps go: scripts/local -> scripts -> repo root.
+    AED_REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 
     summary = {
         "run_id": args.run_id,
