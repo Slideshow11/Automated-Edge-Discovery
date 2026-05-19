@@ -106,6 +106,9 @@ def _validate_guard_compare_json(path: Path) -> tuple[bool, str]:
     except json.JSONDecodeError as e:
         return False, f"malformed JSON in compare JSON: {e}"
 
+    if not isinstance(data, dict):
+        return False, "compare JSON must be a JSON object (not array, string, or number)"
+
     for field in ("status", "recommendation"):
         if field not in data:
             return False, f"compare JSON missing required field: {field}"

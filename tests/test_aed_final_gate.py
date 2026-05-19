@@ -1094,6 +1094,20 @@ class TestPersistentMutationGuardFinalGate:
         assert gate["persistent_mutation_guard"]["status"] == "error"
         assert "authorization_phrase" not in gate
 
+    def test_non_object_json_returns_block(self, tmp_path):
+        """Compare JSON is a JSON array/string/number (not an object) → BLOCK (error)."""
+        cmp_path = str(tmp_path / "non_object.json")
+        # Array is valid JSON but not a dict — should be rejected as invalid
+        gate = self._run_gate_with_pmg(
+            tmp_path, require_pmg=True,
+            compare_json_path=cmp_path,
+            compare_json_content=["status", "clean", "recommendation", "PASS"]
+        )
+        assert gate["final_recommendation"] == "BLOCK"
+        assert gate["persistent_mutation_guard"]["status"] == "error"
+        assert "must be a JSON object" in gate["persistent_mutation_guard"]["message"]
+        assert "authorization_phrase" not in gate
+
     def test_compare_json_missing_status_returns_block(self, tmp_path):
         """Compare JSON missing 'status' field → BLOCK (error)."""
         cmp_path = str(tmp_path / "missing_status.json")
