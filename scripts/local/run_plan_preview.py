@@ -386,8 +386,9 @@ def invoke_claude_plan(
     claude_args = [
         "claude",
         "--permission-mode", "plan",
-        "-p",
+        "-p", "PLAN",
         "--output-format", "stream-json",
+        "--verbose",
     ]
 
     # Add --add-dir for each unique parent dir
@@ -406,7 +407,11 @@ def invoke_claude_plan(
             if k in env:
                 pass  # already present
 
-    # Write system prompt to temp file to avoid CLI length issues
+    # Write system prompt to temp file
+    # Note: the file path is passed via --system-prompt-file arg; Claude reads it.
+    # stdin=subprocess.DEVNULL is safe because --system-prompt-file provides
+    # the full system prompt content to Claude. This avoids stdin timing issues
+    # with piped mode when the process is long-running.
     import tempfile
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -469,7 +474,7 @@ def invoke_claude_plan(
         stdout = b"".join(stdout_parts).decode("utf-8", errors="replace")
         stderr = b"".join(stderr_parts).decode("utf-8", errors="replace")
 
-        return stdout, exit_code
+        return stdout, stderr, exit_code
 
     finally:
         Path(sp_path).unlink(missing_ok=True)
@@ -598,7 +603,7 @@ def run(args: argparse.Namespace) -> int:
             pass  # OK — outside repo
 
     # Invoke Claude Code plan mode
-    stdout, exit_code = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
+    stdout, stderr, exit_code = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
 
     # Extract plan
     plan_text = extract_plan_from_stream(stdout)
@@ -610,15 +615,19 @@ def run(args: argparse.Namespace) -> int:
     # timeout is detected by checking if elapsed >= timeout in invoke_claude_plan
     # which results in partial/empty output. Treat these as PLAN_PREVIEW_ERROR.
     if exit_code != 0:
+        # Grab a safe snippet of stderr to help diagnose the error.
+        # Truncate to first 200 chars — enough to identify the error category
+        # without leaking session content, keys, or hook internals.
+        stderr_snippet = (stderr or "").strip()[:200]
         result = build_result(
             "PLAN_PREVIEW_ERROR",
             args.packet_json,
             output_dir,
             plan_text,
-            [f"claude exited with code {exit_code}"],
+            [f"claude exited with code {exit_code}" + (f": {stderr_snippet}" if stderr_snippet else "")],
             git_status_before,
             git_status_after,
-            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code},
+            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code, "stderr_snippet": stderr_snippet},
         )
         _write_result(result, args)
         return 1

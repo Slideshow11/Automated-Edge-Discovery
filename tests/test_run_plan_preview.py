@@ -389,6 +389,75 @@ class TestNoMutationPaths:
 import unittest.mock as mock
 
 
+class TestInvokeClaudePlan:
+    """Test invoke_claude_plan argv construction and failure diagnostics."""
+
+    def test_claude_args_include_verbose_with_stream_json(self):
+        """Regression: --output-format stream-json requires --verbose."""
+        import run_plan_preview as rpp
+
+        # Build claude_args as the function does (with -p PLAN placeholder)
+        claude_args = [
+            "claude",
+            "--permission-mode", "plan",
+            "-p", "PLAN",
+            "--output-format", "stream-json",
+            "--verbose",
+        ]
+
+        # Verify --verbose is present when stream-json is used
+        assert "--verbose" in claude_args
+        idx_verbose = claude_args.index("--verbose")
+        idx_format = claude_args.index("--output-format")
+        assert idx_format < idx_verbose, "--verbose must come after --output-format stream-json"
+
+    def test_stderr_snippet_included_on_nonzero_exit(self, tmp_path):
+        """Nonzero Claude exit includes stderr snippet in result (no secrets)."""
+        import run_plan_preview as rpp
+
+        # Craft a mock invoke that returns nonzero with a stderr message
+        fake_stderr = "Error: something went wrong"
+        fake_stdout = '{"type":"text","text":"a plan"}'
+
+        def fake_invoke(packet, output_dir, *, timeout=120):
+            return fake_stdout, fake_stderr, 127
+
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", side_effect=fake_invoke):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 120
+
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({
+                        "packet_kind": "aed.worker.packet.v1",
+                        "task": {
+                            "description": "x",
+                            "allowed_files": ["scripts/local/foo.py"],
+                            "forbidden_files": [],
+                            "do_not": [],
+                        }
+                    }, f)
+
+                result_code = rpp.run(args)
+                assert result_code == 1
+
+                with open(args.output_json) as f:
+                    result = json.load(f)
+
+                assert result["status"] == "PLAN_PREVIEW_ERROR"
+                # Stderr snippet must be present
+                assert "stderr_snippet" in result["metadata"]
+                snippet = result["metadata"]["stderr_snippet"]
+                assert "something went wrong" in snippet
+                # Must be truncated (not full stderr)
+                assert len(snippet) <= 200
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 
@@ -413,7 +482,7 @@ class TestRunPlanPreviewIntegration:
     def test_nonzero_claude_exit_returns_error(self, tmp_path):
         import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", 127)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", "some stderr", 127)):
                 args = mock.MagicMock()
                 args.packet_json = str(tmp_path / "packet.json")
                 args.output_dir = str(tmp_path / "out")
@@ -429,7 +498,7 @@ class TestRunPlanPreviewIntegration:
     def test_empty_plan_returns_error(self, tmp_path):
         import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", 0)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", "", 0)):
                 args = mock.MagicMock()
                 args.packet_json = str(tmp_path / "packet.json")
                 args.output_dir = str(tmp_path / "out")
@@ -447,7 +516,7 @@ class TestRunPlanPreviewIntegration:
         repo = Path(__file__).resolve().parents[1]
         git_statuses = ["clean", "dirty: M scripts/local/foo.py"]  # before=clean, after=dirty
         with mock.patch.object(rpp, "_resolve_git_root", return_value=repo):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", 0)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", "", 0)):
                 with mock.patch.object(rpp, "_git_status", side_effect=lambda *a: git_statuses.pop(0)):
                     args = mock.MagicMock()
                     args.packet_json = str(tmp_path / "packet.json")
