@@ -93,6 +93,7 @@ def verify(
     pr_number: int,
     reported_head_sha: Optional[str],
     require_mergeable: bool,
+    pmg_guard_state: Optional[dict] = None,
 ) -> dict:
     """
     Fetch canonical PR data from GitHub and return a verification result dict.
@@ -168,6 +169,25 @@ def verify(
 
     auth_phrase = build_authorization_phrase(pr_number, canonical_head_sha)
     merge_cmd = build_merge_command(pr_number, repo, canonical_head_sha)
+
+    # PMG enforcement: if PMG guard state was provided and is not clean,
+    # suppress the authorization phrase and merge command so no merge can proceed.
+    # This makes verify_final_head_merge_command.py a proper final gate that
+    # cannot emit a final authorization when PMG is stale, blocked, or error.
+    # status "not_required" is allowed (PMG not required for this PR).
+    if pmg_guard_state is not None:
+        pmg_status = pmg_guard_state.get("status", "")
+        if pmg_status in ("blocked", "error"):
+            auth_phrase = ""
+            merge_cmd = ""
+            # Demote recommendation if it would otherwise be MERGE_READY_CANDIDATE
+            if recommendation == "MERGE_READY_CANDIDATE":
+                recommendation = "BLOCK"
+                errors.append(
+                    f"persistent_mutation_guard: PMG status is '{pmg_status}' "
+                    f"({pmg_guard_state.get('message', 'unknown')}). "
+                    f"Authorization withheld. Provide fresh PMG compare JSON."
+                )
 
     return {
         "recommendation": recommendation,
@@ -321,14 +341,30 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--output-json",
-        help="Write result as JSON to this path",
+        help="Write result as JSON to path",
+    )
+    parser.add_argument(
+        "--pmg-guard-state-json",
+        dest="pmg_guard_state_json",
+        help="Path to a PMG guard state JSON file. If provided and status != 'clean', "
+             "authorization phrase and merge command are withheld.",
     )
     parser.add_argument(
         "--output-md",
-        help="Write result as Markdown to this path",
+        help="Write result as Markdown to path",
     )
 
     args = parser.parse_args(argv)
+
+    # Load PMG guard state if provided
+    pmg_guard_state: Optional[dict] = None
+    if args.pmg_guard_state_json:
+        import json as _json
+        try:
+            pmg_guard_state = _json.loads(Path(args.pmg_guard_state_json).read_text())
+        except (FileNotFoundError, ValueError) as e:
+            print(f"FATAL: invalid PMG guard state JSON: {e}", file=sys.stderr)
+            return 1
 
     reported_sha: Optional[str] = args.reported_head_sha
     if reported_sha is not None:
@@ -340,6 +376,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             pr_number=args.pr_number,
             reported_head_sha=reported_sha,
             require_mergeable=args.require_mergeable,
+            pmg_guard_state=pmg_guard_state,
         )
     except Exception as e:
         # Fatal error — PR data could not be fetched
