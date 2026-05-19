@@ -249,7 +249,7 @@ def run_controller(
         guard_state["required"] = require_persistent_guard
 
         # BLOCK on guard failure when required
-        if require_persistent_guard and guard_state["status"] in ("blocked", "error"):
+        if require_persistent_guard and guard_state["status"] in ("blocked", "error", "not_required"):
             run_packet = {
                 "packet_kind": PACKET_KIND,
                 "schema_version": SCHEMA_VERSION,

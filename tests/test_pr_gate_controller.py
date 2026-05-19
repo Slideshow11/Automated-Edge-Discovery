@@ -1092,7 +1092,28 @@ class TestPersistentMutationGuard:
         assert guard.get("required") is False
 
     def test_require_guard_with_missing_compare_json_returns_block(self, mod, tmp_output_dir):
-        """--require-persistent-guard with missing compare JSON returns BLOCK."""
+        """--require-persistent-guard with compare_json=None returns BLOCK with not_required."""
+        with mock.patch.object(mod, "_reject_hermes_path"):
+            result = mod.run_controller(
+                repo_owner="Slideshow11",
+                repo_name="Automated-Edge-Discovery",
+                pr_number=199,
+                board="aed",
+                allowed_files=["docs/README.md"],
+                output_dir=tmp_output_dir,
+                apply_create_task=False,
+                require_persistent_guard=True,
+                persistent_guard_compare_json=None,
+            )
+
+        assert result["result"]["final_recommendation"] == "blocked_on_persistent_guard"
+        guard = result.get("persistent_mutation_guard", {})
+        assert guard.get("status") == "not_required"
+        assert guard.get("required") is True
+        assert "not required" in guard.get("message", "").lower()
+
+    def test_require_guard_with_nonexistent_compare_path_returns_error(self, mod, tmp_output_dir):
+        """--require-persistent-guard with a path that doesn't exist returns BLOCK with error."""
         with mock.patch.object(mod, "_reject_hermes_path"):
             result = mod.run_controller(
                 repo_owner="Slideshow11",
