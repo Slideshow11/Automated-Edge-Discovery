@@ -333,9 +333,12 @@ class TestLoadJson:
 # Integration-style tests (no actual Claude Code invocation)
 # ---------------------------------------------------------------------------
 
+_SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "local" / "run_plan_preview.py"
+
+
 class TestNoMutationPaths:
     def test_script_has_no_dispatch_function_calls(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         # Check for actual dispatch() calls, not the word "dispatch" in comments
         import re
         # dispatch( or from dispatch or import dispatch — not case-insensitive word in comments
@@ -343,7 +346,7 @@ class TestNoMutationPaths:
         assert len(dispatch_calls) == 0, f"found dispatch() calls: {dispatch_calls}"
 
     def test_script_has_no_audit_log_append(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         # Check for actual audit log append calls, not word "audit" in comments/docstrings
         import re
         append_calls = re.findall(r'\.append\s*\(', src)  # any .append( call
@@ -351,28 +354,28 @@ class TestNoMutationPaths:
         assert len(audit_append) == 0, f"found audit.append() calls: {audit_append}"
 
     def test_script_has_no_board_touch(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         forbidden = ["production_board", "kanban", "linear"]
         for kw in forbidden:
             assert kw not in src.lower(), f"found '{kw}' in source"
 
     def test_script_does_not_import_hermes(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         assert "hermes_tools" not in src
         assert "from hermes" not in src
         assert "import hermes" not in src
 
     def test_script_has_no_test_execution(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         assert "pytest" not in src
         assert "unittest" not in src
 
     def test_output_defaults_to_tmp(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         assert "/tmp/aed_runs" in src
 
     def test_no_git_push_calls(self):
-        src = Path("/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py").read_text()
+        src = _SCRIPT_PATH.read_text()
         import re
         # Only flag actual "git push" invocations, not git status/rev-parse
         git_push_calls = re.findall(r'["\']git["\'].*?["\']push["\']', src)
