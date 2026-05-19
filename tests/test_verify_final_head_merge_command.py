@@ -842,3 +842,169 @@ class TestPmgGuardStateCli:
         text = out_md.read_text()
         # Authorization section should be absent or empty
         assert "Authorization Phrase" not in text or "I confirm merge" not in text
+
+
+class TestRequirePmgEnforcement:
+    """
+    Acceptance criterion: when --require-pmg is set and no --pmg-guard-state-json
+    is provided, verify_final_head_merge_command.py must emit:
+      - recommendation: BLOCK
+      - authorization_phrase: "" (empty)
+      - merge_command: "" (empty)
+
+    This closes the operator bypass path where the tool is used as the final
+    merge helper without PMG coverage.
+    """
+
+    def test_require_pmg_no_guard_state_returns_block(self, monkeypatch):
+        """--require-pmg without --pmg-guard-state-json → BLOCK, no auth, no merge_cmd."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state=None,
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "BLOCK"
+        assert result["authorization_phrase"] == ""
+        assert result["merge_command"] == ""
+        assert any(
+            "--require-pmg was set but --pmg-guard-state-json was not provided"
+            in e
+            for e in result["verification_errors"]
+        )
+
+    def test_require_pmg_with_clean_guard_preserves_auth(self, monkeypatch):
+        """--require-pmg with fresh clean PMG → auth phrase and merge command emitted."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={"status": "clean", "message": "guard recommendation: PASS"},
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "MERGE_READY_CANDIDATE"
+        assert result["authorization_phrase"] != ""
+        assert result["merge_command"] != ""
+        assert "I confirm merge" in result["authorization_phrase"]
+        assert "gh pr merge" in result["merge_command"]
+
+    def test_require_pmg_with_stale_guard_returns_block(self, monkeypatch):
+        """--require-pmg with stale PMG (status=error) → BLOCK, no auth, no merge_cmd."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={
+                "status": "error",
+                "message": "compare JSON is stale (compare_at is 1800s older than gate execution, max 600s)",
+            },
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "BLOCK"
+        assert result["authorization_phrase"] == ""
+        assert result["merge_command"] == ""
+
+    def test_no_require_pmg_no_guard_state_returns_merge_ready_candidate(self, monkeypatch):
+        """Without --require-pmg and no PMG guard state → MERGE_READY_CANDIDATE (backward compat)."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state=None,
+            require_pmg=False,
+        )
+        # Backward compatible: no PMG required means auth phrase is still emitted
+        assert result["recommendation"] == "MERGE_READY_CANDIDATE"
+        assert result["authorization_phrase"] != ""
+        assert result["merge_command"] != ""
+
+
+class TestRequirePmgCli:
+    """CLI --require-pmg flag wires into verify() correctly."""
+
+    def test_require_pmg_cli_no_guard_state_returns_error_exit_code(self, tmp_path, monkeypatch):
+        """--require-pmg without --pmg-guard-state-json → exit 0 (BLOCK, not fatal error)."""
+        import json
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        out_json = tmp_path / "out.json"
+        rc = main([
+            "--pr-number", "227",
+            "--reported-head-sha", "dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            "--require-pmg",
+            "--output-json", str(out_json),
+        ])
+        assert rc == 0
+        data = json.loads(out_json.read_text())
+        assert data["recommendation"] == "BLOCK"
+        assert data["authorization_phrase"] == ""
+        assert data["merge_command"] == ""
+
+    def test_require_pmg_cli_with_clean_guard_preserves_auth(self, tmp_path, monkeypatch):
+        """--require-pmg --pmg-guard-state-json with clean status → auth emitted."""
+        import json
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        pmg_path = tmp_path / "pmg.json"
+        pmg_path.write_text(json.dumps({
+            "status": "clean",
+            "message": "guard recommendation: PASS",
+        }))
+        out_json = tmp_path / "out.json"
+        rc = main([
+            "--pr-number", "227",
+            "--reported-head-sha", "dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            "--require-pmg",
+            "--pmg-guard-state-json", str(pmg_path),
+            "--output-json", str(out_json),
+        ])
+        assert rc == 0
+        data = json.loads(out_json.read_text())
+        assert data["recommendation"] == "MERGE_READY_CANDIDATE"
+        assert data["authorization_phrase"] != ""
+        assert data["merge_command"] != ""
+
+    def test_require_pmg_disabled_no_guard_state_preserves_auth(self, tmp_path, monkeypatch):
+        """--no-require-pmg without PMG guard state → auth phrase emitted (backward compat)."""
+        import json
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        out_json = tmp_path / "out.json"
+        rc = main([
+            "--pr-number", "227",
+            "--reported-head-sha", "dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            "--no-require-pmg",
+            "--output-json", str(out_json),
+        ])
+        assert rc == 0
+        data = json.loads(out_json.read_text())
+        assert data["recommendation"] == "MERGE_READY_CANDIDATE"
+        assert data["authorization_phrase"] != ""
+        assert data["merge_command"] != ""
