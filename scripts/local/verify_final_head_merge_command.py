@@ -93,6 +93,8 @@ def verify(
     pr_number: int,
     reported_head_sha: Optional[str],
     require_mergeable: bool,
+    pmg_guard_state: Optional[dict] = None,
+    require_pmg: bool = False,
 ) -> dict:
     """
     Fetch canonical PR data from GitHub and return a verification result dict.
@@ -169,6 +171,65 @@ def verify(
     auth_phrase = build_authorization_phrase(pr_number, canonical_head_sha)
     merge_cmd = build_merge_command(pr_number, repo, canonical_head_sha)
 
+    # PMG mandatory enforcement: if PMG is required but not supplied,
+    # this tool cannot emit final authorization. Withhold auth phrase
+    # and merge command so no merge can proceed without PMG coverage.
+    pmg_missing = require_pmg and (pmg_guard_state is None)
+    if pmg_missing:
+        auth_phrase = ""
+        merge_cmd = ""
+        if recommendation == "MERGE_READY_CANDIDATE":
+            recommendation = "BLOCK"
+            errors.append(
+                "persistent_mutation_guard: --require-pmg was set but "
+                "--pmg-guard-state-json was not provided. PMG is mandatory "
+                "for final merge authorization. Provide a PMG guard state JSON "
+                "or do not use --require-pmg."
+            )
+
+    # PMG enforcement: evaluate guard state when require_pmg is set.
+    # With require_pmg=True, any non-clean status is a BLOCK — including
+    # "not_required" (PMG was required but no guard exists) and unknown/missing
+    # status. With require_pmg=False (default), only "blocked"/"error" block.
+    if pmg_guard_state is not None:
+        pmg_status = pmg_guard_state.get("status", "")
+        # With require_pmg, only "clean" allows authorization.
+        # Without require_pmg, "clean" and "not_required" allow authorization.
+        pmg_allowed = (
+            pmg_status == "clean"
+            or (not require_pmg and pmg_status == "not_required")
+        )
+        if not pmg_allowed:
+            auth_phrase = ""
+            merge_cmd = ""
+            if recommendation == "MERGE_READY_CANDIDATE":
+                recommendation = "BLOCK"
+                if require_pmg:
+                    if pmg_status == "not_required":
+                        errors.append(
+                            "persistent_mutation_guard: --require-pmg was set but "
+                            "status is 'not_required'. PMG is mandatory for final merge "
+                            "authorization. Provide a PMG guard state JSON or do not use "
+                            "--require-pmg."
+                        )
+                    elif pmg_status:
+                        errors.append(
+                            f"persistent_mutation_guard: PMG status is '{pmg_status}' "
+                            f"({pmg_guard_state.get('message', 'unknown')}). "
+                            f"Authorization withheld."
+                        )
+                    else:
+                        errors.append(
+                            "persistent_mutation_guard: PMG guard state has no 'status' field. "
+                            "Authorization withheld. Provide a valid PMG guard state JSON."
+                        )
+                else:
+                    errors.append(
+                        f"persistent_mutation_guard: PMG status is '{pmg_status}' "
+                        f"({pmg_guard_state.get('message', 'unknown')}). "
+                        f"Authorization withheld."
+                    )
+
     return {
         "recommendation": recommendation,
         "pr_number": pr_number,
@@ -240,11 +301,18 @@ def print_result(result: dict) -> None:
     print()
     print(f"RECOMMENDATION: {result['recommendation']}")
     print()
-    print("--- Authorization Phrase ---")
-    print(result["authorization_phrase"])
-    print()
-    print("--- Merge Command ---")
-    print(result["merge_command"])
+    if result["authorization_phrase"]:
+        print("--- Authorization Phrase ---")
+        print(result["authorization_phrase"])
+        print()
+        print("--- Merge Command ---")
+        print(result["merge_command"])
+    else:
+        print("--- Authorization Phrase ---")
+        print("(not emitted — provide PMG guard state or omit --require-pmg)")
+        print()
+        print("--- Merge Command ---")
+        print("(not emitted — provide PMG guard state or omit --require-pmg)")
 
 
 def write_json(result: dict, path: str) -> None:
@@ -321,14 +389,39 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     parser.add_argument(
         "--output-json",
-        help="Write result as JSON to this path",
+        help="Write result as JSON to path",
+    )
+    parser.add_argument(
+        "--pmg-guard-state-json",
+        dest="pmg_guard_state_json",
+        help="Path to a PMG guard state JSON file. If provided and status != 'clean', "
+             "authorization phrase and merge command are withheld.",
+    )
+    parser.add_argument(
+        "--require-pmg",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require PMG guard state for final merge authorization. "
+             "Without --pmg-guard-state-json, no authorization phrase or merge command "
+             "will be emitted. Use this flag when verify_final_head_merge_command.py "
+             "is used as the final authorization step.",
     )
     parser.add_argument(
         "--output-md",
-        help="Write result as Markdown to this path",
+        help="Write result as Markdown to path",
     )
 
     args = parser.parse_args(argv)
+
+    # Load PMG guard state if provided
+    pmg_guard_state: Optional[dict] = None
+    if args.pmg_guard_state_json:
+        import json as _json
+        try:
+            pmg_guard_state = _json.loads(Path(args.pmg_guard_state_json).read_text())
+        except (FileNotFoundError, ValueError) as e:
+            print(f"FATAL: invalid PMG guard state JSON: {e}", file=sys.stderr)
+            return 1
 
     reported_sha: Optional[str] = args.reported_head_sha
     if reported_sha is not None:
@@ -340,6 +433,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             pr_number=args.pr_number,
             reported_head_sha=reported_sha,
             require_mergeable=args.require_mergeable,
+            pmg_guard_state=pmg_guard_state,
+            require_pmg=args.require_pmg,
         )
     except Exception as e:
         # Fatal error — PR data could not be fetched

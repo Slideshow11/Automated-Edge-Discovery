@@ -24,6 +24,22 @@ import sys
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
+
+# Maximum age of a PMG compare JSON before it is considered stale.
+# A clean compare JSON older than this relative to gate execution is rejected.
+MAX_COMPARE_AGE_SECONDS = 600  # 10 minutes
+
+
+def _get_freshness_reference_time() -> datetime:
+    """Return the current UTC timestamp used for PMG compare freshness validation.
+
+    Patched in tests to provide a deterministic clock. Must be called at validation
+    time (not compare-json authoring time) so that pre-generated stale compares are
+    caught even if the test runner itself is slow.
+    """
+    return datetime.now(timezone.utc)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -167,6 +183,45 @@ def _run_persistent_guard_validate(
     # Load compare JSON to extract counts
     with open(compare_json_path) as f:
         data = json.load(f)
+
+    # Temporal validation: compare JSON must carry timestamps proving the compare
+    # ran AFTER the snapshot. A pre-generated clean compare JSON is not acceptable.
+    snapshot_at_str = data.get("snapshot_at", "")
+    compare_at_str = data.get("compare_at", "")
+
+    if not snapshot_at_str:
+        state["status"] = "error"
+        state["message"] = "compare JSON missing snapshot_at: temporal ordering unverifiable"
+        return state
+
+    if not compare_at_str:
+        state["status"] = "error"
+        state["message"] = "compare JSON missing compare_at: temporal ordering unverifiable"
+        return state
+
+    try:
+        snapshot_dt = datetime.fromisoformat(snapshot_at_str.replace("Z", "+00:00"))
+        compare_dt = datetime.fromisoformat(compare_at_str.replace("Z", "+00:00"))
+    except (ValueError, TypeError) as e:
+        state["status"] = "error"
+        state["message"] = f"compare JSON has unparseable timestamp: {e}"
+        return state
+
+    if compare_dt < snapshot_dt:
+        state["status"] = "error"
+        state["message"] = "compare JSON is temporally stale (compare_at < snapshot_at): pre-generated compare rejected"
+        return state
+
+    # Freshness check: compare JSON must be recent relative to gate execution.
+    gate_dt = _get_freshness_reference_time()
+    compare_age_seconds = (gate_dt - compare_dt).total_seconds()
+    if compare_age_seconds > MAX_COMPARE_AGE_SECONDS:
+        state["status"] = "error"
+        state["message"] = (
+            f"compare JSON is stale (compare_at is {compare_age_seconds:.0f}s older than "
+            f"gate execution, max {MAX_COMPARE_AGE_SECONDS}s): pre-generated compare rejected"
+        )
+        return state
 
     rec = data.get("recommendation", "UNKNOWN")
     state["status"] = "clean" if rec == "PASS" else "blocked"
