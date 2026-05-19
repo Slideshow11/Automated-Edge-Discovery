@@ -392,14 +392,10 @@ class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 
     def test_output_dir_in_repo_returns_error(self, tmp_path):
-        # Patch _resolve_git_root to return the repo
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "rpp",
-            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
-        )
-        rpp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rpp)
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "local"))
+        import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
             with mock.patch.object(rpp, "_git_status", return_value="clean"):
                 args = mock.MagicMock()
@@ -416,13 +412,10 @@ class TestRunPlanPreviewIntegration:
                 assert result_code == 1
 
     def test_nonzero_claude_exit_returns_error(self, tmp_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "rpp",
-            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
-        )
-        rpp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rpp)
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "local"))
+        import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
             with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", 127)):
                 args = mock.MagicMock()
@@ -438,13 +431,10 @@ class TestRunPlanPreviewIntegration:
                 assert result_code == 1
 
     def test_empty_plan_returns_error(self, tmp_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "rpp",
-            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
-        )
-        rpp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rpp)
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "local"))
+        import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
             with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", 0)):
                 args = mock.MagicMock()
@@ -460,13 +450,10 @@ class TestRunPlanPreviewIntegration:
                 assert result_code == 1
 
     def test_repo_mutated_returns_blocked(self, tmp_path):
-        import importlib.util
-        spec = importlib.util.spec_from_file_location(
-            "rpp",
-            "/home/max/Automated-Edge-Discovery/scripts/local/run_plan_preview.py",
-        )
-        rpp = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(rpp)
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parents[1] / "scripts" / "local"))
+        import run_plan_preview as rpp
         git_statuses = ["clean", "dirty: M scripts/local/foo.py"]  # before=clean, after=dirty
         with mock.patch.object(rpp, "_resolve_git_root", return_value=Path("/home/max/Automated-Edge-Discovery")):
             with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", 0)):
