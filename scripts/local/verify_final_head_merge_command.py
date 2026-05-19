@@ -187,24 +187,48 @@ def verify(
                 "or do not use --require-pmg."
             )
 
-    # PMG enforcement: if PMG guard state was provided and is not clean,
-    # suppress the authorization phrase and merge command so no merge can proceed.
-    # This makes verify_final_head_merge_command.py a proper final gate that
-    # cannot emit a final authorization when PMG is stale, blocked, or error.
-    # status "not_required" is allowed (PMG not required for this PR).
-    elif pmg_guard_state is not None:
+    # PMG enforcement: evaluate guard state when require_pmg is set.
+    # With require_pmg=True, any non-clean status is a BLOCK — including
+    # "not_required" (PMG was required but no guard exists) and unknown/missing
+    # status. With require_pmg=False (default), only "blocked"/"error" block.
+    if pmg_guard_state is not None:
         pmg_status = pmg_guard_state.get("status", "")
-        if pmg_status in ("blocked", "error"):
+        # With require_pmg, only "clean" allows authorization.
+        # Without require_pmg, "clean" and "not_required" allow authorization.
+        pmg_allowed = (
+            pmg_status == "clean"
+            or (not require_pmg and pmg_status == "not_required")
+        )
+        if not pmg_allowed:
             auth_phrase = ""
             merge_cmd = ""
-            # Demote recommendation if it would otherwise be MERGE_READY_CANDIDATE
             if recommendation == "MERGE_READY_CANDIDATE":
                 recommendation = "BLOCK"
-                errors.append(
-                    f"persistent_mutation_guard: PMG status is '{pmg_status}' "
-                    f"({pmg_guard_state.get('message', 'unknown')}). "
-                    f"Authorization withheld. Provide fresh PMG compare JSON."
-                )
+                if require_pmg:
+                    if pmg_status == "not_required":
+                        errors.append(
+                            "persistent_mutation_guard: --require-pmg was set but "
+                            "status is 'not_required'. PMG is mandatory for final merge "
+                            "authorization. Provide a PMG guard state JSON or do not use "
+                            "--require-pmg."
+                        )
+                    elif pmg_status:
+                        errors.append(
+                            f"persistent_mutation_guard: PMG status is '{pmg_status}' "
+                            f"({pmg_guard_state.get('message', 'unknown')}). "
+                            f"Authorization withheld."
+                        )
+                    else:
+                        errors.append(
+                            "persistent_mutation_guard: PMG guard state has no 'status' field. "
+                            "Authorization withheld. Provide a valid PMG guard state JSON."
+                        )
+                else:
+                    errors.append(
+                        f"persistent_mutation_guard: PMG status is '{pmg_status}' "
+                        f"({pmg_guard_state.get('message', 'unknown')}). "
+                        f"Authorization withheld."
+                    )
 
     return {
         "recommendation": recommendation,

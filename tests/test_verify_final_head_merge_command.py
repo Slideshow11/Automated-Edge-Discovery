@@ -939,6 +939,103 @@ class TestRequirePmgEnforcement:
         assert result["authorization_phrase"] != ""
         assert result["merge_command"] != ""
 
+    def test_require_pmg_not_required_returns_block(self, monkeypatch):
+        """--require-pmg with status=not_required → BLOCK, no auth, no merge_cmd.
+
+        When PMG is mandatory (require_pmg=True), 'not_required' status means
+        no guard was produced — which is a failure when a guard is required.
+        Only 'clean' allows authorization when require_pmg is True.
+        """
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={
+                "status": "not_required",
+                "message": "guard recommendation: PASS",
+            },
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "BLOCK"
+        assert result["authorization_phrase"] == ""
+        assert result["merge_command"] == ""
+        assert any(
+            "--require-pmg was set but status is 'not_required'"
+            in e
+            for e in result["verification_errors"]
+        )
+
+    def test_require_pmg_unknown_status_returns_block(self, monkeypatch):
+        """--require-pmg with unrecognized status → BLOCK, no auth, no merge_cmd."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={
+                "status": "unknown_status",
+                "message": "some message",
+            },
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "BLOCK"
+        assert result["authorization_phrase"] == ""
+        assert result["merge_command"] == ""
+
+    def test_require_pmg_empty_status_returns_block(self, monkeypatch):
+        """--require-pmg with empty/missing status field → BLOCK, no auth, no merge_cmd."""
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={
+                "message": "guard ran but status field absent",
+            },
+            require_pmg=True,
+        )
+        assert result["recommendation"] == "BLOCK"
+        assert result["authorization_phrase"] == ""
+        assert result["merge_command"] == ""
+
+    def test_no_require_pmg_not_required_allows_auth(self, monkeypatch):
+        """Without --require-pmg, status=not_required → MERGE_READY_CANDIDATE (backward compat).
+
+        When PMG is optional, 'not_required' means no guard was configured —
+        which is intentional, so auth phrase should be emitted.
+        """
+        mock = MockGhPrView(CANONICAL_PR_DATA)
+        monkeypatch.setattr(
+            "verify_final_head_merge_command.gh_pr_view_json", mock
+        )
+        result = verify(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=227,
+            reported_head_sha="dab33c5dcc6ef9657644bbe160cf0ff08939a28c",
+            require_mergeable=True,
+            pmg_guard_state={
+                "status": "not_required",
+                "message": "PMG not required for this PR",
+            },
+            require_pmg=False,
+        )
+        assert result["recommendation"] == "MERGE_READY_CANDIDATE"
+        assert result["authorization_phrase"] != ""
+        assert result["merge_command"] != ""
+
 
 class TestRequirePmgCli:
     """CLI --require-pmg flag wires into verify() correctly."""
