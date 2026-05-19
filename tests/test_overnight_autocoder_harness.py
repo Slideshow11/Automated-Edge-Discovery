@@ -26,8 +26,8 @@ from scripts.local.run_overnight_autocoder_harness import (
     main as harness_main,
 )
 
-# Absolute path to AED repo root
-REPO_ROOT = Path("/home/max/Automated-Edge-Discovery")
+# Absolute path to AED repo root — dynamically resolved so tests work in CI
+REPO_ROOT = Path(__file__).parent.parent
 
 
 # ---------------------------------------------------------------------------
