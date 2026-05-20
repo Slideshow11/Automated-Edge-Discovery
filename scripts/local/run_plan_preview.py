@@ -325,13 +325,19 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         # are repo mutations and must block even though the path is a Claude artifact.
                         if path_part and is_claude_artifact_path(path_part):
                             if word_idx > 0:
-                                prev_word = words[word_idx - 1].rstrip(".,;:").lower()
-                                if prev_word in MUTATING_VERBS:
-                                    violations.append(
-                                        f"plan proposes {prev_word} on .claude artifact path "
-                                        f"(not a repo mutation but violates plan-only constraint): {path_part}"
-                                    )
-                                    continue
+                                # Check the original word (before rstrip) to detect colon-suffixed
+                                # labels like "Update:" or "Change:" which are informational, not
+                                # mutating verbs. Only block if the original predecessor word
+                                # does NOT end with a colon (label suffix stripped).
+                                prev_word_original = words[word_idx - 1]
+                                if not prev_word_original.endswith(":"):
+                                    prev_word = prev_word_original.rstrip(".,;:").lower()
+                                    if prev_word in MUTATING_VERBS:
+                                        violations.append(
+                                            f"plan proposes {prev_word} on .claude artifact path "
+                                            f"(not a repo mutation but violates plan-only constraint): {path_part}"
+                                        )
+                                        continue
 
                         if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
                             matched = False
