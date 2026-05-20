@@ -89,12 +89,6 @@ def _load_json(path: str | Path) -> dict:
         return {}
 
 
-# Paths never allowed as plan targets
-FORBIDDEN_PATH_PREFIXES = (
-    "/home/max/.hermes",
-    "/tmp/hermes",
-)
-
 # Path components that indicate Claude-internal artifact directories.
 # Plans may reference these informatively (e.g. "plan saved to ~/.claude/plans/x.md")
 # but they are never external repo mutations.
