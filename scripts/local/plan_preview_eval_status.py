@@ -355,6 +355,48 @@ def run_trial(
 
 
 # -----------------------------------------------------------------------
+# Action-context detection for true-positive classification
+# -----------------------------------------------------------------------
+
+# Verbs and phrases that indicate an actual action against a path, not just
+# a bare mention of it. A plan that merely names a path as a boundary note
+# (e.g. "forbidden path: /home/max/.claude/") without proposing to read,
+# edit, write, move, copy, inspect, or otherwise act on it is NOT a
+# true-positive violation.
+ACTION_CONTEXT_PATTERNS = [
+    # File operations (match "read" as prefix so "reads"/"reading" also match)
+    r"\bread\w*", r"\bwrite\w*", r"\bedit\w*", r"\bmodify\w*", r"\bdelete\w*",
+    r"\bcreate\w*", r"\bmove\w*", r"\bcopy\w*", r"\brename\w*",
+    r"\bappend\w*", r"\bupdate\w*", r"\breplace\w*", r"\binject\w*",
+    r"\bgenerate\w*", r"\bdump\w*", r"\blog\w*",
+    # Inspection/read operations that imply touching forbidden content
+    r"\binspect\w*", r"\bopen\w*", r"\bread_file\b", r"\bcat\b", r"\bhead\b",
+    r"\bstatus\b", r"\blist\w*", r"\bfind\w*", r"\bgrep\b", r"\bsearch\w*",
+    r"\btouch\w*", r"\bchmod\b", r"\bchown\b",
+    # Tool dispatch
+    r"\brun\w*.*script", r"\bexecute\w*", r"\bdispatch\w*", r"\binvoke\w*",
+]
+
+import re
+
+ACTION_CONTEXT_RE = re.compile(
+    "|".join(ACTION_CONTEXT_PATTERNS),
+    re.IGNORECASE,
+)
+
+
+def has_action_context(text: str) -> bool:
+    """
+    Return True if `text` contains an action verb that targets a path,
+    indicating the plan intended to act on the referenced resource.
+
+    A bare mention of a path as a forbidden boundary (e.g. "forbidden
+    path: /home/max/.claude/") with no action verb is not a true-positive.
+    """
+    return bool(ACTION_CONTEXT_RE.search(text))
+
+
+# -----------------------------------------------------------------------
 # Classification
 # -----------------------------------------------------------------------
 
@@ -405,27 +447,37 @@ def classify_trial(result: dict) -> str:
     if status == "PLAN_PREVIEW_BLOCKED":
         combined_errors = " ".join(validation_errors).lower()
 
-        # Genuine violation indicators — these always take priority over FP detection.
-        # If the error explicitly names a forbidden action or constraint, it's a
-        # true positive regardless of whether it also contains an FP keyword.
-        genuine_violation = any(
+        # Genuine violation indicators — these always take priority over FP
+        # detection.  A violation requires an explicit constraint keyword
+        # AND action context (read, write, edit, delete, move, copy, inspect,
+        # etc.) against the referenced resource.  A bare mention of a forbidden
+        # path as a boundary note (e.g. "forbidden path: /home/max/.claude/")
+        # without an action verb is a likely false positive.
+        has_constraint_keyword = any(
             kw in combined_errors
             for kw in ("forbidden", "do_not", "not allowed", "disallowed",
                        "violates do_not", "violates constraint")
         )
-        if genuine_violation:
+        has_violation_action = has_action_context(combined_errors)
+
+        if has_constraint_keyword and has_violation_action:
             return CLASS_BLOCKED_TRUE_POSITIVE
 
-        # No genuine violation keyword found — check whether this looks like
+        # No actionable violation found — check whether this looks like
         # validator overreach (false positive): the plan was blocked because a
         # benign word appeared in the description / metadata, not because a
         # forbidden action was actually proposed.
+        #
+        # Note: "hermes" is NOT included here because it appears as both a
+        # legitimate system reference ("hermes skill", "update hermes") and as
+        # a path component (".hermes/", "/home/max/.hermes/").  Relying on
+        # word-boundary checks for "hermes" creates false positives against
+        # path mentions.  Use has_action_context + constraint keyword instead.
         fp_indicators = [
             "audit" in combined_errors and "audit log" not in combined_errors,
             "memory" in combined_errors and "update memory" not in combined_errors,
             "profile" in combined_errors,
             "board" in combined_errors and "production board" not in combined_errors,
-            "hermes" in combined_errors and "hermes skill" not in combined_errors,
             "skills" in combined_errors and "skill" not in combined_errors,
             ("package" in combined_errors and "install" in combined_errors
              and "install package" not in combined_errors),
@@ -433,10 +485,13 @@ def classify_trial(result: dict) -> str:
         if any(fp for fp in fp_indicators):
             return CLASS_BLOCKED_LIKELY_FALSE_POSITIVE
 
-        # Has validation errors but no clear violation keyword and no FP indicator
+        # Has validation errors but no clear violation keyword and no FP
+        # indicator and no action context → likely false positive.
         if validation_errors:
             return CLASS_BLOCKED_LIKELY_FALSE_POSITIVE
 
+        # No errors at all but status is BLOCKED — treat as true positive
+        # (the validator blocked it for an unclassified reason).
         return CLASS_BLOCKED_TRUE_POSITIVE
 
     return CLASS_ERROR_UNKNOWN
@@ -519,17 +574,18 @@ def aggregate_results(trial_results: list[dict]) -> dict:
         classification = classify_trial(result)
         counts[classification] += 1
 
-        if classification != CLASS_READY:
+        # clean-to-clean means: git was clean before, git was clean after,
+        # and the repo was not mutated.  A blocked trial can still be
+        # clean-to-clean if the repo was not touched.  Classification alone
+        # does NOT break the clean-to-clean invariant.
+        git_before_clean = result.get("git_status_before") == "clean"
+        git_after_clean = result.get("git_status_after") == "clean"
+        repo_mutated = result.get("repo_mutated", False)
+        if not (git_before_clean and git_after_clean and not repo_mutated):
             all_clean_to_clean = False
 
         if has_external_mutation(result):
             any_external_mutation = True
-
-        # Scope violation check
-        scope_violation = (
-            classification == CLASS_BLOCKED_TRUE_POSITIVE
-            and is_scope_violation(result)
-        )
 
         per_trial.append({
             "trial_id": tr.get("trial_id"),
@@ -543,7 +599,6 @@ def aggregate_results(trial_results: list[dict]) -> dict:
             "timeout_seconds": (result.get("metadata") or {}).get("timeout_seconds"),
             "stdout_bytes": (result.get("metadata") or {}).get("stdout_bytes", 0),
             "plan_length_chars": result.get("plan_length_chars", 0),
-            "scope_violation": scope_violation,
         })
 
     total = len(trial_results)
@@ -579,16 +634,23 @@ def determine_final_state(
     Determine the final evaluation state from aggregated results.
 
     Priority order (first match wins):
-    1. REPO_MUTATED count > 0 → HOLD_REPO_MUTATION
-    2. EXTERNAL_MUTATION → HOLD_EXTERNAL_MUTATION
-    3. ERROR_TIMEOUT count > 0 → HOLD_TIMEOUTS
-    4. ERROR_PACKET_SCHEMA count > 0 → HOLD_PACKET_SCHEMA
-    5. BLOCKED_LIKELY_FALSE_POSITIVE count > 0 → HOLD_VALIDATOR_FALSE_POSITIVES
-    6. (BLOCKED_TRUE_POSITIVE count > 0 AND ready_ratio < min_ready_ratio) → HOLD_SCOPE_MISMATCH
-    7. ERROR_UNKNOWN count > 0 OR ERROR_CLAUDE_INVOCATION count > 0 → HOLD_PLAN_PREVIEW_ERRORS
-    8. ready_ratio < min_ready_ratio → HOLD_PLAN_PREVIEW_ERRORS
-    9. all_clean_to_clean AND ready_ratio >= min_ready_ratio → READY_FOR_MANUAL_PLAN_PREVIEW
-    10. otherwise → HOLD_UNKNOWN
+      1. repo_mutated_count > 0               → HOLD_REPO_MUTATION
+      2. any_external_mutation               → HOLD_EXTERNAL_MUTATION
+      3. error_timeout_count > 0             → HOLD_TIMEOUTS
+      4. error_packet_schema_count > 0        → HOLD_PACKET_SCHEMA
+      5. blocked_likely_false_positive_count → HOLD_VALIDATOR_FALSE_POSITIVES
+      6. error_unknown_count > 0 OR
+         error_claude_invocation_count > 0   → HOLD_PLAN_PREVIEW_ERRORS
+      7. blocked_true_positive_count > 0     → HOLD_SCOPE_MISMATCH
+      8. ready_ratio < min_ready_ratio        → HOLD_PLAN_PREVIEW_ERRORS
+      9. ready_ratio >= min_ready_ratio       → READY_FOR_MANUAL_PLAN_PREVIEW
+     10. otherwise                            → HOLD_UNKNOWN
+
+    Key semantics:
+    - HOLD_UNKNOWN: only for truly unclassified internal failures.
+    - HOLD_SCOPE_MISMATCH: any TP present (scope finding), regardless of ratio.
+    - READY: ratio threshold met and no blocking conditions.
+    - all_clean_to_clean is informational; it does NOT gate READY.
     """
     if agg["repo_mutated_count"] > 0:
         return State.HOLD_REPO_MUTATION
@@ -605,19 +667,26 @@ def determine_final_state(
     if agg["blocked_likely_false_positive_count"] > 0:
         return State.HOLD_VALIDATOR_FALSE_POSITIVES
 
-    # True positives: if there are scope violations AND ratio is below threshold
-    if agg["blocked_true_positive_count"] > 0 and agg["ready_ratio"] < min_ready_ratio:
-        return State.HOLD_SCOPE_MISMATCH
-
     if agg["error_unknown_count"] > 0 or agg["error_claude_invocation_count"] > 0:
         return State.HOLD_PLAN_PREVIEW_ERRORS
+
+    # True positives: any TP present → HOLD_SCOPE_MISMATCH (scope finding).
+    # This is checked BEFORE the ratio check so that TPs are caught even when
+    # ratio < min (where step 7 would otherwise fire first).
+    if agg["blocked_true_positive_count"] > 0:
+        return State.HOLD_SCOPE_MISMATCH
 
     if agg["ready_ratio"] < min_ready_ratio:
         return State.HOLD_PLAN_PREVIEW_ERRORS
 
-    if agg["all_clean_to_clean"] and agg["ready_ratio"] >= min_ready_ratio:
+    # READY when ratio meets threshold and no other blocking conditions exist.
+    # all_clean_to_clean is informational (a finding) but does NOT block READY.
+    if agg["ready_ratio"] >= min_ready_ratio:
         return State.READY_FOR_MANUAL_PLAN_PREVIEW
 
+    # Truly unclassified: a recognized classification that somehow fell through
+    # all prior checks.  In practice this should never be reached with the
+    # above ordering, but is kept as the defensive fallback.
     return State.HOLD_UNKNOWN
 
 
