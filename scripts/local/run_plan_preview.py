@@ -231,11 +231,14 @@ def is_claude_artifact_path(path: str) -> bool:
 
 
 def _resolve_git_root() -> Path | None:
-    """Find repo git root, or None if not in a git repo."""
+    """Find repo git root from the current process working directory.
+
+    Returns None if not in a git repo or git fails.
+    Caller must be running from the repo directory (or a subdirectory thereof).
+    """
     try:
         root = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            cwd="/home/max/Automated-Edge-Discovery",
             capture_output=True,
             text=True,
             timeout=10,
@@ -369,8 +372,28 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
     task = packet.get("task", {})
     allowed_files = task.get("allowed_files", [])
 
-    if allowed_files is not None and len(allowed_files) > 0:
-        # Normalize plan text for checking
+    if allowed_files is None or len(allowed_files) == 0:
+        # None or empty list — no files permitted.
+        # Flag any path-like word in the plan as a violation.
+        for line in plan_text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            words = stripped.split()
+            for word in words:
+                path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                if ("/" in path_part or path_part.startswith("./") or path_part.startswith("../")) and "://" not in path_part:
+                    if _looks_like_real_path_token(path_part):
+                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
+                elif path_part:
+                    # Single-component bare word (no /). Check if it is an actual
+                    # file at the repo root — if so, block it.
+                    root = _resolve_git_root()
+                    if root and (root / path_part).is_file():
+                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
+
+    elif len(allowed_files) > 0:
+        # Non-empty allowed_files — check plan against whitelist.
         for line in plan_text.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#"):
@@ -436,26 +459,6 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         violations.append(
                             f"plan references file not in allowed_files: {path_part}"
                         )
-
-    elif allowed_files is not None and len(allowed_files) == 0:
-        # Empty allowed_files list — no files permitted.
-        # Flag any path-like word in the plan as a violation.
-        for line in plan_text.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            words = stripped.split()
-            for word in words:
-                path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
-                if ("/" in path_part or path_part.startswith("./") or path_part.startswith("../")) and "://" not in path_part:
-                    if _looks_like_real_path_token(path_part):
-                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
-                elif path_part:
-                    # Single-component bare word (no /). Check if it is an actual
-                    # file at the repo root — if so, block it.
-                    root = _resolve_git_root()
-                    if root and (root / path_part).is_file():
-                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
 
     return violations
 

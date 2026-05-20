@@ -1390,6 +1390,70 @@ class TestBareRootFileClassifierRegression:
 
 
 
+
+    def test_makefile_blocks_when_allowed_files_is_none(self, tmp_path):
+        """Makefile with allowed_files=None must BLOCK — None treated as block-all."""
+        import run_plan_preview as rpp
+        (tmp_path / "Makefile").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit Makefile to update the build target."
+            packet = {
+                "task": {
+                    # allowed_files is None — should behave like [] (block all files)
+                }
+            }
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, (
+                f"Makefile with allowed_files=None must block. Got: {errors}"
+            )
+            assert "Makefile" in errors[0]
+
+    def test_bin_run_wfa_blocks_when_allowed_files_is_none(self, tmp_path):
+        """bin/run_wfa with allowed_files=None must BLOCK — None treated as block-all."""
+        import run_plan_preview as rpp
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "run_wfa").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit bin/run_wfa to fix CLI entry point."
+            packet = {"task": {}}  # allowed_files missing entirely => None
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, f"bin/run_wfa with allowed_files=None must block. Got: {errors}"
+
+    def test_ordinary_word_still_passes_with_none(self, tmp_path):
+        """Ordinary word 'Plan' with allowed_files=None must NOT block."""
+        import run_plan_preview as rpp
+        # No files in tmp_path
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Run the Plan for today's deployment."
+            packet = {"task": {}}
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"Ordinary word 'Plan' with allowed_files=None must not block. Got: {errors}"
+
+    def test_result_text_still_passes_with_none(self, tmp_path):
+        """result/text with allowed_files=None must NOT block."""
+        import run_plan_preview as rpp
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Handle result/text in the response."
+            packet = {"task": {}}
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"result/text with allowed_files=None must not block. Got: {errors}"
+
+    def test_makefile_allowed_when_explicit_in_allowed_list(self, tmp_path):
+        """Makefile with allowed_files=[\"Makefile\"] must PASS."""
+        import run_plan_preview as rpp
+        (tmp_path / "Makefile").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit Makefile to update the build target."
+            packet = {
+                "task": {
+                    "allowed_files": ["Makefile"],
+                }
+            }
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"Makefile explicitly allowed must pass. Got: {errors}"
+
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
