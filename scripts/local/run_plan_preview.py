@@ -289,7 +289,7 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
             if not stripped or stripped.startswith("#"):
                 continue
             words = stripped.split()
-            for word in words:
+            for word_idx, word in enumerate(words):
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
                         # Skip parenthetical inline lists like "(pip/npm/yarn/poetry/...)"
@@ -304,12 +304,10 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         # Without this ordering, rstrip(".,;:`") removes the trailing backtick
                         # before the endswith check fires, leaving a leading-backtick token that
                         # is_claude_artifact_path cannot classify (Path('`/path') != '/path').
-                        # Save index BEFORE word mutations (backtick stripping, punctuation
-                        # rstrip) since those mutations change `word` in place and it would
-                        # no longer match the original `words` array entry, making
-                        # words.index(word) return -1 and skipping the mutating-verb check
-                        # for exactly the case this code intends to catch.
-                        word_idx = words.index(word)
+                        # We use enumerate(word_idx) instead of words.index(word) because
+                        # when the same word appears twice in a line, words.index() returns the
+                        # FIRST occurrence's index, not the current one — causing the mutating-verb
+                        # detection to check the wrong predecessor word.
                         if word.startswith("`") and word.endswith("`"):
                             word = word[1:-1]
                         # Also strip a single leading backtick that was NOT matched as outer pair
