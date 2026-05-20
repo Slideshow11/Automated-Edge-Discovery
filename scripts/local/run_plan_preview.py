@@ -73,6 +73,16 @@ FORBIDDEN_PATH_PREFIXES = (
     "/tmp/hermes",
 )
 
+# Verbs that indicate a plan proposes editing, deleting, or mutating a file.
+# Used in context-sensitive detection for Claude-internal artifact paths.
+# Informational references (e.g., "plan saved to ~/.claude/plans/foo.md") are allowed.
+# Mutating references (e.g., "Edit ~/.claude/plans/foo.md") must block.
+MUTATING_VERBS = frozenset([
+    "edit", "delete", "remove", "modify", "update", "change",
+    "write", "create", "add", "replace", "move", "rename",
+    "copy", "inject", "append", "truncate", "patch",
+])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -281,14 +291,42 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         # — these are dependency-policy keyword groups, not file paths.
                         if word.startswith("("):
                             continue
-                        # Strip surrounding backticks BEFORE punctuation rstrip
-                        # (punctuation rstrip would otherwise remove trailing backtick,
-                        #  making the endswith check fail)
+                        # Strip surrounding backticks FIRST, before any other processing.
+                        # This must happen before punctuation rstrip so that:
+                        #   `/home/max/.claude/plans/foo.md`.  -> clean path (not a violation)
+                        #   `/home/max/.claude/plans/foo.md`   -> clean path (not a violation)
+                        #   `scripts/local/foo.py`.           -> clean path (not a violation)
+                        # Without this ordering, rstrip(".,;:`") removes the trailing backtick
+                        # before the endswith check fires, leaving a leading-backtick token that
+                        # is_claude_artifact_path cannot classify (Path('`/path') != '/path').
                         if word.startswith("`") and word.endswith("`"):
                             word = word[1:-1]
-                        path_part = word.rstrip(".,;:`").rsplit("<", 1)[0].rsplit(">", 1)[0]
-                        if path_part.startswith("`") and path_part.endswith("`"):
-                            path_part = path_part[1:-1]
+                        # Also strip a single leading backtick that was NOT matched as outer pair
+                        # (e.g. word = "`/path/to/file`." where rstrip already stripped the trailing
+                        # backtick before the outer-pair check could fire).
+                        if word.startswith("`"):
+                            word = word[1:]
+                        # Now strip trailing punctuation (comma, period, semicolon, colon)
+                        # and trailing angle brackets / backticks remaining after above.
+                        path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+
+                        # Context-sensitive mutating-verb detection for .claude artifact paths.
+                        # Informational references (plan ready at ~/.claude/plans/foo.md) are allowed.
+                        # But "Edit ~/.claude/plans/foo.md", "Delete ~/.claude/plans/foo.md" etc.
+                        # are repo mutations and must block even though the path is a Claude artifact.
+                        if path_part and is_claude_artifact_path(path_part):
+                            # Scan backwards for a mutating verb in the same line.
+                            # word_idx is the index of 'word' in words; check words before it.
+                            word_idx = words.index(word) if word in words else -1
+                            if word_idx > 0:
+                                prev_word = words[word_idx - 1].rstrip(".,;:").lower()
+                                if prev_word in MUTATING_VERBS:
+                                    violations.append(
+                                        f"plan proposes {prev_word} on .claude artifact path "
+                                        f"(not a repo mutation but violates plan-only constraint): {path_part}"
+                                    )
+                                    continue
+
                         if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
                             matched = False
                             # Be strict: require the path to START with an allowed prefix,

@@ -662,6 +662,126 @@ class TestIsClaudeArtifactPath:
         assert "run_plan_preview.py" in errors[0]
 
 
+class TestClaudeArtifactPathPunctuation:
+    """
+    Regression tests for the .claude/plans artifact-path false positive.
+
+    The bug: when a path like `/home/max/.claude/plans/foo.md` appeared in inline
+    code (backticks) followed by punctuation (period, comma), the backtick-stripping
+    order left a malformed token with a leading backtick. This caused
+    is_claude_artifact_path to fail (Path('`/path') != '/path') and generated a
+    spurious PLAN_PREVIEW_BLOCKED error.
+
+    Fixed by:
+    1. Stripping surrounding backticks before punctuation rstrip (preserving order)
+    2. Stripping any remaining leading backtick after punctuation rstrip
+    3. Adding context-sensitive mutating-verb detection so "Edit .claude/plans/foo.md"
+       is still blocked (informational references are allowed; mutating references block)
+    """
+
+    def test_inline_code_claude_plans_trailing_period(self):
+        """Informative .claude/plans path in inline code with trailing period — allowed."""
+        import run_plan_preview as rpp
+        plan = "Plan is at `/home/max/.claude/plans/starry-nibbling-bentley.md`."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_verify_final_head_merge_command.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Expected no errors, got: {errors}"
+
+    def test_inline_code_claude_plans_trailing_comma(self):
+        """Informative .claude/plans path in inline code with trailing comma — allowed."""
+        import run_plan_preview as rpp
+        plan = "Plan is at `/home/max/.claude/plans/foo.md`, ready to review."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/verify_final_head_merge_command.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Expected no errors, got: {errors}"
+
+    def test_tilde_claude_plans_path(self):
+        """Informative .claude/plans path with tilde expansion — allowed."""
+        import run_plan_preview as rpp
+        plan = "The plan file at ~/.claude/plans/foo.md is ready."
+        packet = {
+            "task": {
+                "allowed_files": ["docs/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Expected no errors, got: {errors}"
+
+    def test_edit_claude_plans_still_blocks(self):
+        """Mutating verb before .claude/plans path — must block."""
+        import run_plan_preview as rpp
+        plan = "Edit /home/max/.claude/plans/foo.md to fix formatting."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Edit .claude/plans must block"
+        assert any("edit" in e.lower() for e in errors), f"Expected edit verb in error, got: {errors}"
+
+    def test_delete_claude_plans_still_blocks(self):
+        """Delete before .claude/plans path — must block."""
+        import run_plan_preview as rpp
+        plan = "Delete /home/max/.claude/plans/foo.md."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Delete .claude/plans must block"
+        assert any("delete" in e.lower() for e in errors), f"Expected delete verb in error, got: {errors}"
+
+    def test_modify_claude_plans_still_blocks(self):
+        """Modify before .claude/plans path — must block."""
+        import run_plan_preview as rpp
+        plan = "Modify ~/.claude/plans/foo.md to update metadata."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Modify .claude/plans must block"
+        assert any("modify" in e.lower() for e in errors), f"Expected modify verb in error, got: {errors}"
+
+    def test_outside_allowed_repo_path_still_blocks(self):
+        """Ordinary path outside allowed scope — must still block."""
+        import run_plan_preview as rpp
+        plan = "Edit /tmp/some_external_file.txt to fix settings."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Outside allowed repo path must block"
+        assert any("some_external_file" in e for e in errors), f"Expected path in error, got: {errors}"
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 
