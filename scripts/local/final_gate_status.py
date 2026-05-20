@@ -104,8 +104,12 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def gh_json(args: list[str]) -> dict:
-    """Run gh with --json and return parsed output. Raises RuntimeError on failure."""
-    cmd = ["gh", "api", "--jq", "."] + args
+    """Run gh with --json and return parsed output. Raises RuntimeError on failure.
+
+    All gh api calls use list-form args with no shell interpolation.
+    --jq '.' is placed at the end of the argument list (required for gh 2.x).
+    """
+    cmd = ["gh", "api"] + args + ["--jq", "."]
     try:
         result = subprocess.run(
             cmd,
@@ -154,10 +158,11 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
         }
     """
     data = gh_json([
-        "-f", f"owner={repo.split('/')[0]}",
-        "-f", f"repo={repo.split('/')[1]}",
-        "-f", f"pr={pr_number}",
+        "graphql",
         "-f", f"query={query}",
+        "-F", f"owner={repo.split('/')[0]}",
+        "-F", f"repo={repo.split('/')[1]}",
+        "-F", f"pr={pr_number}",
     ])
     repo_data = data.get("data", {}).get("repository", {})
     pr_data = repo_data.get("pullRequest")
