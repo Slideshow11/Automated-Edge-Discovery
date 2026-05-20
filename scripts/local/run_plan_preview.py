@@ -399,10 +399,12 @@ def invoke_claude_plan(
     output_dir: Path,
     *,
     timeout: int = 120,
-) -> tuple[str, int]:
+) -> tuple[str, str, int, dict]:
     """
     Invoke Claude Code in --permission-mode plan with the packet constraints.
-    Returns (stdout, exit_code).
+    Returns (stdout, stderr, exit_code, metadata_dict).
+    metadata_dict contains: timeout_seconds, elapsed_seconds, killed_by_wrapper,
+    stdout_bytes, stderr_bytes.
     """
     # Build system prompt
     system_prompt = build_plan_system_prompt(packet)
@@ -510,7 +512,13 @@ def invoke_claude_plan(
         stdout = b"".join(stdout_parts).decode("utf-8", errors="replace")
         stderr = b"".join(stderr_parts).decode("utf-8", errors="replace")
 
-        return stdout, stderr, exit_code
+        return stdout, stderr, exit_code, {
+            "timeout_seconds": timeout,
+            "elapsed_seconds": elapsed,
+            "killed_by_wrapper": timeout > 0 and elapsed >= timeout,
+            "stdout_bytes": len(stdout),
+            "stderr_bytes": len(stderr),
+        }
 
     finally:
         Path(sp_path).unlink(missing_ok=True)
@@ -677,31 +685,39 @@ def run(args: argparse.Namespace) -> int:
             pass  # OK — outside repo
 
     # Invoke Claude Code plan mode
-    stdout, stderr, exit_code = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
+    stdout, stderr, exit_code, invoke_metadata = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
 
     # Extract plan
     plan_text = extract_plan_from_stream(stdout)
+
+    # Merge invoke metadata into metadata for result
+    invoke_info = invoke_metadata
 
     # Git status after — always checked, even on Claude failure/timeout
     git_status_after = _git_status(repo_root) if repo_root else "not_in_repo"
 
     # Fail closed on Claude errors: nonzero exit, empty output, or timeout
-    # timeout is detected by checking if elapsed >= timeout in invoke_claude_plan
-    # which results in partial/empty output. Treat these as PLAN_PREVIEW_ERROR.
+    # Distinguish wrapper timeout (killed_by_wrapper) from other nonzero exits
     if exit_code != 0:
         # Grab a safe snippet of stderr to help diagnose the error.
         # Truncate to first 200 chars — enough to identify the error category
         # without leaking session content, keys, or hook internals.
         stderr_snippet = (stderr or "").strip()[:200]
+        if invoke_info.get("killed_by_wrapper"):
+            error_type = "claude_timeout"
+            error_msg = f"claude timed out after {invoke_info.get('elapsed_seconds')}s" + (f": {stderr_snippet}" if stderr_snippet else "")
+        else:
+            error_type = "claude_nonzero_exit"
+            error_msg = f"claude exited with code {exit_code}" + (f": {stderr_snippet}" if stderr_snippet else "")
         result = build_result(
             "PLAN_PREVIEW_ERROR",
             args.packet_json,
             output_dir,
             plan_text,
-            [f"claude exited with code {exit_code}" + (f": {stderr_snippet}" if stderr_snippet else "")],
+            [error_msg],
             git_status_before,
             git_status_after,
-            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code, "stderr_snippet": stderr_snippet},
+            {"error_type": error_type, "claude_exit_code": exit_code, "stderr_snippet": stderr_snippet, **invoke_info},
         )
         _write_result(result, args)
         return 1
@@ -715,7 +731,7 @@ def run(args: argparse.Namespace) -> int:
             ["claude returned empty plan output"],
             git_status_before,
             git_status_after,
-            {"error_type": "empty_plan_output"},
+            {"error_type": "empty_plan_output", **invoke_info},
         )
         _write_result(result, args)
         return 1
@@ -749,7 +765,7 @@ def run(args: argparse.Namespace) -> int:
             violations,
             git_status_before,
             git_status_after,
-            {"error_type": "plan_violates_constraints"},
+            {"error_type": "plan_violates_constraints", **invoke_info},
         )
         _write_result(result, args)
         return 1
@@ -763,7 +779,7 @@ def run(args: argparse.Namespace) -> int:
         [],
         git_status_before,
         git_status_after,
-        {"claude_exit_code": exit_code},
+        {"claude_exit_code": exit_code, **invoke_info},
     )
     _write_result(result, args)
     return 0
@@ -824,8 +840,8 @@ def main() -> int:
     parser.add_argument(
         "--timeout",
         type=int,
-        default=120,
-        help="Timeout for Claude Code invocation in seconds",
+        default=300,
+        help="Timeout for Claude Code invocation in seconds (default: 300)",
     )
     args = parser.parse_args()
 
