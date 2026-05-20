@@ -341,16 +341,18 @@ class TestClassifyTrial:
         assert mod.classify_trial(result) == mod.CLASS_ERROR_UNKNOWN
 
     def test_blocked_true_positive_forbidden_file(self):
+        # "forbidden file read" — has both constraint keyword AND action context
         result = make_result(
             "PLAN_PREVIEW_BLOCKED",
-            validation_errors=["plan references forbidden file: .github/workflows/ci.yml"],
+            validation_errors=["forbidden file read: .github/workflows/ci.yml"],
         )
         assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
 
     def test_blocked_true_positive_do_not(self):
+        # "violates do_not constraint: do not read" — constraint keyword + action
         result = make_result(
             "PLAN_PREVIEW_BLOCKED",
-            validation_errors=["plan violates do_not constraint: do not dispatch"],
+            validation_errors=["violates do_not constraint: do not read .claude/secrets"],
         )
         assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
 
@@ -392,10 +394,11 @@ class TestClassifyTrial:
         assert mod.classify_trial(result) == mod.CLASS_BLOCKED_LIKELY_FALSE_POSITIVE
 
     def test_blocked_true_positive_not_counted_as_false_positive(self):
-        # True positive: actual forbidden file reference, not just the word "audit"
+        # True positive: actual forbidden file reference with action verb.
+        # "plan reads forbidden file" has both constraint keyword AND action context.
         result = make_result(
             "PLAN_PREVIEW_BLOCKED",
-            validation_errors=["plan references forbidden file: /home/max/.hermes/skills/"],
+            validation_errors=["plan reads forbidden file: /home/max/.hermes/skills/"],
         )
         assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
 
@@ -482,14 +485,25 @@ class TestAggregateResults:
         assert agg["all_clean_to_clean"] is True
 
     def test_mixed(self):
+        # Trial B has validation_errors with an action verb ("forbidden read")
+        # so it is classified as a true positive (not a likely false positive).
+        # all_clean_to_clean is still True because git was clean and
+        # repo_mutated=false (classification alone does NOT break clean-to-clean).
         results = [
             make_trial_result("A", make_result("PLAN_PREVIEW_READY")),
-            make_trial_result("B", make_result("PLAN_PREVIEW_BLOCKED", validation_errors=["forbidden"])),
+            make_trial_result(
+                "B",
+                make_result(
+                    "PLAN_PREVIEW_BLOCKED",
+                    validation_errors=["forbidden read: /home/max/.claude/file"],
+                ),
+            ),
         ]
         agg = mod.aggregate_results(results)
         assert agg["ready_count"] == 1
         assert agg["blocked_true_positive_count"] == 1
-        assert agg["all_clean_to_clean"] is False
+        assert agg["blocked_likely_false_positive_count"] == 0
+        assert agg["all_clean_to_clean"] is True
 
     def test_repo_mutated_counted(self):
         results = [
@@ -650,8 +664,10 @@ class TestDetermineFinalState:
         state = mod.determine_final_state(agg, min_ready_ratio=0.8)
         assert state == mod.State.HOLD_SCOPE_MISMATCH
 
-    def test_true_positive_above_ratio_still_ready(self):
-        # True positives with high ratio should still be ready if no other issues
+    def test_true_positive_above_ratio_also_scope_mismatch(self):
+        # True positives with high ratio → STILL HOLD_SCOPE_MISMATCH.
+        # Any TP present means the evaluation is not "clean" — the TP is a
+        # scope finding regardless of ratio threshold being met.
         agg = {
             "total_trials": 5,
             "ready_count": 4,
@@ -667,7 +683,7 @@ class TestDetermineFinalState:
             "any_external_mutation": False,
         }
         state = mod.determine_final_state(agg, min_ready_ratio=0.8)
-        assert state == mod.State.READY_FOR_MANUAL_PLAN_PREVIEW
+        assert state == mod.State.HOLD_SCOPE_MISMATCH
 
     def test_claude_invocation_errors(self):
         agg = {
@@ -721,6 +737,222 @@ class TestDetermineFinalState:
         state = mod.determine_final_state(agg, min_ready_ratio=0.8)
         # Current implementation: step 8 fires for ratio < min → HOLD_PLAN_PREVIEW_ERRORS
         assert state in (mod.State.HOLD_PLAN_PREVIEW_ERRORS, mod.State.HOLD_UNKNOWN)
+
+
+# -----------------------------------------------------------------------
+# Tests: has_action_context (true-positive action verb detection)
+# -----------------------------------------------------------------------
+
+class TestHasActionContext:
+    def test_bare_mention_not_action(self):
+        # A bare mention of a path as a boundary note, no action verb
+        assert mod.has_action_context("forbidden path: /home/max/.claude/") is False
+
+    def test_read_action(self):
+        assert mod.has_action_context("read /home/max/.claude/file") is True
+
+    def test_write_action(self):
+        assert mod.has_action_context("write to /home/max/.claude/something") is True
+
+    def test_edit_action(self):
+        assert mod.has_action_context("edit .claude/config.json") is True
+
+    def test_delete_action(self):
+        assert mod.has_action_context("delete .claude/cache") is True
+
+    def test_copy_action(self):
+        assert mod.has_action_context("copy /home/max/.claude/notes") is True
+
+    def test_inspect_action(self):
+        assert mod.has_action_context("inspect /home/max/.claude/state") is True
+
+    def test_search_action(self):
+        assert mod.has_action_context("search .claude/") is True
+
+    def test_run_script_action(self):
+        assert mod.has_action_context("run script in .claude/") is True
+
+
+# -----------------------------------------------------------------------
+# Tests: classify_trial — action-context sensitivity for true positives
+# -----------------------------------------------------------------------
+
+class TestClassifyTrialActionContext:
+    def test_bare_forbidden_mention_no_action_is_likely_false_positive(self):
+        # "forbidden path: /home/max/.claude/" with no action verb → FP, not TP
+        result = make_result(
+            "PLAN_PREVIEW_BLOCKED",
+            validation_errors=["forbidden path: /home/max/.claude/"],
+        )
+        assert mod.classify_trial(result) == mod.CLASS_BLOCKED_LIKELY_FALSE_POSITIVE
+
+    def test_forbidden_with_read_action_is_true_positive(self):
+        # read action against forbidden path → true positive
+        result = make_result(
+            "PLAN_PREVIEW_BLOCKED",
+            validation_errors=["forbidden path: /home/max/.claude/ read"],
+        )
+        assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
+
+    def test_forbidden_with_write_action_is_true_positive(self):
+        result = make_result(
+            "PLAN_PREVIEW_BLOCKED",
+            validation_errors=["forbidden write: /home/max/.claude/"],
+        )
+        assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
+
+    def test_forbidden_with_edit_action_is_true_positive(self):
+        result = make_result(
+            "PLAN_PREVIEW_BLOCKED",
+            validation_errors=["plan edits forbidden file: /home/max/.claude/config"],
+        )
+        assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
+
+    def test_do_not_violation_with_action_is_true_positive(self):
+        result = make_result(
+            "PLAN_PREVIEW_BLOCKED",
+            validation_errors=["violates do_not constraint: do not read .claude/secrets"],
+        )
+        assert mod.classify_trial(result) == mod.CLASS_BLOCKED_TRUE_POSITIVE
+
+
+# -----------------------------------------------------------------------
+# Tests: aggregate_results — clean-to-clean is not classification-driven
+# -----------------------------------------------------------------------
+
+class TestAggregateCleanToClean:
+    def test_blocked_true_positive_with_clean_git_is_clean_to_clean(self):
+        # A blocked trial that never touched the repo is still clean-to-clean.
+        # The old logic: classification != CLASS_READY → all_clean_to_clean=False
+        # New logic: only actual git changes or repo_mutated break the invariant.
+        results = [
+            make_trial_result(
+                "A",
+                make_result("PLAN_PREVIEW_READY", git_status_before="clean", git_status_after="clean"),
+            ),
+            make_trial_result(
+                "B",
+                make_result(
+                    "PLAN_PREVIEW_BLOCKED",
+                    git_status_before="clean",
+                    git_status_after="clean",
+                    validation_errors=["forbidden path: /home/max/.claude/"],
+                ),
+            ),
+        ]
+        agg = mod.aggregate_results(results)
+        assert agg["all_clean_to_clean"] is True
+
+    def test_dirty_git_after_blocked_is_not_clean_to_clean(self):
+        results = [
+            make_trial_result(
+                "A",
+                make_result("PLAN_PREVIEW_READY", git_status_before="clean", git_status_after="dirty"),
+            ),
+        ]
+        agg = mod.aggregate_results(results)
+        assert agg["all_clean_to_clean"] is False
+
+    def test_repo_mutated_blocked_is_not_clean_to_clean(self):
+        results = [
+            make_trial_result(
+                "A",
+                make_result(
+                    "PLAN_PREVIEW_BLOCKED",
+                    git_status_before="clean",
+                    git_status_after="clean",
+                    repo_mutated=True,
+                    validation_errors=["forbidden path: /home/max/.claude/"],
+                ),
+            ),
+        ]
+        agg = mod.aggregate_results(results)
+        assert agg["all_clean_to_clean"] is False
+
+
+# -----------------------------------------------------------------------
+# Tests: determine_final_state — aggregation policy scenarios
+# -----------------------------------------------------------------------
+
+class TestDetermineFinalStateAggregation:
+    def test_4_ready_1_blocked_tp_at_threshold_is_scope_mismatch(self):
+        # 4/5 = 80% ready, 1 true-positive blocked. Ratio meets threshold but
+        # TP is present → HOLD_SCOPE_MISMATCH (not READY, not HOLD_UNKNOWN).
+        agg = {
+            "total_trials": 5,
+            "ready_count": 4,
+            "blocked_true_positive_count": 1,
+            "blocked_likely_false_positive_count": 0,
+            "error_timeout_count": 0,
+            "error_claude_invocation_count": 0,
+            "error_packet_schema_count": 0,
+            "error_unknown_count": 0,
+            "repo_mutated_count": 0,
+            "ready_ratio": 0.8,
+            "all_clean_to_clean": True,
+            "any_external_mutation": False,
+        }
+        state = mod.determine_final_state(agg, min_ready_ratio=0.8)
+        assert state == mod.State.HOLD_SCOPE_MISMATCH
+
+    def test_3_ready_2_blocked_tp_below_threshold_is_scope_mismatch(self):
+        agg = {
+            "total_trials": 5,
+            "ready_count": 3,
+            "blocked_true_positive_count": 2,
+            "blocked_likely_false_positive_count": 0,
+            "error_timeout_count": 0,
+            "error_claude_invocation_count": 0,
+            "error_packet_schema_count": 0,
+            "error_unknown_count": 0,
+            "repo_mutated_count": 0,
+            "ready_ratio": 0.6,
+            "all_clean_to_clean": False,
+            "any_external_mutation": False,
+        }
+        state = mod.determine_final_state(agg, min_ready_ratio=0.8)
+        assert state == mod.State.HOLD_SCOPE_MISMATCH
+
+    def test_4_ready_1_blocked_likely_fp_returns_validator_fp(self):
+        agg = {
+            "total_trials": 5,
+            "ready_count": 4,
+            "blocked_true_positive_count": 0,
+            "blocked_likely_false_positive_count": 1,
+            "error_timeout_count": 0,
+            "error_claude_invocation_count": 0,
+            "error_packet_schema_count": 0,
+            "error_unknown_count": 0,
+            "repo_mutated_count": 0,
+            "ready_ratio": 0.8,
+            "all_clean_to_clean": True,
+            "any_external_mutation": False,
+        }
+        state = mod.determine_final_state(agg, min_ready_ratio=0.8)
+        assert state == mod.State.HOLD_VALIDATOR_FALSE_POSITIVES
+
+    def test_hold_unknown_only_for_truly_unclassified_case(self):
+        # HOLD_UNKNOWN is only returned when no other condition matches AND
+        # no TP/FP/errors are present. Construct the exact path:
+        # ready_ratio >= min, all_clean_to_clean = False, no TPs, no errors.
+        agg = {
+            "total_trials": 2,
+            "ready_count": 2,
+            "blocked_true_positive_count": 0,
+            "blocked_likely_false_positive_count": 0,
+            "error_timeout_count": 0,
+            "error_claude_invocation_count": 0,
+            "error_packet_schema_count": 0,
+            "error_unknown_count": 0,
+            "repo_mutated_count": 0,
+            "ready_ratio": 1.0,  # meets threshold
+            "all_clean_to_clean": False,  # but git was dirty (not TP/FP/error)
+            "any_external_mutation": False,
+        }
+        state = mod.determine_final_state(agg, min_ready_ratio=0.8)
+        # With new logic: TPs=0, errors=0, ratio>=min, but all_clean=False
+        # → READY_FOR_MANUAL_PLAN_PREVIEW (all_clean_to_clean no longer gates READY)
+        assert state == mod.State.READY_FOR_MANUAL_PLAN_PREVIEW
 
 
 # -----------------------------------------------------------------------
