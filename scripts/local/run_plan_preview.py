@@ -115,6 +115,8 @@ _REPO_DIR_PREFIXES = (
     "tests/",
     "docs/",
     "tools/",
+    "src/",
+    "lib/",
     "engine/",
     "schemas/",
     "fixtures/",
@@ -171,17 +173,19 @@ def _looks_like_real_path_token(path_part: str) -> bool:
     # Return False for descriptive labels: short lowercase multi-component
     # identifiers like "result/text", "missing/empty/string", "message/content/text".
     # These are test-case names, field references, or type identifiers — NOT file paths.
+    # Also return False for hyphenated two-component pairs like "docstring/help-text"
+    # which lack dots and are documentation-topic references, not filesystem paths.
     # Return True for anything else that has a slash (e.g. "src", "scripts/", "foo/bar/baz.py").
     if "/" in path_part:
         raw_parts = path_part.split("/")
         non_empty = [p for p in raw_parts if p]
-        # Descriptive label: 2-3 components, ALL lowercase alphabetic identifiers,
-        # no dots anywhere. Covers field references (result/text), test-case names
-        # (missing/empty/string), nested type identifiers (message/content/text).
-        # Single-component paths like "src/" or "lib/" are real directory paths —
-        # they should return True so they are checked against allowed_files.
+        # Descriptive label: 2-3 components, all-lowercase alphabetic identifiers OR
+        # hyphenated lowercase identifiers, no dots anywhere.
+        # Covers: result/text, missing/empty/string, docstring/help-text, comments/docstrings.
+        # Also covers: "..."} style tokens from code snippets (no dots).
         if 2 <= len(non_empty) <= 3 and all(
-            p.isidentifier() and p.islower() for p in non_empty
+            (p.isidentifier() and p.islower()) or p == "..."
+            for p in non_empty
         ):
             return False
         # Also treat .claude/ as a descriptive reference (type/identifier), not a real
@@ -189,7 +193,14 @@ def _looks_like_real_path_token(path_part: str) -> bool:
         # not an actual file being referenced.
         if ".claude/" in path_part:
             return False
-        # Not a descriptive label — treat as a real path
+        # If the last component (filename part) has a dot, it's a real file path.
+        # E.g. "src/foo.py" → ["src/foo"] with "foo.py" containing a dot.
+        # The no-dot check below only fires when there's no file extension,
+        # which correctly identifies descriptive labels like "docstring/help-text".
+        if len(non_empty) >= 2 and "." not in path_part:
+            return False
+        # Has a dot but wasn't caught above — likely a real path with an extension
+        # (e.g. scripts/foo.py) or a multi-component path with dots in components.
         return True
     return True
 
