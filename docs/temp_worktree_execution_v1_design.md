@@ -547,7 +547,7 @@ If `test_policy.allowed = false`:
 
 ### 9.5 Scope-Creep Check
 
-The approved plan defines the scope. Any file in `changed_files` not mentioned in the approved plan text → `HOLD_SCOPE_CREEP`. This is a soft check: it flags for human attention but does not automatically block unless the diff includes files clearly outside the task domain.
+The approved plan defines the scope. Any file in `changed_files` not mentioned in the approved plan text blocks with `HOLD_SCOPE_CREEP`. This is a hard check: it blocks `PATCH_READY_FOR_HUMAN_REVIEW` and requires human review of whether the scope expansion was intentional and approved.
 
 ---
 
