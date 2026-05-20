@@ -129,6 +129,11 @@ def _is_forbidden_path(path: str) -> bool:
 
 def is_claude_artifact_path(path: str) -> bool:
     """Return True if path is a Claude-internal artifact (not a repo mutation)."""
+    # Check raw path for literal ~/.claude/ first — this handles the case where
+    # expanduser resolves to a different home directory (e.g. CI: /home/runner,
+    # prod: /home/max), and also handles environments where HOME is unset.
+    if path.startswith("~/.claude/"):
+        return True
     # Expand tilde to home directory for comparison
     expanded = os.path.expanduser(path)
     p = Path(expanded)
