@@ -782,6 +782,164 @@ class TestClaudeArtifactPathPunctuation:
         assert any("some_external_file" in e for e in errors), f"Expected path in error, got: {errors}"
 
 
+class TestDescriptivePathLabelClassifier:
+    """
+    Regression tests for the path-token classifier false positives.
+
+    The bug: _looks_like_real_path_token was too aggressive, flagging
+    slash-delimited descriptive labels (test-case names, field references,
+    type identifiers) as file paths and blocking valid plans.
+
+    Fixed by: requiring 2-3 lowercase identifier components before calling
+    a slash token a "descriptive label" (not a real path). Single-component
+    directories like "src/" are treated as real paths. All-lowercase 2-3-part
+    identifiers like "result/text", "missing/empty/string", ".claude/plans"
+    are treated as descriptive labels and skipped.
+    """
+
+    def test_slash_delimited_field_reference_does_not_block(self):
+        """Field reference like result/text is descriptive label, not a file path."""
+        import run_plan_preview as rpp
+        plan = "Handle `result/text` field in extract_plan_from_stream."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"result/text is a field reference, not a path: {errors}"
+
+    def test_missing_empty_string_does_not_block(self):
+        """Test-case name missing/empty/string is descriptive label, not a file path."""
+        import run_plan_preview as rpp
+        plan = "Add test for missing/empty/string input to ExitPlanMode parsing."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py", "tests/test_run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"missing/empty/string is a test-case name: {errors}"
+
+    def test_message_content_text_does_not_block(self):
+        """Nested field reference message/content/text is descriptive label."""
+        import run_plan_preview as rpp
+        plan = "Handle message/content/text in the stream parser for dict-based content."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"message/content/text is a field reference: {errors}"
+
+    def test_descriptive_claude_plans_mention_does_not_block(self):
+        """.claude/plans as a descriptive concept should not block."""
+        import run_plan_preview as rpp
+        plan = "Add one test that ensures informational .claude/plans artifact paths with punctuation do not block."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f".claude/plans is the subject of the test, not a mutation: {errors}"
+
+    def test_plan_at_claude_metadata_does_not_block(self):
+        """Informational metadata like 'The plan is at /home/max/.claude/plans/foo.md' should not block."""
+        import run_plan_preview as rpp
+        plan = "The plan is at `/home/max/.claude/plans/floating-bouncing-sutton.md`. It proposes adding 3 test methods."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_verify_final_head_merge_command.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Informational .claude/plans reference should not block: {errors}"
+
+    def test_edit_claude_plans_blocks(self):
+        """Mutating verb before .claude/plans path must still block."""
+        import run_plan_preview as rpp
+        plan = "Edit /home/max/.claude/plans/foo.md to fix metadata."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Edit .claude/plans must block"
+        assert any("edit" in e.lower() for e in errors)
+
+    def test_write_to_claude_plans_blocks(self):
+        """Write to .claude/plans path must still block."""
+        import run_plan_preview as rpp
+        plan = "Write to /home/max/.claude/plans/foo.md as part of the plan."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Write to .claude/plans must block"
+
+    def test_delete_claude_plans_blocks(self):
+        """Delete from .claude/plans path must still block."""
+        import run_plan_preview as rpp
+        plan = "Delete ~/.claude/plans/foo.md after review."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Delete .claude/plans must block"
+        assert any("delete" in e.lower() for e in errors)
+
+    def test_actual_forbidden_path_still_blocks(self):
+        """Forbidden path like /home/max/.hermes/secret must still block."""
+        import run_plan_preview as rpp
+        plan = "Read /home/max/.hermes/audit/log.txt for context."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, "Forbidden path must block"
+
+    def test_allowed_repo_path_still_passes(self):
+        """Allowed repo path must not block."""
+        import run_plan_preview as rpp
+        plan = "Add test to tests/test_run_plan_preview.py for stream parsing edge cases."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"Allowed repo path should not block: {errors}"
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 

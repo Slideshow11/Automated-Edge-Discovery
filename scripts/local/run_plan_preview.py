@@ -108,6 +108,92 @@ FORBIDDEN_CLAUDE_PREFIXES = (
 )
 
 
+# Known repo-directory prefixes — paths starting with these are real paths even
+# if they lack a file extension (e.g. scripts/, tests/, docs/, tools/).
+_REPO_DIR_PREFIXES = (
+    "scripts/",
+    "tests/",
+    "docs/",
+    "tools/",
+    "engine/",
+    "schemas/",
+    "fixtures/",
+    "examples/",
+    "integration/",
+    "wire/",
+    "tooling/",
+    "chore/",
+    "fix/",
+    "feat/",
+    "harden/",
+    "pr-",
+    "task/",
+)
+
+
+def _looks_like_real_path_token(path_part: str) -> bool:
+    """
+    Return True if path_part looks like a real file path rather than a
+    slash-delimited descriptive label or test-case identifier.
+
+    Distinguishes:
+      REAL PATH: /home/max/.claude/plans/foo.md
+                 scripts/local/run.py
+                 ./scripts/foo.py
+                 ~/some/path
+                 tests/test_run.py
+
+      DESCRIPTIVE LABEL: result/text        (field-name pair)
+                         missing/empty/string (test-case name)
+                         message/content/text  (nested field reference)
+                         .claude/plans        (type/identifier reference)
+    """
+    if not path_part:
+        return False
+    # Absolute paths and tilde paths are always real paths
+    if path_part.startswith("/") or path_part.startswith("~"):
+        return True
+    # Dot-slash and dot-dot-slash relative paths are real
+    if path_part.startswith("./") or path_part.startswith("../"):
+        return True
+    # Paths starting with a known repo directory prefix are real
+    for prefix in _REPO_DIR_PREFIXES:
+        if path_part.startswith(prefix):
+            return True
+    # If it has a file extension, it's almost certainly a real path
+    if "." in path_part:
+        # Use os.path.splitext — it splits on the last dot in the final segment
+        import os as _os
+        _, ext = _os.path.splitext(path_part)
+        if ext and len(ext) <= 5:
+            return True
+    # At this point: slash-delimited identifier.
+    # Return False for descriptive labels: short lowercase multi-component
+    # identifiers like "result/text", "missing/empty/string", "message/content/text".
+    # These are test-case names, field references, or type identifiers — NOT file paths.
+    # Return True for anything else that has a slash (e.g. "src", "scripts/", "foo/bar/baz.py").
+    if "/" in path_part:
+        raw_parts = path_part.split("/")
+        non_empty = [p for p in raw_parts if p]
+        # Descriptive label: 2-3 components, ALL lowercase alphabetic identifiers,
+        # no dots anywhere. Covers field references (result/text), test-case names
+        # (missing/empty/string), nested type identifiers (message/content/text).
+        # Single-component paths like "src/" or "lib/" are real directory paths —
+        # they should return True so they are checked against allowed_files.
+        if 2 <= len(non_empty) <= 3 and all(
+            p.isidentifier() and p.islower() for p in non_empty
+        ):
+            return False
+        # Also treat .claude/ as a descriptive reference (type/identifier), not a real
+        # filesystem path — e.g. ".claude/plans" is the concept of Claude plans,
+        # not an actual file being referenced.
+        if ".claude/" in path_part:
+            return False
+        # Not a descriptive label — treat as a real path
+        return True
+    return True
+
+
 def _is_forbidden_path(path: str) -> bool:
     """Check whether a path is forbidden by prefix or dot-hermes component."""
     p = Path(path)
@@ -338,8 +424,35 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                                             f"(not a repo mutation but violates plan-only constraint): {path_part}"
                                         )
                                         continue
+                                    # Also check word_idx-2 when word_idx-1 is a preposition that
+                                    # sits between the verb and the artifact path. E.g. "Write to",
+                                    # "Edit in", "Create for" — the verb is word_idx-2.
+                                    _PREPOSITIONS = frozenset(["to", "at", "in", "for", "into", "onto", "upon"])
+                                    if word_idx >= 2 and prev_word in _PREPOSITIONS:
+                                        prev_prev = words[word_idx - 2].rstrip(".,;:").lower()
+                                        if prev_prev in MUTATING_VERBS:
+                                            violations.append(
+                                                f"plan proposes {prev_prev} {prev_word} on .claude artifact path "
+                                                f"(not a repo mutation but violates plan-only constraint): {path_part}"
+                                            )
+                                            continue
 
-                        if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
+                        # Skip tokens that don't look like real file paths (e.g.
+                        # "result/text", "missing/empty/string" — slash-delimited
+                        # descriptive labels, not filesystem paths). Also skip relative
+                        # .claude/ references like ".claude/plans" which are type/identifier
+                        # mentions (the concept of Claude plans), not filesystem mutations.
+                        if not _looks_like_real_path_token(path_part):
+                            continue
+
+                        # Forbidden paths (e.g. .hermes/, audit/) must always be blocked.
+                        if path_part and _is_forbidden_path(path_part):
+                            violations.append(
+                                f"plan references forbidden path: {path_part}"
+                            )
+                            continue
+
+                        if path_part and not is_claude_artifact_path(path_part):
                             matched = False
                             # Be strict: require the path to START with an allowed prefix,
                             # not just contain the prefix string somewhere.
@@ -363,8 +476,10 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                 continue
             words = stripped.split()
             for word in words:
-                if ("/" in word or word.startswith("./") or word.startswith("../")) and "://" not in word:
-                    violations.append(f"plan references file but allowed_files is empty: {word}")
+                path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                if ("/" in path_part or path_part.startswith("./") or path_part.startswith("../")) and "://" not in path_part:
+                    if _looks_like_real_path_token(path_part):
+                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
 
     return violations
 
