@@ -6,7 +6,8 @@ Temp-worktree execution harness v0.
 
 Given a validated execution packet with a human approval marker, creates a
 disposable Git worktree, runs a mocked executor inside it, collects the diff,
-validates it against the packet constraints, and stops at PATCH_READY_FOR_HUMAN_REVIEW.
+validates it against the packet constraints, checks for external (Hermes)
+mutations via PMG, and stops at PATCH_READY_FOR_HUMAN_REVIEW.
 
 No real Claude execution. No git push. No PR creation. No merge. No dispatch.
 No Hermes mutation. No board updates. No audit append. No memory/profile writes.
@@ -50,6 +51,9 @@ PROTECTED_GATE_SCRIPTS = [
 
 WORKTREE_BASE = Path("/tmp/aed_runs/worktrees")
 
+# Path to the PMG tool (check_persistent_mutation_guard.py)
+PMG_TOOL = SCRIPT_DIR / "check_persistent_mutation_guard.py"
+
 OUTPUT_STATES = frozenset([
     "HOLD_INVALID_PACKET",
     "HOLD_PLAN_NOT_APPROVED",
@@ -65,6 +69,10 @@ OUTPUT_STATES = frozenset([
     "HOLD_TOO_MANY_FILES_CHANGED",
     "HOLD_DIFF_VALIDATION_FAILED",
     "HOLD_UNKNOWN",
+    # PMG states
+    "HOLD_PMG_SNAPSHOT_FAILED",
+    "HOLD_PMG_COMPARE_FAILED",
+    "HOLD_EXTERNAL_MUTATION",
     "PATCH_READY_FOR_HUMAN_REVIEW",
 ])
 
@@ -149,6 +157,69 @@ def git_diff_name_only(worktree_path: Path) -> list[str]:
         capture_output=True, text=True, timeout=30
     )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+# ---------------------------------------------------------------------------
+# PMG helpers (Persistent Mutation Guard)
+# ---------------------------------------------------------------------------
+
+def pmg_snapshot(target_path: str | Path, output_json: str | Path) -> tuple[bool, str]:
+    """
+    Run PMG snapshot over target_path and write result to output_json.
+    Returns (success, error_message).
+    """
+    cmd = [
+        sys.executable,
+        str(PMG_TOOL),
+        "snapshot",
+        "--target", str(target_path),
+        "--output-json", str(output_json),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            return True, ""
+        else:
+            return False, f"PMG snapshot failed with exit {result.returncode}: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return False, "PMG snapshot timed out after 60s"
+    except Exception as e:
+        return False, f"PMG snapshot exception: {e}"
+
+
+def pmg_compare(snapshot_json: str | Path, output_json: str | Path, output_md: str | Path) -> tuple[bool, str]:
+    """
+    Run PMG compare against snapshot_json and write JSON+MD results.
+    Returns (success, error_message).
+    """
+    cmd = [
+        sys.executable,
+        str(PMG_TOOL),
+        "compare",
+        "--snapshot-json", str(snapshot_json),
+        "--output-json", str(output_json),
+        "--output-md", str(output_md),
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode == 0:
+            return True, ""
+        else:
+            return False, f"PMG compare failed with exit {result.returncode}: {result.stderr}"
+    except subprocess.TimeoutExpired:
+        return False, "PMG compare timed out after 60s"
+    except Exception as e:
+        return False, f"PMG compare exception: {e}"
 
 
 # ---------------------------------------------------------------------------
@@ -326,12 +397,14 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     """
     run_id = packet.get("run_id", "unknown")
     worktree_root = WORKTREE_BASE / run_id
+    output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
 
     result = {
         "status": "HOLD_UNKNOWN",
         "run_id": run_id,
         "base_sha": packet.get("base_sha", ""),
         "worktree_path": str(worktree_root),
+        "output_root": str(output_root),
         "changed_files": [],
         "validation_errors": [],
         "main_git_status_before": "unknown",
@@ -341,6 +414,12 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
         "diff_path": "",
         "patch_ready": False,
         "next_action": "fix validation error and retry",
+        # PMG fields
+        "pmg_snapshot_path": "",
+        "pmg_compare_json_path": "",
+        "pmg_compare_md_path": "",
+        "pmg_status": "not_run",
+        "pmg_blocked_files": 0,
     }
 
     # ---- Phase 1: Packet validation ---------------------------------------
@@ -388,12 +467,33 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
         _write_output(result, output_json, output_md)
         return result
 
+    # ---- Phase 3b: PMG pre-snapshot ----------------------------------------
+    # Snapshot the Hermes home tree before any worktree creation.
+    # This detects if something already mutated Hermes before we started.
+
+    pmg_target = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    pmg_snapshot_path = str(output_root / "pmg_snapshot.json")
+    pmg_compare_json_path = str(output_root / "pmg_compare.json")
+    pmg_compare_md_path = str(output_root / "pmg_compare.md")
+
+    result["pmg_snapshot_path"] = pmg_snapshot_path
+
+    output_root_path = Path(output_root)
+    output_root_path.mkdir(parents=True, exist_ok=True)
+
+    ok, snap_err = pmg_snapshot(pmg_target, pmg_snapshot_path)
+    if not ok:
+        result["status"] = "HOLD_PMG_SNAPSHOT_FAILED"
+        result["validation_errors"] = [f"PMG snapshot failed: {snap_err}"]
+        result["next_action"] = "check HERMES_HOME path and PMG tool availability"
+        _write_output(result, output_json, output_md)
+        return result
+
     # ---- Phase 4: Path safety checks ---------------------------------------
 
-    output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
-    if path_inside_repo(output_root, REPO_ROOT):
+    if path_inside_repo(output_root_path, REPO_ROOT):
         result["status"] = "HOLD_OUTPUT_PATH_INSIDE_REPO"
-        result["validation_errors"] = [f"output_root cannot be inside repo: {output_root}"]
+        result["validation_errors"] = [f"output_root cannot be inside repo: {output_root_path}"]
         result["next_action"] = "move output_root outside repo"
         _write_output(result, output_json, output_md)
         return result
@@ -450,7 +550,7 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     worktree_status_before = git_status(worktree_root)
     result["worktree_git_status_before"] = worktree_status_before
 
-    # ---- Phase 8: Run mock executor ---------------------------------------
+    # ---- Phase 8: Run mock executor -----------------------------------------
 
     mock_edits = packet.get("execution", {}).get("mock_edits", [])
     try:
@@ -492,6 +592,45 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
             f"main repo git status changed during execution: {main_status_after}"
         ]
         result["next_action"] = "investigate main repo mutation"
+        _write_output(result, output_json, output_md)
+        return result
+
+    # ---- Phase 9b: PMG post-compare ----------------------------------------
+    # Run PMG compare to detect any external (Hermes) mutations that occurred
+    # during worktree creation and mock execution.
+
+    result["pmg_compare_json_path"] = pmg_compare_json_path
+    result["pmg_compare_md_path"] = pmg_compare_md_path
+
+    ok, cmp_err = pmg_compare(pmg_snapshot_path, pmg_compare_json_path, pmg_compare_md_path)
+    if not ok:
+        result["status"] = "HOLD_PMG_COMPARE_FAILED"
+        result["validation_errors"] = [f"PMG compare failed: {cmp_err}"]
+        result["next_action"] = "check PMG tool and snapshot integrity"
+        _write_output(result, output_json, output_md)
+        return result
+
+    # Read compare result to check status
+    try:
+        compare_data = json.loads(Path(pmg_compare_json_path).read_text(encoding="utf-8"))
+        pmg_status = compare_data.get("status", "unknown")
+        result["pmg_status"] = pmg_status
+        result["pmg_blocked_files"] = compare_data.get("blocked", 0)
+    except Exception as e:
+        result["status"] = "HOLD_PMG_COMPARE_FAILED"
+        result["validation_errors"] = [f"failed to read PMG compare result: {e}"]
+        result["next_action"] = "check PMG compare output file"
+        _write_output(result, output_json, output_md)
+        return result
+
+    # If PMG detected mutations, block with external mutation state
+    if pmg_status != "clean":
+        result["status"] = "HOLD_EXTERNAL_MUTATION"
+        blocked = compare_data.get("blocked", "?")
+        result["validation_errors"] = [
+            f"external mutation detected by PMG: status={pmg_status}, blocked={blocked}"
+        ]
+        result["next_action"] = "investigate Hermes tree mutation; clean environment and retry"
         _write_output(result, output_json, output_md)
         return result
 
@@ -592,6 +731,20 @@ def _render_markdown(result: dict) -> str:
         for err in errors:
             lines.append(f"- `{err}`")
         lines.append("")
+
+    # PMG section
+    pmg_status = result.get("pmg_status", "not_run")
+    lines.append("## Persistent Mutation Guard (PMG)")
+    lines.append(f"- **PMG status**: `{pmg_status}`")
+    if result.get("pmg_snapshot_path"):
+        lines.append(f"- **Snapshot**: `{result['pmg_snapshot_path']}`")
+    if result.get("pmg_compare_json_path"):
+        lines.append(f"- **Compare JSON**: `{result['pmg_compare_json_path']}`")
+    if result.get("pmg_compare_md_path"):
+        lines.append(f"- **Compare MD**: `{result['pmg_compare_md_path']}`")
+    blocked = result.get("pmg_blocked_files", 0)
+    lines.append(f"- **Blocked files**: `{blocked}`")
+    lines.append("")
 
     lines.extend([
         f"**Patch ready**: {patch_ready}",
