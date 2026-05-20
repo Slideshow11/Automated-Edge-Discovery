@@ -41,6 +41,10 @@ import select
 import subprocess
 import sys
 from datetime import datetime, timezone
+
+def _now_iso() -> str:
+    """Return current UTC timestamp in ISO format."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -85,8 +89,13 @@ def _load_json(path: str | Path) -> dict:
         return {}
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+# Path components that indicate Claude-internal artifact directories.
+# Plans may reference these informatively (e.g. "plan saved to ~/.claude/plans/x.md")
+# but they are never external repo mutations.
+FORBIDDEN_CLAUDE_PREFIXES = (
+    "/home/max/.claude",
+    "/tmp/claude",
+)
 
 
 def _is_forbidden_path(path: str) -> bool:
@@ -105,6 +114,17 @@ def _is_forbidden_path(path: str) -> bool:
             for pat in FORBIDDEN_FILENAME_PATTERNS:
                 if part.startswith(pat):
                     return True
+    return False
+
+
+def is_claude_artifact_path(path: str) -> bool:
+    """Return True if path is a Claude-internal artifact (not a repo mutation)."""
+    # Expand tilde to home directory for comparison
+    expanded = os.path.expanduser(path)
+    p = Path(expanded)
+    for prefix in FORBIDDEN_CLAUDE_PREFIXES:
+        if str(p).startswith(prefix):
+            return True
     return False
 
 
@@ -257,11 +277,27 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
             for word in words:
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
-                        path_part = word.rstrip(".,;:").split("<")[0].split(">")[0]
-                        if path_part and not _is_forbidden_path(path_part):
+                        # Skip parenthetical inline lists like "(pip/npm/yarn/poetry/...)"
+                        # — these are dependency-policy keyword groups, not file paths.
+                        if word.startswith("("):
+                            continue
+                        # Strip surrounding backticks BEFORE punctuation rstrip
+                        # (punctuation rstrip would otherwise remove trailing backtick,
+                        #  making the endswith check fail)
+                        if word.startswith("`") and word.endswith("`"):
+                            word = word[1:-1]
+                        path_part = word.rstrip(".,;:`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                        if path_part.startswith("`") and path_part.endswith("`"):
+                            path_part = path_part[1:-1]
+                        if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
                             matched = False
+                            # Be strict: require the path to START with an allowed prefix,
+                            # not just contain the prefix string somewhere.
+                            # (The "or allowed in path_part" check was too loose and caused
+                            # /home/max/Automated-Edge-Discovery/scripts/... to match "scripts/"
+                            # because "scripts/" is contained in the longer path.)
                             for allowed in allowed_files:
-                                if path_part.startswith(allowed) or allowed in path_part:
+                                if path_part.startswith(allowed):
                                     matched = True
                                     break
                             if not matched:
@@ -386,8 +422,9 @@ def invoke_claude_plan(
     claude_args = [
         "claude",
         "--permission-mode", "plan",
-        "-p",
+        "-p", "PLAN",
         "--output-format", "stream-json",
+        "--verbose",
     ]
 
     # Add --add-dir for each unique parent dir
@@ -406,7 +443,11 @@ def invoke_claude_plan(
             if k in env:
                 pass  # already present
 
-    # Write system prompt to temp file to avoid CLI length issues
+    # Write system prompt to temp file
+    # Note: the file path is passed via --system-prompt-file arg; Claude reads it.
+    # stdin=subprocess.DEVNULL is safe because --system-prompt-file provides
+    # the full system prompt content to Claude. This avoids stdin timing issues
+    # with piped mode when the process is long-running.
     import tempfile
     with tempfile.NamedTemporaryFile(
         mode="w",
@@ -469,7 +510,7 @@ def invoke_claude_plan(
         stdout = b"".join(stdout_parts).decode("utf-8", errors="replace")
         stderr = b"".join(stderr_parts).decode("utf-8", errors="replace")
 
-        return stdout, exit_code
+        return stdout, stderr, exit_code
 
     finally:
         Path(sp_path).unlink(missing_ok=True)
@@ -479,30 +520,68 @@ def extract_plan_from_stream(stdout: str) -> str:
     """
     Extract plan text from Claude Code --output-format stream-json output.
     Returns the accumulated text content.
+
+    Handles these stream-json shapes:
+    - Delta format:       {"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+    - Tool-use format:    {"type":"message","message":{"content":[{"type":"tool_use","name":"ExitPlanMode","input":{"plan":"..."}}]}}
+    - Result format:      {"type":"result","subtype":"success","result":"..."}
+    - Simple text delta:  {"text":"..."}
     """
     lines = stdout.splitlines()
     plan_parts: list[str] = []
     for line in lines:
-        if not line.strip():
+        line = line.strip()
+        if not line:
             continue
         try:
             obj = json.loads(line)
-            # Look for text content in streaming JSON
-            if isinstance(obj, dict):
-                # delta format
-                if "content" in obj:
-                    content = obj["content"]
-                    if isinstance(content, list):
-                        for block in content:
-                            if isinstance(block, dict) and block.get("type") == "text":
-                                plan_parts.append(block.get("text", ""))
-                    elif isinstance(content, str):
-                        plan_parts.append(content)
-                # simple text format
-                elif "text" in obj:
-                    plan_parts.append(obj["text"])
+            if not isinstance(obj, dict):
+                continue
+
+            obj_type = obj.get("type", "")
+
+            # message type: nested content inside message.content
+            # Example: {"type":"message","message":{"role":"assistant","content":[{"type":"text","text":"..."}]}}
+            if obj_type == "message":
+                msg = obj.get("message", {})
+                content = msg.get("content", [])
+                if isinstance(content, list):
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        btype = block.get("type", "")
+                        if btype == "text":
+                            text = block.get("text", "")
+                            if text:
+                                plan_parts.append(text)
+                        elif btype == "tool_use":
+                            name = block.get("name", "")
+                            inp = block.get("input", {})
+                            # ExitPlanMode embeds the full markdown plan in the input
+                            if name == "ExitPlanMode" and "plan" in inp:
+                                plan_text = inp["plan"]
+                                if plan_text:
+                                    plan_parts.append(plan_text)
+                elif isinstance(content, str) and content:
+                    # Fallback: content as plain string
+                    plan_parts.append(content)
+
+            # result type: end-of-session summary with plan text
+            # Example: {"type":"result","subtype":"success","result":"The plan file..."}
+            elif obj_type == "result":
+                result_text = obj.get("result", "")
+                if result_text:
+                    plan_parts.append(result_text)
+
+            # Simple text delta format: {"text": "..."}
+            elif "text" in obj:
+                text = obj["text"]
+                if isinstance(text, str) and text:
+                    plan_parts.append(text)
+
         except json.JSONDecodeError:
             continue
+
     return "\n".join(plan_parts)
 
 
@@ -598,7 +677,7 @@ def run(args: argparse.Namespace) -> int:
             pass  # OK — outside repo
 
     # Invoke Claude Code plan mode
-    stdout, exit_code = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
+    stdout, stderr, exit_code = invoke_claude_plan(packet, output_dir, timeout=args.timeout)
 
     # Extract plan
     plan_text = extract_plan_from_stream(stdout)
@@ -610,15 +689,19 @@ def run(args: argparse.Namespace) -> int:
     # timeout is detected by checking if elapsed >= timeout in invoke_claude_plan
     # which results in partial/empty output. Treat these as PLAN_PREVIEW_ERROR.
     if exit_code != 0:
+        # Grab a safe snippet of stderr to help diagnose the error.
+        # Truncate to first 200 chars — enough to identify the error category
+        # without leaking session content, keys, or hook internals.
+        stderr_snippet = (stderr or "").strip()[:200]
         result = build_result(
             "PLAN_PREVIEW_ERROR",
             args.packet_json,
             output_dir,
             plan_text,
-            [f"claude exited with code {exit_code}"],
+            [f"claude exited with code {exit_code}" + (f": {stderr_snippet}" if stderr_snippet else "")],
             git_status_before,
             git_status_after,
-            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code},
+            {"error_type": "claude_nonzero_exit", "claude_exit_code": exit_code, "stderr_snippet": stderr_snippet},
         )
         _write_result(result, args)
         return 1
