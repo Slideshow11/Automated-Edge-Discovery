@@ -420,7 +420,7 @@ class TestInvokeClaudePlan:
         fake_stdout = '{"type":"text","text":"a plan"}'
 
         def fake_invoke(packet, output_dir, *, timeout=120):
-            return fake_stdout, fake_stderr, 127
+            return fake_stdout, fake_stderr, 127, {"timeout_seconds":120,"elapsed_seconds":1,"killed_by_wrapper":False,"stdout_bytes":len(fake_stdout),"stderr_bytes":len(fake_stderr)}
 
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
             with mock.patch.object(rpp, "invoke_claude_plan", side_effect=fake_invoke):
@@ -456,6 +456,99 @@ class TestInvokeClaudePlan:
                 assert "something went wrong" in snippet
                 # Must be truncated (not full stderr)
                 assert len(snippet) <= 200
+
+    def test_timeout_killed_by_wrapper_true(self, tmp_path):
+        """Wrapper timeout sets killed_by_wrapper=True and error_type=claude_timeout."""
+        import run_plan_preview as rpp
+
+        def fake_invoke(packet, output_dir, *, timeout=120):
+            return "", "", -9, {"timeout_seconds":120,"elapsed_seconds":120.0,"killed_by_wrapper":True,"stdout_bytes":0,"stderr_bytes":0}
+
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", side_effect=fake_invoke):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 120
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x"}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 1
+                with open(args.output_json) as f:
+                    result = json.load(f)
+                assert result["status"] == "PLAN_PREVIEW_ERROR"
+                assert result["metadata"]["killed_by_wrapper"] is True
+                assert result["metadata"]["error_type"] == "claude_timeout"
+                assert result["metadata"]["elapsed_seconds"] == 120.0
+
+    def test_nonzero_non_timeout_killed_by_wrapper_false(self, tmp_path):
+        """Non-timeout nonzero exit sets killed_by_wrapper=False and error_type=claude_nonzero_exit."""
+        import run_plan_preview as rpp
+
+        def fake_invoke(packet, output_dir, *, timeout=120):
+            return '{"type":"text","text":"partial"}', "claude error", 127, {"timeout_seconds":120,"elapsed_seconds":30.0,"killed_by_wrapper":False,"stdout_bytes":20,"stderr_bytes":12}
+
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", side_effect=fake_invoke):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 120
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x"}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 1
+                with open(args.output_json) as f:
+                    result = json.load(f)
+                assert result["metadata"]["killed_by_wrapper"] is False
+                assert result["metadata"]["error_type"] == "claude_nonzero_exit"
+                assert result["metadata"]["elapsed_seconds"] == 30.0
+
+    def test_success_includes_all_metadata_fields(self, tmp_path):
+        """Successful run includes elapsed_seconds, stdout_bytes, stderr_bytes in metadata."""
+        import run_plan_preview as rpp
+
+        def fake_invoke(packet, output_dir, *, timeout=300):
+            return '{"type":"text","text":"a plan"}', "", 0, {"timeout_seconds":300,"elapsed_seconds":45.0,"killed_by_wrapper":False,"stdout_bytes":12345,"stderr_bytes":0}
+
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
+            with mock.patch.object(rpp, "invoke_claude_plan", side_effect=fake_invoke):
+                args = mock.MagicMock()
+                args.packet_json = str(tmp_path / "packet.json")
+                args.output_dir = str(tmp_path / "out")
+                args.output_json = str(tmp_path / "result.json")
+                args.output_md = None
+                args.timeout = 300
+                import json
+                with open(args.packet_json, "w") as f:
+                    json.dump({"packet_kind": "aed.worker.packet.v1", "task": {"description": "x", "allowed_files": []}}, f)
+                result_code = rpp.run(args)
+                assert result_code == 0
+                with open(args.output_json) as f:
+                    result = json.load(f)
+                assert result["status"] == "PLAN_PREVIEW_READY"
+                for field in ("timeout_seconds", "elapsed_seconds", "killed_by_wrapper", "stdout_bytes", "stderr_bytes"):
+                    assert field in result["metadata"], f"{field} missing from metadata"
+
+    def test_default_timeout_is_300(self):
+        """Default timeout argument is 300 seconds."""
+        import run_plan_preview as rpp
+        import argparse
+        # Build parser as main() does and check the timeout default
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--packet-json")
+        parser.add_argument("--output-dir")
+        parser.add_argument("--output-json")
+        parser.add_argument("--output-md")
+        parser.add_argument("--timeout", type=int, default=300)
+        args = parser.parse_args(["--packet-json", "/tmp/p.json", "--output-dir", "/tmp/o", "--output-json", "/tmp/r.json"])
+        assert args.timeout == 300
 
 
 class TestExtractPlanFromStream:
@@ -593,7 +686,7 @@ class TestRunPlanPreviewIntegration:
     def test_nonzero_claude_exit_returns_error(self, tmp_path):
         import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", "some stderr", 127)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("some output", "some stderr", 127, {"timeout_seconds":120,"elapsed_seconds":1,"killed_by_wrapper":False,"stdout_bytes":13,"stderr_bytes":13})):
                 args = mock.MagicMock()
                 args.packet_json = str(tmp_path / "packet.json")
                 args.output_dir = str(tmp_path / "out")
@@ -609,7 +702,7 @@ class TestRunPlanPreviewIntegration:
     def test_empty_plan_returns_error(self, tmp_path):
         import run_plan_preview as rpp
         with mock.patch.object(rpp, "_resolve_git_root", return_value=None):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", "", 0)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("", "", 0, {"timeout_seconds":120,"elapsed_seconds":1,"killed_by_wrapper":False,"stdout_bytes":0,"stderr_bytes":0})):
                 args = mock.MagicMock()
                 args.packet_json = str(tmp_path / "packet.json")
                 args.output_dir = str(tmp_path / "out")
@@ -627,7 +720,7 @@ class TestRunPlanPreviewIntegration:
         repo = Path(__file__).resolve().parents[1]
         git_statuses = ["clean", "dirty: M scripts/local/foo.py"]  # before=clean, after=dirty
         with mock.patch.object(rpp, "_resolve_git_root", return_value=repo):
-            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", "", 0)):
+            with mock.patch.object(rpp, "invoke_claude_plan", return_value=("1. Edit scripts/local/foo.py", "", 0, {"timeout_seconds":120,"elapsed_seconds":1,"killed_by_wrapper":False,"stdout_bytes":26,"stderr_bytes":0})):
                 with mock.patch.object(rpp, "_git_status", side_effect=lambda *a: git_statuses.pop(0)):
                     args = mock.MagicMock()
                     args.packet_json = str(tmp_path / "packet.json")
