@@ -304,6 +304,12 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         # Without this ordering, rstrip(".,;:`") removes the trailing backtick
                         # before the endswith check fires, leaving a leading-backtick token that
                         # is_claude_artifact_path cannot classify (Path('`/path') != '/path').
+                        # Save index BEFORE word mutations (backtick stripping, punctuation
+                        # rstrip) since those mutations change `word` in place and it would
+                        # no longer match the original `words` array entry, making
+                        # words.index(word) return -1 and skipping the mutating-verb check
+                        # for exactly the case this code intends to catch.
+                        word_idx = words.index(word)
                         if word.startswith("`") and word.endswith("`"):
                             word = word[1:-1]
                         # Also strip a single leading backtick that was NOT matched as outer pair
@@ -320,9 +326,6 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                         # But "Edit ~/.claude/plans/foo.md", "Delete ~/.claude/plans/foo.md" etc.
                         # are repo mutations and must block even though the path is a Claude artifact.
                         if path_part and is_claude_artifact_path(path_part):
-                            # Scan backwards for a mutating verb in the same line.
-                            # word_idx is the index of 'word' in words; check words before it.
-                            word_idx = words.index(word) if word in words else -1
                             if word_idx > 0:
                                 prev_word = words[word_idx - 1].rstrip(".,;:").lower()
                                 if prev_word in MUTATING_VERBS:
