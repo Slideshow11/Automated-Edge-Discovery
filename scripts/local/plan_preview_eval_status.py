@@ -225,10 +225,18 @@ def generate_trial_packet(trial: dict, output_dir: Path) -> dict:
 
     Returns:
         A valid aed.worker.packet.v1 dict
+
+    Raises:
+        ValueError if trial has no id or trial_id field.
     """
+    trial_id = trial.get("id") or trial.get("trial_id")
+    if not trial_id:
+        raise ValueError(f"Trial missing 'id' and 'trial_id': {list(trial.keys())}")
+
     task = trial.get("task", "unknown task")
     packet = {
         "packet_kind": PACKET_KIND,
+        "trial_id": trial_id,
         "task": {
             "description": task,
             "allowed_files": trial.get("allowed_files", []),
@@ -746,7 +754,9 @@ def run(args: argparse.Namespace) -> int:
     # Run each trial
     trial_results = []
     for trial in trials_list:
-        trial_id = trial.get("id", "?")
+        trial_id = trial.get("id") or trial.get("trial_id")
+        if not trial_id:
+            raise ValueError(f"Trial missing 'id' and 'trial_id': {list(trial.keys())}")
         print(f"  Running trial {trial_id}...", file=sys.stderr)
 
         packet = generate_trial_packet(trial, output_root)
