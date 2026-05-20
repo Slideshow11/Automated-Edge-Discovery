@@ -125,7 +125,9 @@ def _is_forbidden_path(path: str) -> bool:
 
 def is_claude_artifact_path(path: str) -> bool:
     """Return True if path is a Claude-internal artifact (not a repo mutation)."""
-    p = Path(path)
+    # Expand tilde to home directory for comparison
+    expanded = os.path.expanduser(path)
+    p = Path(expanded)
     for prefix in FORBIDDEN_CLAUDE_PREFIXES:
         if str(p).startswith(prefix):
             return True
@@ -281,6 +283,10 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
             for word in words:
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
+                        # Skip parenthetical inline lists like "(pip/npm/yarn/poetry/...)"
+                        # — these are dependency-policy keyword groups, not file paths.
+                        if word.startswith("("):
+                            continue
                         # Strip surrounding backticks BEFORE punctuation rstrip
                         # (punctuation rstrip would otherwise remove trailing backtick,
                         #  making the endswith check fail)
