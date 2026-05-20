@@ -126,7 +126,6 @@ _REPO_DIR_PREFIXES = (
     "fix/",
     "feat/",
     "harden/",
-    "wire/",
     "pr-",
     "task/",
 )
