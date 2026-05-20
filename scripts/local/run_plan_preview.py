@@ -377,97 +377,66 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                 continue
             words = stripped.split()
             for word_idx, word in enumerate(words):
+                path_part = None
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
-                        # Skip parenthetical inline lists like "(pip/npm/yarn/poetry/...)"
-                        # — these are dependency-policy keyword groups, not file paths.
-                        if word.startswith("("):
-                            continue
-                        # Strip surrounding backticks FIRST, before any other processing.
-                        # This must happen before punctuation rstrip so that:
-                        #   `/home/max/.claude/plans/foo.md`.  -> clean path (not a violation)
-                        #   `/home/max/.claude/plans/foo.md`   -> clean path (not a violation)
-                        #   `scripts/local/foo.py`.           -> clean path (not a violation)
-                        # Without this ordering, rstrip(".,;:`") removes the trailing backtick
-                        # before the endswith check fires, leaving a leading-backtick token that
-                        # is_claude_artifact_path cannot classify (Path('`/path') != '/path').
-                        # We use enumerate(word_idx) instead of words.index(word) because
-                        # when the same word appears twice in a line, words.index() returns the
-                        # FIRST occurrence's index, not the current one — causing the mutating-verb
-                        # detection to check the wrong predecessor word.
-                        if word.startswith("`") and word.endswith("`"):
-                            word = word[1:-1]
-                        # Also strip a single leading backtick that was NOT matched as outer pair
-                        # (e.g. word = "`/path/to/file`." where rstrip already stripped the trailing
-                        # backtick before the outer-pair check could fire).
-                        if word.startswith("`"):
-                            word = word[1:]
-                        # Now strip trailing punctuation (comma, period, semicolon, colon)
-                        # and trailing angle brackets / backticks remaining after above.
-                        path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                        if not word.startswith("("):
+                            if word.startswith("`") and word.endswith("`"):
+                                word = word[1:-1]
+                            if word.startswith("`"):
+                                word = word[1:]
+                            path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                elif "." in word:
+                    # Single-component word with dot (e.g. Makefile, README.md).
+                    # Block only if it is an actual file at repo root AND not in allowed_files.
+                    root = _resolve_git_root()
+                    candidate = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+                    if root and (root / candidate).is_file():
+                        path_part = candidate
 
-                        # Context-sensitive mutating-verb detection for .claude artifact paths.
-                        # Informational references (plan ready at ~/.claude/plans/foo.md) are allowed.
-                        # But "Edit ~/.claude/plans/foo.md", "Delete ~/.claude/plans/foo.md" etc.
-                        # are repo mutations and must block even though the path is a Claude artifact.
-                        if path_part and is_claude_artifact_path(path_part):
-                            if word_idx > 0:
-                                # Check the original word (before rstrip) to detect colon-suffixed
-                                # labels like "Update:" or "Change:" which are informational, not
-                                # mutating verbs. Only block if the original predecessor word
-                                # does NOT end with a colon (label suffix stripped).
-                                prev_word_original = words[word_idx - 1]
-                                if not prev_word_original.endswith(":"):
-                                    prev_word = prev_word_original.rstrip(".,;:").lower()
-                                    if prev_word in MUTATING_VERBS:
-                                        violations.append(
-                                            f"plan proposes {prev_word} on .claude artifact path "
-                                            f"(not a repo mutation but violates plan-only constraint): {path_part}"
-                                        )
-                                        continue
-                                    # Also check word_idx-2 when word_idx-1 is a preposition that
-                                    # sits between the verb and the artifact path. E.g. "Write to",
-                                    # "Edit in", "Create for" — the verb is word_idx-2.
-                                    _PREPOSITIONS = frozenset(["to", "at", "in", "for", "into", "onto", "upon"])
-                                    if word_idx >= 2 and prev_word in _PREPOSITIONS:
-                                        prev_prev = words[word_idx - 2].rstrip(".,;:").lower()
-                                        if prev_prev in MUTATING_VERBS:
-                                            violations.append(
-                                                f"plan proposes {prev_prev} {prev_word} on .claude artifact path "
-                                                f"(not a repo mutation but violates plan-only constraint): {path_part}"
-                                            )
-                                            continue
+                if not path_part:
+                    continue
 
-                        # Skip tokens that don't look like real file paths (e.g.
-                        # "result/text", "missing/empty/string" — slash-delimited
-                        # descriptive labels, not filesystem paths). Also skip relative
-                        # .claude/ references like ".claude/plans" which are type/identifier
-                        # mentions (the concept of Claude plans), not filesystem mutations.
-                        if not _looks_like_real_path_token(path_part):
-                            continue
-
-                        # Forbidden paths (e.g. .hermes/, audit/) must always be blocked.
-                        if path_part and _is_forbidden_path(path_part):
-                            violations.append(
-                                f"plan references forbidden path: {path_part}"
-                            )
-                            continue
-
-                        if path_part and not is_claude_artifact_path(path_part):
-                            matched = False
-                            # Be strict: require the path to START with an allowed prefix,
-                            # not just contain the prefix string somewhere.
-                            # (The "or allowed in path_part" check was too loose and caused
-                            # /home/max/Automated-Edge-Discovery/scripts/... to match "scripts/"
-                            # because "scripts/" is contained in the longer path.)
-                            for allowed in allowed_files:
-                                if path_part.startswith(allowed):
-                                    matched = True
-                                    break
-                            if not matched:
+                # Context-sensitive mutating-verb detection for .claude artifact paths.
+                if path_part and is_claude_artifact_path(path_part):
+                    if word_idx > 0:
+                        prev_word_original = words[word_idx - 1]
+                        if not prev_word_original.endswith(":"):
+                            prev_word = prev_word_original.rstrip(".,;:").lower()
+                            if prev_word in MUTATING_VERBS:
                                 violations.append(
-                                    f"plan references file not in allowed_files: {path_part}"
+                                    f"plan proposes {prev_word} on .claude artifact path "
+                                    f"(not a repo mutation but violates plan-only constraint): {path_part}"
                                 )
+                                continue
+                            _PREPOSITIONS = frozenset(["to", "at", "in", "for", "into", "onto", "upon"])
+                            if word_idx >= 2 and prev_word in _PREPOSITIONS:
+                                prev_prev = words[word_idx - 2].rstrip(".,;:").lower()
+                                if prev_prev in MUTATING_VERBS:
+                                    violations.append(
+                                        f"plan proposes {prev_prev} {prev_word} on .claude artifact path "
+                                        f"(not a repo mutation but violates plan-only constraint): {path_part}"
+                                    )
+                                    continue
+
+                if not _looks_like_real_path_token(path_part):
+                    continue
+
+                if path_part and _is_forbidden_path(path_part):
+                    violations.append(f"plan references forbidden path: {path_part}")
+                    continue
+
+                if path_part and not is_claude_artifact_path(path_part):
+                    matched = False
+                    for allowed in allowed_files:
+                        if path_part.startswith(allowed):
+                            matched = True
+                            break
+                    if not matched:
+                        violations.append(
+                            f"plan references file not in allowed_files: {path_part}"
+                        )
+
     elif allowed_files is not None and len(allowed_files) == 0:
         # Empty allowed_files list — no files permitted.
         # Flag any path-like word in the plan as a violation.
@@ -480,6 +449,12 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
                 path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
                 if ("/" in path_part or path_part.startswith("./") or path_part.startswith("../")) and "://" not in path_part:
                     if _looks_like_real_path_token(path_part):
+                        violations.append(f"plan references file but allowed_files is empty: {path_part}")
+                elif path_part:
+                    # Single-component bare word (no /). Check if it is an actual
+                    # file at the repo root — if so, block it.
+                    root = _resolve_git_root()
+                    if root and (root / path_part).is_file():
                         violations.append(f"plan references file but allowed_files is empty: {path_part}")
 
     return violations
