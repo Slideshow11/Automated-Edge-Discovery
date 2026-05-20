@@ -136,14 +136,17 @@ class TestLoadPmgGuardState:
 
 class TestIsCiGreen:
     def test_all_success_returns_true(self):
-        # gh_json returns the list directly (--jq filter applied by gh)
+        # gh_json returns the full dict with workflow_runs key (Python-side filtering)
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "CI"},
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "test (3.11)"},
-            ]
+            m.return_value = {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "CI"},
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "test (3.11)"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -152,12 +155,15 @@ class TestIsCiGreen:
 
     def test_in_progress_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "CI"},
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": None, "status": "in_progress", "name": "governance-validators"},
-            ]
+            m.return_value = {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "CI"},
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": None, "status": "in_progress", "name": "governance-validators"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -167,10 +173,13 @@ class TestIsCiGreen:
 
     def test_failure_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "failure", "status": "completed", "name": "test (3.11)"},
-            ]
+            m.return_value = {
+                "total_count": 1,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "failure", "status": "completed", "name": "test (3.11)"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -180,7 +189,7 @@ class TestIsCiGreen:
 
     def test_no_runs_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = []
+            m.return_value = {"total_count": 0, "workflow_runs": []}
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
