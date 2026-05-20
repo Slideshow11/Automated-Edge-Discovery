@@ -1223,6 +1223,7 @@ class TestRunPlanPreviewIntegration:
                     assert result_code == 1
 
 
+
 class TestBareRootFileClassifierRegression:
     """
     Regression tests for single-component bare-root file bypass.
@@ -1231,144 +1232,162 @@ class TestBareRootFileClassifierRegression:
     or starting with ".". Single-component repo-root files like Makefile
     could be mentioned in a plan even with allowed_files=[] without being blocked.
 
-    These tests verify that real repo-root files are blocked when not allowed,
-    while ordinary words and descriptive labels are not.
+    These tests use tmp_path to create an isolated fake repo root, so they work
+    in any CI environment without depending on actual tracked files.
     """
 
-    def test_makefile_blocks_with_empty_allowed_files(self):
+    def test_makefile_blocks_with_empty_allowed_files(self, tmp_path):
         """Makefile with empty allowed_files must BLOCK."""
         import run_plan_preview as rpp
-        plan = "Edit Makefile to update the build target."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "Makefile").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit Makefile to update the build target."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) > 0, (
-            f"Makefile with empty allowed_files must block. Got: {errors}"
-        )
-        assert "Makefile" in errors[0]
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, (
+                f"Makefile with empty allowed_files must block. Got: {errors}"
+            )
+            assert "Makefile" in errors[0]
 
-    def test_makefile_passes_when_explicitly_allowed(self):
+    def test_makefile_passes_when_explicitly_allowed(self, tmp_path):
         """Makefile with allowed_files=["Makefile"] must PASS."""
         import run_plan_preview as rpp
-        plan = "Edit Makefile to update the build target."
-        packet = {
-            "task": {
-                "allowed_files": ["Makefile"],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "Makefile").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit Makefile to update the build target."
+            packet = {
+                "task": {
+                    "allowed_files": ["Makefile"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) == 0, f"Makefile in allowed_files must pass. Got: {errors}"
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"Makefile in allowed_files must pass. Got: {errors}"
 
-    def test_readme_md_blocks_with_empty_allowed_files(self):
+    def test_readme_md_blocks_with_empty_allowed_files(self, tmp_path):
         """README.md with empty allowed_files must BLOCK."""
         import run_plan_preview as rpp
-        plan = "Update README.md with new installation instructions."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "README.md").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Update README.md with new installation instructions."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) > 0, (
-            f"README.md with empty allowed_files must block. Got: {errors}"
-        )
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, (
+                f"README.md with empty allowed_files must block. Got: {errors}"
+            )
 
-    def test_readme_md_blocks_when_not_allowed(self):
+    def test_readme_md_blocks_when_not_allowed(self, tmp_path):
         """README.md with allowed_files=["scripts/"] must BLOCK."""
         import run_plan_preview as rpp
-        plan = "Update README.md with new installation instructions."
-        packet = {
-            "task": {
-                "allowed_files": ["scripts/"],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "README.md").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Update README.md with new installation instructions."
+            packet = {
+                "task": {
+                    "allowed_files": ["scripts/"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) > 0, (
-            f"README.md not in allowed_files must block. Got: {errors}"
-        )
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, (
+                f"README.md not in allowed_files must block. Got: {errors}"
+            )
 
-    def test_readme_md_passes_when_explicitly_allowed(self):
+    def test_readme_md_passes_when_explicitly_allowed(self, tmp_path):
         """README.md with allowed_files=["README.md"] must PASS."""
         import run_plan_preview as rpp
-        plan = "Update README.md with new installation instructions."
-        packet = {
-            "task": {
-                "allowed_files": ["README.md"],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "README.md").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Update README.md with new installation instructions."
+            packet = {
+                "task": {
+                    "allowed_files": ["README.md"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) == 0, f"README.md in allowed_files must pass. Got: {errors}"
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"README.md in allowed_files must pass. Got: {errors}"
 
-    def test_ordinary_word_plan_does_not_block(self):
-        """Ordinary word "Plan" must NOT block — no file named Plan in repo root."""
+    def test_ordinary_word_plan_does_not_block(self, tmp_path):
+        """Ordinary word "Plan" must NOT block — no file named Plan in fake repo root."""
         import run_plan_preview as rpp
-        plan = "Run the Plan for today's deployment."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        # No files at all in tmp_path
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Run the Plan for today's deployment."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) == 0, f"Ordinary word 'Plan' must not block. Got: {errors}"
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"Ordinary word 'Plan' must not block. Got: {errors}"
 
-    def test_bin_run_wfa_still_blocks(self):
+    def test_bin_run_wfa_still_blocks(self, tmp_path):
         """bin/run_wfa with empty allowed_files must still BLOCK — P1 regression."""
         import run_plan_preview as rpp
-        plan = "Edit bin/run_wfa to fix CLI entry point."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "run_wfa").touch()
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Edit bin/run_wfa to fix CLI entry point."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) > 0, (
-            f"bin/run_wfa with empty allowed_files must block. Got: {errors}"
-        )
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) > 0, f"bin/run_wfa must block. Got: {errors}"
 
-    def test_result_text_still_passes(self):
+    def test_result_text_still_passes(self, tmp_path):
         """result/text descriptive label must still PASS."""
         import run_plan_preview as rpp
-        plan = "Return the result/text field from the response."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        # No result/ dir in tmp_path
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Handle result/text in the response."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) == 0, f"result/text must not block. Got: {errors}"
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"result/text must not block. Got: {errors}"
 
-    def test_missing_empty_string_still_passes(self):
+    def test_missing_empty_string_still_passes(self, tmp_path):
         """missing/empty/string descriptive label must still PASS."""
         import run_plan_preview as rpp
-        plan = "Handle missing/empty/string in the payload."
-        packet = {
-            "task": {
-                "allowed_files": [],
-                "forbidden_files": [],
-                "do_not": [],
+        # No missing/ dir in tmp_path
+        with mock.patch.object(rpp, "_resolve_git_root", return_value=tmp_path):
+            plan = "Handle missing/empty/string in the payload."
+            packet = {
+                "task": {
+                    "allowed_files": [],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
             }
-        }
-        errors = rpp.validate_plan_only_allowed_files(plan, packet)
-        assert len(errors) == 0, f"missing/empty/string must not block. Got: {errors}"
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert len(errors) == 0, f"missing/empty/string must not block. Got: {errors}"
+
 
 
 # ---------------------------------------------------------------------------
