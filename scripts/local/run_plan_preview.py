@@ -73,6 +73,16 @@ FORBIDDEN_PATH_PREFIXES = (
     "/tmp/hermes",
 )
 
+# Verbs that indicate a plan proposes editing, deleting, or mutating a file.
+# Used in context-sensitive detection for Claude-internal artifact paths.
+# Informational references (e.g., "plan saved to ~/.claude/plans/foo.md") are allowed.
+# Mutating references (e.g., "Edit ~/.claude/plans/foo.md") must block.
+MUTATING_VERBS = frozenset([
+    "edit", "delete", "remove", "modify", "update", "change",
+    "write", "create", "add", "replace", "move", "rename",
+    "copy", "inject", "append", "truncate", "patch",
+])
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -119,6 +129,11 @@ def _is_forbidden_path(path: str) -> bool:
 
 def is_claude_artifact_path(path: str) -> bool:
     """Return True if path is a Claude-internal artifact (not a repo mutation)."""
+    # Check raw path for literal ~/.claude/ first — this handles the case where
+    # expanduser resolves to a different home directory (e.g. CI: /home/runner,
+    # prod: /home/max), and also handles environments where HOME is unset.
+    if path.startswith("~/.claude/"):
+        return True
     # Expand tilde to home directory for comparison
     expanded = os.path.expanduser(path)
     p = Path(expanded)
@@ -274,21 +289,56 @@ def validate_plan_only_allowed_files(plan_text: str, packet: dict) -> list[str]:
             if not stripped or stripped.startswith("#"):
                 continue
             words = stripped.split()
-            for word in words:
+            for word_idx, word in enumerate(words):
                 if "/" in word or word.startswith("."):
                     if "://" not in word and not word.startswith("-"):
                         # Skip parenthetical inline lists like "(pip/npm/yarn/poetry/...)"
                         # — these are dependency-policy keyword groups, not file paths.
                         if word.startswith("("):
                             continue
-                        # Strip surrounding backticks BEFORE punctuation rstrip
-                        # (punctuation rstrip would otherwise remove trailing backtick,
-                        #  making the endswith check fail)
+                        # Strip surrounding backticks FIRST, before any other processing.
+                        # This must happen before punctuation rstrip so that:
+                        #   `/home/max/.claude/plans/foo.md`.  -> clean path (not a violation)
+                        #   `/home/max/.claude/plans/foo.md`   -> clean path (not a violation)
+                        #   `scripts/local/foo.py`.           -> clean path (not a violation)
+                        # Without this ordering, rstrip(".,;:`") removes the trailing backtick
+                        # before the endswith check fires, leaving a leading-backtick token that
+                        # is_claude_artifact_path cannot classify (Path('`/path') != '/path').
+                        # We use enumerate(word_idx) instead of words.index(word) because
+                        # when the same word appears twice in a line, words.index() returns the
+                        # FIRST occurrence's index, not the current one — causing the mutating-verb
+                        # detection to check the wrong predecessor word.
                         if word.startswith("`") and word.endswith("`"):
                             word = word[1:-1]
-                        path_part = word.rstrip(".,;:`").rsplit("<", 1)[0].rsplit(">", 1)[0]
-                        if path_part.startswith("`") and path_part.endswith("`"):
-                            path_part = path_part[1:-1]
+                        # Also strip a single leading backtick that was NOT matched as outer pair
+                        # (e.g. word = "`/path/to/file`." where rstrip already stripped the trailing
+                        # backtick before the outer-pair check could fire).
+                        if word.startswith("`"):
+                            word = word[1:]
+                        # Now strip trailing punctuation (comma, period, semicolon, colon)
+                        # and trailing angle brackets / backticks remaining after above.
+                        path_part = word.rstrip(".,;:<>`").rsplit("<", 1)[0].rsplit(">", 1)[0]
+
+                        # Context-sensitive mutating-verb detection for .claude artifact paths.
+                        # Informational references (plan ready at ~/.claude/plans/foo.md) are allowed.
+                        # But "Edit ~/.claude/plans/foo.md", "Delete ~/.claude/plans/foo.md" etc.
+                        # are repo mutations and must block even though the path is a Claude artifact.
+                        if path_part and is_claude_artifact_path(path_part):
+                            if word_idx > 0:
+                                # Check the original word (before rstrip) to detect colon-suffixed
+                                # labels like "Update:" or "Change:" which are informational, not
+                                # mutating verbs. Only block if the original predecessor word
+                                # does NOT end with a colon (label suffix stripped).
+                                prev_word_original = words[word_idx - 1]
+                                if not prev_word_original.endswith(":"):
+                                    prev_word = prev_word_original.rstrip(".,;:").lower()
+                                    if prev_word in MUTATING_VERBS:
+                                        violations.append(
+                                            f"plan proposes {prev_word} on .claude artifact path "
+                                            f"(not a repo mutation but violates plan-only constraint): {path_part}"
+                                        )
+                                        continue
+
                         if path_part and not _is_forbidden_path(path_part) and not is_claude_artifact_path(path_part):
                             matched = False
                             # Be strict: require the path to START with an allowed prefix,
