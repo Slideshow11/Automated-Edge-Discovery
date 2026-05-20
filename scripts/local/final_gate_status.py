@@ -166,20 +166,6 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
     return pr_data
 
 
-def fetch_ci_status(pr_number: int, repo: str) -> dict:
-    """Fetch CI check status for the PR using the REST checks endpoint as fallback."""
-    # Use REST API for status checks since GraphQL commit statusCheckRollup can be null
-    try:
-        checks = gh_json([
-            f"repos/{repo}/commits",
-            "--method", "GET",
-            "--paginate",
-        ])
-        return checks
-    except Exception:
-        return {}
-
-
 def get_required_checks(pr_number: int, repo: str, head_sha: str) -> list[dict]:
     """Get the latest commit status for a given SHA."""
     try:
