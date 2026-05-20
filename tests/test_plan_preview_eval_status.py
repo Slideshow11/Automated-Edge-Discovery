@@ -8,6 +8,7 @@ Mocks subprocess calls to run_plan_preview.py — no real Claude needed.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -139,6 +140,167 @@ class TestGenerateTrialPacket:
         dep = packet["task"]["dependency_install_policy"]
         assert dep["new_dependencies_allowed"] is False
         assert dep["requires_human_approval"] is True
+
+    def test_trial_id_in_packet_from_id_field(self, tmp_path):
+        """trial with id='A' should have trial_id='A' in the packet."""
+        trial = make_trial("A", "Fix bug")
+        packet = mod.generate_trial_packet(trial, tmp_path)
+        assert packet["trial_id"] == "A"
+
+    def test_trial_id_in_packet_from_trial_id_field(self, tmp_path):
+        """trial with trial_id='B' (not 'id') should have trial_id='B' in the packet."""
+        trial = {
+            "trial_id": "B",
+            "task": "Fix bug",
+            "allowed_files": [],
+            "forbidden_files": [],
+            "do_not": [],
+        }
+        packet = mod.generate_trial_packet(trial, tmp_path)
+        assert packet["trial_id"] == "B"
+
+    def test_trial_id_id_takes_precedence_over_trial_id(self, tmp_path):
+        """When both 'id' and 'trial_id' are present, 'id' wins."""
+        trial = {
+            "id": "X",
+            "trial_id": "Y",
+            "task": "Fix bug",
+            "allowed_files": [],
+            "forbidden_files": [],
+            "do_not": [],
+        }
+        packet = mod.generate_trial_packet(trial, tmp_path)
+        assert packet["trial_id"] == "X"
+
+    def test_missing_trial_id_raises_value_error(self, tmp_path):
+        """A trial missing both 'id' and 'trial_id' should raise ValueError."""
+        trial = {
+            "task": "Fix bug",
+            "allowed_files": [],
+            "forbidden_files": [],
+            "do_not": [],
+        }
+        import pytest
+        with pytest.raises(ValueError, match="missing 'id' and 'trial_id'"):
+            mod.generate_trial_packet(trial, tmp_path)
+
+
+# -----------------------------------------------------------------------
+# Tests: trial_id propagation
+# -----------------------------------------------------------------------
+
+class TestTrialIdPropagation:
+    """Verify trial_id propagates from trials JSON through packet to result/per_trial."""
+
+    def test_aggregate_results_preserves_trial_id(self):
+        """per_trial should show the actual trial_id, not '?'."""
+        trial_results = [
+            make_trial_result("A", make_result("PLAN_PREVIEW_READY")),
+            make_trial_result("B", make_result("PLAN_PREVIEW_READY")),
+        ]
+        agg = mod.aggregate_results(trial_results)
+        assert agg["per_trial"][0]["trial_id"] == "A"
+        assert agg["per_trial"][1]["trial_id"] == "B"
+
+    def test_aggregate_results_missing_trial_id_uses_none(self):
+        """A trial result without trial_id should propagate as None in per_trial."""
+        trial_results = [
+            {"result": make_result("PLAN_PREVIEW_READY"), "elapsed": 10.0},
+        ]
+        agg = mod.aggregate_results(trial_results)
+        assert agg["per_trial"][0]["trial_id"] is None
+
+    def test_markdown_report_shows_trial_ids(self, tmp_path):
+        """Markdown table should show A, B, C not '?'."""
+        trial_results = [
+            make_trial_result("A", make_result("PLAN_PREVIEW_READY")),
+            make_trial_result("B", make_result("PLAN_PREVIEW_READY")),
+            make_trial_result("C", make_result("PLAN_PREVIEW_READY")),
+        ]
+        agg = mod.aggregate_results(trial_results)
+        md = mod.build_markdown_report("test_run", {"trials": []}, agg, mod.State.READY_FOR_MANUAL_PLAN_PREVIEW)
+        assert "A" in md and "B" in md and "C" in md
+        assert "?" not in md
+
+    def test_run_rejects_missing_trial_id_at_top_level(self, tmp_path, monkeypatch):
+        """run() should raise ValueError when a trial has no id or trial_id."""
+        # Mock git status to avoid needing a real repo path
+        monkeypatch.setattr(mod, "_git_status", lambda p: "clean")
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0})())
+        monkeypatch.setattr(mod, "_write_json", lambda d, p: None)
+
+        args = argparse.Namespace(
+            trials_json=str(tmp_path / "trials.json"),
+            output_root=str(tmp_path / "out"),
+            output_json=str(tmp_path / "out.json"),
+            output_md=None,
+            repo_root=str(tmp_path / "repo"),
+            min_ready_ratio=0.8,
+            timeout=300,
+        )
+        # Write a trials JSON with a trial missing trial_id
+        trials_json = {
+            "run_id": "test",
+            "trials": [
+                {"task": "Fix bug", "allowed_files": [], "forbidden_files": [], "do_not": []},
+            ],
+        }
+        import json
+        (tmp_path / "trials.json").write_text(json.dumps(trials_json))
+        import pytest
+        with pytest.raises(ValueError, match="missing 'id' and 'trial_id'"):
+            mod.run(args)
+
+    def test_packet_kind_still_aed_worker_packet_v1(self, tmp_path):
+        """Adding trial_id must not break packet_kind."""
+        trial = make_trial("X", "Fix bug")
+        packet = mod.generate_trial_packet(trial, tmp_path)
+        assert packet["packet_kind"] == "aed.worker.packet.v1"
+
+    def test_output_path_uses_trial_id(self, tmp_path, monkeypatch):
+        """Result path should be trial_A/A_result.json not trial_?/?_result.json."""
+        monkeypatch.setattr(mod, "_git_status", lambda p: "clean")
+        monkeypatch.setattr(subprocess, "run", lambda *a, **k: type("R", (), {"returncode": 0})())
+
+        trial = make_trial("D", "Fix bug")
+        args = argparse.Namespace(
+            trials_json=str(tmp_path / "trials.json"),
+            output_root=str(tmp_path / "out"),
+            output_json=None,
+            output_md=None,
+            repo_root=str(tmp_path / "repo"),
+            min_ready_ratio=0.8,
+            timeout=300,
+        )
+        import json
+        (tmp_path / "trials.json").write_text(json.dumps({"run_id": "test", "trials": [trial]}))
+        # Mock run_plan_preview.py write
+        def mock_write_json(data, path):
+            pass
+
+        monkeypatch.setattr(mod, "_write_json", mock_write_json)
+        # Patch subprocess.run to create result file
+        def mock_run(cmd, **kwargs):
+            # Write a result JSON
+            for arg in cmd:
+                if arg.startswith("--output-json"):
+                    idx = cmd.index(arg) + 1
+                    result_path = cmd[idx]
+                    with open(result_path, "w") as f:
+                        json.dump({
+                            "status": "PLAN_PREVIEW_READY",
+                            "validation_errors": [],
+                            "git_status_before": "clean",
+                            "git_status_after": "clean",
+                            "repo_mutated": False,
+                            "elapsed_seconds": 10.0,
+                            "metadata": {"elapsed_seconds": 10.0, "stdout_bytes": 100},
+                        }, f)
+            return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+        monkeypatch.setattr(subprocess, "run", mock_run)
+        mod.run(args)
+        assert (tmp_path / "out" / "trial_D").exists()
 
 
 # -----------------------------------------------------------------------
