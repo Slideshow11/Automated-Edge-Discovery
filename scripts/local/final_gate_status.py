@@ -104,8 +104,12 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def gh_json(args: list[str]) -> dict:
-    """Run gh with --json and return parsed output. Raises RuntimeError on failure."""
-    cmd = ["gh", "api", "--jq", "."] + args
+    """Run gh with --json and return parsed output. Raises RuntimeError on failure.
+
+    All gh api calls use list-form args with no shell interpolation.
+    --jq '.' is placed at the end of the argument list (required for gh 2.x).
+    """
+    cmd = ["gh", "api"] + args + ["--jq", "."]
     try:
         result = subprocess.run(
             cmd,
@@ -140,11 +144,6 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
                                 oid
                                 statusCheckRollup {
                                     state
-                                    checks {
-                                        name
-                                        conclusion
-                                        status
-                                    }
                                 }
                             }
                         }
@@ -154,10 +153,11 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
         }
     """
     data = gh_json([
-        "-f", f"owner={repo.split('/')[0]}",
-        "-f", f"repo={repo.split('/')[1]}",
-        "-f", f"pr={pr_number}",
+        "graphql",
         "-f", f"query={query}",
+        "-F", f"owner={repo.split('/')[0]}",
+        "-F", f"repo={repo.split('/')[1]}",
+        "-F", f"pr={pr_number}",
     ])
     repo_data = data.get("data", {}).get("repository", {})
     pr_data = repo_data.get("pullRequest")
@@ -202,10 +202,14 @@ def is_ci_green(pr_number: int, repo: str, head_sha: str) -> tuple[bool, str]:
     Returns (is_green, reason).
     """
     try:
-        runs = gh_json([
+        # Note: gh_json appends --jq "." at the end. For actions/runs we
+        # need a custom --jq filter, so we cannot pass --jq in args (it
+        # would be overwritten by gh_json's append). Instead, fetch
+        # workflow_runs directly and filter in Python.
+        all_runs = gh_json([
             f"repos/{repo}/actions/runs",
-            "--jq", f".workflow_runs | map(select(.head_sha == \"{head_sha}\"))",
         ])
+        runs = [r for r in all_runs.get("workflow_runs", []) if r.get("head_sha") == head_sha]
     except Exception as e:
         return False, f"Failed to fetch workflow runs: {e}"
 
@@ -559,6 +563,7 @@ def _fatal_result(pr_number: int, repo: str, error: str) -> dict:
         "pr_number": pr_number,
         "repo": repo,
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "head_sha": "",
         "checks": {},
         "blockers": [f"Fatal error: {error}"],
         "authorization_phrase": "",

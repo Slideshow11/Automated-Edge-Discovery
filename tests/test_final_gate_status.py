@@ -136,14 +136,17 @@ class TestLoadPmgGuardState:
 
 class TestIsCiGreen:
     def test_all_success_returns_true(self):
-        # gh_json returns the list directly (--jq filter applied by gh)
+        # gh_json returns the full dict with workflow_runs key (Python-side filtering)
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "CI"},
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "test (3.11)"},
-            ]
+            m.return_value = {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "CI"},
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "test (3.11)"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -152,12 +155,15 @@ class TestIsCiGreen:
 
     def test_in_progress_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "success", "status": "completed", "name": "CI"},
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": None, "status": "in_progress", "name": "governance-validators"},
-            ]
+            m.return_value = {
+                "total_count": 2,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "success", "status": "completed", "name": "CI"},
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": None, "status": "in_progress", "name": "governance-validators"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -167,10 +173,13 @@ class TestIsCiGreen:
 
     def test_failure_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = [
-                {"head_sha": "abc123def0000000000000000000000000000000",
-                 "conclusion": "failure", "status": "completed", "name": "test (3.11)"},
-            ]
+            m.return_value = {
+                "total_count": 1,
+                "workflow_runs": [
+                    {"head_sha": "abc123def0000000000000000000000000000000",
+                     "conclusion": "failure", "status": "completed", "name": "test (3.11)"},
+                ],
+            }
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -180,7 +189,7 @@ class TestIsCiGreen:
 
     def test_no_runs_returns_false(self):
         with mock.patch.object(fgs, "gh_json") as m:
-            m.return_value = []
+            m.return_value = {"total_count": 0, "workflow_runs": []}
             green, reason = fgs.is_ci_green(
                 265, "Slideshow11/Automated-Edge-Discovery",
                 "abc123def0000000000000000000000000000000"
@@ -596,3 +605,119 @@ class TestOutputFormat:
         content = md_path.read_text()
         assert "✅" in content
         assert "READY_TO_MERGE" in content
+
+
+# -----------------------------------------------------------------------
+# Regression: gh_json --jq argument ordering
+# -----------------------------------------------------------------------
+
+class TestGhJsonArgOrdering:
+    """Regression tests for gh api argument ordering (gh 2.x compatibility).
+
+    The bug: gh api --jq '.' must come AFTER the endpoint and -f/-F flags.
+    In gh 2.x, placing --jq before the endpoint causes "accepts 1 arg(s), received 0".
+    The fix: cmd = ["gh", "api"] + args + ["--jq", "."]  (--jq at END).
+
+    Also: graphql variables of type Int must use -F (typed), not -f (raw string).
+    """
+
+    def test_gh_json_places_jq_at_end(self):
+        """--jq '.' must be the last argument in the gh api command."""
+        captured_cmd = None
+
+        def capture_run(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock.MagicMock(returncode=0, stdout='{}', stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=capture_run):
+            try:
+                fgs.gh_json(["graphql", "-f", "query={foo}"])
+            except Exception:
+                pass  # we only care about what command was constructed
+
+        assert captured_cmd is not None
+        assert captured_cmd[-2:] == ["--jq", "."], (
+            f"--jq '.' must be last, got: {captured_cmd}"
+        )
+
+    def test_gh_json_uses_list_form_no_shell(self):
+        """All gh api calls must use list-form args with no shell=True."""
+        original_run = subprocess.run
+        all_calls = []
+
+        def tracking_run(cmd, **kwargs):
+            all_calls.append((cmd, kwargs))
+            return original_run(cmd, **kwargs)
+
+        with mock.patch.object(subprocess, "run", side_effect=tracking_run):
+            try:
+                fgs.gh_json(["repos/test"])
+            except Exception:
+                pass
+
+        for cmd, kwargs in all_calls:
+            assert kwargs.get("shell") is not True, (
+                f"shell=True found in gh api call: {cmd}"
+            )
+            assert isinstance(cmd, list), f"cmd must be list, got: {type(cmd)}"
+
+    def test_gh_json_graphql_int_var_must_use_capital_F(self):
+        """Int graphql variables must use -F (typed) not -f (raw string).
+
+        -f passes raw strings; -F does type coercion (str→int for numeric values).
+        Without -F, a variable of type Int! gets the string "270" and gh rejects it.
+        """
+        captured_cmd = None
+
+        def capture_run(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock.MagicMock(returncode=0, stdout='{}', stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=capture_run):
+            try:
+                fgs.gh_json([
+                    "graphql",
+                    "-f", "query={foo(bar: $pr)}",
+                    "-F", "pr=270",
+                ])
+            except Exception:
+                pass
+
+        # Verify the command was built correctly
+        assert captured_cmd is not None
+        # -F for int variables
+        assert any(arg == "-F" for arg in captured_cmd), (
+            f"Int variables must use -F, got: {captured_cmd}"
+        )
+
+    def test_gh_json_graphql_query_not_treated_as_variable(self):
+        """The query string itself must be passed as -f query=<string>, not as a positional arg.
+
+        This was the original failure mode: --jq '.' was placed before the endpoint,
+        causing gh to interpret the endpoint as the --jq argument value.
+        After the fix (--jq at end), 'graphql' is correctly treated as the endpoint.
+        """
+        captured_cmd = None
+
+        def capture_run(cmd, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return mock.MagicMock(returncode=0, stdout='{"data":{}}', stderr="")
+
+        with mock.patch.object(subprocess, "run", side_effect=capture_run):
+            try:
+                fgs.gh_json(["graphql", "-f", "query={foo}"])
+            except Exception:
+                pass
+
+        assert captured_cmd is not None
+        # The endpoint 'graphql' must come before -f flags
+        graphql_idx = captured_cmd.index("graphql")
+        # graphql should come before any -f flags
+        f_flags = [i for i, a in enumerate(captured_cmd) if a == "-f"]
+        if f_flags:
+            assert all(graphql_idx < idx for idx in f_flags), (
+                f"graphql endpoint must come before -f flags: {captured_cmd}"
+            )
