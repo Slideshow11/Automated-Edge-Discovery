@@ -115,6 +115,9 @@ _REPO_DIR_PREFIXES = (
     "tests/",
     "docs/",
     "tools/",
+    "src/",
+    "lib/",
+    "bin/",
     "engine/",
     "schemas/",
     "fixtures/",
@@ -178,8 +181,6 @@ def _looks_like_real_path_token(path_part: str) -> bool:
         # Descriptive label: 2-3 components, ALL lowercase alphabetic identifiers,
         # no dots anywhere. Covers field references (result/text), test-case names
         # (missing/empty/string), nested type identifiers (message/content/text).
-        # Single-component paths like "src/" or "lib/" are real directory paths —
-        # they should return True so they are checked against allowed_files.
         if 2 <= len(non_empty) <= 3 and all(
             p.isidentifier() and p.islower() for p in non_empty
         ):

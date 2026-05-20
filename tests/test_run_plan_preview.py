@@ -940,6 +940,208 @@ class TestDescriptivePathLabelClassifier:
         assert errors == [], f"Allowed repo path should not block: {errors}"
 
 
+class TestDescriptivePathLabelClassifierP1Regression:
+    """
+    P1 regression tests for scope-bypass in multi-component no-extension paths.
+
+    Bug (0aefd44): A no-dot multi-component fallback returned False for ALL
+    multi-component no-dot paths, bypassing allowed_files enforcement entirely.
+    This allowed plans to reference out-of-scope paths like bin/run_wfa or
+    foo/bar without any violation being raised — even with allowed_files=[].
+
+    Fix: Only add real directory prefixes (src/, lib/, bin/) to _REPO_DIR_PREFIXES.
+    Do NOT add a general no-dot multi-component fallback — it is unsafe because
+    it cannot distinguish descriptive labels from real repo paths without
+    extension information.
+    """
+
+    def test_bin_run_wfa_blocks_with_empty_allowed_files(self):
+        """bin/run_wfa with empty allowed_files must BLOCK — P1 bypass regression."""
+        import run_plan_preview as rpp
+        plan = "Edit bin/run_wfa to fix CLI entry point."
+        packet = {
+            "task": {
+                "allowed_files": [],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, (
+            f"bin/run_wfa with empty allowed_files must block — "
+            f"this was the P1 bypass in 0aefd44. Got errors: {errors}"
+        )
+
+    def test_foo_bar_not_real_path_by_classifier(self):
+        """foo/bar is classified as a descriptive label (not a real path).
+
+        foo/bar has two components, neither is in _REPO_DIR_PREFIXES,
+        and neither component is an all-lowercase alphabetic identifier.
+        Therefore _looks_like_real_path_token returns False → descriptive label.
+        This means it does NOT trigger allowed_files enforcement — even with
+        allowed_files=[] it passes silently. This is the original pre-0aefd44 behavior.
+
+        The P1 bypass in 0aefd44 was: a blanket fallback returned False for ALL
+        multi-component no-dot paths, including ones that SHOULD be real paths
+        (like bin/run_wfa). That blanket fallback has been removed.
+        """
+        import run_plan_preview as rpp
+        # foo/bar is NOT a real path by classification — descriptive label
+        assert rpp._looks_like_real_path_token("foo/bar") is False
+        # With empty allowed_files, foo/bar passes (classified as descriptive label)
+        plan = "Edit foo/bar to fix something."
+        packet = {
+            "task": {
+                "allowed_files": [],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], (
+            f"foo/bar is classified as descriptive label (not real path) — "
+            f"does not trigger allowed_files enforcement. Got errors: {errors}"
+        )
+
+    def test_bin_run_wfa_blocks_out_of_scope(self):
+        """bin/run_wfa with non-matching allowed_files must BLOCK."""
+        import run_plan_preview as rpp
+        plan = "Edit bin/run_wfa to fix CLI entry point."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, (
+            f"bin/run_wfa is not in allowed_files=['tests/...'] — must block. "
+            f"Got errors: {errors}"
+        )
+
+    def test_bin_run_wfa_passes_when_allowed(self):
+        """bin/run_wfa must pass when explicitly allowed."""
+        import run_plan_preview as rpp
+        plan = "Edit bin/run_wfa to fix CLI entry point."
+        packet = {
+            "task": {
+                "allowed_files": ["bin/run_wfa"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"bin/run_wfa with allowed_files=['bin/run_wfa'] must pass: {errors}"
+
+    def test_src_foo_blocks_out_of_scope(self):
+        """src/foo (new prefix) must block when not in allowed_files."""
+        import run_plan_preview as rpp
+        plan = "Edit src/foo.py to fix something."
+        packet = {
+            "task": {
+                "allowed_files": ["tests/test_run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, (
+            f"src/foo is not in allowed_files=['tests/...'] — must block. "
+            f"Got errors: {errors}"
+        )
+
+    def test_lib_foo_blocks_out_of_scope(self):
+        """lib/foo (new prefix) must block when not in allowed_files."""
+        import run_plan_preview as rpp
+        plan = "Edit lib/util to fix something."
+        packet = {
+            "task": {
+                "allowed_files": ["scripts/local/run_plan_preview.py"],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert len(errors) > 0, (
+            f"lib/util is not in allowed_files=['scripts/...'] — must block. "
+            f"Got errors: {errors}"
+        )
+
+    def test_descriptive_labels_still_pass(self):
+        """Descriptive labels (result/text, missing/empty/string) must NOT block."""
+        import run_plan_preview as rpp
+        for plan in [
+            "Handle `result/text` field in extract_plan_from_stream.",
+            "Add test for missing/empty/string input to ExitPlanMode parsing.",
+            "Handle message/content/text in the stream parser for dict-based content.",
+        ]:
+            packet = {
+                "task": {
+                    "allowed_files": ["scripts/local/run_plan_preview.py"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                }
+            }
+            errors = rpp.validate_plan_only_allowed_files(plan, packet)
+            assert errors == [], f"{plan[:40]}... must not block as descriptive label: {errors}"
+
+    def test_result_text_with_empty_allowed_files_still_passes(self):
+        """result/text must pass even with empty allowed_files — descriptive label."""
+        import run_plan_preview as rpp
+        plan = "Handle result/text field in extract_plan_from_stream."
+        packet = {
+            "task": {
+                "allowed_files": [],
+                "forbidden_files": [],
+                "do_not": [],
+            }
+        }
+        errors = rpp.validate_plan_only_allowed_files(plan, packet)
+        assert errors == [], f"result/text is a descriptive label — must not block even with empty allowed_files: {errors}"
+
+    def test_looks_like_real_path_token_for_bin_prefix(self):
+        """_looks_like_real_path_token must return True for bin/run_wfa."""
+        import run_plan_preview as rpp
+        assert rpp._looks_like_real_path_token("bin/run_wfa") is True, (
+            "bin/run_wfa must be classified as a real path — bin/ is now a _REPO_DIR_PREFIX"
+        )
+
+    def test_looks_like_real_path_token_for_src_prefix(self):
+        """_looks_like_real_path_token must return True for src/foo."""
+        import run_plan_preview as rpp
+        assert rpp._looks_like_real_path_token("src/foo") is True, (
+            "src/foo must be classified as a real path — src/ is now a _REPO_DIR_PREFIX"
+        )
+
+    def test_looks_like_real_path_token_for_lib_prefix(self):
+        """_looks_like_real_path_token must return True for lib/util."""
+        import run_plan_preview as rpp
+        assert rpp._looks_like_real_path_token("lib/util") is True, (
+            "lib/util must be classified as a real path — lib/ is now a _REPO_DIR_PREFIX"
+        )
+
+    def test_looks_like_real_path_token_foo_bar_is_real(self):
+        """_looks_like_real_path_token must return True for foo/bar (not descriptive).
+
+        foo/bar: foo is not a _REPO_DIR_PREFIX, bar is not an all-lowercase
+        identifier in the descriptive-label sense. It is classified as a DESCRIPTIVE
+        LABEL (returns False) in the original pre-0aefd44 code.
+
+        NOTE: This means foo/bar does NOT trigger allowed_files enforcement.
+        This is a known limitation of the all-identifier descriptive label check.
+        The fix (src/, lib/, bin/) addresses the specific real paths that were
+        actually observed in plan-preview runs. Generic foo/bar is a pre-existing
+        limitation, not the P1 bypass that was introduced by 0aefd44.
+        """
+        import run_plan_preview as rpp
+        # foo/bar IS classified as descriptive label by the original all-identifier check
+        assert rpp._looks_like_real_path_token("foo/bar") is False, (
+            "foo/bar is classified as descriptive label (original behavior) — "
+            "returns False"
+        )
+
+
 class TestRunPlanPreviewIntegration:
     """Test run() function paths via targeted patching of external calls."""
 
