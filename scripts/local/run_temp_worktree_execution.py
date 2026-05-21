@@ -72,6 +72,7 @@ OUTPUT_STATES = frozenset([
     # Real-Claude states
     "HOLD_REAL_EXECUTOR_NOT_ENABLED",
     "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
+    "HOLD_CLAUDE_COMMAND_INVALID",
     # PMG states
     "HOLD_PMG_SNAPSHOT_FAILED",
     "HOLD_PMG_COMPARE_FAILED",
@@ -403,10 +404,12 @@ def run_claude_executor_stub(
     packet: dict,
     worktree_root: Path,
     output_root: Path,
+    repo_root: Path = REPO_ROOT,
 ) -> dict:
     """
     Placeholder stub for real executor.
-    Returns HOLD_CLAUDE_IMPLEMENTATION_PENDING — real implementation not yet done.
+    Returns HOLD_CLAUDE_IMPLEMENTATION_PENDING (valid contract) or
+    HOLD_CLAUDE_COMMAND_INVALID (contract validation failed).
 
     This stub does NOT:
     - Call subprocess with external executor binary
@@ -417,6 +420,48 @@ def run_claude_executor_stub(
     - Write to Hermes or audit
     - Dispatch or merge
     """
+    # Build command contract (pure, no side effects)
+    contract = build_claude_command_contract(packet, worktree_root, output_root)
+
+    # Validate contract (pure, no side effects)
+    is_valid, validation_errors = validate_claude_command_contract(
+        contract, packet, worktree_root, output_root, repo_root
+    )
+
+    # Build safe summary string (not a command to run)
+    summary_parts = [
+        f"argv={contract['argv']}",
+        f"cwd={contract['cwd']}",
+        f"timeout={contract['timeout_seconds']}s",
+    ]
+    contract_summary = "; ".join(summary_parts)
+
+    if not is_valid:
+        return {
+            "status": "HOLD_CLAUDE_COMMAND_INVALID",
+            "run_id": packet.get("run_id", "unknown"),
+            "base_sha": packet.get("base_sha", ""),
+            "worktree_path": str(worktree_root),
+            "output_root": str(output_root),
+            "changed_files": [],
+            "validation_errors": validation_errors,
+            "main_git_status_before": "unknown",
+            "main_git_status_after": "unknown",
+            "worktree_git_status_before": "unknown",
+            "worktree_git_status_after": "unknown",
+            "diff_path": "",
+            "patch_ready": False,
+            "next_action": "fix command contract validation errors",
+            "pmg_snapshot_path": "",
+            "pmg_compare_json_path": "",
+            "pmg_compare_md_path": "",
+            "pmg_status": "not_run",
+            "pmg_blocked_files": 0,
+            "claude_command_contract_valid": False,
+            "claude_command_contract_errors": validation_errors,
+            "claude_command_contract_summary": contract_summary,
+        }
+
     return {
         "status": "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
         "run_id": packet.get("run_id", "unknown"),
@@ -441,7 +486,290 @@ def run_claude_executor_stub(
         "pmg_compare_md_path": "",
         "pmg_status": "not_run",
         "pmg_blocked_files": 0,
+        "claude_command_contract_valid": True,
+        "claude_command_contract_errors": [],
+        "claude_command_contract_summary": contract_summary,
     }
+
+
+# ---------------------------------------------------------------------------
+# Claude command contract builder and validator
+# ---------------------------------------------------------------------------
+# NOTE: These functions define a SAFE, RESTRICTED command contract for future
+# real-Claude executor implementation. They are PURE (no subprocess calls).
+# All contract parameters must be verified before any real execution.
+# Claude CLI flags listed here are CONSERVATIVE PLACEHOLDERS and must be
+# re-verified against actual Claude CLI documentation before implementation.
+# ---------------------------------------------------------------------------
+
+# Approved Claude binary names (conservative, no shell expansion)
+APPROVED_CLAUDE_BINARIES = frozenset(["claude", "claude.ai", "claude-cli"])
+
+# Forbidden argv patterns for command contract validation.
+# Stored as multi-word lists so token-element scanning avoids false positives from path substrings.
+# Single-token words caught by direct element comparison in validator.
+# Multi-token sequences caught by contiguous subsequence scan.
+_FORBIDDEN_ARGV_PATTERNS = [
+    ["git", "push"],
+    ["gh", "pr", "create"],
+    ["gh", "pr", "merge"],
+    ["gh", "workflow", "run"],
+    ["gh", "api"],
+    ["pip", "install"],
+    ["npm", "install"],
+    ["apt", "install"],
+    ["yum", "install"],
+    ["brew", "install"],
+    ["repository_dispatch"],
+    ["board"],
+    ["|"],
+]
+
+# Maximum timeout in seconds (prevent runaway processes)
+MAX_TIMEOUT_SECONDS = 300  # 5 minutes
+
+
+def build_claude_command_contract(
+    packet: dict,
+    worktree_root: Path,
+    output_root: Path,
+) -> dict:
+    """
+    Build a conservative, safe command contract for future real-Claude executor.
+
+    This is a PURE function — no subprocess, no network, no side effects.
+
+    Returns a structured contract dict with:
+      argv          : approved Claude command as list of strings
+      cwd           : worktree path (must be validated by caller)
+      timeout_seconds: bounded timeout
+      env_policy    : restricted environment variable policy
+      stdout_path   : output_root / stdout file
+      stderr_path   : output_root / stderr file
+      transcript_path: output_root / transcript file
+
+    NOTE: The argv constructed here uses CONSERVATIVE PLACEHOLDER flags.
+    Actual Claude CLI flags must be re-verified against live Claude documentation
+    before replacing this placeholder with real subprocess invocation.
+    """
+    run_id = packet.get("run_id", "unknown")
+    timeout = int(packet.get("execution", {}).get("timeout_seconds", 60))
+    # Bound timeout to prevent runaway
+    timeout = min(max(timeout, 1), MAX_TIMEOUT_SECONDS)
+
+    # Use a placeholder plan path in worktree for the command
+    plan_file_in_worktree = worktree_root / ".aed_plan.md"
+
+    # Conservative placeholder argv — no shell, no prompts, no auto-accept
+    # Flags here are PLACEHOLDERS and MUST be re-verified with real Claude CLI docs
+    argv = [
+        "claude",
+        "--no-input",           # no interactive prompt
+        "--output-format=md",    # structured output (placeholder)
+        str(plan_file_in_worktree),
+    ]
+
+    return {
+        "argv": argv,
+        "cwd": str(worktree_root),
+        "timeout_seconds": timeout,
+        "env_policy": {
+            "allow": [
+                "PATH",
+                "HOME",
+                "USER",
+                "LANG",
+                "LC_*",
+            ],
+            "block": [
+                "HERMES_HOME",
+                "HERMES_PROFILE",
+                "HERMES_CONFIG",
+                "AED_*",
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+            ],
+        },
+        "stdout_path": str(output_root / f"{run_id}_stdout.txt"),
+        "stderr_path": str(output_root / f"{run_id}_stderr.txt"),
+        "transcript_path": str(output_root / f"{run_id}_transcript.md"),
+    }
+
+
+def validate_claude_command_contract(
+    contract: dict,
+    packet: dict,
+    worktree_root: Path,
+    output_root: Path,
+    repo_root: Path,
+) -> tuple[bool, list[str]]:
+    """
+    Validate a Claude command contract for safety.
+
+    This is a PURE function — no subprocess, no network, no side effects.
+
+    Returns (is_valid, list_of_error_messages).
+
+    Validates:
+    - cwd resolves under /tmp/aed_runs/worktrees/
+    - cwd resolves outside the main repo
+    - argv is a list of strings
+    - argv[0] is an approved Claude binary
+    - timeout_seconds is positive and bounded
+    - stdout/stderr/transcript paths are under output_root
+    - output_root is outside the repo
+    - approved_plan_path is outside the repo
+    - no forbidden argv patterns (git push, gh pr create, etc.)
+    - no permission bypass flags
+    """
+    errors: list[str] = []
+
+    # --- cwd validation ---
+    try:
+        cwd_resolved = Path(contract["cwd"]).resolve()
+    except Exception as e:
+        errors.append(f"cwd is not a valid path: {e}")
+        return False, errors
+
+    # Must be under /tmp/aed_runs/worktrees/
+    worktrees_base = Path("/tmp/aed_runs/worktrees").resolve()
+    if not str(cwd_resolved).startswith(str(worktrees_base) + "/"):
+        errors.append(
+            f"cwd must be under {worktrees_base}/, got {cwd_resolved}"
+        )
+
+    # Must be outside the main repo
+    try:
+        repo_root_resolved = repo_root.resolve()
+    except Exception:
+        repo_root_resolved = repo_root
+
+    if str(cwd_resolved).startswith(str(repo_root_resolved) + "/"):
+        errors.append(
+            f"cwd must be outside main repo {repo_root_resolved}, got {cwd_resolved}"
+        )
+
+    # --- argv validation ---
+    argv = contract.get("argv", [])
+    if not isinstance(argv, list):
+        errors.append(f"argv must be a list, got {type(argv).__name__}")
+        return False, errors
+
+    if not all(isinstance(arg, str) for arg in argv):
+        errors.append("all argv elements must be strings")
+
+    if not argv:
+        errors.append("argv cannot be empty")
+        return False, errors
+
+    # argv[0] must be an approved binary name
+    binary = argv[0]
+    # Strip path components for binary name check (no / in binary name)
+    binary_name = binary.split("/")[-1].lower()
+    if binary_name not in APPROVED_CLAUDE_BINARIES:
+        errors.append(
+            f"argv[0] must be one of {sorted(APPROVED_CLAUDE_BINARIES)}, "
+            f"got '{binary}'"
+        )
+
+    # Check for forbidden argv patterns.
+    # Check single-token forbidden words and multi-token forbidden sequences.
+    # We iterate over argv elements to avoid false matches from path substrings.
+    FORBIDDEN_TOKENS = frozenset([
+        "git", "push",
+        "gh", "pr", "create", "merge",
+        "gh", "workflow", "run",
+        "gh", "api",
+        "repository_dispatch",
+        "board",
+        "sudo",
+        "pip", "npm", "apt", "yum", "brew",
+        "--dangerously-skip-permissions",
+        "--dangerously-skip-perm",
+        "--bypasspermissions",
+        "--unrestricted",
+        "--allow-write",
+    ])
+    FORBIDDEN_SEQUENCES = [
+        ("gh", "pr", "create"),
+        ("gh", "pr", "merge"),
+        ("gh", "workflow", "run"),
+        ("gh", "api"),
+        ("pip", "install"),
+        ("npm", "install"),
+        ("apt", "install"),
+        ("yum", "install"),
+        ("brew", "install"),
+        ("git", "push"),
+        ("|",),
+    ]
+
+    # Single-token check: only check argv elements, not joined string (avoids path false positives)
+    argv_lower = [a.lower() for a in argv]
+    for i, token in enumerate(argv_lower):
+        if token in FORBIDDEN_TOKENS:
+            errors.append(f"forbidden token '{token}' found in argv")
+            break
+
+    # Sequence check: check contiguous subsequences
+    for seq in FORBIDDEN_SEQUENCES:
+        seq_len = len(seq)
+        found = any(
+            tuple(argv_lower[i:i+seq_len]) == seq
+            for i in range(len(argv_lower) - seq_len + 1)
+        )
+        if found:
+            errors.append(f"forbidden sequence {' '.join(seq)!r} found in argv")
+            break
+
+    # --- timeout validation ---
+    timeout = contract.get("timeout_seconds", 0)
+    if not isinstance(timeout, (int, float)):
+        errors.append(f"timeout_seconds must be numeric, got {type(timeout).__name__}")
+    elif timeout <= 0:
+        errors.append(f"timeout_seconds must be positive, got {timeout}")
+    elif timeout > MAX_TIMEOUT_SECONDS:
+        errors.append(
+            f"timeout_seconds exceeds maximum {MAX_TIMEOUT_SECONDS}, got {timeout}"
+        )
+
+    # --- output path validation ---
+    output_root_resolved = output_root.resolve()
+    for path_key in ["stdout_path", "stderr_path", "transcript_path"]:
+        path_val = contract.get(path_key, "")
+        if not path_val:
+            errors.append(f"{path_key} is required")
+            continue
+        try:
+            resolved = Path(path_val).resolve()
+            if not str(resolved).startswith(str(output_root_resolved) + "/"):
+                errors.append(
+                    f"{path_key} must be under output_root {output_root_resolved}, "
+                    f"got {resolved}"
+                )
+        except Exception as e:
+            errors.append(f"{path_key} is not a valid path: {e}")
+
+    # --- output_root outside repo ---
+    if path_inside_repo(output_root, repo_root):
+        errors.append(
+            f"output_root must be outside main repo, got {output_root}"
+        )
+
+    # --- approved_plan_path outside repo ---
+    plan_path_str = packet.get("approved_plan_path", "")
+    if plan_path_str:
+        try:
+            plan_resolved = Path(plan_path_str).resolve()
+            if path_inside_repo(plan_resolved, repo_root):
+                errors.append(
+                    f"approved_plan_path must be outside main repo, "
+                    f"got {plan_resolved}"
+                )
+        except Exception:
+            pass  # will be caught by other validation
+
+    return len(errors) == 0, errors
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +818,10 @@ def run(
         "pmg_compare_md_path": "",
         "pmg_status": "not_run",
         "pmg_blocked_files": 0,
+        # Claude command contract fields (for execution.mode="claude" path)
+        "claude_command_contract_valid": None,
+        "claude_command_contract_errors": [],
+        "claude_command_contract_summary": "",
     }
 
     # ---- Phase 1: Packet validation ---------------------------------------
@@ -580,9 +912,9 @@ def run(
             _write_output(result, output_json, output_md)
             return result
 
-        # Flag present: call stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING)
+        # Flag present: call stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING or HOLD_CLAUDE_COMMAND_INVALID)
         # No PMG snapshot, no worktree creation in this stub phase
-        stub_result = run_claude_executor_stub(packet, worktree_root, output_root)
+        stub_result = run_claude_executor_stub(packet, worktree_root, output_root, repo_root=REPO_ROOT)
         result.update(stub_result)
         _write_output(result, output_json, output_md)
         return result
