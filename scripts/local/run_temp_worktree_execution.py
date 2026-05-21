@@ -143,10 +143,17 @@ def git_worktree_remove(worktree_path: Path, parent_repo: Path) -> None:
 
 
 def git_diff(worktree_path: Path) -> str:
+    """Capture staged + unstaged diff in unified format."""
     result = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "-- unified=3"],
+        ["git", "-C", str(worktree_path), "diff", "--cached", "--unified=3"],
         capture_output=True, text=True, timeout=30
     )
+    if not result.stdout:
+        # Fall back to full diff if --cached is empty (no staged changes)
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--unified=3"],
+            capture_output=True, text=True, timeout=30
+        )
     return result.stdout
 
 
@@ -643,6 +650,14 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     Path(result["diff_path"]).write_text(diff_text, encoding="utf-8")
 
     result["changed_files"] = changed_files
+
+    # If changed_files is non-empty but diff is empty, block — diff is required for human review
+    if changed_files and not diff_text.strip():
+        result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
+        result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
+        result["next_action"] = "check git diff capture; ensure mock_edits are staged correctly"
+        _write_output(result, output_json, output_md)
+        return result
 
     # ---- Phase 11: Diff validation -----------------------------------------
 

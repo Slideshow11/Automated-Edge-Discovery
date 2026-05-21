@@ -1679,3 +1679,297 @@ class TestSecurity:
         # Check for shell=True or string-split patterns
         problematic = re.findall(r'subprocess\.\w+\(\s*["\']', source)
         assert len(problematic) == 0, f"subprocess call with string form found: {problematic}"
+
+
+# ---------------------------------------------------------------------------
+# Diff-capture tests
+# ---------------------------------------------------------------------------
+
+class TestDiffCapture:
+    """Tests for diff.patch generation with staged mock edits."""
+
+    def test_valid_mock_edit_returns_patch_ready_and_diff_non_empty(self, tmp_path):
+        """diff.patch must be non-empty when changed_files is non-empty."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        assert base_sha, "AED repo HEAD not found"
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_diff_nonempty_pmg",
+            "task_id": "TASK-DIFF-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit docs/example.md",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/example.md", "content": "# Updated\nNew content.\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+
+            def fake_snapshot(target, output_json):
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
+            f"Got: {result['status']} — {result.get('validation_errors')}"
+        assert result["changed_files"] == ["docs/example.md"]
+        # diff.patch must exist and be non-empty
+        diff_path = Path(result["diff_path"])
+        assert diff_path.exists(), f"diff.patch does not exist at {diff_path}"
+        diff_content = diff_path.read_text()
+        assert diff_content.strip(), f"diff.patch is empty but changed_files is non-empty: {result['changed_files']}"
+        # diff must contain the changed file path
+        assert "docs/example.md" in diff_content, \
+            f"diff.patch does not mention docs/example.md: {diff_content[:200]}"
+
+    def test_nonempty_changed_files_but_empty_diff_returns_hold_diff_validation_failed(self, tmp_path, monkeypatch):
+        """changed_files non-empty + empty diff.patch → HOLD_DIFF_VALIDATION_FAILED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        assert base_sha, "AED repo HEAD not found"
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_diff_empty_pmg",
+            "task_id": "TASK-DIFF-002",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit docs/example.md",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/example.md", "content": "# Updated\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Monkey-patch git_diff to return empty string (simulating the old broken behavior)
+        import run_temp_worktree_execution as rte
+        original_git_diff = rte.git_diff
+
+        def fake_git_diff(worktree_path):
+            return ""  # Simulate broken diff capture
+
+        monkeypatch.setattr(rte, "git_diff", fake_git_diff)
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+
+            def fake_snapshot(target, output_json):
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # Must return HOLD_DIFF_VALIDATION_FAILED when changed_files non-empty but diff empty
+        assert result["status"] == "HOLD_DIFF_VALIDATION_FAILED", \
+            f"Expected HOLD_DIFF_VALIDATION_FAILED, got: {result['status']} — {result.get('validation_errors')}"
+
+    def test_no_changed_files_empty_diff_returns_patch_ready(self, tmp_path):
+        """Zero changed files + empty diff is valid (no changes to review)."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        assert base_sha, "AED repo HEAD not found"
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_no_changes_pmg",
+            "task_id": "TASK-DIFF-003",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "No edits",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],  # No edits — empty diff is expected
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+
+            def fake_snapshot(target, output_json):
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
+        assert result["changed_files"] == []
+
+    def test_diff_contains_changed_file_path(self, tmp_path):
+        """diff.patch must contain the path of the changed file."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        assert base_sha, "AED repo HEAD not found"
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_diff_path_pmg",
+            "task_id": "TASK-DIFF-004",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit README.md",
+                "allowed_files": ["README.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "README.md", "content": "# AED\nModified.\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+
+            def fake_snapshot(target, output_json):
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
+        diff_path = Path(result["diff_path"])
+        diff_content = diff_path.read_text()
+        assert "README.md" in diff_content, \
+            f"diff.patch does not contain README.md: {diff_content[:300]}"
