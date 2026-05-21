@@ -1756,8 +1756,11 @@ class TestDiffCapture:
         assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
             f"Got: {result['status']} — {result.get('validation_errors')}"
         assert result["changed_files"] == ["docs/example.md"]
-        # diff.patch must exist and be non-empty
+        # diff_path must be under output_root, not inside the worktree
         diff_path = Path(result["diff_path"])
+        assert str(tmp_path / "output") in str(diff_path), \
+            f"diff.patch must be under output_root ({tmp_path / 'output'}), got: {diff_path}"
+        # diff.patch must survive worktree cleanup (written to output_root, not worktree)
         assert diff_path.exists(), f"diff.patch does not exist at {diff_path}"
         diff_content = diff_path.read_text()
         assert diff_content.strip(), f"diff.patch is empty but changed_files is non-empty: {result['changed_files']}"
