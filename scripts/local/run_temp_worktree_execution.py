@@ -69,6 +69,9 @@ OUTPUT_STATES = frozenset([
     "HOLD_TOO_MANY_FILES_CHANGED",
     "HOLD_DIFF_VALIDATION_FAILED",
     "HOLD_UNKNOWN",
+    # Real-Claude states
+    "HOLD_REAL_EXECUTOR_NOT_ENABLED",
+    "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
     # PMG states
     "HOLD_PMG_SNAPSHOT_FAILED",
     "HOLD_PMG_COMPARE_FAILED",
@@ -396,13 +399,71 @@ def apply_mock_edits(worktree_path: Path, mock_edits: list[dict]) -> list[str]:
     return changed
 
 
+def run_claude_executor_stub(
+    packet: dict,
+    worktree_root: Path,
+    output_root: Path,
+) -> dict:
+    """
+    Placeholder stub for real executor.
+    Returns HOLD_CLAUDE_IMPLEMENTATION_PENDING — real implementation not yet done.
+
+    This stub does NOT:
+    - Call subprocess with external executor binary
+    - Import LLM client libraries
+    - Invoke the shell
+    - Create any worktree (already created by caller if needed)
+    - Run PMG snapshot
+    - Write to Hermes or audit
+    - Dispatch or merge
+    """
+    return {
+        "status": "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
+        "run_id": packet.get("run_id", "unknown"),
+        "base_sha": packet.get("base_sha", ""),
+        "worktree_path": str(worktree_root),
+        "output_root": str(output_root),
+        "changed_files": [],
+        "validation_errors": [
+            "Real Claude executor not yet implemented. "
+            "Skeleton present: execution.mode='claude' is recognized but blocked. "
+            "Use --enable-real-claude-executor flag when real implementation is ready."
+        ],
+        "main_git_status_before": "unknown",
+        "main_git_status_after": "unknown",
+        "worktree_git_status_before": "unknown",
+        "worktree_git_status_after": "unknown",
+        "diff_path": "",
+        "patch_ready": False,
+        "next_action": "implement run_claude_executor() stub body with real Claude invocation",
+        "pmg_snapshot_path": "",
+        "pmg_compare_json_path": "",
+        "pmg_compare_md_path": "",
+        "pmg_status": "not_run",
+        "pmg_blocked_files": 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 
-def run(packet: dict, output_json: str, output_md: str) -> dict:
+def run(
+    packet: dict,
+    output_json: str,
+    output_md: str,
+    enable_real_claude_executor: bool = False,
+) -> dict:
     """
     Main execution path. Returns the result dict (also written to output_json).
+
+    Args:
+        packet: execution packet dict
+        output_json: path to write result JSON
+        output_md: path to write result Markdown
+        enable_real_claude_executor: if True, allow execution.mode='claude' to
+            proceed to stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING).
+            Defaults to False (claude mode blocked without this flag).
     """
     run_id = packet.get("run_id", "unknown")
     worktree_root = WORKTREE_BASE / run_id
@@ -496,10 +557,33 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # ---- Phase 5: Execution mode check -------------------------------------
 
     exec_mode = packet.get("execution", {}).get("mode", "mock")
-    if exec_mode != "mock":
+
+    # Unsupported modes (not mock, not claude) → always blocked
+    unsupported_modes = {"real", "execute", "run", "agent"}
+    if exec_mode in unsupported_modes:
         result["status"] = "HOLD_EXECUTOR_NOT_ALLOWED"
         result["validation_errors"] = [f"execution.mode must be 'mock', got '{exec_mode}'"]
         result["next_action"] = "set execution.mode to 'mock' or use a different harness"
+        _write_output(result, output_json, output_md)
+        return result
+
+    # claude mode: blocked by default unless --enable-real-claude-executor is set
+    if exec_mode == "claude":
+        if not enable_real_claude_executor:
+            result["status"] = "HOLD_REAL_EXECUTOR_NOT_ENABLED"
+            result["validation_errors"] = [
+                "execution.mode='claude' requires --enable-real-claude-executor flag. "
+                "Real Claude executor is not yet enabled."
+            ]
+            result["next_action"] = "pass --enable-real-claude-executor to enable real Claude mode, " \
+                                   "or use execution.mode='mock' for mock execution"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Flag present: call stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING)
+        # No PMG snapshot, no worktree creation in this stub phase
+        stub_result = run_claude_executor_stub(packet, worktree_root, output_root)
+        result.update(stub_result)
         _write_output(result, output_json, output_md)
         return result
 
@@ -802,6 +886,14 @@ def main() -> int:
         "--output-md", required=True,
         help="Path to write result Markdown"
     )
+    parser.add_argument(
+        "--enable-real-claude-executor",
+        action="store_true",
+        default=False,
+        help="Enable real-Claude executor mode (disabled by default). "
+             "Without this flag, execution.mode='claude' returns "
+             "HOLD_REAL_EXECUTOR_NOT_ENABLED."
+    )
 
     args = parser.parse_args()
 
@@ -816,7 +908,10 @@ def main() -> int:
         print(f"FATAL: invalid JSON in packet: {e}", file=sys.stderr)
         return 1
 
-    result = run(packet, args.output_json, args.output_md)
+    result = run(
+        packet, args.output_json, args.output_md,
+        enable_real_claude_executor=args.enable_real_claude_executor
+    )
     print(f"Status: {result['status']}")
     print(f"Output: {args.output_json}")
     return 0
