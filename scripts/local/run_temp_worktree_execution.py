@@ -165,11 +165,20 @@ def git_diff(worktree_path: Path) -> str:
 
 
 def git_diff_name_only(worktree_path: Path) -> list[str]:
-    """Return list of staged changed file paths in worktree."""
+    """Return list of staged changed file paths in worktree.
+
+    Falls back to unstaged if no staged changes exist.
+    """
     result = subprocess.run(
         ["git", "-C", str(worktree_path), "diff", "--cached", "--name-only"],
         capture_output=True, text=True, timeout=30
     )
+    if not result.stdout:
+        # No staged changes — fall back to unstaged
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--name-only"],
+            capture_output=True, text=True, timeout=30
+        )
     return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
@@ -1153,6 +1162,21 @@ def run(
         worktree_status_before = git_status(worktree_root)
         result["worktree_git_status_before"] = worktree_status_before
 
+        # Phase 7b: Copy approved plan into worktree so Claude has the instructions
+        approved_plan_path = packet.get("approved_plan_path", "")
+        if approved_plan_path:
+            plan_src = Path(approved_plan_path)
+            plan_dst = worktree_root / ".aed_plan.md"
+            if plan_src.is_file():
+                try:
+                    shutil.copy2(plan_src, plan_dst)
+                except Exception as e:
+                    result["status"] = "HOLD_PLAN_COPY_FAILED"
+                    result["validation_errors"] = [f"failed to copy approved plan to worktree: {e}"]
+                    result["next_action"] = "check approved_plan_path is accessible"
+                    _write_output(result, output_json, output_md)
+                    return result
+
         # Phase 8: Run real Claude executor
         claude_result = run_claude_executor(packet, worktree_root, output_root, contract, repo_root=REPO_ROOT)
         result.update(claude_result)
@@ -1218,7 +1242,7 @@ def run(
             _write_output(result, output_json, output_md)
             return result
 
-        if changed_files and not diff_text.strip():
+        if result["changed_files"] and not diff_text.strip():
             result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
             result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
             result["next_action"] = "check git diff capture; ensure edits are staged correctly"
@@ -1236,8 +1260,9 @@ def run(
             validation_errors.append("changed_files contains a file outside allowed scope")
         if check_protected_gate_scripts(result["changed_files"], PROTECTED_GATE_SCRIPTS):
             validation_errors.append("changed_files contains a protected gate script")
-        if check_too_many_files(result["changed_files"], task.get("max_changed_files", 50)):
-            validation_errors.append(f"too many files changed: {len(result['changed_files'])} (max {task.get('max_changed_files', 50)})")
+        if check_too_many_files(result["changed_files"], approval.get("max_changed_files", task.get("max_changed_files", 50))):
+            max_allowed = approval.get("max_changed_files", task.get("max_changed_files", 50))
+            validation_errors.append(f"too many files changed: {len(result['changed_files'])} (max {max_allowed})")
 
         if validation_errors:
             result["status"] = "HOLD_POST_EXEC_VALIDATION_FAILED"
