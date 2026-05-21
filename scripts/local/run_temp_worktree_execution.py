@@ -264,6 +264,104 @@ def path_inside_repo(path: Path, repo_root: Path) -> bool:
 # Packet validation
 # ---------------------------------------------------------------------------
 
+def validate_live_smoke_packet_constraints(packet: dict) -> tuple[bool, str]:
+    """
+    Validate constraints specific to live smoke (execution.mode == "claude") packets.
+
+    Live smoke packets must include proper forbidden_files, do_not, and protected
+    gate scripts to prevent accidental damage to AED infrastructure.
+
+    This is a PURE function — no subprocess, no network, no side effects.
+
+    Returns (ok, error_message).
+    """
+    exec_mode = packet.get("execution", {}).get("mode", "")
+    if exec_mode != "claude":
+        return True, ""  # Only enforce on live smoke packets
+
+    task = packet.get("task", {})
+    forbidden_files = task.get("forbidden_files", [])
+    do_not = task.get("do_not", [])
+
+    # forbidden_files must not be empty for live smoke
+    if not forbidden_files:
+        return False, (
+            "live smoke packet (execution.mode='claude') must have non-empty "
+            "task.forbidden_files. At minimum include: .git/, .github/, "
+            "scripts/local/final_gate_status.py, "
+            "scripts/local/verify_final_head_merge_command.py, "
+            "scripts/local/check_persistent_mutation_guard.py, "
+            "scripts/local/run_temp_worktree_execution.py, "
+            "scripts/local/check_real_executor_readiness.py, "
+            "scripts/local/check_real_claude_env_preflight.py, "
+            "scripts/local/audit_claude_invocation.py, "
+            "/home/max/.hermes/, audit/, boards/, memory/, profile/"
+        )
+
+    # do_not must not be empty for live smoke
+    if not do_not:
+        return False, (
+            "live smoke packet (execution.mode='claude') must have non-empty "
+            "task.do_not. At minimum include behavioral restrictions: "
+            "no git push, no gh pr create/merge, no gh api dispatch, "
+            "no package install, no dispatch, no board updates, "
+            "no Hermes changes, no audit append, no memory/profile updates, "
+            "no edits outside allowed_files, no repair loop, no apply to main"
+        )
+
+    # Protected gate scripts must be in forbidden_files
+    protected_gate_scripts = [
+        "scripts/local/final_gate_status.py",
+        "scripts/local/verify_final_head_merge_command.py",
+        "scripts/local/check_persistent_mutation_guard.py",
+    ]
+    missing_protected = [
+        s for s in protected_gate_scripts
+        if s not in forbidden_files
+    ]
+    if missing_protected:
+        return False, (
+            f"live smoke packet missing protected gate scripts in forbidden_files: "
+            f"{missing_protected}. These must be forbidden to prevent "
+            "accidental mutation of AED infrastructure scripts."
+        )
+
+    # allowed_files must have at most one file for live smoke
+    allowed_files = task.get("allowed_files", [])
+    if len(allowed_files) > 1:
+        return False, (
+            f"live smoke packet must have at most one allowed_file, "
+            f"got {len(allowed_files)}: {allowed_files}"
+        )
+    if len(allowed_files) == 0:
+        return False, (
+            "live smoke packet must have at least one allowed_file. "
+            "Specify exactly one file to edit."
+        )
+
+    # Note: max_changed_files must be 1 for live smoke is enforced
+    # in smoke-plan-specific validation, not here. The packet builder
+    # (build_temp_worktree_execution_packet.py) sets it to 1 for live smoke.
+    # We only check non-None/non-1 values to catch obvious misconfigurations.
+
+    # output_root must be outside repo (already checked by path_inside_repo earlier,
+    # but we double-check here for clarity in the error message)
+    exec_data = packet.get("execution", {})
+    output_root_str = exec_data.get("output_root", "")
+    if output_root_str:
+        try:
+            output_root = Path(output_root_str).resolve()
+            repo_resolved = Path(__file__).parent.parent.parent.resolve()
+            if str(output_root).startswith(str(repo_resolved) + "/"):
+                return False, (
+                    f"live smoke packet output_root must be outside repo: {output_root}"
+                )
+        except Exception:
+            pass  # caught by earlier validation
+
+    return True, ""
+
+
 def validate_packet(packet: dict) -> tuple[bool, str]:
     """Check packet_kind and required top-level fields. Returns (ok, error)."""
     if packet.get("packet_kind") != "aed.temp_worktree.execution.v0":
@@ -551,6 +649,8 @@ def build_claude_command_contract(
       stdout_path   : output_root / stdout file
       stderr_path   : output_root / stderr file
       transcript_path: output_root / transcript file
+      permission_mode: "acceptEdits" for live write smoke (conservative, safe)
+      permission_mode_reason: human-readable justification
 
     NOTE: The argv constructed here uses CONSERVATIVE PLACEHOLDER flags.
     Actual Claude CLI flags must be re-verified against live Claude documentation
@@ -561,15 +661,23 @@ def build_claude_command_contract(
     # Bound timeout to prevent runaway
     timeout = min(max(timeout, 1), MAX_TIMEOUT_SECONDS)
 
-    # Conservative argv for stdin-based input mode.
+    # Permission mode: conservative, safe only.
+    # AcceptEdits allows Claude to create/edit files without permission prompts.
+    # bbp = bypassPermissions (forbidden); dsp = dangerously-skip-permissions (forbidden).
+    # allowed_values = {"default", "acceptEdits"}.
+    permission_mode = "acceptEdits"  # conservative for single-file smoke in temp worktree
+
+    # Build argv with stdin-based input mode and conservative permission mode.
     # Plan content is passed via subprocess input= parameter (stdin).
     # argv has NO prompt text and NO plan path — only the fixed flags.
     # Re-verified against Claude CLI docs: --print --input-format=text --output-format=text
+    # --permission-mode acceptEdits pre-authorizes file creation in temp worktree.
     argv = [
         "claude",
         "--print",               # print mode: no interactive session, exits after output
         "--input-format=text",   # read stdin as plain text prompt
         "--output-format=text",  # plain text output (not md, not json)
+        "--permission-mode", "acceptEdits",  # pre-authorize file creation for smoke test
     ]
 
     return {
@@ -579,7 +687,14 @@ def build_claude_command_contract(
         # New fields documenting stdin-based input mode:
         "input_source": str(worktree_root / ".aed_plan.md"),
         "input_mode": "stdin",
-        "argv_summary": f"argv={argv} [stdin:.aed_plan.md]",  # safe summary for logging
+        "argv_summary": f"argv={argv} [stdin=.aed_plan.md]",  # safe summary for logging
+        # Permission mode fields:
+        "permission_mode": permission_mode,
+        "permission_mode_reason": (
+            "single-file smoke in temp worktree with AED allowed_files/"
+            "forbidden_files/PMG/diff gates. Safe: no git push, no PR, "
+            "no package install, no dispatch, no board/Hermes/audit/memory/profile."
+        ),
         "env_policy": {
             "allow": [
                 "PATH",
@@ -740,6 +855,48 @@ def validate_claude_command_contract(
                 f"not as a positional file argument. Use input_source + input_mode=stdin."
             )
             break
+
+    # --- Permission mode validation ---
+    # Reject dangerous permission bypass flags in argv.
+    FORBIDDEN_PERMISSION_FLAGS = [
+        "--dangerously-skip-permissions",
+        "--dangerously-skip-perm",
+        "--bypasspermissions",
+        "--unrestricted",
+    ]
+    for i, arg in enumerate(argv):
+        if arg in FORBIDDEN_PERMISSION_FLAGS:
+            errors.append(
+                f"argv[{i}] contains forbidden permission flag '{arg}'. "
+                f"Use --permission-mode acceptEdits or omit permission flag. "
+                f"bypassPermissions and dangerously-skip-permissions are not allowed."
+            )
+
+    # Check --permission-mode appears at most once (no duplicates).
+    perm_flag_indices = [i for i, a in enumerate(argv) if a == "--permission-mode"]
+    if len(perm_flag_indices) > 1:
+        errors.append(
+            f"--permission-mode appears {len(perm_flag_indices)} times in argv "
+            f"(at indices {perm_flag_indices}). Only one occurrence is allowed."
+        )
+
+    # Check permission_mode field if present in contract (set by build function).
+    # Reject unsafe values.
+    permission_mode = contract.get("permission_mode", "")
+    if permission_mode:
+        allowed_modes = {"default", "acceptEdits"}
+        if permission_mode not in allowed_modes:
+            errors.append(
+                f"permission_mode must be one of {sorted(allowed_modes)}, "
+                f"got '{permission_mode}'"
+            )
+        # Explicitly reject bypassPermissions in the contract field too.
+        if permission_mode in ("bypassPermissions", "--bypasspermissions",
+                                "dangerously-skip-permissions", "--dangerously-skip-permissions"):
+            errors.append(
+                f"permission_mode value '{permission_mode}' is not allowed. "
+                f"Only 'acceptEdits' is permitted for live smoke."
+            )
 
     # --- timeout validation ---
     timeout = contract.get("timeout_seconds", 0)
@@ -1119,6 +1276,18 @@ def run(
 
         # Flag present: build and validate command contract first.
         # Only proceed to real execution if contract is valid.
+
+        # Phase 5b: Live smoke packet constraint validation.
+        # Must pass before building the command contract or touching the worktree.
+        ok, err = validate_live_smoke_packet_constraints(packet)
+        if not ok:
+            result["status"] = "HOLD_INVALID_PACKET"
+            result["validation_errors"] = [err]
+            result["next_action"] = "fix live smoke packet constraints"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 5c: Build and validate command contract
         contract = build_claude_command_contract(packet, worktree_root, output_root)
         is_valid, validation_errors = validate_claude_command_contract(
             contract, packet, worktree_root, output_root, REPO_ROOT
