@@ -62,6 +62,8 @@ OUTPUT_STATES = frozenset([
     "HOLD_OUTPUT_PATH_INSIDE_REPO",
     "HOLD_WORKTREE_CREATE_FAILED",
     "HOLD_EXECUTOR_NOT_ALLOWED",
+    "HOLD_REAL_EXECUTOR_NOT_ENABLED",
+    "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
     "HOLD_EXECUTOR_FAILED",
     "HOLD_REPO_MUTATION",
     "HOLD_FORBIDDEN_FILE_TOUCHED",
@@ -396,13 +398,70 @@ def apply_mock_edits(worktree_path: Path, mock_edits: list[dict]) -> list[str]:
     return changed
 
 
+
+# --------------------------------------------------------------------------
+# Claude executor stub (skeleton — not yet implemented)
+# --------------------------------------------------------------------------
+
+
+def run_claude_executor_stub(
+    worktree_path: Path,
+    packet: dict,
+    run_id: str,
+    output_root: Path,
+) -> dict:
+    """
+    Stub for real Claude execution.
+
+    This function does NOT:
+    - use anthropic, openai, or any LLM client SDK
+    - invoke a Claude process
+    - make network calls
+    - write to Hermes or audit logs
+
+    Returns HOLD_CLAUDE_IMPLEMENTATION_PENDING immediately.
+    A future PR will implement the actual Claude invocation here.
+    """
+    return {
+        "status": "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
+        "run_id": run_id,
+        "worktree_path": str(worktree_path),
+        "output_root": str(output_root),
+        "changed_files": [],
+        "validation_errors": [
+            "Real Claude executor is not yet implemented. "
+            "This skeleton will be completed in a future PR after design review."
+        ],
+        "next_action": "implement run_claude_executor_stub in a future PR",
+        "worktree_git_status_before": "unknown",
+        "worktree_git_status_after": "unknown",
+        "main_git_status_before": "unknown",
+        "main_git_status_after": "unknown",
+        "diff_path": "",
+        "patch_ready": False,
+        "pmg_snapshot_path": "",
+        "pmg_compare_json_path": "",
+        "pmg_compare_md_path": "",
+        "pmg_status": "not_run",
+        "pmg_blocked_files": 0,
+    }
+
+
 # ---------------------------------------------------------------------------
 # State machine
 # ---------------------------------------------------------------------------
 
-def run(packet: dict, output_json: str, output_md: str) -> dict:
+def run(packet: dict, output_json: str, output_md: str, enable_real_claude_executor: bool = False) -> dict:
     """
     Main execution path. Returns the result dict (also written to output_json).
+
+    Args:
+        packet: execution packet dict
+        output_json: path to write result JSON
+        output_md: path to write result Markdown
+        enable_real_claude_executor: if True, allow execution.mode="claude" to proceed
+            past the mode check. The actual Claude invocation is not implemented yet;
+            the harness will stop at HOLD_CLAUDE_IMPLEMENTATION_PENDING.
     """
     run_id = packet.get("run_id", "unknown")
     worktree_root = WORKTREE_BASE / run_id
@@ -496,7 +555,24 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # ---- Phase 5: Execution mode check -------------------------------------
 
     exec_mode = packet.get("execution", {}).get("mode", "mock")
-    if exec_mode != "mock":
+
+    # "claude" mode is recognized but gated behind --enable-real-claude-executor
+    if exec_mode == "claude":
+        if not enable_real_claude_executor:
+            result["status"] = "HOLD_REAL_EXECUTOR_NOT_ENABLED"
+            result["validation_errors"] = [
+                "execution.mode='claude' requires --enable-real-claude-executor flag. "
+                "Real Claude execution is not yet implemented; this flag enables the "
+                "skeleton only."
+            ]
+            result["next_action"] = "pass --enable-real-claude-executor to enable the skeleton"
+            _write_output(result, output_json, output_md)
+            return result
+        # Flag present: proceed through phases 5b, 6, 7, 8.
+        # Phase 8 (mock executor) will be replaced by run_claude_executor_stub()
+        # which returns HOLD_CLAUDE_IMPLEMENTATION_PENDING without any LLM call.
+
+    elif exec_mode != "mock":
         result["status"] = "HOLD_EXECUTOR_NOT_ALLOWED"
         result["validation_errors"] = [f"execution.mode must be 'mock', got '{exec_mode}'"]
         result["next_action"] = "set execution.mode to 'mock' or use a different harness"
@@ -559,7 +635,17 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     worktree_status_before = git_status(worktree_root)
     result["worktree_git_status_before"] = worktree_status_before
 
-    # ---- Phase 8: Run mock executor -----------------------------------------
+    # ---- Phase 8: Run executor -----------------------------------------
+
+    # For claude mode (when --enable-real-claude-executor is set),
+    # the stub is called instead of the mock executor.
+    if exec_mode == "claude":
+        stub_result = run_claude_executor_stub(
+            worktree_root, packet, run_id, output_root
+        )
+        result.update(stub_result)
+        _write_output(result, output_json, output_md)
+        return result
 
     mock_edits = packet.get("execution", {}).get("mock_edits", [])
     try:
@@ -802,6 +888,13 @@ def main() -> int:
         "--output-md", required=True,
         help="Path to write result Markdown"
     )
+    parser.add_argument(
+        "--enable-real-claude-executor",
+        action="store_true",
+        help="Enable execution.mode='claude' skeleton. "
+             "Real Claude invocation is not yet implemented; "
+             "the harness will stop at HOLD_CLAUDE_IMPLEMENTATION_PENDING."
+    )
 
     args = parser.parse_args()
 
@@ -816,7 +909,7 @@ def main() -> int:
         print(f"FATAL: invalid JSON in packet: {e}", file=sys.stderr)
         return 1
 
-    result = run(packet, args.output_json, args.output_md)
+    result = run(packet, args.output_json, args.output_md, args.enable_real_claude_executor)
     print(f"Status: {result['status']}")
     print(f"Output: {args.output_json}")
     return 0
