@@ -646,8 +646,10 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # ---- Phase 10: Collect changed files and diff --------------------------
 
     diff_text = git_diff(worktree_root)
-    result["diff_path"] = str(worktree_root / "diff.patch")
-    Path(result["diff_path"]).write_text(diff_text, encoding="utf-8")
+    output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+    diff_path = output_root / "diff.patch"
+    diff_path.write_text(diff_text, encoding="utf-8")
+    result["diff_path"] = str(diff_path)
 
     result["changed_files"] = changed_files
 
