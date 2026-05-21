@@ -885,6 +885,60 @@ class TestRunIntegration:
             result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
             assert result["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING", \
                 f"claude mode with flag should return HOLD_CLAUDE_IMPLEMENTATION_PENDING, got {result['status']}"
+            assert result.get("claude_command_contract_valid") is True, \
+                f"claude_command_contract_valid should be True, got {result.get('claude_command_contract_valid')}"
+            assert result.get("claude_command_contract_errors") == [], \
+                f"claude_command_contract_errors should be [], got {result.get('claude_command_contract_errors')}"
+            assert "argv=" in result.get("claude_command_contract_summary", ""), \
+                f"claude_command_contract_summary should contain argv, got {result.get('claude_command_contract_summary')}"
+
+    def test_claude_mode_with_flag_contract_valid_fields(self, tmp_path):
+        """Test 6c: claude mode with flag includes contract metadata in result."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_claude_contract_fields",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+        output_json = tmp_path / "result_claude_contract.json"
+        output_md = tmp_path / "result_claude_contract.md"
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+            assert result["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING"
+            # Contract summary should be a safe non-executable description
+            summary = result.get("claude_command_contract_summary", "")
+            assert "claude" in summary
+            assert "--no-input" in summary
+            # Contract errors should be empty for valid contract
+            assert result.get("claude_command_contract_errors") == []
+            # Contract valid should be True
+            assert result.get("claude_command_contract_valid") is True
 
     def test_edit_outside_allowed_files_returns_hold_outside_allowed(self, tmp_path):
         """Test 7: edit outside allowed_files returns HOLD_OUTSIDE_ALLOWED_FILES."""
