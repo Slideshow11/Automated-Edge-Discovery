@@ -183,9 +183,6 @@ def git_diff_name_only(worktree_path: Path) -> list[str]:
 
     Uses git diff HEAD to capture staged and unstaged tracked changes.
     Also captures untracked files that are not ignored, excluding .aed_plan.md.
-
-    Untracked files are discovered via git ls-files --others --exclude-standard
-    and validated against allowed/forbidden scopes before being included.
     """
     # Tracked changes (staged + unstaged)
     tracked_result = subprocess.run(
@@ -204,9 +201,21 @@ def git_diff_name_only(worktree_path: Path) -> list[str]:
     return [f for f in all_changed if f != ".aed_plan.md"]
 
 
-# ---------------------------------------------------------------------------
+def dedupe_preserve_order(paths: list[str]) -> list[str]:
+    """Deduplicate a list of paths while preserving insertion order."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        out.append(path)
+    return out
+
+
+# --------------------------------------------------------------------------
 # PMG helpers (Persistent Mutation Guard)
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 def pmg_snapshot(target_path: str | Path, output_json: str | Path) -> tuple[bool, str]:
     """
@@ -1495,6 +1504,8 @@ def run(
         all_changed = tracked_changed + untracked_files
         # Defensive filter: .aed_plan.md must never reach changed_files regardless of source
         all_changed = [f for f in all_changed if f != ".aed_plan.md"]
+        # Deduplicate identical paths (e.g. file created as untracked then staged)
+        all_changed = dedupe_preserve_order(all_changed)
         result["changed_files"] = all_changed
         result["diff_path"] = str(diff_path)
 
@@ -1766,6 +1777,8 @@ def run(
     all_changed = tracked_filtered + untracked_files
     # Defensive filter: .aed_plan.md must never reach changed_files regardless of source
     all_changed = [f for f in all_changed if f != ".aed_plan.md"]
+    # Deduplicate identical paths (e.g. file created as untracked then staged)
+    all_changed = dedupe_preserve_order(all_changed)
     result["changed_files"] = all_changed
 
     # Build diff.patch: tracked diff + untracked file diffs

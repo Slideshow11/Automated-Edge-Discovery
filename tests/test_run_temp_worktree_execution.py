@@ -3892,6 +3892,196 @@ class TestUntrackedFileDetection:
         assert result["status"] == "HOLD_TOO_MANY_FILES_CHANGED", \
             f"Exceeding max_changed_files must be blocked, got: {result['status']}"
 
+    def test_dedupe_preserves_order(self):
+        """dedupe_preserve_order() must preserve order and collapse duplicates."""
+        import run_temp_worktree_execution as rte
+        paths = ["a.md", "b.md", "a.md", "c.md", "b.md", "a.md"]
+        result = rte.dedupe_preserve_order(paths)
+        # Should be in first-occurrence order, one copy each
+        assert result == ["a.md", "b.md", "c.md"], f"Got: {result}"
+        # Length must be 3 (not 6)
+        assert len(result) == 3
+
+    def test_dedupe_no_entries_unchanged(self):
+        """dedupe_preserve_order() must return input unchanged when all unique."""
+        import run_temp_worktree_execution as rte
+        paths = ["x.md", "y.md", "z.md"]
+        result = rte.dedupe_preserve_order(paths)
+        assert result == ["x.md", "y.md", "z.md"]
+
+    def test_dedupe_duplicate_tracked_and_untracked_same_file(self, tmp_path):
+        """Same file from tracked and untracked sources must be deduplicated.
+
+        This is the smoke-004 case: a file created as untracked then staged
+        appears in both git_diff_name_only's tracked list and untracked list.
+        The deduplication step must collapse them into one entry so
+        max_changed_files=1 is satisfied by a single real change.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_dedupe_same_file",
+            "task_id": "TASK-DEDUPE-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 1,
+            },
+            "task": {
+                "description": "Single file changed (dedupe case)",
+                "allowed_files": ["docs/scratch.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/scratch.md", "content": "content"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_git_diff_name_only(worktree_path):
+            # Simulates: file appears in both tracked AND untracked lists
+            # (file was created untracked, then git add staged it)
+            return ["docs/scratch.md", "docs/scratch.md"]
+
+        def fake_untracked(worktree_path):
+            return ["docs/scratch.md"]
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_diff_name_only", side_effect=fake_git_diff_name_only), \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # Must NOT be HOLD_TOO_MANY_FILES_CHANGED — deduplication makes it 1 file
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
+            f"Duplicate file should be deduplicated to 1, got: {result['status']} — {result.get('validation_errors', [])}"
+        assert result["changed_files"] == ["docs/scratch.md"], \
+            f"changed_files must have exactly one entry: {result['changed_files']}"
+
+    def test_dedupe_distinct_files_still_blocked(self, tmp_path):
+        """Two distinct files must still trigger HOLD_TOO_MANY_FILES_CHANGED.
+
+        Deduplication must NOT normalize distinct paths — each unique path
+        still counts separately against max_changed_files.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_dedupe_distinct",
+            "task_id": "TASK-DEDUPE-002",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 1,
+            },
+            "task": {
+                "description": "Two distinct files",
+                "allowed_files": ["a.md", "b.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "a.md", "content": "a"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_git_diff_name_only(worktree_path):
+            # Two DISTINCT files — must still be blocked
+            return ["a.md", "b.md"]
+
+        def fake_untracked(worktree_path):
+            return ["b.md"]  # b.md also appears as untracked
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_diff_name_only", side_effect=fake_git_diff_name_only), \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # Two distinct files must still trigger HOLD
+        assert result["status"] == "HOLD_TOO_MANY_FILES_CHANGED", \
+            f"Two distinct files must trigger HOLD, got: {result['status']}"
+
     def test_no_shell_in_untracked_functions(self):
         """git_untracked_files and git_diff_name_only must use shell=False."""
         import run_temp_worktree_execution as rte
