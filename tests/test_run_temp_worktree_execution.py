@@ -1734,10 +1734,12 @@ class TestDiffCapture:
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
+                import shutil
                 shutil.copy(str(pmg_snapshot_path), output_json)
                 return True, ""
 
             def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
                 shutil.copy(str(pmg_compare_json), output_json)
                 shutil.copy(str(pmg_compare_md), output_md)
                 return True, ""
@@ -1818,10 +1820,12 @@ class TestDiffCapture:
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
+                import shutil
                 shutil.copy(str(pmg_snapshot_path), output_json)
                 return True, ""
 
             def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
                 shutil.copy(str(pmg_compare_json), output_json)
                 shutil.copy(str(pmg_compare_md), output_md)
                 return True, ""
@@ -1885,10 +1889,12 @@ class TestDiffCapture:
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
+                import shutil
                 shutil.copy(str(pmg_snapshot_path), output_json)
                 return True, ""
 
             def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
                 shutil.copy(str(pmg_compare_json), output_json)
                 shutil.copy(str(pmg_compare_md), output_md)
                 return True, ""
@@ -1951,10 +1957,12 @@ class TestDiffCapture:
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
+                import shutil
                 shutil.copy(str(pmg_snapshot_path), output_json)
                 return True, ""
 
             def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
                 shutil.copy(str(pmg_compare_json), output_json)
                 shutil.copy(str(pmg_compare_md), output_md)
                 return True, ""
