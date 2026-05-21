@@ -162,16 +162,46 @@ def git_diff(worktree_path: Path) -> str:
     return result.stdout
 
 
-def git_diff_name_only(worktree_path: Path) -> list[str]:
-    """Return list of all changed file paths (staged AND unstaged) relative to HEAD.
+def git_untracked_files(worktree_path: Path) -> list[str]:
+    """Return list of untracked file paths relative to worktree root.
 
-    Uses git diff HEAD to capture the same scope as git_diff().
+    Excludes .aed_plan.md which is an internal harness-managed file.
+    Uses git ls-files --others --exclude-standard to find untracked files
+    that are not ignored by .gitignore.
     """
     result = subprocess.run(
+        ["git", "-C", str(worktree_path), "ls-files", "--others", "--exclude-standard"],
+        capture_output=True, text=True, timeout=30
+    )
+    untracked = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    # Filter out .aed_plan.md (internal harness-managed plan file)
+    return [f for f in untracked if f != ".aed_plan.md"]
+
+
+def git_diff_name_only(worktree_path: Path) -> list[str]:
+    """Return list of all changed file paths (tracked AND untracked) relative to HEAD.
+
+    Uses git diff HEAD to capture staged and unstaged tracked changes.
+    Also captures untracked files that are not ignored, excluding .aed_plan.md.
+
+    Untracked files are discovered via git ls-files --others --exclude-standard
+    and validated against allowed/forbidden scopes before being included.
+    """
+    # Tracked changes (staged + unstaged)
+    tracked_result = subprocess.run(
         ["git", "-C", str(worktree_path), "diff", "HEAD", "--name-only"],
         capture_output=True, text=True, timeout=30
     )
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    tracked = [line.strip() for line in tracked_result.stdout.splitlines() if line.strip()]
+
+    # Untracked files (not ignored, not .aed_plan.md)
+    untracked = git_untracked_files(worktree_path)
+
+    # Return union; .aed_plan.md filtered by git_untracked_files
+    all_changed = tracked + untracked
+
+    # Filter .aed_plan.md from tracked (in case it was staged/tracked then deleted/ignored)
+    return [f for f in all_changed if f != ".aed_plan.md"]
 
 
 # ---------------------------------------------------------------------------
@@ -1423,16 +1453,75 @@ def run(
             result["next_action"] = "investigate Hermes tree mutation; clean environment and retry"
             _write_output(result, output_json, output_md)
             return result
+# ---- Phase 10: Collect changed files and diff --------------------------
+        # Collect tracked changes (staged + unstaged) from git diff HEAD
+        tracked_changed = git_diff_name_only(worktree_root)
 
-        # Phase 10: Collect changed files and diff
-        diff_text = git_diff(worktree_root)
-        diff_path = str(output_root / "diff.patch")
-        Path(diff_path).write_text(diff_text, encoding="utf-8")
+        # Collect untracked files not ignored, excluding .aed_plan.md
+        untracked_files = git_untracked_files(worktree_root)
+
+        # Build diff_path for later use
+        output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+        diff_path = output_root / "diff.patch"
+
+        # Validate untracked files BEFORE adding to changed_files
+        # Block untracked files outside allowed scope
+        task = packet.get("task", {})
+        allowed_files = task.get("allowed_files", [])
+        forbidden_files = task.get("forbidden_files", [])
+
+        outside_untracked = [f for f in untracked_files if f not in allowed_files]
+        if outside_untracked:
+            result["status"] = "HOLD_OUTSIDE_ALLOWED_FILES"
+            result["validation_errors"] = [f"untracked file outside allowed_files: {f}" for f in outside_untracked]
+            result["next_action"] = "check allowed_files constraint"
+            _write_output(result, output_json, output_md)
+            return result
+
+        forbidden_untracked = []
+        for f in untracked_files:
+            for fb in forbidden_files:
+                fb_clean = fb.rstrip("/")
+                if f == fb_clean or f.startswith(fb_clean + "/"):
+                    forbidden_untracked.append(f)
+        if forbidden_untracked:
+            result["status"] = "HOLD_FORBIDDEN_FILE_TOUCHED"
+            result["validation_errors"] = [f"untracked forbidden file touched: {f}" for f in forbidden_untracked]
+            result["next_action"] = "check forbidden_files constraint"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Combine tracked + validated untracked; .aed_plan.md already excluded
+        all_changed = tracked_changed + untracked_files
+        # Defensive filter: .aed_plan.md must never reach changed_files regardless of source
+        all_changed = [f for f in all_changed if f != ".aed_plan.md"]
+        result["changed_files"] = all_changed
         result["diff_path"] = str(diff_path)
-        result["changed_files"] = git_diff_name_only(worktree_root)
 
-        # Filter out the harness-managed plan file from collected changes
-        result["changed_files"] = [f for f in result["changed_files"] if f != ".aed_plan.md"]
+        # Build diff.patch: tracked diff + untracked file diffs
+        diff_parts: list[str] = []
+
+        # Part 1: tracked diff (staged + unstaged)
+        tracked_diff = git_diff(worktree_root)
+        if tracked_diff.strip():
+            diff_parts.append(tracked_diff)
+
+        # Part 2: untracked allowed files (new file diffs)
+        for untracked_file in untracked_files:
+            file_path = worktree_root / untracked_file
+            if file_path.is_file():
+                content = file_path.read_text(encoding="utf-8")
+                diff_parts.append(
+                    f"diff --git a/{untracked_file} b/{untracked_file}\n"
+                    f"new file mode 100644\n"
+                    f"--- /dev/null\n"
+                    f"+++ b/{untracked_file}\n"
+                    f"@@ -0,0 +1,{content.count(chr(10)) + (1 if content and not content.endswith(chr(10)) else 0)} @@\n"
+                    f"{content}"
+                )
+
+        combined_diff = "\n\n".join(diff_parts)
+        diff_path.write_text(combined_diff, encoding="utf-8")
 
         # Empty output check (Claude succeeded but no files changed)
         if not result["changed_files"]:
@@ -1442,30 +1531,44 @@ def run(
             _write_output(result, output_json, output_md)
             return result
 
-        if result["changed_files"] and not diff_text.strip():
+        if result["changed_files"] and not combined_diff.strip():
             result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
             result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
             result["next_action"] = "check git diff capture; ensure edits are staged correctly"
             _write_output(result, output_json, output_md)
             return result
 
-        # Phase 11: Diff validation
-        task = packet.get("task", {})
-        allowed_files = task.get("allowed_files", [])
-        forbidden_files = task.get("forbidden_files", [])
+        # ---- Phase 11: Diff validation -----------------------------------------
+
         validation_errors: list[str] = []
-        if check_forbidden_file_touched(result["changed_files"], forbidden_files):
-            validation_errors.append("changed_files contains a forbidden file")
-        if check_outside_allowed(result["changed_files"], allowed_files):
-            validation_errors.append("changed_files contains a file outside allowed scope")
-        if check_protected_gate_scripts(result["changed_files"], PROTECTED_GATE_SCRIPTS):
-            validation_errors.append("changed_files contains a protected gate script")
-        if check_too_many_files(result["changed_files"], approval.get("max_changed_files", task.get("max_changed_files", 50))):
-            max_allowed = approval.get("max_changed_files", task.get("max_changed_files", 50))
-            validation_errors.append(f"too many files changed: {len(result['changed_files'])} (max {max_allowed})")
+
+        # Check each class of violation
+        outside_allowed = check_outside_allowed(result["changed_files"], allowed_files, worktree_root)
+        if outside_allowed:
+            for f in outside_allowed:
+                validation_errors.append(f"file changed outside allowed_files: {f}")
+
+        forbidden_touched = check_forbidden_file_touched(result["changed_files"], forbidden_files, worktree_root)
+        if forbidden_touched:
+            for f in forbidden_touched:
+                validation_errors.append(f"forbidden file touched: {f}")
+
+        gate_scripts = check_protected_gate_scripts(result["changed_files"], worktree_root)
+        if gate_scripts:
+            for f in gate_scripts:
+                validation_errors.append(f"protected gate script modified: {f}")
+
+        max_allowed_files = approval.get("max_changed_files", task.get("max_changed_files", 50))
+        if check_too_many_files(result["changed_files"], max_allowed_files):
+            validation_errors.append(f"changed files ({len(result['changed_files'])}) exceeds max_changed_files ({max_allowed_files})")
 
         if validation_errors:
-            result["status"] = "HOLD_POST_EXEC_VALIDATION_FAILED"
+            result["status"] = (
+                "HOLD_FORBIDDEN_FILE_TOUCHED" if forbidden_touched else
+                "HOLD_OUTSIDE_ALLOWED_FILES" if outside_allowed else
+                "HOLD_TOO_MANY_FILES_CHANGED" if check_too_many_files(result["changed_files"], max_allowed_files) else
+                "HOLD_POST_EXEC_VALIDATION_FAILED"
+            )
             result["validation_errors"] = validation_errors
             result["next_action"] = "review changed files against task constraints"
             _write_output(result, output_json, output_md)
@@ -1545,8 +1648,9 @@ def run(
         _write_output(result, output_json, output_md)
         return result
 
-    # If no mock_edits, the worktree should be clean (no files changed)
-    if not changed_files:
+    # If no mock_edits AND no untracked files, the worktree should be clean (no files changed)
+    untracked_now = git_untracked_files(worktree_root)
+    if not changed_files and not untracked_now:
         # Write an empty diff for the no-change case
         output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
         diff_path = str(output_root / "diff.patch")
@@ -1562,7 +1666,7 @@ def run(
         _write_output(result, output_json, output_md)
         return result
 
-    # ---- Phase 9: Post-execution status capture ---------------------------
+# ---- Phase 9: Post-execution status capture ---------------------------
 
     worktree_status_after = git_status(worktree_root)
     result["worktree_git_status_after"] = worktree_status_after
@@ -1573,7 +1677,7 @@ def run(
     if not git_status_clean(REPO_ROOT):
         result["status"] = "HOLD_REPO_MUTATION"
         result["validation_errors"] = [
-            f"main repo git status changed during execution: {main_status_after}"
+            f"main repo became dirty after worktree creation: {main_status_after}"
         ]
         result["next_action"] = "investigate main repo mutation"
         _write_output(result, output_json, output_md)
@@ -1620,65 +1724,126 @@ def run(
 
     # ---- Phase 10: Collect changed files and diff --------------------------
 
-    diff_text = git_diff(worktree_root)
     output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
     diff_path = output_root / "diff.patch"
-    diff_path.write_text(diff_text, encoding="utf-8")
     result["diff_path"] = str(diff_path)
 
-    result["changed_files"] = changed_files
+    # Collect tracked changes (staged + unstaged)
+    tracked_changed = git_diff_name_only(worktree_root)
 
-    # If changed_files is non-empty but diff is empty, block — diff is required for human review
-    if changed_files and not diff_text.strip():
+    # Collect untracked files (not ignored, excluding .aed_plan.md)
+    untracked_files = git_untracked_files(worktree_root)
+
+    # Validate untracked files BEFORE adding to changed_files
+    # Block untracked files outside allowed scope
+    task = packet.get("task", {})
+    allowed_files = task.get("allowed_files", [])
+    forbidden_files = task.get("forbidden_files", [])
+
+    outside_untracked = [f for f in untracked_files if f not in allowed_files]
+    if outside_untracked:
+        result["status"] = "HOLD_OUTSIDE_ALLOWED_FILES"
+        result["validation_errors"] = [f"untracked file outside allowed_files: {f}" for f in outside_untracked]
+        result["next_action"] = "check allowed_files constraint"
+        _write_output(result, output_json, output_md)
+        return result
+
+    forbidden_untracked = []
+    for f in untracked_files:
+        for fb in forbidden_files:
+            fb_clean = fb.rstrip("/")
+            if f == fb_clean or f.startswith(fb_clean + "/"):
+                forbidden_untracked.append(f)
+    if forbidden_untracked:
+        result["status"] = "HOLD_FORBIDDEN_FILE_TOUCHED"
+        result["validation_errors"] = [f"untracked forbidden file touched: {f}" for f in forbidden_untracked]
+        result["next_action"] = "check forbidden_files constraint"
+        _write_output(result, output_json, output_md)
+        return result
+
+    # Combine tracked + validated untracked; .aed_plan.md filtered by git_untracked_files
+    tracked_filtered = [f for f in tracked_changed if f != ".aed_plan.md"]
+    all_changed = tracked_filtered + untracked_files
+    # Defensive filter: .aed_plan.md must never reach changed_files regardless of source
+    all_changed = [f for f in all_changed if f != ".aed_plan.md"]
+    result["changed_files"] = all_changed
+
+    # Build diff.patch: tracked diff + untracked file diffs
+    diff_parts: list[str] = []
+
+    # Part 1: tracked diff (staged + unstaged)
+    tracked_diff = git_diff(worktree_root)
+    if tracked_diff.strip():
+        diff_parts.append(tracked_diff)
+
+    # Part 2: untracked allowed files (new file diffs)
+    for untracked_file in untracked_files:
+        file_path = worktree_root / untracked_file
+        if file_path.is_file():
+            content = file_path.read_text(encoding="utf-8")
+            line_count = content.count("\n") + (1 if content and not content.endswith("\n") else 0)
+            diff_parts.append(
+                f"diff --git a/{untracked_file} b/{untracked_file}\n"
+                f"new file mode 100644\n"
+                f"--- /dev/null\n"
+                f"+++ b/{untracked_file}\n"
+                f"@@ -0,0 +1,{line_count} @@\n"
+                f"{content}"
+            )
+
+    combined_diff = "\n\n".join(diff_parts)
+    diff_path.write_text(combined_diff, encoding="utf-8")
+
+    # Empty output check (mock executor returned but no files changed)
+    if not result["changed_files"]:
+        result["status"] = "HOLD_CLAUDE_EMPTY_OUTPUT"
+        result["validation_errors"] = ["executor returned successfully but no files were changed"]
+        result["next_action"] = "verify the approved plan produces file changes, or investigate executor behavior"
+        _write_output(result, output_json, output_md)
+        return result
+
+    if result["changed_files"] and not combined_diff.strip():
         result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
         result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
-        result["next_action"] = "check git diff capture; ensure mock_edits are staged correctly"
+        result["next_action"] = "check git diff capture; ensure edits are staged correctly"
         _write_output(result, output_json, output_md)
         return result
 
     # ---- Phase 11: Diff validation -----------------------------------------
 
-    task = packet.get("task", {})
-    allowed_files = task.get("allowed_files", [])
-    forbidden_files = task.get("forbidden_files", [])
-
     validation_errors: list[str] = []
 
     # Check each class of violation
-    outside_allowed = check_outside_allowed(changed_files, allowed_files, worktree_root)
+    outside_allowed = check_outside_allowed(result["changed_files"], allowed_files, worktree_root)
     if outside_allowed:
         for f in outside_allowed:
             validation_errors.append(f"file changed outside allowed_files: {f}")
 
-    forbidden_touched = check_forbidden_file_touched(changed_files, forbidden_files, worktree_root)
+    forbidden_touched = check_forbidden_file_touched(result["changed_files"], forbidden_files, worktree_root)
     if forbidden_touched:
         for f in forbidden_touched:
             validation_errors.append(f"forbidden file touched: {f}")
 
-    gate_scripts = check_protected_gate_scripts(changed_files, worktree_root)
+    gate_scripts = check_protected_gate_scripts(result["changed_files"], worktree_root)
     if gate_scripts:
         for f in gate_scripts:
             validation_errors.append(f"protected gate script modified: {f}")
 
-    max_files = approval.get("max_changed_files", 999)
-    if check_too_many_files(changed_files, max_files):
-        validation_errors.append(
-            f"changed files ({len(changed_files)}) exceeds max_changed_files ({max_files})"
-        )
+    max_allowed_files = approval.get("max_changed_files", task.get("max_changed_files", 50))
+    if check_too_many_files(result["changed_files"], max_allowed_files):
+        validation_errors.append(f"changed files ({len(result['changed_files'])}) exceeds max_changed_files ({max_allowed_files})")
 
     if validation_errors:
         result["status"] = (
             "HOLD_FORBIDDEN_FILE_TOUCHED" if forbidden_touched else
             "HOLD_OUTSIDE_ALLOWED_FILES" if outside_allowed else
-            "HOLD_TOO_MANY_FILES_CHANGED" if check_too_many_files(changed_files, max_files) else
-            "HOLD_DIFF_VALIDATION_FAILED"
+            "HOLD_TOO_MANY_FILES_CHANGED" if check_too_many_files(result["changed_files"], max_allowed_files) else
+            "HOLD_POST_EXEC_VALIDATION_FAILED"
         )
         result["validation_errors"] = validation_errors
-        result["next_action"] = "fix constraint violations in plan"
+        result["next_action"] = "review changed files against task constraints"
         _write_output(result, output_json, output_md)
         return result
-
-    # ---- Phase 12: Success ------------------------------------------------
 
     result["status"] = "PATCH_READY_FOR_HUMAN_REVIEW"
     result["patch_ready"] = True

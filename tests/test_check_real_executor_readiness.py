@@ -146,7 +146,9 @@ class TestMissingChecklistItem:
 
         We test the checklist checking logic directly with synthetic minimal content.
         """
-        import scripts.local.check_real_executor_readiness as checker_mod
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import check_real_executor_readiness as checker_mod
 
         # Minimal doc with no checklist items
         minimal_doc = "Minimal doc with no checklist items."
@@ -177,7 +179,9 @@ class TestSourceContainsRealClaudeMarker:
         Verify the marker detection logic works on synthetic content.
         The real file should NOT contain real Claude implementation.
         """
-        import scripts.local.check_real_executor_readiness as checker_mod
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import check_real_executor_readiness as checker_mod
 
         # Test detection on synthetic content WITH marker
         content_with_marker = (
