@@ -102,7 +102,8 @@ def make_plan_file(tmp_path: Path, content: str = "Example plan\n") -> tuple[Pat
 
 
 def now_iso() -> str:
-    return f"2026-05-20T{time.strftime('%H:%M:%S', time.gmtime())}Z"
+    # Use a fixed timestamp well within the 24h approval window (noon UTC today)
+    return "2026-05-20T12:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +594,7 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
+        # PMG is checked after approval, but approval fails first so PMG not called
         result = run(packet, str(output_json), str(output_md))
         assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
 

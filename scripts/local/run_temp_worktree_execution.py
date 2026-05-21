@@ -456,7 +456,7 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
         _write_output(result, output_json, output_md)
         return result
 
-    # Verify main is at base_sha
+# Verify main is at base_sha
     main_head = git_rev_parse(REPO_ROOT, "HEAD")
     if main_head != packet.get("base_sha"):
         result["status"] = "HOLD_MAIN_DIRTY"
@@ -467,33 +467,12 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
         _write_output(result, output_json, output_md)
         return result
 
-    # ---- Phase 3b: PMG pre-snapshot ----------------------------------------
-    # Snapshot the Hermes home tree before any worktree creation.
-    # This detects if something already mutated Hermes before we started.
-
-    pmg_target = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-    pmg_snapshot_path = str(output_root / "pmg_snapshot.json")
-    pmg_compare_json_path = str(output_root / "pmg_compare.json")
-    pmg_compare_md_path = str(output_root / "pmg_compare.md")
-
-    result["pmg_snapshot_path"] = pmg_snapshot_path
-
-    output_root_path = Path(output_root)
-    output_root_path.mkdir(parents=True, exist_ok=True)
-
-    ok, snap_err = pmg_snapshot(pmg_target, pmg_snapshot_path)
-    if not ok:
-        result["status"] = "HOLD_PMG_SNAPSHOT_FAILED"
-        result["validation_errors"] = [f"PMG snapshot failed: {snap_err}"]
-        result["next_action"] = "check HERMES_HOME path and PMG tool availability"
-        _write_output(result, output_json, output_md)
-        return result
-
     # ---- Phase 4: Path safety checks ---------------------------------------
 
-    if path_inside_repo(output_root_path, REPO_ROOT):
+    output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+    if path_inside_repo(output_root, REPO_ROOT):
         result["status"] = "HOLD_OUTPUT_PATH_INSIDE_REPO"
-        result["validation_errors"] = [f"output_root cannot be inside repo: {output_root_path}"]
+        result["validation_errors"] = [f"output_root cannot be inside repo: {output_root}"]
         result["next_action"] = "move output_root outside repo"
         _write_output(result, output_json, output_md)
         return result
@@ -515,6 +494,27 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
         _write_output(result, output_json, output_md)
         return result
 
+    # ---- Phase 5b: PMG pre-snapshot ----------------------------------------
+    # Snapshot the Hermes home tree before any worktree creation.
+    # This detects if something already mutated Hermes before we started.
+
+    pmg_target = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    pmg_snapshot_path = str(output_root / "pmg_snapshot.json")
+    pmg_compare_json_path = str(output_root / "pmg_compare.json")
+    pmg_compare_md_path = str(output_root / "pmg_compare.md")
+
+    result["pmg_snapshot_path"] = pmg_snapshot_path
+
+    output_root_path = Path(output_root)
+    output_root_path.mkdir(parents=True, exist_ok=True)
+
+    ok, snap_err = pmg_snapshot(pmg_target, pmg_snapshot_path)
+    if not ok:
+        result["status"] = "HOLD_PMG_SNAPSHOT_FAILED"
+        result["validation_errors"] = [f"PMG snapshot failed: {snap_err}"]
+        result["next_action"] = "check HERMES_HOME path and PMG tool availability"
+        _write_output(result, output_json, output_md)
+        return result
     # ---- Phase 6: Create worktree -----------------------------------------
 
     if worktree_root.exists():
