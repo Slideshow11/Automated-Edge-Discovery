@@ -71,15 +71,21 @@ REQUIRED_CHECKLIST_ITEMS: list[str] = [
     "unattended execution",
 ]
 
-# Marker that would indicate real Claude implementation is present
+# Marker that would indicate real Claude implementation is present.
+# These are specific patterns that indicate REAL execution (subprocess, import),
+# NOT the disabled skeleton mode-guard code itself.
 REAL_CLAUDE_IMPLEMENTATION_MARKERS = [
-    'execution.mode"claude"',
-    "execution.mode = 'claude'",
-    'execution.mode = "claude"',
-    '"claude"',
-    "'claude'",
+    # Real subprocess invocation of claude binary
     "subprocess.run.*claude",
-    "claude",
+    # Direct LLM client imports (any of these = active implementation)
+    "import claude",
+    "from claude",
+    "import anthropic",
+    "from anthropic",
+    "import openai",
+    "from openai",
+    # Real executor function being called (not just mode comparison)
+    "run_claude_executor_stub(",
 ]
 
 # ---------------------------------------------------------------------------
@@ -157,13 +163,18 @@ def check_run_temp_worktree_execution_source() -> dict:
         if implementation_found:
             break
 
-    # Check that non-mock modes are blocked
+    # Check that non-mock modes are blocked.
     # Look for: if exec_mode != "mock": ... return HOLD_EXECUTOR_NOT_ALLOWED
-    blocking_pattern = re.compile(
+    # OR: if exec_mode in {"real", ...}: ... return HOLD_EXECUTOR_NOT_ALLOWED
+    blocking_pattern_old = re.compile(
         r'if\s+exec_mode\s*!=\s*["\']mock["\'].*?HOLD_EXECUTOR_NOT_ALLOWED',
         re.DOTALL
     )
-    has_blocking = bool(blocking_pattern.search(content))
+    blocking_pattern_new = re.compile(
+        r'if\s+exec_mode\s+in\s+.*?unsupported.*?HOLD_EXECUTOR_NOT_ALLOWED',
+        re.DOTALL
+    )
+    has_blocking = bool(blocking_pattern_old.search(content) or blocking_pattern_new.search(content))
 
     return {
         "implementation_found": implementation_found,

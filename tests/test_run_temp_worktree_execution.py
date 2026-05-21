@@ -798,11 +798,93 @@ class TestRunIntegration:
             output_json = tmp_path / f"result_{mode}.json"
             output_md = tmp_path / f"result_{mode}.md"
 
+            # Unsupported modes: always blocked with HOLD_EXECUTOR_NOT_ALLOWED
+        for mode in ["real", "execute", "run", "agent"]:
             with mock.patch.object(rte, "git_status", return_value="clean"), \
                  mock.patch.object(rte, "git_status_clean", return_value=True):
                 result = run(packet, str(output_json), str(output_md))
                 assert result["status"] == "HOLD_EXECUTOR_NOT_ALLOWED", \
                     f"mode={mode} should be blocked, got {result['status']}"
+
+        # claude mode without flag → HOLD_REAL_EXECUTOR_NOT_ENABLED
+        for mode in ["claude"]:
+            packet = {
+                "packet_kind": "aed.temp_worktree.execution.v0",
+                "run_id": f"test_run_mode_{mode}_pmg",
+                "task_id": "TASK-001",
+                "base_sha": base_sha,
+                "approved_plan_path": str(plan_path),
+                "approved_plan_sha256": plan_sha,
+                "approval": {
+                    "approved_for_temp_worktree_execution": True,
+                    "approved_by": "human",
+                    "approved_plan_sha256": plan_sha,
+                    "approved_at": now,
+                    "max_changed_files": 5,
+                },
+                "task": {
+                    "description": "Edit",
+                    "allowed_files": ["docs/example.md"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                },
+                "execution": {
+                    "mode": mode,
+                    "timeout_seconds": 60,
+                    "output_root": str(tmp_path / "output"),
+                },
+            }
+            packet_path = tmp_path / f"packet_{mode}.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            output_json = tmp_path / f"result_{mode}.json"
+            output_md = tmp_path / f"result_{mode}.md"
+
+            with mock.patch.object(rte, "git_status", return_value="clean"), \
+                 mock.patch.object(rte, "git_status_clean", return_value=True):
+                result = run(packet, str(output_json), str(output_md))
+                assert result["status"] == "HOLD_REAL_EXECUTOR_NOT_ENABLED", \
+                    f"mode={mode} without flag should be blocked with HOLD_REAL_EXECUTOR_NOT_ENABLED, got {result['status']}"
+
+    def test_claude_mode_with_flag_returns_hold_claude_implementation_pending(self, tmp_path):
+        """Test 6b: claude mode with --enable-real-claude-executor flag returns HOLD_CLAUDE_IMPLEMENTATION_PENDING."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_run_mode_claude_flag",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+        output_json = tmp_path / "result_claude_flag.json"
+        output_md = tmp_path / "result_claude_flag.md"
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+            assert result["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING", \
+                f"claude mode with flag should return HOLD_CLAUDE_IMPLEMENTATION_PENDING, got {result['status']}"
 
     def test_edit_outside_allowed_files_returns_hold_outside_allowed(self, tmp_path):
         """Test 7: edit outside allowed_files returns HOLD_OUTSIDE_ALLOWED_FILES."""
