@@ -917,7 +917,8 @@ class TestRunIntegration:
              mock.patch.object(rte, "git_status_clean", return_value=True), \
              mock.patch.object(rte, "pmg_snapshot", return_value=(True, "")), \
              mock.patch.object(rte, "pmg_compare", return_value=(True, "")), \
-             mock.patch.object(rte, "run_claude_executor", return_value=success_result):
+             mock.patch.object(rte, "run_claude_executor", return_value=success_result), \
+             mock.patch.object(rte, "git_worktree_add", return_value=subprocess.CompletedProcess("", 0)):
             result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
             # Now that we have a real executor path, it should proceed past the stub
             # The result status depends on whether mock_edits produce changes
@@ -1000,7 +1001,8 @@ class TestRunIntegration:
              mock.patch.object(rte, "git_status_clean", return_value=True), \
              mock.patch.object(rte, "pmg_snapshot", return_value=(True, "")), \
              mock.patch.object(rte, "pmg_compare", return_value=(True, "")), \
-             mock.patch.object(rte, "run_claude_executor", return_value=timeout_result):
+             mock.patch.object(rte, "run_claude_executor", return_value=timeout_result), \
+             mock.patch.object(rte, "git_worktree_add", return_value=subprocess.CompletedProcess("", 0)):
             result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
             assert result["status"] == "HOLD_CLAUDE_TIMEOUT", \
                 f"expected HOLD_CLAUDE_TIMEOUT, got {result['status']}"

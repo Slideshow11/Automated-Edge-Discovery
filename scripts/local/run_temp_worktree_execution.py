@@ -165,21 +165,23 @@ def git_diff(worktree_path: Path) -> str:
 
 
 def git_diff_name_only(worktree_path: Path) -> list[str]:
-    """Return list of staged changed file paths in worktree.
-
-    Falls back to unstaged if no staged changes exist.
-    """
-    result = subprocess.run(
+    """Return list of all changed file paths (staged AND unstaged) in worktree."""
+    staged = subprocess.run(
         ["git", "-C", str(worktree_path), "diff", "--cached", "--name-only"],
         capture_output=True, text=True, timeout=30
-    )
-    if not result.stdout:
-        # No staged changes — fall back to unstaged
-        result = subprocess.run(
-            ["git", "-C", str(worktree_path), "diff", "--name-only"],
-            capture_output=True, text=True, timeout=30
-        )
-    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    ).stdout.splitlines()
+    unstaged = subprocess.run(
+        ["git", "-C", str(worktree_path), "diff", "--name-only"],
+        capture_output=True, text=True, timeout=30
+    ).stdout.splitlines()
+    seen = set()
+    result = []
+    for line in staged + unstaged:
+        line = line.strip()
+        if line and line not in seen:
+            seen.add(line)
+            result.append(line)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1233,6 +1235,9 @@ def run(
         Path(diff_path).write_text(diff_text, encoding="utf-8")
         result["diff_path"] = str(diff_path)
         result["changed_files"] = git_diff_name_only(worktree_root)
+
+        # Filter out the harness-managed plan file from collected changes
+        result["changed_files"] = [f for f in result["changed_files"] if f != ".aed_plan.md"]
 
         # Empty output check (Claude succeeded but no files changed)
         if not result["changed_files"]:
