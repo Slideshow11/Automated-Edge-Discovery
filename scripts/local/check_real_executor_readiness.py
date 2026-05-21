@@ -84,8 +84,6 @@ REAL_CLAUDE_IMPLEMENTATION_MARKERS = [
     "from anthropic",
     "import openai",
     "from openai",
-    # Real executor function being called (not just mode comparison)
-    "run_claude_executor_stub(",
 ]
 
 # ---------------------------------------------------------------------------
