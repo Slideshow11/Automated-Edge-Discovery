@@ -426,13 +426,17 @@ class TestNoForbiddenPatterns:
 
 class TestNoMutation:
     def test_harness_not_mutated(self, clean_repo, mock_run_dir):
-        import scripts.local.run_temp_worktree_execution as harness
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import run_temp_worktree_execution as harness
         before = harness.__file__ and Path(harness.__file__).read_text()
         if before is None:
             # Module imported from zip or otherwise
             pytest.skip("Cannot read harness file")
         _run_audit(mock_run_dir)
-        import scripts.local.run_temp_worktree_execution as harness2
+        import sys as _sys2
+        _sys2.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import run_temp_worktree_execution as harness2
         after = Path(harness2.__file__).read_text()
         assert before == after
 
