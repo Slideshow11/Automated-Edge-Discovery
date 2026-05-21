@@ -102,8 +102,14 @@ def make_plan_file(tmp_path: Path, content: str = "Example plan\n") -> tuple[Pat
 
 
 def now_iso() -> str:
-    # Use a fixed timestamp well within the 24h approval window (noon UTC today)
-    return "2026-05-20T12:00:00Z"
+    # Generate a fresh UTC timestamp within the 24h approval window
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def stale_approved_at() -> str:
+    # Fixed old timestamp for testing expiry — outside the 24h window
+    return "2020-01-01T00:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -111,6 +117,7 @@ def now_iso() -> str:
 # ---------------------------------------------------------------------------
 
 sys.path.insert(0, str(SCRIPT_DIR))
+import run_temp_worktree_execution as rte
 from run_temp_worktree_execution import (
     run, validate_packet, validate_approval, sha256_str as _sha256_str,
     check_forbidden_file_touched, check_outside_allowed,
@@ -283,7 +290,7 @@ class TestValidateApproval:
             "approved_for_temp_worktree_execution": False,
             "approved_by": "human",
             "approved_plan_sha256": plan_sha,
-            "approved_at": "2026-05-20T12:00:00Z",
+            "approved_at": now_iso(),
             "max_changed_files": 5,
         }
         ok, err = validate_approval(approval, str(plan_path))
@@ -296,7 +303,7 @@ class TestValidateApproval:
             "approved_for_temp_worktree_execution": True,
             "approved_by": "bot",
             "approved_plan_sha256": plan_sha,
-            "approved_at": "2026-05-20T12:00:00Z",
+            "approved_at": now_iso(),
             "max_changed_files": 5,
         }
         ok, err = validate_approval(approval, str(plan_path))
@@ -310,7 +317,7 @@ class TestValidateApproval:
             "approved_for_temp_worktree_execution": True,
             "approved_by": "human",
             "approved_plan_sha256": bad_sha,
-            "approved_at": "2026-05-20T12:00:00Z",
+            "approved_at": now_iso(),
             "max_changed_files": 5,
         }
         ok, err = validate_approval(approval, str(plan_path))
@@ -323,7 +330,7 @@ class TestValidateApproval:
             "approved_for_temp_worktree_execution": True,
             "approved_by": "human",
             "approved_plan_sha256": plan_sha,
-            "approved_at": "2020-01-01T00:00:00Z",
+            "approved_at": stale_approved_at(),
             "max_changed_files": 5,
         }
         ok, err = validate_approval(approval, str(plan_path))
@@ -514,7 +521,9 @@ class TestRunIntegration:
         output_md = tmp_path / "result.md"
 
         # Mock PMG functions so tests don't depend on real PMG tool
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             # pm
@@ -595,8 +604,10 @@ class TestRunIntegration:
         output_md = tmp_path / "result.md"
 
         # PMG is checked after approval, but approval fails first so PMG not called
-        result = run(packet, str(output_json), str(output_md))
-        assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md))
+            assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
 
     def test_plan_hash_mismatch_returns_hold(self, tmp_path):
         """Test 3: plan hash mismatch returns HOLD_PLAN_NOT_APPROVED."""
@@ -637,9 +648,11 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
-        assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
-        assert any("mismatch" in e.lower() for e in result.get("validation_errors", []))
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md))
+            assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
+            assert any("mismatch" in e.lower() for e in result.get("validation_errors", []))
 
     def test_dirty_main_repo_returns_hold_main_dirty(self, tmp_path):
         """Test 4: dirty main repo (staged changes) returns HOLD_MAIN_DIRTY."""
@@ -736,8 +749,10 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
-        assert result["status"] == "HOLD_OUTPUT_PATH_INSIDE_REPO"
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md))
+            assert result["status"] == "HOLD_OUTPUT_PATH_INSIDE_REPO"
 
         # Cleanup
         if inside_repo_output.exists():
@@ -783,9 +798,11 @@ class TestRunIntegration:
             output_json = tmp_path / f"result_{mode}.json"
             output_md = tmp_path / f"result_{mode}.md"
 
-            result = run(packet, str(output_json), str(output_md))
-            assert result["status"] == "HOLD_EXECUTOR_NOT_ALLOWED", \
-                f"mode={mode} should be blocked, got {result['status']}"
+            with mock.patch.object(rte, "git_status", return_value="clean"), \
+                 mock.patch.object(rte, "git_status_clean", return_value=True):
+                result = run(packet, str(output_json), str(output_md))
+                assert result["status"] == "HOLD_EXECUTOR_NOT_ALLOWED", \
+                    f"mode={mode} should be blocked, got {result['status']}"
 
     def test_edit_outside_allowed_files_returns_hold_outside_allowed(self, tmp_path):
         """Test 7: edit outside allowed_files returns HOLD_OUTSIDE_ALLOWED_FILES."""
@@ -830,7 +847,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -891,7 +910,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -956,7 +977,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1016,7 +1039,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1076,7 +1101,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1140,7 +1167,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1201,7 +1230,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1262,7 +1293,9 @@ class TestRunIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1328,7 +1361,9 @@ class TestPMGPIntegration:
         output_md = tmp_path / "result.md"
 
         # Mock PMG snapshot to fail
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap:
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap:
             mock_snap.return_value = (False, "PMG snapshot timed out after 60s")
             result = run(packet, str(output_json), str(output_md))
 
@@ -1380,7 +1415,9 @@ class TestPMGPIntegration:
         # Mock snapshot to succeed, compare to fail
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1438,7 +1475,9 @@ class TestPMGPIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         blocked_compare_json, blocked_compare_md = make_blocked_pmg_compare(tmp_path / "pmg", blocked_count=2)
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1501,7 +1540,9 @@ class TestPMGPIntegration:
         pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
         pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1571,7 +1612,9 @@ class TestPMGPIntegration:
         bad_compare_md = pmg_dir / "bad_compare.md"
         bad_compare_md.write_text("malformed", encoding="utf-8")
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
             def fake_snapshot(target, output_json):
                 import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
@@ -1730,7 +1773,9 @@ class TestDiffCapture:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
@@ -1819,7 +1864,9 @@ class TestDiffCapture:
 
         monkeypatch.setattr(rte, "git_diff", fake_git_diff)
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
@@ -1888,7 +1935,9 @@ class TestDiffCapture:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
@@ -1956,7 +2005,9 @@ class TestDiffCapture:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
              mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
 
             def fake_snapshot(target, output_json):
