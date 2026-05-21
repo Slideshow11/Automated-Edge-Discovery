@@ -61,8 +61,30 @@ if `live_smoke_scratch.md` is not desirable.
   "task": {
     "description": "First live Claude smoke: append a single line to docs/live_smoke_scratch.md",
     "allowed_files": ["docs/live_smoke_scratch.md"],
-    "forbidden_files": [],
-    "do_not": []
+    "forbidden_files": [
+      ".git/",
+      ".github/",
+      "scripts/local/final_gate_status.py",
+      "scripts/local/verify_final_head_merge_command.py",
+      "scripts/local/check_persistent_mutation_guard.py",
+      "scripts/local/run_temp_worktree_execution.py",
+      "scripts/local/check_real_executor_readiness.py",
+      "scripts/local/check_real_claude_env_preflight.py",
+      "scripts/local/audit_claude_invocation.py",
+      "scripts/local/run_plan_preview.py",
+      "scripts/local/plan_preview_eval_status.py",
+      "/home/max/.hermes/",
+      "audit/",
+      "boards/",
+      "memory/",
+      "profile/"
+    ],
+    "do_not": [
+      "git push", "gh pr create", "gh pr merge", "gh api",
+      "pip install", "npm install", "apt install", "yum install", "brew install",
+      "sudo", "dispatch", "board", "Hermes", "audit", "memory", "profile",
+      "repair loop", "|", "&&", "||"
+    ]
   },
   "execution": {
     "mode": "claude",
@@ -177,7 +199,7 @@ After the live run completes (regardless of outcome):
 - [ ] Inspect `claude_stderr.txt` — check for warnings or errors
 - [ ] Inspect `claude_transcript.md` — review full execution transcript
 - [ ] Run `python3 scripts/local/audit_claude_invocation.py` on the output directory
-- [ ] Run `python3 scripts/local/check_persistent_mutation_guard.py compare --root ~/.hermes --before <snapshot> --output-json <compare.json>`
+- [ ] Run `python3 scripts/local/check_persistent_mutation_guard.py compare --root ~/.hermes --before <snapshot> --output-json <compare.json> --output-md <compare.md>`
 - [ ] Confirm main repo `git status --short` is clean after worktree cleanup
 - [ ] Do **not** apply the patch automatically
 - [ ] Human decides: discard, apply, or defer
