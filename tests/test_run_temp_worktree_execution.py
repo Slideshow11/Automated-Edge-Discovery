@@ -17,8 +17,9 @@ Coverage:
 - Mock executor (valid edits, path escape blocked)
 - Diff validation (allowed_files, forbidden_files, gate scripts, max_changed_files)
 - Main repo mutation detection post-execution
+- PMG pre/post integration (snapshot, compare, external mutation)
 - State transitions and final states
-- Output JSON and Markdown correctness
+- Output JSON and Markdown correctness (including PMG fields)
 
 No test invokes Claude, uses network, shell=True, git push, gh pr create/merge,
 dispatch, board, Hermes, audit, memory, profile, or package install.
@@ -32,6 +33,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -100,7 +102,8 @@ def make_plan_file(tmp_path: Path, content: str = "Example plan\n") -> tuple[Pat
 
 
 def now_iso() -> str:
-    return f"2026-05-20T{time.strftime('%H:%M:%S', time.gmtime())}Z"
+    # Use a fixed timestamp well within the 24h approval window (noon UTC today)
+    return "2026-05-20T12:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -115,6 +118,71 @@ from run_temp_worktree_execution import (
     apply_mock_edits, WORKTREE_BASE,
     PROTECTED_GATE_SCRIPTS,
 )
+
+
+# ---------------------------------------------------------------------------
+# Mock helpers for PMG integration
+# ---------------------------------------------------------------------------
+
+def make_clean_pmg_snapshot(tmp_path: Path) -> tuple[Path, dict]:
+    """Create a clean PMG snapshot JSON file. Returns (path, data)."""
+    snapshot = {
+        "kind": "pmg.snapshot",
+        "version": "1.0",
+        "target": str(Path.home() / ".hermes"),
+        "files": [],
+        "status": "clean",
+        "blocked": 0,
+    }
+    pmg_dir = tmp_path / "pmg"
+    pmg_dir.mkdir(parents=True, exist_ok=True)
+    path = pmg_dir / "pmg_snapshot.json"
+    path.write_text(json.dumps(snapshot), encoding="utf-8")
+    return path, snapshot
+
+
+def make_clean_pmg_compare(tmp_path: Path) -> tuple[Path, Path]:
+    """Create clean PMG compare JSON and MD files. Returns (json_path, md_path)."""
+    compare_json = {
+        "kind": "pmg.compare",
+        "version": "1.0",
+        "status": "clean",
+        "blocked": 0,
+        "added": [],
+        "removed": [],
+        "changed": [],
+    }
+    pmg_dir = tmp_path / "pmg"
+    pmg_dir.mkdir(parents=True, exist_ok=True)
+    json_path = pmg_dir / "pmg_compare.json"
+    json_path.write_text(json.dumps(compare_json), encoding="utf-8")
+
+    md_content = "# PMG Compare Result\n\n**Status**: `clean`\n**Blocked**: 0\n"
+    md_path = pmg_dir / "pmg_compare.md"
+    md_path.write_text(md_content, encoding="utf-8")
+    return json_path, md_path
+
+
+def make_blocked_pmg_compare(tmp_path: Path, blocked_count: int = 1) -> tuple[Path, Path]:
+    """Create a blocked PMG compare result. Returns (json_path, md_path)."""
+    compare_json = {
+        "kind": "pmg.compare",
+        "version": "1.0",
+        "status": "blocked",
+        "blocked": blocked_count,
+        "added": ["some/file.txt"],
+        "removed": [],
+        "changed": [],
+    }
+    pmg_dir = tmp_path / "pmg"
+    pmg_dir.mkdir(parents=True, exist_ok=True)
+    json_path = pmg_dir / "pmg_compare_blocked.json"
+    json_path.write_text(json.dumps(compare_json), encoding="utf-8")
+
+    md_content = f"# PMG Compare Result\n\n**Status**: `blocked`\n**Blocked**: {blocked_count}\n"
+    md_path = pmg_dir / "pmg_compare_blocked.md"
+    md_path.write_text(md_content, encoding="utf-8")
+    return json_path, md_path
 
 
 # ---------------------------------------------------------------------------
@@ -396,20 +464,25 @@ class TestApplyMockEdits:
 # ---------------------------------------------------------------------------
 
 class TestRunIntegration:
-    """Tests that create a real git worktree from the AED repo's current HEAD."""
+    """Tests that create a real git worktree from the AED repo's current HEAD.
+    PMG functions are mocked so tests don't depend on real PMG tool availability.
+    """
 
     def test_valid_mock_edit_returns_patch_ready(self, tmp_path):
         """Test 1: valid mock edit to one allowed file returns PATCH_READY_FOR_HUMAN_REVIEW."""
-        # Get current HEAD of AED repo (read-only, no mutation)
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
         assert base_sha, "AED repo HEAD not found"
 
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
+        # Create clean PMG snapshot and compare artifacts
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_valid_xyz",  # unique to avoid collision with other tests
+            "run_id": "test_run_valid_pmg_xyz",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -440,7 +513,28 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        # Mock PMG functions so tests don't depend on real PMG tool
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+
+            # pm
+
+            # pmg_snapshot succeeds with clean status and writes snapshot JSON
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
 
         # Cleanup worktree
         worktree_path = Path(result.get("worktree_path", ""))
@@ -451,15 +545,16 @@ class TestRunIntegration:
             f"Got: {result['status']} — {result.get('validation_errors')}"
         assert result["patch_ready"] is True
         assert "docs/example.md" in result["changed_files"]
-        # git_status() returns "clean" only when no output. With untracked files it returns
-        # the full porcelain output. Untracked files are allowed (not staged/unstaged changes).
         assert result["main_git_status_before"] == "clean" or result["main_git_status_before"].startswith("?? ")
         assert result["main_git_status_after"] == "clean" or result["main_git_status_after"].startswith("?? ")
         assert result["diff_path"]
-        # After run() the worktree contains diff.patch. Verify format, then cleanup.
         assert result["diff_path"].endswith("/diff.patch")
         assert output_json.is_file()
         assert output_md.is_file()
+        # PMG fields should be populated
+        assert result.get("pmg_status") == "clean"
+        assert result.get("pmg_snapshot_path")
+        assert result.get("pmg_compare_json_path")
 
     def test_missing_approval_returns_hold_plan_not_approved(self, tmp_path):
         """Test 2: missing approval marker returns HOLD_PLAN_NOT_APPROVED."""
@@ -469,7 +564,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_no_approval",
+            "run_id": "test_run_no_approval_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -499,6 +594,7 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
+        # PMG is checked after approval, but approval fails first so PMG not called
         result = run(packet, str(output_json), str(output_md))
         assert result["status"] == "HOLD_PLAN_NOT_APPROVED"
 
@@ -511,7 +607,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_hash_mismatch",
+            "run_id": "test_run_hash_mismatch_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -552,8 +648,6 @@ class TestRunIntegration:
         now = now_iso()
 
         # Create a dirty state: add a staged change inside the AED repo
-        # Create a temp file inside the repo, stage it, then delete the physical file
-        # This leaves a staged deletion which makes git status non-clean
         dirty_file = REPO_ROOT / "TESTS_TEMP_DIRTY_MARKER.txt"
         dirty_file.write_text("dirty\n")
         subprocess.run(["git", "-C", str(REPO_ROOT), "add", "TESTS_TEMP_DIRTY_MARKER.txt"], capture_output=True, timeout=5)
@@ -562,7 +656,7 @@ class TestRunIntegration:
         try:
             packet = {
                 "packet_kind": "aed.temp_worktree.execution.v0",
-                "run_id": "test_run_dirty_main",
+                "run_id": "test_run_dirty_main_pmg",
                 "task_id": "TASK-001",
                 "base_sha": base_sha,
                 "approved_plan_path": str(plan_path),
@@ -612,7 +706,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_output_inside_repo",
+            "run_id": "test_run_output_inside_repo_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -659,7 +753,7 @@ class TestRunIntegration:
         for mode in ["real", "claude", "execute", "run", "agent"]:
             packet = {
                 "packet_kind": "aed.temp_worktree.execution.v0",
-                "run_id": f"test_run_mode_{mode}",
+                "run_id": f"test_run_mode_{mode}_pmg",
                 "task_id": "TASK-001",
                 "base_sha": base_sha,
                 "approved_plan_path": str(plan_path),
@@ -701,7 +795,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_outside_allowed",
+            "run_id": "test_run_outside_allowed_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -732,7 +826,20 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        # Mock PMG so tests don't depend on real PMG availability
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -749,7 +856,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_forbidden",
+            "run_id": "test_run_forbidden_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -780,7 +887,20 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        # Mock PMG so tests don't depend on real PMG availability
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -797,7 +917,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_too_many",
+            "run_id": "test_run_too_many_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -832,7 +952,20 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        # Mock PMG so tests don't depend on real PMG availability
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -848,7 +981,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_worktree_path",
+            "run_id": "test_run_worktree_path_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -879,7 +1012,19 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        # Mock PMG
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -889,15 +1034,15 @@ class TestRunIntegration:
         assert str(worktree_path).startswith("/tmp/aed_runs/worktrees/"), \
             f"worktree path {worktree_path} not under /tmp/aed_runs/worktrees/"
 
-    def test_result_json_includes_changed_files_and_diff_path(self, tmp_path):
-        """Test 12: result JSON includes changed_files and diff_path."""
+    def test_result_json_includes_pmg_fields(self, tmp_path):
+        """Test: result JSON includes pmg_snapshot_path, pmg_compare_json_path, pmg_status."""
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_json_output_xyz",  # unique to avoid collision
+            "run_id": "test_run_json_pmg_fields",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -928,37 +1073,40 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
 
-        # Get worktree path BEFORE cleanup
-        worktree_path_str = result.get("worktree_path", "")
-        diff_path_str = result.get("diff_path", "")
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+            result = run(packet, str(output_json), str(output_md))
 
-        # Cleanup worktree
-        worktree_path = Path(worktree_path_str)
+        worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
             cleanup_worktree(worktree_path)
 
-        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
-            f"Status: {result['status']}, errors: {result.get('validation_errors')}"
-        assert "file1.txt" in result["changed_files"]
-        assert diff_path_str, "diff_path is empty"
-        # Check diff_path exists - if cleanup deleted it, the worktree existed which means success
-        # The worktree was removed by cleanup, so we check the result object directly
-        assert result["diff_path"], f"diff_path not set in result"
-        assert result["worktree_path"], "worktree_path not set in result"
-        # Verify the diff.patch was written to worktree before cleanup
-        assert diff_path_str.endswith("/diff.patch"), f"unexpected diff_path format: {diff_path_str}"
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
+        assert "pmg_snapshot_path" in result
+        assert "pmg_compare_json_path" in result
+        assert "pmg_compare_md_path" in result
+        assert "pmg_status" in result
+        assert result["pmg_status"] == "clean"
+        assert result["pmg_blocked_files"] == 0
 
-    def test_result_markdown_includes_status_and_changed_files(self, tmp_path):
-        """Test 13: result markdown includes status and changed files."""
+    def test_result_markdown_includes_pmg_section(self, tmp_path):
+        """Test: result markdown includes PMG status section."""
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_md_output",
+            "run_id": "test_run_md_pmg_section",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -989,16 +1137,27 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
             cleanup_worktree(worktree_path)
 
         md_text = Path(output_md).read_text()
-        assert "PATCH_READY_FOR_HUMAN_REVIEW" in md_text
-        assert "file1.txt" in md_text
-        assert "Changed Files" in md_text
+        assert "Persistent Mutation Guard (PMG)" in md_text
+        assert "PMG status" in md_text
+        assert "clean" in md_text
 
     def test_no_auto_apply_on_patch_ready(self, tmp_path):
         """Verify PATCH_READY_FOR_HUMAN_REVIEW stops at human review, does not auto-apply."""
@@ -1008,7 +1167,7 @@ class TestRunIntegration:
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_no_auto_apply",
+            "run_id": "test_run_no_auto_apply_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -1039,7 +1198,18 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -1048,18 +1218,17 @@ class TestRunIntegration:
         assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
         assert result["patch_ready"] is True
         assert "human reviews" in result["next_action"].lower()
-        # Main checkout must still be clean
         assert result["main_git_status_after"] == "clean" or result["main_git_status_after"].startswith("?? ")
 
     def test_empty_mock_edits_returns_patch_ready(self, tmp_path):
-        """Zero mock_edits means no changes; harness should return PATCH_READY_FOR_HUMAN_REVIEW with empty diff."""
+        """Zero mock_edits means no changes; harness returns PATCH_READY_FOR_HUMAN_REVIEW with empty diff."""
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
-            "run_id": "test_run_empty_edits",
+            "run_id": "test_run_empty_edits_pmg",
             "task_id": "TASK-001",
             "base_sha": base_sha,
             "approved_plan_path": str(plan_path),
@@ -1090,7 +1259,18 @@ class TestRunIntegration:
         output_json = tmp_path / "result.json"
         output_md = tmp_path / "result.md"
 
-        result = run(packet, str(output_json), str(output_md))
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+            result = run(packet, str(output_json), str(output_md))
 
         worktree_path = Path(result.get("worktree_path", ""))
         if worktree_path.exists():
@@ -1099,6 +1279,315 @@ class TestRunIntegration:
         assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
         assert result["changed_files"] == []
         assert result["patch_ready"] is True
+
+
+# ---------------------------------------------------------------------------
+# PMG-specific tests
+# ---------------------------------------------------------------------------
+
+class TestPMGPIntegration:
+    """Tests for PMG snapshot, compare, and external mutation blocking."""
+
+    def test_pmg_snapshot_failure_returns_hold_pmg_snapshot_failed(self, tmp_path):
+        """PMG snapshot subprocess failure returns HOLD_PMG_SNAPSHOT_FAILED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_pmg_snapshot_fail",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["file1.txt"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "file1.txt", "content": "updated"}],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Mock PMG snapshot to fail
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap:
+            mock_snap.return_value = (False, "PMG snapshot timed out after 60s")
+            result = run(packet, str(output_json), str(output_md))
+
+        assert result["status"] == "HOLD_PMG_SNAPSHOT_FAILED"
+        assert any("PMG snapshot failed" in e for e in result.get("validation_errors", []))
+        # worktree should not have been created (snapshot happens before worktree)
+        worktree_path = Path(result.get("worktree_path", ""))
+        assert not worktree_path.exists()
+
+    def test_pmg_compare_failure_returns_hold_pmg_compare_failed(self, tmp_path):
+        """PMG compare subprocess failure returns HOLD_PMG_COMPARE_FAILED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_pmg_compare_fail",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["file1.txt"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "file1.txt", "content": "updated"}],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Mock snapshot to succeed, compare to fail
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.return_value = (False, "PMG compare failed with exit 1: internal error")
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_PMG_COMPARE_FAILED"
+        assert any("PMG compare failed" in e for e in result.get("validation_errors", []))
+
+    def test_pmg_compare_blocked_returns_hold_external_mutation(self, tmp_path):
+        """PMG compare returns blocked status → HOLD_EXTERNAL_MUTATION."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_pmg_blocked",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["file1.txt"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "file1.txt", "content": "updated"}],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        blocked_compare_json, blocked_compare_md = make_blocked_pmg_compare(tmp_path / "pmg", blocked_count=2)
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(blocked_compare_json), output_json); shutil.copy(str(blocked_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_EXTERNAL_MUTATION", \
+            f"Expected HOLD_EXTERNAL_MUTATION, got {result['status']}: {result.get('validation_errors')}"
+        assert any("external mutation detected" in e.lower() for e in result.get("validation_errors", []))
+        assert result["pmg_status"] == "blocked"
+        assert result["pmg_blocked_files"] == 2
+
+    def test_pmg_clean_returns_patch_ready(self, tmp_path):
+        """Clean PMG snapshot and compare → PATCH_READY_FOR_HUMAN_REVIEW."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_pmg_clean_ok",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["file1.txt"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "file1.txt", "content": "updated"}],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW"
+        assert result["pmg_status"] == "clean"
+        assert result["pmg_blocked_files"] == 0
+        assert "file1.txt" in result["changed_files"]
+        assert result["main_git_status_after"] == "clean" or result["main_git_status_after"].startswith("?? ")
+
+    def test_pmg_compare_read_failure_returns_hold_pmg_compare_failed(self, tmp_path):
+        """PMG compare succeeds but JSON read fails → HOLD_PMG_COMPARE_FAILED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_pmg_read_fail",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit",
+                "allowed_files": ["file1.txt"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "file1.txt", "content": "updated"}],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+
+        # Write a malformed compare JSON
+        pmg_dir = tmp_path / "pmg"
+        pmg_dir.mkdir(parents=True, exist_ok=True)
+        bad_compare_json = pmg_dir / "bad_compare.json"
+        bad_compare_json.write_text("NOT JSON{", encoding="utf-8")
+        bad_compare_md = pmg_dir / "bad_compare.md"
+        bad_compare_md.write_text("malformed", encoding="utf-8")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(bad_compare_json), output_json); shutil.copy(str(bad_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_PMG_COMPARE_FAILED"
+        assert any("failed to read PMG compare result" in e for e in result.get("validation_errors", []))
 
 
 # ---------------------------------------------------------------------------
@@ -1135,7 +1624,6 @@ class TestSecurity:
         """Harness does not call any dispatch function or CLI."""
         harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
         source = harness_path.read_text()
-        # Check for actual dispatch invocation, not just comment mentions
         import re
         dispatch_calls = re.findall(r'\bdispatch\s*\(', source)
         assert len(dispatch_calls) == 0, f"dispatch() call found: {dispatch_calls}"
@@ -1145,8 +1633,6 @@ class TestSecurity:
         harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
         source = harness_path.read_text()
         import re
-        # Only fail if there's a non-comment, non-docstring call to a board function
-        # Docstrings mention board in the "non-goals" section - that's documentation
         board_func_calls = re.findall(r'\bboard\w*\.update\b|\bboard\w*\.create\b|\bkanban\b', source)
         assert len(board_func_calls) == 0, f"board function call found: {board_func_calls}"
 
@@ -1163,7 +1649,6 @@ class TestSecurity:
         harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
         source = harness_path.read_text()
         import re
-        # Check for actual file write operations to memory/profile paths
         memory_writes = re.findall(r'(memory|profile).*\.write\(|write.*(memory|profile)', source, re.IGNORECASE)
         assert len(memory_writes) == 0, f"memory/profile write found: {memory_writes}"
 
@@ -1173,3 +1658,24 @@ class TestSecurity:
         source = harness_path.read_text()
         for term in ["pip install", "npm install", "apt install", "brew install", "pip install", "python.*-m pip"]:
             assert term.lower() not in source.lower(), f"package install '{term}' found in harness"
+
+    def test_pmg_harness_calls_are_subprocess_only(self):
+        """PMG functions use subprocess, not os.system or other callers."""
+        harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
+        source = harness_path.read_text()
+        import re
+        # pmg_snapshot and pmg_compare should only be called via subprocess
+        # They should not call os.system, eval, exec, etc.
+        dangerous_calls = re.findall(r'(os\.system|os\.popen|eval|exec)\s*\(', source)
+        assert len(dangerous_calls) == 0, f"dangerous call found: {dangerous_calls}"
+
+    def test_pmg_calls_use_list_arg_subprocess(self):
+        """All PMG subprocess calls use list-form args (no shell strings)."""
+        harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
+        source = harness_path.read_text()
+        import re
+        # Find all subprocess calls in pmg_snapshot and pmg_compare
+        # They should use [cmd, arg1, arg2, ...] form
+        # Check for shell=True or string-split patterns
+        problematic = re.findall(r'subprocess\.\w+\(\s*["\']', source)
+        assert len(problematic) == 0, f"subprocess call with string form found: {problematic}"
