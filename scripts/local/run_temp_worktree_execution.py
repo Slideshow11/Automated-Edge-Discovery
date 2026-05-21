@@ -568,8 +568,8 @@ def build_claude_command_contract(
     # Flags here are PLACEHOLDERS and MUST be re-verified with real Claude CLI docs
     argv = [
         "claude",
-        "--no-input",           # no interactive prompt
-        "--output-format=md",    # structured output (placeholder)
+        "--print",               # print mode: read plan file, output response, exit
+        "--output-format=text",  # plain text output (not md, not json)
         str(plan_file_in_worktree),
     ]
 
