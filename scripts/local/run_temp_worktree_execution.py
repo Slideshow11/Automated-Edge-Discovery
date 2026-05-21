@@ -73,6 +73,9 @@ OUTPUT_STATES = frozenset([
     "HOLD_REAL_EXECUTOR_NOT_ENABLED",
     "HOLD_CLAUDE_IMPLEMENTATION_PENDING",
     "HOLD_CLAUDE_COMMAND_INVALID",
+    "HOLD_CLAUDE_TIMEOUT",
+    "HOLD_CLAUDE_NONZERO_EXIT",
+    "HOLD_CLAUDE_EMPTY_OUTPUT",
     # PMG states
     "HOLD_PMG_SNAPSHOT_FAILED",
     "HOLD_PMG_COMPARE_FAILED",
@@ -573,6 +576,7 @@ def build_claude_command_contract(
         "argv": argv,
         "cwd": str(worktree_root),
         "timeout_seconds": timeout,
+        "argv_summary": f"argv={argv}",  # safe summary for logging
         "env_policy": {
             "allow": [
                 "PATH",
@@ -773,8 +777,172 @@ def validate_claude_command_contract(
 
 
 # ---------------------------------------------------------------------------
-# State machine
+# Real Claude executor
 # ---------------------------------------------------------------------------
+# Called only when execution.mode="claude" AND --enable-real-claude-executor
+# is set AND command contract is valid.
+# Runs Claude CLI in the worktree, captures output, writes artifact files.
+# ---------------------------------------------------------------------------
+
+def run_claude_executor(
+    packet: dict,
+    worktree_root: Path,
+    output_root: Path,
+    contract: dict,
+    repo_root: Path = REPO_ROOT,
+) -> dict:
+    """
+    Run real Claude CLI in the worktree using the validated command contract.
+
+    This function is ONLY reached when:
+      1. execution.mode == "claude"
+      2. --enable-real-claude-executor flag is set
+      3. build_claude_command_contract succeeded
+      4. validate_claude_command_contract returned True
+
+    Responsibilities:
+      - Call subprocess.run with list-form argv, cwd=worktree_root, no shell=True
+      - Capture stdout and stderr
+      - Write claude_stdout.txt, claude_stderr.txt, claude_transcript.md
+      - Handle timeout, nonzero exit, empty output
+      - Return a result dict that the caller (run()) propagates
+
+    This function does NOT:
+      - Call git push, gh pr, or any write to the main repo
+      - Import LLM client libraries (claude SDK, anthropic, openai, etc.)
+      - Use shell=True
+      - Dispatch, update boards, append audit, or write to memory/profile
+    """
+    run_id = packet.get("run_id", "unknown")
+    argv = contract["argv"]          # list, e.g. ["claude", "--continue", ...]
+    timeout = contract["timeout_seconds"]
+
+    # Sanity-check argv is a list of strings (contract validated but we double-check)
+    if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+        return {
+            "status": "HOLD_CLAUDE_COMMAND_INVALID",
+            "claude_exit_code": None,
+            "claude_started_at": "",
+            "claude_finished_at": "",
+            "claude_elapsed_seconds": 0.0,
+            "claude_stdout_path": "",
+            "claude_stderr_path": "",
+            "claude_transcript_path": "",
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [],
+            "claude_command_contract_summary": "",
+        }
+
+    output_root_path = Path(output_root)
+    output_root_path.mkdir(parents=True, exist_ok=True)
+
+    claude_started_at = datetime.now(timezone.utc).isoformat()
+
+    stdout_path = output_root_path / "claude_stdout.txt"
+    stderr_path = output_root_path / "claude_stderr.txt"
+    transcript_path = output_root_path / "claude_transcript.md"
+
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=str(worktree_root.resolve()),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            # NOTE: shell=False (list-form argv only)
+        )
+        exit_code = proc.returncode
+    except subprocess.TimeoutExpired:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        # Write whatever partial output we can capture
+        stdout_path.write_text("(timeout - partial output)", encoding="utf-8")
+        stderr_path.write_text(f"(timeout after {timeout}s)", encoding="utf-8")
+        elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(claude_started_at)).total_seconds()
+        return {
+            "status": "HOLD_CLAUDE_TIMEOUT",
+            "claude_exit_code": -1,
+            "claude_started_at": claude_started_at,
+            "claude_finished_at": finished_at,
+            "claude_elapsed_seconds": elapsed,
+            "claude_stdout_path": str(stdout_path),
+            "claude_stderr_path": str(stderr_path),
+            "claude_transcript_path": "",
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [f"Claude timed out after {timeout}s"],
+            "claude_command_contract_summary": contract.get("argv_summary", ""),
+        }
+    except Exception as e:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        return {
+            "status": "HOLD_CLAUDE_COMMAND_INVALID",
+            "claude_exit_code": -2,
+            "claude_started_at": claude_started_at,
+            "claude_finished_at": finished_at,
+            "claude_elapsed_seconds": 0.0,
+            "claude_stdout_path": "",
+            "claude_stderr_path": "",
+            "claude_transcript_path": "",
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [f"subprocess error: {e}"],
+            "claude_command_contract_summary": contract.get("argv_summary", ""),
+        }
+
+    finished_at = datetime.now(timezone.utc).isoformat()
+    elapsed = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(claude_started_at)).total_seconds()
+
+    # Write artifacts
+    stdout_path.write_text(proc.stdout, encoding="utf-8")
+    stderr_path.write_text(proc.stderr, encoding="utf-8")
+
+    # Build combined transcript
+    transcript_lines = [
+        f"# Claude Execution Transcript",
+        f"# Run: {run_id}",
+        f"# Started: {claude_started_at}",
+        f"# Finished: {finished_at}",
+        f"# Elapsed: {elapsed:.1f}s",
+        f"# Exit code: {exit_code}",
+        f"# CWD: {worktree_root}",
+        f"# Command: {' '.join(argv)}",
+        "",
+        "## STDOUT",
+        proc.stdout or "(empty)",
+        "",
+        "## STDERR",
+        proc.stderr or "(empty)",
+    ]
+    transcript_path.write_text("\n".join(transcript_lines), encoding="utf-8")
+
+    # Nonzero exit → HOLD
+    if exit_code != 0:
+        return {
+            "status": "HOLD_CLAUDE_NONZERO_EXIT",
+            "claude_exit_code": exit_code,
+            "claude_started_at": claude_started_at,
+            "claude_finished_at": finished_at,
+            "claude_elapsed_seconds": elapsed,
+            "claude_stdout_path": str(stdout_path),
+            "claude_stderr_path": str(stderr_path),
+            "claude_transcript_path": str(transcript_path),
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [],  # contract valid; execution failed
+            "claude_command_contract_summary": contract.get("argv_summary", ""),
+        }
+
+    return {
+        "status": "CLAUDE_EXECUTOR_SUCCESS",
+        "claude_exit_code": exit_code,
+        "claude_started_at": claude_started_at,
+        "claude_finished_at": finished_at,
+        "claude_elapsed_seconds": elapsed,
+        "claude_stdout_path": str(stdout_path),
+        "claude_stderr_path": str(stderr_path),
+        "claude_transcript_path": str(transcript_path),
+        "claude_command_contract_valid": True,
+        "claude_command_contract_errors": [],
+        "claude_command_contract_summary": contract.get("argv_summary", ""),
+    }
+
 
 def run(
     packet: dict,
@@ -790,7 +958,7 @@ def run(
         output_json: path to write result JSON
         output_md: path to write result Markdown
         enable_real_claude_executor: if True, allow execution.mode='claude' to
-            proceed to stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING).
+            proceed to the real executor (with full PMG + worktree guard).
             Defaults to False (claude mode blocked without this flag).
     """
     run_id = packet.get("run_id", "unknown")
@@ -912,10 +1080,175 @@ def run(
             _write_output(result, output_json, output_md)
             return result
 
-        # Flag present: call stub (returns HOLD_CLAUDE_IMPLEMENTATION_PENDING or HOLD_CLAUDE_COMMAND_INVALID)
-        # No PMG snapshot, no worktree creation in this stub phase
-        stub_result = run_claude_executor_stub(packet, worktree_root, output_root, repo_root=REPO_ROOT)
-        result.update(stub_result)
+        # Flag present: build and validate command contract first.
+        # Only proceed to real execution if contract is valid.
+        contract = build_claude_command_contract(packet, worktree_root, output_root)
+        is_valid, validation_errors = validate_claude_command_contract(
+            contract, packet, worktree_root, output_root, REPO_ROOT
+        )
+        result["claude_command_contract_valid"] = is_valid
+        result["claude_command_contract_errors"] = validation_errors
+        contract_summary = "; ".join([
+            f"argv={contract['argv']}",
+            f"cwd={contract['cwd']}",
+            f"timeout={contract['timeout_seconds']}s",
+        ])
+        result["claude_command_contract_summary"] = contract_summary
+
+        if not is_valid:
+            result["status"] = "HOLD_CLAUDE_COMMAND_INVALID"
+            result["validation_errors"] = validation_errors
+            result["next_action"] = "fix command contract validation errors"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Contract valid: proceed to real execution with full PMG + worktree guard.
+        # Phase 5b: PMG pre-snapshot (before worktree creation)
+        pmg_target = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        pmg_snapshot_path = str(output_root / "pmg_snapshot.json")
+        pmg_compare_json_path = str(output_root / "pmg_compare.json")
+        pmg_compare_md_path = str(output_root / "pmg_compare.md")
+        result["pmg_snapshot_path"] = pmg_snapshot_path
+        result["pmg_compare_json_path"] = pmg_compare_json_path
+        result["pmg_compare_md_path"] = pmg_compare_md_path
+
+        output_root_path = Path(output_root)
+        output_root_path.mkdir(parents=True, exist_ok=True)
+        ok, snap_err = pmg_snapshot(pmg_target, pmg_snapshot_path)
+        if not ok:
+            result["status"] = "HOLD_PMG_SNAPSHOT_FAILED"
+            result["validation_errors"] = [f"PMG snapshot failed: {snap_err}"]
+            result["next_action"] = "check HERMES_HOME path and PMG tool availability"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 6: Create worktree
+        if worktree_root.exists():
+            try:
+                git_worktree_remove(worktree_root, REPO_ROOT)
+            except Exception:
+                pass
+            shutil.rmtree(worktree_root, ignore_errors=True)
+        worktree_root.mkdir(parents=True, exist_ok=True)
+        base_sha = packet.get("base_sha", "")
+        wt_result = git_worktree_add(worktree_root, base_sha, REPO_ROOT)
+        if wt_result.returncode != 0:
+            result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
+            result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
+            result["next_action"] = "check base_sha is valid and worktree path is available"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 7: Pre-execution git status
+        main_status_after_create = git_status(REPO_ROOT)
+        if not git_status_clean(REPO_ROOT):
+            result["status"] = "HOLD_REPO_MUTATION"
+            result["validation_errors"] = [
+                f"main repo became dirty after worktree creation: {main_status_after_create}"
+            ]
+            result["next_action"] = "investigate main repo mutation"
+            _write_output(result, output_json, output_md)
+            return result
+
+        worktree_status_before = git_status(worktree_root)
+        result["worktree_git_status_before"] = worktree_status_before
+
+        # Phase 8: Run real Claude executor
+        claude_result = run_claude_executor(packet, worktree_root, output_root, contract, repo_root=REPO_ROOT)
+        result.update(claude_result)
+
+        # If executor returned a HOLD, propagate it immediately
+        if result["status"].startswith("HOLD_"):
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Executor succeeded: continue to post-execution validation
+        worktree_status_after = git_status(worktree_root)
+        result["worktree_git_status_after"] = worktree_status_after
+        main_status_after = git_status(REPO_ROOT)
+        result["main_git_status_after"] = main_status_after
+
+        if not git_status_clean(REPO_ROOT):
+            result["status"] = "HOLD_REPO_MUTATION"
+            result["validation_errors"] = [f"main repo git status changed during execution: {main_status_after}"]
+            result["next_action"] = "investigate main repo mutation"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 9: PMG post-compare
+        ok, cmp_err = pmg_compare(pmg_snapshot_path, pmg_compare_json_path, pmg_compare_md_path)
+        if not ok:
+            result["status"] = "HOLD_PMG_COMPARE_FAILED"
+            result["validation_errors"] = [f"PMG compare failed: {cmp_err}"]
+            result["next_action"] = "check PMG tool and snapshot integrity"
+            _write_output(result, output_json, output_md)
+            return result
+
+        try:
+            compare_data = json.loads(Path(pmg_compare_json_path).read_text(encoding="utf-8"))
+            pmg_status = compare_data.get("status", "unknown")
+            result["pmg_status"] = pmg_status
+            result["pmg_blocked_files"] = compare_data.get("blocked", 0)
+        except Exception as e:
+            result["status"] = "HOLD_PMG_COMPARE_FAILED"
+            result["validation_errors"] = [f"failed to read PMG compare result: {e}"]
+            _write_output(result, output_json, output_md)
+            return result
+
+        if pmg_status != "clean":
+            result["status"] = "HOLD_EXTERNAL_MUTATION"
+            blocked = compare_data.get("blocked", "?")
+            result["validation_errors"] = [f"external mutation detected by PMG: status={pmg_status}, blocked={blocked}"]
+            result["next_action"] = "investigate Hermes tree mutation; clean environment and retry"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 10: Collect changed files and diff
+        diff_text = git_diff(worktree_root)
+        diff_path = str(output_root / "diff.patch")
+        Path(diff_path).write_text(diff_text, encoding="utf-8")
+        result["diff_path"] = str(diff_path)
+        result["changed_files"] = git_diff_name_only(worktree_root)
+
+        # Empty output check (Claude succeeded but no files changed)
+        if not result["changed_files"]:
+            result["status"] = "HOLD_CLAUDE_EMPTY_OUTPUT"
+            result["validation_errors"] = ["Claude executor returned successfully but no files were changed"]
+            result["next_action"] = "verify the approved plan produces file changes, or investigate executor behavior"
+            _write_output(result, output_json, output_md)
+            return result
+
+        if changed_files and not diff_text.strip():
+            result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
+            result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
+            result["next_action"] = "check git diff capture; ensure edits are staged correctly"
+            _write_output(result, output_json, output_md)
+            return result
+
+        # Phase 11: Diff validation
+        task = packet.get("task", {})
+        allowed_files = task.get("allowed_files", [])
+        forbidden_files = task.get("forbidden_files", [])
+        validation_errors: list[str] = []
+        if check_forbidden_file_touched(result["changed_files"], forbidden_files):
+            validation_errors.append("changed_files contains a forbidden file")
+        if check_outside_allowed(result["changed_files"], allowed_files):
+            validation_errors.append("changed_files contains a file outside allowed scope")
+        if check_protected_gate_scripts(result["changed_files"], PROTECTED_GATE_SCRIPTS):
+            validation_errors.append("changed_files contains a protected gate script")
+        if check_too_many_files(result["changed_files"], task.get("max_changed_files", 50)):
+            validation_errors.append(f"too many files changed: {len(result['changed_files'])} (max {task.get('max_changed_files', 50)})")
+
+        if validation_errors:
+            result["status"] = "HOLD_POST_EXEC_VALIDATION_FAILED"
+            result["validation_errors"] = validation_errors
+            result["next_action"] = "review changed files against task constraints"
+            _write_output(result, output_json, output_md)
+            return result
+
+        result["status"] = "PATCH_READY_FOR_HUMAN_REVIEW"
+        result["patch_ready"] = True
+        result["next_action"] = "human reviews diff.patch; manually apply or discard"
         _write_output(result, output_json, output_md)
         return result
 
