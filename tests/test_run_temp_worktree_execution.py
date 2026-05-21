@@ -908,7 +908,7 @@ class TestRunIntegration:
             "claude_transcript_path": str(output_root / "claude_transcript.md"),
             "claude_command_contract_valid": True,
             "claude_command_contract_errors": [],
-            "claude_command_contract_summary": f"argv=['claude', '--no-input', '--output-format=md', '.aed_plan.md']",
+            "claude_command_contract_summary": f"argv=['claude', '--print', '--input-format=text', '--output-format=text'] [stdin:.aed_plan.md]",
         }
         (output_root / "claude_stdout.txt").write_text("Claude output", encoding="utf-8")
         (output_root / "claude_stderr.txt").write_text("", encoding="utf-8")
@@ -993,7 +993,7 @@ class TestRunIntegration:
             "claude_transcript_path": "",
             "claude_command_contract_valid": True,
             "claude_command_contract_errors": ["Claude timed out after 60s"],
-            "claude_command_contract_summary": f"argv=['claude', '--no-input', '--output-format=md', '.aed_plan.md']",
+            "claude_command_contract_summary": f"argv=['claude', '--print', '--input-format=text', '--output-format=text'] [stdin:.aed_plan.md]",
         }
         (output_root / "claude_stdout.txt").write_text("(timeout)", encoding="utf-8")
 
@@ -1009,7 +1009,9 @@ class TestRunIntegration:
             # Contract summary should be a safe non-executable description
             summary = result.get("claude_command_contract_summary", "")
             assert "claude" in summary, f"summary should mention claude: {summary}"
-            assert "--no-input" in summary, f"summary should mention --no-input: {summary}"
+            assert "--no-input" not in summary, f"summary should NOT contain deprecated --no-input flag: {summary}"
+            # New contract uses --print --input-format=text --output-format=text (stdin mode)
+            assert "--print" in summary, f"summary should mention --print: {summary}"
             # Contract valid should be True (HOLD from timeout, not from contract invalid)
             assert result.get("claude_command_contract_valid") is True
             # Timeout error detail is carried in claude_command_contract_errors (not validation_errors)

@@ -561,23 +561,25 @@ def build_claude_command_contract(
     # Bound timeout to prevent runaway
     timeout = min(max(timeout, 1), MAX_TIMEOUT_SECONDS)
 
-    # Use a placeholder plan path in worktree for the command
-    plan_file_in_worktree = worktree_root / ".aed_plan.md"
-
-    # Conservative placeholder argv — no shell, no prompts, no auto-accept
-    # Flags here are PLACEHOLDERS and MUST be re-verified with real Claude CLI docs
+    # Conservative argv for stdin-based input mode.
+    # Plan content is passed via subprocess input= parameter (stdin).
+    # argv has NO prompt text and NO plan path — only the fixed flags.
+    # Re-verified against Claude CLI docs: --print --input-format=text --output-format=text
     argv = [
         "claude",
-        "--no-input",           # no interactive prompt
-        "--output-format=md",    # structured output (placeholder)
-        str(plan_file_in_worktree),
+        "--print",               # print mode: no interactive session, exits after output
+        "--input-format=text",   # read stdin as plain text prompt
+        "--output-format=text",  # plain text output (not md, not json)
     ]
 
     return {
         "argv": argv,
         "cwd": str(worktree_root),
         "timeout_seconds": timeout,
-        "argv_summary": f"argv={argv}",  # safe summary for logging
+        # New fields documenting stdin-based input mode:
+        "input_source": str(worktree_root / ".aed_plan.md"),
+        "input_mode": "stdin",
+        "argv_summary": f"argv={argv} [stdin:.aed_plan.md]",  # safe summary for logging
         "env_policy": {
             "allow": [
                 "PATH",
@@ -727,6 +729,18 @@ def validate_claude_command_contract(
             errors.append(f"forbidden sequence {' '.join(seq)!r} found in argv")
             break
 
+    # Reject argv containing .aed_plan.md as a positional argument.
+    # The plan is passed via stdin (input_source), not as a file argument.
+    # This prevents regression of the first-smoke failure where the plan
+    # was passed as a file path causing an approval prompt instead of execution.
+    for i, arg in enumerate(argv):
+        if ".aed_plan.md" in arg:
+            errors.append(
+                f"argv[{i}] contains '.aed_plan.md' — plan must be passed via stdin, "
+                f"not as a positional file argument. Use input_source + input_mode=stdin."
+            )
+            break
+
     # --- timeout validation ---
     timeout = contract.get("timeout_seconds", 0)
     if not isinstance(timeout, (int, float)):
@@ -843,6 +857,27 @@ def run_claude_executor(
     stderr_path = output_root_path / "claude_stderr.txt"
     transcript_path = output_root_path / "claude_transcript.md"
 
+    # Read the plan text that was copied to worktree/.aed_plan.md (Phase 7b).
+    # The contract specifies input_source = worktree/.aed_plan.md and input_mode = stdin.
+    plan_file_path = Path(worktree_root) / ".aed_plan.md"
+    try:
+        plan_text = plan_file_path.read_text(encoding="utf-8")
+    except Exception as e:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        return {
+            "status": "HOLD_CLAUDE_COMMAND_INVALID",
+            "claude_exit_code": None,
+            "claude_started_at": claude_started_at,
+            "claude_finished_at": finished_at,
+            "claude_elapsed_seconds": 0.0,
+            "claude_stdout_path": "",
+            "claude_stderr_path": "",
+            "claude_transcript_path": "",
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [f"failed to read .aed_plan.md from worktree: {e}"],
+            "claude_command_contract_summary": contract.get("argv_summary", ""),
+        }
+
     try:
         proc = subprocess.run(
             argv,
@@ -850,6 +885,7 @@ def run_claude_executor(
             capture_output=True,
             text=True,
             timeout=timeout,
+            input=plan_text,        # pass plan via stdin (input_mode=stdin)
             # NOTE: shell=False (list-form argv only)
         )
         exit_code = proc.returncode
@@ -904,7 +940,7 @@ def run_claude_executor(
         f"# Elapsed: {elapsed:.1f}s",
         f"# Exit code: {exit_code}",
         f"# CWD: {worktree_root}",
-        f"# Command: {' '.join(argv)}",
+        f"# Command: {' '.join(argv)} [stdin=.aed_plan.md]",
         "",
         "## STDOUT",
         proc.stdout or "(empty)",
