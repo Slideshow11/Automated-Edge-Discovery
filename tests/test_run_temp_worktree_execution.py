@@ -102,8 +102,8 @@ def make_plan_file(tmp_path: Path, content: str = "Example plan\n") -> tuple[Pat
 
 
 def now_iso() -> str:
-    # Use a fixed timestamp well within the 24h approval window (noon UTC today)
-    return "2026-05-20T12:00:00Z"
+    # Use a fixed timestamp well within the 24h approval window (recent UTC)
+    return "2026-05-21T09:00:00Z"
 
 
 # ---------------------------------------------------------------------------
@@ -1984,3 +1984,320 @@ class TestDiffCapture:
         diff_content = diff_path.read_text()
         assert "README.md" in diff_content, \
             f"diff.patch does not contain README.md: {diff_content[:300]}"
+
+# --------------------------------------------------------------------------
+# Real Claude executor skeleton tests
+# --------------------------------------------------------------------------
+
+
+class TestRealClaudeExecutorSkeleton:
+    """Tests for execution.mode='claude' skeleton (disabled by default)."""
+
+    def test_claude_mode_without_flag_returns_hold_real_executor_not_enabled(self, tmp_path, monkeypatch):
+        """execution.mode='claude' without --enable-real-claude-executor returns HOLD_REAL_EXECUTOR_NOT_ENABLED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        # Mock git_status_clean to always return True so we don't depend on repo state
+        import run_temp_worktree_execution as rte
+        monkeypatch.setattr(rte, "git_status_clean", lambda p: True)
+        monkeypatch.setattr(rte, "git_status", lambda p: "clean")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_claude_no_flag",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # No flag passed → HOLD_REAL_EXECUTOR_NOT_ENABLED
+        result = run(packet, str(output_json), str(output_md))
+        assert result["status"] == "HOLD_REAL_EXECUTOR_NOT_ENABLED", \
+            f"Expected HOLD_REAL_EXECUTOR_NOT_ENABLED, got: {result['status']}"
+        # Must not create worktree
+        worktree_path = Path(result.get("worktree_path", ""))
+        assert not worktree_path.exists(), \
+            f"worktree should not be created but found at: {worktree_path}"
+        # PMG snapshot must NOT have been called (blocked before Phase 5b)
+        assert result.get("pmg_snapshot_path") == "", \
+            f"PMG should not run before mode check; got pmg_snapshot_path={result.get('pmg_snapshot_path')}"
+
+    def test_claude_mode_with_flag_returns_hold_claude_implementation_pending(self, tmp_path, monkeypatch):
+        """execution.mode='claude' with --enable-real-claude-executor returns HOLD_CLAUDE_IMPLEMENTATION_PENDING."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        # Mock git functions and PMG so we can test the stub result
+        import run_temp_worktree_execution as rte
+        monkeypatch.setattr(rte, "git_status_clean", lambda p: True)
+        monkeypatch.setattr(rte, "git_status", lambda p: "clean")
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp:
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            packet = {
+                "packet_kind": "aed.temp_worktree.execution.v0",
+                "run_id": "test_claude_with_flag",
+                "task_id": "TASK-001",
+                "base_sha": base_sha,
+                "approved_plan_path": str(plan_path),
+                "approved_plan_sha256": plan_sha,
+                "approval": {
+                    "approved_for_temp_worktree_execution": True,
+                    "approved_by": "human",
+                    "approved_plan_sha256": plan_sha,
+                    "approved_at": now,
+                    "max_changed_files": 5,
+                },
+                "task": {
+                    "description": "Test",
+                    "allowed_files": ["docs/example.md"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                },
+                "execution": {
+                    "mode": "claude",
+                    "timeout_seconds": 60,
+                    "output_root": str(tmp_path / "output"),
+                },
+            }
+
+            packet_path = tmp_path / "packet.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            output_json = tmp_path / "result.json"
+            output_md = tmp_path / "result.md"
+
+            # Flag passed → HOLD_CLAUDE_IMPLEMENTATION_PENDING (no real Claude invoked)
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+            assert result["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING", \
+                f"Expected HOLD_CLAUDE_IMPLEMENTATION_PENDING, got: {result['status']}"
+            assert "not yet implemented" in result.get("validation_errors", [])[0].lower()
+
+    def test_claude_mode_with_flag_does_not_invoke_claude(self, tmp_path, monkeypatch):
+        """With flag, harness must not call subprocess for Claude."""
+        import run_temp_worktree_execution as rte
+        import subprocess
+        original_run = subprocess.run
+        subprocess_calls = []
+
+        def track_run(*args, **kwargs):
+            subprocess_calls.append((args, kwargs))
+            return original_run(*args, **kwargs)
+
+        # Also mock PMG so worktree creation doesn't fail
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_claude_no_subprocess",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Apply all mocks before calling run()
+        monkeypatch.setattr(rte, "git_status_clean", lambda p: True)
+        monkeypatch.setattr(rte, "git_status", lambda p: "clean")
+
+        with mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(subprocess, "run", side_effect=track_run):
+            def fake_snapshot(target, output_json):
+                import shutil; shutil.copy(str(pmg_snapshot_path), output_json); return True, ""
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil; shutil.copy(str(pmg_compare_json), output_json); shutil.copy(str(pmg_compare_md), output_md); return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+
+        assert result["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING"
+        # Verify no Claude subprocess calls were made
+        for args, kwargs in subprocess_calls:
+            cmd_str = ' '.join(args[0]) if args and args[0] else ''
+            assert 'claude' not in cmd_str.lower() or 'git' in cmd_str.lower(), \
+                f"Subprocess call to Claude found: {cmd_str}"
+
+    def test_unsupported_mode_still_returns_hold_executor_not_allowed(self, tmp_path, monkeypatch):
+        """Non-mock, non-claude modes (e.g. 'agent') still return HOLD_EXECUTOR_NOT_ALLOWED."""
+        import run_temp_worktree_execution as rte
+        monkeypatch.setattr(rte, "git_status_clean", lambda p: True)
+        monkeypatch.setattr(rte, "git_status", lambda p: "clean")
+
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        for mode in ["agent", "execute", "run"]:
+            packet = {
+                "packet_kind": "aed.temp_worktree.execution.v0",
+                "run_id": f"test_mode_{mode}",
+                "task_id": "TASK-001",
+                "base_sha": base_sha,
+                "approved_plan_path": str(plan_path),
+                "approved_plan_sha256": plan_sha,
+                "approval": {
+                    "approved_for_temp_worktree_execution": True,
+                    "approved_by": "human",
+                    "approved_plan_sha256": plan_sha,
+                    "approved_at": now,
+                    "max_changed_files": 5,
+                },
+                "task": {
+                    "description": "Test",
+                    "allowed_files": ["docs/example.md"],
+                    "forbidden_files": [],
+                    "do_not": [],
+                },
+                "execution": {
+                    "mode": mode,
+                    "timeout_seconds": 60,
+                    "output_root": str(tmp_path / "output"),
+                },
+            }
+
+            result = run(packet, str(tmp_path / f"out_{mode}.json"), str(tmp_path / f"out_{mode}.md"))
+            assert result["status"] == "HOLD_EXECUTOR_NOT_ALLOWED", \
+                f"mode={mode} should be blocked, got {result['status']}"
+
+    def test_run_claude_executor_stub_returns_correct_fields(self, tmp_path):
+        """run_claude_executor_stub returns result with all required fields."""
+        import run_temp_worktree_execution as rte
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        packet = {"execution": {"mode": "claude"}}
+        stub = rte.run_claude_executor_stub(worktree, packet, "test_run", tmp_path / "out")
+        assert stub["status"] == "HOLD_CLAUDE_IMPLEMENTATION_PENDING"
+        assert stub["run_id"] == "test_run"
+        assert "not yet implemented" in stub["validation_errors"][0]
+        assert stub["worktree_path"] == str(worktree)
+
+    def test_no_anthropic_openai_imports_in_harness(self):
+        """Harness source must not import anthropic, openai, or LLM clients."""
+        harness_path = SCRIPT_DIR / "run_temp_worktree_execution.py"
+        source = harness_path.read_text()
+        forbidden_imports = ["from anthropic", "import anthropic", "from openai", "import openai",
+                            "from cohere", "import cohere", "from mistralai", "import mistralai",
+                            "from google.generativeai", "import google.generativeai"]
+        for mod in forbidden_imports:
+            assert mod not in source, \
+                f"forbidden import '{mod}' found in harness"
+
+    def test_stub_function_has_no_subprocess_calls(self):
+        """run_claude_executor_stub must not call subprocess."""
+        import run_temp_worktree_execution as rte
+        import inspect
+        source = inspect.getsource(rte.run_claude_executor_stub)
+        assert "subprocess" not in source, \
+            "run_claude_executor_stub must not call subprocess"
+
+    def test_claude_mode_passes_approval_check_before_blocking(self, tmp_path):
+        """Claude mode without flag must still pass packet validation and approval before returning HOLD."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        # Invalid approval (not approved_for_temp_worktree_execution)
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_claude_bad_approval",
+            "task_id": "TASK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": False,  # Invalid
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        result = run(packet, str(output_json), str(output_md))
+        # Must fail at approval check, not mode check
+        assert result["status"] == "HOLD_PLAN_NOT_APPROVED", \
+            f"Expected HOLD_PLAN_NOT_APPROVED (approval blocks first), got: {result['status']}"
+
+
