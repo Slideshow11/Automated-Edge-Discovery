@@ -10,7 +10,12 @@ from pathlib import Path
 
 import pytest
 
-REPO_ROOT = Path("/home/max/Automated-Edge-Discovery")
+# ---------------------------------------------------------------------------
+# Paths — resolved relative to this test file, not hardcoded
+# ---------------------------------------------------------------------------
+
+TESTS_DIR = Path(__file__).parent.resolve()  # .../Automated-Edge-Discovery/tests
+REPO_ROOT = TESTS_DIR.parent.resolve()       # .../Automated-Edge-Discovery
 SCRIPT = REPO_ROOT / "scripts/local/build_temp_worktree_execution_packet.py"
 
 
@@ -20,7 +25,10 @@ SCRIPT = REPO_ROOT / "scripts/local/build_temp_worktree_execution_packet.py"
 
 def run_bridge(argv):
     """Run the bridge script. Returns (exitcode, stdout, stderr)."""
-    cmd = [sys.executable, str(SCRIPT)] + argv
+    # Use relative path from this test file's location so CI works when
+    # checked out to any working directory (including non-/home/max paths)
+    script_path = Path(__file__).resolve().parent.parent / "scripts/local/build_temp_worktree_execution_packet.py"
+    cmd = [sys.executable, str(script_path)] + argv
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     return r.returncode, r.stdout, r.stderr
 
