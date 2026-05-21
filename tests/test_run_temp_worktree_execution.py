@@ -744,13 +744,17 @@ class TestRunIntegration:
             import shutil
             shutil.rmtree(inside_repo_output, ignore_errors=True)
 
-    def test_non_mock_mode_returns_hold_executor_not_allowed(self, tmp_path):
-        """Test 6: non-mock execution mode returns HOLD_EXECUTOR_NOT_ALLOWED."""
+    def test_non_mock_mode_returns_hold_executor_not_allowed(self, tmp_path, monkeypatch):
+        """Non-mock, non-claude execution modes return HOLD_EXECUTOR_NOT_ALLOWED."""
+        import run_temp_worktree_execution as rte
+        monkeypatch.setattr(rte, "git_status_clean", lambda p: True)
+        monkeypatch.setattr(rte, "git_status", lambda p: "clean")
+
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
-        for mode in ["real", "claude", "execute", "run", "agent"]:
+        for mode in ["real", "execute", "run", "agent"]:
             packet = {
                 "packet_kind": "aed.temp_worktree.execution.v0",
                 "run_id": f"test_run_mode_{mode}_pmg",
