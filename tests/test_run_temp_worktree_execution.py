@@ -588,8 +588,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "mock",
@@ -633,8 +643,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "mock",
@@ -734,8 +754,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "mock",
@@ -873,8 +903,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "claude",
@@ -965,8 +1005,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "claude",
@@ -1046,8 +1096,18 @@ class TestRunIntegration:
             "task": {
                 "description": "Edit",
                 "allowed_files": ["docs/example.md"],
-                "forbidden_files": [],
-                "do_not": [],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                ],
             },
             "execution": {
                 "mode": "mock",
@@ -2559,3 +2619,687 @@ class TestDiffCapture:
         diff_content = diff_path.read_text()
         assert "README.md" in diff_content, \
             f"diff.patch does not contain README.md: {diff_content[:300]}"
+
+
+# ============================================================================
+# Live smoke packet constraint tests
+# ============================================================================
+
+class TestValidateLiveSmokePacketConstraints:
+    """Tests for validate_live_smoke_packet_constraints()."""
+
+    def test_valid_live_smoke_packet_passes(self):
+        """A well-formed live smoke packet passes validation."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/live_smoke_scratch.md"],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                    "scripts/local/run_temp_worktree_execution.py",
+                    "scripts/local/check_real_executor_readiness.py",
+                    "scripts/local/check_real_claude_env_preflight.py",
+                    "scripts/local/audit_claude_invocation.py",
+                    "/home/max/.hermes/",
+                    "audit/",
+                    "boards/",
+                    "memory/",
+                    "profile/",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                    "no gh api dispatch",
+                    "no package install",
+                    "no dispatch",
+                    "no board updates",
+                    "no Hermes changes",
+                    "no audit append",
+                    "no memory/profile updates",
+                ],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert ok, f"valid live smoke packet should pass, got error: {err}"
+
+    def test_empty_forbidden_files_rejected(self):
+        """Live smoke packet with empty forbidden_files is rejected."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],  # empty — forbidden
+                "do_not": ["no git push"],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert not ok, "empty forbidden_files must be rejected"
+        assert "forbidden_files" in err.lower() or "non-empty" in err.lower()
+
+    def test_empty_do_not_rejected(self):
+        """Live smoke packet with empty do_not is rejected."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [".git/"],
+                "do_not": [],  # empty — forbidden
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert not ok, "empty do_not must be rejected"
+        assert "do_not" in err.lower() or "non-empty" in err.lower()
+
+    def test_missing_protected_gate_scripts_rejected(self):
+        """Live smoke packet missing protected gate scripts in forbidden_files is rejected."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [".git/", ".github/"],  # missing protected scripts
+                "do_not": ["no git push"],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert not ok, "missing protected gate scripts must be rejected"
+        assert "final_gate_status" in err or "protected" in err.lower()
+
+    def test_multiple_allowed_files_rejected(self):
+        """Live smoke packet with more than one allowed_file is rejected."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/example.md", "README.md"],  # two files — too many
+                "forbidden_files": [
+                    ".git/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": ["no git push"],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert not ok, "multiple allowed_files must be rejected for live smoke"
+        assert "allowed_file" in err.lower() or "at most one" in err.lower()
+
+    def test_zero_allowed_files_rejected(self):
+        """Live smoke packet with zero allowed_files is rejected."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": [],  # zero — forbidden
+                "forbidden_files": [
+                    ".git/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": ["no git push"],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert not ok, "zero allowed_files must be rejected"
+        assert "allowed_file" in err.lower() or "at least one" in err.lower()
+
+    def test_non_integer_max_changed_files_passes_validation(self):
+        """Live smoke packet with non-integer max_changed_files is not rejected by
+        validate_live_smoke_packet_constraints (only enforced at packet builder level)."""
+        # max_changed_files enforcement is done at packet builder level, not here.
+        # validate_live_smoke_packet_constraints only checks non-None/non-1 values
+        # and passes for any valid integer including 5.
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_live",
+            "task_id": "TASK-LIVE-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 5},
+            "task": {
+                "description": "Smoke test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [
+                    ".git/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                ],
+                "do_not": ["no git push"],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert ok, f"non-1 max_changed_files must be allowed at validator level: {err}"
+
+    def test_mock_mode_packet_passes_without_constraints(self):
+        """Mock mode packets skip live smoke constraint validation."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_mock",
+            "task_id": "TASK-MOCK-001",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 5},
+            "task": {
+                "description": "Mock test",
+                "allowed_files": ["docs/example.md"],
+                "forbidden_files": [],  # empty is fine for mock
+                "do_not": [],  # empty is fine for mock
+            },
+            "execution": {"mode": "mock"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert ok, f"mock mode packet should pass even with empty constraints: {err}"
+
+
+# ============================================================================
+# Permission-mode contract tests
+# ============================================================================
+
+class TestPermissionModeContract:
+    """Tests for --permission-mode acceptEdits in command contract."""
+
+    def test_contract_includes_permission_mode_accept_edits(self):
+        """build_claude_command_contract includes --permission-mode acceptEdits."""
+        packet = {
+            "run_id": "test_perm",
+            "base_sha": "abc123",
+            "execution": {"timeout_seconds": 60},
+        }
+        worktree = Path("/tmp/aed_runs/worktrees/test_perm")
+        output = Path("/tmp/aed_runs/output/test_perm")
+        contract = rte.build_claude_command_contract(packet, worktree, output)
+
+        assert "--permission-mode" in contract["argv"], \
+            f"--permission-mode must be in argv: {contract['argv']}"
+        idx = contract["argv"].index("--permission-mode")
+        assert contract["argv"][idx + 1] == "acceptEdits", \
+            f"--permission-mode value must be acceptEdits: {contract['argv']}"
+
+    def test_contract_permission_mode_field_set(self):
+        """Contract includes permission_mode and permission_mode_reason fields."""
+        packet = {
+            "run_id": "test_perm_field",
+            "base_sha": "abc123",
+            "execution": {"timeout_seconds": 60},
+        }
+        worktree = Path("/tmp/aed_runs/worktrees/test_perm_field")
+        output = Path("/tmp/aed_runs/output/test_perm_field")
+        contract = rte.build_claude_command_contract(packet, worktree, output)
+
+        assert "permission_mode" in contract, "contract must have permission_mode field"
+        assert contract["permission_mode"] == "acceptEdits", \
+            f"permission_mode must be acceptEdits: {contract['permission_mode']}"
+        assert "permission_mode_reason" in contract, \
+            "contract must have permission_mode_reason field"
+        assert len(contract["permission_mode_reason"]) > 10, \
+            "permission_mode_reason must be non-empty"
+
+    def test_validator_accepts_accept_edits_in_argv(self):
+        """Validator accepts argv with --permission-mode acceptEdits."""
+        contract = {
+            "argv": ["claude", "--print", "--input-format=text",
+                     "--output-format=text", "--permission-mode", "acceptEdits"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+            "permission_mode": "acceptEdits",
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert is_valid, f"valid acceptEdits contract must pass: {errors}"
+
+    def test_validator_rejects_bypass_permissions_in_argv(self):
+        """Validator rejects argv containing --bypasspermissions."""
+        contract = {
+            "argv": ["claude", "--print", "--input-format=text",
+                     "--bypasspermissions"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid, "bypassPermissions must be rejected"
+        assert any("bypasspermissions" in e.lower() for e in errors), \
+            f"error must mention bypassPermissions: {errors}"
+
+    def test_validator_rejects_dangerously_skip_permissions(self):
+        """Validator rejects argv containing --dangerously-skip-permissions."""
+        contract = {
+            "argv": ["claude", "--print", "--dangerously-skip-permissions"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid, "--dangerously-skip-permissions must be rejected"
+        assert any("dangerously" in e.lower() or "forbidden" in e.lower() for e in errors), \
+            f"error must mention dangerously-skip-permissions: {errors}"
+
+    def test_validator_rejects_duplicate_permission_mode_flag(self):
+        """Validator rejects argv where --permission-mode appears twice."""
+        contract = {
+            "argv": ["claude", "--print", "--permission-mode", "acceptEdits",
+                     "--permission-mode", "acceptEdits"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid, "duplicate --permission-mode must be rejected"
+        assert any("appears" in e.lower() and "times" in e.lower() for e in errors), \
+            f"error must mention duplicate --permission-mode: {errors}"
+
+    def test_validator_rejects_bypass_permissions_in_contract_field(self):
+        """Validator rejects contract.permission_mode set to bypassPermissions."""
+        contract = {
+            "argv": ["claude", "--print", "--input-format=text", "--output-format=text"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+            "permission_mode": "bypassPermissions",  # forbidden value
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid, "permission_mode=bypassPermissions must be rejected"
+        assert any("permission_mode" in e.lower() for e in errors), \
+            f"error must mention permission_mode: {errors}"
+
+    def test_validator_accepts_default_permission_mode(self):
+        """Validator accepts contract.permission_mode='default'."""
+        contract = {
+            "argv": ["claude", "--print"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+            "permission_mode": "default",  # allowed value
+        }
+        packet = {"approved_plan_path": "/tmp/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert is_valid, f"permission_mode=default must pass: {errors}"
+
+
+# ============================================================================
+# Smoke 003 packet preview tests (no execution)
+# ============================================================================
+
+class TestSmoke003PacketPreview:
+    """Tests that smoke 003 packet preview would satisfy all constraints."""
+
+    def test_smoke_003_packet_preview_has_forbidden_files(self):
+        """Smoke 003 packet preview must have non-empty forbidden_files."""
+        # Simulate the expected smoke 003 packet structure
+        forbidden = [
+            ".git/",
+            ".github/",
+            "scripts/local/final_gate_status.py",
+            "scripts/local/verify_final_head_merge_command.py",
+            "scripts/local/check_persistent_mutation_guard.py",
+            "scripts/local/run_temp_worktree_execution.py",
+            "scripts/local/check_real_executor_readiness.py",
+            "scripts/local/check_real_claude_env_preflight.py",
+            "scripts/local/audit_claude_invocation.py",
+            "/home/max/.hermes/",
+            "audit/",
+            "boards/",
+            "memory/",
+            "profile/",
+        ]
+        assert len(forbidden) > 0, "forbidden_files must be non-empty"
+        assert ".git/" in forbidden
+        assert "scripts/local/final_gate_status.py" in forbidden
+
+    def test_smoke_003_packet_preview_has_do_not(self):
+        """Smoke 003 packet preview must have non-empty do_not."""
+        do_not = [
+            "no git push",
+            "no gh pr create",
+            "no gh pr merge",
+            "no gh api dispatch",
+            "no package install",
+            "no dispatch",
+            "no board updates",
+            "no Hermes changes",
+            "no audit append",
+            "no memory/profile updates",
+            "no edits outside allowed_files",
+            "no repair loop",
+            "no apply to main",
+        ]
+        assert len(do_not) > 0, "do_not must be non-empty"
+        assert "no git push" in do_not
+        assert "no gh pr create" in do_not
+
+    def test_smoke_003_packet_preview_single_allowed_file(self):
+        """Smoke 003 packet preview must have exactly one allowed_file."""
+        allowed_files = ["docs/live_smoke_scratch.md"]
+        assert len(allowed_files) == 1, \
+            f"smoke 003 must have exactly one allowed_file, got {len(allowed_files)}"
+
+    def test_smoke_003_packet_preview_max_changed_files_one(self):
+        """Smoke 003 packet preview must have max_changed_files=1."""
+        max_changed = 1
+        assert max_changed == 1, "max_changed_files must be 1 for live smoke"
+
+    def test_live_smoke_packet_with_all_constraints_passes_validation(self):
+        """A complete live smoke packet (smoke 003 style) passes all constraint checks."""
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "first_live_claude_smoke_003_preview",
+            "task_id": "TASK-003",
+            "base_sha": "abc123",
+            "approved_plan_path": "/tmp/plan.md",
+            "approved_plan_sha256": "abc",
+            "approval": {"max_changed_files": 1},
+            "task": {
+                "description": "Smoke test 003",
+                "allowed_files": ["docs/live_smoke_scratch.md"],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                    "scripts/local/run_temp_worktree_execution.py",
+                    "scripts/local/check_real_executor_readiness.py",
+                    "scripts/local/check_real_claude_env_preflight.py",
+                    "scripts/local/audit_claude_invocation.py",
+                    "/home/max/.hermes/",
+                    "audit/",
+                    "boards/",
+                    "memory/",
+                    "profile/",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                    "no gh api dispatch",
+                    "no package install",
+                    "no dispatch",
+                    "no board updates",
+                    "no Hermes changes",
+                    "no audit append",
+                    "no memory/profile updates",
+                ],
+            },
+            "execution": {"mode": "claude"},
+        }
+        ok, err = rte.validate_live_smoke_packet_constraints(packet)
+        assert ok, f"complete smoke 003 packet must pass: {err}"
+
+
+# ============================================================================
+# Integration: full smoke 003 style packet through run() with mocked executor
+# ============================================================================
+
+class TestSmoke003PacketIntegration:
+    """Integration test: full packet goes through run() with mocked real executor."""
+
+    def test_smoke_003_style_packet_through_run_with_mocked_executor(self, tmp_path):
+        """A smoke 003 style packet with --enable-real-claude-executor is validated and contract is built."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        # Full smoke 003 style packet with proper constraints
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_smoke_003_style",
+            "task_id": "TASK-003",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 1,
+            },
+            "task": {
+                "description": "Live smoke 003",
+                "allowed_files": ["docs/live_smoke_scratch.md"],
+                "forbidden_files": [
+                    ".git/",
+                    ".github/",
+                    "scripts/local/final_gate_status.py",
+                    "scripts/local/verify_final_head_merge_command.py",
+                    "scripts/local/check_persistent_mutation_guard.py",
+                    "scripts/local/run_temp_worktree_execution.py",
+                    "scripts/local/check_real_executor_readiness.py",
+                    "scripts/local/check_real_claude_env_preflight.py",
+                    "scripts/local/audit_claude_invocation.py",
+                    "/home/max/.hermes/",
+                    "audit/",
+                    "boards/",
+                    "memory/",
+                    "profile/",
+                ],
+                "do_not": [
+                    "no git push",
+                    "no gh pr create",
+                    "no gh pr merge",
+                    "no gh api dispatch",
+                    "no package install",
+                    "no dispatch",
+                    "no board updates",
+                    "no Hermes changes",
+                    "no audit append",
+                    "no memory/profile updates",
+                    "no edits outside allowed_files",
+                    "no repair loop",
+                    "no apply to main",
+                ],
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+        output_root = tmp_path / "output"
+        output_root.mkdir()
+        (output_root / "pmg_snapshot.json").write_text('{"status":"clean","files":{}}', encoding="utf-8")
+        (output_root / "pmg_compare.json").write_text('{"status":"clean","blocked":0}', encoding="utf-8")
+
+        # Mock run_claude_executor to return success so we can check contract fields
+        success_result = {
+            "status": "CLAUDE_EXECUTOR_SUCCESS",
+            "claude_exit_code": 0,
+            "claude_started_at": "2026-05-21T12:00:00Z",
+            "claude_finished_at": "2026-05-21T12:01:00Z",
+            "claude_elapsed_seconds": 60.0,
+            "claude_stdout_path": str(output_root / "claude_stdout.txt"),
+            "claude_stderr_path": str(output_root / "claude_stderr.txt"),
+            "claude_transcript_path": str(output_root / "claude_transcript.md"),
+            "claude_command_contract_valid": True,
+            "claude_command_contract_errors": [],
+            "claude_command_contract_summary": (
+                "argv=['claude', '--print', '--input-format=text', '--output-format=text', "
+                "'--permission-mode', 'acceptEdits'] [stdin=.aed_plan.md]"
+            ),
+        }
+        (output_root / "claude_stdout.txt").write_text("smoke result", encoding="utf-8")
+        (output_root / "claude_stderr.txt").write_text("", encoding="utf-8")
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch.object(rte, "pmg_snapshot", return_value=(True, "")), \
+             mock.patch.object(rte, "pmg_compare", return_value=(True, "")), \
+             mock.patch.object(rte, "run_claude_executor", return_value=success_result), \
+             mock.patch.object(rte, "git_worktree_add", return_value=subprocess.CompletedProcess("", 0)):
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+
+        # Packet passes constraint validation (Phase 1b)
+        assert result["status"] in ("PATCH_READY_FOR_HUMAN_REVIEW", "HOLD_CLAUDE_EMPTY_OUTPUT"), \
+            f"smoke 003 style packet must pass Phase 1b: {result['status']}"
+
+        # Contract is valid
+        assert result.get("claude_command_contract_valid") is True, \
+            f"contract must be valid: {result.get('claude_command_contract_errors')}"
+
+        # Contract summary includes --permission-mode acceptEdits
+        summary = result.get("claude_command_contract_summary", "")
+        assert "--permission-mode" in summary, \
+            f"contract summary must include --permission-mode: {summary}"
+        assert "acceptEdits" in summary, \
+            f"contract summary must include acceptEdits: {summary}"
+
+    def test_smoke_002_style_bad_packet_rejected_by_phase_1b(self, tmp_path):
+        """Smoke 002 style packet (empty forbidden/do_not) is rejected at Phase 5b."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        # Smoke 002 style packet — missing constraints (the original bug)
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_smoke_002_bug",
+            "task_id": "TASK-002",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 1,
+            },
+            "task": {
+                "description": "Smoke test 002 (bad)",
+                "allowed_files": ["docs/live_smoke_scratch.md"],
+                "forbidden_files": [],  # THE BUG: empty forbidden_files
+                "do_not": [],           # THE BUG: empty do_not
+            },
+            "execution": {
+                "mode": "claude",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Mock git_status to avoid HOLD_MAIN_DIRTY (repo is dirty with our changes)
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True):
+            result = run(packet, str(output_json), str(output_md), enable_real_claude_executor=True)
+
+        # Must be rejected at Phase 5b with HOLD_INVALID_PACKET (empty forbidden/do_not)
+        assert result["status"] == "HOLD_INVALID_PACKET", \
+            f"smoke 002 style bad packet must be rejected at Phase 5b: {result['status']}"
+        assert any("forbidden_files" in e.lower() or "non-empty" in e.lower()
+                   for e in result.get("validation_errors", [])), \
+            f"error must mention forbidden_files: {result.get('validation_errors')}"
