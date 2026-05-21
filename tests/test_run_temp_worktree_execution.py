@@ -1770,8 +1770,294 @@ class TestPMGPIntegration:
 
 
 # ---------------------------------------------------------------------------
-# Security tests
+# Command contract validator tests (pure functions, no git/subprocess)
 # ---------------------------------------------------------------------------
+
+class TestCommandContractValidator:
+    """Unit tests for build_claude_command_contract and validate_claude_command_contract."""
+
+    def test_build_contract_returns_valid_structure(self):
+        """Contract builder returns expected keys and types."""
+        import tempfile
+        from pathlib import Path
+
+        packet = {
+            "run_id": "test_build",
+            "base_sha": "abc123",
+            "execution": {"timeout_seconds": 60},
+        }
+        worktree = Path("/tmp/aed_runs/worktrees/test_build")
+        output = Path("/tmp/aed_runs/output/test_build")
+
+        contract = rte.build_claude_command_contract(packet, worktree, output)
+
+        assert "argv" in contract
+        assert "cwd" in contract
+        assert "timeout_seconds" in contract
+        assert "env_policy" in contract
+        assert "stdout_path" in contract
+        assert "stderr_path" in contract
+        assert "transcript_path" in contract
+        assert isinstance(contract["argv"], list)
+        assert all(isinstance(a, str) for a in contract["argv"])
+        assert contract["argv"][0] == "claude"
+
+    def test_validate_contract_cwd_not_under_worktrees(self):
+        """Invalid cwd outside /tmp/aed_runs/worktrees/ is rejected."""
+        import tempfile
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "/tmp/other/plan.md"],
+            "cwd": "/tmp/other/worktree",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/other/stdout.txt",
+            "stderr_path": "/tmp/other/stderr.txt",
+            "transcript_path": "/tmp/other/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/other/worktree")
+        output = Path("/tmp/other/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("/tmp/aed_runs/worktrees/" in e for e in errors)
+
+    def test_validate_contract_cwd_inside_repo(self):
+        """cwd inside main repo is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "/home/max/Automated-Edge-Discovery/plan.md"],
+            "cwd": "/home/max/Automated-Edge-Discovery",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/home/max/Automated-Edge-Discovery")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        # cwd inside repo is rejected (must be under worktrees_base AND outside main repo)
+        assert any("outside main repo" in e or "cwd must be under" in e for e in errors)
+
+    def test_validate_contract_forbidden_git_push(self):
+        """argv containing git push is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "git", "push"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("forbidden" in e.lower() for e in errors)
+
+    def test_validate_contract_forbidden_gh_pr_create(self):
+        """argv containing gh pr create is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "gh", "pr", "create"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("forbidden" in e.lower() for e in errors)
+
+    def test_validate_contract_forbidden_gh_pr_merge(self):
+        """argv containing gh pr merge is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "gh", "pr", "merge"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("forbidden" in e.lower() for e in errors)
+
+    def test_validate_contract_forbidden_npm_install(self):
+        """argv containing npm install is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "npm", "install"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("forbidden" in e.lower() for e in errors)
+
+    def test_validate_contract_timeout_zero_invalid(self):
+        """timeout_seconds <= 0 is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "plan.md"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 0,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("positive" in e.lower() for e in errors)
+
+    def test_validate_contract_timeout_exceeds_max_invalid(self):
+        """timeout_seconds > MAX_TIMEOUT_SECONDS is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "plan.md"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 999999,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("exceeds maximum" in e.lower() for e in errors)
+
+    def test_validate_contract_stdout_outside_output_root(self):
+        """stdout_path outside output_root is rejected."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "plan.md"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/other/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert not is_valid
+        assert any("stdout_path" in e and "output_root" in e for e in errors)
+
+    def test_validate_contract_valid_full_path(self):
+        """Valid contract with all paths correct passes validation."""
+        from pathlib import Path
+
+        contract = {
+            "argv": ["claude", "--no-input", "/tmp/aed_runs/worktrees/test/plan.md"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/test_stdout.txt",
+            "stderr_path": "/tmp/output/test_stderr.txt",
+            "transcript_path": "/tmp/output/test_transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        is_valid, errors = rte.validate_claude_command_contract(
+            contract, packet, worktree, output, repo_root
+        )
+        assert is_valid, f"Expected valid, got errors: {errors}"
+        assert len(errors) == 0
+
+    def test_validate_contract_no_subprocess_calls(self):
+        """Validator does not call subprocess (pure function)."""
+        import unittest.mock as mock
+
+        contract = {
+            "argv": ["claude", "--no-input", "plan.md"],
+            "cwd": "/tmp/aed_runs/worktrees/test",
+            "timeout_seconds": 60,
+            "stdout_path": "/tmp/output/stdout.txt",
+            "stderr_path": "/tmp/output/stderr.txt",
+            "transcript_path": "/tmp/output/transcript.md",
+        }
+        packet = {"approved_plan_path": "/tmp/other/plan.md"}
+        worktree = Path("/tmp/aed_runs/worktrees/test")
+        output = Path("/tmp/output")
+        repo_root = Path("/home/max/Automated-Edge-Discovery")
+
+        with mock.patch("subprocess.run", side_effect=Exception("subprocess.run called!")) as mock_run:
+            is_valid, errors = rte.validate_claude_command_contract(
+                contract, packet, worktree, output, repo_root
+            )
+        mock_run.assert_not_called()
+        assert is_valid  # valid contract, no subprocess call
+
 
 class TestSecurity:
     def test_no_forbidden_command_calls_in_harness(self):
