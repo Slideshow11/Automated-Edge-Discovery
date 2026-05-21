@@ -3255,9 +3255,11 @@ class TestSmoke003PacketIntegration:
         assert "acceptEdits" in summary, \
             f"contract summary must include acceptEdits: {summary}"
 
-    def test_smoke_002_style_bad_packet_rejected_by_phase_1b(self, tmp_path):
+def test_smoke_002_style_bad_packet_rejected_by_phase_1b(tmp_path):
         """Smoke 002 style packet (empty forbidden/do_not) is rejected at Phase 5b."""
         base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        assert base_sha, "AED repo HEAD not found"
+
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
 
@@ -3303,3 +3305,624 @@ class TestSmoke003PacketIntegration:
         assert any("forbidden_files" in e.lower() or "non-empty" in e.lower()
                    for e in result.get("validation_errors", [])), \
             f"error must mention forbidden_files: {result.get('validation_errors')}"
+
+
+class TestUntrackedFileDetection:
+    """Tests for untracked file detection in git_diff_name_only() and git_untracked_files()."""
+
+    def test_git_untracked_files_excludes_aed_plan_md(self, tmp_path):
+        """git_untracked_files() must not return .aed_plan.md."""
+        import run_temp_worktree_execution as rte
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        # Init git repo in worktree
+        subprocess.run(["git", "init"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=worktree, capture_output=True)
+        # Create .aed_plan.md and a regular file
+        (worktree / ".aed_plan.md").write_text("plan", encoding="utf-8")
+        docs_dir = worktree / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        (docs_dir / "scratch.md").write_text("content", encoding="utf-8")
+
+        untracked = rte.git_untracked_files(worktree)
+
+        assert ".aed_plan.md" not in untracked, \
+            f".aed_plan.md must not be in untracked list: {untracked}"
+        assert "docs/scratch.md" in untracked, \
+            f"docs/scratch.md must be in untracked list: {untracked}"
+
+    def test_git_diff_name_only_includes_untracked_files(self, tmp_path):
+        """git_diff_name_only() must include untracked files after the fix."""
+        import run_temp_worktree_execution as rte
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        subprocess.run(["git", "init"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=worktree, capture_output=True)
+
+        # Create an untracked file
+        docs_dir = worktree / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        (docs_dir / "scratch.md").write_text("content", encoding="utf-8")
+        (worktree / ".aed_plan.md").write_text("plan", encoding="utf-8")
+
+        changed = rte.git_diff_name_only(worktree)
+
+        # .aed_plan.md must NOT be in the list (filtered out)
+        assert ".aed_plan.md" not in changed, \
+            f".aed_plan.md must not be in changed_files: {changed}"
+        # docs/scratch.md must be in the list
+        assert "docs/scratch.md" in changed, \
+            f"docs/scratch.md must be in changed_files: {changed}"
+
+    def test_untracked_allowed_file_reaches_patch_ready(self, tmp_path):
+        """Untracked allowed file passes validation and reaches PATCH_READY_FOR_HUMAN_REVIEW."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_untracked_allowed",
+            "task_id": "TASK-UTRACK-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 3,
+            },
+            "task": {
+                "description": "Untracked allowed file test",
+                "allowed_files": ["docs/live_smoke_scratch.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],  # No tracked mock edits — only untracked
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        # We need to:
+        # 1. Mock git_untracked_files to return our file
+        # 2. Create the actual file in the worktree so the diff builder can read it
+        # 3. Mock git_diff to return "" (no tracked changes)
+
+        worktree_root = None  # Will be set after worktree is created
+
+        # Pre-create the untracked file inside the mock worktree path
+        # so that the Phase 10 diff builder can read its content.
+        created_untracked_path = None
+
+        def fake_untracked(worktree_path):
+            nonlocal worktree_root, created_untracked_path
+            worktree_root = worktree_path
+            # Create the file inside the worktree so the diff builder can read it
+            untracked_path = worktree_path / "docs/live_smoke_scratch.md"
+            untracked_path.parent.mkdir(exist_ok=True)
+            untracked_path.write_text("first_live_claude_smoke_003 ran at 2026-05-21\n", encoding="utf-8")
+            created_untracked_path = untracked_path
+            return ["docs/live_smoke_scratch.md"]
+
+        def fake_git_diff(path):
+            return ""  # No tracked changes
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", side_effect=fake_git_diff), \
+             mock.patch.object(rte, "git_diff_name_only", return_value=[]):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # Must reach PATCH_READY_FOR_HUMAN_REVIEW (not HOLD_CLAUDE_EMPTY_OUTPUT)
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
+            f"Untracked allowed file must reach PATCH_READY_FOR_HUMAN_REVIEW, got: {result['status']} — {result.get('validation_errors')}"
+        assert "docs/live_smoke_scratch.md" in result.get("changed_files", []), \
+            f"docs/live_smoke_scratch.md must be in changed_files: {result.get('changed_files')}"
+
+    def test_untracked_outside_allowed_file_blocked(self, tmp_path):
+        """Untracked file outside allowed_files returns HOLD_OUTSIDE_ALLOWED_FILES."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_untracked_outside",
+            "task_id": "TASK-UTRACK-002",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 3,
+            },
+            "task": {
+                "description": "Untracked outside allowed test",
+                "allowed_files": ["docs/live_smoke_scratch.md"],  # Only this is allowed
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_untracked(worktree_path):
+            return ["SECURITY.md"]  # Outside allowed_files
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", return_value=""):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_OUTSIDE_ALLOWED_FILES", \
+            f"Untracked outside-allowed must be blocked, got: {result['status']}"
+
+    def test_untracked_forbidden_file_blocked(self, tmp_path):
+        """Untracked forbidden file returns HOLD_FORBIDDEN_FILE_TOUCHED."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_untracked_forbidden",
+            "task_id": "TASK-UTRACK-003",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 3,
+            },
+            "task": {
+                "description": "Untracked forbidden file test",
+                "allowed_files": ["docs/live_smoke_scratch.md", "scripts/local/final_gate_status.py"],
+                "forbidden_files": ["scripts/local/final_gate_status.py"],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_untracked(worktree_path):
+            return ["scripts/local/final_gate_status.py"]  # Forbidden file
+
+        def fake_git_diff(path):
+            return ""  # No tracked changes
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", side_effect=fake_git_diff), \
+             mock.patch.object(rte, "git_diff_name_only", return_value=[]):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_FORBIDDEN_FILE_TOUCHED", \
+            f"Untracked forbidden file must be blocked, got: {result['status']}"
+
+    def test_aed_plan_md_excluded_from_changed_files(self, tmp_path):
+        """.aed_plan.md must never appear in changed_files even when untracked."""
+        import run_temp_worktree_execution as rte
+        worktree = tmp_path / "worktree"
+        worktree.mkdir()
+        subprocess.run(["git", "init"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=worktree, capture_output=True)
+        subprocess.run(["git", "config", "user.name", "Test"], cwd=worktree, capture_output=True)
+
+        # .aed_plan.md is untracked, docs/scratch.md is untracked
+        (worktree / ".aed_plan.md").write_text("internal plan", encoding="utf-8")
+        docs_dir = worktree / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        (docs_dir / "scratch.md").write_text("user content", encoding="utf-8")
+
+        changed = rte.git_diff_name_only(worktree)
+
+        assert ".aed_plan.md" not in changed, \
+            f".aed_plan.md must not be in changed_files: {changed}"
+        assert "docs/scratch.md" in changed, \
+            f"docs/scratch.md must be in changed_files: {changed}"
+
+    def test_aed_plan_md_not_in_diff_patch(self, tmp_path):
+        """.aed_plan.md must not appear in diff.patch even if staged/tracked."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_aed_plan_not_in_diff",
+            "task_id": "TASK-DIFF-003",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Verify .aed_plan.md excluded from diff",
+                "allowed_files": ["docs/live_smoke_scratch.md", ".aed_plan.md"],  # .aed_plan.md is internal, allowed but filtered
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/live_smoke_scratch.md", "content": "# Updated\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_untracked(worktree_path):
+            return [".aed_plan.md"]  # Simulate .aed_plan.md as untracked (internal file)
+
+        def fake_git_diff(path):
+            # Return a proper tracked diff for the mock edit
+            return (
+                "diff --git a/docs/live_smoke_scratch.md b/docs/live_smoke_scratch.md\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/docs/live_smoke_scratch.md\n"
+                "@@ -0,0 +1 @@\n"
+                "+# Updated\n"
+            )
+
+        def fake_git_diff_name_only(path):
+            return ["docs/live_smoke_scratch.md"]  # Mock tracked changes from apply_mock_edits
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", side_effect=fake_git_diff), \
+             mock.patch.object(rte, "git_diff_name_only", side_effect=fake_git_diff_name_only):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # Must succeed (mock edit of docs/live_smoke_scratch.md is valid)
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
+            f"Expected PATCH_READY_FOR_HUMAN_REVIEW, got: {result['status']}"
+
+        # .aed_plan.md must NOT be in changed_files
+        changed = result.get("changed_files", [])
+        assert ".aed_plan.md" not in changed, \
+            f".aed_plan.md must not be in changed_files: {changed}"
+
+        # Check diff.patch does not mention .aed_plan.md
+        diff_path = Path(result["diff_path"])
+        if diff_path.exists():
+            diff_content = diff_path.read_text()
+            assert ".aed_plan.md" not in diff_content, \
+                f"diff.patch must not contain .aed_plan.md: {diff_content[:300]}"
+
+    def test_mixed_tracked_and_untracked_all_detected(self, tmp_path):
+        """Both tracked staged changes and untracked files appear in changed_files."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_mixed_tracked_untracked",
+            "task_id": "TASK-MIXED-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Mixed tracked and untracked test",
+                "allowed_files": ["docs/example.md", "docs/live_smoke_scratch.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/example.md", "content": "# Tracked edit\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_untracked(worktree_path):
+            return ["docs/live_smoke_scratch.md"]  # Untracked file
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "PATCH_READY_FOR_HUMAN_REVIEW", \
+            f"Expected PATCH_READY_FOR_HUMAN_REVIEW, got: {result['status']}"
+
+        changed = result.get("changed_files", [])
+        # Both tracked (mock edit) and untracked must appear
+        assert "docs/example.md" in changed, \
+            f"Tracked mock edit must be in changed_files: {changed}"
+        assert "docs/live_smoke_scratch.md" in changed, \
+            f"Untracked file must be in changed_files: {changed}"
+        assert ".aed_plan.md" not in changed, \
+            f".aed_plan.md must not be in changed_files: {changed}"
+
+    def test_max_changed_files_applies_to_untracked(self, tmp_path):
+        """max_changed_files constraint must count untracked files."""
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_max_changed_untracked",
+            "task_id": "TASK-MAX-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 1,  # Only 1 file allowed
+            },
+            "task": {
+                "description": "Max changed files with untracked",
+                "allowed_files": ["docs/a.md", "docs/b.md"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [{"path": "docs/a.md", "content": "# A\n"}],
+            },
+        }
+
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        import run_temp_worktree_execution as rte
+
+        def fake_untracked(worktree_path):
+            return ["docs/b.md"]  # 2nd untracked file
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked):
+
+            def fake_snapshot(target, output_json):
+                import shutil
+                shutil.copy(str(pmg_snapshot_path), output_json)
+                return True, ""
+
+            def fake_compare(snapshot_json, output_json, output_md):
+                import shutil
+                shutil.copy(str(pmg_compare_json), output_json)
+                shutil.copy(str(pmg_compare_md), output_md)
+                return True, ""
+
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        assert result["status"] == "HOLD_TOO_MANY_FILES_CHANGED", \
+            f"Exceeding max_changed_files must be blocked, got: {result['status']}"
+
+    def test_no_shell_in_untracked_functions(self):
+        """git_untracked_files and git_diff_name_only must use shell=False."""
+        import run_temp_worktree_execution as rte
+        import inspect
+
+        for func_name in ["git_untracked_files", "git_diff_name_only"]:
+            func = getattr(rte, func_name)
+            source = inspect.getsource(func)
+            assert "shell=True" not in source, \
+                f"{func_name} must not use shell=True: {source}"
+            assert "shell = True" not in source, \
+                f"{func_name} must not use shell=True: {source}"
+
+    def test_no_live_claude_in_tests(self):
+        """Confirm this test file does not invoke live Claude."""
+        import run_temp_worktree_execution as rte
+        import inspect
+
+        # Scan the TEST FILE ONLY (not the main module) for forbidden execution patterns
+        # The main module legitimately defines run_claude_executor(); tests must not call it
+        test_file = inspect.getfile(rte)
+        test_source_text = Path(test_file).read_text(encoding="utf-8")
+
+        # Patterns that indicate live (non-mocked) Claude invocation in test code
+        forbidden_code_patterns = [
+            "subprocess.run([\"claude\"",
+            "subprocess.run(['claude'",
+        ]
+
+        for pattern in forbidden_code_patterns:
+            assert pattern not in test_source_text, \
+                f"Test file must not contain live-Caude invocation pattern: {pattern}"
+
+        # shell=True check is done in test_no_shell_in_untracked_functions

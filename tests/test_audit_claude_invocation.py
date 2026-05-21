@@ -47,7 +47,9 @@ def _run_audit(
     mock_git_clean: bool = True,
 ) -> dict:
     """Run audit_invocation() directly with mocked git status."""
-    import scripts.local.audit_claude_invocation as audit
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+    import audit_claude_invocation as audit
 
     def fake_git_clean(repo_root):
         return mock_git_clean
@@ -318,7 +320,9 @@ class TestRealClaudeInvokedAlwaysFalse:
 class TestOutputFiles:
     def test_json_output_written(self, mock_run_dir, tmp_path):
         out_json = tmp_path / "audit.json"
-        import scripts.local.audit_claude_invocation as audit
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import audit_claude_invocation as audit
         with patch.object(audit, "_git_status_clean", lambda r: True):
             result = audit.audit_invocation(
                 run_root=mock_run_dir,
@@ -335,7 +339,9 @@ class TestOutputFiles:
 
     def test_md_output_written(self, mock_run_dir, tmp_path):
         out_md = tmp_path / "audit.md"
-        import scripts.local.audit_claude_invocation as audit
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import audit_claude_invocation as audit
         with patch.object(audit, "_git_status_clean", lambda r: True):
             result = audit.audit_invocation(
                 run_root=mock_run_dir,
@@ -479,7 +485,9 @@ class TestPmgStatus:
 
     def test_pmg_clean_does_not_block(self, mock_run_dir):
         """PMG status clean → does not override mock classification."""
-        import scripts.local.audit_claude_invocation as audit
+        import sys as _sys
+        _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+        import audit_claude_invocation as audit
         with patch.object(audit, "_git_status_clean", lambda r: True):
             result = audit.audit_invocation(
                 run_root=mock_run_dir,
@@ -489,5 +497,6 @@ class TestPmgStatus:
                 output_json=None,
                 output_md=None,
             )
-        # Should be MOCK_ONLY, not blocked by PMG
-        assert result["status"] == STATE_MOCK_ONLY
+            # Should be MOCK_ONLY, not blocked — pmg_status may not be present
+            # when no pmg artifact exists; the key check is status is MOCK_ONLY
+            assert result["status"] == STATE_MOCK_ONLY

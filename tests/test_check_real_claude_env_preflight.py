@@ -68,7 +68,9 @@ def _run_direct(**kwargs):
     Run preflight.run_preflight() directly with full mocking of all
     environment-dependent helpers.
     """
-    import scripts.local.check_real_claude_env_preflight as preflight
+    import sys as _sys
+    _sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+    import check_real_claude_env_preflight as preflight
 
     mock_git_dirty       = kwargs.pop("mock_git_dirty",       False)
     mock_tty             = kwargs.pop("mock_tty",              True)
