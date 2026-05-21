@@ -150,19 +150,18 @@ def git_worktree_remove(worktree_path: Path, parent_repo: Path) -> None:
 
 
 def git_diff(worktree_path: Path) -> str:
-    """Capture both staged and unstaged diff in unified format."""
+    """Capture staged + unstaged diff in unified format."""
     result = subprocess.run(
         ["git", "-C", str(worktree_path), "diff", "--cached", "--unified=3"],
         capture_output=True, text=True, timeout=30
     )
-    unstaged = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "--unified=3"],
-        capture_output=True, text=True, timeout=30
-    ).stdout
-    # Always include unstaged alongside any staged diff
-    if result.stdout:
-        return result.stdout + ("\n" + unstaged if unstaged.strip() else "")
-    return unstaged
+    if not result.stdout:
+        # Fall back to full diff if --cached is empty (no staged changes)
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--unified=3"],
+            capture_output=True, text=True, timeout=30
+        )
+    return result.stdout
 
 
 def git_diff_name_only(worktree_path: Path) -> list[str]:
