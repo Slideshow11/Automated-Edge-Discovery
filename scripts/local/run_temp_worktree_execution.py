@@ -172,8 +172,8 @@ def pmg_snapshot(target_path: str | Path, output_json: str | Path) -> tuple[bool
         sys.executable,
         str(PMG_TOOL),
         "snapshot",
-        "--target", str(target_path),
-        "--output-json", str(output_json),
+        "--root", str(target_path),
+        "--output", str(output_json),
     ]
     try:
         result = subprocess.run(
@@ -197,11 +197,13 @@ def pmg_compare(snapshot_json: str | Path, output_json: str | Path, output_md: s
     Run PMG compare against snapshot_json and write JSON+MD results.
     Returns (success, error_message).
     """
+    pmg_target = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
     cmd = [
         sys.executable,
         str(PMG_TOOL),
         "compare",
-        "--snapshot-json", str(snapshot_json),
+        "--root", pmg_target,
+        "--before", str(snapshot_json),
         "--output-json", str(output_json),
         "--output-md", str(output_md),
     ]
