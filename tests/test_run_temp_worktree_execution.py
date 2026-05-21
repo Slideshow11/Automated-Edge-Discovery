@@ -1758,8 +1758,8 @@ class TestDiffCapture:
         assert result["changed_files"] == ["docs/example.md"]
         # diff_path must be under output_root, not inside the worktree
         diff_path = Path(result["diff_path"])
-        assert str(tmp_path / "output") in str(diff_path), \
-            f"diff.patch must be under output_root ({tmp_path / 'output'}), got: {diff_path}"
+        assert diff_path.parent.resolve() == (tmp_path / "output").resolve(), \
+            f"diff.patch must be directly under output_root ({tmp_path / 'output'}), got parent: {diff_path.parent}"
         # diff.patch must survive worktree cleanup (written to output_root, not worktree)
         assert diff_path.exists(), f"diff.patch does not exist at {diff_path}"
         diff_content = diff_path.read_text()

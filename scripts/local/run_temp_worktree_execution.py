@@ -574,7 +574,8 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # If no mock_edits, the worktree should be clean (no files changed)
     if not changed_files:
         # Write an empty diff for the no-change case
-        diff_path = str(worktree_root / "diff.patch")
+        output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+        diff_path = str(output_root / "diff.patch")
         Path(diff_path).write_text("", encoding="utf-8")
         result["status"] = "PATCH_READY_FOR_HUMAN_REVIEW"
         result["changed_files"] = []
