@@ -143,10 +143,17 @@ def git_worktree_remove(worktree_path: Path, parent_repo: Path) -> None:
 
 
 def git_diff(worktree_path: Path) -> str:
+    """Capture staged + unstaged diff in unified format."""
     result = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "-- unified=3"],
+        ["git", "-C", str(worktree_path), "diff", "--cached", "--unified=3"],
         capture_output=True, text=True, timeout=30
     )
+    if not result.stdout:
+        # Fall back to full diff if --cached is empty (no staged changes)
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "diff", "--unified=3"],
+            capture_output=True, text=True, timeout=30
+        )
     return result.stdout
 
 
@@ -567,7 +574,8 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # If no mock_edits, the worktree should be clean (no files changed)
     if not changed_files:
         # Write an empty diff for the no-change case
-        diff_path = str(worktree_root / "diff.patch")
+        output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+        diff_path = str(output_root / "diff.patch")
         Path(diff_path).write_text("", encoding="utf-8")
         result["status"] = "PATCH_READY_FOR_HUMAN_REVIEW"
         result["changed_files"] = []
@@ -639,10 +647,20 @@ def run(packet: dict, output_json: str, output_md: str) -> dict:
     # ---- Phase 10: Collect changed files and diff --------------------------
 
     diff_text = git_diff(worktree_root)
-    result["diff_path"] = str(worktree_root / "diff.patch")
-    Path(result["diff_path"]).write_text(diff_text, encoding="utf-8")
+    output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
+    diff_path = output_root / "diff.patch"
+    diff_path.write_text(diff_text, encoding="utf-8")
+    result["diff_path"] = str(diff_path)
 
     result["changed_files"] = changed_files
+
+    # If changed_files is non-empty but diff is empty, block — diff is required for human review
+    if changed_files and not diff_text.strip():
+        result["status"] = "HOLD_DIFF_VALIDATION_FAILED"
+        result["validation_errors"] = ["changed_files is non-empty but diff.patch is empty"]
+        result["next_action"] = "check git diff capture; ensure mock_edits are staged correctly"
+        _write_output(result, output_json, output_md)
+        return result
 
     # ---- Phase 11: Diff validation -----------------------------------------
 
