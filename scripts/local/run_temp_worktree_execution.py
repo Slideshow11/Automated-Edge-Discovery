@@ -150,38 +150,28 @@ def git_worktree_remove(worktree_path: Path, parent_repo: Path) -> None:
 
 
 def git_diff(worktree_path: Path) -> str:
-    """Capture staged + unstaged diff in unified format."""
+    """Capture complete worktree diff from HEAD to current state (staged + unstaged).
+
+    Uses git-diff-HEAD so the diff always reflects the final worktree state,
+    regardless of whether changes are staged, unstaged, or both.
+    """
     result = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "--cached", "--unified=3"],
+        ["git", "-C", str(worktree_path), "diff", "HEAD", "--unified=3"],
         capture_output=True, text=True, timeout=30
     )
-    if not result.stdout:
-        # Fall back to full diff if --cached is empty (no staged changes)
-        result = subprocess.run(
-            ["git", "-C", str(worktree_path), "diff", "--unified=3"],
-            capture_output=True, text=True, timeout=30
-        )
     return result.stdout
 
 
 def git_diff_name_only(worktree_path: Path) -> list[str]:
-    """Return list of all changed file paths (staged AND unstaged) in worktree."""
-    staged = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "--cached", "--name-only"],
+    """Return list of all changed file paths (staged AND unstaged) relative to HEAD.
+
+    Uses git diff HEAD to capture the same scope as git_diff().
+    """
+    result = subprocess.run(
+        ["git", "-C", str(worktree_path), "diff", "HEAD", "--name-only"],
         capture_output=True, text=True, timeout=30
-    ).stdout.splitlines()
-    unstaged = subprocess.run(
-        ["git", "-C", str(worktree_path), "diff", "--name-only"],
-        capture_output=True, text=True, timeout=30
-    ).stdout.splitlines()
-    seen = set()
-    result = []
-    for line in staged + unstaged:
-        line = line.strip()
-        if line and line not in seen:
-            seen.add(line)
-            result.append(line)
-    return result
+    )
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
 
 # ---------------------------------------------------------------------------
