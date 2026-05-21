@@ -21,8 +21,7 @@ SCRIPT = REPO_ROOT / "scripts/local/build_temp_worktree_execution_packet.py"
 def run_bridge(argv):
     """Run the bridge script. Returns (exitcode, stdout, stderr)."""
     cmd = [sys.executable, str(SCRIPT)] + argv
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
-                       cwd=str(REPO_ROOT))
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     return r.returncode, r.stdout, r.stderr
 
 
