@@ -651,6 +651,37 @@ class TestUntrackedFilesExpected:
         assert status == "APPLIED_BRANCH_READY"
         assert "docs/new.md" in checks.get("untracked_expected", [])
 
+    def test_new_untracked_directory_with_file(self, tmp_path):
+        """With git status -uall, a new untracked directory shows individual file paths."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Create a new directory with a new file inside - no tracked parent dir
+        new_dir = repo / "newdocs"
+        new_dir.mkdir()
+        new_file = new_dir / "page.md"
+        new_file.write_text("new page\n", encoding="utf-8")
+        # Verify git status shows the file, not just the directory
+        r_status = subprocess.run(
+            ["git", "status", "--short", "-uall", "--"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        # Should show ?? newdocs/page.md not just ?? newdocs/
+        assert "?? newdocs/page.md" in r_status.stdout, f"git status -uall should show file: {r_status.stdout}"
+
+        result_path = make_result_json(tmp_path, changed_files=["newdocs/page.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["newdocs/page.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        assert "newdocs/page.md" in checks.get("untracked_expected", [])
+
 
 class TestUntrackedFilesUnexpected:
     """HOLD_UNEXPECTED_UNTRACKED_FILE when unexpected untracked file is present."""

@@ -304,6 +304,7 @@ def verify(
         repo_root,
         "status",
         "--short",
+        "-uall",
         "--",
     )
     untracked_files = []
