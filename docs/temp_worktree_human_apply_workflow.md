@@ -52,35 +52,59 @@ Before any future apply tool runs, it must receive all of the following as expli
 
 ## 4. Required Pre-Apply Checks
 
-The future apply tool must verify ALL of the following before emitting any apply preview or executing any apply step:
+The apply tool must verify ALL of the following before emitting any apply preview or executing any apply step. Checks are organized into three tiers:
+
+### Tier 1 — Verifier Artifact-Level Checks (delegated to `verify_temp_worktree_apply_readiness.py`)
 
 | # | Check | Failure State |
 |---|-------|---------------|
-| 1 | Repo `git status` is clean (no staged/unstaged changes) | `HOLD_REPO_DIRTY` |
-| 2 | Current HEAD SHA matches `--expected-head` | `HOLD_EXPECTED_HEAD_MISMATCH` |
-| 3 | `verify_temp_worktree_apply_readiness.py` returned `APPLY_READY` for this exact `result.json` + `diff.patch` pair | `HOLD_READINESS_NOT_APPLY_READY` |
-| 4 | `apply-readiness-json` is valid JSON with `status: APPLY_READY` | `HOLD_READINESS_INVALID_JSON` |
-| 5 | `changed_files` from `result.json` is non-empty | `HOLD_CHANGED_FILES_EMPTY` |
-| 6 | `changed_files` contains no duplicates | `HOLD_CHANGED_FILES_DUPLICATE` |
-| 7 | All `changed_files` are within `allowed_files` | `HOLD_OUTSIDE_ALLOWED_FILES` |
-| 8 | No `changed_files` are in `forbidden_files` | `HOLD_FORBIDDEN_FILE_TOUCHED` |
-| 9 | `changed_files` count ≤ `max_changed_files` | `HOLD_TOO_MANY_FILES_CHANGED` |
-| 10 | `.aed_plan.md` is NOT in `changed_files` | `HOLD_AED_PLAN_INCLUDED` |
-| 11 | `.aed_plan.md` is NOT in `diff.patch` content | `HOLD_AED_PLAN_INCLUDED` |
-| 12 | `diff.patch` is non-empty | `HOLD_DIFF_EMPTY` |
-| 13 | `diff.patch` contains every path in `changed_files` | `HOLD_DIFF_MISSING_CHANGED_FILE` |
-| 14 | `diff.patch` contains no `forbidden_files` paths | `HOLD_DIFF_CONTAINS_FORBIDDEN_FILE` |
-| 15 | PMG status is clean | `HOLD_PMG_NOT_CLEAN` |
-| 16 | Worktree path is outside the repo | `HOLD_WORKTREE_INSIDE_REPO` |
-| 17 | `diff.patch` path is outside the repo | `HOLD_PATCH_PATH_INSIDE_REPO` |
-| 18 | Command contract in `result.json` shows `shell=False` | `HOLD_COMMAND_CONTRACT_UNSAFE` |
-| 19 | `approval-token` is present and non-empty | `HOLD_APPROVAL_MISSING` |
-| 20 | `real_claude_invoked` is true in `result.json` (when `--require-real-claude` is passed) | `HOLD_CLAUDE_NOT_INVOKED` |
-| 21 | No `git push`, `gh pr create`, `gh pr merge`, `dispatch`, `board`, Hermes, audit, memory, profile, or package-install strings in `result.json` command contract | `HOLD_COMMAND_CONTRACT_UNSAFE` |
-| 22 | `result.json` has `claude_exit_code: 0` (when present) | `HOLD_CLAUDE_EXIT_NONZERO` |
-| 23 | `verify_temp_worktree_apply_readiness.py` is re-run internally with the provided inputs as a sanity check | `HOLD_READINESS_INTERNAL_MISMATCH` |
+| 1 | `result.json` exists and is valid JSON | `HOLD_RESULT_MISSING` / `HOLD_RESULT_INVALID_JSON` |
+| 2 | `diff.patch` exists and is non-empty | `HOLD_DIFF_MISSING` / `HOLD_DIFF_EMPTY` |
+| 3 | Result status is `PATCH_READY_FOR_HUMAN_REVIEW` | `HOLD_STATUS_NOT_PATCH_READY` |
+| 4 | `changed_files` is non-empty and has no duplicates | `HOLD_CHANGED_FILES_EMPTY` / `HOLD_CHANGED_FILES_DUPLICATE` |
+| 5 | `.aed_plan.md` is NOT in `changed_files` and NOT in `diff.patch` | `HOLD_AED_PLAN_INCLUDED` |
+| 6 | All `changed_files` are within `allowed_files` | `HOLD_OUTSIDE_ALLOWED_FILES` |
+| 7 | No `changed_files` are in `forbidden_files` | `HOLD_FORBIDDEN_FILE_TOUCHED` |
+| 8 | `changed_files` count ≤ `max_changed_files` | `HOLD_TOO_MANY_FILES_CHANGED` |
+| 9 | `diff.patch` contains every path in `changed_files` | `HOLD_DIFF_MISSING_CHANGED_FILE` |
+| 10 | `diff.patch` contains no `forbidden_files` paths | `HOLD_DIFF_CONTAINS_FORBIDDEN_FILE` |
+| 11 | **Command contract in `result.json` shows no `shell=True` and no dangerous bypass flags** | **`HOLD_COMMAND_CONTRACT_UNSAFE`** |
+| 12 | Packet metadata present (`allowed_files`/`forbidden_files`/`max_changed_files`) | `HOLD_PACKET_METADATA_MISSING` |
 
----
+> **Why command-contract (check 11) is an artifact-level check:** The command contract describes what was actually invoked on the artifact. A dirty local repo must not mask an unsafe `shell=True` contract — the artifact-level failure is the more specific signal and is reported first by the verifier. A clean repo is still required for `APPLY_READY`; this ordering does not weaken that requirement.
+
+### Tier 2 — Verifier Artifact-Environment Relationship Checks
+
+| # | Check | Failure State |
+|---|-------|---------------|
+| 13 | Output paths (`--output-json`, `--output-md`) are outside the repo | `HOLD_OUTPUT_INSIDE_REPO` |
+| 14 | `worktree_path` is outside the repo | `HOLD_WORKTREE_INSIDE_REPO` |
+| 15 | `diff.patch` path is outside the repo | `HOLD_PATCH_PATH_INSIDE_REPO` |
+
+### Tier 3 — Environment Checks (checked after artifact checks pass)
+
+| # | Check | Failure State |
+|---|-------|---------------|
+| 16 | **Repo `git status` is clean (no staged/unstaged changes)** | **`HOLD_REPO_DIRTY`** |
+| 17 | PMG status is clean (when `--require-pmg-clean` is passed) | `HOLD_PMG_NOT_CLEAN` |
+
+### Tier 4 — Apply-Tool-Specific Checks
+
+| # | Check | Failure State |
+|---|-------|---------------|
+| 18 | Current HEAD SHA matches `--expected-head` | `HOLD_EXPECTED_HEAD_MISMATCH` |
+| 19 | `verify_temp_worktree_apply_readiness.py` returned `APPLY_READY` for this exact `result.json` + `diff.patch` pair | `HOLD_READINESS_NOT_APPLY_READY` |
+| 20 | `apply-readiness-json` is valid JSON with `status: APPLY_READY` | `HOLD_READINESS_INVALID_JSON` |
+| 21 | `approval-token` is present and non-empty | `HOLD_APPROVAL_MISSING` |
+| 22 | `real_claude_invoked` is true in `result.json` (when `--require-real-claude` is passed) | `HOLD_CLAUDE_NOT_INVOKED` |
+| 23 | `result.json` has `claude_exit_code: 0` (when present) | `HOLD_CLAUDE_EXIT_NONZERO` |
+| 24 | `verify_temp_worktree_apply_readiness.py` is re-run internally as a sanity check | `HOLD_READINESS_INTERNAL_MISMATCH` |
+
+> **Why check 16 (`HOLD_REPO_DIRTY`) is after checks 1–15:** The verifier reports the most specific failure it can determine. If an artifact has an unsafe command contract (check 11), the verifier returns `HOLD_COMMAND_CONTRACT_UNSAFE` before checking repo cleanliness. Only when the artifact is valid does the verifier check environment state and return `HOLD_REPO_DIRTY` if the local repo is dirty. This ensures a dirty development machine does not mask an unsafe artifact.
+
+### Fallback for Manual Verification
+
+If running the verifier is not possible, a human can check checks 1–24 in the order above. The most specific applicable failure is the correct result.
 
 ## 5. Implementation Path: Option A (Read-Only Preview) First
 
