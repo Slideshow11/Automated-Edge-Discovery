@@ -182,11 +182,12 @@ def get_pr_changed_files(pr_number: int, repo: str, head_sha: str) -> list[str]:
 
     Uses ``git diff --name-only main...<head_sha>`` locally so it respects
     local branch state and never touches the network beyond the local repo.
+    cwd is always the current working directory (the local repo root), not
+    the GitHub repo slug passed via --repo.
     """
     try:
         result = subprocess.run(
             ["git", "diff", "--name-only", f"main...{head_sha}"],
-            cwd=repo,
             capture_output=True,
             text=True,
             timeout=15,
@@ -322,8 +323,15 @@ def is_docs_only(paths: list[str]) -> bool:
         p = path.startswith("./") and path[2:] or path
         if p.endswith("/"):
             return False
-        filename = p.rsplit("/", 1)[-1] if "/" in p else p
-        if filename in _DOCS_ONLY_ROOT_FILES:
+        # Determine whether this is a top-level (root) path or a nested path.
+        # Only root-level filenames (not inside any directory) are allowed
+        # as a docs-only safe list.
+        is_root = "/" not in p
+        filename = p.rsplit("/", 1)[-1] if not is_root else p
+
+        # Root-level known doc files (README.md, LICENSE, etc.) are safe
+        # only when they are at the repo root — not inside subdirectories.
+        if is_root and filename in _DOCS_ONLY_ROOT_FILES:
             continue
         if any(p.startswith(prefix) for prefix in _DOCS_ONLY_PREFIXES):
             ext = filename[filename.rfind("."):] if "." in filename else ""

@@ -788,6 +788,15 @@ class TestIsDocsOnly:
     def test_doc_subdirectory_md_is_docs_only(self):
         assert fgs.is_docs_only(["doc/architecture.md"]) is True
 
+    def test_nested_readme_not_docs_only(self):
+        assert fgs.is_docs_only(["src/package/README.md"]) is False
+
+    def test_nested_license_not_docs_only(self):
+        assert fgs.is_docs_only(["vendor/LICENSE"]) is False
+
+    def test_nested_governance_not_docs_only(self):
+        assert fgs.is_docs_only(["src/GOVERNANCE.md"]) is False
+
     def test_json_in_docs_not_docs_only(self):
         assert fgs.is_docs_only(["docs/example.json"]) is False
 
