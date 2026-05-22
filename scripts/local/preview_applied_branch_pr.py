@@ -225,7 +225,8 @@ def verify(
     checks["repo_clean"] = True
 
     # ── 10. Changed files from verification are non-empty and unique ─────────
-    changed_files = verification.get("changed_files_actual") or verification.get("changed_files_expected") or []
+    raw_changed = verification.get("changed_files_actual") or verification.get("changed_files_expected") or []
+    changed_files = [f for f in raw_changed if f]  # filter empty strings
     checks["changed_files"] = changed_files
     if not changed_files:
         return STATE_HOLD_CHANGED_FILES_EMPTY, {**checks}
@@ -261,8 +262,11 @@ def verify(
     checks["aed_plan_excluded"] = True
 
     # ── 13. Forbidden files not in branch diff ──────────────────────────────
-    task = verification.get("task", {})
-    forbidden_files = task.get("forbidden_files", [])
+    task_data = verification.get("task", {})
+    if isinstance(task_data, dict):
+        forbidden_files = task_data.get("forbidden_files", [])
+    else:
+        forbidden_files = []
     checks["forbidden_files"] = forbidden_files
     if forbidden_files:
         touched = [f for f in branch_diff_files if f in forbidden_files]

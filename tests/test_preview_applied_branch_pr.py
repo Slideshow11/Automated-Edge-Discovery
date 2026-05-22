@@ -322,6 +322,27 @@ class TestChangedFilesDuplicate:
         )
         assert status == "HOLD_CHANGED_FILES_DUPLICATE"
 
+    def test_empty_string_in_changed_files_is_filtered(self, tmp_path):
+        """Empty strings in changed_files are filtered out and don't cause spurious mismatch."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["", "docs/scratch.md"],  # empty string + valid file
+            changed_files_actual=["", "docs/scratch.md"],
+        )
+
+        status, _ = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        # Empty string should be filtered; verification should pass with filtered list
+        # The branch has docs/scratch.md only, and filtered changed_files is ["docs/scratch.md"]
+        # So this should be PR_PREVIEW_READY (not HOLD_BRANCH_DIFF_MISMATCH)
+        assert status == "PR_PREVIEW_READY"
+
 
 class TestBranchDiffMismatch:
     """HOLD_BRANCH_DIFF_MISMATCH when branch diff doesn't match changed_files."""
@@ -434,6 +455,27 @@ class TestForbiddenFileTouched:
             repo, json_path, "apply/test", "main", base_sha,
         )
         assert status == "HOLD_FORBIDDEN_FILE_TOUCHED"
+
+    def test_non_dict_task_does_not_crash(self, tmp_path):
+        """Non-dict task field does not raise AttributeError; forbidden_files treated as empty."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+            task="not_a_dict",  # string instead of dict
+        )
+
+        status, _ = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        # Must not raise; should return PR_PREVIEW_READY since forbidden_files defaults to []
+        # (conservative: non-dict task means no forbidden files to check)
+        assert status == "PR_PREVIEW_READY"
 
 
 class TestNoShellInTool:
