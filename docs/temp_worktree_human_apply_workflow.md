@@ -307,7 +307,18 @@ The combined state means:
 
 ---
 
-## 11. Open Questions
+## 12. Process Gap Record (2026-05-22)
+
+**Commit `3841710`** ("feat: gated temp-worktree patch apply-to-local-branch tool") implemented Option B and landed on `main` without a GitHub PR review due to a recovery workflow that caused GitHub to see zero diff between the feature branch and main.
+
+The full process gap record, safety audit evidence, validation results, and forward guardrail are documented in:
+**`docs/apply_tool_direct_main_process_gap_3841710.md`**
+
+On merge of that record: `PROCESS_HOLD_REMEDIATION_REQUIRED` → `PROCESS_GAP_RECORDED_CODE_SAFE`.
+
+---
+
+## 13. Open Questions
 
 1. Should `--approval-token` be a specific phrase or any non-empty string? (Recommended: any non-empty string, but documented minimum length.)
 2. Should Option A also run `git apply --check` as part of the preview, so the preview itself confirms the patch is applicable? (Recommended: yes, run `git apply --check` and include the output.)
