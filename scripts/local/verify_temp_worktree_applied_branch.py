@@ -333,9 +333,47 @@ def verify(
         }
     checks["no_unexpected_untracked"] = True
 
+    # ── 14b.2. Tracked modified files — git apply on same-revision applied
+    #        branches leaves modifications in index/worktree rather than as
+    #        committed changes (branch head == base sha, so committed diff empty).
+    #        Detect via git status --short. Stage codes:
+    #          "M " = modified in index (staged)  ← git apply uses this
+    #          " M" = modified in worktree
+    #          "MM" = modified in both index+worktree
+    #        We accept any stage where stage[0] == 'M' and stage != "??".
+    tracked_modified = []
+    if r_status.returncode == 0:
+        for line in r_status.stdout.strip().splitlines():
+            if not line:
+                continue
+            ls = line.lstrip()
+            parts = ls.split(" ", 1)
+            if len(parts) < 2:
+                continue
+            stage = parts[0]
+            is_modified = len(stage) >= 1 and stage[0] == "M" and stage != "??"
+            if is_modified:
+                path = parts[1].strip()
+                if path:
+                    tracked_modified.append(path)
+
+    tracked_modified_expected = sorted(f for f in tracked_modified if f in expected_set)
+    tracked_modified_unexpected = sorted(f for f in tracked_modified if f not in expected_set)
+
+    checks["tracked_modified"] = tracked_modified
+    checks["tracked_modified_expected"] = tracked_modified_expected
+    checks["tracked_modified_unexpected"] = tracked_modified_unexpected
+
+    if tracked_modified_unexpected:
+        return STATE_HOLD_UNEXPECTED_UNTRACKED, {
+            **checks,
+            "unexpected_dirty_tracked_files": tracked_modified_unexpected,
+        }
+    checks["no_unexpected_dirty_tracked"] = True
+
     # ── 15. Branch diff must contain exactly the result changed_files ─────────
-    #        Include expected untracked files that came from git apply.
-    actual_applied = set(branch_changed_files) | set(untracked_expected)
+    #        Include expected untracked files and expected tracked modified files.
+    actual_applied = set(branch_changed_files) | set(untracked_expected) | set(tracked_modified_expected)
     branch_set = actual_applied
     if branch_set != expected_set:
         extra = sorted(branch_set - expected_set)

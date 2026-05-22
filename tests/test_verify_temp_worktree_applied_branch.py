@@ -963,3 +963,169 @@ class TestHappyPath:
         assert checks.get("branch_diff_matches_expected") is True
         assert checks.get("merge_base_matches") is True
         assert checks.get("apply_readiness_status") == "APPLY_READY"
+
+
+class TestTrackedModifiedSameRevision:
+    """APPLIED_BRANCH_READY when git apply modifies a tracked file on a same-revision
+    branch (branch head == base sha, no committed diff, but worktree/index is dirty).
+
+    Regression test for real bug: real_task_trial_001 returned HOLD_BRANCH_DIFF_MISMATCH
+    because the verifier only checked committed branch diff and missed worktree/index
+    modifications from git apply on same-revision applied branches.
+    """
+
+    def test_staged_modification_on_same_revision_branch(self, tmp_path):
+        """git apply stages a modification to an already-tracked file.
+        Branch HEAD == base sha (no commits on branch).
+        git status shows 'M  path' (staged index modification).
+        """
+        # Create a temp git repo with docs/tracked.md committed on main
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        tracked = docs_dir / "tracked.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, capture_output=True)
+
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True)
+
+        # Simulate git apply: modify tracked file and stage it
+        tracked.write_text("modified by apply\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+
+        # Verify: branch head == base, git status shows staged M
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        assert r.stdout.strip() == base_sha, "branch head should equal base_sha"
+
+        r = subprocess.run(["git", "status", "--short", "-uall"], cwd=repo, capture_output=True, text=True)
+        assert r.stdout.startswith("M "), f"Expected staged M, got: {r.stdout!r}"
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/tracked.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/tracked.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        assert "docs/tracked.md" in checks.get("tracked_modified_expected", [])
+        assert "docs/tracked.md" in checks.get("tracked_modified", [])
+        assert checks.get("no_unexpected_dirty_tracked") is True
+
+    def test_worktree_modification_on_same_revision_branch(self, tmp_path):
+        """Worktree modification (not staged) on same-revision branch.
+        git status shows ' M path' (worktree dirty only).
+        """
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        tracked = docs_dir / "tracked.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, capture_output=True)
+
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True)
+
+        # Worktree modification only — no git add
+        tracked.write_text("worktree modification\n", encoding="utf-8")
+
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        assert r.stdout.strip() == base_sha
+
+        r = subprocess.run(["git", "status", "--short", "-uall"], cwd=repo, capture_output=True, text=True)
+        assert " M" in r.stdout and not r.stdout.startswith("??"), f"Expected worktree M, got: {r.stdout!r}"
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/tracked.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/tracked.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        assert "docs/tracked.md" in checks.get("tracked_modified_expected", [])
+
+    def test_unexpected_dirty_tracked_file_is_blocked(self, tmp_path):
+        """Unexpected tracked modification (not in expected changed_files) is blocked.
+        Returns HOLD_UNEXPECTED_UNTRACKED.
+        """
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        tracked = docs_dir / "tracked.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add tracked"], cwd=repo, capture_output=True)
+
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True)
+
+        # Modify a file NOT in expected changed_files
+        tracked.write_text("unexpected modification\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/expected.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/expected.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "HOLD_UNEXPECTED_UNTRACKED_FILE", f"Expected HOLD_UNEXPECTED_UNTRACKED_FILE, got {status}"
+        assert "docs/tracked.md" in checks.get("tracked_modified_unexpected", [])
+
+    def test_mixed_tracked_modified_and_untracked_on_same_revision(self, tmp_path):
+        """Both tracked modification (staged) and untracked new file on same-revision.
+        Both must be recognized as actual_applied.
+        """
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+
+        # Pre-create docs/ as tracked on base — include tracked.md so it's M not A
+        marker = docs_dir / ".gitkeep"
+        marker.write_text("\n", encoding="utf-8")
+        tracked = docs_dir / "tracked.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep", "docs/tracked.md"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs"], cwd=repo, capture_output=True)
+
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True)
+
+        # Tracked file: modify and stage (M  status — file existed on base)
+        tracked.write_text("modified\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+
+        # Untracked file: new file from git apply
+        new_file = docs_dir / "new.md"
+        new_file.write_text("new content\n", encoding="utf-8")
+        # Do NOT git add — stays untracked
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/tracked.md", "docs/new.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/tracked.md", "docs/new.md"]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        assert "docs/tracked.md" in checks.get("tracked_modified_expected", [])
+        assert "docs/new.md" in checks.get("untracked_expected", [])
