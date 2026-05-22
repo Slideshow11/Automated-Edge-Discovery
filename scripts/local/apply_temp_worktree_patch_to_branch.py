@@ -102,6 +102,7 @@ STATE_CHANGED_FILES_MISMATCH = "HOLD_CHANGED_FILES_MISMATCH"
 STATE_FORBIDDEN_CHANGED      = "HOLD_FORBIDDEN_FILE_CHANGED"
 STATE_PROTECTED_CHANGED     = "HOLD_PROTECTED_FILE_CHANGED"
 STATE_UNEXPECTED_MUTATION    = "HOLD_UNEXPECTED_MUTATION"
+STATE_UNEXPECTED_UNTRACKED   = "HOLD_UNEXPECTED_UNTRACKED_FILE"
 STATE_INTERNAL_ERROR         = "HOLD_INTERNAL_ERROR"
 
 # Files that are forbidden from being changed by any patch
@@ -656,21 +657,32 @@ def apply_patch_to_branch(
     status_output = _git_status_short(target_repo)
     checks["post_apply_git_status"] = status_output
 
-    # Parse staged/unstaged changes
+    # Parse staged/unstaged changes AND expected untracked files.
+    # git apply creates new files as untracked (??), not staged (A).
+    # We count them as applied only if they appear in expected changed_files.
     modified = []
+    untracked_expected = []
+    untracked_unexpected = []
     for line in status_output.strip().splitlines():
-        if line.startswith("??"):
+        if not line:
             continue
         parts = line.strip().split()
         if len(parts) >= 2:
-            stage = parts[0]
-            filepath = parts[1]
+            stage, filepath = parts[0], parts[1]
             if stage in ("M", "A", "D", "R"):
                 modified.append(filepath)
+            elif stage == "??":
+                if filepath in changed_files:
+                    untracked_expected.append(filepath)
+                else:
+                    untracked_unexpected.append(filepath)
 
     checks["modified_files"] = modified
+    checks["untracked_expected"] = untracked_expected
+    checks["untracked_unexpected"] = untracked_unexpected
     checks["expected_changed_files"] = changed_files
 
+    # Unexpected tracked modifications are always a problem
     unexpected = [f for f in modified if f not in changed_files]
     if unexpected:
         return STATE_UNEXPECTED_MUTATION, {
@@ -681,7 +693,22 @@ def apply_patch_to_branch(
             "unexpected_modified_files": unexpected,
         }
 
-    missing = [f for f in changed_files if f not in modified]
+    # Unexpected untracked files are a problem unless we have a clear reason
+    # to believe they came from the apply (for now, any unexpected untracked
+    # file not in changed_files is treated as suspicious)
+    if untracked_unexpected:
+        return STATE_UNEXPECTED_UNTRACKED, {
+            **checks,
+            "applied": True,
+            "branch_created": True,
+            "branch_name": branch_name,
+            "unexpected_untracked_files": untracked_unexpected,
+        }
+
+    # Build the complete set of detected applied files
+    detected_applied = set(modified) | set(untracked_expected)
+
+    missing = [f for f in changed_files if f not in detected_applied]
     if missing:
         return STATE_CHANGED_FILES_MISMATCH, {
             **checks,

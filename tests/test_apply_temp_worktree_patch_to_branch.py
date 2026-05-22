@@ -642,6 +642,249 @@ class TestProtectedFileBlocks:
         assert status == "HOLD_PROTECTED_FILE_CHANGED"
 
 
+class TestUntrackedNewFileAfterApply:
+    """git apply creates new files as untracked (??), not staged (A)."""
+
+    def test_untracked_new_file_is_recognized_as_applied(self, tmp_path, monkeypatch):
+        """New-file patch with expected file as ?? returns APPLY_COMPLETE_LOCAL_BRANCH_READY."""
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=["docs/new.md"],
+            task={"description": "Test", "allowed_files": ["docs/new.md"], "forbidden_files": []},
+        )
+        diff_path = make_diff_patch(tmp_path, content=(
+            "diff --git a/docs/new.md b/docs/new.md\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/docs/new.md\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+content\n"
+        ))
+
+        def mock_head(repo_root):
+            return "99e27aa2f9e6e5b8c1a3d2e7f4a6b8c0d9e1f3a5"
+        monkeypatch.setattr(aptb, "_git_head", mock_head)
+
+        def mock_clean(repo_root):
+            return True
+        monkeypatch.setattr(aptb, "_git_status_clean", mock_clean)
+
+        def mock_branch_exists(repo_root, branch):
+            return False
+        monkeypatch.setattr(aptb, "_git_branch_exists", mock_branch_exists)
+
+        def mock_apply_check_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
+
+        def mock_apply_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
+
+        # git status shows the new file as untracked (??), not staged (A)
+        def mock_status_short(repo_root):
+            return "?? docs/new.md"
+        monkeypatch.setattr(aptb, "_git_status_short", mock_status_short)
+
+        def mock_checkout_ok(repo_root, branch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_checkout_new_branch", mock_checkout_ok)
+
+        status, result = aptb.apply_patch_to_branch(
+            result_path, diff_path, REPO_ROOT,
+            "apply/test-untracked",
+            require_apply_ready=False,
+            apply_readiness_json_path=None,
+            allow_real_apply=True,
+            expected_base_sha=None,
+            dry_run=False,
+        )
+
+        assert status == "APPLY_TO_BRANCH_APPLIED"
+        assert result.get("applied") is True
+        assert result.get("branch_created") is True
+        assert result.get("untracked_expected") == ["docs/new.md"]
+        assert result.get("untracked_unexpected") == []
+
+    def test_untracked_expected_file_in_detected_applied(self, tmp_path, monkeypatch):
+        """The detected applied set includes expected untracked files."""
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=["docs/new.md"],
+            task={"description": "Test", "allowed_files": ["docs/new.md"], "forbidden_files": []},
+        )
+        diff_path = make_diff_patch(tmp_path, content=(
+            "diff --git a/docs/new.md b/docs/new.md\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/docs/new.md\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+content\n"
+        ))
+
+        def mock_head(repo_root):
+            return "99e27aa2f9e6e5b8c1a3d2e7f4a6b8c0d9e1f3a5"
+        monkeypatch.setattr(aptb, "_git_head", mock_head)
+
+        def mock_clean(repo_root):
+            return True
+        monkeypatch.setattr(aptb, "_git_status_clean", mock_clean)
+
+        def mock_branch_exists(repo_root, branch):
+            return False
+        monkeypatch.setattr(aptb, "_git_branch_exists", mock_branch_exists)
+
+        def mock_apply_check_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
+
+        def mock_apply_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
+
+        # Only the expected file is untracked; no unexpected files
+        def mock_status_short(repo_root):
+            return "?? docs/new.md"
+        monkeypatch.setattr(aptb, "_git_status_short", mock_status_short)
+
+        def mock_checkout_ok(repo_root, branch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_checkout_new_branch", mock_checkout_ok)
+
+        status, result = aptb.apply_patch_to_branch(
+            result_path, diff_path, REPO_ROOT,
+            "apply/test-untracked-counted",
+            require_apply_ready=False,
+            apply_readiness_json_path=None,
+            allow_real_apply=True,
+            expected_base_sha=None,
+            dry_run=False,
+        )
+
+        assert status == "APPLY_TO_BRANCH_APPLIED"
+        # modified=[] but untracked_expected=["docs/new.md"]; detected_applied includes both
+        assert result.get("changed_files_match") is True
+
+
+class TestUnexpectedUntrackedFileBlocks:
+    """Unexpected untracked files (not in changed_files) are blocked."""
+
+    def test_unexpected_untracked_file_returns_hold(self, tmp_path, monkeypatch):
+        """Untracked file not in changed_files returns HOLD_UNEXPECTED_UNTRACKED_FILE."""
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=["docs/scratch.md"],
+            task={"description": "Test", "allowed_files": ["docs/scratch.md"], "forbidden_files": []},
+        )
+        diff_path = make_diff_patch(tmp_path, content=(
+            "diff --git a/docs/scratch.md b/docs/scratch.md\n"
+            "new file mode 100644\n"
+            "--- /dev/null\n"
+            "+++ b/docs/scratch.md\n"
+            "@@ -0,0 +1,1 @@\n"
+            "+hello\n"
+        ))
+
+        def mock_head(repo_root):
+            return "99e27aa2f9e6e5b8c1a3d2e7f4a6b8c0d9e1f3a5"
+        monkeypatch.setattr(aptb, "_git_head", mock_head)
+
+        def mock_clean(repo_root):
+            return True
+        monkeypatch.setattr(aptb, "_git_status_clean", mock_clean)
+
+        def mock_branch_exists(repo_root, branch):
+            return False
+        monkeypatch.setattr(aptb, "_git_branch_exists", mock_branch_exists)
+
+        def mock_apply_check_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
+
+        def mock_apply_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
+
+        # Both the expected file AND an unexpected file are untracked
+        def mock_status_short(repo_root):
+            return "?? docs/scratch.md\n?? docs/leftover.txt"
+        monkeypatch.setattr(aptb, "_git_status_short", mock_status_short)
+
+        def mock_checkout_ok(repo_root, branch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_checkout_new_branch", mock_checkout_ok)
+
+        status, result = aptb.apply_patch_to_branch(
+            result_path, diff_path, REPO_ROOT,
+            "apply/test-unexpected-untracked",
+            require_apply_ready=False,
+            apply_readiness_json_path=None,
+            allow_real_apply=True,
+            expected_base_sha=None,
+            dry_run=False,
+        )
+
+        assert status == "HOLD_UNEXPECTED_UNTRACKED_FILE"
+        assert result.get("applied") is True
+        assert result.get("branch_created") is True
+        assert "docs/leftover.txt" in result.get("unexpected_untracked_files", [])
+
+
+class TestMissingFileStillBlocked:
+    """Missing expected file (not present in git status) still returns mismatch."""
+
+    def test_missing_expected_file_returns_mismatch(self, tmp_path, monkeypatch):
+        """Expected file absent from git status returns HOLD_CHANGED_FILES_MISMATCH."""
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=["docs/scratch.md"],
+            task={"description": "Test", "allowed_files": ["docs/scratch.md"], "forbidden_files": []},
+        )
+        diff_path = make_diff_patch(tmp_path)
+
+        def mock_head(repo_root):
+            return "99e27aa2f9e6e5b8c1a3d2e7f4a6b8c0d9e1f3a5"
+        monkeypatch.setattr(aptb, "_git_head", mock_head)
+
+        def mock_clean(repo_root):
+            return True
+        monkeypatch.setattr(aptb, "_git_status_clean", mock_clean)
+
+        def mock_branch_exists(repo_root, branch):
+            return False
+        monkeypatch.setattr(aptb, "_git_branch_exists", mock_branch_exists)
+
+        def mock_apply_check_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
+
+        def mock_apply_ok(repo_root, diff_patch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
+
+        # Clean git status — no files at all (apply did nothing)
+        def mock_status_short(repo_root):
+            return ""
+        monkeypatch.setattr(aptb, "_git_status_short", mock_status_short)
+
+        def mock_checkout_ok(repo_root, branch):
+            return True, ""
+        monkeypatch.setattr(aptb, "_git_checkout_new_branch", mock_checkout_ok)
+
+        status, result = aptb.apply_patch_to_branch(
+            result_path, diff_path, REPO_ROOT,
+            "apply/test-missing",
+            require_apply_ready=False,
+            apply_readiness_json_path=None,
+            allow_real_apply=True,
+            expected_base_sha=None,
+            dry_run=False,
+        )
+
+        assert status == "HOLD_CHANGED_FILES_MISMATCH"
+        assert "docs/scratch.md" in result.get("missing_modified_files", [])
+
+
 class TestNoPushInImplementation:
     """No push, PR, merge, or Claude invocation exists in the implementation."""
 
