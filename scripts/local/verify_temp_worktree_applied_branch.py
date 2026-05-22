@@ -353,7 +353,7 @@ def verify(
             stage = parts[0]
             is_modified = len(stage) >= 1 and stage[0] == "M" and stage != "??"
             if is_modified:
-                path = parts[1]
+                path = parts[1].strip()
                 if path:
                     tracked_modified.append(path)
 
