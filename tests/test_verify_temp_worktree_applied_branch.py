@@ -553,6 +553,38 @@ class TestTooManyFilesChanged:
         assert status == "HOLD_TOO_MANY_FILES_CHANGED"
 
 
+class TestPmgNotClean:
+    """HOLD_PMG_NOT_CLEAN when apply_readiness pmg_status is not clean."""
+
+    def test_pmg_status_dirty(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        head = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", head, "docs/scratch.md")
+        result_path = make_result_json(tmp_path)
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, pmg_status="dirty")
+
+        status, _ = vtab.verify(
+            repo, "apply/test", head, result_path, diff_path, readiness_path,
+        )
+        assert status == "HOLD_PMG_NOT_CLEAN"
+
+    def test_pmg_blocked_files(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        head = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", head, "docs/scratch.md")
+        result_path = make_result_json(tmp_path)
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, pmg_blocked_files=3)
+
+        status, _ = vtab.verify(
+            repo, "apply/test", head, result_path, diff_path, readiness_path,
+        )
+        assert status == "HOLD_PMG_NOT_CLEAN"
+
+
 class TestNoShellInVerifier:
     """Verifier must not use shell=True in subprocess calls."""
 
