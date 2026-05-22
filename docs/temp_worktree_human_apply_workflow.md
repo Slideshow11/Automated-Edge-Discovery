@@ -502,3 +502,11 @@ On merge of that record: `PROCESS_HOLD_REMEDIATION_REQUIRED` → `PROCESS_GAP_RE
 2. Should Option A also run `git apply --check` as part of the preview, so the preview itself confirms the patch is applicable? (Recommended: yes, run `git apply --check` and include the output.)
 3. Should the apply preview tool create a local branch as an alternative to applying directly to main? (Option B addresses this; Option A does not.)
 4. Should `verify_temp_worktree_apply_readiness.py` be re-run inside the apply tool automatically, or should the apply tool trust the provided `apply-readiness-json`? (Recommended: re-run internally as a sanity check, report discrepancy as `HOLD_READINESS_INTERNAL_MISMATCH`.)
+
+---
+
+## 14. Related Design
+
+The **single-task autocoder controller** (`scripts/local/run_autocoder_single_task.py`) orchestrates the full six-stage pipeline — from `run_temp_worktree_execution.py` through `PR_PREVIEW_READY` — for one strict task packet, without pushing, opening PRs, merging, committing, staging, or mutating main. Design documented in:
+
+**`docs/autocoder_single_task_controller_design.md`**
