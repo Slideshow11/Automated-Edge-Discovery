@@ -252,9 +252,107 @@ CLI:
 
 ---
 
-## 7. Status Taxonomy
+## 7. Implemented Workflow Stages
 
-### Option A Statuses (`preview_temp_worktree_apply.py`)
+The following stages have been implemented (in order):
+
+### Stage 1: `run_temp_worktree_execution.py`
+Produces `PATCH_READY_FOR_HUMAN_REVIEW` artifacts (result.json + diff.patch).
+
+### Stage 2: `verify_temp_worktree_apply_readiness.py`
+Confirms the diff is safe to apply. Returns `APPLY_READY` or a `HOLD_*` state.
+
+### Stage 3: `preview_temp_worktree_apply.py`
+Read-only preview of apply commands and checklists. Returns `APPLY_PREVIEW_READY` or a `HOLD_*` state.
+
+### Stage 4: `apply_temp_worktree_patch_to_branch.py`
+Gated apply of diff.patch to a new local branch. Returns `APPLY_COMPLETE_LOCAL_BRANCH_READY` or a `HOLD_*` state. **Does not push. Does not open PRs. Does not merge.**
+
+### Stage 5: `verify_temp_worktree_applied_branch.py`
+Read-only verifier that inspects the local apply branch after Stage 4. Returns `APPLIED_BRANCH_READY` or a `HOLD_*` state.
+
+```
+Purpose:
+  Read-only verifier that checks a local apply branch matches expected artifacts.
+  Does NOT commit, push, open PRs, merge, apply patches, stage files, or invoke Claude.
+
+CLI:
+  python3 scripts/local/verify_temp_worktree_applied_branch.py \
+    --repo-root /home/max/Automated-Edge-Discovery \
+    --branch-name apply/smoke-005-2026-05-22 \
+    --expected-base-sha a1e8bec... \
+    --result-json /tmp/aed_run/result.json \
+    --diff-patch /tmp/aed_run/diff.patch \
+    --apply-readiness-json /tmp/aed_run/apply_readiness.json \
+    --output-json /tmp/apply_branch_readiness.json \
+    --output-md /tmp/apply_branch_readiness.md
+```
+
+**Checks performed:**
+- Repo is a git repo
+- Output paths are outside the repo
+- Branch exists locally and is not protected (main/master/HEAD)
+- Expected base SHA exists and is valid
+- Merge-base of branch with expected base matches expected base SHA
+- result.json is valid with status `PATCH_READY_FOR_HUMAN_REVIEW`
+- diff.patch exists and is non-empty
+- apply_readiness.json has status `APPLY_READY`
+- changed_files from result.json are non-empty and unique
+- Branch diff matches changed_files exactly
+- `.aed_plan.md` is not in branch diff
+- Forbidden files from result.json task are not in branch diff
+- Branch diff file count ≤ max_changed_files
+- PMG is clean (when reported by apply_readiness)
+
+**`APPLIED_BRANCH_READY` does NOT authorize push or PR creation.** It means the branch artifact is consistent with the verification JSON. Human approval is still required before any push or PR.
+
+### Stage 6: `preview_applied_branch_pr.py`
+Read-only PR preparation preview that consumes `APPLIED_BRANCH_READY` evidence and emits human-review commands and checklists.
+
+```
+Purpose:
+  Read-only PR preparation preview for applied temp-worktree branches.
+  Emits human-review commands and checklists as TEXT ONLY.
+  Does NOT push, open PRs, merge, commit, stage files, apply patches, or invoke Claude.
+
+CLI:
+  python3 scripts/local/preview_applied_branch_pr.py \
+    --repo-root /home/max/Automated-Edge-Discovery \
+    --applied-branch-json /tmp/apply_branch_readiness.json \
+    --branch-name apply/smoke-005-2026-05-22 \
+    --base-branch main \
+    --expected-base-sha a1e8bec... \
+    --output-json /tmp/pr_preview.json \
+    --output-md /tmp/pr_preview.md
+```
+
+**Checks performed:**
+- Repo is a git repo
+- Output paths are outside the repo
+- Applied-branch verification JSON exists and is valid JSON
+- Verification status is `APPLIED_BRANCH_READY`
+- Branch name matches verification JSON
+- Expected base SHA matches verification JSON
+- Local branch exists and is not protected
+- Repo working tree is clean
+- Changed files from verification are non-empty and unique
+- Branch diff matches verification changed_files
+- `.aed_plan.md` is not in branch diff
+- Forbidden files from verification task are not in branch diff
+
+**Output includes:**
+- Suggested PR title and body (generated from branch name and changed files)
+- `gh pr create` command as TEXT ONLY (not executed)
+- Pre-push and pre-PR checklists
+- Safety statement confirming no push, PR, merge, commit, stage, patch apply, or Claude invocation
+
+**`PR_PREVIEW_READY` does NOT authorize push or PR creation.** Human must review the checklist, confirm PMG clean, and manually push and open PR.
+
+---
+
+## 8. Status Taxonomy
+
+### Stage 3 Statuses (`preview_temp_worktree_apply.py`)
 
 | Status | Meaning |
 |--------|---------|
@@ -282,7 +380,7 @@ CLI:
 | `HOLD_READINESS_INTERNAL_MISMATCH` | internal re-run of apply-readiness verifier disagrees |
 | `HOLD_UNKNOWN` | Unexpected error |
 
-### Option B Additional Statuses
+### Stage 4 Additional Statuses
 
 | Status | Meaning |
 |--------|---------|
@@ -291,9 +389,60 @@ CLI:
 | `HOLD_POST_APPLY_TESTS_FAILED` | pytest returned non-zero after apply |
 | `HOLD_BRANCH_CREATION_FAILED` | `git checkout -b` returned non-zero |
 
+### Stage 5 Statuses (`verify_temp_worktree_applied_branch.py`)
+
+| Status | Meaning |
+|--------|---------|
+| `APPLIED_BRANCH_READY` | Branch verified as consistent with artifacts |
+| `HOLD_REPO_NOT_FOUND` | Repo root is not a git repo |
+| `HOLD_OUTPUT_INSIDE_REPO` | Output path is inside the repo |
+| `HOLD_BRANCH_MISSING` | Local branch does not exist |
+| `HOLD_PROTECTED_BRANCH` | Branch is main/master/HEAD |
+| `HOLD_EXPECTED_BASE_MISSING` | Expected base SHA does not exist |
+| `HOLD_MERGE_BASE_MISMATCH` | Branch merge-base does not match expected base |
+| `HOLD_REPO_DIRTY` | Repo working tree is not clean |
+| `HOLD_RESULT_MISSING` | result.json does not exist |
+| `HOLD_RESULT_INVALID_JSON` | result.json is not valid JSON |
+| `HOLD_DIFF_MISSING` | diff.patch does not exist |
+| `HOLD_DIFF_EMPTY` | diff.patch is empty |
+| `HOLD_READINESS_MISSING` | apply_readiness.json does not exist |
+| `HOLD_READINESS_NOT_APPLY_READY` | apply_readiness.json status is not APPLY_READY |
+| `HOLD_STATUS_NOT_PATCH_READY` | result.json status is not PATCH_READY_FOR_HUMAN_REVIEW |
+| `HOLD_CHANGED_FILES_EMPTY` | changed_files is empty |
+| `HOLD_CHANGED_FILES_DUPLICATE` | changed_files has duplicates |
+| `HOLD_BRANCH_DIFF_MISMATCH` | Branch diff does not match changed_files |
+| `HOLD_AED_PLAN_INCLUDED` | .aed_plan.md is in branch diff |
+| `HOLD_FORBIDDEN_FILE_TOUCHED` | Forbidden file is in branch diff |
+| `HOLD_TOO_MANY_FILES_CHANGED` | Branch diff count > max_changed_files |
+| `HOLD_PMG_NOT_CLEAN` | PMG is not clean |
+| `HOLD_UNKNOWN` | Unexpected error |
+
+### Stage 6 Statuses (`preview_applied_branch_pr.py`)
+
+| Status | Meaning |
+|--------|---------|
+| `PR_PREVIEW_READY` | All checks passed; PR preview written to output JSON/MD |
+| `HOLD_REPO_NOT_FOUND` | Repo root is not a git repo |
+| `HOLD_OUTPUT_INSIDE_REPO` | Output path is inside the repo |
+| `HOLD_VERIFICATION_MISSING` | Applied-branch verification JSON does not exist |
+| `HOLD_VERIFICATION_INVALID_JSON` | Applied-branch verification JSON is not valid JSON |
+| `HOLD_VERIFICATION_NOT_READY` | Verification status is not APPLIED_BRANCH_READY |
+| `HOLD_BRANCH_MISMATCH` | Branch name does not match verification JSON |
+| `HOLD_EXPECTED_BASE_MISMATCH` | Expected base SHA does not match verification JSON |
+| `HOLD_BRANCH_MISSING` | Local branch does not exist |
+| `HOLD_BASE_BRANCH_MISSING` | Base branch cannot be resolved |
+| `HOLD_PROTECTED_BRANCH` | Branch is main/master/HEAD |
+| `HOLD_REPO_DIRTY` | Repo working tree is not clean |
+| `HOLD_CHANGED_FILES_EMPTY` | changed_files is empty |
+| `HOLD_CHANGED_FILES_DUPLICATE` | changed_files has duplicates |
+| `HOLD_BRANCH_DIFF_MISMATCH` | Branch diff does not match changed_files |
+| `HOLD_AED_PLAN_INCLUDED` | .aed_plan.md is in branch diff |
+| `HOLD_FORBIDDEN_FILE_TOUCHED` | Forbidden file is in branch diff |
+| `HOLD_UNKNOWN` | Unexpected error |
+
 ---
 
-## 8. Safety Rule
+## 9. Safety Rule
 
 ### The Boundary
 
@@ -308,24 +457,29 @@ The combined state means:
 
 ---
 
-## 9. Recommended Implementation Order
+## 10. Recommended Implementation Order (Superseded by Implementation)
 
-1. **Now (this PR):** Design doc only. No code.
-2. **Next PR:** Implement `scripts/local/preview_temp_worktree_apply.py` (Option A, read-only).
-3. **Next PR:** Add tests for `preview_temp_worktree_apply.py`.
-4. **After Option A is validated:** Implement `apply_temp_worktree_patch_to_branch.py` (Option B).
-5. **After Option B is validated:** Design the human-review-to-PR workflow.
+> ⚠️ The implementation order below was the original design plan. All stages have now been implemented.
+
+1. **Implemented (PR #296):** Design doc for temp-worktree human apply workflow.
+2. **Implemented (PR #295):** `verify_temp_worktree_apply_readiness.py` (Stage 2).
+3. **Implemented (PR #297):** `preview_temp_worktree_apply.py` (Stage 3).
+4. **Implemented (PR #302):** `verify_temp_worktree_applied_branch.py` (Stage 5).
+5. **Implemented (PR #303, this PR):** `preview_applied_branch_pr.py` (Stage 6).
+6. **Remaining:** Human push and PR creation (manual, no tool).
 
 ---
 
-## 10. Relationship to Existing Tools
+## 11. Relationship to Existing Tools
 
 | Tool | Role |
 |------|------|
 | `run_temp_worktree_execution.py` | Produces `PATCH_READY_FOR_HUMAN_REVIEW` artifacts |
 | `verify_temp_worktree_apply_readiness.py` | Confirms diff is safe to apply (APPLY_READY / HOLD_*) |
-| `preview_temp_worktree_apply.py` (proposed) | Read-only preview of apply commands and checklist |
-| `apply_temp_worktree_patch_to_branch.py` (proposed) | Gated apply to local branch (Option B) |
+| `preview_temp_worktree_apply.py` | Read-only preview of apply commands and checklist (Stage 3) |
+| `apply_temp_worktree_patch_to_branch.py` | Gated apply to local branch (Stage 4) |
+| `verify_temp_worktree_applied_branch.py` | Read-only branch verifier (Stage 5) |
+| `preview_applied_branch_pr.py` | Read-only PR preparation preview (Stage 6) |
 | `final_gate_status.py` | Verifies PR is ready to merge |
 | `verify_final_head_merge_command.py` | Verifies HEAD SHA for safe merge |
 
