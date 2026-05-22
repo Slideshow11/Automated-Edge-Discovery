@@ -51,6 +51,7 @@ STATE_HOLD_BRANCH_MISSING    = "HOLD_BRANCH_MISSING"
 STATE_HOLD_BASE_BRANCH_MISSING = "HOLD_BASE_BRANCH_MISSING"
 STATE_HOLD_PROTECTED_BRANCH  = "HOLD_PROTECTED_BRANCH"
 STATE_HOLD_REPO_DIRTY        = "HOLD_REPO_DIRTY"
+STATE_HOLD_UNEXPECTED_DIRTY_FILE = "HOLD_UNEXPECTED_DIRTY_FILE"
 STATE_HOLD_CHANGED_FILES_EMPTY = "HOLD_CHANGED_FILES_EMPTY"
 STATE_HOLD_CHANGED_FILES_DUPLICATE = "HOLD_CHANGED_FILES_DUPLICATE"
 STATE_HOLD_BRANCH_DIFF_MISMATCH = "HOLD_BRANCH_DIFF_MISMATCH"
@@ -107,6 +108,67 @@ def _git_status_clean(repo_root: Path) -> bool:
     """Return True if repo working tree is clean."""
     r = _run_git(repo_root, "status", "--porcelain")
     return r.returncode == 0 and r.stdout.strip() == ""
+
+
+def _git_dirty_paths(repo_root: Path) -> set[str]:
+    """
+    Return the set of dirty paths (relative to repo root) from git status.
+    Uses --short -uall so new files inside new directories are listed individually.
+    Tracked changed files: stage/index status chars (M, D, etc.)
+    Untracked files: '??' status
+    Returns paths like {'docs/scratch.md', 'scripts/a.py'}
+    """
+    r = _run_git(repo_root, "status", "--short", "-uall", "--")
+    if r.returncode != 0:
+        return set()
+    paths: set[str] = set()
+    for line in r.stdout.strip().splitlines():
+        if len(line) < 3:
+            continue
+        # Git status --short format: XY path or XY  path (status + space(s) + path)
+        # Handle both 'M  docs/main.md' (two spaces) and 'M README.md' (one space)
+        space_idx = line.find(" ", 2)
+        if space_idx == -1:
+            space_idx = line.find(" ", 1)
+            if space_idx == -1:
+                continue
+        file_path = line[space_idx + 1:].strip()
+        status_part = line[:2]
+        if status_part == "??":  # untracked
+            paths.add(file_path)
+        elif status_part[0] in ("M", "D", "A", "R", "C"):  # staged changes
+            paths.add(file_path)
+        elif status_part[1] in ("M", "D"):  # unstaged changes
+            paths.add(file_path)
+    return paths
+
+
+def _get_allowed_dirty_paths(verification: dict) -> set[str]:
+    """
+    Extract the union of all file paths that are allowed to appear dirty
+    from the applied-branch verification JSON.
+
+    Allowed paths come from:
+    - changed_files_actual (primary: committed+untracked changes the verifier saw)
+    - changed_files_expected (fallback: what was expected)
+    - checks.untracked_expected (explicit list of expected untracked files)
+    """
+    allowed: set[str] = set()
+    actual = verification.get("changed_files_actual") or []
+    for f in actual:
+        if f:
+            allowed.add(f)
+    expected = verification.get("changed_files_expected") or []
+    for f in expected:
+        if f:
+            allowed.add(f)
+    checks = verification.get("checks", {})
+    if isinstance(checks, dict):
+        untracked_expected = checks.get("untracked_expected") or []
+        for f in untracked_expected:
+            if f:
+                allowed.add(f)
+    return allowed
 
 
 # ---------------------------------------------------------------------------
@@ -217,12 +279,56 @@ def verify(
         return STATE_HOLD_PROTECTED_BRANCH, {**checks, "branch_name": branch_name}
     checks["branch_not_protected"] = True
 
-    # ── 9. Repo working tree is clean ─────────────────────────────────────────
+    # ── 9. Repo working tree is clean or dirty paths are all expected ────────────
     repo_clean = _git_status_clean(repo_root)
     checks["repo_git_status_clean"] = repo_clean
     if not repo_clean:
-        return STATE_HOLD_REPO_DIRTY, {**checks}
-    checks["repo_clean"] = True
+        # Repo is dirty — check if the dirty paths are all expected from verification
+        allowed = _get_allowed_dirty_paths(verification)
+        dirty_paths = _git_dirty_paths(repo_root)
+        unexpected = sorted(dirty_paths - allowed)
+
+        # Reject .aed_plan.md and forbidden files even in dirty paths
+        if ".aed_plan.md" in unexpected:
+            checks["repo_clean"] = False
+            return STATE_HOLD_AED_PLAN_INCLUDED, {**checks, "dirty_paths": dirty_paths}
+
+        task_data = verification.get("task", {})
+        if isinstance(task_data, dict):
+            forbidden_files = task_data.get("forbidden_files", [])
+        else:
+            forbidden_files = []
+        if forbidden_files:
+            touched_forbidden = [f for f in unexpected if f in forbidden_files]
+            if touched_forbidden:
+                checks["repo_clean"] = False
+                return STATE_HOLD_FORBIDDEN_FILE_TOUCHED, {
+                    **checks,
+                    "dirty_paths": dirty_paths,
+                    "forbidden_touched": touched_forbidden,
+                }
+
+        if unexpected:
+            # Some dirty paths are not in the allowed set
+            checks["repo_clean"] = False
+            return STATE_HOLD_UNEXPECTED_DIRTY_FILE, {
+                **checks,
+                "dirty_paths": sorted(dirty_paths),
+                "allowed_dirty_paths": sorted(allowed),
+                "unexpected_dirty_paths": unexpected,
+            }
+
+        # All dirty paths are expected — proceed with warning
+        checks["repo_clean"] = False
+        checks["verified_dirty_worktree_allowed"] = True
+        checks["dirty_paths"] = sorted(dirty_paths)
+        warnings.append(
+            "Working tree is dirty but all dirty paths are verified "
+            "by APPLIED_BRANCH_READY. Proceeding with PR preview."
+        )
+    else:
+        checks["repo_clean"] = True
+        checks["verified_dirty_worktree_allowed"] = False
 
     # ── 10. Changed files from verification are non-empty and unique ─────────
     raw_changed = verification.get("changed_files_actual") or verification.get("changed_files_expected") or []
@@ -240,23 +346,36 @@ def verify(
     checks["changed_files_unique"] = True
 
     # ── 11. Branch diff matches verification changed_files ───────────────────
-    r = _run_git(repo_root, "diff", "--name-only", f"{expected_base_sha}...refs/heads/{branch_name}")
-    branch_diff_files = [f for f in r.stdout.strip().splitlines() if f]
-    checks["branch_diff_files"] = branch_diff_files
+    # Skip this check when step 9 allowed a dirty worktree, because:
+    # - Applied branches may have zero commits on top of the merge base
+    # - Files added by git apply appear as untracked worktree changes, not committed
+    # - The APPLIED_BRANCH_READY verification JSON is the authoritative source
+    #   for what files this PR adds; the branch diff only reflects commits
+    # When repo is clean, use the full diff check as normal consistency gate.
+    branch_diff_files: list[str] = []  # always defined for steps 12/13
+    if checks.get("verified_dirty_worktree_allowed"):
+        checks["branch_diff_skipped_dirty_allowed"] = True
+        checks["branch_diff_files"] = []
+        checks["branch_diff_matches_expected"] = None
+    else:
+        r = _run_git(repo_root, "diff", "--name-only", f"refs/heads/{base_branch}..refs/heads/{branch_name}")
+        branch_diff_files = [f for f in r.stdout.strip().splitlines() if f]
+        checks["branch_diff_files"] = branch_diff_files
 
-    branch_set = set(branch_diff_files)
-    expected_set = set(changed_files)
-    if branch_set != expected_set:
-        extra = sorted(branch_set - expected_set)
-        missing = sorted(expected_set - branch_set)
-        return STATE_HOLD_BRANCH_DIFF_MISMATCH, {
-            **checks,
-            "extra_files": extra,
-            "missing_files": missing,
-        }
-    checks["branch_diff_matches_expected"] = True
+        branch_set = set(branch_diff_files)
+        expected_set = set(changed_files)
+        if branch_set != expected_set:
+            extra = sorted(branch_set - expected_set)
+            missing = sorted(expected_set - branch_set)
+            return STATE_HOLD_BRANCH_DIFF_MISMATCH, {
+                **checks,
+                "extra_files": extra,
+                "missing_files": missing,
+            }
+        checks["branch_diff_matches_expected"] = True
 
     # ── 12. .aed_plan.md not in branch diff ──────────────────────────────────
+    # Use branch_diff_files for checks; empty list is safe when step 11 skipped
     if ".aed_plan.md" in branch_diff_files:
         return STATE_HOLD_AED_PLAN_INCLUDED, {**checks}
     checks["aed_plan_excluded"] = True
@@ -382,6 +501,7 @@ def write_json_output(
         "checklist": checklist,
         "errors": errors,
         "warnings": warnings,
+        "checks": checks,
         "generated_at": generated_at,
         "safety_statement": safety_statement,
     }

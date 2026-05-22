@@ -271,24 +271,297 @@ class TestProtectedBranch:
 
 
 class TestRepoDirty:
-    """HOLD_REPO_DIRTY when repo working tree is not clean."""
+    """HOLD_UNEXPECTED_DIRTY_FILE when dirty path is not in any allowed set."""
 
-    def test_repo_dirty(self, tmp_path):
+    def test_repo_dirty_untracked_not_in_verification(self, tmp_path):
+        """HOLD_UNEXPECTED_DIRTY_FILE when untracked file is not in verification changed_files."""
         repo = make_temp_git_repo()
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
         head = r.stdout.strip()
         make_apply_branch(repo, "apply/test", head, "docs/scratch.md")
         json_path = make_applied_branch_json(tmp_path, "apply/test", head)
-        # Make the working tree dirty
-        (repo / "docs" / "scratch.md").write_text("dirty\n", encoding="utf-8")
+        # Make the working tree dirty with a file NOT in verification
+        (repo / "docs" / "extra.md").write_text("dirty\n", encoding="utf-8")
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", head,
+        )
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
+        assert "docs/extra.md" in checks.get("unexpected_dirty_paths", [])
+
+    def test_repo_dirty_modified_file_not_in_verification(self, tmp_path):
+        """HOLD_UNEXPECTED_DIRTY_FILE when modified tracked file is not in changed_files."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        head = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", head, "docs/scratch.md")
+        json_path = make_applied_branch_json(tmp_path, "apply/test", head)
+        # Modify a tracked file that is NOT in changed_files
+        subprocess.run(["git", "checkout", "apply/test"], cwd=repo, capture_output=True, text=True)
+        (repo / "README.md").write_text("modified\n", encoding="utf-8")
 
         status, _ = pap.verify(
             repo, json_path, "apply/test", "main", head,
         )
-        assert status == "HOLD_REPO_DIRTY"
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
 
 
-class TestChangedFilesEmpty:
+class TestVerifiedDirtyWorktreeAllowed:
+    """PR_PREVIEW_READY when all dirty paths are verified by APPLIED_BRANCH_READY."""
+
+    def test_dirty_untracked_in_changed_files(self, tmp_path):
+        """Dirty untracked file that is in changed_files_actual → PR_PREVIEW_READY."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        # Create branch with one committed file
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        committed = repo / "docs" / "main.md"
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        committed.write_text("main\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/main.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "main doc"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/main.md"],
+            changed_files_actual=["docs/main.md"],
+        )
+
+        # Make repo dirty with the file from changed_files_actual
+        dirty_file = repo / "docs" / "main.md"
+        dirty_file.write_text("dirty\n", encoding="utf-8")
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        assert status == "PR_PREVIEW_READY"
+        assert checks.get("verified_dirty_worktree_allowed") is True
+        assert checks.get("repo_clean") is False
+
+    def test_dirty_untracked_in_untracked_expected(self, tmp_path):
+        """Dirty untracked file that is in checks.untracked_expected → PR_PREVIEW_READY."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        committed = repo / "docs" / "main.md"
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        committed.write_text("main\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/main.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "main doc"], cwd=repo, capture_output=True, text=True)
+
+        # JSON: only docs/main.md is in changed_files_actual (committed on branch).
+        # docs/new_page.md is listed in untracked_expected (expected untracked on disk).
+        json_data = {
+            "status": "APPLIED_BRANCH_READY",
+            "applied_branch_ready": True,
+            "repo_root": str(repo),
+            "branch_name": "apply/test",
+            "expected_base_sha": base_sha,
+            "merge_base_sha": base_sha,
+            "current_head_sha": base_sha,
+            "changed_files_expected": ["docs/main.md"],
+            "changed_files_actual": ["docs/main.md"],  # only committed file
+            "checks": {
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "untracked_expected": ["docs/new_page.md"],  # expected untracked on disk
+            },
+            "errors": [],
+            "warnings": [],
+            "generated_at": "2026-05-22T00:00:00Z",
+            "safety_statement": "Test",
+            "task": {"forbidden_files": []},
+        }
+        json_path = tmp_path / "applied_branch.json"
+        json_path.write_text(json.dumps(json_data), encoding="utf-8")
+
+        # Create the untracked file on disk
+        new_page = repo / "docs" / "new_page.md"
+        new_page.parent.mkdir(parents=True, exist_ok=True)
+        new_page.write_text("new\n", encoding="utf-8")
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        assert status == "PR_PREVIEW_READY"
+        assert checks.get("verified_dirty_worktree_allowed") is True
+
+    def test_dirty_aed_plan_still_rejected(self, tmp_path):
+        """Dirty .aed_plan.md → HOLD_AED_PLAN_INCLUDED (checked before unexpected dirty)."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+        )
+
+        # Make .aed_plan.md dirty on disk (not in allowed set → unexpected,
+        # but .aed_plan.md is checked first and rejected specifically)
+        plan = repo / ".aed_plan.md"
+        plan.write_text("plan\n", encoding="utf-8")
+
+        status, _ = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        # .aed_plan.md in unexpected dirty → HOLD_AED_PLAN_INCLUDED (specific gate)
+        assert status == "HOLD_AED_PLAN_INCLUDED"
+
+    def test_dirty_forbidden_file_still_rejected(self, tmp_path):
+        """Dirty forbidden file → HOLD_FORBIDDEN_FILE_TOUCHED (checked before unexpected dirty)."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+            task={"forbidden_files": ["scripts/local/hack.py"]},
+        )
+
+        # Make forbidden file dirty on disk (not in allowed set → unexpected,
+        # but forbidden file is checked first and rejected specifically)
+        hack = repo / "scripts" / "local" / "hack.py"
+        hack.parent.mkdir(parents=True, exist_ok=True)
+        hack.write_text("hack\n", encoding="utf-8")
+
+        status, _ = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        # scripts/local/hack.py in unexpected dirty → HOLD_FORBIDDEN_FILE_TOUCHED (specific gate)
+        assert status == "HOLD_FORBIDDEN_FILE_TOUCHED"
+
+    def test_dirty_untracked_not_in_changed_files_rejected(self, tmp_path):
+        """HOLD_UNEXPECTED_DIRTY_FILE when dirty path not in any allowed set."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+        )
+
+        # Dirty with an unexpected file not in changed_files
+        unexpected = repo / "docs" / "unexpected.md"
+        unexpected.parent.mkdir(parents=True, exist_ok=True)
+        unexpected.write_text("unexpected\n", encoding="utf-8")
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
+        assert "docs/unexpected.md" in checks.get("unexpected_dirty_paths", [])
+
+    def test_verification_not_ready_still_blocked(self, tmp_path):
+        """HOLD_VERIFICATION_NOT_READY still returned even when repo is clean."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        head = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", head, "docs/scratch.md")
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", head, status="HOLD_SOME_REASON",
+        )
+
+        status, _ = pap.verify(
+            repo, json_path, "apply/test", "main", head,
+        )
+        assert status == "HOLD_VERIFICATION_NOT_READY"
+
+    def test_output_includes_verified_dirty_worktree_allowed_field(self, tmp_path):
+        """Output JSON must include verified_dirty_worktree_allowed when applicable."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        committed = repo / "docs" / "main.md"
+        committed.parent.mkdir(parents=True, exist_ok=True)
+        committed.write_text("main\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/main.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "main doc"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/main.md"],
+            changed_files_actual=["docs/main.md"],
+        )
+
+        # Make repo dirty with expected file
+        dirty_file = repo / "docs" / "main.md"
+        dirty_file.write_text("dirty\n", encoding="utf-8")
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+        assert status == "PR_PREVIEW_READY"
+        # verified_dirty_worktree_allowed must be present in checks
+        assert "verified_dirty_worktree_allowed" in checks
+
+
+class TestNoGitAddInPreviewTool:
+    """Source inspection: preview tool must not call git add."""
+
+    def test_no_git_add_in_verify(self):
+        import inspect, re
+        source = inspect.getsource(pap.verify)
+        found = re.findall(r"git.*add", source, re.IGNORECASE)
+        assert not found, f"verify() must not call git add: {found}"
+
+    def test_no_git_add_in_helpers(self):
+        import inspect, re
+        for name in ["_git_status_clean", "_git_dirty_paths", "_get_allowed_dirty_paths"]:
+            if hasattr(pap, name):
+                source = inspect.getsource(getattr(pap, name))
+                found = re.findall(r"git.*add", source, re.IGNORECASE)
+                assert not found, f"{name}() must not call git add: {found}"
+
+
+class TestNoGhPrCreateExecution:
+    """gh pr create must not be executed — only emitted as text."""
+
+    def test_no_gh_pr_create_subprocess(self):
+        import inspect, re
+        source = inspect.getsource(pap)
+        found = re.findall(r"subprocess.*gh.*pr.*create", source, re.IGNORECASE)
+        assert not found, f"File must not call `gh pr create` via subprocess: {found}"
+
+
+class TestHappyPath:
+    """PR_PREVIEW_READY when all checks pass."""
+
+    def test_pr_preview_ready(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        make_apply_branch(repo, "apply/test", base_sha, "docs/scratch.md")
+
+        json_path = make_applied_branch_json(
+            tmp_path, "apply/test", base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+            task={"forbidden_files": []},
+        )
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/test", "main", base_sha,
+        )
+
+        assert status == "PR_PREVIEW_READY"
+        assert checks.get("branch_diff_matches_expected") is True
+        assert checks.get("repo_clean") is True
+        assert checks.get("branch_not_protected") is True
+        assert checks.get("verified_dirty_worktree_allowed") is False
     """HOLD_CHANGED_FILES_EMPTY when changed_files is empty."""
 
     def test_changed_files_empty(self, tmp_path):
