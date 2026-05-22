@@ -391,26 +391,10 @@ def verify(
         return STATE_CLAUDE_EXIT_NONZERO, {**checks, "claude_exit_code": exit_code}
     checks["claude_exit_zero"] = exit_code == 0 or exit_code is None
 
-    # ── 15. Repo git status ────────────────────────────────────────────────────
-    repo_clean = _git_status_clean(repo_root)
-    checks["repo_git_clean"] = repo_clean
-    if not repo_clean:
-        return STATE_REPO_DIRTY, {**checks}
-
-    # ── 16. Output paths outside repo ─────────────────────────────────────────
-    # (output paths are passed as args, checked by caller before calling verify)
-    checks["output_paths_outside_repo"] = True
-
-    # ── 17. Worktree path outside repo ─────────────────────────────────────────
-    worktree_path = result.get("worktree_path", "")
-    if worktree_path and _path_inside_repo(worktree_path, repo_root):
-        return STATE_WORKTREE_INSIDE_REPO, {
-            **checks,
-            "worktree_path": str(worktree_path),
-        }
-    checks["worktree_outside_repo"] = True
-
-    # ── 18. Command contract safety ────────────────────────────────────────────
+    # ── 15. Command contract safety (artifact-level, before environment) ──────
+    # Command contract unsafe is an artifact-level property and must be reported
+    # even if the repo is dirty — it is a more specific safety signal than
+    # HOLD_REPO_DIRTY and should not be masked by environment state.
     contract = result.get("claude_command_contract_summary", result.get("claude_command_contract", {}))
     if contract:
         contract_str = str(contract)
@@ -432,6 +416,25 @@ def verify(
         checks["command_contract_safe"] = True
     else:
         checks["command_contract_present"] = False
+
+    # ── 16. Repo git status ────────────────────────────────────────────────────
+    repo_clean = _git_status_clean(repo_root)
+    checks["repo_git_clean"] = repo_clean
+    if not repo_clean:
+        return STATE_REPO_DIRTY, {**checks}
+
+    # ── 17. Output paths outside repo ─────────────────────────────────────────
+    # (output paths are passed as args, checked by caller before calling verify)
+    checks["output_paths_outside_repo"] = True
+
+    # ── 18. Worktree path outside repo ─────────────────────────────────────────
+    worktree_path = result.get("worktree_path", "")
+    if worktree_path and _path_inside_repo(worktree_path, repo_root):
+        return STATE_WORKTREE_INSIDE_REPO, {
+            **checks,
+            "worktree_path": str(worktree_path),
+        }
+    checks["worktree_outside_repo"] = True
 
     # ── 19. Packet metadata sufficiency ─────────────────────────────────────────
     has_constraints = bool(allowed_files or forbidden_files or max_changed_files is not None)
