@@ -96,6 +96,16 @@ def parse_args() -> argparse.Namespace:
         default="Slideshow11/Automated-Edge-Discovery",
         help="GitHub repository (default: Slideshow11/Automated-Edge-Discovery)",
     )
+    parser.add_argument(
+        "--allow-docs-only-codex-waiver",
+        action="store_true",
+        default=False,
+        help=(
+            "When set and the PR contains only documentation changes "
+            "(markdown/text files under docs/, README.md, etc.), "
+            "Codex exact-head review may be waived for the final gate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -166,6 +176,31 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
     return pr_data
 
 
+def get_pr_changed_files(pr_number: int, repo: str, head_sha: str) -> list[str]:
+    """
+    Return the list of files changed between main and the given head SHA.
+
+    Uses ``git diff --name-only main...<head_sha>`` locally so it respects
+    local branch state and never touches the network beyond the local repo.
+    cwd is always the current working directory (the local repo root), not
+    the GitHub repo slug passed via --repo.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "diff", "--name-only", f"main...{head_sha}"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("git not found in PATH")
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("git diff timed out")
+    if result.returncode != 0:
+        raise RuntimeError(f"git diff failed: {result.stderr.strip()}")
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
 def get_required_checks(pr_number: int, repo: str, head_sha: str) -> list[dict]:
     """Get the latest commit status for a given SHA."""
     try:
@@ -234,9 +269,83 @@ def is_ci_green(pr_number: int, repo: str, head_sha: str) -> tuple[bool, str]:
     return True, f"All {len(runs)} workflow run(s) succeeded"
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Documentation-only diff classifier
+# --------------------------------------------------------------------------
+
+# Safe documentation paths — these never contain executable code, tests,
+# workflows, schemas, configs, or any other gate-relevant artifacts.
+_DOCS_ONLY_PREFIXES: tuple[str, ...] = (
+    "docs/",
+    "doc/",
+)
+
+# Safe root-level documentation filenames.
+_DOCS_ONLY_ROOT_FILES: frozenset[str] = frozenset({
+    "README.md",
+    "CHANGELOG.md",
+    "CHANGES.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "LICENSE",
+    "LICENSE.md",
+    "SECURITY.md",
+    "SUPPORT.md",
+    "GOVERNANCE.md",
+    "docs.md",
+    "ROADMAP.md",
+    "FAQ.md",
+    "Glossary.md",
+    "glossary.md",
+})
+
+# File extensions that are always safe for documentation-only PRs.
+_DOCS_ONLY_EXTENSIONS: frozenset[str] = frozenset({".md", ".txt", ".rst"})
+
+
+def is_docs_only(paths: list[str]) -> bool:
+    """
+    Return True if every path in ``paths`` is a documentation-only file.
+
+    A docs-only file is one that:
+      - Lives under docs/ or doc/
+      - Is a known root-level documentation filename (README.md, etc.)
+      - Has a documentation-safe extension (.md, .txt, .rst) under docs/
+
+    Any path that is a directory, an executable, a script, a test, a workflow,
+    a config file, a schema, or any file with a non-doc extension is NOT
+    docs-only, even if it lives inside docs/ (e.g. docs/script.py).
+    """
+    if not paths:
+        return False
+
+    for path in paths:
+        p = path.startswith("./") and path[2:] or path
+        if p.endswith("/"):
+            return False
+        # Determine whether this is a top-level (root) path or a nested path.
+        # Only root-level filenames (not inside any directory) are allowed
+        # as a docs-only safe list.
+        is_root = "/" not in p
+        filename = p.rsplit("/", 1)[-1] if not is_root else p
+
+        # Root-level known doc files (README.md, LICENSE, etc.) are safe
+        # only when they are at the repo root — not inside subdirectories.
+        if is_root and filename in _DOCS_ONLY_ROOT_FILES:
+            continue
+        if any(p.startswith(prefix) for prefix in _DOCS_ONLY_PREFIXES):
+            ext = filename[filename.rfind("."):] if "." in filename else ""
+            if ext in _DOCS_ONLY_EXTENSIONS:
+                continue
+            return False
+        return False
+
+    return True
+
+
+# --------------------------------------------------------------------------
 # Git status check
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 def is_git_clean(repo_path: str = ".") -> tuple[bool, str]:
     """Return (is_clean, output). Checks git status --porcelain."""
@@ -489,7 +598,25 @@ def evaluate(args: argparse.Namespace) -> dict:
         )
 
     # --- Check 4: Codex exact-head review ---
+    # Docs-only waiver: if --allow-docs-only-codex-waiver is set AND the PR
+    # diff is docs-only, skip the Codex SHA requirement.
     codex_sha = args.codex_reviewed_sha
+    docs_waiver_used = False
+    if not codex_sha and args.allow_docs_only_codex_waiver:
+        # Fetch changed files for this PR to determine if it is docs-only.
+        try:
+            changed_files = get_pr_changed_files(pr_number, repo, canonical_head_sha)
+            if is_docs_only(changed_files):
+                docs_waiver_used = True
+                # Set codex_sha equal to head so the existing SHA-match logic
+                # at the bottom of this block passes.  This lets the flow
+                # continue to the PMG and git-status checks rather than
+                # returning HOLD_CODEX_REQUIRED here.
+                codex_sha = canonical_head_sha
+        except Exception:
+            # If we cannot determine changed files, do NOT waive
+            codex_sha = None  # fall through to normal HOLD_CODEX_REQUIRED
+
     if not codex_sha:
         blockers = ["No --codex-reviewed-sha supplied; Codex exact-head review cannot be verified"]
         return compute_result(
@@ -545,10 +672,12 @@ def evaluate(args: argparse.Namespace) -> dict:
         "pr_open": True,
         "head_matches": True,
         "ci_green": True,
-        "codex_exact_head": True,
+        "codex_exact_head": not docs_waiver_used,
         "pmg_clean": True,
         "git_status_clean": True,
     }
+    if docs_waiver_used:
+        checks["codex_review_waived_for_docs_only"] = True
     blockers = []
     return compute_result(
         State.READY_TO_MERGE, pr_number, canonical_head_sha,

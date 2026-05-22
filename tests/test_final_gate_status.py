@@ -31,6 +31,7 @@ def make_args(
     output_json=None,
     output_md=None,
     repo="Slideshow11/Automated-Edge-Discovery",
+    allow_docs_only_codex_waiver=False,
 ):
     return type(
         "Args",
@@ -43,6 +44,7 @@ def make_args(
             "output_json": output_json,
             "output_md": output_md,
             "repo": repo,
+            "allow_docs_only_codex_waiver": allow_docs_only_codex_waiver,
         },
     )()
 
@@ -721,3 +723,286 @@ class TestGhJsonArgOrdering:
             assert all(graphql_idx < idx for idx in f_flags), (
                 f"graphql endpoint must come before -f flags: {captured_cmd}"
             )
+
+
+# --------------------------------------------------------------------------
+# is_docs_only classifier
+# --------------------------------------------------------------------------
+
+class TestIsDocsOnly:
+    def test_docs_subdirectory_md_is_docs_only(self):
+        assert fgs.is_docs_only(["docs/architecture.md"]) is True
+
+    def test_multiple_docs_md_files(self):
+        assert fgs.is_docs_only([
+            "docs/architecture.md",
+            "docs/process_gap.md",
+            "docs/notes.md",
+        ]) is True
+
+    def test_readme_root_is_docs_only(self):
+        assert fgs.is_docs_only(["README.md"]) is True
+
+    def test_mixed_readme_and_docs(self):
+        assert fgs.is_docs_only(["README.md", "docs/notes.md"]) is True
+
+    def test_governance_md_is_docs_only(self):
+        assert fgs.is_docs_only(["GOVERNANCE.md"]) is True
+
+    def test_license_is_docs_only(self):
+        assert fgs.is_docs_only(["LICENSE"]) is True
+
+    def test_txt_in_docs_is_docs_only(self):
+        assert fgs.is_docs_only(["docs/notes.txt"]) is True
+
+    def test_rst_in_docs_is_docs_only(self):
+        assert fgs.is_docs_only(["docs/index.rst"]) is True
+
+    def test_script_py_in_docs_is_not_docs_only(self):
+        assert fgs.is_docs_only(["docs/script.py"]) is False
+
+    def test_scripts_local_py_is_not_docs_only(self):
+        assert fgs.is_docs_only(["scripts/local/foo.py"]) is False
+
+    def test_test_file_is_not_docs_only(self):
+        assert fgs.is_docs_only(["tests/test_final_gate_status.py"]) is False
+
+    def test_workflow_is_not_docs_only(self):
+        assert fgs.is_docs_only([".github/workflows/ci.yml"]) is False
+
+    def test_config_is_not_docs_only(self):
+        assert fgs.is_docs_only(["pyproject.toml"]) is False
+
+    def test_mixed_docs_and_code_not_docs_only(self):
+        assert fgs.is_docs_only(["docs/notes.md", "scripts/local/foo.py"]) is False
+
+    def test_mixed_docs_and_workflow_not_docs_only(self):
+        assert fgs.is_docs_only(["README.md", ".github/workflows/ci.yml"]) is False
+
+    def test_empty_list_not_docs_only(self):
+        assert fgs.is_docs_only([]) is False
+
+    def test_directory_trailing_slash_not_docs_only(self):
+        assert fgs.is_docs_only(["docs/"]) is False
+
+    def test_doc_subdirectory_md_is_docs_only(self):
+        assert fgs.is_docs_only(["doc/architecture.md"]) is True
+
+    def test_nested_readme_not_docs_only(self):
+        assert fgs.is_docs_only(["src/package/README.md"]) is False
+
+    def test_nested_license_not_docs_only(self):
+        assert fgs.is_docs_only(["vendor/LICENSE"]) is False
+
+    def test_nested_governance_not_docs_only(self):
+        assert fgs.is_docs_only(["src/GOVERNANCE.md"]) is False
+
+    def test_json_in_docs_not_docs_only(self):
+        assert fgs.is_docs_only(["docs/example.json"]) is False
+
+    def test_yaml_in_docs_not_docs_only(self):
+        assert fgs.is_docs_only(["docs/config.yaml"]) is False
+
+
+# --------------------------------------------------------------------------
+# Docs-only Codex waiver
+# --------------------------------------------------------------------------
+
+class TestDocsOnlyCodexWaiver:
+    """Tests for --allow-docs-only-codex-waiver behavior."""
+
+    def test_no_waiver_no_codex_returns_hold(self, pmg_clean):
+        """Without waiver flag, missing Codex review returns HOLD_CODEX_REQUIRED."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=False,
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open()):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CODEX_REQUIRED
+        assert "codex" in result["blockers"][0].lower()
+
+    def test_waiver_code_pr_still_holds(self, pmg_clean):
+        """With waiver but non-docs diff, still returns HOLD_CODEX_REQUIRED."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files", return_value=["scripts/local/foo.py"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CODEX_REQUIRED
+
+    def test_waiver_mixed_pr_still_holds(self, pmg_clean):
+        """With waiver but mixed diff (docs + code), still returns HOLD_CODEX_REQUIRED."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      return_value=["docs/notes.md", "scripts/local/foo.py"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CODEX_REQUIRED
+
+    def test_waiver_docs_only_returns_ready(self, pmg_clean):
+        """With waiver and docs-only diff, returns READY_TO_MERGE if all gates pass."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    with mock.patch.object(fgs, "get_pr_changed_files",
+                                          return_value=["docs/notes.md", "README.md"]):
+                        result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.READY_TO_MERGE
+
+    def test_waiver_docs_only_emit_waiver_field(self, pmg_clean):
+        """When waiver is used, output explicitly includes codex_review_waived_for_docs_only."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    with mock.patch.object(fgs, "get_pr_changed_files",
+                                          return_value=["docs/notes.md"]):
+                        result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.READY_TO_MERGE
+        assert result["checks"].get("codex_review_waived_for_docs_only") is True
+        assert result["checks"]["codex_exact_head"] is False
+
+    def test_no_waiver_docs_pr_still_holds(self, pmg_clean):
+        """Without waiver flag, docs-only PR with no Codex still returns HOLD."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=False,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      return_value=["docs/notes.md"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CODEX_REQUIRED
+
+    def test_waiver_does_not_bypass_pmg(self, pmg_blocked):
+        """Waiver must NOT skip PMG check — blocked PMG still returns HOLD_PMG_DIRTY."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_blocked,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      return_value=["docs/notes.md"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_PMG_DIRTY
+
+    def test_waiver_does_not_bypass_ci(self, pmg_clean):
+        """Waiver must NOT skip CI check — red CI still returns HOLD_CI_RED."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(False, "test failed")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      return_value=["docs/notes.md"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CI_RED
+
+    def test_waiver_does_not_bypass_head_match(self, pmg_clean):
+        """Waiver must NOT skip head-match check."""
+        args = make_args(
+            reported_head_sha="deadbeef0000000000000000000000000000000",
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      return_value=["docs/notes.md"]):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_HEAD_MISMATCH
+
+    def test_waiver_does_not_bypass_git_dirty(self, pmg_clean):
+        """Waiver must NOT skip git status check."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(False, "M dirty.txt")):
+                    with mock.patch.object(fgs, "get_pr_changed_files",
+                                          return_value=["docs/notes.md"]):
+                        result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_GIT_DIRTY
+
+    def test_waiver_with_explicit_codex_sha_still_uses_codex(self, pmg_clean):
+        """When --codex-reviewed-sha is explicitly provided, waiver is not invoked."""
+        sha = "abc123def0000000000000000000000000000000"
+        args = make_args(
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,  # waiver present but not needed
+        )
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.READY_TO_MERGE
+        # codex_exact_head should be True since explicit SHA was supplied
+        assert result["checks"]["codex_exact_head"] is True
+        assert "codex_review_waived_for_docs_only" not in result["checks"]
+
+    def test_waiver_get_pr_changed_files_error_falls_back_to_hold(self, pmg_clean):
+        """If get_pr_changed_files raises, waiver is NOT applied — returns HOLD."""
+        args = make_args(
+            codex_reviewed_sha=None,
+            pmg_guard_state_json=pmg_clean,
+            allow_docs_only_codex_waiver=True,
+        )
+        sha = "abc123def0000000000000000000000000000000"
+        pr = make_pr_open(sha)
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=pr):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "get_pr_changed_files",
+                                      side_effect=RuntimeError("git diff failed")):
+                    result = fgs.evaluate(args)
+        assert result["status"] == fgs.State.HOLD_CODEX_REQUIRED
