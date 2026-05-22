@@ -106,8 +106,13 @@ def make_clean_pmg_compare(pmg_dir: Path):
 class TestHappyPath:
     """APPLY_READY when all checks pass."""
 
-    def test_apply_ready_synthetic_smoke_005(self, tmp_path):
+    def test_apply_ready_synthetic_smoke_005(self, tmp_path, monkeypatch):
         """Smoke 005-like synthetic result returns APPLY_READY."""
+        import verify_temp_worktree_apply_readiness as vtar
+
+        # Isolate: force a clean git status regardless of development-machine state
+        monkeypatch.setattr(vtar, "_git_status_clean", lambda repo_root: True)
+
         result_path = make_result_json(
             tmp_path,
             changed_files=["docs/live_smoke_scratch.md"],
@@ -571,8 +576,13 @@ class TestOutputPathInsideRepo:
 class TestWorktreeInsideRepo:
     """HOLD_WORKTREE_INSIDE_REPO when worktree path is inside repo."""
 
-    def test_worktree_inside_repo(self, tmp_path):
+    def test_worktree_inside_repo(self, tmp_path, monkeypatch):
         """worktree_path inside repo returns HOLD_WORKTREE_INSIDE_REPO."""
+        import verify_temp_worktree_apply_readiness as vtar
+
+        # Isolate: force a clean git status regardless of development-machine state
+        monkeypatch.setattr(vtar, "_git_status_clean", lambda repo_root: True)
+
         result_path = make_result_json(
             tmp_path,
             worktree_path=str(REPO_ROOT / "worktree_inside"),
@@ -613,6 +623,62 @@ class TestCommandContractUnsafe:
 
     def test_bypass_permissions_flag(self, tmp_path):
         """bypassPermissions flag in contract returns HOLD_COMMAND_CONTRACT_UNSAFE."""
+        result_path = make_result_json(
+            tmp_path,
+            claude_command_contract_summary="argv=['claude', '--print', '--dangerously-skip-permissions']",
+        )
+        diff_path = make_diff_patch(tmp_path)
+
+        status, checks = vtar.verify(
+            result_path, diff_path, REPO_ROOT,
+            require_real_claude=False,
+            require_pmg_clean=False,
+            max_diff_bytes=1_000_000,
+            expected_status="PATCH_READY_FOR_HUMAN_REVIEW",
+        )
+
+        assert status == "HOLD_COMMAND_CONTRACT_UNSAFE"
+
+
+class TestCommandContractBeforeRepoDirty:
+    """HOLD_COMMAND_CONTRACT_UNSAFE is reported even when repo is dirty.
+
+    This is a regression test for a prior ordering issue where repo-dirty
+    (an environment-level signal) was checked before command-contract
+    safety (an artifact-level signal), causing unsafe contracts to be
+    masked as HOLD_REPO_DIRTY when both conditions were true.
+    """
+
+    def test_shell_true_with_dirty_repo_returns_command_contract_unsafe(
+        self, tmp_path, monkeypatch
+    ):
+        """shell=True contract with dirty repo returns HOLD_COMMAND_CONTRACT_UNSAFE."""
+        import verify_temp_worktree_apply_readiness as vtar
+        monkeypatch.setattr(vtar, "_git_status_clean", lambda repo_root: False)
+
+        result_path = make_result_json(
+            tmp_path,
+            claude_command_contract_summary="argv=['claude', '--print'] shell=True cwd=/tmp",
+        )
+        diff_path = make_diff_patch(tmp_path)
+
+        status, checks = vtar.verify(
+            result_path, diff_path, REPO_ROOT,
+            require_real_claude=False,
+            require_pmg_clean=False,
+            max_diff_bytes=1_000_000,
+            expected_status="PATCH_READY_FOR_HUMAN_REVIEW",
+        )
+
+        assert status == "HOLD_COMMAND_CONTRACT_UNSAFE"
+
+    def test_bypass_permissions_with_dirty_repo_returns_command_contract_unsafe(
+        self, tmp_path, monkeypatch
+    ):
+        """bypassPermissions flag with dirty repo returns HOLD_COMMAND_CONTRACT_UNSAFE."""
+        import verify_temp_worktree_apply_readiness as vtar
+        monkeypatch.setattr(vtar, "_git_status_clean", lambda repo_root: False)
+
         result_path = make_result_json(
             tmp_path,
             claude_command_contract_summary="argv=['claude', '--print', '--dangerously-skip-permissions']",
