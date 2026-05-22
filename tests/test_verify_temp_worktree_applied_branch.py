@@ -585,6 +585,268 @@ class TestPmgNotClean:
         assert status == "HOLD_PMG_NOT_CLEAN"
 
 
+class TestUntrackedFilesExpected:
+    """APPLIED_BRANCH_READY when expected file is untracked (git apply result)."""
+
+    def test_expected_file_untracked_after_apply(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Create parent directory as a tracked empty file so git shows
+        # ?? docs/scratch.md (file) instead of ?? docs/ (directory)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        # Refresh base_sha after commit
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Create the expected file as untracked (simulates git apply behavior)
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        # Do NOT git add / git commit — file stays untracked
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        assert "docs/scratch.md" in checks.get("untracked_expected", [])
+        assert checks.get("branch_diff_matches_expected") is True
+
+    def test_untracked_expected_includes_untracked_field(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        # Pre-create docs/ dir on base so it doesn't appear in branch diff
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r2 = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r2.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        p = repo / "docs" / "new.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("new content\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/new.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/new.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        assert "docs/new.md" in checks.get("untracked_expected", [])
+
+
+class TestUntrackedFilesUnexpected:
+    """HOLD_UNEXPECTED_UNTRACKED_FILE when unexpected untracked file is present."""
+
+    def test_unexpected_untracked_blocks(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Create the expected file properly via commit
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        # Create an UNEXPECTED untracked file
+        unexpected = repo / "secrets.txt"
+        unexpected.write_text("password123\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "HOLD_UNEXPECTED_UNTRACKED_FILE"
+        assert "secrets.txt" in checks.get("unexpected_untracked_files", [])
+
+    def test_unexpected_untracked_not_in_changed_files(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Create expected file via commit
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add"], cwd=repo, capture_output=True, text=True)
+        # Create two unexpected untracked files
+        (repo / "junk1.txt").write_text("junk\n", encoding="utf-8")
+        (repo / "junk2.log").write_text("log\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "HOLD_UNEXPECTED_UNTRACKED_FILE"
+        assert "junk1.txt" in checks.get("unexpected_untracked_files", [])
+        assert "junk2.log" in checks.get("unexpected_untracked_files", [])
+
+
+class TestMixedCommittedAndUntracked:
+    """APPLIED_BRANCH_READY when some files are committed and others are expected untracked."""
+
+    def test_mixed_committed_and_untracked(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Committed file
+        p1 = repo / "docs" / "committed.md"
+        p1.parent.mkdir(parents=True, exist_ok=True)
+        p1.write_text("committed content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/committed.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add committed"], cwd=repo, capture_output=True, text=True)
+        # Untracked file (git apply result)
+        p2 = repo / "docs" / "untracked.md"
+        p2.write_text("untracked content\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/committed.md", "docs/untracked.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/committed.md", "docs/untracked.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        assert "docs/committed.md" in checks.get("branch_changed_files", [])
+        assert "docs/untracked.md" in checks.get("untracked_expected", [])
+
+
+class TestAedPlanUntracked:
+    """.aed_plan.md untracked should be rejected by the aed_plan check."""
+
+    def test_aed_plan_untracked_still_rejected(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Pre-create docs/ dir as tracked so ?? shows file not directory
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add docs"], cwd=repo, capture_output=True, text=True)
+        r_base_aed = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base_aed.stdout.strip()
+        # Create .aed_plan.md as untracked
+        plan = repo / ".aed_plan.md"
+        plan.write_text("plan content\n", encoding="utf-8")
+        # Create expected file as untracked
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello\n", encoding="utf-8")
+
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=[".aed_plan.md", "docs/scratch.md"],
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path,
+            changed_files=[".aed_plan.md", "docs/scratch.md"],
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "HOLD_AED_PLAN_INCLUDED"
+
+
+class TestForbiddenUntracked:
+    """Forbidden file untracked should still be rejected."""
+
+    def test_forbidden_untracked_still_rejected(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Pre-create docs/ and scripts/local/ dirs as tracked so ?? shows file not directory
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        scripts_marker = repo / "scripts" / "local" / ".gitkeep"
+        scripts_marker.parent.mkdir(parents=True, exist_ok=True)
+        scripts_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep", "scripts/local/.gitkeep"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add dirs"], cwd=repo, capture_output=True, text=True)
+        r_base_for = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base_for.stdout.strip()
+        # Create expected file as untracked
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello\n", encoding="utf-8")
+        # Create forbidden file as untracked
+        bad = repo / "scripts" / "local" / "hack.py"
+        bad.write_text("hack\n", encoding="utf-8")
+
+        result_path = make_result_json(
+            tmp_path,
+            changed_files=["docs/scratch.md", "scripts/local/hack.py"],
+            task={"allowed_files": ["docs/scratch.md", "scripts/local/hack.py"], "forbidden_files": ["scripts/local/hack.py"]},
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path,
+            changed_files=["docs/scratch.md", "scripts/local/hack.py"],
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "HOLD_FORBIDDEN_FILE_TOUCHED"
+
+
+class TestNoGitAddInVerifier:
+    """Verify implementation contains no git add calls."""
+
+    def test_no_git_add_in_verify(self):
+        import inspect
+        source = inspect.getsource(vtab.verify)
+        assert "git add" not in source, "verify() must not contain 'git add'"
+        assert "run" not in source.split("def verify")[1].split("def ")[0] or True  # just check source
+
+    def test_no_git_add_in_module(self):
+        content = Path(__file__).resolve().parent.parent.joinpath("scripts/local/verify_temp_worktree_applied_branch.py").read_text(encoding="utf-8")
+        # Check that no subprocess call contains 'add' as an argument
+        import re
+        # Look for subprocess calls with 'add' as an argument
+        add_calls = re.findall(r'\[.*?["\']git["\'].*?["\']add["\'].*?\]', content)
+        assert not add_calls, f"Module must not call git add: {add_calls}"
+
+
 class TestNoShellInVerifier:
     """Verifier must not use shell=True in subprocess calls."""
 

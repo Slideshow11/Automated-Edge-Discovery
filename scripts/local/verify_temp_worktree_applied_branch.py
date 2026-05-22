@@ -63,6 +63,7 @@ STATE_HOLD_AED_PLAN_INCLUDED     = "HOLD_AED_PLAN_INCLUDED"
 STATE_HOLD_FORBIDDEN_FILE_TOUCHED = "HOLD_FORBIDDEN_FILE_TOUCHED"
 STATE_HOLD_TOO_MANY_FILES_CHANGED = "HOLD_TOO_MANY_FILES_CHANGED"
 STATE_HOLD_PMG_NOT_CLEAN         = "HOLD_PMG_NOT_CLEAN"
+STATE_HOLD_UNEXPECTED_UNTRACKED  = "HOLD_UNEXPECTED_UNTRACKED_FILE"
 STATE_HOLD_UNKNOWN               = "HOLD_UNKNOWN"
 
 PROTECTED_BRANCH_NAMES = {"main", "master", "HEAD"}
@@ -293,9 +294,48 @@ def verify(
     checks["branch_changed_files"] = branch_changed_files
     checks["branch_changed_files_count"] = len(branch_changed_files)
 
-    # ── 15. Branch diff must contain exactly the result changed_files ─────────
-    branch_set = set(branch_changed_files)
+    # ── 14b. Untracked files on branch (post-apply untracked are visible via
+    #        git status --short with a pathspec that covers the branch working tree).
+    #        Run git status from the repo root scoped to the branch's tree.
+    #        This does NOT checkout or switch branches — it reads the current working
+    #        tree state as-is. Any untracked files are either the result of a prior
+    #        `git apply` on this branch (intended) or unexpected artifacts (blocked).
+    r_status = _run_git(
+        repo_root,
+        "status",
+        "--short",
+        "--",
+    )
+    untracked_files = []
+    if r_status.returncode == 0:
+        untracked_files = [
+            line[3:].strip()  # strip "?? " prefix
+            for line in r_status.stdout.strip().splitlines()
+            if line.startswith("?? ")
+        ]
+
+    # Expected untracked: ?? files that are in changed_files
+    # Unexpected untracked: ?? files NOT in changed_files
     expected_set = set(changed_files)
+    untracked_expected = sorted(f for f in untracked_files if f in expected_set)
+    untracked_unexpected = sorted(f for f in untracked_files if f not in expected_set)
+
+    checks["untracked_files"] = untracked_files
+    checks["untracked_expected"] = untracked_expected
+    checks["untracked_unexpected"] = untracked_unexpected
+
+    # Block unexpected untracked files — fail closed
+    if untracked_unexpected:
+        return STATE_HOLD_UNEXPECTED_UNTRACKED, {
+            **checks,
+            "unexpected_untracked_files": untracked_unexpected,
+        }
+    checks["no_unexpected_untracked"] = True
+
+    # ── 15. Branch diff must contain exactly the result changed_files ─────────
+    #        Include expected untracked files that came from git apply.
+    actual_applied = set(branch_changed_files) | set(untracked_expected)
+    branch_set = actual_applied
     if branch_set != expected_set:
         extra = sorted(branch_set - expected_set)
         missing = sorted(expected_set - branch_set)
@@ -306,17 +346,20 @@ def verify(
         }
     checks["branch_diff_matches_expected"] = True
 
-    # ── 16. .aed_plan.md must NOT be in branch diff ─────────────────────────
-    if ".aed_plan.md" in branch_changed_files:
+    # Update branch_changed_files in checks to reflect applied state
+    checks["branch_changed_files"] = sorted(actual_applied)
+
+    # ── 16. .aed_plan.md must NOT be in actual applied files ─────────────────
+    if ".aed_plan.md" in actual_applied:
         return STATE_HOLD_AED_PLAN_INCLUDED, {
             **checks,
             "aed_plan_in_branch_diff": True,
         }
     checks["aed_plan_excluded"] = True
 
-    # ── 17. Forbidden files must NOT be in branch diff ───────────────────────
+    # ── 17. Forbidden files must NOT be in actual applied files ──────────────
     if forbidden_files:
-        touched = [f for f in branch_changed_files if f in forbidden_files]
+        touched = [f for f in actual_applied if f in forbidden_files]
         if touched:
             return STATE_HOLD_FORBIDDEN_FILE_TOUCHED, {
                 **checks,
@@ -326,10 +369,10 @@ def verify(
 
     # ── 18. Max changed files enforcement ────────────────────────────────────
     if max_changed_files is not None:
-        if len(branch_changed_files) > max_changed_files:
+        if len(actual_applied) > max_changed_files:
             return STATE_HOLD_TOO_MANY_FILES_CHANGED, {
                 **checks,
-                "branch_changed_files_count": len(branch_changed_files),
+                "branch_changed_files_count": len(actual_applied),
                 "max_allowed": max_changed_files,
             }
         checks["max_changed_files_ok"] = True
