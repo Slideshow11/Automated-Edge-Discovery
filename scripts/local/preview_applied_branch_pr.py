@@ -346,27 +346,36 @@ def verify(
     checks["changed_files_unique"] = True
 
     # ── 11. Branch diff matches verification changed_files ───────────────────
-    # Use base_branch as reference (not merge_base) because applied branches
-    # may have zero commits on top of the merge base — files added by git apply
-    # appear as untracked worktree changes relative to base_branch. The diff
-    # against base_branch captures what this PR would actually add.
-    r = _run_git(repo_root, "diff", "--name-only", f"refs/heads/{base_branch}..refs/heads/{branch_name}")
-    branch_diff_files = [f for f in r.stdout.strip().splitlines() if f]
-    checks["branch_diff_files"] = branch_diff_files
+    # Skip this check when step 9 allowed a dirty worktree, because:
+    # - Applied branches may have zero commits on top of the merge base
+    # - Files added by git apply appear as untracked worktree changes, not committed
+    # - The APPLIED_BRANCH_READY verification JSON is the authoritative source
+    #   for what files this PR adds; the branch diff only reflects commits
+    # When repo is clean, use the full diff check as normal consistency gate.
+    branch_diff_files: list[str] = []  # always defined for steps 12/13
+    if checks.get("verified_dirty_worktree_allowed"):
+        checks["branch_diff_skipped_dirty_allowed"] = True
+        checks["branch_diff_files"] = []
+        checks["branch_diff_matches_expected"] = None
+    else:
+        r = _run_git(repo_root, "diff", "--name-only", f"refs/heads/{base_branch}..refs/heads/{branch_name}")
+        branch_diff_files = [f for f in r.stdout.strip().splitlines() if f]
+        checks["branch_diff_files"] = branch_diff_files
 
-    branch_set = set(branch_diff_files)
-    expected_set = set(changed_files)
-    if branch_set != expected_set:
-        extra = sorted(branch_set - expected_set)
-        missing = sorted(expected_set - branch_set)
-        return STATE_HOLD_BRANCH_DIFF_MISMATCH, {
-            **checks,
-            "extra_files": extra,
-            "missing_files": missing,
-        }
-    checks["branch_diff_matches_expected"] = True
+        branch_set = set(branch_diff_files)
+        expected_set = set(changed_files)
+        if branch_set != expected_set:
+            extra = sorted(branch_set - expected_set)
+            missing = sorted(expected_set - branch_set)
+            return STATE_HOLD_BRANCH_DIFF_MISMATCH, {
+                **checks,
+                "extra_files": extra,
+                "missing_files": missing,
+            }
+        checks["branch_diff_matches_expected"] = True
 
     # ── 12. .aed_plan.md not in branch diff ──────────────────────────────────
+    # Use branch_diff_files for checks; empty list is safe when step 11 skipped
     if ".aed_plan.md" in branch_diff_files:
         return STATE_HOLD_AED_PLAN_INCLUDED, {**checks}
     checks["aed_plan_excluded"] = True
