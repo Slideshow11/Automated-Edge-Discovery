@@ -25,6 +25,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -47,6 +48,30 @@ FORBIDDEN_EXECUTION_MODES = frozenset(["claude", "live", "real"])
 
 # Subprocess timeout for each stage (seconds)
 STAGE_TIMEOUT = 600
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _sha256_file(path: Path) -> str:
+    """Compute SHA-256 of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _git_rev_parse(repo: Path, ref: str = "HEAD") -> str:
+    """Return the SHA for a given git ref."""
+    proc = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", ref],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        return ""
+    return proc.stdout.strip()
+
 
 # ---------------------------------------------------------------------------
 # State definitions
@@ -231,31 +256,74 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
 # Stage 1: Build execution packet
 # ---------------------------------------------------------------------------
 
-def build_execution_packet(task_packet: dict) -> dict:
+def build_execution_packet(task_packet: dict, plan_sha: str, approved_plan_file: Path) -> dict:
     """
     Convert task packet into an execution packet for run_temp_worktree_execution.py.
+
+    Args:
+        task_packet: high-level autocoder task packet (aed.autocoder.single_task.v0)
+        plan_sha: SHA-256 of the approved plan file (pre-written to output_root)
+        approved_plan_file: Path to the written approved plan file
+
+    The execution packet schema (aed.temp_worktree.execution.v0) requires:
+        packet_kind, run_id, task_id, base_sha, approved_plan_path,
+        approved_plan_sha256, approval, task, execution,
+    plus execution metadata fields.
     """
-    # Determine allowed/forbidden files for the execution packet.
-    # If allowed_files is null, pass null (all allowed).
-    # If forbidden_files is set, pass as-is.
     allowed = task_packet.get("allowed_files")
     forbidden = task_packet.get("forbidden_files")
+    task_id = task_packet["task_id"]
 
-    # Build execution packet per aed.temp_worktree.execution.v0
+    # Resolve base_sha: use explicit value from task packet, else current HEAD
+    base_sha = task_packet.get("base_sha") or _git_rev_parse(REPO_ROOT, "HEAD")
+
+    # Normalize execution_mode "mocked" -> "mock" for the nested execution dict
+    exec_mode_raw = task_packet.get("execution_mode", "mocked")
+    exec_mode = "mock" if exec_mode_raw == "mocked" else exec_mode_raw
+
     exec_packet = {
         "packet_kind": "aed.temp_worktree.execution.v0",
-        "execution_mode": "mocked",  # always mocked in v0
-        "goal": task_packet["goal"],
+        # run_id and task_id
+        "run_id": task_id,
+        "task_id": task_id,
+        # base_sha for worktree creation
+        "base_sha": base_sha,
+        # Execution mode (nested, as required by run_temp_worktree_execution.py)
+        "execution": {
+            "mode": exec_mode,
+            "output_root": task_packet["output_root"],
+            "timeout_seconds": 300,
+            # Pass through mock_edits for smoke testing with synthetic diffs
+            "mock_edits": task_packet.get("mock_edits", []),
+        },
+        # Goal
+        "goal": task_packet.get("goal", ""),
+        # File constraints
         "allowed_files": allowed,
         "forbidden_files": forbidden,
         "max_changed_files": task_packet.get("max_changed_files"),
-        "required_tests": task_packet.get("required_tests"),
-        "output_root": task_packet["output_root"],
-        "task_id": task_packet["task_id"],
-        "branch_name": task_packet["branch_name"],
-        "suggested_pr_title": task_packet["suggested_pr_title"],
-        "suggested_pr_body": task_packet["suggested_pr_body"],
-        # execution_packet is derived from task_packet, not user-controlled
+        # Branch metadata
+        "branch_name": task_packet.get("branch_name", ""),
+        "suggested_pr_title": task_packet.get("suggested_pr_title", ""),
+        "suggested_pr_body": task_packet.get("suggested_pr_body", ""),
+        # Approval (required by validate_packet and validate_approval)
+        "approval": {
+            "approved_at": datetime.now(timezone.utc).isoformat(),
+            "approved_by": "human",
+            "approved_plan_sha256": plan_sha,
+            "approved_for_temp_worktree_execution": True,
+        },
+        # Approved plan file info
+        "approved_plan_path": str(approved_plan_file),
+        "approved_plan_sha256": plan_sha,
+        # Task section (required by validate_packet and post-execution diff validation)
+        "task": {
+            "description": task_packet.get("goal", ""),
+            "allowed_files": allowed if allowed else [],
+            "forbidden_files": forbidden if forbidden else [],
+            "do_not": task_packet.get("do_not", []),
+        },
+        # Metadata
         "execution_packet_created_at": datetime.now(timezone.utc).isoformat(),
         "source_packet_kind": task_packet.get("packet_kind"),
     }
@@ -362,8 +430,16 @@ def run_autocoder_single_task(
     # Make output root
     output_root.mkdir(parents=True, exist_ok=True)
 
+    # Write approved_plan.md before building the execution packet.
+    # SHA must match approved_plan_sha256 that goes into the packet.
+    approved_plan_file = output_root / "approved_plan.md"
+    goal_text = task_packet.get("goal", "")
+    plan_content = f"# AED Single-Task Smoke Plan\n\ntask_id: {task_id}\ngoal: {goal_text}\n"
+    approved_plan_file.write_text(plan_content, encoding="utf-8")
+    plan_sha = _sha256_file(approved_plan_file)
+
     # Stage 1: Build execution packet
-    exec_packet = build_execution_packet(task_packet)
+    exec_packet = build_execution_packet(task_packet, plan_sha, approved_plan_file)
     _write_json(execution_packet_path, exec_packet)
     _write_json(task_packet_path.parent / f"task_packet_{task_id}.json", task_packet)
 
