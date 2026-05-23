@@ -213,7 +213,7 @@ def dedupe_preserve_order(paths: list[str]) -> list[str]:
     return out
 
 
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # PMG helpers (Persistent Mutation Guard)
 # --------------------------------------------------------------------------
 
@@ -1801,7 +1801,8 @@ def run(
                 f"--- /dev/null\n"
                 f"+++ b/{untracked_file}\n"
                 f"@@ -0,0 +1,{line_count} @@\n"
-                f"{content}"
+                + "".join(f"+{line}" for line in content.splitlines(keepends=True))
+                + ("" if content.endswith("\n") else "\n\ No newline at end of file\n")
             )
 
     combined_diff = "\n\n".join(diff_parts)
