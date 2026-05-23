@@ -548,6 +548,7 @@ def run_autocoder_single_task(
         "--diff-patch", str(diff_patch_path),
         "--apply-readiness-json", str(apply_readiness_json_path),
         "--repo-root", str(REPO_ROOT),
+        "--expected-head", str(base_sha),
         "--output-json", str(apply_preview_json_path),
         "--output-md", str(apply_preview_md_path),
     ]
