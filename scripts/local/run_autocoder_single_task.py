@@ -120,22 +120,24 @@ def _is_path_forbidden(path: str, forbidden: list[str]) -> bool:
 
     Rules:
     - Normalizes both path and forbidden entries to use "/" as separator.
-    - Rejects absolute paths.
-    - Rejects paths containing ".." segment.
+    - Rejects absolute paths regardless of forbidden list.
+    - Rejects paths containing ".." segment regardless of forbidden list.
     - Exact match: path == forbidden_entry
     - Prefix match: if forbidden_entry ends with "/", blocks any path starting with that prefix.
+      Without trailing slash, also blocks any path that starts with entry + "/".
     """
-    if not forbidden:
-        return False
     # Normalize
     path = path.strip().replace("\\", "/")
-    # Reject absolute
+    # Reject absolute paths unconditionally
     if path.startswith("/"):
         return True
-    # Reject traversal
+    # Reject traversal unconditionally
     parts = path.split("/")
     if ".." in parts:
         return True
+    # If no forbidden entries, path is not forbidden (but absolute/traversal already rejected above)
+    if not forbidden:
+        return False
     for entry in forbidden:
         entry_norm = entry.strip().replace("\\", "/").rstrip("/")
         if not entry_norm:

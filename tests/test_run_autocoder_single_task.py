@@ -348,7 +348,7 @@ class TestMockEditsValidation:
         assert "forbidden" in err or "not in allowed" in err
 
     def test_rejects_mock_edit_absolute_path(self, tmp_path):
-        """Absolute paths are rejected (caught by allowed or forbidden check)."""
+        """Absolute paths are rejected unconditionally (before forbidden check)."""
         packet = make_packet(
             forbidden_files=["/tmp/"],
             mock_edits=[{"path": "/tmp/aed_runs/somefile.md", "content": "absolute"}],
@@ -356,7 +356,7 @@ class TestMockEditsValidation:
         result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
         assert result["status"] == "HOLD_TASK_PACKET_INVALID"
         err = result.get("error", "").lower()
-        assert "forbidden" in err or "not in allowed" in err
+        assert "forbidden" in err
 
     def test_rejects_mock_edit_backslash_normalized(self, tmp_path):
         """Backslashes are normalized and prefix match applied."""
