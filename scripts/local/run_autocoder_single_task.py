@@ -308,7 +308,10 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
             if allowed is not None and path not in allowed:
                 return False, f"mock_edits[{i}].path '{path}' is not in allowed_files"
             # Each mock edit path must not be forbidden (exact, prefix, or dir)
-            if forbidden is not None and _is_path_forbidden(path, forbidden):
+            # Always call _is_path_forbidden so absolute/traversal checks run even
+            # when forbidden_files is null. Empty list is safe — absolute/traversal
+            # checks run before the early return.
+            if _is_path_forbidden(path, forbidden or []):
                 return False, f"mock_edits[{i}].path '{path}' is forbidden"
         # Number of mock edits must not exceed max_changed_files
         mcf = packet.get("max_changed_files")

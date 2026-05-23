@@ -335,6 +335,17 @@ class TestMockEditsValidation:
         assert result["status"] == "HOLD_TASK_PACKET_INVALID"
         assert "forbidden" in result.get("error", "").lower()
 
+    def test_rejects_mock_edit_absolute_path_with_null_forbidden(self, tmp_path):
+        """Absolute paths rejected even when forbidden_files is null."""
+        packet = make_packet(
+            forbidden_files=None,
+            mock_edits=[{"path": "/tmp/evil.md", "content": "absolute"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        err = result.get("error", "").lower()
+        assert "forbidden" in err
+
     def test_rejects_mock_edit_traversal_path(self, tmp_path):
         """Paths containing '..' are rejected (caught by allowed or forbidden check)."""
         packet = make_packet(
