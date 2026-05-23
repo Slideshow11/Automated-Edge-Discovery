@@ -175,7 +175,11 @@ The controller must **never**:
 - Install packages via pip/apt/etc.
 - Use `shell=True` in any subprocess call
 
-## 9. Subprocess Call Pattern
+## 9. Relationship to Batch Controller
+
+Batch orchestration is designed separately in `docs/autocoder_batch_controller_design.md` and must call the single-task controller sequentially in v0. The single-task controller is the atomic unit of execution; the batch controller is a thin orchestrator that invokes it per task.
+
+## 10. Subprocess Call Pattern
 
 All tool invocations use explicit argv lists with no shell interpolation:
 ```python
@@ -191,7 +195,7 @@ subprocess.run(
 )
 ```
 
-## 10. Next Implementation PR
+## 11. Next Implementation PR
 
 Implement `scripts/local/run_autocoder_single_task.py` following this design. The implementation:
 1. Validates task packet against rules in §3
