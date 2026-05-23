@@ -114,6 +114,43 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.rename(path)
 
 
+def _is_path_forbidden(path: str, forbidden: list[str]) -> bool:
+    """
+    Return True if path is forbidden by the forbidden list.
+
+    Rules:
+    - Normalizes both path and forbidden entries to use "/" as separator.
+    - Rejects absolute paths.
+    - Rejects paths containing ".." segment.
+    - Exact match: path == forbidden_entry
+    - Prefix match: if forbidden_entry ends with "/", blocks any path starting with that prefix.
+    """
+    if not forbidden:
+        return False
+    # Normalize
+    path = path.strip().replace("\\", "/")
+    # Reject absolute
+    if path.startswith("/"):
+        return True
+    # Reject traversal
+    parts = path.split("/")
+    if ".." in parts:
+        return True
+    for entry in forbidden:
+        entry_norm = entry.strip().replace("\\", "/").rstrip("/")
+        if not entry_norm:
+            continue
+        if entry.endswith("/"):
+            # Prefix: block any path that starts with entry
+            if path == entry_norm or path.startswith(entry_norm + "/"):
+                return True
+        else:
+            # Exact or prefix within directory
+            if path == entry_norm or path.startswith(entry_norm + "/"):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -268,9 +305,9 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
             # Each mock edit path must be in allowed_files
             if allowed is not None and path not in allowed:
                 return False, f"mock_edits[{i}].path '{path}' is not in allowed_files"
-            # Each mock edit path must not be in forbidden_files
-            if forbidden is not None and path in forbidden:
-                return False, f"mock_edits[{i}].path '{path}' is in forbidden_files"
+            # Each mock edit path must not be forbidden (exact, prefix, or dir)
+            if forbidden is not None and _is_path_forbidden(path, forbidden):
+                return False, f"mock_edits[{i}].path '{path}' is forbidden"
         # Number of mock edits must not exceed max_changed_files
         mcf = packet.get("max_changed_files")
         if mcf is not None and len(mock_edits) > mcf:

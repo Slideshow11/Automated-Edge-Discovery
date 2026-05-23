@@ -315,6 +315,59 @@ class TestMockEditsValidation:
         assert result["status"] == "HOLD_TASK_PACKET_INVALID"
         assert "forbidden" in result.get("error", "").lower()
 
+    def test_rejects_mock_edit_under_forbidden_prefix_dir(self, tmp_path):
+        """Forbidden dir with trailing slash blocks files inside it."""
+        packet = make_packet(
+            forbidden_files=["scripts/"],
+            mock_edits=[{"path": "scripts/local/run_autocoder_single_task.py", "content": "hacked"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "forbidden" in result.get("error", "").lower()
+
+    def test_rejects_mock_edit_under_forbidden_prefix_no_trailing_slash(self, tmp_path):
+        """Forbidden dir without trailing slash also blocks files inside it."""
+        packet = make_packet(
+            forbidden_files=["scripts"],
+            mock_edits=[{"path": "scripts/local/run_autocoder_single_task.py", "content": "hacked"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "forbidden" in result.get("error", "").lower()
+
+    def test_rejects_mock_edit_traversal_path(self, tmp_path):
+        """Paths containing '..' are rejected (caught by allowed or forbidden check)."""
+        packet = make_packet(
+            allowed_files=["docs/safe.md"],
+            mock_edits=[{"path": "../docs/safe.md", "content": "escape"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        # Rejected either because path is not in allowed_files OR path is forbidden (starts with / or contains ..)
+        err = result.get("error", "").lower()
+        assert "forbidden" in err or "not in allowed" in err
+
+    def test_rejects_mock_edit_absolute_path(self, tmp_path):
+        """Absolute paths are rejected (caught by allowed or forbidden check)."""
+        packet = make_packet(
+            forbidden_files=["/tmp/"],
+            mock_edits=[{"path": "/tmp/aed_runs/somefile.md", "content": "absolute"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        err = result.get("error", "").lower()
+        assert "forbidden" in err or "not in allowed" in err
+
+    def test_rejects_mock_edit_backslash_normalized(self, tmp_path):
+        """Backslashes are normalized and prefix match applied."""
+        packet = make_packet(
+            forbidden_files=["scripts/"],
+            mock_edits=[{"path": "scripts\\local\\run.py", "content": "backslashes"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "forbidden" in result.get("error", "").lower()
+
     def test_rejects_mock_edits_count_exceeds_max_changed_files(self, tmp_path):
         packet = make_packet(
             max_changed_files=1,
