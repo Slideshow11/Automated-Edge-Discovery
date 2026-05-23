@@ -264,3 +264,117 @@ class TestSafetyBoundaries:
         import re
         argv_matches = re.findall(r'\["gh",\s*"pr",\s*"merge"\]', code)
         assert not argv_matches, f"gh pr merge subprocess call found: {argv_matches}"
+
+
+# --------------------------------------------------------------------------
+# mock_edits validation tests
+# --------------------------------------------------------------------------
+
+
+class TestMockEditsValidation:
+    """Test that mock_edits is validated before build_execution_packet."""
+
+    def test_rejects_mock_edits_not_list(self, tmp_path):
+        packet = make_packet(mock_edits="not a list")
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "mock_edits" in result.get("error", "").lower()
+
+    def test_rejects_empty_mock_edits_list(self, tmp_path):
+        packet = make_packet(mock_edits=[])
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "mock_edits" in result.get("error", "").lower()
+
+    def test_rejects_mock_edit_missing_path(self, tmp_path):
+        packet = make_packet(mock_edits=[{"content": "new content"}])
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "path" in result.get("error", "").lower()
+
+    def test_rejects_mock_edit_empty_path(self, tmp_path):
+        packet = make_packet(mock_edits=[{"path": "", "content": "new content"}])
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+
+    def test_rejects_mock_edit_not_in_allowed_files(self, tmp_path):
+        packet = make_packet(
+            allowed_files=["docs/safe.md"],
+            mock_edits=[{"path": "docs/forbidden.md", "content": "new"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "allowed_files" in result.get("error", "").lower()
+
+    def test_rejects_mock_edit_in_forbidden_files(self, tmp_path):
+        packet = make_packet(
+            forbidden_files=["scripts/secret.py"],
+            mock_edits=[{"path": "scripts/secret.py", "content": "new"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "forbidden" in result.get("error", "").lower()
+
+    def test_rejects_mock_edits_count_exceeds_max_changed_files(self, tmp_path):
+        packet = make_packet(
+            max_changed_files=1,
+            mock_edits=[
+                {"path": "docs/a.md", "content": "a"},
+                {"path": "docs/b.md", "content": "b"},
+            ],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "max_changed_files" in result.get("error", "").lower()
+
+    def test_accepts_valid_mock_edits(self, tmp_path):
+        packet = make_packet(
+            allowed_files=["docs/test.md"],
+            mock_edits=[{"path": "docs/test.md", "content": "new content"}],
+        )
+        result = run_controller(packet, tmp_path / "out.json", tmp_path / "out.md")
+        # Passes validation — proceeds to stage 2 (not necessarily to READY)
+        assert result["status"] != "HOLD_TASK_PACKET_INVALID"
+
+
+class TestMockEditsBuildIntegration:
+    """Test that build_execution_packet includes mock_edits in execution dict."""
+
+    def test_build_execution_packet_includes_mock_edits(self, tmp_path):
+        """Verify execution.mock_edits is populated from task packet."""
+        import sys
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from run_autocoder_single_task import build_execution_packet
+
+        task_packet = make_packet(
+            task_id="test-mock-packet",
+            allowed_files=["docs/test.md"],
+            mock_edits=[{"path": "docs/test.md", "content": "new"}],
+        )
+        from pathlib import Path
+        plan_file = tmp_path / "plan.md"
+        plan_file.write_text("plan", encoding="utf-8")
+        plan_sha = "deadbeef" * 8  # fake SHA for this unit test
+
+        exec_packet = build_execution_packet(task_packet, plan_sha, plan_file)
+
+        assert "execution" in exec_packet
+        assert "mock_edits" in exec_packet["execution"]
+        assert exec_packet["execution"]["mock_edits"] == [{"path": "docs/test.md", "content": "new"}]
+
+    def test_build_execution_packet_empty_mock_edits_when_absent(self, tmp_path):
+        """Verify execution.mock_edits defaults to [] when not in task packet."""
+        import sys
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from run_autocoder_single_task import build_execution_packet
+
+        task_packet = make_packet(task_id="test-no-mock")
+        from pathlib import Path
+        plan_file = tmp_path / "plan.md"
+        plan_file.write_text("plan", encoding="utf-8")
+        plan_sha = "deadbeef" * 8
+
+        exec_packet = build_execution_packet(task_packet, plan_sha, plan_file)
+
+        assert "execution" in exec_packet
+        assert exec_packet["execution"].get("mock_edits") == []

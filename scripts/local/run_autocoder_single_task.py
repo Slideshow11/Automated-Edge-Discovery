@@ -249,6 +249,33 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
     if not body:
         return False, "suggested_pr_body is required"
 
+    # mock_edits: null or list of dicts with "path" and "content"
+    mock_edits = packet.get("mock_edits")
+    if mock_edits is not None:
+        if not isinstance(mock_edits, list):
+            return False, "mock_edits must be a list or null"
+        if not mock_edits:
+            return False, "mock_edits must be non-empty when present"
+        for i, edit in enumerate(mock_edits):
+            if not isinstance(edit, dict):
+                return False, f"mock_edits[{i}] must be a dict"
+            path = edit.get("path")
+            content = edit.get("content")
+            if not isinstance(path, str) or not path:
+                return False, f"mock_edits[{i}].path must be a non-empty string"
+            if not isinstance(content, str):
+                return False, f"mock_edits[{i}].content must be a string"
+            # Each mock edit path must be in allowed_files
+            if allowed is not None and path not in allowed:
+                return False, f"mock_edits[{i}].path '{path}' is not in allowed_files"
+            # Each mock edit path must not be in forbidden_files
+            if forbidden is not None and path in forbidden:
+                return False, f"mock_edits[{i}].path '{path}' is in forbidden_files"
+        # Number of mock edits must not exceed max_changed_files
+        mcf = packet.get("max_changed_files")
+        if mcf is not None and len(mock_edits) > mcf:
+            return False, f"mock_edits count ({len(mock_edits)}) exceeds max_changed_files ({mcf})"
+
     return True, ""
 
 
