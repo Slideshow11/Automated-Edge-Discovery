@@ -434,7 +434,6 @@ def run_autocoder_single_task(
     output_root = Path(output_root_str).resolve()
     task_id = task_packet["task_id"]
     branch_name = task_packet["branch_name"]
-    base_sha = None  # resolved during execution
 
     # Output sub-paths
     execution_packet_path = output_root / "execution_packet.json"
@@ -469,6 +468,9 @@ def run_autocoder_single_task(
     exec_packet = build_execution_packet(task_packet, plan_sha, approved_plan_file)
     _write_json(execution_packet_path, exec_packet)
     _write_json(task_packet_path.parent / f"task_packet_{task_id}.json", task_packet)
+
+    # Extract resolved base_sha for use in subsequent stages
+    base_sha = exec_packet["base_sha"]
 
     # -------------------------------------------------------------------------
     # Stage 2: Temp worktree execution
@@ -575,10 +577,11 @@ def run_autocoder_single_task(
     # -------------------------------------------------------------------------
     # Stage 5: Apply to local branch
     # -------------------------------------------------------------------------
-    # Resolve base_sha from apply readiness or use main
-    if stage3_data:
+    # Resolve base_sha from stage 3 data only if not already set
+    # (base_sha was resolved earlier in build_execution_packet from task_packet.base_sha or HEAD)
+    if base_sha is None and stage3_data:
         base_sha = stage3_data.get("base_sha") or stage3_data.get("checks", {}).get("base_sha")
-    if not base_sha:
+    if base_sha is None:
         base_sha_result = subprocess.run(
             ["git", "rev-parse", "main"],
             cwd=str(REPO_ROOT),
