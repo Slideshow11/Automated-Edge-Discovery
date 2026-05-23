@@ -114,6 +114,45 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.rename(path)
 
 
+def _is_path_forbidden(path: str, forbidden: list[str]) -> bool:
+    """
+    Return True if path is forbidden by the forbidden list.
+
+    Rules:
+    - Normalizes both path and forbidden entries to use "/" as separator.
+    - Rejects absolute paths regardless of forbidden list.
+    - Rejects paths containing ".." segment regardless of forbidden list.
+    - Exact match: path == forbidden_entry
+    - Prefix match: if forbidden_entry ends with "/", blocks any path starting with that prefix.
+      Without trailing slash, also blocks any path that starts with entry + "/".
+    """
+    # Normalize
+    path = path.strip().replace("\\", "/")
+    # Reject absolute paths unconditionally
+    if path.startswith("/"):
+        return True
+    # Reject traversal unconditionally
+    parts = path.split("/")
+    if ".." in parts:
+        return True
+    # If no forbidden entries, path is not forbidden (but absolute/traversal already rejected above)
+    if not forbidden:
+        return False
+    for entry in forbidden:
+        entry_norm = entry.strip().replace("\\", "/").rstrip("/")
+        if not entry_norm:
+            continue
+        if entry.endswith("/"):
+            # Prefix: block any path that starts with entry
+            if path == entry_norm or path.startswith(entry_norm + "/"):
+                return True
+        else:
+            # Exact or prefix within directory
+            if path == entry_norm or path.startswith(entry_norm + "/"):
+                return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -248,6 +287,36 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
     body = packet.get("suggested_pr_body", "")
     if not body:
         return False, "suggested_pr_body is required"
+
+    # mock_edits: null or list of dicts with "path" and "content"
+    mock_edits = packet.get("mock_edits")
+    if mock_edits is not None:
+        if not isinstance(mock_edits, list):
+            return False, "mock_edits must be a list or null"
+        if not mock_edits:
+            return False, "mock_edits must be non-empty when present"
+        for i, edit in enumerate(mock_edits):
+            if not isinstance(edit, dict):
+                return False, f"mock_edits[{i}] must be a dict"
+            path = edit.get("path")
+            content = edit.get("content")
+            if not isinstance(path, str) or not path:
+                return False, f"mock_edits[{i}].path must be a non-empty string"
+            if not isinstance(content, str):
+                return False, f"mock_edits[{i}].content must be a string"
+            # Each mock edit path must be in allowed_files
+            if allowed is not None and path not in allowed:
+                return False, f"mock_edits[{i}].path '{path}' is not in allowed_files"
+            # Each mock edit path must not be forbidden (exact, prefix, or dir)
+            # Always call _is_path_forbidden so absolute/traversal checks run even
+            # when forbidden_files is null. Empty list is safe — absolute/traversal
+            # checks run before the early return.
+            if _is_path_forbidden(path, forbidden or []):
+                return False, f"mock_edits[{i}].path '{path}' is forbidden"
+        # Number of mock edits must not exceed max_changed_files
+        mcf = packet.get("max_changed_files")
+        if mcf is not None and len(mock_edits) > mcf:
+            return False, f"mock_edits count ({len(mock_edits)}) exceeds max_changed_files ({mcf})"
 
     return True, ""
 
@@ -407,7 +476,6 @@ def run_autocoder_single_task(
     output_root = Path(output_root_str).resolve()
     task_id = task_packet["task_id"]
     branch_name = task_packet["branch_name"]
-    base_sha = None  # resolved during execution
 
     # Output sub-paths
     execution_packet_path = output_root / "execution_packet.json"
@@ -442,6 +510,9 @@ def run_autocoder_single_task(
     exec_packet = build_execution_packet(task_packet, plan_sha, approved_plan_file)
     _write_json(execution_packet_path, exec_packet)
     _write_json(task_packet_path.parent / f"task_packet_{task_id}.json", task_packet)
+
+    # Extract resolved base_sha for use in subsequent stages
+    base_sha = exec_packet["base_sha"]
 
     # -------------------------------------------------------------------------
     # Stage 2: Temp worktree execution
@@ -521,6 +592,7 @@ def run_autocoder_single_task(
         "--diff-patch", str(diff_patch_path),
         "--apply-readiness-json", str(apply_readiness_json_path),
         "--repo-root", str(REPO_ROOT),
+        "--expected-head", str(base_sha),
         "--output-json", str(apply_preview_json_path),
         "--output-md", str(apply_preview_md_path),
     ]
@@ -547,10 +619,11 @@ def run_autocoder_single_task(
     # -------------------------------------------------------------------------
     # Stage 5: Apply to local branch
     # -------------------------------------------------------------------------
-    # Resolve base_sha from apply readiness or use main
-    if stage3_data:
+    # Resolve base_sha from stage 3 data only if not already set
+    # (base_sha was resolved earlier in build_execution_packet from task_packet.base_sha or HEAD)
+    if base_sha is None and stage3_data:
         base_sha = stage3_data.get("base_sha") or stage3_data.get("checks", {}).get("base_sha")
-    if not base_sha:
+    if base_sha is None:
         base_sha_result = subprocess.run(
             ["git", "rev-parse", "main"],
             cwd=str(REPO_ROOT),
@@ -729,7 +802,7 @@ def run_autocoder_single_task(
     for k, v in final_review["artifacts"].items():
         md_lines.append(f"- **{k}:** `{v}`")
     md_lines.extend(["", "---", f"*Generated: {final_review['generated_at']}*"])
-    final_review_md_path.write_text("\n".join(md_lines))
+    final_review_packet_md_path.write_text("\n".join(md_lines))
 
     # Final success result
     result = {
