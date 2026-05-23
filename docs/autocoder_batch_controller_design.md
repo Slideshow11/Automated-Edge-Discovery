@@ -238,3 +238,30 @@ The single-task controller (`run_autocoder_single_task.py`) handles all six stag
 | 1 | Fatal error (batch packet unparseable, no tasks, etc.) |
 
 On exit 0, check `batch_status.json` for the actual status.
+## 15. Implementation Notes (v0)
+
+### Implementation Status
+The v0 implementation exists at `scripts/local/run_autocoder_batch.py` with companion tests at `tests/test_run_autocoder_batch.py`.
+
+### Scope
+- Mock-only execution (execution_mode="mocked" required; live execution is `HOLD_UNSUPPORTED_EXECUTION_MODE`)
+- Sequential task processing (no parallelism)
+- No retries
+- Invokes `run_autocoder_single_task.py` via explicit argv list with `_real_subprocess_run`
+- Validates batch and task constraint packets before execution
+- Aggregates `final_status.json` from each single-task run into `batch_status.json` and `batch_status.md`
+- Stops at `BATCH_READY_FOR_HUMAN_REVIEW` or first HOLD when `stop_on_first_hold=true`
+
+### Safety Invariants (enforced in code)
+- No `shell=True` in any subprocess call
+- No `--enable-real-claude-executor` flag passed to single-task controller
+- No `gh pr create`, `gh pr merge`, `git push`, `git merge`, `git commit`, `git add`, `git stage`
+- No `dispatch()`, no board mutation, no Hermes skill/profile/memory/audit mutation
+- No package installation
+- `_real_subprocess_run` (saved reference) used for all internal git checks and single-task invocation
+
+### Feature-Branch Smoke
+The smoke test creates two tasks that append to *new* `docs/smoke_alpha_001.md` and `docs/smoke_beta_002.md` files. Smoke passes when both single-task runs return `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, producing `BATCH_READY_FOR_HUMAN_REVIEW`.
+
+### What Remains Out of Scope
+Live-Claude execution, parallelism, retries, push/PR/merge/commit/staging, dispatch, board/Hermes mutation, audit append, memory/profile update, package installation.
