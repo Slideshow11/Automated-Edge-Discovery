@@ -760,7 +760,7 @@ def run_autocoder_single_task(
     for k, v in final_review["artifacts"].items():
         md_lines.append(f"- **{k}:** `{v}`")
     md_lines.extend(["", "---", f"*Generated: {final_review['generated_at']}*"])
-    final_review_md_path.write_text("\n".join(md_lines))
+    final_review_packet_md_path.write_text("\n".join(md_lines))
 
     # Final success result
     result = {
