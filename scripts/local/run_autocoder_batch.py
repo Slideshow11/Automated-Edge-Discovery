@@ -256,6 +256,7 @@ def _normalize_task_packet(task_packet: dict, batch_base_sha: str, batch_output_
     Normalize a task packet for the batch context:
     - Fill in base_sha if missing
     - Set output_root to batch_tasks_dir/task_id if not set or invalid
+    - Derive suggested_pr_title and suggested_pr_body from goal if missing
     Returns the normalized copy.
     """
     normalized = dict(task_packet)
@@ -264,6 +265,12 @@ def _normalize_task_packet(task_packet: dict, batch_base_sha: str, batch_output_
     normalized["base_sha"] = batch_base_sha
     task_output = batch_output_root / "tasks" / task_id
     normalized["output_root"] = str(task_output)
+    # Derive missing PR fields from goal so single-task controller validation passes
+    goal = normalized.get("goal", "")
+    if not normalized.get("suggested_pr_title"):
+        normalized["suggested_pr_title"] = goal[:80] if goal else f"task: {task_id}"
+    if not normalized.get("suggested_pr_body"):
+        normalized["suggested_pr_body"] = goal or f"Task {task_id} from batch controller"
     return normalized
 
 
