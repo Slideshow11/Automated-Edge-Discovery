@@ -2,9 +2,11 @@
 
 ## 1. Objective
 
-`run_autocoder_batch.py` processes a list of strict single-task packets sequentially by invoking `run_autocoder_single_task.py` for each task. It aggregates results, writes batch-level artifacts, and stops at `BATCH_READY_FOR_HUMAN_REVIEW` without pushing, opening PRs, merging, committing, staging files, or mutating main.
+`run_autocoder_batch.py` processes a list of strict single-task packets sequentially by invoking `run_autocoder_single_task.py` for each task inside its own isolated git worktree. It aggregates results, writes batch-level artifacts, and stops at `BATCH_READY_FOR_HUMAN_REVIEW`.
 
-It is a **read-only batch orchestrator** that invokes `run_autocoder_single_task.py` via explicit `subprocess.run` calls with no `shell=True`.
+**The batch controller is not read-only.** For each task it creates a dedicated git worktree outside the main repo and runs the single-task controller from within that worktree. This isolates each task's apply-branch dirty state (human-review artifact) from the next task's execution environment.
+
+v0 is mock-only, sequential, and produces only local branch candidates — no push, no PR creation, no merge, no commit, no staging.
 
 ## 2. Non-Goals for v0 (Hard Boundaries)
 
@@ -74,33 +76,41 @@ validate_batch_packet(batch_packet) → HOLD_BATCH_PACKET_INVALID or proceeds
 validate_task_constraints(tasks) → HOLD_TASK_PACKET_INVALID or proceeds
 create_output_dirs(output_root, tasks)
 
+batch_start_branch = git branch --show-current ( feat/autocoder-batch-controller-v0 or main )
+batch_start_head   = git rev-parse HEAD          ( base SHA for this batch run )
+
 for each task in tasks (sequential order):
-    task_output = output_root / "tasks" / task.task_id
+    task_worktree_path = output_root / "task_worktrees" / task.task_id
+
+    # Create isolated worktree just for this task (outside main repo)
+    git worktree add --detach <task_worktree_path> <batch_start_head>
+    # Now the main repo is untouched; the task runs in its own worktree.
+
     argv = [
         "python3", str(SINGLE_TASK_SCRIPT),
         "--task-packet-json", str(task_packet_path),
         "--output-json", str(task_output / "final_status.json"),
         "--output-md", str(task_output / "final_status.md"),
     ]
-    rc, stdout, stderr = subprocess.run(argv, cwd=REPO_ROOT)
+    # Run single-task controller inside the task's isolated worktree.
+    # REPO_ROOT inside the worktree resolves to the worktree itself,
+    # so the task's apply-branch dirty state stays inside the worktree
+    # and does NOT pollute the main repo for the next task.
+    rc, stdout, stderr = subprocess.run(argv, cwd=<task_worktree_path>)
+
     task_result = read_json(task_output / "final_status.json")
 
-    if task_result.status == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW":
-        record success, continue
-    elif task_result.status.startswith("HOLD_"):
-        if stop_on_first_hold:
-            batch_status = HOLD_TASK_FAILED
-            record failing task_id and status
-            stop loop
-        else:
-            record HOLD and continue
-    else:
-        batch_status = HOLD_UNKNOWN
-        stop loop
+    # On WORKTREE_SETUP_FAILURE: remove worktree, record failure, stop if stop_on_first_hold
+    # On success: keep worktree (preserves apply-branch artifact for human review), continue
+    # On HOLD status: record task, stop if stop_on_first_hold, keep worktree
 
 write batch_status.json and batch_status.md
-stop (no push, no PR, no merge)
+stop (no push, no PR, no merge, worktrees preserved for human review)
 ```
+
+**Per-task worktree isolation** is the core mechanism that prevents task A's dirty apply branch from blocking task B. Each task runs in a detached-HEAD worktree created from `batch_start_head`. The main repo remains clean throughout the batch. Successful task worktrees are **kept** (not deleted) so the human reviewer can inspect the apply branches.
+
+v0 does not use `git restore` or `git checkout` in the main worktree between tasks — the worktree isolation model makes that unnecessary.
 
 ## 6. Batch Status Taxonomy
 
@@ -206,9 +216,45 @@ Smoke test with two mocked tasks:
 
 **Expected result**: `BATCH_READY_FOR_HUMAN_REVIEW`
 
-## 12. Future Phases
+## 12. Per-Task Worktree Isolation
 
-| Phase | Content |
+Each task is executed inside its own git worktree created via `git worktree add --detach <worktree_path> <batch_start_head>`. This is the core mechanism for task isolation.
+
+**Why worktrees instead of restore/cleanup?**
+
+The single-task controller intentionally leaves its apply branch with dirty uncommitted changes as a human-review artifact. Switching away from that branch with `git restore .` would silently discard or obscure the uncommitted working-tree state. True per-task worktree isolation keeps each task's artifact fully intact in its own worktree, invisible to all other tasks and to the main repo worktree.
+
+**Worktree layout:**
+```
+/tmp/aed_runs/autocoder_batch_<batch_id>/task_worktrees/
+├── <task_id_1>/           # detached HEAD at batch_start_head
+│   └── [repo clone at that SHA]
+├── <task_id_2>/           # another detached HEAD at batch_start_head
+└── ...
+```
+
+**Worktree lifecycle:**
+- Created before each task via `git worktree add --detach`
+- On worktree creation failure: removed immediately, task recorded as `HOLD_WORKTREE_SETUP_FAILED`
+- On task failure or HOLD: worktree is kept so artifacts are inspectable
+- On task success: worktree is kept; human reviewer can `git worktree list` to find all task branches
+- Worktrees are never auto-deleted by the batch controller
+
+**REPO_ROOT resolution in worktrees:**
+`run_autocoder_single_task.py` computes `SCRIPT_DIR = Path(__file__).parent.resolve()` and `REPO_ROOT = SCRIPT_DIR.parent.parent.resolve()`. When run from a task worktree, `__file__` resolves to the worktree path, so `REPO_ROOT` correctly points to the worktree itself. All downstream scripts inherit this self-locating behavior, meaning the single-task controller and its stage scripts all operate on the worktree copy — never the main repo.
+
+**What is preserved per task:**
+- The task worktree itself (detached HEAD at `batch_start_head`)
+- Any local branch created by the single-task controller inside that worktree (e.g., `apply/<task_id>`)
+- Uncommitted dirty changes on that branch (the human-review artifact)
+- All task output artifacts under `tasks/<task_id>/`
+
+**What the main repo worktree remains:**
+- Clean (no dirty files, no stage files) throughout the batch
+- On `batch_start_branch` (e.g., `feat/autocoder-batch-controller-v0`) throughout
+- `HEAD` is never moved by the batch controller
+
+## 13. Future Phases
 |---|---|
 | v0 | Mock-only, sequential, no push/PR/merge/commit |
 | v1 | Optional `stop_on_first_hold=false`, full aggregation |
@@ -219,7 +265,7 @@ Smoke test with two mocked tasks:
 
 Live Claude execution is out of scope for v0. When it becomes available in a future phase, it must be gated behind an explicit human approval step before any mutating operation.
 
-## 13. Relationship to Single-Task Controller
+## 14. Relationship to Single-Task Controller
 
 The batch controller is a **thin orchestrator** that:
 1. Validates the batch packet and task constraints
@@ -230,7 +276,7 @@ The batch controller is a **thin orchestrator** that:
 
 The single-task controller (`run_autocoder_single_task.py`) handles all six stages (execution → apply → verification → PR preview) for each task. The batch controller does not duplicate that logic — it reuses it by subprocess invocation.
 
-## 14. Exit Codes
+## 15. Exit Codes
 
 | Exit Code | Meaning |
 |---|---|
@@ -238,10 +284,17 @@ The single-task controller (`run_autocoder_single_task.py`) handles all six stag
 | 1 | Fatal error (batch packet unparseable, no tasks, etc.) |
 
 On exit 0, check `batch_status.json` for the actual status.
-## 15. Implementation Notes (v0)
+## 16. Implementation Notes (v0)
 
 ### Implementation Status
 The v0 implementation exists at `scripts/local/run_autocoder_batch.py` with companion tests at `tests/test_run_autocoder_batch.py`.
+
+### Core Isolation Mechanism
+Each task runs inside a dedicated git worktree (via `git worktree add --detach`) created from `batch_start_head`. The worktree path is `<output_root>/task_worktrees/<task_id>`. The single-task controller is invoked with `cwd=<task_worktree_path>`, so `REPO_ROOT` resolves to the worktree itself. This means:
+- Each task's apply-branch dirty state stays in its own worktree
+- The main repo worktree is never touched between tasks
+- Task worktrees are kept after task completion (preserving artifacts for human review)
+- Only on worktree creation failure is the worktree removed (failed setup only)
 
 ### Scope
 - Mock-only execution (execution_mode="mocked" required; live execution is `HOLD_UNSUPPORTED_EXECUTION_MODE`)
@@ -260,8 +313,8 @@ The v0 implementation exists at `scripts/local/run_autocoder_batch.py` with comp
 - No package installation
 - `_real_subprocess_run` (saved reference) used for all internal git checks and single-task invocation
 
-### Feature-Branch Smoke
-The smoke test creates two tasks that append to *new* `docs/smoke_alpha_001.md` and `docs/smoke_beta_002.md` files. Smoke passes when both single-task runs return `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, producing `BATCH_READY_FOR_HUMAN_REVIEW`.
+### Happy-Path Smoke (two-task)
+The happy-path smoke uses two existing tracked docs files (e.g. `docs/wfa_next_steps.md`, `docs/wfa_run_examples.md`) with append-only mock edits. Both files must exist at `base_sha` with zero `.aed_plan` occurrences. Smoke passes when both single-task runs return `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, producing `BATCH_READY_FOR_HUMAN_REVIEW` with both task worktrees preserved and inspectable.
 
 ### What Remains Out of Scope
 Live-Claude execution, parallelism, retries, push/PR/merge/commit/staging, dispatch, board/Hermes mutation, audit append, memory/profile update, package installation.

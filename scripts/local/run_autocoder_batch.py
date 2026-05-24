@@ -130,6 +130,112 @@ def _git_branch_exists(branch_name: str) -> bool:
     return proc.returncode == 0
 
 
+def _git_current_branch() -> str:
+    """
+    Return the current branch name.  Returns '' if the worktree is in a
+    detached HEAD state or if the command fails.
+    """
+    proc = _real_subprocess_run(
+        ["git", "-C", str(REPO_ROOT), "branch", "--show-current"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode == 0:
+        return proc.stdout.strip()
+    return ""
+
+
+def _git_rev_parse_head() -> str:
+    """Return the current HEAD SHA as a 40-char hex string."""
+    proc = _real_subprocess_run(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def _git_worktree_add(worktree_path: Path, base_sha: str) -> tuple[bool, str]:
+    """
+    Create a new git worktree at worktree_path checked out at base_sha.
+
+    Returns (success, diagnostic_message).
+    The new worktree is NOT a bare path inside the repo — it is outside by design.
+    """
+    wt_resolved = worktree_path.resolve()
+    # Validate the worktree destination is truly outside the main repo.
+    # If it is inside REPO_ROOT, reject it.
+    try:
+        wt_resolved.relative_to(REPO_ROOT.resolve())
+        return False, f"worktree path {wt_resolved} is inside the repo — not allowed"
+    except ValueError:
+        pass  # Outside the repo — OK
+
+    proc = _real_subprocess_run(
+        [
+            "git", "-C", str(REPO_ROOT),
+            "worktree", "add",
+            "--detach",
+            str(wt_resolved),
+            base_sha,
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return False, proc.stderr.strip()
+    return True, ""
+
+
+def _git_worktree_remove(worktree_path: Path) -> tuple[bool, str]:
+    """
+    Remove a git worktree at worktree_path (used only for failed/incomplete setup;
+    successful task worktrees are kept for human review).
+
+    Returns (success, diagnostic_message).
+    """
+    proc = _real_subprocess_run(
+        ["git", "-C", str(REPO_ROOT), "worktree", "remove", str(worktree_path), "--force"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if proc.returncode != 0:
+        return False, proc.stderr.strip()
+    return True, ""
+
+
+def _git_status_clean() -> bool:
+    """
+    Return True only when the main repo worktree has no staged or unstaged
+    tracked changes.  Untracked files (?? lines) are ignored since they are
+    not part of the committed state.
+    """
+    proc = _real_subprocess_run(
+        ["git", "-C", str(REPO_ROOT), "status", "--short"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if proc.returncode != 0:
+        return False
+    # Filter to only lines with a status character in column 2 (tracked changes).
+    # Untracked files start with '??' in columns 1-2.
+    for line in proc.stdout.splitlines():
+        if len(line) >= 2 and line[0] in "MADRC" and line[1] == " ":
+            # Staged/unstaged tracked change found
+            return False
+    return True
+
+
+def _derive_batch_starting_point() -> tuple[str, str]:
+    """
+    Capture the batch controller's starting point:
+      (batch_start_branch, batch_start_head)
+
+    batch_start_branch may be empty string if in detached HEAD state.
+    batch_start_head is a 40-char SHA.
+
+    Returns ("", sha) when detached.
+    """
+    branch = _git_current_branch()
+    head = _git_rev_parse_head()
+    return branch, head
+
+
 def _is_path_inside_repo(path_str: str) -> bool:
     """Return True if path is inside REPO_ROOT."""
     # Reject path traversal before resolution
@@ -402,6 +508,9 @@ def run_autocoder_batch(
     # --- Write batch packet copy ---
     _write_json(output_root / "batch_packet.json", batch_packet)
 
+    # --- Capture batch starting point ---
+    batch_start_branch, batch_start_head = _derive_batch_starting_point()
+
     # --- Process tasks sequentially ---
     task_results: list[dict] = []
     failed_task_id: Optional[str] = None
@@ -413,6 +522,35 @@ def run_autocoder_batch(
     for i, task in enumerate(tasks):
         task_id: str = task["task_id"]
         branch_name: str = task["branch_name"]
+
+        # Per-task isolated worktree
+        # Each task runs from its own git worktree so that task A's apply-branch
+        # dirty state does not block task B.  Successful task worktrees are kept
+        # for human review; only failed-setup worktrees are removed.
+        task_worktrees_root = output_root / "task_worktrees"
+        task_worktree_path = task_worktrees_root / task_id
+
+        ok, diag = _git_worktree_add(task_worktree_path, base_sha)
+        if not ok:
+            errors.append(f"tasks[{i}] ({task_id}): worktree creation failed: {diag}")
+            tr = {
+                "task_id": task_id,
+                "status": State.HOLD_TASK_FAILED,
+                "branch_name": branch_name,
+                "output_root": str(batch_tasks_dir / task_id),
+                "task_worktree_path": str(task_worktree_path),
+                "error": f"worktree add failed: {diag}",
+            }
+            task_results.append(tr)
+            if stop_on_first_hold:
+                failed_task_id = task_id
+                failed_task_status = State.HOLD_TASK_FAILED
+                # Clean up so the failed worktree does not block future operations
+                _git_worktree_remove(task_worktree_path)
+                break
+            all_ready = False
+            warnings.append(f"worktree creation failed for {task_id}, continuing: {diag}")
+            continue
 
         # Normalize task packet
         normalized_task = _normalize_task_packet(task, base_sha, output_root, task_id)
@@ -437,7 +575,7 @@ def run_autocoder_batch(
         try:
             proc = _real_subprocess_run(
                 argv,
-                cwd=str(REPO_ROOT),
+                cwd=str(task_worktree_path),
                 capture_output=True,
                 text=True,
                 timeout=600,
@@ -449,6 +587,7 @@ def run_autocoder_batch(
                 "status": State.HOLD_SINGLE_TASK_SUBPROCESS_FAILED,
                 "branch_name": branch_name,
                 "output_root": str(task_output_dir),
+                "task_worktree_path": str(task_worktree_path),
                 "error": "subprocess timeout",
             })
             if stop_on_first_hold:
@@ -464,6 +603,7 @@ def run_autocoder_batch(
                 "status": State.HOLD_SINGLE_TASK_SUBPROCESS_FAILED,
                 "branch_name": branch_name,
                 "output_root": str(task_output_dir),
+                "task_worktree_path": str(task_worktree_path),
                 "error": str(e),
             })
             if stop_on_first_hold:
@@ -482,6 +622,7 @@ def run_autocoder_batch(
                 "status": State.HOLD_SINGLE_TASK_SUBPROCESS_FAILED,
                 "branch_name": branch_name,
                 "output_root": str(task_output_dir),
+                "task_worktree_path": str(task_worktree_path),
                 "error": f"returncode {proc.returncode}",
                 "stderr": proc.stderr[:500],
             })
@@ -551,6 +692,7 @@ def run_autocoder_batch(
             "status": task_status,
             "branch_name": branch_name,
             "output_root": str(task_output_dir),
+            "task_worktree_path": str(task_worktree_path),
             "final_status_json": str(task_output_json_path),
             "final_status_md": str(task_output_md_path),
         })
@@ -603,6 +745,9 @@ def run_autocoder_batch(
         "batch_id": batch_id,
         "base_sha": base_sha,
         "output_root": output_root_str,
+        "task_worktrees_root": str(output_root / "task_worktrees"),
+        "batch_start_branch": batch_start_branch,
+        "batch_start_head": batch_start_head,
         "task_count": len(tasks),
         "completed_task_count": len(task_results),
         "failed_task_id": failed_task_id,
@@ -614,10 +759,13 @@ def run_autocoder_batch(
         "warnings": warnings,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "safety_statement": (
-            "This batch was executed with no live Claude, no push, no PR creation, "
+            "This batch was executed by creating per-task git worktrees for each "
+            "single-task controller run so that task apply-branch dirty state does "
+            "not block the next task. No live Claude was used. No push, no PR creation, "
             "no merge, no commit, no staging, no dispatch, no board mutation, "
             "no Hermes mutation, no audit appends, no memory/profile updates, "
-            "and no package installation."
+            "and no package installation. Successful task worktrees are preserved "
+            "for human review and are not auto-deleted."
         ),
     }
 
