@@ -91,12 +91,13 @@ for each task in tasks (sequential order):
         "--task-packet-json", str(task_packet_path),
         "--output-json", str(task_output / "final_status.json"),
         "--output-md", str(task_output / "final_status.md"),
+        "--repo-root", str(task_worktree_path),
     ]
-    # Run single-task controller inside the task's isolated worktree.
-    # REPO_ROOT inside the worktree resolves to the worktree itself,
-    # so the task's apply-branch dirty state stays inside the worktree
-    # and does NOT pollute the main repo for the next task.
-    rc, stdout, stderr = subprocess.run(argv, cwd=<task_worktree_path>)
+    # Run single-task controller from the reviewed parent checkout, with
+    # --repo-root pointing to the task worktree so stage tools operate on
+    # the correct files. The task's apply-branch dirty state stays inside
+    # the worktree and does NOT pollute the main repo for the next task.
+    rc, stdout, stderr = subprocess.run(argv, cwd=str(task_worktree_path))
 
     task_result = read_json(task_output / "final_status.json")
 
