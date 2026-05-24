@@ -442,3 +442,83 @@ class TestMockEditsBuildIntegration:
 
         assert "execution" in exec_packet
         assert exec_packet["execution"].get("mock_edits") == []
+
+
+class TestRepoRootArg:
+    """Test --repo-root argument handling."""
+
+    def run_with_repo_root(self, task_packet, output_json, output_md, repo_root_path):
+        """Run controller with --repo-root override."""
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+            json.dump(task_packet, f)
+            pkt_path = Path(f.name)
+        try:
+            script_path = SCRIPT_DIR / "run_autocoder_single_task.py"
+            argv = [
+                "python3", str(script_path),
+                "--task-packet-json", str(pkt_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+                "--repo-root", str(repo_root_path),
+            ]
+            result = subprocess.run(
+                argv,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if Path(str(output_json)).exists():
+                with open(str(output_json)) as f:
+                    return json.load(f)
+            return {
+                "status": "NO_OUTPUT",
+                "subprocess_rc": result.returncode,
+                "stderr": result.stderr[:200],
+            }
+        finally:
+            os.unlink(pkt_path)
+
+    def test_rejects_nonexistent_repo_root(self, tmp_path):
+        """--repo-root pointing to non-existent path returns HOLD_TASK_PACKET_INVALID."""
+        packet = make_packet(
+            task_id="test-repo-root-nonexistent",
+            allowed_files=["docs/test.md"],
+        )
+        result = self.run_with_repo_root(
+            packet, tmp_path / "out.json", tmp_path / "out.md",
+            "/nonexistent/path/that/does/not/exist",
+        )
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "not a git repository" in result.get("error", "").lower()
+
+    def test_rejects_non_git_repo_root(self, tmp_path):
+        """--repo-root pointing to non-git directory returns HOLD_TASK_PACKET_INVALID."""
+        packet = make_packet(
+            task_id="test-repo-root-not-git",
+            allowed_files=["docs/test.md"],
+        )
+        result = self.run_with_repo_root(
+            packet, tmp_path / "out.json", tmp_path / "out.md",
+            str(tmp_path),  # tmp_path is a plain directory, not a git repo
+        )
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert "not a git repository" in result.get("error", "").lower()
+
+    def test_accepts_valid_repo_root(self, tmp_path):
+        """--repo-root pointing to a valid git repo is accepted and used."""
+        # Use the AED repo root itself as a known-valid git repo
+        packet = make_packet(
+            task_id="test-repo-root-valid",
+            allowed_files=["docs/test.md"],
+            output_root=str(tmp_path / "aed_runs"),
+        )
+        result = self.run_with_repo_root(
+            packet, tmp_path / "out.json", tmp_path / "out.md",
+            str(REPO_ROOT),  # The test repo is a valid git repo
+        )
+        # Should pass validation (not HOLD_TASK_PACKET_INVALID)
+        # May fail at later stage since docs/test.md may not exist, but
+        # not with "not a git repository"
+        assert "not a git repository" not in result.get("error", "").lower()

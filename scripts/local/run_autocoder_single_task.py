@@ -40,7 +40,11 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-REPO_ROOT = SCRIPT_DIR.parent.parent.resolve()
+_DEFAULT_REPO_ROOT = SCRIPT_DIR.parent.parent.resolve()
+
+# Module-level repo root — set in main() based on --repo-root argument.
+# Accessible to all functions in this module without passing as parameter.
+effective_repo_root: Path = _DEFAULT_REPO_ROOT
 
 VALID_PACKET_KIND = "aed.autocoder.single_task.v0"
 VALID_EXECUTION_MODES = frozenset(["mocked"])
@@ -209,7 +213,7 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
         return False, "branch_name is required"
     result = subprocess.run(
         ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"],
-        cwd=str(REPO_ROOT),
+        cwd=str(effective_repo_root),
         capture_output=True,
         text=True,
         timeout=10,
@@ -227,16 +231,16 @@ def validate_task_packet(packet: dict) -> tuple[bool, str]:
         return False, f"output_root is not a valid path: {output_root_str}"
 
     try:
-        repo_root_resolved = REPO_ROOT.resolve()
+        repo_root_resolved = effective_repo_root.resolve()
     except Exception:
-        repo_root_resolved = REPO_ROOT.absolute()
+        repo_root_resolved = effective_repo_root.absolute()
 
     # Check if output_root is inside repo
     try:
         output_root.relative_to(repo_root_resolved)
         return False, (
             f"output_root must be outside the repo. "
-            f"Got: {output_root_str} (inside {REPO_ROOT})"
+            f"Got: {output_root_str} (inside {effective_repo_root})"
         )
     except ValueError:
         pass  # correctly outside repo
@@ -344,7 +348,7 @@ def build_execution_packet(task_packet: dict, plan_sha: str, approved_plan_file:
     task_id = task_packet["task_id"]
 
     # Resolve base_sha: use explicit value from task packet, else current HEAD
-    base_sha = task_packet.get("base_sha") or _git_rev_parse(REPO_ROOT, "HEAD")
+    base_sha = task_packet.get("base_sha") or _git_rev_parse(effective_repo_root, "HEAD")
 
     # Normalize execution_mode "mocked" -> "mock" for the nested execution dict
     exec_mode_raw = task_packet.get("execution_mode", "mocked")
@@ -524,7 +528,7 @@ def run_autocoder_single_task(
         "--output-json", str(result_json_path),
         "--output-md", str(result_md_path),
     ]
-    rc2, stdout2, stderr2 = run_stage(stage2_argv, REPO_ROOT)
+    rc2, stdout2, stderr2 = run_stage(stage2_argv, effective_repo_root)
     del stage2_argv
 
     # Load result
@@ -557,12 +561,12 @@ def run_autocoder_single_task(
         str(SCRIPT_DIR / "verify_temp_worktree_apply_readiness.py"),
         "--result-json", str(result_json_path),
         "--diff-patch", str(diff_patch_path),
-        "--repo-root", str(REPO_ROOT),
+        "--repo-root", str(effective_repo_root),
         "--output-json", str(apply_readiness_json_path),
         "--output-md", str(apply_readiness_md_path),
         "--require-pmg-clean",
     ]
-    rc3, stdout3, stderr3 = run_stage(stage3_argv, REPO_ROOT)
+    rc3, stdout3, stderr3 = run_stage(stage3_argv, effective_repo_root)
     del stage3_argv
 
     stage3_data = load_stage_json(apply_readiness_json_path)
@@ -591,12 +595,12 @@ def run_autocoder_single_task(
         "--result-json", str(result_json_path),
         "--diff-patch", str(diff_patch_path),
         "--apply-readiness-json", str(apply_readiness_json_path),
-        "--repo-root", str(REPO_ROOT),
+        "--repo-root", str(effective_repo_root),
         "--expected-head", str(base_sha),
         "--output-json", str(apply_preview_json_path),
         "--output-md", str(apply_preview_md_path),
     ]
-    rc4, stdout4, stderr4 = run_stage(stage4_argv, REPO_ROOT)
+    rc4, stdout4, stderr4 = run_stage(stage4_argv, effective_repo_root)
     del stage4_argv
 
     stage4_data = load_stage_json(apply_preview_json_path)
@@ -626,7 +630,7 @@ def run_autocoder_single_task(
     if base_sha is None:
         base_sha_result = subprocess.run(
             ["git", "rev-parse", "main"],
-            cwd=str(REPO_ROOT),
+            cwd=str(effective_repo_root),
             capture_output=True,
             text=True,
             timeout=10,
@@ -636,7 +640,7 @@ def run_autocoder_single_task(
     stage5_argv = [
         "python3",
         str(SCRIPT_DIR / "apply_temp_worktree_patch_to_branch.py"),
-        "--target-repo", str(REPO_ROOT),
+        "--target-repo", str(effective_repo_root),
         "--result-json", str(result_json_path),
         "--diff-patch", str(diff_patch_path),
         "--apply-readiness-json", str(apply_readiness_json_path),
@@ -646,7 +650,7 @@ def run_autocoder_single_task(
         "--output-md", str(apply_to_branch_md_path),
         "--allow-real-apply",
     ]
-    rc5, stdout5, stderr5 = run_stage(stage5_argv, REPO_ROOT)
+    rc5, stdout5, stderr5 = run_stage(stage5_argv, effective_repo_root)
     del stage5_argv
 
     stage5_data = load_stage_json(apply_to_branch_json_path)
@@ -675,7 +679,7 @@ def run_autocoder_single_task(
     stage6_argv = [
         "python3",
         str(SCRIPT_DIR / "verify_temp_worktree_applied_branch.py"),
-        "--repo-root", str(REPO_ROOT),
+        "--repo-root", str(effective_repo_root),
         "--branch-name", branch_name,
         "--expected-base-sha", str(base_sha),
         "--result-json", str(result_json_path),
@@ -684,7 +688,7 @@ def run_autocoder_single_task(
         "--output-json", str(applied_branch_verification_json_path),
         "--output-md", str(applied_branch_verification_md_path),
     ]
-    rc6, stdout6, stderr6 = run_stage(stage6_argv, REPO_ROOT)
+    rc6, stdout6, stderr6 = run_stage(stage6_argv, effective_repo_root)
     del stage6_argv
 
     stage6_data = load_stage_json(applied_branch_verification_json_path)
@@ -713,7 +717,7 @@ def run_autocoder_single_task(
     stage7_argv = [
         "python3",
         str(SCRIPT_DIR / "preview_applied_branch_pr.py"),
-        "--repo-root", str(REPO_ROOT),
+        "--repo-root", str(effective_repo_root),
         "--applied-branch-json", str(applied_branch_verification_json_path),
         "--branch-name", branch_name,
         "--base-branch", "main",
@@ -723,7 +727,7 @@ def run_autocoder_single_task(
         "--suggested-pr-title", task_packet["suggested_pr_title"],
         "--suggested-pr-body", task_packet["suggested_pr_body"],
     ]
-    rc7, stdout7, stderr7 = run_stage(stage7_argv, REPO_ROOT)
+    rc7, stdout7, stderr7 = run_stage(stage7_argv, effective_repo_root)
     del stage7_argv
 
     stage7_data = load_stage_json(pr_preview_json_path)
@@ -874,8 +878,47 @@ def main() -> int:
         required=True,
         help="Path to write final status Markdown",
     )
+    parser.add_argument(
+        "--repo-root",
+        required=False,
+        help=(
+            "Path to the repository root. If provided, overrides the default "
+            "derived from __file__. Use this when the controller is invoked "
+            "from a different location than the repo being tested. "
+            "Must be a valid git repository."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # Set effective_repo_root before any controller logic runs.
+    if args.repo_root:
+        repo_root_path = Path(args.repo_root).resolve()
+        # Validate it is a git repository
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=str(repo_root_path),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            is_git_repo = proc.returncode == 0 and "true" in proc.stdout.lower()
+        except Exception:
+            is_git_repo = False
+        if not is_git_repo:
+            err = {
+                "status": "HOLD_TASK_PACKET_INVALID",
+                "error": f"--repo-root is not a git repository: {repo_root_path}",
+            }
+            output_json_path = Path(args.output_json).resolve()
+            _write_json(output_json_path, err)
+            print(f"FATAL: --repo-root is not a valid git repository: {repo_root_path}", file=sys.stderr)
+            return 1
+        global effective_repo_root
+        effective_repo_root = repo_root_path
+    else:
+        effective_repo_root = _DEFAULT_REPO_ROOT
 
     task_packet_path = Path(args.task_packet_json).resolve()
     output_json_path = Path(args.output_json).resolve()

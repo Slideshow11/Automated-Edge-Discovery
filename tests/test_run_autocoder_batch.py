@@ -990,6 +990,112 @@ class TestBatchIntegration:
         assert "status" in task_result
 
 
+class TestScriptSource:
+    """Test that the batch controller uses the trusted parent script, not worktree script."""
+
+    def test_batch_invokes_parent_script_with_repo_root(self, tmp_path):
+        """Batch controller must use SINGLE_TASK_SCRIPT (parent) with --repo-root.
+
+        This is the core trusted-script fix: previously the batch invoked
+        <task_worktree>/scripts/local/run_autocoder_single_task.py (worktree copy),
+        meaning controller code came from base_sha. Now it uses the reviewed parent
+        checkout's script and passes --repo-root <task_worktree_path> so the worktree
+        is still the repo-under-test.
+        """
+        task_out_root = tmp_path / "tasks" / "task-trusted-001"
+        task_out_root.mkdir(parents=True)
+        task_final_status = {
+            "status": "SINGLE_TASK_READY_FOR_HUMAN_REVIEW",
+            "task_id": "task-trusted-001",
+            "branch_name": "apply/test-trusted",
+            "base_sha": "a" * 40,
+            "goal": "Trusted script smoke.",
+            "execution_mode": "mocked",
+            "generated_at": "2025-01-01T00:00:00Z",
+        }
+        (task_out_root / "final_status.json").write_text(json.dumps(task_final_status))
+        (task_out_root / "final_status.md").write_text("# Ready\n")
+
+        task1 = make_task(
+            task_id="task-trusted-001",
+            branch_name="apply/test-trusted",
+            allowed_files=["docs/trusted_001.md"],
+            output_root=str(task_out_root),
+        )
+        current_sha = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        batch = make_batch(
+            batch_id="test-trusted-script",
+            base_sha=current_sha,
+            tasks=[task1],
+            stop_on_first_hold=True,
+        )
+
+        captured_argv = []
+
+        def capture_runner(argv, cwd=None, capture_output=False, text=False,
+                           timeout=None, shell=False, env=None):
+            captured_argv.extend(argv)
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return CP()
+
+        # Add SCRIPT_DIR to sys.path so we can import the batch module directly
+        # and patch its _real_subprocess_run
+        import sys
+        orig_path = list(sys.path)
+        sys.path.insert(0, str(SCRIPT_DIR))
+        try:
+            import run_autocoder_batch as batch_module
+            original_real_run = batch_module._real_subprocess_run
+            batch_module._real_subprocess_run = capture_runner
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                    json.dump(batch, f)
+                    pkt_path = Path(f.name)
+                try:
+                    result = batch_module.run_autocoder_batch(
+                        batch_packet_path=pkt_path,
+                        output_json_path=tmp_path / "out.json",
+                        output_md_path=tmp_path / "out.md",
+                    )
+                finally:
+                    os.unlink(pkt_path)
+            finally:
+                batch_module._real_subprocess_run = original_real_run
+        finally:
+            sys.path[:] = orig_path
+
+        # The captured argv should contain the parent (reviewed) script path,
+        # NOT the worktree script path. SINGLE_TASK_SCRIPT is the parent script.
+        parent_script = str(SCRIPT_DIR / "run_autocoder_single_task.py")
+        assert any(parent_script in arg for arg in captured_argv), (
+            f"Parent script '{parent_script}' not found in argv: {captured_argv}"
+        )
+
+        # The captured argv must include --repo-root
+        repo_root_args = [a for a in captured_argv if a == "--repo-root"]
+        assert len(repo_root_args) >= 1, (
+            f"--repo-root not found in argv: {captured_argv}"
+        )
+
+        # The --repo-root value should follow the --repo-root flag
+        repo_root_idx = captured_argv.index("--repo-root")
+        repo_root_value = captured_argv[repo_root_idx + 1]
+        # Must be a valid looking path (not empty, not the parent script path)
+        assert len(repo_root_value) > 5, (
+            f"--repo-root value looks bogus: {repo_root_value}"
+        )
+        # Must NOT be the parent script itself
+        assert "run_autocoder_single_task.py" not in repo_root_value, (
+            f"--repo-root should be worktree path, not script path: {repo_root_value}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Compile check
 # ---------------------------------------------------------------------------
