@@ -316,5 +316,8 @@ Each task runs inside a dedicated git worktree (via `git worktree add --detach`)
 ### Happy-Path Smoke (two-task)
 The happy-path smoke uses two existing tracked docs files (e.g. `docs/wfa_next_steps.md`, `docs/wfa_run_examples.md`) with append-only mock edits. Both files must exist at `base_sha` with zero `.aed_plan` occurrences. Smoke passes when both single-task runs return `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, producing `BATCH_READY_FOR_HUMAN_REVIEW` with both task worktrees preserved and inspectable.
 
+### Process Note
+PR #314 was post-merge verified (191/191 tests pass, smoke passes), but its explicit final-gate invocation was recorded separately in `docs/pr314_batch_controller_gate_process_gap.md`. The canonical explicit pre-merge gate sequence (Step 2: `final_gate_status.py` + Step 3: `verify_final_head_merge_command.py` before `gh pr merge`) is now documented there for future PRs.
+
 ### What Remains Out of Scope
 Live-Claude execution, parallelism, retries, push/PR/merge/commit/staging, dispatch, board/Hermes mutation, audit append, memory/profile update, package installation.
