@@ -570,10 +570,14 @@ def run_autocoder_batch(
 
         _write_json(task_packet_json_path, normalized_task)
 
-        # Invoke single-task controller via explicit argv subprocess
+        # Invoke single-task controller via explicit argv subprocess.
+        # Use the script from INSIDE the task worktree so that REPO_ROOT
+        # resolves to the worktree (not the parent repo). This is the core of
+        # the per-task isolation model: each task sees only its own worktree.
+        task_script = task_worktree_path / "scripts" / "local" / "run_autocoder_single_task.py"
         argv = [
             "python3",
-            str(SINGLE_TASK_SCRIPT),
+            str(task_script),
             "--task-packet-json", str(task_packet_json_path),
             "--output-json", str(task_output_json_path),
             "--output-md", str(task_output_md_path),
