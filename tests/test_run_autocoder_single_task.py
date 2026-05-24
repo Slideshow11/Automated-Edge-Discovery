@@ -66,8 +66,16 @@ def run_controller(task_packet: dict, output_json, output_md) -> dict:
         os.unlink(pkt_path)
 
 
-def make_packet(task_id: str = "test-task-001", **overrides) -> dict:
-    """Make a valid base task packet with optional overrides."""
+def make_packet(task_id: str = None, **overrides) -> dict:
+    """Make a valid base task packet with optional overrides.
+
+    task_id defaults to a fresh UUID so each call produces a unique branch_name,
+    avoiding spurious 'branch already exists' failures in concurrent or
+    sequential test runs.
+    """
+    import uuid as _uuid
+    if task_id is None:
+        task_id = f"test-task-{_uuid.uuid4().hex[:8]}"
     base = {
         "packet_kind": "aed.autocoder.single_task.v0",
         "task_id": task_id,
