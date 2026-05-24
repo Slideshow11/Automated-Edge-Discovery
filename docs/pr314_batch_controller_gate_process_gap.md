@@ -181,8 +181,43 @@ This docs-only PR must **not**:
 
 ---
 
-## 10. Cross-Reference
+## 11. PR #317 Post-Merge Gate Process Gap (PROCESS_GAP_ONLY)
+
+**Classification:** PROCESS_GAP_ONLY — no runtime remediation required.
+
+**What happened:**
+PR #317 (fix: add --repo-root to single-task controller for trusted-script isolation) was squash-merged to main at merge SHA `91bad0112068c0c075a0753ca05a22eb75b55d58` from PR head `3e85e936df88d092a85a3fd717bffb37ac117cdd`. The PR #317 final report incorrectly stated that `final_gate_status.py`, `verify_final_head_merge_command.py`, and PMG compare were "N/A or absent" — this was wrong. Those scripts exist and were required by this very governance document (Section 10, Cross-Reference).
+
+The explicit final-gate commands documented in Section 5 (Step 2: `final_gate_status.py` + Step 3: `verify_final_head_merge_command.py` before `gh pr merge`) were **skipped** before PR #317's merge. The gate scripts were not run and the process gap was not reported.
+
+**Post-merge structural validation (all passed):**
+- CI: all checks green (governance-validators × 2, pr-gate-live-smoke × 2, test × 2, validator × 2)
+- Focused test suite: 302/302 passed
+- Feature-branch smoke: `BATCH_READY_FOR_HUMAN_REVIEW`, both tasks `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, no `HOLD_MAIN_DIRTY`
+- Codex reviews: clean (both non-blocking findings documented below)
+- Post-merge `final_gate_status.py` re-run: all structural checks pass (`head_matches: True`, `ci_green: True`, `codex_exact_head: True`, `pmg_clean: True`, `git_status_clean: True`) — only `pr_open` fails because PR is already merged (expected)
+- PMG compare: clean
+
+**Codex non-blocking findings:**
+1. Docs conflict: `docs/autocoder_batch_controller_design.md` sections around line 243 and 293 still describe the pre-PR #317 model where `run_autocoder_single_task.py` is invoked from the task worktree and `REPO_ROOT` derives from `__file__`. The new PR #317 section (line 325+) correctly documents the `--repo-root` trusted-script model, creating a conflict. Non-blocking — the new section is authoritative.
+2. Test-strength gap: `TestScriptSource.test_batch_invokes_parent_script_with_repo_root` checks `--repo-root` is present and not the script path, but does not assert the value equals the task worktree path. Implementation is correct; test could be stronger.
+
+**No runtime remediation required.** The PR #317 code is safe — no live Claude, no `--enable-real-claude-executor`, no `shell=True`, no push/PR/merge/commit/stage/git-add behavior, no Hermes memory/profile touched, all tests pass.
+
+**This PR (PR remediation) addresses:**
+- Records the process gap formally
+- Fixes the docs conflict in `docs/autocoder_batch_controller_design.md` (lines 243, 293)
+- Strengthens `TestScriptSource` to assert `--repo-root` value equals task worktree path
+- Removes accidental untracked noise files (`docs/test.md`, `test_apply_output.json`)
+
+**Future requirement:** All AED PRs must run the explicit gate sequence (`final_gate_status.py` → `verify_final_head_merge_command.py`) before `gh pr merge`. The PR #315 / PR #317 process gap is not a license to skip gates for future PRs.
+
+---
+
+## 12. Cross-Reference
 
 - PR #314: https://github.com/Slideshow11/Automated-Edge-Discovery/pull/314
+- PR #315: https://github.com/Slideshow11/Automated-Edge-Discovery/pull/315 (records PR #314 gate process gap)
+- PR #317: https://github.com/Slideshow11/Automated-Edge-Discovery/pull/317
 - Batch controller design: `docs/autocoder_batch_controller_design.md`
 - Gate infrastructure: `scripts/local/final_gate_status.py`, `scripts/local/verify_final_head_merge_command.py`, `scripts/local/check_persistent_mutation_guard.py`

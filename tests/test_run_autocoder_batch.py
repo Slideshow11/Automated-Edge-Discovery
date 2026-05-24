@@ -1031,13 +1031,17 @@ class TestScriptSource:
             base_sha=current_sha,
             tasks=[task1],
             stop_on_first_hold=True,
+            output_root=str(tmp_path),
         )
 
         captured_argv = []
+        captured_kwargs = []
+        task_worktree_path_str = str(tmp_path / "task_worktrees" / "task-trusted-001")
 
         def capture_runner(argv, cwd=None, capture_output=False, text=False,
                            timeout=None, shell=False, env=None):
             captured_argv.extend(argv)
+            captured_kwargs.append({"argv": argv, "cwd": cwd, "shell": shell})
             class CP:
                 returncode = 0
                 stdout = ""
@@ -1093,6 +1097,34 @@ class TestScriptSource:
         # Must NOT be the parent script itself
         assert "run_autocoder_single_task.py" not in repo_root_value, (
             f"--repo-root should be worktree path, not script path: {repo_root_value}"
+        )
+
+        # The --repo-root value must be the task worktree path (not just "looks valid").
+        # Batch builds: task_worktree_path = output_root / "task_worktrees" / task_id
+        # The captured argv contains this path as an absolute string.
+        # Confirm the value equals the task worktree path exactly.
+        assert repo_root_value == task_worktree_path_str, (
+            f"--repo-root value must equal task_worktree_path '{task_worktree_path_str}', "
+            f"got '{repo_root_value}'"
+        )
+
+        # Verify cwd was also set to the task worktree path
+        # The batch controller passes cwd=str(task_worktree_path) to subprocess.run
+        captured_cwds = [kw.get("cwd") for kw in captured_kwargs if kw.get("cwd")]
+        task_worktree_str = str(tmp_path / "task_worktrees" / "task-trusted-001")
+        assert task_worktree_str in captured_cwds, (
+            f"cwd should be task_worktree_path '{task_worktree_str}', "
+            f"got cwds: {captured_cwds}"
+        )
+
+        # Explicitly confirm no --enable-real-claude-executor in captured argv
+        assert not any("--enable-real-claude-executor" in str(a) for a in captured_argv), (
+            f"--enable-real-claude-executor found in argv: {captured_argv}"
+        )
+
+        # Explicitly confirm no shell=True in the captured argv (safety check)
+        assert not any("shell=True" in str(a) for a in captured_argv), (
+            f"shell=True found in argv: {captured_argv}"
         )
 
 

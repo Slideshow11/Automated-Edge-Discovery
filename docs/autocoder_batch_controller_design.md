@@ -91,12 +91,13 @@ for each task in tasks (sequential order):
         "--task-packet-json", str(task_packet_path),
         "--output-json", str(task_output / "final_status.json"),
         "--output-md", str(task_output / "final_status.md"),
+        "--repo-root", str(task_worktree_path),
     ]
-    # Run single-task controller inside the task's isolated worktree.
-    # REPO_ROOT inside the worktree resolves to the worktree itself,
-    # so the task's apply-branch dirty state stays inside the worktree
-    # and does NOT pollute the main repo for the next task.
-    rc, stdout, stderr = subprocess.run(argv, cwd=<task_worktree_path>)
+    # Run single-task controller from the reviewed parent checkout, with
+    # --repo-root pointing to the task worktree so stage tools operate on
+    # the correct files. The task's apply-branch dirty state stays inside
+    # the worktree and does NOT pollute the main repo for the next task.
+    rc, stdout, stderr = subprocess.run(argv, cwd=str(task_worktree_path))
 
     task_result = read_json(task_output / "final_status.json")
 
@@ -240,8 +241,8 @@ The single-task controller intentionally leaves its apply branch with dirty unco
 - On task success: worktree is kept; human reviewer can `git worktree list` to find all task branches
 - Worktrees are never auto-deleted by the batch controller
 
-**REPO_ROOT resolution in worktrees:**
-`run_autocoder_single_task.py` computes `SCRIPT_DIR = Path(__file__).parent.resolve()` and `REPO_ROOT = SCRIPT_DIR.parent.parent.resolve()`. When run from a task worktree, `__file__` resolves to the worktree path, so `REPO_ROOT` correctly points to the worktree itself. All downstream scripts inherit this self-locating behavior, meaning the single-task controller and its stage scripts all operate on the worktree copy — never the main repo.
+**Trusted-script model and `--repo-root`:**
+`run_autocoder_single_task.py` runs the **reviewed parent checkout's** script (`SINGLE_TASK_SCRIPT`), not a script copied into the task worktree. The batch controller passes `--repo-root <task_worktree_path>` so stages 3–7 operate on the correct worktree files. `effective_repo_root` (module-level, set after argparse validation) flows to all stage tool subprocess calls. Stage 2 (`run_temp_worktree_execution.py`) operates on the **parent repo** for pre-flight checks and worktree creation — acceptable for mocked v0 only; before live Claude, stage 2 must be re-reviewed or receive `--repo-root` explicitly. The self-locating `SCRIPT_DIR.parent.parent` derivation is the **fallback** when `--repo-root` is omitted (standalone mode).
 
 **What is preserved per task:**
 - The task worktree itself (detached HEAD at `batch_start_head`)
@@ -290,7 +291,7 @@ On exit 0, check `batch_status.json` for the actual status.
 The v0 implementation exists at `scripts/local/run_autocoder_batch.py` with companion tests at `tests/test_run_autocoder_batch.py`.
 
 ### Core Isolation Mechanism
-Each task runs inside a dedicated git worktree (via `git worktree add --detach`) created from `batch_start_head`. The worktree path is `<output_root>/task_worktrees/<task_id>`. The single-task controller is invoked with `cwd=<task_worktree_path>`, so `REPO_ROOT` resolves to the worktree itself. This means:
+Each task runs inside a dedicated git worktree (via `git worktree add --detach`) created from `batch_start_head`. The worktree path is `<output_root>/task_worktrees/<task_id>`. The batch controller invokes the **reviewed parent checkout's** `SINGLE_TASK_SCRIPT` with `--repo-root <task_worktree_path>`, so stages 3–7 operate on the correct worktree files. `effective_repo_root` (set from `--repo-root` or `_DEFAULT_REPO_ROOT` fallback) routes all stage tool subprocess calls to the worktree. This means:
 - Each task's apply-branch dirty state stays in its own worktree
 - The main repo worktree is never touched between tasks
 - Task worktrees are kept after task completion (preserving artifacts for human review)
@@ -317,7 +318,7 @@ Each task runs inside a dedicated git worktree (via `git worktree add --detach`)
 The happy-path smoke uses two existing tracked docs files (e.g. `docs/wfa_next_steps.md`, `docs/wfa_run_examples.md`) with append-only mock edits. Both files must exist at `base_sha` with zero `.aed_plan` occurrences. Smoke passes when both single-task runs return `SINGLE_TASK_READY_FOR_HUMAN_REVIEW`, producing `BATCH_READY_FOR_HUMAN_REVIEW` with both task worktrees preserved and inspectable.
 
 ### Process Note
-PR #314 was post-merge verified (191/191 tests pass, smoke passes), but its explicit final-gate invocation was recorded separately in `docs/pr314_batch_controller_gate_process_gap.md`. The canonical explicit pre-merge gate sequence (Step 2: `final_gate_status.py` + Step 3: `verify_final_head_merge_command.py` before `gh pr merge`) is now documented there for future PRs.
+PR #314 was post-merge verified (191/191 tests pass, smoke passes), but its explicit final-gate invocation was recorded separately in `docs/pr314_batch_controller_gate_process_gap.md`. PR #317 (trusted-script / `--repo-root` fix) was merged without running explicit gate commands; the process gap is recorded in the same document (Section 11). The canonical explicit pre-merge gate sequence (Step 2: `final_gate_status.py` + Step 3: `verify_final_head_merge_command.py` before `gh pr merge`) is now documented there for all future AED PRs.
 
 ### What Remains Out of Scope
 Live-Claude execution, parallelism, retries, push/PR/merge/commit/staging, dispatch, board/Hermes mutation, audit append, memory/profile update, package installation.
