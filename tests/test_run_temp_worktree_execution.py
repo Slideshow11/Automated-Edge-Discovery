@@ -32,6 +32,7 @@ import json
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -3307,6 +3308,230 @@ def test_smoke_002_style_bad_packet_rejected_by_phase_1b(tmp_path):
             f"error must mention forbidden_files: {result.get('validation_errors')}"
 
 
+class TestRepoRootArg:
+    """Tests for the --repo-root CLI argument of run_temp_worktree_execution.py."""
+
+    def test_accepts_valid_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to a valid git repo is accepted and used for Phase 3.
+
+        We create a fresh worktree at base_sha to ensure the worktree itself is clean
+        (no WIP changes from the test environment). Using the main repo checkout
+        directly would fail Phase 3 due to uncommitted test WIP changes.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        worktree_path = tmp_path / "worktree"
+
+        # Create a clean worktree at base_sha to use as --repo-root
+        wt_res = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add",
+             str(worktree_path), base_sha, "--detach"],
+            capture_output=True, text=True, timeout=30
+        )
+        if wt_res.returncode != 0:
+            pytest.skip(f"cannot create worktree for test: {wt_res.stderr}")
+
+        try:
+            plan_path, plan_sha = make_plan_file(tmp_path)
+            now = now_iso()
+            # Create a fake Hermes home so PMG snapshot doesn't fail on missing Hermes
+            fake_hermes = tmp_path / ".hermes"
+            fake_hermes.mkdir()
+            (fake_hermes / "config").write_text("{}")
+
+            packet = {
+                "packet_kind": "aed.temp_worktree.execution.v0",
+                "run_id": f"test-repo-root-valid-{uuid.uuid4().hex[:8]}",
+                "task_id": "TASK-REPO-001",
+                "base_sha": base_sha,
+                "approved_plan_path": str(plan_path),
+                "approved_plan_sha256": plan_sha,
+                "approval": {
+                    "approved_for_temp_worktree_execution": True,
+                    "approved_by": "human",
+                    "approved_plan_sha256": plan_sha,
+                    "approved_at": now,
+                    "max_changed_files": 5,
+                },
+                "task": {
+                    "description": "Edit docs/example.md",
+                    "allowed_files": ["docs/example.md"],
+                    "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                    "do_not": [],
+                },
+                "execution": {
+                    "mode": "mock",
+                    "timeout_seconds": 60,
+                    "output_root": str(tmp_path / "output"),
+                    "mock_edits": [],
+                },
+            }
+
+            packet_path = tmp_path / "packet.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            output_json = tmp_path / "result.json"
+            output_md = tmp_path / "result.md"
+
+            argv = [
+                "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+                "--packet-json", str(packet_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+                "--repo-root", str(worktree_path),
+            ]
+
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=60,
+                env={**__import__("os").environ, "HERMES_HOME": str(tmp_path / ".hermes")},
+            )
+
+            # Should succeed: worktree HEAD (base_sha) == packet base_sha, worktree is clean
+            # Note: HERMES_HOME is passed so PMG targets the temp dir instead of the CI runner's home.
+            assert result.returncode == 0, f"non-zero exit: {result.stderr}"
+            data = json.loads(output_json.read_text())
+            # Phase 3 passes with matching HEAD and clean status
+            assert data["status"] in (
+                "PATCH_READY_FOR_HUMAN_REVIEW",
+                "HOLD_PLAN_NOT_APPROVED",
+                "HOLD_INVALID_PACKET",
+            ), f"unexpected status: {data.get('status')} — {data.get('validation_errors')}"
+        finally:
+            # Clean up worktree
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                 str(worktree_path), "--force"],
+                capture_output=True
+            )
+
+    def test_rejects_nonexistent_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to non-existent path returns exit code 1."""
+        packet = {"packet_kind": "x"}
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", "/nonexistent/path/xyz",
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30
+        )
+
+        assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
+        assert "does not exist" in result.stderr, f"stderr must mention 'does not exist': {result.stderr}"
+
+    def test_rejects_non_git_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to a non-git directory returns exit code 1."""
+        # tmp_path is not a git repo
+        packet = {"packet_kind": "x"}
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", str(tmp_path),
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30
+        )
+
+        assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
+        assert "not inside a git worktree" in result.stderr, \
+            f"stderr must mention 'not inside a git worktree': {result.stderr}"
+
+    def test_repo_root_used_for_phase3_head_check(self, tmp_path):
+        """With --repo-root, Phase 3 checks effective_repo_root HEAD == base_sha, not parent checkout."""
+        import run_temp_worktree_execution as rte
+
+        # Create a git worktree at a known base_sha
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        worktree_path = tmp_path / "worktree"
+        wt_res = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add",
+             str(worktree_path), base_sha],
+            capture_output=True, text=True
+        )
+        if wt_res.returncode != 0:
+            pytest.skip(f"cannot create worktree for test: {wt_res.stderr}")
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+        # Create a fake Hermes home so PMG snapshot doesn't fail on missing Hermes
+        fake_hermes = tmp_path / ".hermes"
+        fake_hermes.mkdir()
+        (fake_hermes / "config").write_text("{}")
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": f"test-repo-root-phase3-{uuid.uuid4().hex[:8]}",
+            "task_id": "TASK-REPO-P3",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit README.md",
+                "allowed_files": ["README.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Run with --repo-root pointing to the worktree
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", str(worktree_path),
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60,
+            env={**__import__("os").environ, "HERMES_HOME": str(tmp_path / ".hermes")},
+        )
+
+        # Cleanup worktree
+        subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "remove", str(worktree_path), "--force"],
+            capture_output=True
+        )
+
+        assert result.returncode == 0, f"non-zero exit: {result.stderr}"
+        data = json.loads(output_json.read_text())
+        # Worktree HEAD (base_sha) == packet base_sha → Phase 3 passes
+        assert data.get("status") != "HOLD_MAIN_DIRTY", \
+            f"Phase 3 should pass with correct --repo-root: {data.get('validation_errors')}"
+
+
 class TestUntrackedFileDetection:
     """Tests for untracked file detection in git_diff_name_only() and git_untracked_files()."""
 
@@ -4081,6 +4306,120 @@ class TestUntrackedFileDetection:
         # Two distinct files must still trigger HOLD
         assert result["status"] == "HOLD_TOO_MANY_FILES_CHANGED", \
             f"Two distinct files must trigger HOLD, got: {result['status']}"
+
+    def test_untracked_file_no_newline_marker(self, tmp_path):
+        """Synthetic diff for untracked file without trailing newline must emit
+        literal backslash-space-No-newline pattern (not a raw string literal).
+
+        git apply requires: ...content\\n\\ No newline at end of file\\n
+        NOT: ...content\\ No newline at end of file\\n  (literal backslash)
+
+        The test mocks git_untracked_files to create the untracked file inside
+        the worktree (so the diff builder can read it), and returns its path.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        # Build a minimal packet (no mock_edits, so diff comes from untracked files only)
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_newline_marker_xyz",
+            "task_id": "TASK-NEWSL-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 10,
+            },
+            "task": {
+                "description": "Test untracked file without newline",
+                "allowed_files": ["untracked_dir/"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "out"),
+            },
+        }
+
+        output_json = tmp_path / "output.json"
+        output_md = tmp_path / "output.md"
+
+        captured_worktree_root = None
+
+        def fake_untracked(worktree_path):
+            nonlocal captured_worktree_root
+            captured_worktree_root = worktree_path
+            # Create an untracked file with no trailing newline inside the worktree
+            untracked_dir = worktree_path / "untracked_dir"
+            untracked_dir.mkdir(exist_ok=True)
+            no_newline_file = untracked_dir / "no_newline.txt"
+            # Write WITHOUT trailing newline
+            no_newline_file.write_text("line without newline", encoding="utf-8")
+            return ["untracked_dir/no_newline.txt"]
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", return_value=""), \
+             mock.patch.object(rte, "git_diff_name_only", return_value=[]):
+
+            def fake_snapshot(*a): return True, ""
+            def fake_compare(*a):
+                # pmg_compare writes output_json and output_md; copy the pre-made clean files
+                import shutil
+                shutil.copy(str(pmg_compare_json), a[1])
+                shutil.copy(str(pmg_compare_md), a[2])
+                return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # The patch content is stored in diff_path (written to disk), not in result dict
+        # The patch content is stored in diff_path (written to disk), not in result dict
+        diff_path = result.get("diff_path", "")
+        if diff_path and Path(diff_path).exists():
+            diff_patch = Path(diff_path).read_text(encoding="utf-8")
+        else:
+            diff_patch = ""
+
+# The diff must contain the correct git-diff marker:
+        #   ...content<newline>\ No newline at end of file<newline>
+        # i.e. a real newline BEFORE the marker, a literal backslash char,
+        # a space, and a real newline AFTER the marker.
+        assert "\n\\ No newline at end of file\n" in diff_patch, \
+            f"diff_patch must contain the correct marker form '\\n\\ No newline at end of file\\n', got: {repr(diff_patch[:500])}"
+        # Must NOT contain the broken raw-string escape: \n (literal backslash-n)
+        # which would appear as two separate characters in the diff.
+        assert "\\n\\ No newline" not in diff_patch, \
+            f"diff_patch must not contain broken \\n escape before marker: {repr(diff_patch[:500])}"
+        # git apply --check is the authoritative validity test
+        import subprocess
+        test_patch_file = tmp_path / "test.patch"
+        test_patch_file.write_text(diff_patch, encoding="utf-8")
+        apply_check = subprocess.run(
+            ["git", "apply", "--check", str(test_patch_file)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert apply_check.returncode == 0, \
+            f"git apply --check failed on synthetic patch: {apply_check.stderr}"
 
     def test_no_shell_in_untracked_functions(self):
         """git_untracked_files and git_diff_name_only must use shell=False."""

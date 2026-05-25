@@ -372,6 +372,14 @@ def validate_task_constraints(tasks: list[dict]) -> tuple[bool, str]:
                 f"got '{pkt}'"
             )
 
+        # --- task_id path-traversal sanitization ---
+        import re
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", task_id):
+            return False, (
+                f"tasks[{i}] has invalid task_id: '{task_id}'. "
+                f"Must match ^[A-Za-z0-9][A-Za-z0-9._-]{{0,127}}$ — "
+                f"no path separators, no '..', no absolute paths."
+            )
         # --- task_id uniqueness ---
         if not task_id:
             return False, f"tasks[{i}] is missing task_id"
@@ -476,7 +484,16 @@ def run_autocoder_batch(
     base_sha = _git_sha_for_placeholder(base_sha)
     output_root_str: str = batch_packet["output_root"]
     output_root = Path(output_root_str).resolve()
-    stop_on_first_hold: bool = batch_packet.get("stop_on_first_hold", True)
+    stop_on_first_hold_raw = batch_packet.get("stop_on_first_hold", True)
+    # Explicit bool coercion: reject strings that would silently be truthy
+    if isinstance(stop_on_first_hold_raw, bool):
+        stop_on_first_hold: bool = stop_on_first_hold_raw
+    else:
+        raise ValueError(
+            f"stop_on_first_hold must be a bool, got {type(stop_on_first_hold_raw).__name__}: "
+            f"{stop_on_first_hold_raw!r}. "
+            f'String "false" is not accepted; use boolean false explicitly.'
+        )
     max_tasks: Optional[int] = batch_packet.get("max_tasks")
 
     # --- Batch size cap ---

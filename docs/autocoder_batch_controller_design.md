@@ -242,7 +242,7 @@ The single-task controller intentionally leaves its apply branch with dirty unco
 - Worktrees are never auto-deleted by the batch controller
 
 **Trusted-script model and `--repo-root`:**
-`run_autocoder_single_task.py` runs the **reviewed parent checkout's** script (`SINGLE_TASK_SCRIPT`), not a script copied into the task worktree. The batch controller passes `--repo-root <task_worktree_path>` so stages 3–7 operate on the correct worktree files. `effective_repo_root` (module-level, set after argparse validation) flows to all stage tool subprocess calls. Stage 2 (`run_temp_worktree_execution.py`) operates on the **parent repo** for pre-flight checks and worktree creation — acceptable for mocked v0 only; before live Claude, stage 2 must be re-reviewed or receive `--repo-root` explicitly. The self-locating `SCRIPT_DIR.parent.parent` derivation is the **fallback** when `--repo-root` is omitted (standalone mode).
+`run_autocoder_single_task.py` runs the **reviewed parent checkout's** script (`SINGLE_TASK_SCRIPT`), not a script copied into the task worktree. The batch controller passes `--repo-root <task_worktree_path>` to the single-task controller, which propagates it to stage 2 (`run_temp_worktree_execution.py`). All Phase 3 checks (git_status_clean, git_rev_parse HEAD vs base_sha, path safety, worktree create/remove) operate on `effective_repo_root`. The parent AED checkout can remain on a feature branch; no global `git checkout main` is required or performed. `SCRIPT_DIR.parent.parent` derivation is the **fallback** when `--repo-root` is omitted (standalone mode).
 
 **What is preserved per task:**
 - The task worktree itself (detached HEAD at `batch_start_head`)
@@ -327,11 +327,6 @@ Live-Claude execution, parallelism, retries, push/PR/merge/commit/staging, dispa
 
 PR #317 separates trusted controller code from repo content under test. The batch controller invokes the reviewed parent `run_autocoder_single_task.py` and passes `--repo-root <task_worktree_path>` so stages 3–7 operate on the correct worktree files. `effective_repo_root` flows to all downstream stage tools.
 
-Stage 2 (`run_temp_worktree_execution.py`) is scoped differently. It operates on the **parent repo** (`REPO_ROOT`, derived from `SCRIPT_DIR.parent.parent`) for:
-- `git_status_clean(REPO_ROOT)` — pre-flight check for `HOLD_MAIN_DIRTY`
-- `git_rev_parse(REPO_ROOT, "HEAD")` — verifying main HEAD matches `base_sha`
-- `git worktree add <path> <base_sha>` — creating a temp worktree (using parent repo as commit source)
+Stage 2 (`run_temp_worktree_execution.py`) now accepts `--repo-root` and uses `effective_repo_root` for all parent-repo checks. When the batch controller invokes single-task with `--repo-root <task_worktree_path>`, that value flows to stage 2's `run()` via `--repo-root <worktree_path>`. All Phase 3 checks (git_status_clean, git_rev_parse HEAD vs base_sha), path safety checks, worktree create/remove, and post-execution status checks operate on `effective_repo_root`. The parent AED checkout can remain on a feature branch; the batch controller does not globally switch to `main`.
 
-The temp worktree is created from `base_sha` (a commit SHA, not a file path), and mock execution runs inside it with `cwd=<worktree>`. Stage 2 does not use `effective_repo_root` for file operations.
-
-**This is acceptable for mocked v0 only.** Before live Claude execution, `run_temp_worktree_execution.py` must either receive `--repo-root` explicitly or use `effective_repo_root` for all parent-repo checks. The stage 2 boundary is documented here to make the v0 assumption explicit and prevent silent assumption drift in future changes.
+The temp worktree is created from `base_sha` (a commit SHA, not a file path), and mock execution runs inside it with `cwd=<worktree>`. This model holds for both mock v0 and future live-Claude execution.

@@ -34,13 +34,18 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-REPO_ROOT = SCRIPT_DIR.parent.parent.resolve()
+# Use REPO_ROOT as the module-level repo root. Default is computed from script
+# location; it can be overridden at runtime via the --repo-root CLI argument
+# so that execution checks (main HEAD vs base_sha, git status, worktree ops)
+# operate on the task worktree rather than the parent checkout.
+REPO_ROOT: Path = SCRIPT_DIR.parent.parent.resolve()
 
 PROTECTED_GATE_SCRIPTS = [
     "scripts/local/final_gate_status.py",
@@ -1182,6 +1187,7 @@ def run(
     output_json: str,
     output_md: str,
     enable_real_claude_executor: bool = False,
+    effective_repo_root: Optional[Path] = None,
 ) -> dict:
     """
     Main execution path. Returns the result dict (also written to output_json).
@@ -1193,7 +1199,17 @@ def run(
         enable_real_claude_executor: if True, allow execution.mode='claude' to
             proceed to the real executor (with full PMG + worktree guard).
             Defaults to False (claude mode blocked without this flag).
+        effective_repo_root: repo root to use for all git status/HEAD/worktree
+            checks. When None (default), uses the module-level REPO_ROOT
+            (the AED parent checkout). When a task worktree path is supplied
+            (e.g. via --repo-root from the batch controller), all Phase 3+
+            checks operate on the worktree rather than the parent checkout.
     """
+    # Resolve effective repo root: default to module-level REPO_ROOT
+    # if not supplied by the caller (main() via --repo-root).
+    if effective_repo_root is None:
+        effective_repo_root = REPO_ROOT
+
     run_id = packet.get("run_id", "unknown")
     worktree_root = WORKTREE_BASE / run_id
     output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
@@ -1249,10 +1265,10 @@ def run(
 
     # ---- Phase 3: Main repo clean check ------------------------------------
 
-    main_status_before = git_status(REPO_ROOT)
+    main_status_before = git_status(effective_repo_root)
     result["main_git_status_before"] = main_status_before
 
-    if not git_status_clean(REPO_ROOT):
+    if not git_status_clean(effective_repo_root):
         result["status"] = "HOLD_MAIN_DIRTY"
         result["validation_errors"] = [f"main repo has staged or unstaged changes; untracked files are allowed: {main_status_before}"]
         result["next_action"] = "clean main repo (commit, reset, or discard staged/unstaged changes) and retry"
@@ -1260,7 +1276,7 @@ def run(
         return result
 
 # Verify main is at base_sha
-    main_head = git_rev_parse(REPO_ROOT, "HEAD")
+    main_head = git_rev_parse(effective_repo_root, "HEAD")
     if main_head != packet.get("base_sha"):
         result["status"] = "HOLD_MAIN_DIRTY"
         result["validation_errors"] = [
@@ -1273,14 +1289,14 @@ def run(
     # ---- Phase 4: Path safety checks ---------------------------------------
 
     output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
-    if path_inside_repo(output_root, REPO_ROOT):
+    if path_inside_repo(output_root, effective_repo_root):
         result["status"] = "HOLD_OUTPUT_PATH_INSIDE_REPO"
         result["validation_errors"] = [f"output_root cannot be inside repo: {output_root}"]
         result["next_action"] = "move output_root outside repo"
         _write_output(result, output_json, output_md)
         return result
 
-    if path_inside_repo(worktree_root, REPO_ROOT):
+    if path_inside_repo(worktree_root, effective_repo_root):
         result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
         result["validation_errors"] = [f"worktree path cannot be inside repo: {worktree_root}"]
         result["next_action"] = "ensure worktree root is outside repo"
@@ -1329,7 +1345,7 @@ def run(
         # Phase 5c: Build and validate command contract
         contract = build_claude_command_contract(packet, worktree_root, output_root)
         is_valid, validation_errors = validate_claude_command_contract(
-            contract, packet, worktree_root, output_root, REPO_ROOT
+            contract, packet, worktree_root, output_root, effective_repo_root
         )
         result["claude_command_contract_valid"] = is_valid
         result["claude_command_contract_errors"] = validation_errors
@@ -1370,13 +1386,13 @@ def run(
         # Phase 6: Create worktree
         if worktree_root.exists():
             try:
-                git_worktree_remove(worktree_root, REPO_ROOT)
+                git_worktree_remove(worktree_root, effective_repo_root)
             except Exception:
                 pass
             shutil.rmtree(worktree_root, ignore_errors=True)
         worktree_root.mkdir(parents=True, exist_ok=True)
         base_sha = packet.get("base_sha", "")
-        wt_result = git_worktree_add(worktree_root, base_sha, REPO_ROOT)
+        wt_result = git_worktree_add(worktree_root, base_sha, effective_repo_root)
         if wt_result.returncode != 0:
             result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
             result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
@@ -1385,8 +1401,8 @@ def run(
             return result
 
         # Phase 7: Pre-execution git status
-        main_status_after_create = git_status(REPO_ROOT)
-        if not git_status_clean(REPO_ROOT):
+        main_status_after_create = git_status(effective_repo_root)
+        if not git_status_clean(effective_repo_root):
             result["status"] = "HOLD_REPO_MUTATION"
             result["validation_errors"] = [
                 f"main repo became dirty after worktree creation: {main_status_after_create}"
@@ -1414,7 +1430,7 @@ def run(
                     return result
 
         # Phase 8: Run real Claude executor
-        claude_result = run_claude_executor(packet, worktree_root, output_root, contract, repo_root=REPO_ROOT)
+        claude_result = run_claude_executor(packet, worktree_root, output_root, contract, repo_root=effective_repo_root)
         result.update(claude_result)
 
         # If executor returned a HOLD, propagate it immediately
@@ -1425,10 +1441,10 @@ def run(
         # Executor succeeded: continue to post-execution validation
         worktree_status_after = git_status(worktree_root)
         result["worktree_git_status_after"] = worktree_status_after
-        main_status_after = git_status(REPO_ROOT)
+        main_status_after = git_status(effective_repo_root)
         result["main_git_status_after"] = main_status_after
 
-        if not git_status_clean(REPO_ROOT):
+        if not git_status_clean(effective_repo_root):
             result["status"] = "HOLD_REPO_MUTATION"
             result["validation_errors"] = [f"main repo git status changed during execution: {main_status_after}"]
             result["next_action"] = "investigate main repo mutation"
@@ -1616,7 +1632,7 @@ def run(
 
     if worktree_root.exists():
         try:
-            git_worktree_remove(worktree_root, REPO_ROOT)
+            git_worktree_remove(worktree_root, effective_repo_root)
         except Exception:
             pass
         shutil.rmtree(worktree_root, ignore_errors=True)
@@ -1624,7 +1640,7 @@ def run(
     worktree_root.mkdir(parents=True, exist_ok=True)
 
     base_sha = packet.get("base_sha", "")
-    wt_result = git_worktree_add(worktree_root, base_sha, REPO_ROOT)
+    wt_result = git_worktree_add(worktree_root, base_sha, effective_repo_root)
     if wt_result.returncode != 0:
         result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
         result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
@@ -1634,8 +1650,8 @@ def run(
 
     # ---- Phase 7: Pre-execution git status --------------------------------
 
-    main_status_after_create = git_status(REPO_ROOT)
-    if not git_status_clean(REPO_ROOT):
+    main_status_after_create = git_status(effective_repo_root)
+    if not git_status_clean(effective_repo_root):
         result["status"] = "HOLD_REPO_MUTATION"
         result["validation_errors"] = [
             f"main repo became dirty after worktree creation: {main_status_after_create}"
@@ -1672,7 +1688,7 @@ def run(
         result["patch_ready"] = True
         result["next_action"] = "human reviews empty diff; no patch to apply"
         result["worktree_git_status_after"] = git_status(worktree_root)
-        result["main_git_status_after"] = git_status(REPO_ROOT)
+        result["main_git_status_after"] = git_status(effective_repo_root)
         result["diff_path"] = diff_path
         _write_output(result, output_json, output_md)
         return result
@@ -1682,10 +1698,10 @@ def run(
     worktree_status_after = git_status(worktree_root)
     result["worktree_git_status_after"] = worktree_status_after
 
-    main_status_after = git_status(REPO_ROOT)
+    main_status_after = git_status(effective_repo_root)
     result["main_git_status_after"] = main_status_after
 
-    if not git_status_clean(REPO_ROOT):
+    if not git_status_clean(effective_repo_root):
         result["status"] = "HOLD_REPO_MUTATION"
         result["validation_errors"] = [
             f"main repo became dirty after worktree creation: {main_status_after}"
@@ -1746,12 +1762,20 @@ def run(
     untracked_files = git_untracked_files(worktree_root)
 
     # Validate untracked files BEFORE adding to changed_files
-    # Block untracked files outside allowed scope
+    # Block untracked files outside allowed scope.
+    # Use prefix matching (like Phase 9b check_outside_allowed) so that
+    # allowed_files=["dir/"] permits "dir/subdir/file.txt".
     task = packet.get("task", {})
     allowed_files = task.get("allowed_files", [])
     forbidden_files = task.get("forbidden_files", [])
-
-    outside_untracked = [f for f in untracked_files if f not in allowed_files]
+    outside_untracked = []
+    for f in untracked_files:
+        matched = any(
+            f == af or f.startswith(af)
+            for af in allowed_files
+        )
+        if not matched:
+            outside_untracked.append(f)
     if outside_untracked:
         result["status"] = "HOLD_OUTSIDE_ALLOWED_FILES"
         result["validation_errors"] = [f"untracked file outside allowed_files: {f}" for f in outside_untracked]
@@ -1802,7 +1826,7 @@ def run(
                 f"+++ b/{untracked_file}\n"
                 f"@@ -0,0 +1,{line_count} @@\n"
                 + "".join(f"+{line}" for line in content.splitlines(keepends=True))
-                + ("" if content.endswith("\n") else "\n\ No newline at end of file\n")
++ ("\n\\ No newline at end of file\n" if not content.endswith("\n") else "")
             )
 
     combined_diff = "\n\n".join(diff_parts)
@@ -1963,8 +1987,39 @@ def main() -> int:
              "Without this flag, execution.mode='claude' returns "
              "HOLD_REAL_EXECUTOR_NOT_ENABLED."
     )
+    parser.add_argument(
+        "--repo-root",
+        type=str,
+        default=None,
+        help="Repo root path to use for git status/HEAD/worktree operations. "
+             "Defaults to the module-level REPO_ROOT (the AED checkout). "
+             "Use this to direct checks at a task worktree instead of the "
+             "parent checkout when the batch controller invokes from a "
+             "feature branch with base_sha_policy=current_main."
+    )
 
     args = parser.parse_args()
+
+    # Resolve and validate --repo-root if provided
+    effective_repo_root: Path = REPO_ROOT  # default: use module-level REPO_ROOT
+    if args.repo_root:
+        repo_root_arg = Path(args.repo_root).resolve()
+        if not repo_root_arg.exists():
+            print(f"FATAL: --repo-root does not exist: {args.repo_root}", file=sys.stderr)
+            return 1
+        # Verify it is inside a git repo via git rev-parse --is-inside-work-tree
+        try:
+            proc = subprocess.run(
+                ["git", "-C", str(repo_root_arg), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True, text=True, timeout=10
+            )
+            if proc.returncode != 0 or proc.stdout.strip() != "true":
+                print(f"FATAL: --repo-root is not inside a git worktree: {args.repo_root}", file=sys.stderr)
+                return 1
+        except subprocess.TimeoutExpired:
+            print(f"FATAL: git rev-parse timed out for --repo-root: {args.repo_root}", file=sys.stderr)
+            return 1
+        effective_repo_root = repo_root_arg
 
     packet_path = Path(args.packet_json)
     if not packet_path.is_file():
@@ -1979,7 +2034,8 @@ def main() -> int:
 
     result = run(
         packet, args.output_json, args.output_md,
-        enable_real_claude_executor=args.enable_real_claude_executor
+        enable_real_claude_executor=args.enable_real_claude_executor,
+        effective_repo_root=effective_repo_root,
     )
     print(f"Status: {result['status']}")
     print(f"Output: {args.output_json}")
