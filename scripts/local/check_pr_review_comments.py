@@ -20,7 +20,7 @@ Exit codes:
 """
 
 import argparse
-import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
@@ -294,7 +294,7 @@ def render_md(
         f"# PR Review Comment Gate — PR #{pr_number}\n",
         f"**Reported head SHA:** `{reported_sha}`  ",
         f"**Status:** `{status}`  ",
-        f"**Harvested at:** {datetime.datetime.utcnow().isoformat()}Z\n",
+        f"**Harvested at:** {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}\n",
         f"## Summary\n",
         f"| Severity | Count |",
         f"|---|---|",
@@ -525,7 +525,7 @@ def main() -> int:
         "status": status,
         "pr_number": args.pr_number,
         "reported_head_sha": args.reported_head_sha,
-        "harvested_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "harvested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "sources_fetched": sources_fetched,
         "api_errors": api_errors,
         "findings": all_findings,
