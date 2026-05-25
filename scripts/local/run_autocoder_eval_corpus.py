@@ -109,12 +109,12 @@ def resolve_base_sha(policy: str, repo: Path) -> tuple[bool, str, str]:
         if len(policy) != 40 or not all(c in "0123456789abcdef" for c in policy):
             return False, f"base_sha must be a 40-char hex SHA (got '{policy[:8]}...')", ""
         result = subprocess.run(
-            ["git", "-C", str(repo), "cat-file", "-e", f"{policy}:README.md"],
+            ["git", "-C", str(repo), "rev-parse", "--verify", policy],
             capture_output=True,
             timeout=10,
         )
         if result.returncode != 0:
-            return False, f"SHA '{policy[:8]}...' does not exist in repo", ""
+            return False, f"SHA '{policy[:8]}...' is not a valid git object", ""
         return True, f"literal SHA {policy}", policy
 
 
