@@ -4307,6 +4307,120 @@ class TestUntrackedFileDetection:
         assert result["status"] == "HOLD_TOO_MANY_FILES_CHANGED", \
             f"Two distinct files must trigger HOLD, got: {result['status']}"
 
+    def test_untracked_file_no_newline_marker(self, tmp_path):
+        """Synthetic diff for untracked file without trailing newline must emit
+        literal backslash-space-No-newline pattern (not a raw string literal).
+
+        git apply requires: ...content\\n\\ No newline at end of file\\n
+        NOT: ...content\\ No newline at end of file\\n  (literal backslash)
+
+        The test mocks git_untracked_files to create the untracked file inside
+        the worktree (so the diff builder can read it), and returns its path.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        pmg_snapshot_path, _ = make_clean_pmg_snapshot(tmp_path / "pmg")
+        pmg_compare_json, pmg_compare_md = make_clean_pmg_compare(tmp_path / "pmg")
+
+        # Build a minimal packet (no mock_edits, so diff comes from untracked files only)
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": "test_newline_marker_xyz",
+            "task_id": "TASK-NEWSL-001",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 10,
+            },
+            "task": {
+                "description": "Test untracked file without newline",
+                "allowed_files": ["untracked_dir/"],
+                "forbidden_files": [],
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "out"),
+            },
+        }
+
+        output_json = tmp_path / "output.json"
+        output_md = tmp_path / "output.md"
+
+        captured_worktree_root = None
+
+        def fake_untracked(worktree_path):
+            nonlocal captured_worktree_root
+            captured_worktree_root = worktree_path
+            # Create an untracked file with no trailing newline inside the worktree
+            untracked_dir = worktree_path / "untracked_dir"
+            untracked_dir.mkdir(exist_ok=True)
+            no_newline_file = untracked_dir / "no_newline.txt"
+            # Write WITHOUT trailing newline
+            no_newline_file.write_text("line without newline", encoding="utf-8")
+            return ["untracked_dir/no_newline.txt"]
+
+        with mock.patch.object(rte, "git_status", return_value="clean"), \
+             mock.patch.object(rte, "git_status_clean", return_value=True), \
+             mock.patch("run_temp_worktree_execution.pmg_snapshot") as mock_snap, \
+             mock.patch("run_temp_worktree_execution.pmg_compare") as mock_cmp, \
+             mock.patch.object(rte, "git_untracked_files", side_effect=fake_untracked), \
+             mock.patch.object(rte, "git_diff", return_value=""), \
+             mock.patch.object(rte, "git_diff_name_only", return_value=[]):
+
+            def fake_snapshot(*a): return True, ""
+            def fake_compare(*a):
+                # pmg_compare writes output_json and output_md; copy the pre-made clean files
+                import shutil
+                shutil.copy(str(pmg_compare_json), a[1])
+                shutil.copy(str(pmg_compare_md), a[2])
+                return True, ""
+            mock_snap.side_effect = fake_snapshot
+            mock_cmp.side_effect = fake_compare
+
+            result = run(packet, str(output_json), str(output_md))
+
+        worktree_path = Path(result.get("worktree_path", ""))
+        if worktree_path.exists():
+            cleanup_worktree(worktree_path)
+
+        # The patch content is stored in diff_path (written to disk), not in result dict
+        # The patch content is stored in diff_path (written to disk), not in result dict
+        diff_path = result.get("diff_path", "")
+        if diff_path and Path(diff_path).exists():
+            diff_patch = Path(diff_path).read_text(encoding="utf-8")
+        else:
+            diff_patch = ""
+
+# The diff must contain the correct git-diff marker:
+        #   ...content<newline>\ No newline at end of file<newline>
+        # i.e. a real newline BEFORE the marker, a literal backslash char,
+        # a space, and a real newline AFTER the marker.
+        assert "\n\\ No newline at end of file\n" in diff_patch, \
+            f"diff_patch must contain the correct marker form '\\n\\ No newline at end of file\\n', got: {repr(diff_patch[:500])}"
+        # Must NOT contain the broken raw-string escape: \n (literal backslash-n)
+        # which would appear as two separate characters in the diff.
+        assert "\\n\\ No newline" not in diff_patch, \
+            f"diff_patch must not contain broken \\n escape before marker: {repr(diff_patch[:500])}"
+        # git apply --check is the authoritative validity test
+        import subprocess
+        test_patch_file = tmp_path / "test.patch"
+        test_patch_file.write_text(diff_patch, encoding="utf-8")
+        apply_check = subprocess.run(
+            ["git", "apply", "--check", str(test_patch_file)],
+            capture_output=True, text=True, timeout=10,
+        )
+        assert apply_check.returncode == 0, \
+            f"git apply --check failed on synthetic patch: {apply_check.stderr}"
+
     def test_no_shell_in_untracked_functions(self):
         """git_untracked_files and git_diff_name_only must use shell=False."""
         import run_temp_worktree_execution as rte

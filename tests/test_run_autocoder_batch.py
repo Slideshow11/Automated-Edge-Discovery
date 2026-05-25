@@ -163,7 +163,7 @@ def make_batch(
     output_root: str = None,
     tasks=None,
     max_tasks: int = None,
-    stop_on_first_hold: bool = True,
+    stop_on_first_hold=True,  # noqa: bool|str — intentionally broad to test rejection
     **overrides,
 ) -> dict:
     """Make a valid base batch packet with optional overrides."""
@@ -563,6 +563,147 @@ class TestTaskConstraintValidation:
         out_md = tmp_path / "out.md"
         result = run_batch(batch, out_json, out_md)
         assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+
+    def test_task_id_path_traversal_rejected(self, tmp_path):
+        """task_id with path separators or dotdot is rejected as HOLD_TASK_PACKET_INVALID."""
+        task1 = make_task(
+            task_id="../../../tmp/aed_escaped",
+            branch_name="apply/test-traversal",
+            output_root=str(tmp_path / "batch_root")
+        )
+        batch = make_batch(batch_id="test-batch-002", tasks=[task1])
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID", \
+            f"task_id with path separators must be rejected, got: {result['status']}"
+
+    def test_task_id_dotdot_rejected(self, tmp_path):
+        """task_id with '..' is rejected as HOLD_TASK_PACKET_INVALID."""
+        task1 = make_task(
+            task_id="../escape",
+            branch_name="apply/test-dotdot",
+            output_root=str(tmp_path / "batch_root")
+        )
+        batch = make_batch(batch_id="test-batch-003", tasks=[task1])
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID", \
+            f"task_id with '..' must be rejected, got: {result['status']}"
+
+    def test_task_id_absolute_path_rejected(self, tmp_path):
+        """task_id that is an absolute path is rejected as HOLD_TASK_PACKET_INVALID."""
+        task1 = make_task(
+            task_id="/tmp/escape",
+            branch_name="apply/test-absolute",
+            output_root=str(tmp_path / "batch_root")
+        )
+        batch = make_batch(batch_id="test-batch-004", tasks=[task1])
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID", \
+            f"absolute-path task_id must be rejected, got: {result['status']}"
+
+    def test_task_id_valid_still_works(self, tmp_path):
+        """Valid task_id (alphanumeric with dots/underscores/hyphens) still works."""
+        task1 = make_task(
+            task_id="task-valid-001.a_b",
+            branch_name="apply/test-valid",
+            output_root=str(tmp_path / "batch_root")
+        )
+        task2 = make_task(
+            task_id="Task-Valid-002",
+            branch_name="apply/test-valid-2",
+            output_root=str(tmp_path / "batch_root_2")
+        )
+        batch = make_batch(batch_id="test-batch-005", tasks=[task1, task2])
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+
+        def fake_run(argv):
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return CP()
+
+        result = run_batch_via_module(batch, out_json, out_md,
+                                      monkeypatch_runner=fake_run)
+        assert result["status"] != "HOLD_TASK_PACKET_INVALID", \
+            f"valid task_id should not be rejected, got: {result['status']}"
+
+
+# ---------------------------------------------------------------------------
+# stop_on_first_hold type coercion tests
+# ---------------------------------------------------------------------------
+
+class TestStopOnFirstHoldType:
+    def test_stop_on_first_hold_false_bool_works(self, tmp_path):
+        """stop_on_first_hold=false (boolean) does not stop on first HOLD."""
+        task1 = make_task(task_id="task-hold-001", branch_name="apply/test-hold-a")
+        task2 = make_task(task_id="task-hold-002", branch_name="apply/test-hold-b")
+        batch = make_batch(
+            batch_id="test-batch-stop-false",
+            tasks=[task1, task2],
+            stop_on_first_hold=False,
+        )
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+
+        def fake_run(argv):
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return CP()
+
+        result = run_batch_via_module(batch, out_json, out_md,
+                                      monkeypatch_runner=fake_run)
+        assert result.get("status") not in ("NO_OUTPUT", "ERROR"), \
+            f"stop_on_first_hold=false must not cause type error, got: {result.get('status')}"
+
+    def test_stop_on_first_hold_true_bool_works(self, tmp_path):
+        """stop_on_first_hold=true (boolean) works without type error."""
+        task1 = make_task(task_id="task-hold-b001", branch_name="apply/test-hold-c")
+        batch = make_batch(
+            batch_id="test-batch-stop-true",
+            tasks=[task1],
+            stop_on_first_hold=True,
+        )
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+
+        def fake_run(argv):
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return CP()
+
+        result = run_batch_via_module(batch, out_json, out_md,
+                                      monkeypatch_runner=fake_run)
+        assert result.get("status") not in ("NO_OUTPUT", "ERROR"), \
+            f"stop_on_first_hold=true must not cause type error, got: {result.get('status')}"
+
+    def test_stop_on_first_hold_string_false_rejected(self, tmp_path):
+        """stop_on_first_hold="false" (string) must be rejected, not treated as truthy."""
+        task1 = make_task(task_id="task-hold-c001", branch_name="apply/test-str-false")
+        batch = make_batch(
+            batch_id="test-batch-stop-str",
+            tasks=[task1],
+            stop_on_first_hold="false",  # STRING "false" — must be rejected
+        )
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        # stop_on_first_hold='false' string is rejected with an error status.
+        # The error message must mention "bool" (not silently treated as truthy).
+        assert result["status"] in ("HOLD_BATCH_PACKET_INVALID", "HOLD_UNKNOWN", "ERROR", "NO_OUTPUT"), \
+            f"stop_on_first_hold='false' string must be rejected, got: {result['status']}"
+        assert "bool" in result.get("error", "").lower(), \
+            f"error must mention 'bool' type requirement, got: {result.get('error')}"
 
 
 # ---------------------------------------------------------------------------

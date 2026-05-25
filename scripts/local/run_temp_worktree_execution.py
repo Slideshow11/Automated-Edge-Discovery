@@ -1762,12 +1762,20 @@ def run(
     untracked_files = git_untracked_files(worktree_root)
 
     # Validate untracked files BEFORE adding to changed_files
-    # Block untracked files outside allowed scope
+    # Block untracked files outside allowed scope.
+    # Use prefix matching (like Phase 9b check_outside_allowed) so that
+    # allowed_files=["dir/"] permits "dir/subdir/file.txt".
     task = packet.get("task", {})
     allowed_files = task.get("allowed_files", [])
     forbidden_files = task.get("forbidden_files", [])
-
-    outside_untracked = [f for f in untracked_files if f not in allowed_files]
+    outside_untracked = []
+    for f in untracked_files:
+        matched = any(
+            f == af or f.startswith(af)
+            for af in allowed_files
+        )
+        if not matched:
+            outside_untracked.append(f)
     if outside_untracked:
         result["status"] = "HOLD_OUTSIDE_ALLOWED_FILES"
         result["validation_errors"] = [f"untracked file outside allowed_files: {f}" for f in outside_untracked]
@@ -1818,7 +1826,7 @@ def run(
                 f"+++ b/{untracked_file}\n"
                 f"@@ -0,0 +1,{line_count} @@\n"
                 + "".join(f"+{line}" for line in content.splitlines(keepends=True))
-                + ("" if content.endswith("\n") else r"\ No newline at end of file\n")
++ ("\n\\ No newline at end of file\n" if not content.endswith("\n") else "")
             )
 
     combined_diff = "\n\n".join(diff_parts)

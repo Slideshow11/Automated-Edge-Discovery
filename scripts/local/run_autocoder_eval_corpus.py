@@ -575,6 +575,24 @@ def main(
     # Step 7: Invoke batch controller
     print(f"INFO: invoking batch controller: python3 {BATCH_SCRIPT}")
     batch_ok, combined, rc = invoke_batch_controller(batch_packet, out_root)
+    if rc != 0:
+        print(f"FATAL: batch subprocess exited nonzero (rc={rc}), cannot read stale batch_status.json as success", file=sys.stderr)
+        if combined:
+            print(f"Batch stderr/stdout:\n{combined[:2000]}", file=sys.stderr)
+        # Write a failure eval_report so CI can inspect the failure without reading stale data
+        status_ok, stale_batch_status, _ = read_batch_status(out_root)
+        fake_batch_status = stale_batch_status if status_ok else {"status": "UNKNOWN", "tasks": []}
+        eval_report = build_eval_report(corpus, base_sha, fake_batch_status, out_root, run_id)
+        eval_report["eval_pass"] = False
+        eval_report["batch_subprocess_rc"] = rc
+        eval_report["failure_summary"] = (
+            f"batch subprocess exited rc={rc}; "
+            f"stale batch_status.json was NOT treated as success"
+        )
+        write_eval_report(eval_report, out_root, Path(report_json), Path(report_md))
+        write_eval_run_metadata(out_root, corpus, base_sha, False, run_id)
+        print(f"❌ eval_pass=False — batch_subprocess_rc={rc}", file=sys.stderr)
+        return 1
     print(f"INFO: batch controller exited zero (status={batch_ok}), reading batch_status.json")
 
     # Step 8: Read batch status
