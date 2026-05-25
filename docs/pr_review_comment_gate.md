@@ -85,13 +85,33 @@ Every finding is assigned a deterministic, stable ID:
 codex-<12-char-sha256>
 ```
 
-The ID is derived from: `source_kind | user | path | line | severity | normalized_body_prefix[:200]`
+The ID is derived from: `user | path | line | severity | normalized_body_prefix[:200]`
+
+**`source_kind` is intentionally excluded** so the same finding from different endpoints
+(e.g. `inline_review_comment` + `per_review_comment`) produces the same ID and is correctly
+deduplicated into one merged record with a `sources` list.
 
 Same finding harvested twice → same ID. IDs enable stable waiver matching.
 
----
+## 7. Live Head SHA Verification (P1-B)
 
-## 7. Waiver Rules
+Before applying any waivers, the script fetches the PR's live `headRefOid` via `gh pr view`
+and compares it to `--reported-head-sha`. If they differ:
+- Status becomes `REVIEW_COMMENTS_INCONCLUSIVE` (exit 2)
+- No waivers are applied
+- `live_head_sha` and `head_sha_mismatch` are included in the output JSON
+- This prevents stale waiver replay against an outdated SHA
+
+## 8. API Failure Handling (P1-A)
+
+If **any** endpoint fails (rate limit, network error, invalid JSON, gh non-zero exit):
+- Status becomes `REVIEW_COMMENTS_INCONCLUSIVE` (exit 2)
+- The script **never** returns `REVIEW_COMMENTS_CLEAN` with partial/incomplete data
+- API errors are surfaced in `api_errors` in the output JSON
+
+This fail-closed behavior ensures partial harvests cannot mask unresolved blockers.
+
+## 9. Waiver Rules
 
 ### Format
 
@@ -122,7 +142,7 @@ Same finding harvested twice → same ID. IDs enable stable waiver matching.
 
 ---
 
-## 8. Required Workflow
+## 10. Required Workflow
 
 For every AED PR, **after every push** and **before running `final_gate_status.py`**:
 
@@ -142,7 +162,7 @@ python3 scripts/local/final_gate_status.py ...
 
 ---
 
-## 9. Updated Final Gate Checklist
+## 11. Updated Final Gate Checklist
 
 The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_gap.md`):
 
@@ -155,7 +175,7 @@ The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_
 
 ---
 
-## 10. Safety Properties
+## 12. Safety Properties
 
 - **No `shell=True`** — all `gh` invocations use list-argv `subprocess.run`
 - **No live Claude** — script only calls `gh` CLI and Python stdlib
@@ -167,7 +187,7 @@ The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_
 
 ---
 
-## 11. Future Improvements (Out of Scope for v0)
+## 13. Future Improvements (Out of Scope for v0)
 
 - P0/P1 waiver support with explicit human authorization
 - Automatic "fixed in later commit" detection via git history

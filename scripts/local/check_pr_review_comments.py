@@ -284,6 +284,8 @@ def render_md(
     status: str,
     pr_number: int,
     reported_sha: str,
+    live_sha: str,
+    sha_mismatch: bool,
     sources: list[str],
     findings: list[dict[str, Any]],
     blockers: list[dict[str, Any]],
@@ -293,22 +295,27 @@ def render_md(
     lines = [
         f"# PR Review Comment Gate — PR #{pr_number}\n",
         f"**Reported head SHA:** `{reported_sha}`  ",
+        f"**Live head SHA:** `{live_sha}`  ",
         f"**Status:** `{status}`  ",
         f"**Harvested at:** {datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}\n",
-        f"## Summary\n",
-        f"| Severity | Count |",
-        f"|---|---|",
     ]
+    if sha_mismatch:
+        lines.append("**⚠️  Live SHA mismatch — waivers blocked, status is INCONCLUSIVE.**\n")
+    lines.extend([
+        f"## Summary\n",
+        f"| Severity | Count |\n",
+        f"|---|---|\n",
+    ])
     for sev in ("P0", "P1", "P2", "P3", "UNSPECIFIED_BLOCKING", "UNSPECIFIED_INFO"):
         count = counts.get(sev, 0)
-        lines.append(f"| {sev} | {count} |")
+        lines.append(f"| {sev} | {count} |\n")
     lines.extend([
         f"\n**Blocked:** {counts.get('blocked', 0)}  ",
         f"**Waived:** {counts.get('waived', 0)}\n",
         f"## Sources Fetched\n",
     ])
     for src in sources:
-        lines.append(f"- {src}")
+        lines.append(f"- {src}\n")
     lines.append(f"\n## Findings\n")
     if not findings:
         lines.append("_No Codex/automated-review findings detected._\n")
@@ -354,7 +361,7 @@ def render_md(
         lines.append(
             "⚠️  Could not determine status. Review API errors and retry.\n"
         )
-    return "\n".join(lines)
+    return "".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +457,25 @@ def main() -> int:
 
     all_findings = dedup_findings(all_findings)
 
-    # Load waivers if provided
+    # P1-B: Verify live head SHA against --reported-head-sha before applying waivers.
+    # P1-B: Waivers are SHA-specific; applying a stale waiver to a new head is unsafe.
+    # P1-B: Fetch live PR metadata and compare. Mismatch => inconclusive, skip waivers.
+    live_head_sha = ""
+    head_sha_mismatch = False
+    ok_live, live_data, err_live = gh_pr_view(args.repo, args.pr_number)
+    if not ok_live:
+        api_errors.append(f"live_pr_fetch: {err_live}")
+        head_sha_mismatch = True
+    else:
+        live_head_sha = live_data.get("headRefOid", "")
+        if live_head_sha and live_head_sha != args.reported_head_sha:
+            api_errors.append(
+                f"live_head_mismatch: reported={args.reported_head_sha[:8]} "
+                f"live={live_head_sha[:8]} — waivers blocked until SHA is corrected"
+            )
+            head_sha_mismatch = True
+
+    # Load waivers if provided (only if head SHA verified)
     waivers_applied: list[dict[str, Any]] = []
     waiver_map: dict[str, dict[str, Any]] = {}
     if args.allow_p2_waivers:
@@ -499,7 +524,7 @@ def main() -> int:
                 blockers.append(f)
         # P3 and UNSPECIFIED_INFO are informational only
 
-    # Counts
+    # Count severity buckets
     counts: dict[str, int] = {k: 0 for k in (
         "P0", "P1", "P2", "P3", "UNSPECIFIED_BLOCKING", "UNSPECIFIED_INFO",
         "blocked", "waived",
@@ -510,8 +535,10 @@ def main() -> int:
     counts["blocked"] = len(blockers)
     counts["waived"] = len(waivers_applied)
 
-    # Determine status
-    if api_errors and not all_findings:
+    # P1-A: fail-closed on API errors — never silently declare clean with partial data.
+    # P1-A: if ANY endpoint failed, the harvest is incomplete; status must not be CLEAN.
+    #       If blockers were also found, BLOCKED is acceptable but api_errors must be surfaced.
+    if api_errors:
         status = "REVIEW_COMMENTS_INCONCLUSIVE"
     elif blockers:
         status = "REVIEW_COMMENTS_BLOCKED"
@@ -525,6 +552,8 @@ def main() -> int:
         "status": status,
         "pr_number": args.pr_number,
         "reported_head_sha": args.reported_head_sha,
+        "live_head_sha": live_head_sha,
+        "head_sha_mismatch": head_sha_mismatch,
         "harvested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "sources_fetched": sources_fetched,
         "api_errors": api_errors,
@@ -537,6 +566,7 @@ def main() -> int:
     Path(args.output_json).write_text(json.dumps(output, indent=2))
     md = render_md(
         status, args.pr_number, args.reported_head_sha,
+        live_head_sha, head_sha_mismatch,
         sources_fetched, all_findings, blockers, waivers_applied, counts,
     )
     Path(args.output_md).write_text(md)

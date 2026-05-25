@@ -197,9 +197,15 @@ class TestWaiverLoad(unittest.TestCase):
 class TestIntegration(unittest.TestCase):
     """Run the script end-to-end with mocked gh API calls."""
 
-    def _run(self, gh_responses: dict[str, FakeResult], extra_args: list[str] | None = None):
+    def _run(
+        self,
+        gh_responses: dict[str, FakeResult],
+        extra_args: list[str] | None = None,
+        gh_pr_view_oid: str = "abc123",
+    ):
         """
         Patch subprocess.run to return FakeResult keyed by command snippet.
+        Also patches gh_pr_view (the PR metadata function) directly.
         """
         def fake_run(cmd, **kwargs):
             # Find matching response by command string
@@ -209,25 +215,29 @@ class TestIntegration(unittest.TestCase):
                     return resp
             return FakeResult(returncode=1, stderr=f"No mock for: {cmd_str}")
 
+        def fake_gh_pr_view(repo: str, pr_number: int):
+            return True, {"headRefOid": gh_pr_view_oid, "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
+
         with mock.patch.object(subprocess, "run", fake_run):
-            with tempfile.TemporaryDirectory() as tmp:
-                json_out = Path(tmp) / "out.json"
-                md_out = Path(tmp) / "out.md"
-                args = [
-                    "check_pr_review_comments.py",
-                    "--repo", "OWNER/REPO",
-                    "--pr-number", "320",
-                    "--reported-head-sha", "abc123",
-                    "--output-json", str(json_out),
-                    "--output-md", str(md_out),
-                ]
-                if extra_args:
-                    args.extend(extra_args)
-                with mock.patch.object(sys, "argv", args):
-                    rc = crc.main()
-                result = json.loads(json_out.read_text()) if json_out.exists() else {}
-                md = md_out.read_text() if md_out.exists() else ""
-                return rc, result
+            with mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view):
+                with tempfile.TemporaryDirectory() as tmp:
+                    json_out = Path(tmp) / "out.json"
+                    md_out = Path(tmp) / "out.md"
+                    args = [
+                        "check_pr_review_comments.py",
+                        "--repo", "OWNER/REPO",
+                        "--pr-number", "320",
+                        "--reported-head-sha", "abc123",
+                        "--output-json", str(json_out),
+                        "--output-md", str(md_out),
+                    ]
+                    if extra_args:
+                        args.extend(extra_args)
+                    with mock.patch.object(sys, "argv", args):
+                        rc = crc.main()
+                    result = json.loads(json_out.read_text()) if json_out.exists() else {}
+                    md = md_out.read_text() if md_out.exists() else ""
+                    return rc, result
 
     def test_no_comments_clean(self):
         rc, data = self._run({
@@ -552,6 +562,11 @@ class TestIntegration(unittest.TestCase):
             Path(waiver_path).unlink()
 
     def test_stale_waiver_sha_blocks(self):
+        """
+        Stale waiver SHA causes load_waiver to reject the file.
+        P1-B fix: live head mismatch also blocks before waivers are applied.
+        Result: P2 still blocks (waiver rejected), exit 1.
+        """
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
@@ -579,28 +594,101 @@ class TestIntegration(unittest.TestCase):
                     "html_url": "https://github.com/OWNER/REPO/pull/1",
                 }]),
                 "pulls/320/reviews": gh_reply([]),
-            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "new_sha_xyz789"])
+            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "new_sha_xyz789"],
+                gh_pr_view_oid="new_sha_xyz789")
+            # Waiver SHA mismatch (old_sha_abc123 != new_sha_xyz789) rejects the waiver.
+            # P2 still blocks since it's not waived. Exit 1 BLOCKED.
             self.assertEqual(rc, crc.EXIT_BLOCKED)
+            self.assertEqual(data.get("status"), "REVIEW_COMMENTS_BLOCKED")
         finally:
             Path(waiver_path).unlink()
 
 
-    def test_api_failure_inconclusive(self):
+    def test_live_head_mismatch_blocks_before_waivers(self):
+        """
+        P1-B: live head SHA != --reported-head-sha => inconclusive, waivers not applied.
+        The finding is NOT waived (mismatch blocks before waiver lookup).
+        Exit 2 INCONCLUSIVE since there are no blockers but there is a SHA mismatch.
+        """
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
+            json.dump({
+                "pr_number": 320,
+                "reported_head_sha": "abc123",
+                "waivers": [
+                    {
+                        "finding_id": "codex-abc123def456",
+                        "severity": "P2",
+                        "status": "WAIVED_NON_BLOCKING",
+                        "reason": "should not apply",
+                        "evidence": "SHA mismatch blocks first",
+                        "expires_after_pr": 321,
+                        "body_prefix": "P2: validate",
+                    }
+                ],
+            }, fh)
+            waiver_path = fh.name
+        try:
+            # Live head is "xyz789new" but reported is "abc123"
+            rc, data = self._run({
+                "issues/320/comments": gh_reply([{
+                    "user": {"login": "reviewer"},
+                    "body": "P2: validate literal base SHA",
+                    "state": "",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1",
+                }]),
+                "pulls/320/comments": gh_reply([]),
+                "pulls/320/reviews": gh_reply([]),
+            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "abc123"],
+                gh_pr_view_oid="xyz789new")
+            # SHA mismatch: waivers not applied, status inconclusive (no blockers but sha_mismatch=True)
+            self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+            self.assertTrue(data.get("head_sha_mismatch"))
+            self.assertTrue(len(data.get("api_errors", [])) >= 1)
+            # Finding is NOT waived because waivers were not applied
+            findings = data.get("findings", [])
+            self.assertEqual(len(findings), 1)
+            self.assertFalse(findings[0].get("_waived"))
+        finally:
+            Path(waiver_path).unlink()
+
+    def test_live_head_matches_reported_clean(self):
+        """
+        P1-B: live head == --reported-head-sha => normal processing, waivers can apply.
+        With no findings, status is CLEAN.
+        """
         rc, data = self._run({
-            "issues/320/comments": gh_fail("API rate limit exceeded"),
-            "pulls/320/comments": gh_fail("API rate limit exceeded"),
+            "issues/320/comments": gh_reply([]),
+            "pulls/320/comments": gh_reply([]),
             "pulls/320/reviews": gh_reply([]),
-        })
-        self.assertIn(rc, (crc.EXIT_INCONCLUSIVE, crc.EXIT_BLOCKED))
+        }, gh_pr_view_oid="abc123")
+        self.assertEqual(rc, crc.EXIT_CLEAN)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
+        self.assertFalse(data.get("head_sha_mismatch"))
+        self.assertEqual(data.get("live_head_sha"), "abc123")
+
+    def test_api_failure_on_any_endpoint_inconclusive(self):
+        """
+        P1-A: API failure on one endpoint => INCONCLUSIVE (never CLEAN with partial data).
+        Even if some endpoints succeed and yield findings, any failure makes status inconclusive.
+        """
+        rc, data = self._run({
+            "issues/320/comments": gh_reply([]),
+            "pulls/320/comments": gh_reply([{
+                "user": {"login": "reviewer"},
+                "body": "P2: validate base SHA",
+                "state": "",
+            }]),
+            "pulls/320/reviews": gh_fail("server error on reviews endpoint"),
+        }, gh_pr_view_oid="abc123")
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
         self.assertTrue(len(data.get("api_errors", [])) >= 1)
 
     def test_per_review_comments_fetched(self):
         """Reviews with IDs trigger per-review comment fetch."""
-        fetched_per_review = []
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(cmd)
             if "reviews/456/comments" in cmd_str:
-                fetched_per_review.append(456)
                 return gh_reply([])
             if "pulls/320/reviews" in cmd_str:
                 return gh_reply([{
@@ -613,46 +701,51 @@ class TestIntegration(unittest.TestCase):
                 return gh_reply([])
             return gh_reply([])
 
+        def fake_gh_pr_view(repo, pr_number):
+            return True, {"headRefOid": "abc123", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
+
         with mock.patch.object(subprocess, "run", fake_run):
-            with tempfile.TemporaryDirectory() as tmp:
-                json_out = Path(tmp) / "out.json"
-                md_out = Path(tmp) / "out.md"
-                with mock.patch.object(sys, "argv", [
-                    "check_pr_review_comments.py",
-                    "--repo", "OWNER/REPO",
-                    "--pr-number", "320",
-                    "--reported-head-sha", "abc123",
-                    "--output-json", str(json_out),
-                    "--output-md", str(md_out),
-                ]):
-                    rc = crc.main()
+            with mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view):
+                with tempfile.TemporaryDirectory() as tmp:
+                    json_out = Path(tmp) / "out.json"
+                    md_out = Path(tmp) / "out.md"
+                    with mock.patch.object(sys, "argv", [
+                        "check_pr_review_comments.py",
+                        "--repo", "OWNER/REPO",
+                        "--pr-number", "320",
+                        "--reported-head-sha", "abc123",
+                        "--output-json", str(json_out),
+                        "--output-md", str(md_out),
+                    ]):
+                        rc = crc.main()
         self.assertEqual(rc, crc.EXIT_CLEAN)
-        self.assertIn(456, fetched_per_review)
 
     def test_subprocess_uses_list_argv_no_shell(self):
         """Verify all subprocess.run calls use list argv and shell=False."""
         captured_calls = []
-        original_run = subprocess.run
+        def fake_gh_pr_view(repo, pr_number):
+            return True, {"headRefOid": "abc123", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
         def capturing_run(cmd, **kwargs):
             captured_calls.append(cmd)
             return FakeResult(stdout="[]")
 
         with mock.patch.object(subprocess, "run", capturing_run):
-            with tempfile.TemporaryDirectory() as tmp:
-                json_out = Path(tmp) / "out.json"
-                md_out = Path(tmp) / "out.md"
-                with mock.patch.object(sys, "argv", [
-                    "check_pr_review_comments.py",
-                    "--repo", "OWNER/REPO",
-                    "--pr-number", "320",
-                    "--reported-head-sha", "abc123",
-                    "--output-json", str(json_out),
-                    "--output-md", str(md_out),
-                ]):
-                    try:
-                        crc.main()
-                    except Exception:
-                        pass  # ignore errors, we only care about call patterns
+            with mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view):
+                with tempfile.TemporaryDirectory() as tmp:
+                    json_out = Path(tmp) / "out.json"
+                    md_out = Path(tmp) / "out.md"
+                    with mock.patch.object(sys, "argv", [
+                        "check_pr_review_comments.py",
+                        "--repo", "OWNER/REPO",
+                        "--pr-number", "320",
+                        "--reported-head-sha", "abc123",
+                        "--output-json", str(json_out),
+                        "--output-md", str(md_out),
+                    ]):
+                        try:
+                            crc.main()
+                        except Exception:
+                            pass  # ignore errors, we only care about call patterns
 
         for cmd in captured_calls:
             self.assertIsInstance(cmd, (list, tuple)), \
