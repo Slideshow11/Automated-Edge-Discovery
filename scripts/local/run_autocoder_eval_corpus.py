@@ -482,8 +482,13 @@ def main(
     report_json: str,
     report_md: str,
     run_id: str | None = None,
+    repo_root_override: Path | None = None,
+    base_sha_override: str | None = None,
 ) -> int:
     """Returns 0 on eval_pass, 1 on eval_fail or fatal error."""
+
+    # Use override if provided, otherwise fall back to script-inferred REPO_ROOT
+    repo = repo_root_override if repo_root_override is not None else REPO_ROOT
 
     corpus_path = Path(corpus_json)
     if not corpus_path.exists():
@@ -508,19 +513,23 @@ def main(
         print(f"FATAL: task validation failed: {err}", file=sys.stderr)
         return 1
 
-    # Step 3: Resolve base_sha
-    policy = corpus.get("base_sha_policy", "current_main")
-    ok, msg, base_sha = resolve_base_sha(policy, REPO_ROOT)
-    if not ok:
-        print(f"FATAL: base_sha_policy resolution failed: {msg}", file=sys.stderr)
-        return 1
-    print(f"INFO: base_sha_policy='{policy}' resolved to base_sha='{base_sha}'")
+    # Step 3: Resolve base_sha — use override if provided
+    if base_sha_override:
+        base_sha = base_sha_override
+        print(f"INFO: using --base-sha override: base_sha='{base_sha}'")
+    else:
+        policy = corpus.get("base_sha_policy", "current_main")
+        ok, msg, base_sha = resolve_base_sha(policy, repo)
+        if not ok:
+            print(f"FATAL: base_sha_policy resolution failed: {msg}", file=sys.stderr)
+            return 1
+        print(f"INFO: base_sha_policy='{policy}' resolved to base_sha='{base_sha}'")
 
     # Step 4: Validate target files and branch names
     # Note: We skip corpus branch collision checking here because the batch packet
     # uses run-scoped branch names. Generated branch collisions are checked after
     # build_batch_packet generates them.
-    targets_valid, target_errors = validate_corpus_targets(corpus, base_sha, REPO_ROOT, skip_branch_check=True)
+    targets_valid, target_errors = validate_corpus_targets(corpus, base_sha, repo, skip_branch_check=True)
     if not targets_valid:
         for te in target_errors:
             print(f"FATAL: corpus target validation: {te}", file=sys.stderr)
@@ -588,12 +597,29 @@ if __name__ == "__main__":
     parser.add_argument("--report-json", required=True, help="Path to write eval_report.json")
     parser.add_argument("--report-md", required=True, help="Path to write eval_report.md")
     parser.add_argument("--run-id", default=None, help="Optional run ID for generated branch names. If omitted, a timestamp-based ID is generated.")
+    parser.add_argument("--repo-root", default=None, help="Path to the repository root. If omitted, inferred from script location.")
+    parser.add_argument("--base-sha", default=None, help="Override base_sha directly. If omitted, base_sha_policy in the corpus JSON determines it (default: current main branch).")
 
     args = parser.parse_args()
+
+    # Determine effective repo root
+    if args.repo_root:
+        repo_root = Path(args.repo_root).resolve()
+    else:
+        repo_root = REPO_ROOT.resolve()
+
+    # If --base-sha is provided, use it directly; otherwise resolve via policy
+    if args.base_sha:
+        base_sha_override = args.base_sha
+    else:
+        base_sha_override = None
+
     sys.exit(main(
         corpus_json=args.corpus_json,
         output_root=args.output_root,
         report_json=args.report_json,
         report_md=args.report_md,
         run_id=args.run_id,
+        repo_root_override=repo_root,
+        base_sha_override=base_sha_override,
     ))
