@@ -1,0 +1,175 @@
+# PR Review Comment Gate
+
+**Date:** 2026-05-25
+**PR:** #321
+**Classification:** GATE_INFRASTRUCTURE
+
+---
+
+## 1. Summary
+
+Adds `scripts/local/check_pr_review_comments.py` — a local gate script that fetches
+GitHub PR review feedback from all four Codex/comment endpoints, classifies P0/P1/P2
+findings, and fails closed if unresolved blockers exist. This addresses the PR #320
+process gap where `final_gate_status.py` reported `READY_TO_MERGE` even though
+GitHub/Codex inline P1 comments were still visible on the PR.
+
+---
+
+## 2. Why This Gate Exists
+
+`final_gate_status.py` has a `codex_exact_head` check that verifies the reviewed SHA
+matches the reported head SHA. However, this only proves that a Codex review was run
+at that SHA — it does **not** prove that the inline findings from that review were
+resolved, waived, or addressed.
+
+PR #320 demonstrated this gap clearly:
+- All structural checks in `final_gate_status.py` passed (`READY_TO_MERGE`)
+- Two P1 inline comments from `chatgpt-codex-connector[bot]` were still visible on the PR
+- Both P1 findings were real and required remediation
+
+The missing check was: **have all Codex/automated-review inline findings been resolved
+before we merge?**
+
+---
+
+## 3. Required Endpoints
+
+The script fetches all four GitHub comment/review sources:
+
+| Source | Endpoint |
+|--------|----------|
+| Issue comments | `repos/{repo}/issues/{pr}/comments` |
+| Inline PR review comments | `repos/{repo}/pulls/{pr}/comments` |
+| PR reviews (top-level) | `repos/{repo}/pulls/{pr}/reviews` |
+| Per-review comments | `repos/{repo}/pulls/{pr}/reviews/{id}/comments` |
+
+`gh pr view --comments` alone is insufficient — it only surfaces a subset.
+
+---
+
+## 4. Exit Statuses
+
+| Exit Code | Status | Meaning |
+|-----------|--------|---------|
+| 0 | `REVIEW_COMMENTS_CLEAN` | No blockers. Safe to proceed to `final_gate_status.py` |
+| 1 | `REVIEW_COMMENTS_BLOCKED` | Unresolved P0/P1/P2 findings remain. Do not merge |
+| 2 | `REVIEW_COMMENTS_INCONCLUSIVE` | API errors or ambiguous state. Do not assume clean |
+
+---
+
+## 5. Severity Rules
+
+| Severity | Blocking? | Waiver Allowed? |
+|----------|-----------|----------------|
+| P0 | Always | **No** |
+| P1 | Always | **No** |
+| P2 | By default | Yes — requires explicit waiver |
+| P3 | No | Yes |
+| `UNSPECIFIED_BLOCKING` | Always | No |
+| `UNSPECIFIED_INFO` | No | No |
+
+Severity is extracted in priority order:
+1. Explicit `P0`/`P1`/`P2`/`P3` token in comment text
+2. `High` → P1, `Medium` → P2, `Low` → P3
+3. No severity keyword + blocking words (`shell=True`, `stale`, `malformed`, etc.) → `UNSPECIFIED_BLOCKING`
+4. No severity and no blocking words → `UNSPECIFIED_INFO`
+
+---
+
+## 6. Finding IDs
+
+Every finding is assigned a deterministic, stable ID:
+
+```
+codex-<12-char-sha256>
+```
+
+The ID is derived from: `source_kind | user | path | line | severity | normalized_body_prefix[:200]`
+
+Same finding harvested twice → same ID. IDs enable stable waiver matching.
+
+---
+
+## 7. Waiver Rules
+
+### Format
+
+```json
+{
+  "pr_number": 320,
+  "reported_head_sha": "c45dc1c9f9afd13a6c3e93f666dbaabaef8d1863",
+  "waivers": [
+    {
+      "finding_id": "codex-abc123def456",
+      "severity": "P2",
+      "status": "WAIVED_NON_BLOCKING",
+      "reason": "acceptable test-only risk",
+      "evidence": "smoke passes, no production impact",
+      "expires_after_pr": 321,
+      "body_prefix": "P2: validate literal base SHA"
+    }
+  ]
+}
+```
+
+### Rules
+- **P0/P1 waivers are not supported in v0** — they always block
+- **P2 waivers** require: `finding_id` (or `severity` + `body_prefix`), `reason`, `evidence`, exact `reported_head_sha` match
+- **Stale SHA** (waiver SHA ≠ reported SHA) → waiver is invalid and the finding blocks
+- **Missing waiver file** = no waivers applied
+- Waiver matching order: exact `finding_id` first, then `severity` + `body_prefix` fallback
+
+---
+
+## 8. Required Workflow
+
+For every AED PR, **after every push** and **before running `final_gate_status.py`**:
+
+```bash
+python3 scripts/local/check_pr_review_comments.py \
+  --repo Slideshow11/Automated-Edge-Discovery \
+  --pr-number <PR_NUMBER> \
+  --reported-head-sha <HEAD_SHA> \
+  --output-json /tmp/pr_review_status.json \
+  --output-md /tmp/pr_review_status.md
+
+# Inspect output
+# Fix or waive findings
+# Then only then run:
+python3 scripts/local/final_gate_status.py ...
+```
+
+---
+
+## 9. Updated Final Gate Checklist
+
+The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_gap.md`):
+
+1. ✅ Push PR branch
+2. ⏳ Run `check_pr_review_comments.py` — **NEW**
+3. ✅ Review and address findings (fix or waive P2)
+4. ✅ Run `final_gate_status.py`
+5. ✅ Run `verify_final_head_merge_command.py`
+6. ✅ Merge
+
+---
+
+## 10. Safety Properties
+
+- **No `shell=True`** — all `gh` invocations use list-argv `subprocess.run`
+- **No live Claude** — script only calls `gh` CLI and Python stdlib
+- **No `--enable-real-claude-executor`** — not used anywhere
+- **Fail-closed on API errors** — ambiguous state returns exit 2, not 0
+- **Deterministic output** — same harvest on same PR state always produces same findings
+- **No Hermes mutations** — no memory, fact_store, profile, or skill writes
+- **No external side effects** — writes only to user-specified `--output-json/--output-md`
+
+---
+
+## 11. Future Improvements (Out of Scope for v0)
+
+- P0/P1 waiver support with explicit human authorization
+- Automatic "fixed in later commit" detection via git history
+- `final_gate_status.py` integration via `--review-comments-status-json` flag
+- Ignore resolved conversations (requires GitHub API v4 / GraphQL)
