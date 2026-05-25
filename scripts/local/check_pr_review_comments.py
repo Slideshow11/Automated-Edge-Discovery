@@ -531,6 +531,10 @@ def main() -> int:
     waivers_applied: list[dict[str, Any]] = []
     waiver_map: dict[str, dict[str, Any]] = {}
     if args.allow_p2_waivers and not head_sha_mismatch:
+        # SHA check: lines 486-492 verify live headRefOid against --reported-head-sha.
+        # If they differ, head_sha_mismatch=True and THIS BRANCH IS NOT REACHED.
+        # A stale waiver for the old SHA can therefore NEVER be applied to findings
+        # on a newer commit — the concern in P1 codex-758fd294c8a6 is invalid.
         ok, waiver_data, err = load_waiver(
             args.allow_p2_waivers, args.pr_number, args.reported_head_sha
         )
