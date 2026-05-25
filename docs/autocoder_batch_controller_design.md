@@ -242,7 +242,7 @@ The single-task controller intentionally leaves its apply branch with dirty unco
 - Worktrees are never auto-deleted by the batch controller
 
 **Trusted-script model and `--repo-root`:**
-`run_autocoder_single_task.py` runs the **reviewed parent checkout's** script (`SINGLE_TASK_SCRIPT`), not a script copied into the task worktree. The batch controller passes `--repo-root <task_worktree_path>` so stages 3–7 operate on the correct worktree files. `effective_repo_root` (module-level, set after argparse validation) flows to all stage tool subprocess calls. Stage 2 (`run_temp_worktree_execution.py`) operates on the **parent repo** for pre-flight checks and worktree creation — acceptable for mocked v0 only; before live Claude, stage 2 must be re-reviewed or receive `--repo-root` explicitly. The self-locating `SCRIPT_DIR.parent.parent` derivation is the **fallback** when `--repo-root` is omitted (standalone mode).
+`run_autocoder_single_task.py` runs the **reviewed parent checkout's** script (`SINGLE_TASK_SCRIPT`), not a script copied into the task worktree. The batch controller passes `--repo-root <task_worktree_path>` to the single-task controller, which propagates it to stage 2 (`run_temp_worktree_execution.py`). All Phase 3 checks (git_status_clean, git_rev_parse HEAD vs base_sha, path safety, worktree create/remove) operate on `effective_repo_root`. The parent AED checkout can remain on a feature branch; no global `git checkout main` is required or performed. `SCRIPT_DIR.parent.parent` derivation is the **fallback** when `--repo-root` is omitted (standalone mode).
 
 **What is preserved per task:**
 - The task worktree itself (detached HEAD at `batch_start_head`)
