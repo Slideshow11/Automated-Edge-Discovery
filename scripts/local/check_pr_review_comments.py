@@ -524,10 +524,13 @@ def main() -> int:
         else:
             stale_findings.append(f)
 
-    # Load waivers if provided (only if head SHA verified)
+    # Load waivers if provided (only if head SHA verified).
+    # P1-B: if live head != reported head, do not load waivers — a stale waiver
+    # for the old SHA must not be applied to findings on the newer commit.
+    # The mismatch is also recorded as an api_error so status => INCONCLUSIVE.
     waivers_applied: list[dict[str, Any]] = []
     waiver_map: dict[str, dict[str, Any]] = {}
-    if args.allow_p2_waivers:
+    if args.allow_p2_waivers and not head_sha_mismatch:
         ok, waiver_data, err = load_waiver(
             args.allow_p2_waivers, args.pr_number, args.reported_head_sha
         )
