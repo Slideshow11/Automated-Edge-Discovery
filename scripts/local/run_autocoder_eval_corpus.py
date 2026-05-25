@@ -91,18 +91,19 @@ def resolve_base_sha(policy: str, repo: Path) -> tuple[bool, str, str]:
     Returns (ok, message, sha)
     """
     if policy == "current_main":
-        result = subprocess.run(
-            ["git", "-C", str(repo), "rev-parse", "main"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if result.returncode != 0:
-            return False, f"git rev-parse main failed: {result.stderr.strip()}", ""
-        sha = result.stdout.strip()
-        if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha):
-            return False, f"git rev-parse main returned invalid SHA: {sha}", ""
-        return True, f"resolved to {sha}", sha
+        # Try origin/main first (CI may not have main checked out as local branch)
+        for ref in ["origin/main", "main"]:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", ref],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0:
+                sha = result.stdout.strip()
+                if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+                    return True, f"resolved to {sha}", sha
+        return False, f"git rev-parse main failed (tried main, origin/main)", ""
     else:
         # Treat as a literal SHA
         if len(policy) != 40 or not all(c in "0123456789abcdef" for c in policy):
