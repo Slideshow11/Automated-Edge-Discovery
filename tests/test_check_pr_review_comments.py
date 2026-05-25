@@ -52,7 +52,7 @@ class TestClassify(unittest.TestCase):
             "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange) Emit a real newline marker**",
             "path": "scripts/local/run_temp_worktree_execution.py",
             "line": 1821,
-            "commit_id": "aabbccdd",
+            "commit_id": "abc123abc123",
             "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
         }
         got = crc.classify_item(item, "issue_comment", set())
@@ -143,7 +143,7 @@ class TestWaiverLoad(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": "p2-001",
@@ -157,7 +157,7 @@ class TestWaiverLoad(unittest.TestCase):
             }, fh)
             path = fh.name
         try:
-            ok, data, err = crc.load_waiver(path, 320, "abc123")
+            ok, data, err = crc.load_waiver(path, 320, "abc123abc123abc123abc123abc123abc123abcd12")
             self.assertTrue(ok)
             self.assertEqual(len(data["waivers"]), 1)
         finally:
@@ -182,7 +182,7 @@ class TestWaiverLoad(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 319,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [],
             }, fh)
             path = fh.name
@@ -201,7 +201,7 @@ class TestIntegration(unittest.TestCase):
         self,
         gh_responses: dict[str, FakeResult],
         extra_args: list[str] | None = None,
-        gh_pr_view_oid: str = "abc123",
+        gh_pr_view_oid: str = "abc123abc123abc123abc123abc123abc123abcd12",
     ):
         """
         Patch subprocess.run to return FakeResult keyed by command snippet.
@@ -227,7 +227,7 @@ class TestIntegration(unittest.TestCase):
                         "check_pr_review_comments.py",
                         "--repo", "OWNER/REPO",
                         "--pr-number", "320",
-                        "--reported-head-sha", "abc123",
+                        "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12",
                         "--output-json", str(json_out),
                         "--output-md", str(md_out),
                     ]
@@ -257,7 +257,7 @@ class TestIntegration(unittest.TestCase):
                 "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange) Emit a real newline marker**",
                 "path": "scripts/local/run_temp_worktree_execution.py",
                 "line": 1821,
-                "commit_id": "aabbccdd",
+                "commit_id": "abc123abc123",
                 "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
             }]),
             "pulls/320/reviews": gh_reply([]),
@@ -284,7 +284,7 @@ class TestIntegration(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": "p2-001",
@@ -321,7 +321,7 @@ class TestIntegration(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": "p1-001",
@@ -356,7 +356,7 @@ class TestIntegration(unittest.TestCase):
             "body": "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange) Emit a real newline marker**",
             "path": "scripts/local/run_temp_worktree_execution.py",
             "line": 1821,
-            "commit_id": "aabbccdd",
+            "commit_id": "abc123abc123",
         }
         got = crc.classify_item(item, "inline_review_comment", set())
         self.assertEqual(len(got), 1)
@@ -447,7 +447,7 @@ class TestIntegration(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": fid,
@@ -529,7 +529,7 @@ class TestIntegration(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": "codex-abc123def456",
@@ -553,7 +553,7 @@ class TestIntegration(unittest.TestCase):
                     "html_url": "https://github.com/OWNER/REPO/pull/1",
                 }]),
                 "pulls/320/reviews": gh_reply([]),
-            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "abc123"])
+            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12"])
             # The finding_id won't match (random hash), so it should still block
             # unless finding_id is actually the same as the waiver
             # This tests that P2 still blocks without exact finding_id match
@@ -594,8 +594,8 @@ class TestIntegration(unittest.TestCase):
                     "html_url": "https://github.com/OWNER/REPO/pull/1",
                 }]),
                 "pulls/320/reviews": gh_reply([]),
-            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "new_sha_xyz789"],
-                gh_pr_view_oid="new_sha_xyz789")
+            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "xyz789xyz789xyz789xyz789xyz789xyz789xy0123"],
+                gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123")
             # Waiver SHA mismatch (old_sha_abc123 != new_sha_xyz789) rejects the waiver.
             # P2 still blocks since it's not waived. Exit 1 BLOCKED.
             self.assertEqual(rc, crc.EXIT_BLOCKED)
@@ -613,7 +613,7 @@ class TestIntegration(unittest.TestCase):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fh:
             json.dump({
                 "pr_number": 320,
-                "reported_head_sha": "abc123",
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
                 "waivers": [
                     {
                         "finding_id": "codex-abc123def456",
@@ -638,8 +638,8 @@ class TestIntegration(unittest.TestCase):
                 }]),
                 "pulls/320/comments": gh_reply([]),
                 "pulls/320/reviews": gh_reply([]),
-            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "abc123"],
-                gh_pr_view_oid="xyz789new")
+            }, extra_args=["--allow-p2-waivers", waiver_path, "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12"],
+                gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123")
             # SHA mismatch: waivers not applied, status inconclusive (no blockers but sha_mismatch=True)
             self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
             self.assertTrue(data.get("head_sha_mismatch"))
@@ -660,11 +660,11 @@ class TestIntegration(unittest.TestCase):
             "issues/320/comments": gh_reply([]),
             "pulls/320/comments": gh_reply([]),
             "pulls/320/reviews": gh_reply([]),
-        }, gh_pr_view_oid="abc123")
+        }, gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12")
         self.assertEqual(rc, crc.EXIT_CLEAN)
         self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
         self.assertFalse(data.get("head_sha_mismatch"))
-        self.assertEqual(data.get("live_head_sha"), "abc123")
+        self.assertEqual(data.get("live_head_sha"), "abc123abc123abc123abc123abc123abc123abcd12")
 
     def test_api_failure_on_any_endpoint_inconclusive(self):
         """
@@ -679,7 +679,7 @@ class TestIntegration(unittest.TestCase):
                 "state": "",
             }]),
             "pulls/320/reviews": gh_fail("server error on reviews endpoint"),
-        }, gh_pr_view_oid="abc123")
+        }, gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12")
         self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
         self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
         self.assertTrue(len(data.get("api_errors", [])) >= 1)
@@ -702,7 +702,7 @@ class TestIntegration(unittest.TestCase):
             return gh_reply([])
 
         def fake_gh_pr_view(repo, pr_number):
-            return True, {"headRefOid": "abc123", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
+            return True, {"headRefOid": "abc123abc123abc123abc123abc123abc123abcd12", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
 
         with mock.patch.object(subprocess, "run", fake_run):
             with mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view):
@@ -713,7 +713,7 @@ class TestIntegration(unittest.TestCase):
                         "check_pr_review_comments.py",
                         "--repo", "OWNER/REPO",
                         "--pr-number", "320",
-                        "--reported-head-sha", "abc123",
+                        "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12",
                         "--output-json", str(json_out),
                         "--output-md", str(md_out),
                     ]):
@@ -724,7 +724,7 @@ class TestIntegration(unittest.TestCase):
         """Verify all subprocess.run calls use list argv and shell=False."""
         captured_calls = []
         def fake_gh_pr_view(repo, pr_number):
-            return True, {"headRefOid": "abc123", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
+            return True, {"headRefOid": "abc123abc123abc123abc123abc123abc123abcd12", "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
         def capturing_run(cmd, **kwargs):
             captured_calls.append(cmd)
             return FakeResult(stdout="[]")
@@ -738,7 +738,7 @@ class TestIntegration(unittest.TestCase):
                         "check_pr_review_comments.py",
                         "--repo", "OWNER/REPO",
                         "--pr-number", "320",
-                        "--reported-head-sha", "abc123",
+                        "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12",
                         "--output-json", str(json_out),
                         "--output-md", str(md_out),
                     ]):

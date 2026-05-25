@@ -187,7 +187,25 @@ The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_
 
 ---
 
-## 13. Future Improvements (Out of Scope for v0)
+## 13. Stale vs Current-Head Findings
+
+Review comments in GitHub are attached to specific commit SHAs. A finding's `commit_id` (12-char prefix) tells us which commit the comment was made on.
+
+**Current-head findings**: `commit_id` matches the live PR head SHA. These represent issues that exist in the current state of the PR branch and must be fixed or explicitly waived before the gate can pass.
+
+**Stale findings**: `commit_id` does not match the live PR head SHA. These represent issues found on an older commit that has since been superseded by new commits. Stale P0/P1 findings do **not** indefinitely block the gate — instead, the gate returns `REVIEW_COMMENTS_INCONCLUSIVE` (exit 2), which requires an exact-head Codex re-review to clear. This prevents both silent ignoring and indefinite blocking.
+
+**Key rules**:
+- Current-head P0/P1 always block (exit 1)
+- Stale P0/P1 → `REVIEW_COMMENTS_INCONCLUSIVE` (exit 2), not `CLEAN`
+- Waivers apply only to current-head findings — stale findings cannot be waived because they attach to a superseded commit
+- A finding without `commit_id` is treated as current-head (pre-v1 compat)
+- Stale findings are clearly tagged `(STALE)` in JSON (`is_stale_head: true`) and markdown output
+
+**Why not automatically mark stale findings as fixed?**
+Because "the commit is different" does not prove "the issue was actually fixed." The only way to definitively clear a stale finding is for Codex to re-review the current HEAD and either confirm the issue is gone or acknowledge the fix. Until that happens, the status is `INCONCLUSIVE`, requiring human attention.
+
+## 14. Future Improvements (Out of Scope for v0)
 
 - P0/P1 waiver support with explicit human authorization
 - Automatic "fixed in later commit" detection via git history

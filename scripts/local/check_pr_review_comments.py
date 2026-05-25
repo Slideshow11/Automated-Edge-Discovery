@@ -288,7 +288,8 @@ def render_md(
     sha_mismatch: bool,
     sources: list[str],
     findings: list[dict[str, Any]],
-    blockers: list[dict[str, Any]],
+    current_head_blockers: list[dict[str, Any]],
+    stale_blockers: list[dict[str, Any]],
     waivers: list[dict[str, Any]],
     counts: dict[str, int],
 ) -> str:
@@ -321,21 +322,30 @@ def render_md(
         lines.append("_No Codex/automated-review findings detected._\n")
     for f in findings:
         waiver_str = " *(waived)*" if f.get("_waived") else ""
+        stale_tag = " *(STALE)*" if f.get("is_stale_head") else " *(CURRENT)*"
         sev = f["severity"]
         lines.extend([
-            f"### {sev} — {f['user']} @ {f['file_path']}:{f['line']}{waiver_str}\n",
+            f"### {sev} — {f['user']} @ {f['file_path']}:{f['line']}{waiver_str}{stale_tag}\n",
             f"- URL: {f['url'] or 'N/A'}\n",
             f"- Commit: `{f['commit_id']}`\n",
             f"\n{f['body'][:2000]}\n",
         ])
-    lines.append(f"\n## Blockers\n")
-    if not blockers:
-        lines.append("_No blockers._\n")
+    lines.append(f"\n## Current-Head Blockers\n")
+    if not current_head_blockers:
+        lines.append("_No current-head blockers._\n")
     else:
-        for b in blockers:
+        for b in current_head_blockers:
             lines.append(
                 f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
                 f"[link]({b['url']})\n"
+            )
+            lines.append(f"  {b['body'][:300]}\n")
+    if stale_blockers:
+        lines.append(f"\n## Stale Blockers (require exact-head re-review — INCONCLUSIVE)\n")
+        for b in stale_blockers:
+            lines.append(
+                f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
+                f"[link]({b['url']})  *(STALE — attached to old commit)*\n"
             )
             lines.append(f"  {b['body'][:300]}\n")
     lines.append(f"\n## P2 Waivers\n")
@@ -355,7 +365,13 @@ def render_md(
         )
     elif status == "REVIEW_COMMENTS_BLOCKED":
         lines.append(
-            "❌ Unresolved blockers remain. Fix or explicitly waive before proceeding.\n"
+            "❌ Unresolved current-head blockers remain. Fix or explicitly waive before proceeding.\n"
+        )
+    elif stale_blockers:
+        lines.append(
+            "⚠️  Stale P0/P1 findings attached to old commits — not indefinitely blocking.\n"
+            "    Trigger an exact-head Codex re-review to clear stale blockers.\n"
+            "    Status is INCONCLUSIVE until clean exact-head review evidence exists.\n"
         )
     else:
         lines.append(
@@ -475,6 +491,39 @@ def main() -> int:
             )
             head_sha_mismatch = True
 
+    # -----------------------------------------------------------------------
+    # Stale vs current-head classification
+    # -----------------------------------------------------------------------
+    # A finding is "current-head" if its commit_id matches the live PR head SHA
+    # (GitHub stores 12-char prefixes on inline/per-review comments).
+    # A finding with no commit_id is treated as current-head (pre-v1 compat).
+    # Findings attached to an older commit are "stale" — they represent issues
+    # that were already addressed in later commits and must not indefinitely
+    # block the gate.
+    live_head_12 = live_head_sha[:12] if live_head_sha else ""
+
+    current_head_findings: list[dict[str, Any]] = []
+    stale_findings: list[dict[str, Any]] = []
+
+    for f in all_findings:
+        fid_commit = f.get("commit_id", "")
+        if not fid_commit:
+            # Pre-v1 finding or comment without commit_id — treat as current.
+            is_current = True
+            is_stale = False
+        elif fid_commit == live_head_12:
+            is_current = True
+            is_stale = False
+        else:
+            is_current = False
+            is_stale = True
+        f["is_current_head"] = is_current
+        f["is_stale_head"] = is_stale
+        if is_current:
+            current_head_findings.append(f)
+        else:
+            stale_findings.append(f)
+
     # Load waivers if provided (only if head SHA verified)
     waivers_applied: list[dict[str, Any]] = []
     waiver_map: dict[str, dict[str, Any]] = {}
@@ -490,9 +539,10 @@ def main() -> int:
             for w in waiver_data.get("waivers", []):
                 waiver_map[w.get("finding_id", "")] = w
 
-    # Mark findings as waived.
-    # v0 waiver matching: by finding_id OR by (severity + first-100-chars-of-body).
-    for f in all_findings:
+    # Mark current-head findings as waived.
+    # Waivers only apply to current-head findings — stale findings cannot be waived
+    # because they represent issues on a superseded commit.
+    for f in current_head_findings:
         matched_waiver = None
         fid = f.get("finding_id", "")
         if fid in waiver_map:
@@ -511,18 +561,28 @@ def main() -> int:
             f["_waiver_reason"] = matched_waiver.get("reason", "")
             waivers_applied.append(matched_waiver)
 
-    # Classify blockers
-    blockers = []
-    for f in all_findings:
+    # Classify blockers — only current-head findings can block.
+    # Stale findings (on older commits) are reported but cannot indefinitely block.
+    current_head_blockers: list[dict[str, Any]] = []
+    stale_blockers: list[dict[str, Any]] = []
+    for f in current_head_findings:
         sev = f["severity"]
         if sev in ("P0", "P1", "UNSPECIFIED_BLOCKING"):
-            blockers.append(f)
+            current_head_blockers.append(f)
         elif sev == "P2":
             if args.fail_on_p2:
-                blockers.append(f)
+                current_head_blockers.append(f)
             elif not f.get("_waived"):
-                blockers.append(f)
+                current_head_blockers.append(f)
         # P3 and UNSPECIFIED_INFO are informational only
+    for f in stale_findings:
+        sev = f["severity"]
+        if sev in ("P0", "P1", "UNSPECIFIED_BLOCKING"):
+            stale_blockers.append(f)
+        elif sev == "P2":
+            if args.fail_on_p2:
+                stale_blockers.append(f)
+            # stale P2s without fail_on_p2 are informational only
 
     # Count severity buckets
     counts: dict[str, int] = {k: 0 for k in (
@@ -532,20 +592,31 @@ def main() -> int:
     for f in all_findings:
         sev = f["severity"]
         counts[sev] = counts.get(sev, 0) + 1
-    counts["blocked"] = len(blockers)
+    counts["blocked"] = len(current_head_blockers)
     counts["waived"] = len(waivers_applied)
 
-    # P1-A: fail-closed on API errors — never silently declare clean with partial data.
-    # P1-A: if ANY endpoint failed, the harvest is incomplete; status must not be CLEAN.
-    #       If blockers were also found, BLOCKED is acceptable but api_errors must be surfaced.
+    # Status determination:
+    # 1. API errors => INCONCLUSIVE (incomplete data — fail closed)
+    # 2. Current-head P0/P1/P2 blockers => BLOCKED
+    # 3. Stale P0/P1/P2 blockers => INCONCLUSIVE (stale findings require exact-head re-review)
+    # 4. No blockers => CLEAN
     if api_errors:
         status = "REVIEW_COMMENTS_INCONCLUSIVE"
-    elif blockers:
+    elif current_head_blockers:
         status = "REVIEW_COMMENTS_BLOCKED"
+    elif stale_blockers:
+        status = "REVIEW_COMMENTS_INCONCLUSIVE"
     elif all_findings:
         status = "REVIEW_COMMENTS_CLEAN"
     else:
         status = "REVIEW_COMMENTS_CLEAN"
+
+    # stale_findings_summary for reporting
+    stale_findings_summary = {
+        "total_stale": len(stale_findings),
+        "stale_blockers": len(stale_blockers),
+        "stale_finding_ids": [f["finding_id"] for f in stale_findings],
+    }
 
     # Write outputs
     output = {
@@ -558,7 +629,11 @@ def main() -> int:
         "sources_fetched": sources_fetched,
         "api_errors": api_errors,
         "findings": all_findings,
-        "blockers": blockers,
+        "blockers": current_head_blockers,
+        "stale_blockers": stale_blockers,
+        "stale_findings_summary": stale_findings_summary,
+        "current_head_findings_count": len(current_head_findings),
+        "stale_findings_count": len(stale_findings),
         "p2_waivers": waivers_applied,
         "summary_counts": counts,
     }
@@ -567,12 +642,13 @@ def main() -> int:
     md = render_md(
         status, args.pr_number, args.reported_head_sha,
         live_head_sha, head_sha_mismatch,
-        sources_fetched, all_findings, blockers, waivers_applied, counts,
+        sources_fetched, all_findings, current_head_blockers,
+        stale_blockers, waivers_applied, counts,
     )
     Path(args.output_md).write_text(md)
 
-    print(f"[check_pr_review_comments] status={status} blockers={len(blockers)} "
-          f"findings={len(all_findings)} waivers={len(waivers_applied)}")
+    print(f"[check_pr_review_comments] status={status} blockers={len(current_head_blockers)} "
+          f"stale={len(stale_blockers)} findings={len(all_findings)} waivers={len(waivers_applied)}")
 
     if status == "REVIEW_COMMENTS_BLOCKED":
         return EXIT_BLOCKED
