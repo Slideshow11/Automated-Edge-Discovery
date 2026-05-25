@@ -83,6 +83,48 @@ jobs:
       - name: Run governance manifests validator checks
         run: bash scripts/ci/validate_governance_manifests.sh
 
+  review-comment-gate:
+    runs-on: ubuntu-latest
+    # Runs on all pull_request events targeting main.
+    # Requires --pr-number and --reported-head-sha from the PR context.
+    # gh CLI is pre-installed on ubuntu-latest runners and authenticated
+    # via GITHUB_TOKEN. No live Claude, no Hermes mutations.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Run review-comment gate
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/review_comment_gate
+          python scripts/local/check_pr_review_comments.py \
+            --repo "$REPO" \
+            --pr-number "$PR_NUMBER" \
+            --reported-head-sha "$HEAD_SHA" \
+            --output-json /tmp/review_comment_gate/status.json \
+            --output-md /tmp/review_comment_gate/status.md
+          echo "=== REVIEW COMMENT GATE OUTPUT ==="
+          cat /tmp/review_comment_gate/status.json
+          echo ""
+          # Exit code 0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE
+          # The script itself exits with the correct code — no wrapper needed.
+
+      - name: Upload gate artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-comment-gate-report
+          path: /tmp/review_comment_gate/
+
   pr-gate-live-smoke:
     needs: [test]
     runs-on: ubuntu-latest
