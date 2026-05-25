@@ -1,0 +1,110 @@
+{
+  "corpus_kind": "aed.autocoder.corpus.v0",
+  "corpus_id": "corpus-001",
+  "corpus_version": "0.1.0",
+  "description": "Initial smoke and edge-case suite for AED autocoder controller v0. All tasks are deterministic mocked runs targeting existing tracked docs files. Failures indicate controller bugs, not LLM output issues.",
+  "created_at": "2026-05-24T00:00:00Z",
+  "base_sha_policy": "current_main",
+  "tasks": [
+    {
+      "packet_kind": "aed.autocoder.single_task.v0",
+      "task_id": "corpus-001-task-001",
+      "goal": "Append validation line to docs/wfa_next_steps.md",
+      "allowed_files": ["docs/wfa_next_steps.md"],
+      "forbidden_files": [],
+      "max_changed_files": 1,
+      "output_root": null,
+      "branch_name": "apply/corpus-001-task-001",
+      "execution_mode": "mocked",
+      "mock_edits": [
+        {
+          "path": "docs/wfa_next_steps.md",
+          "content": "append",
+          "text": "\n## Corpus-001 Validation Line\nThis line confirms the single-task controller handled this task correctly.\n"
+        }
+      ],
+      "suggested_pr_title": "docs: append corpus-001 validation line to wfa_next_steps.md",
+      "suggested_pr_body": "Corpus-001 task 001: smoke test for single-task controller path.\n\nGoal: append validation line to docs/wfa_next_steps.md\nExecution: mocked\nExpected: SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+    },
+    {
+      "packet_kind": "aed.autocoder.single_task.v0",
+      "task_id": "corpus-001-task-002",
+      "goal": "Append validation line to docs/wfa_run_examples.md",
+      "allowed_files": ["docs/wfa_run_examples.md"],
+      "forbidden_files": [],
+      "max_changed_files": 1,
+      "output_root": null,
+      "branch_name": "apply/corpus-001-task-002",
+      "execution_mode": "mocked",
+      "mock_edits": [
+        {
+          "path": "docs/wfa_run_examples.md",
+          "content": "append",
+          "text": "\n## Corpus-001 Validation Line\nThis line confirms the single-task controller handled this task correctly.\n"
+        }
+      ],
+      "suggested_pr_title": "docs: append corpus-001 validation line to wfa_run_examples.md",
+      "suggested_pr_body": "Corpus-001 task 002: smoke test for single-task controller path.\n\nGoal: append validation line to docs/wfa_run_examples.md\nExecution: mocked\nExpected: SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+    },
+    {
+      "packet_kind": "aed.autocoder.single_task.v0",
+      "task_id": "corpus-001-task-003",
+      "goal": "Append validation line to docs/pr314_batch_controller_gate_process_gap.md",
+      "allowed_files": ["docs/pr314_batch_controller_gate_process_gap.md"],
+      "forbidden_files": [],
+      "max_changed_files": 1,
+      "output_root": null,
+      "branch_name": "apply/corpus-001-task-003",
+      "execution_mode": "mocked",
+      "mock_edits": [
+        {
+          "path": "docs/pr314_batch_controller_gate_process_gap.md",
+          "content": "append",
+          "text": "\n## Corpus-001 Validation Line\nThis line confirms the single-task controller handled this task correctly.\n"
+        }
+      ],
+      "suggested_pr_title": "docs: append corpus-001 validation line to pr314 batch gap doc",
+      "suggested_pr_body": "Corpus-001 task 003: smoke test for single-task controller path.\n\nGoal: append validation line to docs/pr314_batch_controller_gate_process_gap.md\nExecution: mocked\nExpected: SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+    },
+    {
+      "packet_kind": "aed.autocoder.single_task.v0",
+      "task_id": "corpus-001-task-004",
+      "goal": "Append validation line to docs/aed_tasker_executor_design.md",
+      "allowed_files": ["docs/aed_tasker_executor_design.md"],
+      "forbidden_files": [],
+      "max_changed_files": 1,
+      "output_root": null,
+      "branch_name": "apply/corpus-001-task-004",
+      "execution_mode": "mocked",
+      "mock_edits": [
+        {
+          "path": "docs/aed_tasker_executor_design.md",
+          "content": "append",
+          "text": "\n## Corpus-001 Validation Line\nThis line confirms the single-task controller handled this task correctly.\n"
+        }
+      ],
+      "suggested_pr_title": "docs: append corpus-001 validation line to aed_tasker_executor_design.md",
+      "suggested_pr_body": "Corpus-001 task 004: smoke test for single-task controller path.\n\nGoal: append validation line to docs/aed_tasker_executor_design.md\nExecution: mocked\nExpected: SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+    },
+    {
+      "packet_kind": "aed.autocoder.single_task.v0",
+      "task_id": "corpus-001-task-005",
+      "goal": "Append validation line to docs/aed_executor_packet_usage.md",
+      "allowed_files": ["docs/aed_executor_packet_usage.md"],
+      "forbidden_files": [],
+      "max_changed_files": 1,
+      "output_root": null,
+      "branch_name": "apply/corpus-001-task-005",
+      "execution_mode": "mocked",
+      "mock_edits": [
+        {
+          "path": "docs/aed_executor_packet_usage.md",
+          "content": "append",
+          "text": "\n## Corpus-001 Validation Line\nThis line confirms the single-task controller handled this task correctly.\n"
+        }
+      ],
+      "suggested_pr_title": "docs: append corpus-001 validation line to executor packet usage doc",
+      "suggested_pr_body": "Corpus-001 task 005: smoke test for single-task controller path.\n\nGoal: append validation line to docs/aed_executor_packet_usage.md\nExecution: mocked\nExpected: SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+    }
+  ]
+}
