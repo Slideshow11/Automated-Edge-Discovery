@@ -80,6 +80,92 @@ SEVERITY_MAP = {
 # GitHub API helpers (list-argv, no shell=True)
 # ---------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# GitHub GraphQL helper (review thread resolution state)
+# --------------------------------------------------------------------------
+
+
+def gh_graphql_review_threads(
+    repo: str, pr_number: int
+) -> tuple[bool, list[dict[str, Any]], str]:
+    """
+    Fetch PR review-thread resolution state via GraphQL.
+
+    Returns (success, threads_list, error_msg).
+    threads_list entries: {id, isResolved, isOutdated, comments: [{databaseId, url}]}
+
+    Note: gh api graphql -f passes all variables as strings, which GraphQL rejects
+    for Int. We embed the PR number as a raw integer literal in the query.
+    Also note: nested braces must be balanced; comments(first:50) has its own
+    nodes subfield requiring a closing '}' before the comments block closes.
+    """
+    owner, name = repo.split("/", 1)
+    # Build with explicit brace counting via a list to ensure balance.
+    # comments(first:50) { nodes { databaseId url } }
+    #                                     ^^--- +1 extra } to close the inner nodes
+    query_parts = [
+        "query {",
+        f'repository(owner:"{owner}", name:"{name}") {{',
+        f"pullRequest(number:{pr_number}) {{",
+        "reviewThreads(first:100) {",
+        "nodes {",
+        "id isResolved isOutdated",
+        "comments(first:50) { nodes { databaseId url } }",  # note: inner nodes needs extra }
+        "}",  # close nodes
+        "}",  # close reviewThreads
+        "}",  # close pullRequest
+        "}",  # close repository
+        "}",  # close query
+    ]
+    query_literal = " ".join(query_parts)
+    cmd = ["gh", "api", "graphql", "--raw-field",
+           f"query={query_literal}"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=30, check=False
+        )
+    except OSError as exc:
+        return False, [], f"gh graphql invocation failed: {exc}"
+
+    if result.returncode != 0:
+        return False, [], f"gh graphql returned {result.returncode}: {result.stderr[:500]}"
+
+    try:
+        data = json.loads(result.stdout)
+        errors = data.get("errors")
+        if errors:
+            return False, [], f"GraphQL errors: {errors}"
+        nodes = (
+            data.get("data", {})
+            .get("repository", {})
+            .get("pullRequest", {})
+            .get("reviewThreads", {})
+            .get("nodes", [])
+        )
+        # Flatten: keep thread metadata + each comment's databaseId/url
+        threads: list[dict[str, Any]] = []
+        for node in nodes:
+            thread_id = node.get("id", "")
+            is_resolved = node.get("isResolved", False)
+            is_outdated = node.get("isOutdated", False)
+            for comment in (node.get("comments", {}) or {}).get("nodes", []):
+                threads.append({
+                    "thread_id": thread_id,
+                    "is_resolved": is_resolved,
+                    "is_outdated": is_outdated,
+                    "database_id": comment.get("databaseId"),
+                    "url": comment.get("url") or "",
+                })
+        return True, threads, ""
+    except (json.JSONDecodeError, KeyError) as exc:
+        return False, [], f"invalid GraphQL response: {exc}"
+
+
+# --------------------------------------------------------------------------
+# GitHub REST API helpers (list-argv, no shell=True)
+# --------------------------------------------------------------------------
+
+
 def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
     """
     Call `gh api` for the given endpoint (no leading slash).
@@ -290,8 +376,10 @@ def render_md(
     findings: list[dict[str, Any]],
     current_head_blockers: list[dict[str, Any]],
     stale_blockers: list[dict[str, Any]],
+    resolved_non_blockers: list[dict[str, Any]],
     waivers: list[dict[str, Any]],
     counts: dict[str, int],
+    thread_api_error: str | None = None,
 ) -> str:
     lines = [
         f"# PR Review Comment Gate — PR #{pr_number}\n",
@@ -323,11 +411,17 @@ def render_md(
     for f in findings:
         waiver_str = " *(waived)*" if f.get("_waived") else ""
         stale_tag = " *(STALE)*" if f.get("is_stale_head") else " *(CURRENT)*"
+        thread_tag = ""
+        if f.get("thread_resolved"):
+            thread_tag = " *(thread:RESOLVED)*"
+        elif f.get("thread_id"):
+            thread_tag = " *(thread:OPEN)*"
         sev = f["severity"]
         lines.extend([
-            f"### {sev} — {f['user']} @ {f['file_path']}:{f['line']}{waiver_str}{stale_tag}\n",
+            f"### {sev} — {f['user']} @ {f['file_path']}:{f['line']}{waiver_str}{stale_tag}{thread_tag}\n",
             f"- URL: {f['url'] or 'N/A'}\n",
             f"- Commit: `{f['commit_id']}`\n",
+            f"- Thread: `{f.get('thread_id', 'N/A')}`\n",
             f"\n{f['body'][:2000]}\n",
         ])
     lines.append(f"\n## Current-Head Blockers\n")
@@ -335,9 +429,13 @@ def render_md(
         lines.append("_No current-head blockers._\n")
     else:
         for b in current_head_blockers:
+            thread_tag = ""
+            if b.get("thread_id"):
+                state = "RESOLVED" if b.get("thread_resolved") else "OPEN"
+                thread_tag = f" [thread:{state}]"
             lines.append(
                 f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
-                f"[link]({b['url']})\n"
+                f"[link]({b['url']}){thread_tag}\n"
             )
             lines.append(f"  {b['body'][:300]}\n")
     if stale_blockers:
@@ -347,6 +445,15 @@ def render_md(
                 f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
                 f"[link]({b['url']})  *(STALE — attached to old commit)*\n"
             )
+            lines.append(f"  {b['body'][:300]}\n")
+    if resolved_non_blockers:
+        lines.append(f"\n## Resolved Review Threads (not blocking)\n")
+        for b in resolved_non_blockers:
+            lines.append(
+                f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
+                f"[link]({b['url']})  *(RESOLVED — not blocking)*\n"
+            )
+            lines.append(f"  thread_id: `{b.get('thread_id', 'N/A')}`\n")
             lines.append(f"  {b['body'][:300]}\n")
     lines.append(f"\n## P2 Waivers\n")
     if not waivers:
@@ -473,6 +580,34 @@ def main() -> int:
 
     all_findings = dedup_findings(all_findings)
 
+    # -----------------------------------------------------------------------
+    # Review-thread resolution state via GraphQL (read-only)
+    # -----------------------------------------------------------------------
+    # Build a mapping: finding URL -> thread metadata (isResolved, isOutdated, thread_id).
+    # Findings in resolved threads are reported but do not block.
+    # Key: URL (from inline_review_comment or per_review_comment).
+    # Fallback key: "databaseId:<id>" for findings with a known databaseId.
+    thread_meta_by_url: dict[str, dict[str, Any]] = {}
+    thread_api_error: str | None = None
+    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
+        args.repo, args.pr_number
+    )
+    if not ok_threads:
+        thread_api_error = err_threads
+    else:
+        for entry in thread_entries:
+            url = entry.get("url", "")
+            if url:
+                thread_meta_by_url[url] = entry
+
+    # Attach thread metadata to each finding by URL.
+    for f in all_findings:
+        url = f.get("url", "")
+        meta = thread_meta_by_url.get(url, {})
+        f["thread_id"] = meta.get("thread_id", "")
+        f["thread_resolved"] = meta.get("is_resolved", False)
+        f["thread_outdated"] = meta.get("is_outdated", False)
+
     # P1-B: Verify live head SHA against --reported-head-sha.
     # This check MUST happen before any waiver loading or blocker classification.
     # A stale SHA can never reach the waiver-loading code path.
@@ -510,11 +645,13 @@ def main() -> int:
             "findings": all_findings,
             "blockers": [],
             "stale_blockers": [],
+            "resolved_non_blockers": [],
             "stale_findings_summary": {"total_stale": 0, "stale_blockers": 0, "stale_finding_ids": []},
             "current_head_findings_count": 0,
             "stale_findings_count": 0,
             "p2_waivers": [],
             "summary_counts": {},
+            "thread_api_error": None,
         }
         Path(args.output_json).write_text(json.dumps(output, indent=2))
         md = f"# PR Review Comment Gate — PR #{args.pr_number}\n\n"
@@ -602,17 +739,40 @@ def main() -> int:
 
     # Classify blockers — only current-head findings can block.
     # Stale findings (on older commits) are reported but cannot indefinitely block.
+    # Findings in resolved GitHub review threads are reported but do not block.
+    # If thread-resolution metadata is unavailable for a P0/P1/P2, fail closed.
     current_head_blockers: list[dict[str, Any]] = []
     stale_blockers: list[dict[str, Any]] = []
+    resolved_non_blockers: list[dict[str, Any]] = []
+
     for f in current_head_findings:
         sev = f["severity"]
+        thread_resolved = f.get("thread_resolved", False)
+        has_thread_meta = bool(f.get("thread_id") or f.get("url"))
+
         if sev in ("P0", "P1", "UNSPECIFIED_BLOCKING"):
-            current_head_blockers.append(f)
+            # P0/P1 always blocking unless resolved via GitHub review thread.
+            if thread_resolved:
+                resolved_non_blockers.append(f)
+            elif not has_thread_meta:
+                # No thread metadata — fail closed.
+                current_head_blockers.append(f)
+            else:
+                current_head_blockers.append(f)
         elif sev == "P2":
             if args.fail_on_p2:
-                current_head_blockers.append(f)
-            elif not f.get("_waived"):
-                current_head_blockers.append(f)
+                if thread_resolved:
+                    resolved_non_blockers.append(f)
+                elif not has_thread_meta:
+                    current_head_blockers.append(f)
+                else:
+                    current_head_blockers.append(f)
+            else:
+                # Default P2: blocks unless waived OR resolved via GitHub thread.
+                if thread_resolved:
+                    resolved_non_blockers.append(f)
+                elif not f.get("_waived"):
+                    current_head_blockers.append(f)
         # P3 and UNSPECIFIED_INFO are informational only
     for f in stale_findings:
         sev = f["severity"]
@@ -635,11 +795,15 @@ def main() -> int:
     counts["waived"] = len(waivers_applied)
 
     # Status determination:
-    # 1. API errors => INCONCLUSIVE (incomplete data — fail closed)
-    # 2. Current-head P0/P1/P2 blockers => BLOCKED
-    # 3. Stale P0/P1/P2 blockers => INCONCLUSIVE (stale findings require exact-head re-review)
-    # 4. No blockers => CLEAN
+    # 1. API errors (REST) => INCONCLUSIVE (incomplete data — fail closed)
+    # 2. GraphQL thread-resolution failure => INCONCLUSIVE (cannot determine resolved state)
+    # 3. Current-head P0/P1/P2 blockers => BLOCKED
+    # 4. Stale P0/P1/P2 blockers => INCONCLUSIVE (stale findings require exact-head re-review)
+    # 5. No blockers => CLEAN
     if api_errors:
+        status = "REVIEW_COMMENTS_INCONCLUSIVE"
+    elif thread_api_error:
+        api_errors.append(f"review_threads_graphql: {thread_api_error}")
         status = "REVIEW_COMMENTS_INCONCLUSIVE"
     elif current_head_blockers:
         status = "REVIEW_COMMENTS_BLOCKED"
@@ -667,9 +831,11 @@ def main() -> int:
         "harvested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         "sources_fetched": sources_fetched,
         "api_errors": api_errors,
+        "thread_api_error": thread_api_error,
         "findings": all_findings,
         "blockers": current_head_blockers,
         "stale_blockers": stale_blockers,
+        "resolved_non_blockers": resolved_non_blockers,
         "stale_findings_summary": stale_findings_summary,
         "current_head_findings_count": len(current_head_findings),
         "stale_findings_count": len(stale_findings),
@@ -682,12 +848,14 @@ def main() -> int:
         status, args.pr_number, args.reported_head_sha,
         live_head_sha, head_sha_mismatch,
         sources_fetched, all_findings, current_head_blockers,
-        stale_blockers, waivers_applied, counts,
+        stale_blockers, resolved_non_blockers, waivers_applied, counts,
+        thread_api_error,
     )
     Path(args.output_md).write_text(md)
 
     print(f"[check_pr_review_comments] status={status} blockers={len(current_head_blockers)} "
-          f"stale={len(stale_blockers)} findings={len(all_findings)} waivers={len(waivers_applied)}")
+          f"stale={len(stale_blockers)} resolved={len(resolved_non_blockers)} "
+          f"findings={len(all_findings)} waivers={len(waivers_applied)}")
 
     if status == "REVIEW_COMMENTS_BLOCKED":
         return EXIT_BLOCKED

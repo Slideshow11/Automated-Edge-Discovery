@@ -209,7 +209,16 @@ class TestIntegration(unittest.TestCase):
         Patch subprocess.run to return FakeResult keyed by command snippet.
         Also patches gh_pr_view (the PR metadata function) directly.
         Optionally patches crc.load_waiver to verify it is or is not called.
+
+        Provides a default empty GraphQL response for reviewThreads if not
+        explicitly provided, so existing tests continue to work.
         """
+        # Default empty GraphQL response if not overridden
+        if "graphql" not in gh_responses:
+            gh_responses["graphql"] = gh_reply({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"nodes": []},
+            }}}})
+
         def fake_run(cmd, **kwargs):
             # Find matching response by command string
             cmd_str = " ".join(cmd)
@@ -700,6 +709,10 @@ class TestIntegration(unittest.TestCase):
         """Reviews with IDs trigger per-review comment fetch."""
         def fake_run(cmd, **kwargs):
             cmd_str = " ".join(cmd)
+            if "graphql" in cmd_str:
+                return FakeResult(stdout=json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": []},
+                }}}}))
             if "reviews/456/comments" in cmd_str:
                 return gh_reply([])
             if "pulls/320/reviews" in cmd_str:
@@ -916,6 +929,17 @@ class TestIntegration(unittest.TestCase):
                     "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
                 }]),
                 "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_test1",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
             },
             gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
         )
@@ -925,6 +949,185 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(data.get("blockers", [])), 1)
         self.assertEqual(data["blockers"][0]["severity"], "P1")
         self.assertEqual(data.get("p2_waivers"), [])
+        # Thread state correctly attached
+        self.assertEqual(data["blockers"][0].get("thread_id"), "PRRT_test1")
+        self.assertEqual(data["blockers"][0].get("thread_resolved"), False)
+
+    def test_current_head_resolved_p1_review_thread_does_not_block(self):
+        """
+        When a current-head P1 finding is in a resolved GitHub review thread,
+        it is reported as resolved_non_blockers and does NOT block.
+        Status should be CLEAN (no remaining blockers).
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "abc123abc123",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_resolved1",
+                        "isResolved": True,  # Thread is RESOLVED
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # Resolved thread -> not blocking
+        self.assertEqual(rc, crc.EXIT_CLEAN)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
+        # The P1 is in resolved_non_blockers, not blockers
+        self.assertEqual(len(data.get("blockers", [])), 0)
+        self.assertEqual(len(data.get("resolved_non_blockers", [])), 1)
+        self.assertEqual(data["resolved_non_blockers"][0]["severity"], "P1")
+        self.assertEqual(data["resolved_non_blockers"][0].get("thread_resolved"), True)
+        self.assertEqual(data["resolved_non_blockers"][0].get("thread_id"), "PRRT_resolved1")
+
+    def test_current_head_p1_missing_thread_metadata_fails_closed(self):
+        """
+        When a current-head P1 has no thread metadata (finding URL not in GraphQL result),
+        it should fail closed: treated as a blocker, status BLOCKED.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "abc123abc123",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                # GraphQL returns NO threads matching this URL
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": []},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # No thread metadata -> fail closed -> BLOCKED
+        self.assertEqual(rc, crc.EXIT_BLOCKED)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_BLOCKED")
+        self.assertEqual(len(data.get("blockers", [])), 1)
+        self.assertEqual(data["blockers"][0]["severity"], "P1")
+        self.assertEqual(data["blockers"][0].get("thread_id"), "")
+
+    def test_graphql_review_threads_api_failure_inconclusive(self):
+        """
+        GraphQL API failure for reviewThreads -> INCONCLUSIVE.
+        Cannot determine resolution state, so fail closed.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "abc123abc123",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_fail("GraphQL endpoint unavailable"),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
+        self.assertIsNotNone(data.get("thread_api_error"))
+        self.assertIn("graphql", data["thread_api_error"].lower())
+
+    def test_stale_p1_still_reported_as_stale_not_silently_ignored(self):
+        """
+        Stale P1 findings are reported as stale_blockers, not silently dropped.
+        They do not block, but they are clearly visible in the output.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "oldoldold",  # Does NOT match current head
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_stale1",
+                        "isResolved": False,
+                        "isOutdated": True,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # Stale P1 -> INCONCLUSIVE (not BLOCKED), reported as stale_blockers
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
+        self.assertEqual(len(data.get("stale_blockers", [])), 1)
+        self.assertEqual(data["stale_blockers"][0]["severity"], "P1")
+        self.assertEqual(data["stale_blockers"][0]["is_stale_head"], True)
+        # Not in blockers
+        self.assertEqual(len(data.get("blockers", [])), 0)
+
+    def test_resolved_findings_appear_in_json_and_markdown_output(self):
+        """
+        Resolved findings appear in both JSON (resolved_non_blockers) and
+        markdown (Resolved Review Threads section) output.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "abc123abc123",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_resolved2",
+                        "isResolved": True,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # JSON: resolved_non_blockers has the finding
+        self.assertEqual(len(data.get("resolved_non_blockers", [])), 1)
+        self.assertEqual(data["resolved_non_blockers"][0]["thread_resolved"], True)
+        # Thread ID visible in finding
+        self.assertEqual(data["resolved_non_blockers"][0]["thread_id"], "PRRT_resolved2")
 
 
 import tempfile

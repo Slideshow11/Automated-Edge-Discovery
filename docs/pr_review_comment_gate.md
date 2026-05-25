@@ -187,7 +187,29 @@ The canonical pre-merge sequence (per `docs/pr314_batch_controller_gate_process_
 
 ---
 
-## 13. Stale vs Current-Head Findings
+## 13. Resolved Review Threads (GraphQL)
+
+GitHub review threads can be resolved by human reviewers via the GitHub UI or API. Once a thread is resolved, the findings within it no longer block the gate — even if they are P0/P1 severity — because a human has explicitly reviewed and closed that conversation.
+
+**Implementation**: The gate fetches `reviewThreads` via the GitHub GraphQL API (`gh api graphql`). Each finding's `url` field is matched to its corresponding thread comment entry. The thread's `isResolved` field is attached to the finding.
+
+**Behavior**:
+- **Unresolved thread + current-head P0/P1** → `REVIEW_COMMENTS_BLOCKED` (exit 1) — blocks normally
+- **Resolved thread + current-head P0/P1** → reported as `resolved_non_blockers`, does **not** block, visible in JSON/markdown output
+- **Missing thread metadata + current-head P0/P1** → fail closed: treated as blocker (`REVIEW_COMMENTS_BLOCKED`)
+- **GraphQL API failure** → `REVIEW_COMMENTS_INCONCLUSIVE` (exit 2) — cannot determine resolution state
+- **Stale findings** → tracked separately; resolution state is secondary to the stale/current-head classification
+
+**Read-only**: The gate never resolves, dismisses, or modifies GitHub conversations. It only reads thread state to inform blocking decisions.
+
+**Note on P1 waivers**: P1 findings cannot be waived. If a current-head P1 is a false positive, the correct resolution path is for a human to resolve the GitHub review thread in the UI, or for Codex to re-review and change its assessment.
+
+---
+
+## 14. Stale vs Current-Head Findings
+
+**Note**: Section numbering was updated after adding "Resolved Review Threads" support.
+"Stale vs Current-Head Findings" was previously section 13 and is now section 14.
 
 Review comments in GitHub are attached to specific commit SHAs. A finding's `commit_id` (12-char prefix) tells us which commit the comment was made on.
 
@@ -205,9 +227,11 @@ Review comments in GitHub are attached to specific commit SHAs. A finding's `com
 **Why not automatically mark stale findings as fixed?**
 Because "the commit is different" does not prove "the issue was actually fixed." The only way to definitively clear a stale finding is for Codex to re-review the current HEAD and either confirm the issue is gone or acknowledge the fix. Until that happens, the status is `INCONCLUSIVE`, requiring human attention.
 
-## 14. Future Improvements (Out of Scope for v0)
+---
+
+## 15. Future Improvements (Out of Scope for v0)
 
 - P0/P1 waiver support with explicit human authorization
 - Automatic "fixed in later commit" detection via git history
 - `final_gate_status.py` integration via `--review-comments-status-json` flag
-- Ignore resolved conversations (requires GitHub API v4 / GraphQL)
+- ~~Ignore resolved conversations~~ — **Implemented in v1** via GitHub GraphQL `reviewThreads` API
