@@ -519,11 +519,37 @@ def main(
         print(f"INFO: using --base-sha override: base_sha='{base_sha}'")
     else:
         policy = corpus.get("base_sha_policy", "current_main")
-        ok, msg, base_sha = resolve_base_sha(policy, repo)
-        if not ok:
-            print(f"FATAL: base_sha_policy resolution failed: {msg}", file=sys.stderr)
-            return 1
-        print(f"INFO: base_sha_policy='{policy}' resolved to base_sha='{base_sha}'")
+        if policy == "current_main":
+            # Try multiple refs: GITHUB_BASE_REF (CI), origin/main, main, HEAD
+            # GITHUB_BASE_REF is set by GitHub Actions for PRs
+            import os
+            github_base_ref = os.environ.get("GITHUB_BASE_REF", "")
+            refs_to_try = []
+            if github_base_ref:
+                refs_to_try.append(github_base_ref)  # e.g., "main" in CI
+            refs_to_try.extend(["origin/main", "main"])
+            for ref in refs_to_try:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), "rev-parse", ref],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    sha = result.stdout.strip()
+                    if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+                        print(f"INFO: resolved main to {sha} via {ref}")
+                        base_sha = sha
+                        break
+            else:
+                print(f"FATAL: could not resolve main (tried: {', '.join(refs_to_try)})", file=sys.stderr)
+                return 1
+        else:
+            ok, msg, base_sha = resolve_base_sha(policy, repo)
+            if not ok:
+                print(f"FATAL: base_sha_policy resolution failed: {msg}", file=sys.stderr)
+                return 1
+            print(f"INFO: base_sha_policy='{policy}' resolved to base_sha='{base_sha}'")
 
     # Step 4: Validate target files and branch names
     # Note: We skip corpus branch collision checking here because the batch packet
