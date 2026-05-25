@@ -5,6 +5,7 @@ Unit tests for check_pr_review_comments.py.
 Uses mock subprocess to avoid real GitHub calls.
 """
 
+import contextlib
 import json
 import subprocess
 import sys
@@ -202,10 +203,12 @@ class TestIntegration(unittest.TestCase):
         gh_responses: dict[str, FakeResult],
         extra_args: list[str] | None = None,
         gh_pr_view_oid: str = "abc123abc123abc123abc123abc123abc123abcd12",
+        mock_load_waiver=None,
     ):
         """
         Patch subprocess.run to return FakeResult keyed by command snippet.
         Also patches gh_pr_view (the PR metadata function) directly.
+        Optionally patches crc.load_waiver to verify it is or is not called.
         """
         def fake_run(cmd, **kwargs):
             # Find matching response by command string
@@ -218,26 +221,35 @@ class TestIntegration(unittest.TestCase):
         def fake_gh_pr_view(repo: str, pr_number: int):
             return True, {"headRefOid": gh_pr_view_oid, "state": "OPEN", "url": f"https://github.com/{repo}/pull/{pr_number}"}, ""
 
-        with mock.patch.object(subprocess, "run", fake_run):
-            with mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view):
-                with tempfile.TemporaryDirectory() as tmp:
-                    json_out = Path(tmp) / "out.json"
-                    md_out = Path(tmp) / "out.md"
-                    args = [
-                        "check_pr_review_comments.py",
-                        "--repo", "OWNER/REPO",
-                        "--pr-number", "320",
-                        "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12",
-                        "--output-json", str(json_out),
-                        "--output-md", str(md_out),
-                    ]
-                    if extra_args:
-                        args.extend(extra_args)
-                    with mock.patch.object(sys, "argv", args):
-                        rc = crc.main()
-                    result = json.loads(json_out.read_text()) if json_out.exists() else {}
-                    md = md_out.read_text() if md_out.exists() else ""
-                    return rc, result
+        patches = [
+            mock.patch.object(subprocess, "run", fake_run),
+            mock.patch.object(crc, "gh_pr_view", fake_gh_pr_view),
+        ]
+        if mock_load_waiver is not None:
+            patches.append(mock.patch.object(crc, "load_waiver", mock_load_waiver))
+
+        ctx = contextlib.ExitStack()
+        for p in patches:
+            ctx.enter_context(p)
+        with ctx:
+            with tempfile.TemporaryDirectory() as tmp:
+                json_out = Path(tmp) / "out.json"
+                md_out = Path(tmp) / "out.md"
+                args = [
+                    "check_pr_review_comments.py",
+                    "--repo", "OWNER/REPO",
+                    "--pr-number", "320",
+                    "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12",
+                    "--output-json", str(json_out),
+                    "--output-md", str(md_out),
+                ]
+                if extra_args:
+                    args.extend(extra_args)
+                with mock.patch.object(sys, "argv", args):
+                    rc = crc.main()
+                result = json.loads(json_out.read_text()) if json_out.exists() else {}
+                md = md_out.read_text() if md_out.exists() else ""
+                return rc, result
 
     def test_no_comments_clean(self):
         rc, data = self._run({
@@ -751,6 +763,168 @@ class TestIntegration(unittest.TestCase):
             self.assertIsInstance(cmd, (list, tuple)), \
                 f"subprocess.run must receive list argv, got {type(cmd)}: {cmd}"
             self.assertNotIn("shell=True", " ".join(str(c) for c in cmd))
+
+    def test_head_mismatch_load_waiver_never_called(self):
+        """
+        FAIL-FAST: when live head != reported head, load_waiver must NEVER be called.
+        Even if a waiver file path is provided, the mismatch branch exits before
+        waiver loading is reachable.
+        """
+        def load_waiver_raises(*args, **kwargs):
+            raise AssertionError("load_waiver was called on head SHA mismatch — FAIL-FAST violated")
+
+        fh = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        waiver_path = fh.name
+        try:
+            json.dump({
+                "pr_number": 320,
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "waivers": [{"finding_id": "p2-001", "severity": "P2",
+                             "status": "WAIVED_NON_BLOCKING", "reason": "test",
+                             "expires_after_pr": 321}],
+            }, fh)
+            fh.close()
+
+            # Live head is "xyz789..." (mismatch with waiver SHA "abc123...")
+            rc, data = self._run(
+                {
+                    "issues/320/comments": gh_reply([]),
+                    "pulls/320/comments": gh_reply([]),
+                    "pulls/320/reviews": gh_reply([]),
+                },
+                extra_args=["--allow-p2-waivers", waiver_path,
+                            "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12"],
+                gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123",
+                mock_load_waiver=load_waiver_raises,
+            )
+            # Exit 2 INCONCLUSIVE due to mismatch
+            self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+            self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
+            self.assertTrue(data.get("head_sha_mismatch"))
+            # Findings are reported but no waivers applied
+            self.assertEqual(data.get("blockers"), [])
+            self.assertEqual(data.get("p2_waivers"), [])
+        finally:
+            Path(waiver_path).unlink(missing_ok=True)
+
+    def test_head_match_allows_load_waiver(self):
+        """
+        When live head == reported head, load_waiver IS called and waivers apply.
+        """
+        fid = crc.make_finding_id(
+            "chatgpt-codex-connector[bot]",
+            "scripts/local/run_temp_worktree_execution.py",
+            "1821",
+            "P2",
+            "**<sub><sub>![P2](https://img.shields.io/badge/P2-yellow) fix this**"
+        )
+        fh = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        waiver_path = fh.name
+        try:
+            json.dump({
+                "pr_number": 320,
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "waivers": [{"finding_id": fid, "severity": "P2",
+                             "status": "WAIVED_NON_BLOCKING", "reason": "acceptable risk",
+                             "evidence": "test passes", "expires_after_pr": 321,
+                             "body_prefix": "p2: fix this"}],
+            }, fh)
+            fh.close()
+
+            # Matching SHA, P2 comment that matches the waiver
+            rc, data = self._run(
+                {
+                    "issues/320/comments": gh_reply([]),
+                    "pulls/320/comments": gh_reply([{
+                        "user": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "**<sub><sub>![P2](https://img.shields.io/badge/P2-yellow) fix this**",
+                        "path": "scripts/local/run_temp_worktree_execution.py",
+                        "line": 1821,
+                        "commit_id": "abc123abc123",
+                        "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                    }]),
+                    "pulls/320/reviews": gh_reply([]),
+                },
+                extra_args=["--allow-p2-waivers", waiver_path],
+                gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+            )
+            # Waiver applies, P2 is no longer a blocker -> CLEAN
+            self.assertEqual(rc, crc.EXIT_CLEAN)
+            self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
+            self.assertFalse(data.get("head_sha_mismatch"))
+            self.assertGreaterEqual(len(data.get("p2_waivers", [])), 1)
+        finally:
+            Path(waiver_path).unlink(missing_ok=True)
+
+    def test_stale_waiver_not_replayed_after_new_commits(self):
+        """
+        Waiver was issued for OLD SHA. New commits landed (live head != waiver SHA).
+        The waiver MUST NOT be loaded or applied. Status = INCONCLUSIVE.
+        """
+        fh = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        waiver_path = fh.name
+        try:
+            json.dump({
+                "pr_number": 320,
+                "reported_head_sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "waivers": [{"finding_id": "p2-001", "severity": "P2",
+                             "status": "WAIVED_NON_BLOCKING", "reason": "stale waiver",
+                             "expires_after_pr": 321}],
+            }, fh)
+            fh.close()
+
+            # Live head is "xyz789..." but waiver is for "abc123..."
+            rc, data = self._run(
+                {
+                    "issues/320/comments": gh_reply([]),
+                    "pulls/320/comments": gh_reply([{
+                        "user": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "**<sub><sub>![P2](https://img.shields.io/badge/P2-yellow) fix this**",
+                        "path": "scripts/local/run_temp_worktree_execution.py",
+                        "line": 1821,
+                        "commit_id": "xyz789xyz789",  # current head commit
+                        "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                    }]),
+                    "pulls/320/reviews": gh_reply([]),
+                },
+                extra_args=["--allow-p2-waivers", waiver_path,
+                            "--reported-head-sha", "abc123abc123abc123abc123abc123abc123abcd12"],
+                gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123",
+            )
+            # Mismatch -> INCONCLUSIVE, waivers not applied
+            self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+            self.assertTrue(data.get("head_sha_mismatch"))
+            self.assertEqual(data.get("blockers"), [])  # no current-head blockers on mismatch
+            self.assertEqual(data.get("p2_waivers"), [])
+        finally:
+            Path(waiver_path).unlink(missing_ok=True)
+
+    def test_current_head_p1_still_blocks(self):
+        """
+        Current-head P1 findings still block normally when live head == reported head.
+        This is the non-regression case: P1s never get waived silently.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "abc123abc123",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # P1 blocks, no waivers apply
+        self.assertEqual(rc, crc.EXIT_BLOCKED)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_BLOCKED")
+        self.assertEqual(len(data.get("blockers", [])), 1)
+        self.assertEqual(data["blockers"][0]["severity"], "P1")
+        self.assertEqual(data.get("p2_waivers"), [])
 
 
 import tempfile

@@ -473,9 +473,9 @@ def main() -> int:
 
     all_findings = dedup_findings(all_findings)
 
-    # P1-B: Verify live head SHA against --reported-head-sha before applying waivers.
-    # P1-B: Waivers are SHA-specific; applying a stale waiver to a new head is unsafe.
-    # P1-B: Fetch live PR metadata and compare. Mismatch => inconclusive, skip waivers.
+    # P1-B: Verify live head SHA against --reported-head-sha.
+    # This check MUST happen before any waiver loading or blocker classification.
+    # A stale SHA can never reach the waiver-loading code path.
     live_head_sha = ""
     head_sha_mismatch = False
     ok_live, live_data, err_live = gh_pr_view(args.repo, args.pr_number)
@@ -490,6 +490,45 @@ def main() -> int:
                 f"live={live_head_sha[:8]} — waivers blocked until SHA is corrected"
             )
             head_sha_mismatch = True
+
+    # -----------------------------------------------------------------------
+    # FAIL-FAST: if head SHA mismatch, do not load or apply any waivers.
+    # load_waiver() and waiver application are UNREACHABLE here.
+    # -----------------------------------------------------------------------
+    if head_sha_mismatch:
+        # Stale/current-head classification is skipped on mismatch.
+        # Findings are reported as-harvested; no waivers applied.
+        output = {
+            "status": "REVIEW_COMMENTS_INCONCLUSIVE",
+            "pr_number": args.pr_number,
+            "reported_head_sha": args.reported_head_sha,
+            "live_head_sha": live_head_sha,
+            "head_sha_mismatch": head_sha_mismatch,
+            "harvested_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "sources_fetched": sources_fetched,
+            "api_errors": api_errors,
+            "findings": all_findings,
+            "blockers": [],
+            "stale_blockers": [],
+            "stale_findings_summary": {"total_stale": 0, "stale_blockers": 0, "stale_finding_ids": []},
+            "current_head_findings_count": 0,
+            "stale_findings_count": 0,
+            "p2_waivers": [],
+            "summary_counts": {},
+        }
+        Path(args.output_json).write_text(json.dumps(output, indent=2))
+        md = f"# PR Review Comment Gate — PR #{args.pr_number}\n\n"
+        md += f"**Reported head SHA:** `{args.reported_head_sha}`  \n"
+        md += f"**Live head SHA:** `{live_head_sha}`  \n"
+        md += f"**Status:** `REVIEW_COMMENTS_INCONCLUSIVE`  \n"
+        md += f"\n**⚠️  Live SHA mismatch — waivers blocked, status is INCONCLUSIVE.**\n\n"
+        md += f"**Error:** {api_errors[0]}\n\n"
+        md += f"_Findings are reported as-harvested; no waivers applied on mismatch._\n"
+        md += f"_Trigger an exact-head Codex re-review to clear this state._\n"
+        Path(args.output_md).write_text(md)
+        print(f"[check_pr_review_comments] status=REVIEW_COMMENTS_INCONCLUSIVE "
+              f"(head_sha_mismatch=True, waivers unreachable)")
+        return EXIT_INCONCLUSIVE
 
     # -----------------------------------------------------------------------
     # Stale vs current-head classification
@@ -524,17 +563,10 @@ def main() -> int:
         else:
             stale_findings.append(f)
 
-    # Load waivers if provided (only if head SHA verified).
-    # P1-B: if live head != reported head, do not load waivers — a stale waiver
-    # for the old SHA must not be applied to findings on the newer commit.
-    # The mismatch is also recorded as an api_error so status => INCONCLUSIVE.
+    # Load waivers (only reached when live head == reported head — mismatch impossible here).
     waivers_applied: list[dict[str, Any]] = []
     waiver_map: dict[str, dict[str, Any]] = {}
-    if args.allow_p2_waivers and not head_sha_mismatch:
-        # SHA check: lines 486-492 verify live headRefOid against --reported-head-sha.
-        # If they differ, head_sha_mismatch=True and THIS BRANCH IS NOT REACHED.
-        # A stale waiver for the old SHA can therefore NEVER be applied to findings
-        # on a newer commit — the concern in P1 codex-758fd294c8a6 is invalid.
+    if args.allow_p2_waivers:
         ok, waiver_data, err = load_waiver(
             args.allow_p2_waivers, args.pr_number, args.reported_head_sha
         )
