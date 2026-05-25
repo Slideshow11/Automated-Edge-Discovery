@@ -88,11 +88,14 @@ jobs:
         run: bash scripts/ci/validate_governance_manifests.sh
 
   review-comment-gate:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # Runs on all pull_request events targeting main.
-    # Requires --pr-number and --reported-head-sha from the PR context.
-    # gh CLI is pre-installed on ubuntu-latest runners and authenticated
-    # via GITHUB_TOKEN. No live Claude, no Hermes mutations.
+    # Runs only on pull_request events targeting main.
+    # Skipped on push events (branches like feat/*, fix/*) where
+    # github.event.pull_request is absent and PR_NUMBER/HEAD_SHA
+    # would be empty, causing check_pr_review_comments.py to fail.
+    # Uses gh CLI authenticated via GITHUB_TOKEN.
+    # No live Claude, no Hermes mutations.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
