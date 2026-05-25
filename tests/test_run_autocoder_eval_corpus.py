@@ -333,22 +333,29 @@ class TestResolveBaseSha:
     def test_current_main_resolves_to_sha(self):
         ns = _ns()
         repo = Path(".").resolve()
+        # Skip if main branch is not available (e.g., CI checks out feature branch only)
+        try:
+            main_sha = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "main"], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            pytest.skip("main branch not available")
         ok, msg, sha = ns["resolve_base_sha"]("current_main", repo)
         assert ok, msg
         assert len(sha) == 40
         assert all(c in "0123456789abcdef" for c in sha)
-        # Verify it matches git rev-parse main
-        main_sha = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "main"], text=True
-        ).strip()
         assert sha == main_sha
 
     def test_literal_valid_sha_passes(self):
         ns = _ns()
         repo = Path(".").resolve()
-        head = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "main"], text=True
-        ).strip()
+        # Skip if main branch is not available (e.g., CI checks out feature branch only)
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "main"], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            pytest.skip("main branch not available")
         ok, msg, sha = ns["resolve_base_sha"](head, repo)
         assert ok, msg
         assert sha == head
@@ -369,9 +376,13 @@ class TestValidateCorpusTargets:
     def test_all_targets_exist_and_clean_no_aed_plan(self):
         ns = _ns()
         repo = Path(".").resolve()
-        head = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "main"], text=True
-        ).strip()
+        # Skip if main branch is not available (e.g., CI checks out feature branch only)
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "main"], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            pytest.skip("main branch not available")
         corpus = json.loads(Path("corpus/corpus-001.json").read_text(encoding="utf-8"))
         ok, errors = ns["validate_corpus_targets"](corpus, head, repo, skip_branch_check=True)
         # Branch collision errors may occur if branches already exist from prior runs;
@@ -382,9 +393,13 @@ class TestValidateCorpusTargets:
     def test_nonexistent_file_fails_validation(self):
         ns = _ns()
         repo = Path(".").resolve()
-        head = subprocess.check_output(
-            ["git", "-C", str(repo), "rev-parse", "main"], text=True
-        ).strip()
+        # Skip if main branch is not available (e.g., CI checks out feature branch only)
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "main"], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            pytest.skip("main branch not available")
         corpus = {
             "corpus_id": "test",
             "corpus_version": "0.1.0",
