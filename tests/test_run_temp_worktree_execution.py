@@ -32,6 +32,7 @@ import json
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -3305,6 +3306,219 @@ def test_smoke_002_style_bad_packet_rejected_by_phase_1b(tmp_path):
         assert any("forbidden_files" in e.lower() or "non-empty" in e.lower()
                    for e in result.get("validation_errors", [])), \
             f"error must mention forbidden_files: {result.get('validation_errors')}"
+
+
+class TestRepoRootArg:
+    """Tests for the --repo-root CLI argument of run_temp_worktree_execution.py."""
+
+    def test_accepts_valid_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to a valid git repo is accepted and used for Phase 3.
+
+        We create a fresh worktree at base_sha to ensure the worktree itself is clean
+        (no WIP changes from the test environment). Using the main repo checkout
+        directly would fail Phase 3 due to uncommitted test WIP changes.
+        """
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        worktree_path = tmp_path / "worktree"
+
+        # Create a clean worktree at base_sha to use as --repo-root
+        wt_res = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add",
+             str(worktree_path), base_sha, "--detach"],
+            capture_output=True, text=True, timeout=30
+        )
+        if wt_res.returncode != 0:
+            pytest.skip(f"cannot create worktree for test: {wt_res.stderr}")
+
+        try:
+            plan_path, plan_sha = make_plan_file(tmp_path)
+            now = now_iso()
+
+            packet = {
+                "packet_kind": "aed.temp_worktree.execution.v0",
+                "run_id": f"test-repo-root-valid-{uuid.uuid4().hex[:8]}",
+                "task_id": "TASK-REPO-001",
+                "base_sha": base_sha,
+                "approved_plan_path": str(plan_path),
+                "approved_plan_sha256": plan_sha,
+                "approval": {
+                    "approved_for_temp_worktree_execution": True,
+                    "approved_by": "human",
+                    "approved_plan_sha256": plan_sha,
+                    "approved_at": now,
+                    "max_changed_files": 5,
+                },
+                "task": {
+                    "description": "Edit docs/example.md",
+                    "allowed_files": ["docs/example.md"],
+                    "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                    "do_not": [],
+                },
+                "execution": {
+                    "mode": "mock",
+                    "timeout_seconds": 60,
+                    "output_root": str(tmp_path / "output"),
+                    "mock_edits": [],
+                },
+            }
+
+            packet_path = tmp_path / "packet.json"
+            packet_path.write_text(json.dumps(packet), encoding="utf-8")
+            output_json = tmp_path / "result.json"
+            output_md = tmp_path / "result.md"
+
+            argv = [
+                "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+                "--packet-json", str(packet_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+                "--repo-root", str(worktree_path),
+            ]
+
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=60
+            )
+
+            # Should succeed: worktree HEAD (base_sha) == packet base_sha, worktree is clean
+            assert result.returncode == 0, f"non-zero exit: {result.stderr}"
+            data = json.loads(output_json.read_text())
+            # Phase 3 passes with matching HEAD and clean status
+            assert data["status"] in (
+                "PATCH_READY_FOR_HUMAN_REVIEW",
+                "HOLD_PLAN_NOT_APPROVED",
+                "HOLD_INVALID_PACKET",
+            ), f"unexpected status: {data.get('status')} — {data.get('validation_errors')}"
+        finally:
+            # Clean up worktree
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                 str(worktree_path), "--force"],
+                capture_output=True
+            )
+
+    def test_rejects_nonexistent_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to non-existent path returns exit code 1."""
+        packet = {"packet_kind": "x"}
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", "/nonexistent/path/xyz",
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30
+        )
+
+        assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
+        assert "does not exist" in result.stderr, f"stderr must mention 'does not exist': {result.stderr}"
+
+    def test_rejects_non_git_repo_root_arg(self, tmp_path):
+        """--repo-root pointing to a non-git directory returns exit code 1."""
+        # tmp_path is not a git repo
+        packet = {"packet_kind": "x"}
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", str(tmp_path),
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=30
+        )
+
+        assert result.returncode == 1, f"expected exit 1, got {result.returncode}"
+        assert "not inside a git worktree" in result.stderr, \
+            f"stderr must mention 'not inside a git worktree': {result.stderr}"
+
+    def test_repo_root_used_for_phase3_head_check(self, tmp_path):
+        """With --repo-root, Phase 3 checks effective_repo_root HEAD == base_sha, not parent checkout."""
+        import run_temp_worktree_execution as rte
+
+        # Create a git worktree at a known base_sha
+        base_sha = git_rev_parse(REPO_ROOT, "HEAD")
+        worktree_path = tmp_path / "worktree"
+        wt_res = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add",
+             str(worktree_path), base_sha],
+            capture_output=True, text=True
+        )
+        if wt_res.returncode != 0:
+            pytest.skip(f"cannot create worktree for test: {wt_res.stderr}")
+
+        plan_path, plan_sha = make_plan_file(tmp_path)
+        now = now_iso()
+
+        packet = {
+            "packet_kind": "aed.temp_worktree.execution.v0",
+            "run_id": f"test-repo-root-phase3-{uuid.uuid4().hex[:8]}",
+            "task_id": "TASK-REPO-P3",
+            "base_sha": base_sha,
+            "approved_plan_path": str(plan_path),
+            "approved_plan_sha256": plan_sha,
+            "approval": {
+                "approved_for_temp_worktree_execution": True,
+                "approved_by": "human",
+                "approved_plan_sha256": plan_sha,
+                "approved_at": now,
+                "max_changed_files": 5,
+            },
+            "task": {
+                "description": "Edit README.md",
+                "allowed_files": ["README.md"],
+                "forbidden_files": PROTECTED_GATE_SCRIPTS,
+                "do_not": [],
+            },
+            "execution": {
+                "mode": "mock",
+                "timeout_seconds": 60,
+                "output_root": str(tmp_path / "output"),
+                "mock_edits": [],
+            },
+        }
+
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        output_json = tmp_path / "result.json"
+        output_md = tmp_path / "result.md"
+
+        # Run with --repo-root pointing to the worktree
+        argv = [
+            "python3", str(SCRIPT_DIR / "run_temp_worktree_execution.py"),
+            "--packet-json", str(packet_path),
+            "--output-json", str(output_json),
+            "--output-md", str(output_md),
+            "--repo-root", str(worktree_path),
+        ]
+
+        result = subprocess.run(
+            argv, capture_output=True, text=True, timeout=60
+        )
+
+        # Cleanup worktree
+        subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "remove", str(worktree_path), "--force"],
+            capture_output=True
+        )
+
+        assert result.returncode == 0, f"non-zero exit: {result.stderr}"
+        data = json.loads(output_json.read_text())
+        # Worktree HEAD (base_sha) == packet base_sha → Phase 3 passes
+        assert data.get("status") != "HOLD_MAIN_DIRTY", \
+            f"Phase 3 should pass with correct --repo-root: {data.get('validation_errors')}"
 
 
 class TestUntrackedFileDetection:

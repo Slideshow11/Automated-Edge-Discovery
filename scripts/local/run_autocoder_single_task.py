@@ -527,6 +527,7 @@ def run_autocoder_single_task(
         "--packet-json", str(execution_packet_path),
         "--output-json", str(result_json_path),
         "--output-md", str(result_md_path),
+        "--repo-root", str(effective_repo_root),
     ]
     rc2, stdout2, stderr2 = run_stage(stage2_argv, effective_repo_root)
     del stage2_argv
