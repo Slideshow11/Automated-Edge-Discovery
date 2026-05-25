@@ -3333,6 +3333,10 @@ class TestRepoRootArg:
         try:
             plan_path, plan_sha = make_plan_file(tmp_path)
             now = now_iso()
+            # Create a fake Hermes home so PMG snapshot doesn't fail on missing Hermes
+            fake_hermes = tmp_path / ".hermes"
+            fake_hermes.mkdir()
+            (fake_hermes / "config").write_text("{}")
 
             packet = {
                 "packet_kind": "aed.temp_worktree.execution.v0",
@@ -3376,10 +3380,12 @@ class TestRepoRootArg:
             ]
 
             result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=60
+                argv, capture_output=True, text=True, timeout=60,
+                env={**__import__("os").environ, "HERMES_HOME": str(tmp_path / ".hermes")},
             )
 
             # Should succeed: worktree HEAD (base_sha) == packet base_sha, worktree is clean
+            # Note: HERMES_HOME is passed so PMG targets the temp dir instead of the CI runner's home.
             assert result.returncode == 0, f"non-zero exit: {result.stderr}"
             data = json.loads(output_json.read_text())
             # Phase 3 passes with matching HEAD and clean status
@@ -3461,6 +3467,10 @@ class TestRepoRootArg:
 
         plan_path, plan_sha = make_plan_file(tmp_path)
         now = now_iso()
+        # Create a fake Hermes home so PMG snapshot doesn't fail on missing Hermes
+        fake_hermes = tmp_path / ".hermes"
+        fake_hermes.mkdir()
+        (fake_hermes / "config").write_text("{}")
 
         packet = {
             "packet_kind": "aed.temp_worktree.execution.v0",
@@ -3505,7 +3515,8 @@ class TestRepoRootArg:
         ]
 
         result = subprocess.run(
-            argv, capture_output=True, text=True, timeout=60
+            argv, capture_output=True, text=True, timeout=60,
+            env={**__import__("os").environ, "HERMES_HOME": str(tmp_path / ".hermes")},
         )
 
         # Cleanup worktree
