@@ -42,6 +42,8 @@ class State:
     HOLD_CI_RED = "HOLD_CI_RED"
     HOLD_CODEX_REQUIRED = "HOLD_CODEX_REQUIRED"
     HOLD_CODEX_STALE = "HOLD_CODEX_STALE"
+    HOLD_REVIEW_COMMENTS_BLOCKED = "HOLD_REVIEW_COMMENTS_BLOCKED"
+    HOLD_REVIEW_COMMENTS_INCONCLUSIVE = "HOLD_REVIEW_COMMENTS_INCONCLUSIVE"
     HOLD_PMG_MISSING = "HOLD_PMG_MISSING"
     HOLD_PMG_DIRTY = "HOLD_PMG_DIRTY"
     HOLD_HEAD_MISMATCH = "HOLD_HEAD_MISMATCH"
@@ -104,6 +106,17 @@ def parse_args() -> argparse.Namespace:
             "When set and the PR contains only documentation changes "
             "(markdown/text files under docs/, README.md, etc.), "
             "Codex exact-head review may be waived for the final gate."
+        ),
+    )
+    parser.add_argument(
+        "--review-comments-json",
+        help=(
+            "Path to a check_pr_review_comments.py output JSON. "
+            "When supplied, a fresh local BLOCKED or INCONCLUSIVE review-comment "
+            "gate result will override the Codex SHA check and cause a HOLD, "
+            "preventing merge authorization even when --codex-reviewed-sha matches. "
+            "This closes the gap where Codex posts comments after CI completes. "
+            "If the file is absent or invalid, a HOLD is issued."
         ),
     )
     return parser.parse_args()
@@ -404,6 +417,52 @@ def load_pmg_guard_state(path: str) -> tuple[bool, Optional[dict], str]:
         return False, data, f"PMG guard state status is '{status}' (expected 'clean')"
 
 
+def load_review_comments_state(path: str) -> tuple[bool, Optional[dict], str]:
+    """
+    Load and validate a check_pr_review_comments.py output JSON.
+
+    Returns (is_valid, data, error_message).
+    A valid file with status REVIEW_COMMENTS_CLEAN is treated as clean.
+    REVIEW_COMMENTS_BLOCKED or REVIEW_COMMENTS_INCONCLUSIVE is treated as not-clean.
+    A missing or invalid file causes a HOLD.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return False, None, f"Review-comments JSON not found: {path}"
+    except json.JSONDecodeError as e:
+        return False, None, f"Invalid JSON in review-comments file: {e}"
+
+    if not isinstance(data, dict):
+        return False, None, "Review-comments file must be a JSON object"
+
+    status = data.get("status")
+    if status == "REVIEW_COMMENTS_CLEAN":
+        return True, data, "Review-comments gate is clean"
+    elif status == "REVIEW_COMMENTS_BLOCKED":
+        blockers = data.get("blockers", [])
+        if not isinstance(blockers, list):
+            return False, data, (
+                "Review-comments file 'blockers' field is not a list "
+                f"(got {type(blockers).__name__})"
+            )
+        blocker_summary = "; ".join(
+            f"{b.get('severity', '?')} on {b.get('file_path', '?') or 'PR'}"
+            for b in blockers[:3]
+        ) or "unknown"
+        return False, data, f"Review-comments gate is BLOCKED: {blocker_summary}"
+    elif status == "REVIEW_COMMENTS_INCONCLUSIVE":
+        return False, data, (
+            "Review-comments gate is INCONCLUSIVE "
+            "(review-comment-gate returned INCONCLUSIVE — stale findings or API errors)"
+        )
+    elif status is None:
+        return False, None, "Review-comments file has no 'status' field"
+    else:
+        return False, data, f"Review-comments file status is '{status}' (expected CLEAN/BLOCKED/INCONCLUSIVE)"
+
+
 # ---------------------------------------------------------------------------
 # Build output report
 # ---------------------------------------------------------------------------
@@ -456,6 +515,8 @@ def compute_result(
                 next_action = "PR is closed/merged, manual review required"
             elif "git" in first:
                 next_action = "clean git status and rerun"
+            elif "review-comment" in first:
+                next_action = "run local check_pr_review_comments.py and address findings, then rerun"
             else:
                 next_action = "resolve blocker and rerun final gate status"
         else:
@@ -586,7 +647,28 @@ def evaluate(args: argparse.Namespace) -> dict:
             blockers, repo, None,
         )
 
-    # --- Check 3: CI must be green ---
+    # --- Check 3 (moved before CI): Fresh local review-comment gate ---
+    # When --review-comments-json is provided, check it BEFORE is_ci_green.
+    # This ensures a fresh local BLOCKED/INCONCLUSIVE result takes precedence
+    # over stale CI state, closing the structural gap identified in PR #326.
+    rc_path = getattr(args, "review_comments_json", None)
+    if rc_path:
+        rc_valid, rc_data, rc_reason = load_review_comments_state(rc_path)
+        if not rc_valid:
+            blockers = [f"Review-comments gate: {rc_reason}"]
+            rc_blocked = (
+                State.HOLD_REVIEW_COMMENTS_BLOCKED
+                if "BLOCKED" in rc_reason
+                else State.HOLD_REVIEW_COMMENTS_INCONCLUSIVE
+            )
+            return compute_result(
+                rc_blocked, pr_number, canonical_head_sha,
+                {"pr_open": True, "head_matches": True, "ci_green": True,
+                 "codex_exact_head": True, "pmg_clean": True, "git_status_clean": True},
+                blockers, repo, None,
+            )
+
+    # --- Check 4: CI must be green ---
     ci_green, ci_reason = is_ci_green(pr_number, repo, canonical_head_sha)
     if not ci_green:
         blockers = [f"CI is not green: {ci_reason}"]
@@ -597,7 +679,7 @@ def evaluate(args: argparse.Namespace) -> dict:
             blockers, repo, None,
         )
 
-    # --- Check 4: Codex exact-head review ---
+    # --- Check 5: Codex exact-head review ---
     # Docs-only waiver: if --allow-docs-only-codex-waiver is set AND the PR
     # diff is docs-only, skip the Codex SHA requirement.
     codex_sha = args.codex_reviewed_sha
@@ -656,7 +738,7 @@ def evaluate(args: argparse.Namespace) -> dict:
             blockers, repo, pmg_data,
         )
 
-    # --- Check 6: Git status must be clean ---
+    # --- Check 7: Git status must be clean ---
     git_clean, git_reason = is_git_clean()
     if not git_clean:
         blockers = [f"Git status is not clean: {git_reason.split(chr(10))[0]}"]

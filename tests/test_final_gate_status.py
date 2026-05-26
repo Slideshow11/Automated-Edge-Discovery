@@ -32,6 +32,7 @@ def make_args(
     output_md=None,
     repo="Slideshow11/Automated-Edge-Discovery",
     allow_docs_only_codex_waiver=False,
+    review_comments_json=None,
 ):
     return type(
         "Args",
@@ -45,6 +46,7 @@ def make_args(
             "output_md": output_md,
             "repo": repo,
             "allow_docs_only_codex_waiver": allow_docs_only_codex_waiver,
+            "review_comments_json": review_comments_json,
         },
     )()
 
@@ -130,6 +132,82 @@ class TestLoadPmgGuardState:
         is_valid, data, reason = fgs.load_pmg_guard_state(str(path))
         assert is_valid is False
         assert "json" in reason.lower()
+
+
+# ---------------------------------------------------------------------------
+# Review-comments state loading tests
+# ---------------------------------------------------------------------------
+
+class TestLoadReviewCommentsState:
+    def test_clean_returns_valid(self, tmp_path):
+        path = tmp_path / "rc_clean.json"
+        path.write_text(json.dumps({"status": "REVIEW_COMMENTS_CLEAN", "blockers": []}))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is True
+        assert data["status"] == "REVIEW_COMMENTS_CLEAN"
+
+    def test_blocked_returns_invalid(self, tmp_path):
+        path = tmp_path / "rc_blocked.json"
+        path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": [{"severity": "P2", "file_path": "scripts/test.py"}],
+        }))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "BLOCKED" in reason
+
+    def test_inconclusive_returns_invalid(self, tmp_path):
+        path = tmp_path / "rc_inconclusive.json"
+        path.write_text(json.dumps({"status": "REVIEW_COMMENTS_INCONCLUSIVE", "stale_blockers": []}))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "INCONCLUSIVE" in reason
+
+    def test_no_status_field_returns_invalid(self, tmp_path):
+        path = tmp_path / "rc_no_status.json"
+        path.write_text(json.dumps({"blockers": []}))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "status" in reason.lower()
+
+    def test_nonexistent_returns_invalid(self):
+        is_valid, data, reason = fgs.load_review_comments_state("/nonexistent/path.json")
+        assert is_valid is False
+        assert "not found" in reason.lower()
+
+    def test_invalid_json_returns_invalid(self, tmp_path):
+        path = tmp_path / "bad.json"
+        path.write_text("{ this is not json")
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "json" in reason.lower()
+
+    def test_blocked_inconclusive_next_action_is_review_comments(self, tmp_path):
+        """Blockers starting with 'Review-comments gate' produce the review-comments next_action."""
+        path = tmp_path / "rc_blocked.json"
+        path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": [{"severity": "P1", "file_path": "test.py"}],
+        }))
+        # Verify the blocker text is recognized
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert "Review-comments gate" in reason or "BLOCKED" in reason
+
+    def test_blockers_not_a_list_returns_invalid(self, tmp_path):
+        """
+        If blockers is a dict (malformed JSON), load_review_comments_state
+        returns invalid with a clear error rather than crashing on b.get().
+        Regression test for Codex P2 on PR #327.
+        """
+        path = tmp_path / "rc_blocked_malformed.json"
+        path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": {"0": {"severity": "P2"}},  # should be a list, not a dict
+        }))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "not a list" in reason
+        assert "dict" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +554,152 @@ class TestReadyToMerge:
                 r = fgs.evaluate(args_pmg)
         assert r["merge_command"] == ""
         assert r["authorization_phrase"] == ""
+
+
+# ---------------------------------------------------------------------------
+# Review-comments JSON integration (Check 6 — closes PR #326 structural gap)
+# ---------------------------------------------------------------------------
+
+class TestReviewCommentsJsonIntegration:
+    """Tests for --review-comments-json integration in evaluate()."""
+
+    def test_hold_review_comments_blocked_when_file_blocked(self, pmg_clean, tmp_path):
+        """
+        When --review-comments-json is supplied and the file shows REVIEW_COMMENTS_BLOCKED,
+        evaluate() returns HOLD_REVIEW_COMMENTS_BLOCKED even when --codex-reviewed-sha matches.
+        This is the PR #326 structural gap fix.
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        rc_path = tmp_path / "rc_blocked.json"
+        rc_path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": [{"severity": "P2", "file_path": "scripts/test.py"}],
+        }))
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json=str(rc_path),
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        assert result["status"] == fgs.State.HOLD_REVIEW_COMMENTS_BLOCKED
+        assert any("Review-comments gate" in b for b in result["blockers"])
+        assert result["merge_command"] == ""
+
+    def test_hold_review_comments_inconclusive_when_file_inconclusive(self, pmg_clean, tmp_path):
+        """
+        When --review-comments-json shows REVIEW_COMMENTS_INCONCLUSIVE,
+        evaluate() returns HOLD_REVIEW_COMMENTS_INCONCLUSIVE.
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        rc_path = tmp_path / "rc_inconclusive.json"
+        rc_path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_INCONCLUSIVE",
+            "stale_blockers": [{"severity": "P1", "file_path": "test.py"}],
+        }))
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json=str(rc_path),
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        assert result["status"] == fgs.State.HOLD_REVIEW_COMMENTS_INCONCLUSIVE
+        assert any("Review-comments gate" in b for b in result["blockers"])
+
+    def test_ready_when_review_comments_json_is_clean(self, pmg_clean, tmp_path):
+        """
+        When --review-comments-json is supplied and shows REVIEW_COMMENTS_CLEAN,
+        evaluate() continues to READY_TO_MERGE (no regression).
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        rc_path = tmp_path / "rc_clean.json"
+        rc_path.write_text(json.dumps({"status": "REVIEW_COMMENTS_CLEAN", "blockers": []}))
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json=str(rc_path),
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        assert result["status"] == fgs.State.READY_TO_MERGE
+        assert result["blockers"] == []
+
+    def test_hold_when_review_comments_json_missing(self, pmg_clean):
+        """
+        When --review-comments-json is supplied but the file does not exist,
+        evaluate() returns HOLD_REVIEW_COMMENTS_INCONCLUSIVE (fail-closed).
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json="/nonexistent/review-comments.json",
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        assert result["status"] == fgs.State.HOLD_REVIEW_COMMENTS_INCONCLUSIVE
+        assert any("not found" in b for b in result["blockers"])
+
+    def test_no_review_comments_json_means_codex_sha_check_only(self, pmg_clean):
+        """
+        When --review-comments-json is NOT supplied, evaluate() falls back to
+        the existing --codex-reviewed-sha trust check (Check 4) with no review-comments override.
+        This confirms backward compatibility.
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json=None,  # not supplied
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        # Should pass — no review-comments-json means the gap is unchanged for old callers
+        assert result["status"] == fgs.State.READY_TO_MERGE
+
+    def test_next_action_for_review_comments_blocker(self, pmg_clean, tmp_path):
+        """
+        Review-comments blockers produce next_action pointing to check_pr_review_comments.py.
+        """
+        sha = "abc123def0000000000000000000000000000000"
+        rc_path = tmp_path / "rc_blocked.json"
+        rc_path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": [{"severity": "P2", "file_path": "scripts/test.py"}],
+        }))
+        args = make_args(
+            reported_head_sha=sha,
+            codex_reviewed_sha=sha,
+            pmg_guard_state_json=str(pmg_clean),
+            review_comments_json=str(rc_path),
+        )
+        with mock.patch.object(fgs, "fetch_pr_state", return_value=make_pr_open(sha)):
+            with mock.patch.object(fgs, "is_ci_green", return_value=(True, "ok")):
+                with mock.patch.object(fgs, "is_git_clean", return_value=(True, "ok")):
+                    result = fgs.evaluate(args)
+
+        assert "check_pr_review_comments.py" in result["next_action"]
 
 
 # ---------------------------------------------------------------------------
