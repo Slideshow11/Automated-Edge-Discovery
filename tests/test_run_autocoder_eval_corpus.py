@@ -533,14 +533,24 @@ class TestInvokeBatchControllerRCGuard:
         report_json = tmp_path / "report.json"
         report_md = tmp_path / "report.md"
 
-        # Get a real SHA to avoid validate_corpus_targets failing before we reach the rc guard
-        try:
-            real_sha = subprocess.check_output(
-                ["git", "-C", str(Path(".").resolve()), "rev-parse", "main"],
-                text=True,
-            ).strip()
-        except subprocess.CalledProcessError:
-            real_sha = "a" * 40  # fallback — validate_corpus_targets will fail, test will fail fast
+        # Get a real SHA so validate_corpus_targets doesn't fail before we reach the rc guard.
+        # Try multiple refs: HEAD (CI shallow clone), origin/main, main.
+        repo_path = Path(".").resolve()
+        real_sha = None
+        for ref in ["HEAD", "origin/main", "main"]:
+            try:
+                real_sha = subprocess.check_output(
+                    ["git", "-C", str(repo_path), "rev-parse", "--verify", ref],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                break
+            except subprocess.CalledProcessError:
+                pass
+        if real_sha is None:
+            # Last-resort fallback — validate_corpus_targets will fail fast; test will fail
+            # with a clear assertion rather than silently returning the wrong result.
+            real_sha = "a" * 40
 
         # Mock invoke_batch_controller to return nonzero rc
         # This simulates the batch subprocess crashing/failing
