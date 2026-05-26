@@ -442,6 +442,11 @@ def load_review_comments_state(path: str) -> tuple[bool, Optional[dict], str]:
         return True, data, "Review-comments gate is clean"
     elif status == "REVIEW_COMMENTS_BLOCKED":
         blockers = data.get("blockers", [])
+        if not isinstance(blockers, list):
+            return False, data, (
+                "Review-comments file 'blockers' field is not a list "
+                f"(got {type(blockers).__name__})"
+            )
         blocker_summary = "; ".join(
             f"{b.get('severity', '?')} on {b.get('file_path', '?') or 'PR'}"
             for b in blockers[:3]

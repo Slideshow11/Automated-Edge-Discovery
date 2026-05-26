@@ -193,6 +193,22 @@ class TestLoadReviewCommentsState:
         is_valid, data, reason = fgs.load_review_comments_state(str(path))
         assert "Review-comments gate" in reason or "BLOCKED" in reason
 
+    def test_blockers_not_a_list_returns_invalid(self, tmp_path):
+        """
+        If blockers is a dict (malformed JSON), load_review_comments_state
+        returns invalid with a clear error rather than crashing on b.get().
+        Regression test for Codex P2 on PR #327.
+        """
+        path = tmp_path / "rc_blocked_malformed.json"
+        path.write_text(json.dumps({
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": {"0": {"severity": "P2"}},  # should be a list, not a dict
+        }))
+        is_valid, data, reason = fgs.load_review_comments_state(str(path))
+        assert is_valid is False
+        assert "not a list" in reason
+        assert "dict" in reason
+
 
 # ---------------------------------------------------------------------------
 # CI green tests
