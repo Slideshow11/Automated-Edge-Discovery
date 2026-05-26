@@ -647,7 +647,28 @@ def evaluate(args: argparse.Namespace) -> dict:
             blockers, repo, None,
         )
 
-    # --- Check 3: CI must be green ---
+    # --- Check 3 (moved before CI): Fresh local review-comment gate ---
+    # When --review-comments-json is provided, check it BEFORE is_ci_green.
+    # This ensures a fresh local BLOCKED/INCONCLUSIVE result takes precedence
+    # over stale CI state, closing the structural gap identified in PR #326.
+    rc_path = getattr(args, "review_comments_json", None)
+    if rc_path:
+        rc_valid, rc_data, rc_reason = load_review_comments_state(rc_path)
+        if not rc_valid:
+            blockers = [f"Review-comments gate: {rc_reason}"]
+            rc_blocked = (
+                State.HOLD_REVIEW_COMMENTS_BLOCKED
+                if "BLOCKED" in rc_reason
+                else State.HOLD_REVIEW_COMMENTS_INCONCLUSIVE
+            )
+            return compute_result(
+                rc_blocked, pr_number, canonical_head_sha,
+                {"pr_open": True, "head_matches": True, "ci_green": True,
+                 "codex_exact_head": True, "pmg_clean": True, "git_status_clean": True},
+                blockers, repo, None,
+            )
+
+    # --- Check 4: CI must be green ---
     ci_green, ci_reason = is_ci_green(pr_number, repo, canonical_head_sha)
     if not ci_green:
         blockers = [f"CI is not green: {ci_reason}"]
@@ -658,7 +679,7 @@ def evaluate(args: argparse.Namespace) -> dict:
             blockers, repo, None,
         )
 
-    # --- Check 4: Codex exact-head review ---
+    # --- Check 5: Codex exact-head review ---
     # Docs-only waiver: if --allow-docs-only-codex-waiver is set AND the PR
     # diff is docs-only, skip the Codex SHA requirement.
     codex_sha = args.codex_reviewed_sha
@@ -716,29 +737,6 @@ def evaluate(args: argparse.Namespace) -> dict:
              "codex_exact_head": True, "pmg_clean": False, "git_status_clean": True},
             blockers, repo, pmg_data,
         )
-
-    # --- Check 6: Fresh local review-comment gate (if --review-comments-json supplied) ---
-    # When --review-comments-json is provided, load and validate it.
-    # A BLOCKED or INCONCLUSIVE result causes a HOLD even when --codex-reviewed-sha
-    # matched the head SHA, closing the gap where Codex posts comments after CI runs.
-    # This is an optional integration gate — omitting the flag leaves the existing
-    # Codex SHA trust-based check (Check 4) as the only review-comment signal.
-    rc_path = getattr(args, "review_comments_json", None)
-    if rc_path:
-        rc_valid, rc_data, rc_reason = load_review_comments_state(rc_path)
-        if not rc_valid:
-            blockers = [f"Review-comments gate: {rc_reason}"]
-            rc_blocked = (
-                State.HOLD_REVIEW_COMMENTS_BLOCKED
-                if "BLOCKED" in rc_reason
-                else State.HOLD_REVIEW_COMMENTS_INCONCLUSIVE
-            )
-            return compute_result(
-                rc_blocked, pr_number, canonical_head_sha,
-                {"pr_open": True, "head_matches": True, "ci_green": True,
-                 "codex_exact_head": True, "pmg_clean": True, "git_status_clean": True},
-                blockers, repo, pmg_data,
-            )
 
     # --- Check 7: Git status must be clean ---
     git_clean, git_reason = is_git_clean()
