@@ -1,0 +1,316 @@
+{
+  "corpus_kind": "aed.codex_remediation.corpus.v0",
+  "corpus_id": "codex-remediation-pr314-320",
+  "corpus_version": "0.1.0",
+  "description": "Regression and evidence tasks derived from the PR #314-#320 Codex note retrospective audit. Converts 26 audit findings into structured remediation tasks for the AED batch autocoder. All tasks are mock-only in Wave 1.",
+  "source_audit_doc": "docs/codex_note_retrospective_audit_pr314_320.md",
+  "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
+  "created_at": "2026-05-26T00:00:00Z",
+  "base_sha_policy": "current_main",
+  "scope": {
+    "prs": [314, 315, 316, 317, 318, 319, 320],
+    "finding_count": 26,
+    "p1_count": 18,
+    "p2_count": 8,
+    "unique_classifications": {
+      "FIXED_ALREADY": 18,
+      "STILL_PRESENT_GOVERNANCE_GAP": 2,
+      "INCONCLUSIVE": 4,
+      "FALSE_POSITIVE_WITH_EVIDENCE": 0,
+      "STILL_PRESENT_RUNTIME_BUG": 0
+    }
+  },
+  "wave_definitions": {
+    "1": {
+      "description": "Low-risk regression tests and documentation evidence tasks. Mock execution only.",
+      "task_ids": [
+        "rgr-314-task-id-path-traversal",
+        "rgr-314-stop-on-first-hold-bool",
+        "rgr-320-batch-ok-subprocess-rc",
+        "rgr-320-no-newline-marker",
+        "rgr-320-base-sha-catfile",
+        "doc-323-applied-status-name",
+        "doc-323-enable-real-claude-executor-claim"
+      ],
+      "execution_mode": "mocked"
+    },
+    "2": {
+      "description": "Remaining regression tests for FIXED_ALREADY findings. Not yet populated.",
+      "task_ids": [],
+      "execution_mode": "mocked"
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "rgr-314-task-id-path-traversal",
+      "wave": 1,
+      "source_pr": 314,
+      "finding_id": "codex-f23c1e3c82d9",
+      "severity": "P1",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "task_id used directly in path construction without sanitization — vulnerable to path traversal",
+      "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_batch.py line 377 now uses re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', task_id) before path use.",
+      "task_category": "already_fixed_needs_regression_test",
+      "action": {
+        "type": "add_regression_test",
+        "target_file": "tests/test_run_autocoder_batch.py",
+        "allowed_files": [
+          "tests/test_run_autocoder_batch.py",
+          "tests/test_persistent_mutation_guard.py",
+          "tests/test_aed_final_gate.py"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          "scripts/local/run_temp_worktree_execution.py",
+          "scripts/local/run_autocoder_eval_corpus.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "test_type": "unit",
+        "test_pattern": "test_task_id_sanitization_rejects_path_traversal",
+        "success_criteria": "Test exists and PASSES in current main. Test would FAIL if the re.fullmatch sanitization is removed.",
+        "deliverable": "New test function in tests/test_run_autocoder_batch.py that verifies task_id path traversal is rejected."
+      },
+      "safety_notes": [
+        "Do not modify scripts/local/run_autocoder_batch.py",
+        "execution_mode must be 'unit' not 'mocked' for this task type",
+        "No live Claude execution",
+        "No Hermes mutation",
+        "No git push/merge"
+      ],
+      "notes": "Codex correctly identified a real P1 path traversal vulnerability. The fix (re.fullmatch) was added in e60e3b5. A regression test ensures it stays."
+    },
+    {
+      "task_id": "rgr-314-stop-on-first-hold-bool",
+      "wave": 1,
+      "source_pr": 314,
+      "finding_id": "codex-ed1a995a38ff",
+      "severity": "P2",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "stop_on_first_hold consumed by Python truthiness — string 'false' would be truthy",
+      "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_batch.py lines 489-494 now have isinstance(stop_on_first_hold_raw, bool) with explicit ValueError.",
+      "task_category": "already_fixed_needs_regression_test",
+      "action": {
+        "type": "add_regression_test",
+        "target_file": "tests/test_run_autocoder_batch.py",
+        "allowed_files": [
+          "tests/test_run_autocoder_batch.py",
+          "tests/test_persistent_mutation_guard.py",
+          "tests/test_aed_final_gate.py"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          "scripts/local/run_temp_worktree_execution.py",
+          "scripts/local/run_autocoder_eval_corpus.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "test_type": "unit",
+        "test_pattern": "test_stop_on_first_hold_rejects_non_boolean",
+        "success_criteria": "Test exists and PASSES in current main. Test would FAIL if the isinstance(bool) check is removed.",
+        "deliverable": "New test function in tests/test_run_autocoder_batch.py that verifies stop_on_first_hold type enforcement."
+      },
+      "safety_notes": [
+        "Do not modify scripts/local/run_autocoder_batch.py",
+        "execution_mode must be 'unit' not 'mocked' for this task type",
+        "No live Claude execution",
+        "No Hermes mutation",
+        "No git push/merge"
+      ],
+      "notes": "Codex correctly identified a type-safety bug. The isinstance(bool) check was added in e60e3b5. A regression test ensures it stays."
+    },
+    {
+      "task_id": "rgr-320-batch-ok-subprocess-rc",
+      "wave": 1,
+      "source_pr": 320,
+      "finding_id": "codex-2cc61202297f",
+      "severity": "P1",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "Eval runner logs batch_ok but reads batch_status.json regardless of subprocess rc — stale status consumed",
+      "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_eval_corpus.py line 599 now exits immediately on non-zero rc: if rc != 0: return 1",
+      "task_category": "already_fixed_needs_regression_test",
+      "action": {
+        "type": "add_regression_test",
+        "target_file": "tests/test_run_autocoder_eval_corpus.py",
+        "allowed_files": [
+          "tests/test_run_autocoder_eval_corpus.py",
+          "tests/test_persistent_mutation_guard.py",
+          "tests/test_aed_final_gate.py"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_eval_corpus.py",
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_temp_worktree_execution.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "test_type": "unit",
+        "test_pattern": "test_eval_corpus_exits_on_nonzero_subprocess_rc",
+        "success_criteria": "Test exists and PASSES in current main. Test would FAIL if the 'if rc != 0: return 1' guard is removed.",
+        "deliverable": "New test function in tests/test_run_autocoder_eval_corpus.py that verifies the eval runner exits on non-zero subprocess rc."
+      },
+      "safety_notes": [
+        "Do not modify scripts/local/run_autocoder_eval_corpus.py",
+        "No live Claude execution",
+        "No Hermes mutation",
+        "No git push/merge"
+      ],
+      "notes": "Codex correctly identified that the eval runner would consume stale batch_status.json on subprocess failure. The rc guard was added in e60e3b5."
+    },
+    {
+      "task_id": "rgr-320-no-newline-marker",
+      "wave": 1,
+      "source_pr": 320,
+      "finding_id": "codex-5eab68d6866b",
+      "severity": "P1",
+      "classification": "INCONCLUSIVE",
+      "finding_summary": "Codex claims run_temp_worktree_execution.py emits wrong newline marker in synthetic untracked-file diffs",
+      "current_main_status": "Audit could not confirm. Current code at line 1829 shows: '\"\\n\\\\ No newline at end of file\\n\"' which produces correct patch format. Cannot determine if code was wrong at PR #320 head.",
+      "task_category": "inconclusive_needs_manual_audit",
+      "action": {
+        "type": "manual_review",
+        "target_file": "scripts/local/run_temp_worktree_execution.py",
+        "allowed_files": [
+          "scripts/local/run_temp_worktree_execution.py"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "success_criteria": "Written audit note concluding either 'confirmed bug' or 'false positive' with evidence, filed as a comment on this task.",
+        "deliverable": "Markdown evidence note in docs/codex_remediation_corpus_design.md appending to the Wave 1 section, citing git show of the actual output at e60e3b5."
+      },
+      "safety_notes": [
+        "No code changes in this task",
+        "No live Claude execution",
+        "Document the manual review finding, do not attempt to auto-fix",
+        "No Hermes mutation"
+      ],
+      "notes": "Audit was INCONCLUSIVE. Human review of git history around line 1829 of run_temp_worktree_execution.py is required before any action."
+    },
+    {
+      "task_id": "rgr-320-base-sha-catfile",
+      "wave": 1,
+      "source_pr": 320,
+      "finding_id": "codex-8fac8e3d2da2",
+      "severity": "P2",
+      "classification": "INCONCLUSIVE",
+      "finding_summary": "Codex claims resolve_base_sha uses git cat-file -e incorrectly for literal SHA validation",
+      "current_main_status": "Audit could not confirm. resolve_base_sha() validates SHA format then uses git rev-parse --verify SHA (correct). validate_corpus_targets() uses cat-file -e sha:path for per-file existence (correct). No bug confirmed in current main.",
+      "task_category": "inconclusive_needs_manual_audit",
+      "action": {
+        "type": "manual_review",
+        "target_file": "scripts/local/run_autocoder_eval_corpus.py",
+        "allowed_files": [
+          "scripts/local/run_autocoder_eval_corpus.py"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "success_criteria": "Written audit note concluding either 'confirmed bug' or 'false positive' with evidence, filed as a comment on this task.",
+        "deliverable": "Markdown evidence note in docs/codex_remediation_corpus_design.md appending to the Wave 1 section, citing the relevant resolve_base_sha and validate_corpus_targets functions."
+      },
+      "safety_notes": [
+        "No code changes in this task",
+        "No live Claude execution",
+        "Document the manual review finding, do not attempt to auto-fix",
+        "No Hermes mutation"
+      ],
+      "notes": "Audit was INCONCLUSIVE. Human review of git cat-file usage vs git rev-parse usage in context is required before any action."
+    },
+    {
+      "task_id": "doc-323-applied-status-name",
+      "wave": 1,
+      "source_pr": 323,
+      "finding_id": "PR316-review-comment-APPLY_COMPLETE_LOCAL_BRANCH",
+      "severity": "P2",
+      "classification": "STILL_PRESENT_GOVERNANCE_GAP",
+      "finding_summary": "Handbook and audit doc showed Stage 5 status as APPLY_COMPLETE_LOCAL_BRANCH but code uses APPLY_TO_BRANCH_APPLIED",
+      "current_main_status": "Fixed in PR #323. docs/autocoder_engineering_handbook.md line 68 now shows APPLY_TO_BRANCH_APPLIED. docs/autocoder_architecture_audit_2026_05.md line 65 also corrected.",
+      "task_category": "docs_only_fixed",
+      "action": {
+        "type": "verify_existing_test_and_document",
+        "target_file": "docs/codex_remediation_corpus_design.md",
+        "allowed_files": [
+          "docs/codex_remediation_corpus_design.md",
+          "docs/autocoder_engineering_handbook.md",
+          "docs/autocoder_architecture_audit_2026_05.md"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          "scripts/local/run_temp_worktree_execution.py",
+          "scripts/local/run_autocoder_eval_corpus.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "success_criteria": "grep confirms APPLY_TO_BRANCH_APPLIED is present and APPLY_COMPLETE_LOCAL_BRANCH is absent in all docs. Evidence note appended to docs/codex_remediation_corpus_design.md.",
+        "deliverable": "Evidence note in docs/codex_remediation_corpus_design.md confirming the doc fix is in place and citing the PR #323 commit."
+      },
+      "safety_notes": [
+        "No runtime code changes",
+        "No live Claude execution",
+        "No Hermes mutation",
+        "No git push/merge"
+      ],
+      "notes": "Governance gap was fixed in PR #323 (commit 03b6663). This task documents that it is resolved and was not re-broken."
+    },
+    {
+      "task_id": "doc-323-enable-real-claude-executor-claim",
+      "wave": 1,
+      "source_pr": 323,
+      "finding_id": "PR316-review-comment-enable-real-claude-executor",
+      "severity": "P2",
+      "classification": "STILL_PRESENT_GOVERNANCE_GAP",
+      "finding_summary": "Audit doc falsely claimed grep finds zero occurrences of --enable-real-claude-executor across stage scripts. Flag is actually present in run_temp_worktree_execution.py.",
+      "current_main_status": "Fixed in PR #323. docs/autocoder_architecture_audit_2026_05.md rows 18-19 corrected with explicit note about run_temp_worktree_execution.py occurrences.",
+      "task_category": "docs_only_fixed",
+      "action": {
+        "type": "verify_existing_test_and_document",
+        "target_file": "docs/codex_remediation_corpus_design.md",
+        "allowed_files": [
+          "docs/codex_remediation_corpus_design.md",
+          "docs/autocoder_architecture_audit_2026_05.md"
+        ],
+        "forbidden_files": [
+          "scripts/local/run_autocoder_batch.py",
+          "scripts/local/run_autocoder_single_task.py",
+          "scripts/local/run_temp_worktree_execution.py",
+          "scripts/local/run_autocoder_eval_corpus.py",
+          ".hermes/**",
+          "skills/**",
+          "memory/**",
+          "profiles/**"
+        ],
+        "success_criteria": "grep confirms docs/autocoder_architecture_audit_2026_05.md contains the corrected claim and the occurrence count. Evidence note appended to docs/codex_remediation_corpus_design.md.",
+        "deliverable": "Evidence note in docs/codex_remediation_corpus_design.md confirming the false claim was corrected and citing the accurate flag occurrences."
+      },
+      "safety_notes": [
+        "No runtime code changes",
+        "No live Claude execution",
+        "No Hermes mutation",
+        "No git push/merge"
+      ],
+      "notes": "Governance gap was fixed in PR #323 (commit 03b6663). This task documents that the false audit claim was corrected with evidence."
+    }
+  ]
+}
