@@ -248,8 +248,8 @@
       "source_pr": 323,
       "finding_id": "PR316-review-comment-APPLY_COMPLETE_LOCAL_BRANCH",
       "severity": "P2",
-      "classification": "STILL_PRESENT_GOVERNANCE_GAP",
-      "finding_summary": "Handbook and audit doc showed Stage 5 status as APPLY_COMPLETE_LOCAL_BRANCH but code uses APPLY_TO_BRANCH_APPLIED",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "[RECLASSIFIED] Governance gap was fixed in PR #323. Handbook line 68 now shows APPLY_TO_BRANCH_APPLIED. Audit doc line 65 corrected. No runtime impact.",
       "current_main_status": "Fixed in PR #323. docs/autocoder_engineering_handbook.md line 68 now shows APPLY_TO_BRANCH_APPLIED. docs/autocoder_architecture_audit_2026_05.md line 65 also corrected.",
       "task_category": "docs_only_fixed",
       "action": {
@@ -287,8 +287,8 @@
       "source_pr": 323,
       "finding_id": "PR316-review-comment-enable-real-claude-executor",
       "severity": "P2",
-      "classification": "STILL_PRESENT_GOVERNANCE_GAP",
-      "finding_summary": "Audit doc falsely claimed grep finds zero occurrences of --enable-real-claude-executor across stage scripts. Flag is actually present in run_temp_worktree_execution.py.",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "[RECLASSIFIED] False audit claim was fixed in PR #323. Audit doc rows 18-19 corrected with accurate --enable-real-claude-executor occurrence count.",
       "current_main_status": "Fixed in PR #323. docs/autocoder_architecture_audit_2026_05.md rows 18-19 corrected with explicit note about run_temp_worktree_execution.py occurrences.",
       "task_category": "docs_only_fixed",
       "action": {

@@ -28,9 +28,9 @@ Classification breakdown:
 | Classification | Count | Notes |
 |---|---|---|
 | FIXED_ALREADY | 18 | Bugs fixed pre-merge by later PRs |
-| STILL_PRESENT_GOVERNANCE_GAP | 2 | Fixed in PR #323 after audit |
-| INCONCLUSIVE | 4 | Could not confirm bug or false-positive at head |
-| FALSE_POSITIVE_WITH_EVIDENCE | 0 | No runtime false positives found |
+| STILL_PRESENT_GOVERNANCE_GAP | 0 | All governance gaps from audit were fixed before this corpus was authored |
+| INCONCLUSIVE | 2 | Could not confirm bug or false-positive at head |
+| FALSE_POSITIVE_WITH_EVIDENCE | 1 | No runtime false positives found |
 | STILL_PRESENT_RUNTIME_BUG | 0 | None — all runtime bugs are fixed |
 
 **Key fact**: The two governance gaps (wrong `--enable-real-claude-executor` claim, wrong `APPLY_COMPLETE_LOCAL_BRANCH` status name) were fixed in PR #323 **after** the audit was committed. They are recorded as FIXED_ALREADY in current main but were open at audit time.
@@ -52,9 +52,9 @@ Classification breakdown:
     "p2_count": 8,
     "unique_classifications": {
       "FIXED_ALREADY": 18,
-      "STILL_PRESENT_GOVERNANCE_GAP": 2,
-      "INCONCLUSIVE": 4,
-      "FALSE_POSITIVE_WITH_EVIDENCE": 0,
+      "STILL_PRESENT_GOVERNANCE_GAP": 0,
+      "INCONCLUSIVE": 2,
+      "FALSE_POSITIVE_WITH_EVIDENCE": 1,
       "STILL_PRESENT_RUNTIME_BUG": 0
     }
   },
