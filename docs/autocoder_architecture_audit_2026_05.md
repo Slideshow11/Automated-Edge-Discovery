@@ -62,7 +62,7 @@ Task Packet (aed.autocoder.single_task.v0)
         └─► Stage 4: preview_temp_worktree_apply.py
               └─► apply_preview.json (APPLY_PREVIEW_READY / HOLD_*)
         └─► Stage 5: apply_temp_worktree_patch_to_branch.py
-              └─► apply_to_branch.json (APPLY_COMPLETE_LOCAL_BRANCH / HOLD_*)
+              └─► apply_to_branch.json (APPLY_TO_BRANCH_APPLIED / HOLD_*)
               └─► Creates apply/ branch with dirty local changes
         └─► Stage 6: verify_temp_worktree_applied_branch.py
               └─► applied_branch_verification.json (APPLIED_BRANCH_READY / HOLD_*)
@@ -277,6 +277,6 @@ Effect: Controller code always from the reviewed parent repo checkout. Repo-unde
 | 15 | **Book/handbook draft status** | ✅ `docs/autocoder_engineering_handbook.md` drafted (19k chars, 18 sections) |
 | 16 | **Sources reviewed** | AED docs (3 design docs, 1 process gap doc), AED stage scripts (7 scripts), AED test files (2 test files), SWE-agent design patterns, OpenAI Codex AGENTS.md public guidance principles. |
 | 17 | **Drift classification** | **STRONG_BUT_NEEDS_EVAL_LAYER** — architecture sound, safety conservative and correct, scaffold proven, but no measuring instrument for output quality. |
-| 18 | **No live Claude** | ✅ Confirmed. `execution_mode` is `frozenset(["mocked"])` in single-task controller; `claude`/`live`/`real` rejected at validation. No `--enable-real-claude-executor` flag anywhere in batch controller pipeline. |
-| 19 | **No --enable-real-claude-executor** | ✅ Confirmed. `grep` across all stage scripts and batch controller shows zero occurrences. |
+| 18 | **No live Claude** | ✅ Confirmed for batch controller pipeline. `execution_mode` is `frozenset(["mocked"])` in batch controller (`run_autocoder_batch.py`); `claude`/`live`/`real` mode rejected at the controller level. Stage-2 executor (`run_temp_worktree_execution.py`) does accept `execution.mode="claude"` but gates it behind `if not enable_real_claude_executor: raise "claude mode not yet ready"`. The safety property (no unintended live-Claude invocation) holds because: (a) batch controller REJECTOR is correct, (b) `--enable-real-claude-executor` is opt-in and False by default. |
+| 19 | **No --enable-real-claude-executor** | ⚠️ Correction. The original audit stated zero occurrences across all stage scripts — this was incorrect. `run_temp_worktree_execution.py` (stage-2 executor) contains `--enable-real-claude-executor` at lines 621, 998, 1015, 1189, 1199, 1319, 1321 (7 occurrences, not 8 as previously stated — the prior count included an extra line reference). The flag is defined as a CLI arg (`--enable-real-claude-executor`) and used as a boolean guard. The batch controller (`run_autocoder_batch.py`) does not contain this flag. This remediation corrects the audit record. |
 | 20 | **Hermes memory/profile not touched** | ✅ Confirmed. Zero `skill_manage`, `memory.*`, `fact_store`, `memory_store`, `MEMORY.md`, `USER.md` calls in any autocoder script. PMG compare returns `blocked=0` after all post-merge verification runs. |

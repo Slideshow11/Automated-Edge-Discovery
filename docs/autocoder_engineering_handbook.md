@@ -65,7 +65,7 @@ Task Packet (aed.autocoder.single_task.v0)
 ┌─────────────────────────────────────┐
 │  Stage 5: Apply to Local Branch      │
 │  output: apply_to_branch.json         │
-│  status: APPLY_COMPLETE_LOCAL_BRANCH │
+│  status: APPLY_TO_BRANCH_APPLIED │
 │  (DOES NOT PUSH)                    │
 └─────────────────────────────────────┘
        │ verify_temp_worktree_applied_branch
