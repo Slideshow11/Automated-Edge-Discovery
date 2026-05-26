@@ -225,4 +225,19 @@ They can be run independently or in sequence. They do not conflict.
 
 ---
 
-*Review status — 2026-05-26: PR readiness requires CI and review-comment gate results on the exact current head before merge.*
+*Review status — 2026-05-26: PR marked ready-for-review. Exact-head CI not yet available as of last check (head 30b82b5). This note will be updated when CI results arrive.*
+
+---
+
+## 11. Reclassification History (2026-05-26)
+
+The following tasks were reclassified during PR #324 human review:
+
+| task_id | original classification | final classification | reason |
+|---|---|---|---|
+| `rgr-320-no-newline-marker` | INCONCLUSIVE | FALSE_POSITIVE_WITH_EVIDENCE | test_untracked_file_no_newline_marker (tests/test_run_temp_worktree_execution.py:4310) already covers this; git apply --check confirms correct format |
+| `rgr-320-base-sha-catfile` | INCONCLUSIVE | already_fixed_needs_regression_test | validate_corpus_targets uses cat-file -e sha:path correctly; resolve_base_sha uses rev-parse --verify correctly; no bug but regression test needed |
+| `doc-323-applied-status-name` | STILL_PRESENT_GOVERNANCE_GAP | FIXED_ALREADY | PR #323 fixed before this corpus was authored |
+| `doc-323-enable-real-claude-executor-claim` | STILL_PRESENT_GOVERNANCE_GAP | FIXED_ALREADY | PR #323 fixed before this corpus was authored |
+
+This section is part of the permanent corpus record and should not be removed.
