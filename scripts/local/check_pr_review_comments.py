@@ -376,6 +376,7 @@ def render_md(
     findings: list[dict[str, Any]],
     current_head_blockers: list[dict[str, Any]],
     stale_blockers: list[dict[str, Any]],
+    resolved_stale_blockers: list[dict[str, Any]],
     resolved_non_blockers: list[dict[str, Any]],
     waivers: list[dict[str, Any]],
     counts: dict[str, int],
@@ -445,6 +446,15 @@ def render_md(
                 f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
                 f"[link]({b['url']})  *(STALE — attached to old commit)*\n"
             )
+            lines.append(f"  {b['body'][:300]}\n")
+    if resolved_stale_blockers:
+        lines.append(f"\n## Resolved Stale Blockers (reported as history — not blocking)\n")
+        for b in resolved_stale_blockers:
+            lines.append(
+                f"- **[{b['severity']}]** {b['user']} — {b['file_path']}:{b['line']}  "
+                f"[link]({b['url']})  *(STALE + THREAD RESOLVED — reported as history)*\n"
+            )
+            lines.append(f"  thread_id: `{b.get('thread_id', 'N/A')}`\n")
             lines.append(f"  {b['body'][:300]}\n")
     if resolved_non_blockers:
         lines.append(f"\n## Resolved Review Threads (not blocking)\n")
@@ -741,8 +751,12 @@ def main() -> int:
     # Stale findings (on older commits) are reported but cannot indefinitely block.
     # Findings in resolved GitHub review threads are reported but do not block.
     # If thread-resolution metadata is unavailable for a P0/P1/P2, fail closed.
+    #
+    # Resolved stale findings (thread_resolved=True): reported as history, NOT blocking.
+    # Unresolved stale findings (thread_resolved=False): INCONCLUSIVE.
     current_head_blockers: list[dict[str, Any]] = []
     stale_blockers: list[dict[str, Any]] = []
+    resolved_stale_blockers: list[dict[str, Any]] = []
     resolved_non_blockers: list[dict[str, Any]] = []
 
     for f in current_head_findings:
@@ -776,12 +790,18 @@ def main() -> int:
         # P3 and UNSPECIFIED_INFO are informational only
     for f in stale_findings:
         sev = f["severity"]
-        if sev in ("P0", "P1", "UNSPECIFIED_BLOCKING"):
+        if sev not in ("P0", "P1", "UNSPECIFIED_BLOCKING", "P2"):
+            continue
+        thread_resolved = f.get("thread_resolved", False)
+        if thread_resolved:
+            # Resolved stale findings: reported as history, NOT blocking.
+            resolved_stale_blockers.append(f)
+        elif sev == "P2" and not args.fail_on_p2:
+            # Stale P2 without fail_on_p2: informational only.
+            continue
+        else:
+            # Unresolved stale P0/P1/P2: INCONCLUSIVE.
             stale_blockers.append(f)
-        elif sev == "P2":
-            if args.fail_on_p2:
-                stale_blockers.append(f)
-            # stale P2s without fail_on_p2 are informational only
 
     # Count severity buckets
     counts: dict[str, int] = {k: 0 for k in (
@@ -798,8 +818,9 @@ def main() -> int:
     # 1. API errors (REST) => INCONCLUSIVE (incomplete data — fail closed)
     # 2. GraphQL thread-resolution failure => INCONCLUSIVE (cannot determine resolved state)
     # 3. Current-head P0/P1/P2 blockers => BLOCKED
-    # 4. Stale P0/P1/P2 blockers => INCONCLUSIVE (stale findings require exact-head re-review)
-    # 5. No blockers => CLEAN
+    # 4. Unresolved stale P0/P1/P2 blockers => INCONCLUSIVE (stale findings require exact-head re-review)
+    # 5. Resolved stale P0/P1/P2 blockers => reported as history, NOT blocking
+    # 6. No blockers => CLEAN
     if api_errors:
         status = "REVIEW_COMMENTS_INCONCLUSIVE"
     elif thread_api_error:
@@ -818,6 +839,7 @@ def main() -> int:
     stale_findings_summary = {
         "total_stale": len(stale_findings),
         "stale_blockers": len(stale_blockers),
+        "resolved_stale_blockers": len(resolved_stale_blockers),
         "stale_finding_ids": [f["finding_id"] for f in stale_findings],
     }
 
@@ -835,6 +857,7 @@ def main() -> int:
         "findings": all_findings,
         "blockers": current_head_blockers,
         "stale_blockers": stale_blockers,
+        "resolved_stale_blockers": resolved_stale_blockers,
         "resolved_non_blockers": resolved_non_blockers,
         "stale_findings_summary": stale_findings_summary,
         "current_head_findings_count": len(current_head_findings),
@@ -848,13 +871,15 @@ def main() -> int:
         status, args.pr_number, args.reported_head_sha,
         live_head_sha, head_sha_mismatch,
         sources_fetched, all_findings, current_head_blockers,
-        stale_blockers, resolved_non_blockers, waivers_applied, counts,
+        stale_blockers, resolved_stale_blockers, resolved_non_blockers,
+        waivers_applied, counts,
         thread_api_error,
     )
     Path(args.output_md).write_text(md)
 
     print(f"[check_pr_review_comments] status={status} blockers={len(current_head_blockers)} "
-          f"stale={len(stale_blockers)} resolved={len(resolved_non_blockers)} "
+          f"stale={len(stale_blockers)} resolved_stale={len(resolved_stale_blockers)} "
+          f"resolved={len(resolved_non_blockers)} "
           f"findings={len(all_findings)} waivers={len(waivers_applied)}")
 
     if status == "REVIEW_COMMENTS_BLOCKED":

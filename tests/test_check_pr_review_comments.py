@@ -1129,6 +1129,226 @@ class TestIntegration(unittest.TestCase):
         # Thread ID visible in finding
         self.assertEqual(data["resolved_non_blockers"][0]["thread_id"], "PRRT_resolved2")
 
+    def test_resolved_stale_p1_returns_clean(self):
+        """
+        Resolved stale P1 findings return REVIEW_COMMENTS_CLEAN.
+        thread_resolved=True on a stale finding means it is reported as
+        resolved_stale_blockers in the output but does NOT make the gate
+        inconclusive. This is the key semantics fix for PR #325.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "oldoldold",   # Does NOT match current head
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_stale_resolved",
+                        "isResolved": True,   # Thread resolved — key fix
+                        "isOutdated": True,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # Exit code 0 = CLEAN (not INCONCLUSIVE)
+        self.assertEqual(rc, crc.EXIT_CLEAN)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
+        # Resolved stale P1 in resolved_stale_blockers
+        self.assertEqual(len(data.get("resolved_stale_blockers", [])), 1)
+        self.assertEqual(
+            data["resolved_stale_blockers"][0]["severity"], "P1")
+        self.assertEqual(
+            data["resolved_stale_blockers"][0]["is_stale_head"], True)
+        self.assertEqual(
+            data["resolved_stale_blockers"][0]["thread_resolved"], True)
+        # Not in stale_blockers (unresolved)
+        self.assertEqual(len(data.get("stale_blockers", [])), 0)
+        # Not in current-head blockers
+        self.assertEqual(len(data.get("blockers", [])), 0)
+
+    def test_resolved_stale_p1_plus_current_unspecified_info_returns_clean(self):
+        """
+        Resolved stale P1 + current-head UNSPECIFIED_INFO => CLEAN.
+        UNSPECIFIED_INFO is never blocking. Resolved stale P1 is also not
+        blocking. No current-head P0/P1/P2 blockers exist.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Nit: consider renaming variable",   # UNSPECIFIED_INFO
+                    "commit_id": "abc123abc123abc123abc123abc123abc123abcd12",  # current
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r99",
+                }]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "oldoldold",   # stale
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_stale_p1_resolved",
+                        "isResolved": True,
+                        "isOutdated": True,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        self.assertEqual(rc, crc.EXIT_CLEAN)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_CLEAN")
+        # Resolved stale P1 in resolved_stale_blockers
+        self.assertEqual(len(data.get("resolved_stale_blockers", [])), 1)
+        # Current-head UNSPECIFIED_INFO not blocking
+        self.assertEqual(len(data.get("blockers", [])), 0)
+        self.assertEqual(len(data.get("stale_blockers", [])), 0)
+
+    def test_unresolved_stale_p1_still_returns_inconclusive(self):
+        """
+        Unresolved stale P1 (thread_resolved=False) => INCONCLUSIVE.
+        This confirms we did NOT weaken the unresolved-stale-path.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                    "path": "scripts/local/run_temp_worktree_execution.py",
+                    "line": 1821,
+                    "commit_id": "oldoldold",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [{
+                        "id": "PRRT_stale_unresolved",
+                        "isResolved": False,   # NOT resolved — unchanged behavior
+                        "isOutdated": True,
+                        "comments": {"nodes": [{
+                            "databaseId": 1,
+                            "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                        }]},
+                    }]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # Unresolved stale P1 => INCONCLUSIVE (not BLOCKED, not CLEAN)
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
+        self.assertEqual(len(data.get("stale_blockers", [])), 1)
+        self.assertEqual(data["stale_blockers"][0]["severity"], "P1")
+        self.assertEqual(data["stale_blockers"][0]["is_stale_head"], True)
+        self.assertEqual(data["stale_blockers"][0]["thread_resolved"], False)
+        self.assertEqual(len(data.get("blockers", [])), 0)
+        self.assertEqual(len(data.get("resolved_stale_blockers", [])), 0)
+
+    def test_resolved_stale_p1_plus_unresolved_stale_p1_returns_inconclusive(self):
+        """
+        Resolved stale P1 + unresolved stale P1 => INCONCLUSIVE.
+        The unresolved stale P1 keeps the gate inconclusive even when
+        another stale P1 is resolved.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([
+                    {
+                        "user": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) fix this P1 issue**",
+                        "path": "scripts/local/run_temp_worktree_execution.py",
+                        "line": 1821,
+                        "commit_id": "oldoldold",   # stale #1
+                        "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                    },
+                    {
+                        "user": {"login": "chatgpt-codex-connector[bot]"},
+                        "body": "**<sub><sub>![P1](https://img.shields.io/badge/P1-orange) another P1 issue**",
+                        "path": "scripts/local/run_temp_worktree_execution.py",
+                        "line": 2000,
+                        "commit_id": "anotherold",   # stale #2
+                        "html_url": "https://github.com/OWNER/REPO/pull/1#discussion_r2",
+                    },
+                ]),
+                "pulls/320/reviews": gh_reply([]),
+                "graphql": gh_reply({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"nodes": [
+                        {
+                            "id": "PRRT_stale1_resolved",
+                            "isResolved": True,   # resolved — goes to resolved_stale_blockers
+                            "isOutdated": True,
+                            "comments": {"nodes": [{
+                                "databaseId": 1,
+                                "url": "https://github.com/OWNER/REPO/pull/1#discussion_r1",
+                            }]},
+                        },
+                        {
+                            "id": "PRRT_stale2_unresolved",
+                            "isResolved": False,  # NOT resolved — keeps gate INCONCLUSIVE
+                            "isOutdated": True,
+                            "comments": {"nodes": [{
+                                "databaseId": 2,
+                                "url": "https://github.com/OWNER/REPO/pull/1#discussion_r2",
+                            }]},
+                        },
+                    ]},
+                }}}}),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        # Still INCONCLUSIVE due to unresolved stale P1
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_INCONCLUSIVE")
+        # Unresolved stale P1 in stale_blockers
+        self.assertEqual(len(data.get("stale_blockers", [])), 1)
+        self.assertEqual(data["stale_blockers"][0]["thread_resolved"], False)
+        # Resolved stale P1 in resolved_stale_blockers
+        self.assertEqual(len(data.get("resolved_stale_blockers", [])), 1)
+        self.assertEqual(
+            data["resolved_stale_blockers"][0]["thread_resolved"], True)
+        # No current-head blockers
+        self.assertEqual(len(data.get("blockers", [])), 0)
+
+    def test_resolved_stale_blockers_field_in_json_output(self):
+        """
+        resolved_stale_blockers field is present in JSON output even when empty.
+        Confirms the new field is always included for forward-compatibility.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([]),
+                "pulls/320/reviews": gh_reply([]),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        self.assertEqual(rc, crc.EXIT_CLEAN)
+        self.assertIn("resolved_stale_blockers", data)
+        self.assertIsInstance(data["resolved_stale_blockers"], list)
+        self.assertEqual(len(data["resolved_stale_blockers"]), 0)
+        self.assertIn("resolved_stale_blockers", data["stale_findings_summary"])
+
 
 import tempfile
 
