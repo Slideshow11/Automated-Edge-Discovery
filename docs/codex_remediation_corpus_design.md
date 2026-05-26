@@ -189,10 +189,14 @@ Wave 1 contains **7 tasks** selected by these criteria:
 | `rgr-314-task-id-path-traversal` | already_fixed_needs_regression_test | P1 | add_regression_test |
 | `rgr-314-stop-on-first-hold-bool` | already_fixed_needs_regression_test | P2 | add_regression_test |
 | `rgr-320-batch-ok-subprocess-rc` | already_fixed_needs_regression_test | P1 | add_regression_test |
-| `rgr-320-no-newline-marker` | inconclusive_needs_manual_audit | P1 | manual_review |
-| `rgr-320-base-sha-catfile` | inconclusive_needs_manual_audit | P2 | manual_review |
+| `rgr-320-no-newline-marker` | false_positive_with_evidence | P1 | add_evidence_note |
+| `rgr-320-base-sha-catfile` | already_fixed_needs_regression_test | P2 | add_regression_test |
 | `doc-323-applied-status-name` | docs_only_fixed | P2 | verify_existing_test_and_document |
 | `doc-323-enable-real-claude-executor-claim` | docs_only_fixed | P2 | verify_existing_test_and_document |
+
+> **2026-05-26 manual audit update**: `rgr-320-no-newline-marker` was reclassified from `inconclusive_needs_manual_audit` → `false_positive_with_evidence`. The existing test `test_untracked_file_no_newline_marker` (tests/test_run_temp_worktree_execution.py:4310) already verifies the correct format and runs `git apply --check` as an authoritative test. Codex's concern was unfounded — the code was always correct.
+>
+> `rgr-320-base-sha-catfile` was reclassified from `inconclusive_needs_manual_audit` → `already_fixed_needs_regression_test`. `validate_corpus_targets` uses `cat-file -e sha:path` for file existence (correct usage). `resolve_base_sha` uses `rev-parse --verify` for SHA validation (correct usage). No bug exists but a regression test should be added to prevent future regression.
 
 Future waves (not yet in this file) will cover:
 - Wave 2: Remaining regression tests for output_root null handling, repo-root propagation

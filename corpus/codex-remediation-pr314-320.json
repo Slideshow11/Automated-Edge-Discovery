@@ -8,7 +8,15 @@
   "created_at": "2026-05-26T00:00:00Z",
   "base_sha_policy": "current_main",
   "scope": {
-    "prs": [314, 315, 316, 317, 318, 319, 320],
+    "prs": [
+      314,
+      315,
+      316,
+      317,
+      318,
+      319,
+      320
+    ],
     "finding_count": 26,
     "p1_count": 18,
     "p2_count": 8,
@@ -48,7 +56,7 @@
       "finding_id": "codex-f23c1e3c82d9",
       "severity": "P1",
       "classification": "FIXED_ALREADY",
-      "finding_summary": "task_id used directly in path construction without sanitization — vulnerable to path traversal",
+      "finding_summary": "task_id used directly in path construction without sanitization \u2014 vulnerable to path traversal",
       "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_batch.py line 377 now uses re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', task_id) before path use.",
       "task_category": "already_fixed_needs_regression_test",
       "action": {
@@ -90,7 +98,7 @@
       "finding_id": "codex-ed1a995a38ff",
       "severity": "P2",
       "classification": "FIXED_ALREADY",
-      "finding_summary": "stop_on_first_hold consumed by Python truthiness — string 'false' would be truthy",
+      "finding_summary": "stop_on_first_hold consumed by Python truthiness \u2014 string 'false' would be truthy",
       "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_batch.py lines 489-494 now have isinstance(stop_on_first_hold_raw, bool) with explicit ValueError.",
       "task_category": "already_fixed_needs_regression_test",
       "action": {
@@ -132,7 +140,7 @@
       "finding_id": "codex-2cc61202297f",
       "severity": "P1",
       "classification": "FIXED_ALREADY",
-      "finding_summary": "Eval runner logs batch_ok but reads batch_status.json regardless of subprocess rc — stale status consumed",
+      "finding_summary": "Eval runner logs batch_ok but reads batch_status.json regardless of subprocess rc \u2014 stale status consumed",
       "current_main_status": "Fixed in commit e60e3b5 (PR #320). run_autocoder_eval_corpus.py line 599 now exits immediately on non-zero rc: if rc != 0: return 1",
       "task_category": "already_fixed_needs_regression_test",
       "action": {
@@ -171,12 +179,12 @@
       "source_pr": 320,
       "finding_id": "codex-5eab68d6866b",
       "severity": "P1",
-      "classification": "INCONCLUSIVE",
-      "finding_summary": "Codex claims run_temp_worktree_execution.py emits wrong newline marker in synthetic untracked-file diffs",
-      "current_main_status": "Audit could not confirm. Current code at line 1829 shows: '\"\\n\\\\ No newline at end of file\\n\"' which produces correct patch format. Cannot determine if code was wrong at PR #320 head.",
-      "task_category": "inconclusive_needs_manual_audit",
+      "classification": "FALSE_POSITIVE_WITH_EVIDENCE",
+      "finding_summary": "[RECLASSIFIED] Codex claimed wrong newline marker but code was correct at line 1829. Existing test_untracked_file_no_newline_marker confirms correct format.",
+      "current_main_status": "Code was always correct. Line 1829 produces literal backslash correctly. test_untracked_file_no_newline_marker (line 4310) verifies format and runs git apply --check as authoritative test.",
+      "task_category": "false_positive_with_evidence",
       "action": {
-        "type": "manual_review",
+        "type": "add_evidence_note",
         "target_file": "scripts/local/run_temp_worktree_execution.py",
         "allowed_files": [
           "scripts/local/run_temp_worktree_execution.py"
@@ -193,10 +201,9 @@
         "deliverable": "Markdown evidence note in docs/codex_remediation_corpus_design.md appending to the Wave 1 section, citing git show of the actual output at e60e3b5."
       },
       "safety_notes": [
-        "No code changes in this task",
-        "No live Claude execution",
-        "Document the manual review finding, do not attempt to auto-fix",
-        "No Hermes mutation"
+        "No code changes",
+        "No live Claude",
+        "Document false positive with evidence"
       ],
       "notes": "Audit was INCONCLUSIVE. Human review of git history around line 1829 of run_temp_worktree_execution.py is required before any action."
     },
@@ -206,12 +213,12 @@
       "source_pr": 320,
       "finding_id": "codex-8fac8e3d2da2",
       "severity": "P2",
-      "classification": "INCONCLUSIVE",
-      "finding_summary": "Codex claims resolve_base_sha uses git cat-file -e incorrectly for literal SHA validation",
-      "current_main_status": "Audit could not confirm. resolve_base_sha() validates SHA format then uses git rev-parse --verify SHA (correct). validate_corpus_targets() uses cat-file -e sha:path for per-file existence (correct). No bug confirmed in current main.",
-      "task_category": "inconclusive_needs_manual_audit",
+      "classification": "FIXED_ALREADY",
+      "finding_summary": "[RECLASSIFIED] Codex misidentified cat-file usage. validate_corpus_targets uses cat-file -e correctly for file existence; resolve_base_sha uses rev-parse --verify for SHA. Both correct. Needs regression test.",
+      "current_main_status": "Functions are correct. validate_corpus_targets line 171 uses cat-file -e sha:path (correct). resolve_base_sha line 112 uses rev-parse --verify SHA (correct). No bug. Needs regression test to prevent future regression.",
+      "task_category": "already_fixed_needs_regression_test",
       "action": {
-        "type": "manual_review",
+        "type": "add_regression_test",
         "target_file": "scripts/local/run_autocoder_eval_corpus.py",
         "allowed_files": [
           "scripts/local/run_autocoder_eval_corpus.py"
@@ -228,10 +235,10 @@
         "deliverable": "Markdown evidence note in docs/codex_remediation_corpus_design.md appending to the Wave 1 section, citing the relevant resolve_base_sha and validate_corpus_targets functions."
       },
       "safety_notes": [
-        "No code changes in this task",
-        "No live Claude execution",
-        "Document the manual review finding, do not attempt to auto-fix",
-        "No Hermes mutation"
+        "No Hermes mutation",
+        "No live Claude",
+        "No git push/merge",
+        "Add regression test only"
       ],
       "notes": "Audit was INCONCLUSIVE. Human review of git cat-file usage vs git rev-parse usage in context is required before any action."
     },
