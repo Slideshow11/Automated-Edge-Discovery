@@ -241,3 +241,5 @@ The following tasks were reclassified during PR #324 human review:
 | `doc-323-enable-real-claude-executor-claim` | STILL_PRESENT_GOVERNANCE_GAP | FIXED_ALREADY | PR #323 fixed before this corpus was authored |
 
 This section is part of the permanent corpus record and should not be removed.
+
+*Exact-head CI is required before this corpus PR can merge.*
