@@ -552,24 +552,14 @@ class TestInvokeBatchControllerRCGuard:
             # with a clear assertion rather than silently returning the wrong result.
             real_sha = "a" * 40
 
-        # Mock invoke_batch_controller to return nonzero rc
-        # This simulates the batch subprocess crashing/failing
+        # Mock invoke_batch_controller to return nonzero rc.
+        # This simulates the batch subprocess crashing/failing.
         def fake_invoke_batch_controller(batch_packet, output_root):
             return False, "batch subprocess died", 42
 
-        # Patch invoke_batch_controller and _render_eval_report_md in the module namespace.
-        # _render_eval_report_md crashes on string failure_summary (pre-existing bug);
-        # we bypass it to test the JSON report output.
+        # Patch invoke_batch_controller in the module namespace.
         orig_invoke = ns.get("invoke_batch_controller")
-        orig_render = ns.get("_render_eval_report_md")
-
-        def fake_render(report):
-            # Write a dummy md so write_eval_report doesn't crash
-            Path(str(report_md)).write_text("# dummy\n", encoding="utf-8")
-            return "# dummy"
-
         ns["invoke_batch_controller"] = fake_invoke_batch_controller
-        ns["_render_eval_report_md"] = fake_render
 
         try:
             rc = ns["main"](
@@ -584,16 +574,11 @@ class TestInvokeBatchControllerRCGuard:
         finally:
             if orig_invoke is not None:
                 ns["invoke_batch_controller"] = orig_invoke
-            if orig_render is not None:
-                ns["_render_eval_report_md"] = orig_render
 
         # Eval runner MUST return nonzero when batch rc != 0
         assert rc == 1, f"main() must return 1 on nonzero batch rc, got {rc}"
 
-        # The report must show eval_pass=False and batch_subprocess_rc=42
-        # Note: _render_eval_report_md crashes on the string failure_summary set by
-        # the rc-guard path (it expects list[dict], gets str). We only assert on
-        # the JSON report — the md render failure is a pre-existing code bug.
+        # The JSON report must show eval_pass=False and the subprocess rc
         assert report_json.exists(), "report.json must be written"
         report = json.loads(report_json.read_text(encoding="utf-8"))
         assert report.get("eval_pass") is False, (
@@ -602,13 +587,23 @@ class TestInvokeBatchControllerRCGuard:
         assert report.get("batch_subprocess_rc") == 42, (
             f"batch_subprocess_rc must be 42, got {report.get('batch_subprocess_rc')}"
         )
-        assert report.get("failure_summary"), (
-            "failure_summary must be present"
+        assert report.get("batch_subprocess_failure_reason"), (
+            "batch_subprocess_failure_reason must be present"
         )
-        # failure_summary is a str when rc guard triggers (pre-existing code issue)
         assert "stale batch_status.json was NOT treated as success" in str(
-            report.get("failure_summary", "")
-        ), f"failure_summary must mention stale-data guard, got: {report.get('failure_summary')}"
+            report.get("batch_subprocess_failure_reason", "")
+        ), f"batch_subprocess_failure_reason must mention stale-data guard, got: {report.get('batch_subprocess_failure_reason')}"
+
+        # The Markdown report must be written by the real _render_eval_report_md
+        # (no monkeypatch — production rendering is now exercised)
+        assert report_md.exists(), "report.md must be written by real renderer"
+        md_text = report_md.read_text(encoding="utf-8")
+        assert "Batch Subprocess Failure" in md_text, (
+            f"Markdown must contain 'Batch Subprocess Failure' section, got: {md_text[:500]}"
+        )
+        assert "stale batch_status.json was NOT treated as success" in md_text, (
+            f"Markdown must contain stale-data guard message, got: {md_text[:500]}"
+        )
 
 
 # -----------------------------------------------------------------------

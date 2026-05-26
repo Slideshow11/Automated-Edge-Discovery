@@ -434,6 +434,11 @@ def _render_eval_report_md(report: dict) -> str:
             lines.append(f"- **{fs['task_id']}**: `{fs['status']}`")
             lines.append(f"  - generated_branch: `{fs['generated_branch']}`")
 
+    if report.get("batch_subprocess_failure_reason"):
+        lines.append("")
+        lines.append("## Batch Subprocess Failure")
+        lines.append(f"`{report['batch_subprocess_failure_reason']}`")
+
     return "\n".join(lines)
 
 
@@ -585,7 +590,7 @@ def main(
         eval_report = build_eval_report(corpus, base_sha, fake_batch_status, out_root, run_id)
         eval_report["eval_pass"] = False
         eval_report["batch_subprocess_rc"] = rc
-        eval_report["failure_summary"] = (
+        eval_report["batch_subprocess_failure_reason"] = (
             f"batch subprocess exited rc={rc}; "
             f"stale batch_status.json was NOT treated as success"
         )
