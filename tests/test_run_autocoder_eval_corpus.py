@@ -442,6 +442,169 @@ class TestValidateCorpusTargets:
         assert not ok
         assert any("does not exist" in e for e in errors)
 
+    def test_catfile_sha_path_correct_format(self):
+        """Regression test: validate_corpus_targets uses git cat-file -e sha:path.
+
+        Codex found that validate_corpus_targets uses `git cat-file -e sha:path`
+        for per-file existence checks, and resolve_base_sha uses
+        `git rev-parse --verify SHA` for SHA validation. Both patterns are
+        correct. This test confirms the sha:path format is used and that
+        files absent from a valid SHA fail with the expected error message.
+        """
+        ns = _ns()
+        repo = Path(".").resolve()
+        try:
+            head = subprocess.check_output(
+                ["git", "-C", str(repo), "rev-parse", "main"], text=True
+            ).strip()
+        except subprocess.CalledProcessError:
+            pytest.skip("main branch not available")
+
+        # Use a file that definitely does not exist at HEAD
+        corpus = {
+            "corpus_id": "test-sha-path",
+            "corpus_version": "0.1.0",
+            "tasks": [
+                {
+                    "packet_kind": "aed.autocoder.single_task.v0",
+                    "task_id": "t1-sha-path",
+                    "goal": "Verify sha:path pattern",
+                    "branch_name": "apply/t1-sha-path",
+                    "allowed_files": ["this/file/does/not/exist/at/this/sha.txt"],
+                    "mock_edits": [],
+                    "execution_mode": "mocked",
+                }
+            ],
+        }
+        ok, errors = ns["validate_corpus_targets"](corpus, head, repo, skip_branch_check=True)
+        assert not ok, "validate_corpus_targets must fail for a file absent at a valid SHA"
+        # Error must mention the file and the SHA prefix
+        file_errors = [e for e in errors if "does not exist" in e]
+        assert file_errors, f"Expected 'does not exist' error, got: {errors}"
+        assert head[:8] in errors[0], f"Error must include SHA prefix, got: {errors[0]}"
+
+
+# -----------------------------------------------------------------------
+# Test: invoke_batch_controller — subprocess rc guard (rgr-320-batch-ok-subprocess-rc)
+# -----------------------------------------------------------------------
+class TestInvokeBatchControllerRCGuard:
+    """Regression test: eval runner must not treat stale batch_status.json as success.
+
+    Codex found that the eval runner logged batch_ok but would read
+    batch_status.json regardless of the subprocess return code — meaning a
+    stale OK-looking status file could mask a batch failure.
+
+    Fix (e60e3b5, PR #320): `if rc != 0: return 1` added at the top of the
+    batch-result handler. This test verifies the guard is in place and that
+    a nonzero batch subprocess rc produces eval_pass=False in the report.
+    """
+
+    def test_eval_runner_exits_nonzero_on_batch_subprocess_failure(self, tmp_path):
+        ns = _ns()
+
+        # Create a minimal valid corpus
+        corpus = {
+            "corpus_kind": "aed.autocoder.corpus.v0",
+            "corpus_id": "test-rc-guard",
+            "corpus_version": "0.1.0",
+            "tasks": [
+                {
+                    "packet_kind": "aed.autocoder.single_task.v0",
+                    "task_id": "t1-rc",
+                    "goal": "Test rc guard",
+                    "branch_name": "apply/t1-rc",
+                    "allowed_files": ["docs/README.md"],
+                    "mock_edits": [{"path": "docs/README.md", "content": "append", "text": "test"}],
+                    "execution_mode": "mocked",
+                }
+            ],
+        }
+        corpus_path = tmp_path / "corpus.json"
+        corpus_path.write_text(json.dumps(corpus), encoding="utf-8")
+
+        # Create a fake batch_status.json that looks OK (the stale data)
+        batch_status = {
+            "status": "BATCH_READY_FOR_HUMAN_REVIEW",
+            "tasks": [{"task_id": "t1-rc", "status": "HOLD_TASK_PACKET_INVALID"}],
+        }
+        batch_status_path = tmp_path / "batch_status.json"
+        batch_status_path.write_text(json.dumps(batch_status), encoding="utf-8")
+
+        report_json = tmp_path / "report.json"
+        report_md = tmp_path / "report.md"
+
+        # Get a real SHA so validate_corpus_targets doesn't fail before we reach the rc guard.
+        # Try multiple refs: HEAD (CI shallow clone), origin/main, main.
+        repo_path = Path(".").resolve()
+        real_sha = None
+        for ref in ["HEAD", "origin/main", "main"]:
+            try:
+                real_sha = subprocess.check_output(
+                    ["git", "-C", str(repo_path), "rev-parse", "--verify", ref],
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                ).strip()
+                break
+            except subprocess.CalledProcessError:
+                pass
+        if real_sha is None:
+            # Last-resort fallback — validate_corpus_targets will fail fast; test will fail
+            # with a clear assertion rather than silently returning the wrong result.
+            real_sha = "a" * 40
+
+        # Mock invoke_batch_controller to return nonzero rc.
+        # This simulates the batch subprocess crashing/failing.
+        def fake_invoke_batch_controller(batch_packet, output_root):
+            return False, "batch subprocess died", 42
+
+        # Patch invoke_batch_controller in the module namespace.
+        orig_invoke = ns.get("invoke_batch_controller")
+        ns["invoke_batch_controller"] = fake_invoke_batch_controller
+
+        try:
+            rc = ns["main"](
+                corpus_json=str(corpus_path),
+                output_root=str(tmp_path),
+                report_json=str(report_json),
+                report_md=str(report_md),
+                run_id="rc-guard-test",
+                repo_root_override=Path(".").resolve(),
+                base_sha_override=real_sha,
+            )
+        finally:
+            if orig_invoke is not None:
+                ns["invoke_batch_controller"] = orig_invoke
+
+        # Eval runner MUST return nonzero when batch rc != 0
+        assert rc == 1, f"main() must return 1 on nonzero batch rc, got {rc}"
+
+        # The JSON report must show eval_pass=False and the subprocess rc
+        assert report_json.exists(), "report.json must be written"
+        report = json.loads(report_json.read_text(encoding="utf-8"))
+        assert report.get("eval_pass") is False, (
+            "eval_pass must be False when batch subprocess fails"
+        )
+        assert report.get("batch_subprocess_rc") == 42, (
+            f"batch_subprocess_rc must be 42, got {report.get('batch_subprocess_rc')}"
+        )
+        assert report.get("batch_subprocess_failure_reason"), (
+            "batch_subprocess_failure_reason must be present"
+        )
+        assert "stale batch_status.json was NOT treated as success" in str(
+            report.get("batch_subprocess_failure_reason", "")
+        ), f"batch_subprocess_failure_reason must mention stale-data guard, got: {report.get('batch_subprocess_failure_reason')}"
+
+        # The Markdown report must be written by the real _render_eval_report_md
+        # (no monkeypatch — production rendering is now exercised)
+        assert report_md.exists(), "report.md must be written by real renderer"
+        md_text = report_md.read_text(encoding="utf-8")
+        assert "Batch Subprocess Failure" in md_text, (
+            f"Markdown must contain 'Batch Subprocess Failure' section, got: {md_text[:500]}"
+        )
+        assert "stale batch_status.json was NOT treated as success" in md_text, (
+            f"Markdown must contain stale-data guard message, got: {md_text[:500]}"
+        )
+
 
 # -----------------------------------------------------------------------
 # Test: build_batch_packet
