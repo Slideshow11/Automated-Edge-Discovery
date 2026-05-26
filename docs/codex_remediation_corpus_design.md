@@ -222,3 +222,7 @@ This corpus is **orthogonal** to `corpus/corpus-001.json`:
 - `codex-remediation-pr314-320.json`: tasks for confirming past Codex findings are resolved and protected
 
 They can be run independently or in sequence. They do not conflict.
+
+---
+
+*Review status — 2026-05-26: PR readiness requires CI and review-comment gate results on the exact current head before merge.*
