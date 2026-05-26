@@ -23,7 +23,7 @@
     "unique_classifications": {
       "FIXED_ALREADY": 18,
       "STILL_PRESENT_GOVERNANCE_GAP": 0,
-      "INCONCLUSIVE": 2,
+      "INCONCLUSIVE": 0,
       "FALSE_POSITIVE_WITH_EVIDENCE": 1,
       "STILL_PRESENT_RUNTIME_BUG": 0
     }
@@ -197,8 +197,8 @@
           "memory/**",
           "profiles/**"
         ],
-        "success_criteria": "Written audit note concluding either 'confirmed bug' or 'false positive' with evidence, filed as a comment on this task.",
-        "deliverable": "Markdown evidence note in docs/codex_remediation_corpus_design.md appending to the Wave 1 section, citing git show of the actual output at e60e3b5."
+        "success_criteria": "No action required. Finding is documented as false positive in docs/codex_remediation_corpus_design.md Section 11 reclassification history. task_category=false_positive_with_evidence.",
+        "deliverable": "No file changes. The reclassification history in docs/codex_remediation_corpus_design.md (Section 11) serves as the evidence note."
       },
       "safety_notes": [
         "No code changes",
@@ -219,9 +219,10 @@
       "task_category": "already_fixed_needs_regression_test",
       "action": {
         "type": "add_regression_test",
-        "target_file": "scripts/local/run_autocoder_eval_corpus.py",
+        "target_file": "tests/test_run_autocoder_eval_corpus.py",
         "allowed_files": [
-          "scripts/local/run_autocoder_eval_corpus.py"
+          "scripts/local/run_autocoder_eval_corpus.py",
+          "tests/test_run_autocoder_eval_corpus.py"
         ],
         "forbidden_files": [
           "scripts/local/run_autocoder_batch.py",
