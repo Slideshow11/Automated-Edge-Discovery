@@ -1349,6 +1349,75 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(len(data["resolved_stale_blockers"]), 0)
         self.assertIn("resolved_stale_blockers", data["stale_findings_summary"])
 
+    def test_mismatch_output_includes_resolved_stale_blockers_field(self):
+        """
+        Mismatch output path (head SHA mismatch) includes resolved_stale_blockers
+        field to maintain schema consistency with the normal output path.
+        Regression test for the PR #326 post-merge audit finding.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([]),
+                "pulls/320/reviews": gh_reply([]),
+            },
+            # Live head differs from reported head -> mismatch path
+            gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123",
+        )
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertTrue(data.get("head_sha_mismatch"))
+        # Schema consistency: resolved_stale_blockers must be present
+        self.assertIn("resolved_stale_blockers", data)
+        self.assertIsInstance(data["resolved_stale_blockers"], list)
+        self.assertEqual(len(data["resolved_stale_blockers"]), 0)
+
+    def test_mismatch_output_includes_stale_findings_summary_resolved_stale_blockers(self):
+        """
+        Mismatch output path includes stale_findings_summary.resolved_stale_blockers
+        to maintain schema consistency. Regression test for PR #326 audit.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([]),
+                "pulls/320/reviews": gh_reply([]),
+            },
+            gh_pr_view_oid="xyz789xyz789xyz789xyz789xyz789xyz789xy0123",
+        )
+        self.assertEqual(rc, crc.EXIT_INCONCLUSIVE)
+        self.assertTrue(data.get("head_sha_mismatch"))
+        self.assertIn("stale_findings_summary", data)
+        self.assertIn("resolved_stale_blockers", data["stale_findings_summary"])
+        self.assertEqual(data["stale_findings_summary"]["resolved_stale_blockers"], 0)
+
+    def test_blocked_output_includes_resolved_stale_blockers(self):
+        """
+        BLOCKED output path includes resolved_stale_blockers field.
+        Confirms schema consistency when gate is BLOCKED.
+        """
+        rc, data = self._run(
+            {
+                "issues/320/comments": gh_reply([]),
+                "pulls/320/comments": gh_reply([{
+                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "P1: something is wrong",
+                    "state": "",
+                    "path": "scripts/test.py",
+                    "line": 10,
+                    "commit_id": "abc123abc123abc123abc123abc123abc123abcd12",
+                    "html_url": "https://github.com/OWNER/REPO/pull/1",
+                }]),
+                "pulls/320/reviews": gh_reply([]),
+            },
+            gh_pr_view_oid="abc123abc123abc123abc123abc123abc123abcd12",
+        )
+        self.assertEqual(rc, crc.EXIT_BLOCKED)
+        self.assertEqual(data.get("status"), "REVIEW_COMMENTS_BLOCKED")
+        # Schema consistency: resolved_stale_blockers present even when blocked
+        self.assertIn("resolved_stale_blockers", data)
+        self.assertIsInstance(data["resolved_stale_blockers"], list)
+        self.assertIn("resolved_stale_blockers", data.get("stale_findings_summary", {}))
+
 
 import tempfile
 
