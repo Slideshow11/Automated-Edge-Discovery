@@ -43,17 +43,17 @@ Classification labels:
 
 ## 3. Findings Summary
 
-**Total P0/P1/P2 findings across all PRs: 34** (26 P1 + 8 P2)
+**Total P0/P1/P2 findings across all PRs: 26 unique deduped findings** (18 P1 + 8 P2; table rows below include duplicate-comment records of the same finding, not separate findings)
 
 | PR | P0 | P1 | P2 | Current-Head Blockers | Stale Blockers |
 |---|---|---|---|---|---|
-| #314 | 0 | 4 | 2 | 4 | 0 |
+| #314 | 0 | 2 | 2 | 4 | 0 |
 | #315 | 0 | 6 | 0 | 0 | 6 stale |
 | #316 | 0 | 0 | 4 | 4 | 0 |
-| #317 | 0 | 4 | 0 | 4 | 0 |
+| #317 | 0 | 2 | 0 | 4 | 0 |
 | #318 | 0 | 0 | 0 | 0 | 0 |
-| #319 | 0 | 4 | 0 | 4 | 0 |
-| #320 | 0 | 8 | 2 | 4 | 6 |
+| #319 | 0 | 2 | 0 | 4 | 0 |
+| #320 | 0 | 6 | 2 | 4 | 6 |
 
 ---
 
@@ -172,21 +172,14 @@ No P0/P1/P2 findings. Clean merge.
 |---|---|---|---|---|---|
 | #314 | P1 | task_id path traversal | run_autocoder_batch.py | FIXED_ALREADY | No (fix in PR #320) |
 | #314 | P2 | stop_on_first_hold not bool | run_autocoder_batch.py | FIXED_ALREADY | No (fix in PR #320) |
-| #314 | P1 | (duplicate) | run_autocoder_batch.py | FIXED_ALREADY | No |
-| #314 | P2 | (duplicate) | run_autocoder_batch.py | FIXED_ALREADY | No |
-| #315 | P1×6 | stale gate-doc issues | pr314 gap doc | FIXED_ALREADY | No |
+| #315 | P1×6 | stale gate-doc issues (6 stale findings) | pr314 gap doc | FIXED_ALREADY | No |
 | #316 | P2 | false audit: no --enable-real-claude-executor | docs/audit | STILL_PRESENT_GOVERNANCE_GAP | **Yes** |
 | #316 | P2 | Stage 5 `APPLY_COMPLETE_LOCAL_BRANCH` wrong | docs/handbook | STILL_PRESENT_GOVERNANCE_GAP | **Yes** |
-| #316 | P2 | (duplicate) | docs/audit | STILL_PRESENT_GOVERNANCE_GAP | Yes |
-| #316 | P2 | (duplicate) | docs/handbook | STILL_PRESENT_GOVERNANCE_GAP | Yes |
 | #317 | P1 | repo root not propagated | run_autocoder_batch.py | FIXED_ALREADY | No |
-| #317 | P1 | (duplicate) | run_autocoder_batch.py | FIXED_ALREADY | No |
 | #318 | — | none | — | CLEAN | No |
 | #319 | P1 | output_root null rejected early | corpus/corpus-001.json | FIXED_ALREADY | No |
-| #319 | P1 | (duplicate) | corpus/corpus-001.json | FIXED_ALREADY | No |
 | #320 | P1 | batch_ok not acted on | run_autocoder_eval_corpus.py | FIXED_ALREADY | No |
-| #320 | P1 | (duplicate) | run_autocoder_eval_corpus.py | FIXED_ALREADY | No |
-| #320 | P1×4 | stale: newline marker, other | run_temp_worktree_execution.py | INCONCLUSIVE | Unclear |
+| #320 | P1×4 | stale: newline marker, other (4 stale findings) | run_temp_worktree_execution.py | INCONCLUSIVE | Unclear |
 | #320 | P2 | stale: base_sha cat-file | run_autocoder_eval_corpus.py | INCONCLUSIVE | Unclear |
 
 ---
