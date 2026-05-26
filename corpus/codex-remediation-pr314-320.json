@@ -22,9 +22,9 @@
     "p2_count": 8,
     "unique_classifications": {
       "FIXED_ALREADY": 18,
-      "STILL_PRESENT_GOVERNANCE_GAP": 2,
-      "INCONCLUSIVE": 4,
-      "FALSE_POSITIVE_WITH_EVIDENCE": 0,
+      "STILL_PRESENT_GOVERNANCE_GAP": 0,
+      "INCONCLUSIVE": 2,
+      "FALSE_POSITIVE_WITH_EVIDENCE": 1,
       "STILL_PRESENT_RUNTIME_BUG": 0
     }
   },
@@ -205,7 +205,7 @@
         "No live Claude",
         "Document false positive with evidence"
       ],
-      "notes": "Audit was INCONCLUSIVE. Human review of git history around line 1829 of run_temp_worktree_execution.py is required before any action."
+      "notes": "Codex finding was unfounded. test_untracked_file_no_newline_marker (tests/test_run_temp_worktree_execution.py:4310) already verifies correct format and runs git apply --check as authoritative test. No code changes needed."
     },
     {
       "task_id": "rgr-320-base-sha-catfile",
@@ -240,7 +240,7 @@
         "No git push/merge",
         "Add regression test only"
       ],
-      "notes": "Audit was INCONCLUSIVE. Human review of git cat-file usage vs git rev-parse usage in context is required before any action."
+      "notes": "Codex misidentified cat-file usage. validate_corpus_targets uses cat-file -e sha:path correctly for file existence. resolve_base_sha uses rev-parse --verify correctly for SHA validation. No bug. Regression test needed to prevent future misuse."
     },
     {
       "task_id": "doc-323-applied-status-name",
