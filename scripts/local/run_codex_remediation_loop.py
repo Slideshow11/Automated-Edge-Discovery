@@ -1121,15 +1121,17 @@ def main(
             print(f"FATAL: {err}", file=sys.stderr)
             return 1
 
-        # Validate wave execution_mode (must be mocked or repair-plan)
+        # Validate wave execution_mode (must be repair-plan, not mocked)
         wave_num = str(task.get("wave", ""))
         wave_def = corpus.get("wave_definitions", {}).get(wave_num, {})
         if isinstance(wave_def, dict):
-            wave_mode = wave_def.get("execution_mode", "mocked")
-            if wave_mode not in ("mocked", "repair-plan"):
+            wave_mode = wave_def.get("execution_mode", "")
+            if wave_mode != "repair-plan":
                 print(
                     f"FATAL: one-task-repair-plan: wave {wave_num} has "
-                    f"execution_mode='{wave_mode}'. Expected 'mocked' or 'repair-plan'.",
+                    f"execution_mode='{wave_mode}'. "
+                    f"Must be 'repair-plan' for repair-plan generation. "
+                    f"Mocked waves are not eligible.",
                     file=sys.stderr,
                 )
                 return 1

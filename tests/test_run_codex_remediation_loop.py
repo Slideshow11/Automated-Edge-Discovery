@@ -835,9 +835,125 @@ def test_task_classification_docs_fixed(
 # -------------------------------------------------------------------------
 
 
+def _make_repair_plan_corpus(tmp_path: Path) -> tuple[Path, Path]:
+    """
+    Create a Wave-2-style corpus with execution_mode="repair-plan".
+    This is the eligible mode for one-task-repair-plan mode.
+    Returns (corpus_path, wave1_corpus_path).
+    """
+    wave1_corpus = {
+        "corpus_kind": "aed.codex_remediation.corpus.v0",
+        "corpus_id": "wave1-test",
+        "corpus_version": "0.1.0",
+        "description": "Wave 1 test",
+        "source_audit_doc": "docs/test.md",
+        "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
+        "base_sha_policy": "current_main",
+        "wave_definitions": {
+            "1": {"description": "Wave 1", "task_ids": ["wave1-task-1"], "execution_mode": "mocked"}
+        },
+        "tasks": [
+            {
+                "task_id": "wave1-task-1",
+                "wave": 1,
+                "classification": "FIXED_ALREADY",
+                "task_category": "already_fixed_needs_regression_test",
+                "source_pr": 314,
+                "finding_id": "codex-test-001",
+                "severity": "P1",
+                "finding_summary": "Wave 1 test finding",
+                "current_main_status": "Fixed",
+                "action": {
+                    "type": "add_regression_test",
+                    "target_file": "tests/test_run_autocoder_batch.py",
+                    "allowed_files": ["tests/test_run_autocoder_batch.py"],
+                    "forbidden_files": [],
+                    "success_criteria": "Test passes on current main",
+                    "deliverable": "New test function test_wave1_task_1",
+                },
+                "safety_notes": ["No live Claude", "No Hermes mutation"],
+            },
+        ],
+    }
+    wave1_path = tmp_path / "wave1_corpus.json"
+    wave1_path.write_text(json.dumps(wave1_corpus), encoding="utf-8")
+
+    wave2_corpus = {
+        "corpus_kind": "aed.codex_remediation.corpus.v0",
+        "corpus_id": "wave2-test",
+        "corpus_version": "0.1.0",
+        "description": "Wave 2 test",
+        "source_audit_doc": "docs/test.md",
+        "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
+        "base_sha_policy": "current_main",
+        "wave_definitions": {
+            "1": "See wave1_corpus.json",
+            "2": {"description": "Wave 2", "task_ids": ["wave2-task-1", "wave2-task-2"], "execution_mode": "repair-plan"},
+        },
+        "tasks": [
+            {
+                "task_id": "wave2-task-1",
+                "wave": 2,
+                "classification": "FIXED_ALREADY",
+                "task_category": "already_fixed_needs_regression_test",
+                "source_pr": 319,
+                "source_finding_id": "codex-wave2-001",
+                "severity": "P1",
+                "goal": "Add a regression test for wave2 finding",
+                "action": {
+                    "type": "add_regression_test",
+                    "target_file": "tests/test_run_autocoder_batch.py",
+                    "allowed_files": ["tests/test_run_autocoder_batch.py"],
+                    "forbidden_files": [],
+                    "success_criteria": "Test calls _normalize_task_packet with output_root null",
+                    "deliverable": "New test function test_wave2_task_1_normalized",
+                },
+                "safety": {
+                    "no_live_claude": True,
+                    "no_hermes_mutations": True,
+                    "no_github_mutations": True,
+                    "no_install": True,
+                    "scope_narrow": True,
+                },
+                "notes": "Wave 2 test task",
+            },
+            {
+                "task_id": "wave2-task-2",
+                "wave": 2,
+                "classification": "FIXED_ALREADY",
+                "task_category": "already_fixed_needs_regression_test",
+                "source_pr": 317,
+                "source_finding_id": "codex-wave2-002",
+                "severity": "P1",
+                "goal": "Add a regression test for repo-root propagation",
+                "action": {
+                    "type": "add_regression_test",
+                    "target_file": "tests/test_run_autocoder_batch.py",
+                    "allowed_files": ["tests/test_run_autocoder_batch.py"],
+                    "forbidden_files": [],
+                    "success_criteria": "Test verifies --repo-root is passed to stage-2",
+                    "deliverable": "New test function test_wave2_task_2_repo_root",
+                },
+                "safety": {
+                    "no_live_claude": True,
+                    "no_hermes_mutations": True,
+                    "no_github_mutations": True,
+                    "no_install": True,
+                    "scope_narrow": True,
+                },
+                "notes": "Wave 2 test task 2",
+            },
+        ],
+    }
+    corpus_path = tmp_path / "wave2_corpus.json"
+    corpus_path.write_text(json.dumps(wave2_corpus), encoding="utf-8")
+    return corpus_path, wave1_path
+
+
 def _make_wave2_corpus(tmp_path: Path) -> tuple[Path, Path]:
     """
-    Create a Wave-2-style corpus with two tasks.
+    Create a Wave-2-style corpus with execution_mode="mocked".
+    This is NOT eligible for one-task-repair-plan mode.
     Returns (corpus_path, wave1_corpus_path).
     """
     wave1_corpus = {
@@ -953,7 +1069,7 @@ def test_one_task_repair_plan_generates_all_required_files(
     tmp_path: Path,
 ) -> None:
     """one-task-repair-plan generates all 7 required files."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -984,7 +1100,7 @@ def test_one_task_repair_plan_rejects_missing_task_id(
     tmp_path: Path,
 ) -> None:
     """one-task-repair-plan requires --task-id."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1006,7 +1122,7 @@ def test_one_task_repair_plan_rejects_unknown_task_id(
     tmp_path: Path,
 ) -> None:
     """one-task-repair-plan rejects a task_id not in the corpus."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1029,7 +1145,7 @@ def test_one_task_repair_plan_processes_exactly_one_task(
     tmp_path: Path,
 ) -> None:
     """Only the specified task is processed; other tasks are not touched."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1057,7 +1173,7 @@ def test_one_task_repair_plan_prompt_includes_required_fields(
     tmp_path: Path,
 ) -> None:
     """repair_prompt.md includes allowed_files, forbidden_files, deliverable, success_criteria."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1088,7 +1204,7 @@ def test_one_task_repair_plan_writes_only_under_output_root(
     monkeypatch: Any,
 ) -> None:
     """Runner writes no files outside output_root."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     written_paths: list[str] = []
 
@@ -1125,7 +1241,7 @@ def test_one_task_repair_plan_no_subprocess_invocation(
     monkeypatch: Any,
 ) -> None:
     """one-task-repair-plan does not invoke subprocess for code execution."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     subprocess_calls: list[Any] = []
 
@@ -1167,7 +1283,7 @@ def test_one_task_repair_plan_no_repo_mutation(
     tmp_path: Path,
 ) -> None:
     """one-task-repair-plan does not mutate any repo files."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
 
     result = subprocess.run(
@@ -1219,7 +1335,7 @@ def test_one_task_repair_plan_rejects_missing_success_criteria(
         "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
         "base_sha_policy": "current_main",
         "wave_definitions": {
-            "1": {"description": "Wave 1", "task_ids": ["bad-task"], "execution_mode": "mocked"}
+            "1": {"description": "Wave 1", "task_ids": ["bad-task"], "execution_mode": "repair-plan"}
         },
         "tasks": [
             {
@@ -1275,7 +1391,7 @@ def test_one_task_repair_plan_rejects_missing_deliverable(
         "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
         "base_sha_policy": "current_main",
         "wave_definitions": {
-            "1": {"description": "Wave 1", "task_ids": ["bad-task-2"], "execution_mode": "mocked"}
+            "1": {"description": "Wave 1", "task_ids": ["bad-task-2"], "execution_mode": "repair-plan"}
         },
         "tasks": [
             {
@@ -1318,11 +1434,68 @@ def test_one_task_repair_plan_rejects_missing_deliverable(
     assert "deliverable" in result.stderr.lower()
 
 
+def test_one_task_repair_plan_rejects_mocked_wave(
+    tmp_path: Path,
+) -> None:
+    """one-task-repair-plan rejects tasks from waves with execution_mode='mocked'."""
+    corpus = {
+        "corpus_kind": "aed.codex_remediation.corpus.v0",
+        "corpus_id": "test",
+        "corpus_version": "0.1.0",
+        "description": "Test",
+        "source_audit_doc": "docs/test.md",
+        "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
+        "base_sha_policy": "current_main",
+        "wave_definitions": {
+            "1": {"description": "Wave 1", "task_ids": ["mocked-task"], "execution_mode": "mocked"}
+        },
+        "tasks": [
+            {
+                "task_id": "mocked-task",
+                "wave": 1,
+                "classification": "FIXED_ALREADY",
+                "task_category": "already_fixed_needs_regression_test",
+                "source_pr": 314,
+                "finding_summary": "Test",
+                "action": {
+                    "type": "add_regression_test",
+                    "target_file": "tests/test_run_autocoder_batch.py",
+                    "allowed_files": ["tests/test_run_autocoder_batch.py"],
+                    "forbidden_files": [],
+                    "success_criteria": "Test passes",
+                    "deliverable": "New test function",
+                },
+                "safety_notes": ["No live Claude"],
+            },
+        ],
+    }
+    corpus_path = tmp_path / "corpus.json"
+    corpus_path.write_text(json.dumps(corpus), encoding="utf-8")
+    out_dir = tmp_path / "output"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--corpus", str(corpus_path),
+            "--task-id", "mocked-task",
+            "--output-root", str(out_dir),
+            "--mode", "one-task-repair-plan",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert result.returncode == 1
+    assert "mocked" in result.stderr.lower()
+    assert "repair-plan" in result.stderr.lower()
+
+
 def test_one_task_repair_plan_status_fields(
     tmp_path: Path,
 ) -> None:
     """repair_plan_status.json has correct execution fields set to False."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
@@ -1353,7 +1526,7 @@ def test_mock_plan_only_still_works(
     tmp_path: Path,
 ) -> None:
     """mock-plan-only mode continues to work after one-task-repair-plan additions."""
-    corpus_path, _ = _make_wave2_corpus(tmp_path)
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
     out_dir = tmp_path / "output"
     result = subprocess.run(
         [
