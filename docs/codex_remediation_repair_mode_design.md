@@ -243,9 +243,11 @@ Use `pytest.mark.parametrize` to test both positive and negative cases:
 
 ```python
 import pytest
-import re
 
-SANITIZE_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+# Import the production batch controller module to exercise its actual validation
+import sys
+sys.path.insert(0, str(REPO_ROOT / "scripts" / "local"))
+import run_autocoder_batch as batch_module
 
 @pytest.mark.parametrize("task_id,expected_valid", [
     # Valid task IDs
@@ -256,21 +258,35 @@ SANITIZE_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
     ("../etc/passwd", False),
     ("foo/../../../bar", False),
     ("foo\\windows\\system32", False),
-    ("foo..bar", False),
     # Invalid — too long
     ("a" * 200, False),
+    # Note: "foo..bar" IS valid per production regex [A-Za-z0-9][A-Za-z0-9._-]{0,127}
+    # because '.' is in the character class [A-Za-z0-9._-]; it is not a path traversal.
 ])
 def test_task_id_sanitization_rejects_path_traversal(task_id, expected_valid):
-    match = SANITIZE_PATTERN.fullmatch(task_id)
-    is_valid = match is not None
-    assert is_valid == expected_valid, f"task_id {task_id!r}: expected valid={expected_valid}, got {is_valid}"
+    # Call the production batch controller's inline validation (run_autocoder_batch.py ~line 377)
+    # by building a minimal batch packet and passing it through the controller's
+    # validate_task_constraints path. The exact interface (function vs. subprocess call)
+    # should be determined by inspecting the current main HEAD of run_autocoder_batch.py.
+    valid, _reason = batch_module._validate_task_id_safety(task_id)
+    assert valid == expected_valid, (
+        f"task_id {task_id!r}: production validation returned {valid}, "
+        f"expected {expected_valid}"
+    )
 ```
 
 ## Notes
 
-- The test should mirror the actual `re.fullmatch` pattern from `run_autocoder_batch.py:377`
-- The pattern should NOT be hardcoded from memory — copy it from the current main HEAD using `git show main:scripts/local/run_autocoder_batch.py | grep -A2 'fullmatch'`
-- If the pattern in main HEAD differs from the one documented above, the test should use the current main HEAD pattern
+- The test must exercise the **production** validation function from `run_autocoder_batch.py`,
+  not a local copy of the regex. If the production regex is removed, the test must fail.
+- The function name `_validate_task_id_safety` (or equivalent) should be confirmed by
+  inspecting the current main HEAD: `git show main:scripts/local/run_autocoder_batch.py | grep -A5 'fullmatch'`
+- If no separate function exists (validation is inline), the test should call the batch
+  controller entry point with a task packet containing the test task_id and assert rejection.
+- The `foo..bar` case is intentionally absent — it is valid per the production regex
+  `[A-Za-z0-9][A-Za-z0-9._-]{0,127}` since `.` is in the character class, and adding it
+  as `("foo..bar", True)` would be redundant with the existing `task_with.dots_and_underscores`
+  positive case.
 ```
 
 ### 4e. `stop_conditions.md`
