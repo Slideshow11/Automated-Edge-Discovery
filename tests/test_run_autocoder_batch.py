@@ -764,6 +764,54 @@ class TestTaskNormalization:
         # Should not fail on output_root validation
         assert result["status"] != "HOLD_BATCH_PACKET_INVALID"
 
+    def test_output_root_null_normalized_before_validation(self, tmp_path):
+        """Regression: batch controller must normalize output_root: null before
+        validate_task_constraints rejects it. If the controller calls
+        validate_task_constraints before _normalize_task_packet, the batch
+        returns HOLD_TASK_PACKET_INVALID instead of READY.
+
+        This mirrors test_task_output_root_normalized_to_batch_tasks_dir but
+        with output_root explicitly set to None (the regression case).
+        """
+        import uuid
+
+        def fake_run(argv):
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+                def __init__(self):
+                    pass
+            return CP()
+
+        # Use truly unique identifiers so no worktree collision occurs
+        uid = uuid.uuid4().hex[:8]
+        task_id = f"task-null-root-{uid}"
+        branch_name = f"apply/test-null-root-{uid}"
+
+        task = make_task(task_id=task_id, output_root=None,
+                         branch_name=branch_name,
+                         allowed_files=[f"docs/null_root_{uid}.md"])
+        batch = make_batch(batch_id=f"test-null-root-batch-{uid}", tasks=[task])
+
+        result = run_batch_via_module(batch, tmp_path / "out.json",
+                                      tmp_path / "out.md",
+                                      monkeypatch_runner=fake_run)
+
+        # The batch must not reject the task as invalid at validation time.
+        # HOLD_TASK_PACKET_INVALID means validate_task_constraints ran on
+        # the raw null-output_root task before _normalize_task_packet filled it.
+        # After the fix, normalization happens first so validation passes.
+        # The batch may still be HOLD_TASK_FAILED (task execution failed) or
+        # BATCH_READY (task succeeded) — both are fine. The bug was
+        # HOLD_TASK_PACKET_INVALID which would have come from validation
+        # rejecting null output_root before any normalization.
+        assert result["status"] != "HOLD_TASK_PACKET_INVALID", (
+            f"Got HOLD_TASK_PACKET_INVALID — validate_task_constraints "
+            "rejected null output_root before normalization. "
+            "rgr-319 may not be fixed in production code."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Execution tests (mocked subprocess)
