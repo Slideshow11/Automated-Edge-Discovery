@@ -1,0 +1,98 @@
+{
+  "corpus_kind": "aed.codex_remediation.corpus.v0",
+  "corpus_id": "codex-remediation-wave2-pr314-320",
+  "corpus_version": "0.1.0",
+  "description": "Wave 2 regression tests for output_root null handling and repo-root propagation, derived from the PR #314-#320 Codex note retrospective audit. Confirms that two FIXED_ALREADY findings remain fixed in current main. Mock execution only.",
+  "source_audit_doc": "docs/codex_note_retrospective_audit_pr314_320.md",
+  "base_sha": "03b66632e8a2ab3cbadc342d87e4d6bc5b9c8211",
+  "created_at": "2026-05-26T00:00:00Z",
+  "base_sha_policy": "current_main",
+  "scope": {
+    "prs": [314, 315, 316, 317, 318, 319, 320],
+    "wave": 2,
+    "finding_count": 2,
+    "p1_count": 1,
+    "p2_count": 1,
+    "unique_classifications": {
+      "FIXED_ALREADY": 2,
+      "STILL_PRESENT_RUNTIME_BUG": 0,
+      "STILL_PRESENT_GOVERNANCE_GAP": 0,
+      "INCONCLUSIVE": 0,
+      "FALSE_POSITIVE_WITH_EVIDENCE": 0
+    }
+  },
+  "wave_definitions": {
+    "1": "See corpus/codex-remediation-pr314-320.json",
+    "2": {
+      "description": "Regression tests for output_root null normalization and repo-root propagation. Mock execution only. Unlocked after Wave 1 completion report is reviewed and approved.",
+      "task_ids": [
+        "rgr-319-output-root-null-normalization",
+        "rgr-317-repo-root-propagation"
+      ]
+    }
+  },
+  "tasks": [
+    {
+      "task_id": "rgr-319-output-root-null-normalization",
+      "wave": 2,
+      "classification": "FIXED_ALREADY",
+      "task_category": "already_fixed_needs_regression_test",
+      "source_pr": 319,
+      "source_finding_id": "codex-319-output-root-null",
+      "severity": "P1",
+      "goal": "Add a regression test confirming that _normalize_task_packet sets output_root to batch_tasks_dir/task_id when the task packet has output_root: null, and that validate_task_constraints passes the normalized packet.",
+      "action": {
+        "type": "add_regression_test",
+        "target_file": "tests/test_run_autocoder_batch.py",
+        "allowed_files": [
+          "tests/test_run_autocoder_batch.py",
+          "scripts/local/run_autocoder_batch.py"
+        ],
+        "mock_only": true
+      },
+      "success_criteria": "The new test calls _normalize_task_packet with output_root: null, asserts the normalized packet has output_root set to batch_output_root/tasks/task_id, and asserts validate_task_constraints passes on the normalized result.",
+      "deliverable": "A new pytest test function test_output_root_null_normalized_before_validation in tests/test_run_autocoder_batch.py, using the existing fixtures (tmp_path, unique_id, etc.). The test must pass on current main without modifying any existing code.",
+      "safety": {
+        "no_privileged_mode": true,
+        "no_allowlist_bypass": true,
+        "no_live_claude": true,
+        "no_github_mutations": true,
+        "no_hermes_mutations": true,
+        "no_install": true,
+        "scope_narrow": true
+      },
+      "notes": "The P1 concern in PR #319 was that validate_task_constraints rejects null output_root BEFORE normalization. Code inspection (run_autocoder_batch.py:254-276) shows _normalize_task_packet runs FIRST, setting output_root at line 267, then validate_task_constraints (line 347) validates the normalized packet. No bug exists but a regression test ensures this call-order is never reversed."
+    },
+    {
+      "task_id": "rgr-317-repo-root-propagation",
+      "wave": 2,
+      "classification": "FIXED_ALREADY",
+      "task_category": "already_fixed_needs_regression_test",
+      "source_pr": 317,
+      "source_finding_id": "codex-317-repo-root-not-propagated",
+      "severity": "P1",
+      "goal": "Add a regression test confirming that the batch controller passes --repo-root <task_worktree_path> to the stage-2 single-task controller subprocess when executing a task.",
+      "action": {
+        "type": "add_regression_test",
+        "target_file": "tests/test_run_autocoder_batch.py",
+        "allowed_files": [
+          "tests/test_run_autocoder_batch.py",
+          "scripts/local/run_autocoder_batch.py"
+        ],
+        "mock_only": true
+      },
+      "success_criteria": "The new test mocks subprocess.Popen, calls _execute_single_task with a real task dict, and asserts that the '--repo-root' argument is present in the subprocess call args with the correct task_worktree_path value.",
+      "deliverable": "A new pytest test function test_repo_root_passed_to_stage2_executor in tests/test_run_autocoder_batch.py. The test must pass on current main without modifying any existing production code.",
+      "safety": {
+        "no_privileged_mode": true,
+        "no_allowlist_bypass": true,
+        "no_live_claude": true,
+        "no_github_mutations": true,
+        "no_hermes_mutations": true,
+        "no_install": true,
+        "scope_narrow": true
+      },
+      "notes": "The P1 concern in PR #317 was that repo root was not propagated into the stage-2 executor. Code inspection (run_autocoder_batch.py:596-609) shows '--repo-root', str(task_worktree_path) is passed at line 603. The fix was included in PR #317 head (commit 3e85e936). No regression test existed at the time. Wave 2 adds one."
+    }
+  ]
+}

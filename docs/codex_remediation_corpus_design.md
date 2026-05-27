@@ -198,10 +198,11 @@ Wave 1 contains **7 tasks** selected by these criteria:
 >
 > `rgr-320-base-sha-catfile` was reclassified from `inconclusive_needs_manual_audit` → `already_fixed_needs_regression_test`. `validate_corpus_targets` uses `cat-file -e sha:path` for file existence (correct usage). `resolve_base_sha` uses `rev-parse --verify` for SHA validation (correct usage). No bug exists but a regression test should be added to prevent future regression.
 
-Future waves (not yet in this file) will cover:
-- Wave 2: Remaining regression tests for output_root null handling, repo-root propagation
-- Wave 3: any remaining inconclusive items that are resolved by manual audit
-- Wave N: `still_present_bug` tasks if any are ever identified in this corpus
+Wave 2 is now in `corpus/codex-remediation-wave2-pr314-320.json`.
+
+Wave 3 (not yet in this file) will cover any remaining inconclusive items resolved by manual audit.
+
+Wave N: `still_present_bug` tasks if any are ever identified in this corpus.
 
 ---
 
@@ -226,6 +227,68 @@ They can be run independently or in sequence. They do not conflict.
 ---
 
 *Review status — 2026-05-26: PR marked ready-for-review. Exact-head CI not yet available as of last check (head 30b82b5). This note will be updated when CI results arrive.*
+
+---
+
+## 10. Wave 2 — Regression Tests for output_root null and repo-root propagation
+
+**Corpus file**: `corpus/codex-remediation-wave2-pr314-320.json`
+**Wave**: 2
+**PRs in scope**: PRs #314–#320 (same retrospective audit as Wave 1)
+**Source findings**: `docs/codex_note_retrospective_audit_pr314_320.md`
+
+### Wave 2 Scope Summary
+
+| Task ID | Source PR | Severity | Classification | Action Type |
+|---|---|---|---|---|
+| `rgr-319-output-root-null-normalization` | #319 | P1 | FIXED_ALREADY | add_regression_test |
+| `rgr-317-repo-root-propagation` | #317 | P1 | FIXED_ALREADY | add_regression_test |
+
+### Task Details
+
+#### rgr-319-output-root-null-normalization
+
+| Field | Value |
+|---|---|
+| **Source finding** | PR #319 — `output_root: null` in corpus-001 |
+| **Classification** | FIXED_ALREADY — `_normalize_task_packet()` handles null correctly before validation |
+| **Code location** | `scripts/local/run_autocoder_batch.py:254-276` |
+| **Action** | Add regression test `test_output_root_null_normalized_before_validation` to `tests/test_run_autocoder_batch.py` |
+| **Success criteria** | Test confirms `_normalize_task_packet` sets `output_root` to `batch_tasks_dir/task_id` when task has `output_root: null`, and `validate_task_constraints` passes the normalized packet |
+| **Allowed files** | `tests/test_run_autocoder_batch.py`, `scripts/local/run_autocoder_batch.py` |
+| **Safety** | mock_only, no live Claude, no GitHub mutations, no Hermes mutations, scope_narrow |
+
+**Finding detail**: Codex P1 concern was that `validate_task_constraints` rejects null `output_root` before `_normalize_task_packet` sets it. Code inspection shows normalize runs first (line 267 sets `normalized["output_root"]`), then validation runs on the normalized result. No bug. Regression test ensures this call-order is never reversed.
+
+#### rgr-317-repo-root-propagation
+
+| Field | Value |
+|---|---|
+| **Source finding** | PR #317 — repo root not propagated into stage-2 executor |
+| **Classification** | FIXED_ALREADY — `--repo-root` correctly passed at `run_autocoder_batch.py:603` |
+| **Code location** | `scripts/local/run_autocoder_batch.py:596-609` |
+| **Action** | Add regression test `test_repo_root_passed_to_stage2_executor` to `tests/test_run_autocoder_batch.py` |
+| **Success criteria** | Test mocks `subprocess.Popen`, calls `_execute_single_task`, asserts `'--repo-root'` is in subprocess args with correct `task_worktree_path` value |
+| **Allowed files** | `tests/test_run_autocoder_batch.py`, `scripts/local/run_autocoder_batch.py` |
+| **Safety** | mock_only, no live Claude, no GitHub mutations, no Hermes mutations, scope_narrow |
+
+**Finding detail**: PR #317's P1 concern was that repo root was not propagated into the stage-2 executor. The fix (adding `--repo-root str(task_worktree_path)` at line 603) was included in PR #317 head. No regression test existed at the time. Wave 2 adds one.
+
+### Wave 2 Execution Prerequisites
+
+Wave 2 tasks MUST NOT be executed until:
+1. All Wave 1 tasks have completed and the Wave 1 completion report has been reviewed and approved.
+2. The review-comment gate is CLEAN on the Wave 2 PR at its exact head SHA.
+
+### Wave 2 vs Wave 1 Differences
+
+| Property | Wave 1 | Wave 2 |
+|---|---|---|
+| Tasks | 7 (mix of docs and regression) | 2 (regression only) |
+| PRs in scope | #314–#320 | #314–#320 (same audit) |
+| Findings addressed | 26 (all classifications) | 2 (FIXED_ALREADY only) |
+| Execution | Mock only | Mock only |
+| Trigger | Codex retrospective audit | Same audit, remaining items |
 
 ---
 

@@ -424,7 +424,7 @@ def build_loop_status(
         "loop_runner_version": LOOP_RUNNER_VERSION,
         "corpus_id": corpus["corpus_id"],
         "corpus_version": corpus["corpus_version"],
-        "wave": corpus.get("wave_definitions", {}).get("1", {}).get("description", ""),
+        "wave": (corpus.get("wave_definitions", {}).get("1", {}) or {}).get("description", "") if isinstance(corpus.get("wave_definitions", {}).get("1", {}), dict) else "",
         "mode": "mock-plan-only",
         "base_sha_policy": corpus.get("base_sha_policy", "current_main"),
         "status": "LOOP_COMPLETE_MOCK_PLAN_ONLY",
@@ -575,7 +575,7 @@ def main(
 
     # Validate corpus execution_mode
     wave1 = corpus.get("wave_definitions", {}).get("1", {})
-    if wave1.get("execution_mode") != "mocked":
+    if isinstance(wave1, dict) and wave1.get("execution_mode") != "mocked":
         print(
             f"FATAL: Wave 1 execution_mode must be 'mocked', "
             f"got '{wave1.get('execution_mode')}'",
