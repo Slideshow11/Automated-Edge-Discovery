@@ -48,10 +48,10 @@
           "tests/test_run_autocoder_batch.py",
           "scripts/local/run_autocoder_batch.py"
         ],
-        "mock_only": true
+        "mock_only": true,
+        "success_criteria": "The new test calls _normalize_task_packet with output_root: null, asserts the normalized packet has output_root set to batch_output_root/tasks/task_id, and asserts validate_task_constraints passes on the normalized result.",
+        "deliverable": "A new pytest test function test_output_root_null_normalized_before_validation in tests/test_run_autocoder_batch.py, using the existing fixtures (tmp_path, unique_id, etc.). The test must pass on current main without modifying any existing code."
       },
-      "success_criteria": "The new test calls _normalize_task_packet with output_root: null, asserts the normalized packet has output_root set to batch_output_root/tasks/task_id, and asserts validate_task_constraints passes on the normalized result.",
-      "deliverable": "A new pytest test function test_output_root_null_normalized_before_validation in tests/test_run_autocoder_batch.py, using the existing fixtures (tmp_path, unique_id, etc.). The test must pass on current main without modifying any existing code.",
       "safety": {
         "no_privileged_mode": true,
         "no_allowlist_bypass": true,
@@ -79,10 +79,10 @@
           "tests/test_run_autocoder_batch.py",
           "scripts/local/run_autocoder_batch.py"
         ],
-        "mock_only": true
+        "mock_only": true,
+        "success_criteria": "The new test mocks subprocess.Popen, calls _execute_single_task with a real task dict, and asserts that the '--repo-root' argument is present in the subprocess call args with the correct task_worktree_path value.",
+        "deliverable": "A new pytest test function test_repo_root_passed_to_stage2_executor in tests/test_run_autocoder_batch.py. The test must pass on current main without modifying any existing production code."
       },
-      "success_criteria": "The new test mocks subprocess.Popen, calls _execute_single_task with a real task dict, and asserts that the '--repo-root' argument is present in the subprocess call args with the correct task_worktree_path value.",
-      "deliverable": "A new pytest test function test_repo_root_passed_to_stage2_executor in tests/test_run_autocoder_batch.py. The test must pass on current main without modifying any existing production code.",
       "safety": {
         "no_privileged_mode": true,
         "no_allowlist_bypass": true,
