@@ -1282,16 +1282,36 @@ def test_one_task_repair_plan_no_subprocess_invocation(
 def test_one_task_repair_plan_no_repo_mutation(
     tmp_path: Path,
 ) -> None:
-    """one-task-repair-plan does not mutate any repo files."""
-    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
+    """one-task-repair-plan does not mutate any repo files.
+
+    Uses a temp copy of the repo corpus so the test is isolated from
+    worktree state and does not need to whitelist intentional changes.
+    """
+    # Copy the repo corpus to tmp so the script reads from tmp, not REPO_ROOT.
+    repo_corpus = REPO_ROOT / "corpus" / "codex-remediation-wave2-pr314-320.json"
+    corpus_path = tmp_path / "wave2_corpus.json"
+    import shutil
+    shutil.copy2(repo_corpus, corpus_path)
     out_dir = tmp_path / "output"
+
+    # Capture porcelain status BEFORE the script runs so we diff only what the
+    # script changed, not accumulated worktree state from other tests in the
+    # same pytest session.
+    import subprocess as _sub
+    before_status = _sub.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    before_lines = {ln for ln in before_status.stdout.strip().splitlines() if ln}
 
     result = subprocess.run(
         [
             sys.executable,
             str(SCRIPT),
             "--corpus", str(corpus_path),
-            "--task-id", "wave2-task-1",
+            "--task-id", "rgr-319-output-root-null-normalization",
             "--output-root", str(out_dir),
             "--mode", "one-task-repair-plan",
         ],
@@ -1301,25 +1321,33 @@ def test_one_task_repair_plan_no_repo_mutation(
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
-    # Only verify clean if worktree is clean at start of test
-    # (test runner's own changes don't count)
-    git_diff = subprocess.run(
-        ["git", "diff", "--name-only"],
+    # Diff before vs after to isolate script-caused changes.
+    after_status = _sub.run(
+        ["git", "status", "--porcelain"],
         capture_output=True,
         text=True,
         cwd=str(REPO_ROOT),
     )
-    changed_files = git_diff.stdout.strip()
-    if changed_files:
-        known_changes = {
-            "scripts/local/run_codex_remediation_loop.py",
-            "tests/test_run_codex_remediation_loop.py",
-        }
-        unexpected = [
-            f for f in changed_files.splitlines()
-            if f not in known_changes
-        ]
-        assert not unexpected, f"Repo mutated by script: {unexpected}"
+    after_lines = {ln for ln in after_status.stdout.strip().splitlines() if ln}
+
+    # Only files in after but not in before are script-caused changes.
+    script_changes = after_lines - before_lines
+    unexpected = []
+    for ln in sorted(script_changes):
+        # porcelain: XY path
+        parts = ln.split(None, 1)
+        if len(parts) < 2:
+            continue
+        path = parts[1]
+        # This test file is modified by this branch's PR changes — ignore.
+        # The script itself does not modify any repo files when run with a
+        # temp corpus copy and temp output_root.
+        if path == "tests/test_run_codex_remediation_loop.py":
+            continue
+        abs_path = (REPO_ROOT / path).resolve()
+        if not str(abs_path).startswith(str(out_dir.resolve())):
+            unexpected.append(path)
+    assert not unexpected, f"Repo mutated by script: {unexpected}"
 
 
 def test_one_task_repair_plan_rejects_missing_success_criteria(
