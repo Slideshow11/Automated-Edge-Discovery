@@ -1199,6 +1199,48 @@ def test_one_task_repair_plan_prompt_includes_required_fields(
     assert "live claude" in prompt.lower()
 
 
+def test_one_task_repair_plan_suggested_test_name_from_deliverable(
+    tmp_path: Path,
+) -> None:
+    """When the corpus deliverable specifies an explicit test name, suggested_tests.md uses it."""
+    corpus_path, _ = _make_repair_plan_corpus(tmp_path)
+    out_dir = tmp_path / "output"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(SCRIPT),
+            "--corpus", str(corpus_path),
+            "--task-id", "wave2-task-1",
+            "--output-root", str(out_dir),
+            "--mode", "one-task-repair-plan",
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    suggested_md = (out_dir / "wave2-task-1" / "suggested_tests.md").read_text(encoding="utf-8")
+    repair_prompt_md = (out_dir / "wave2-task-1" / "repair_prompt.md").read_text(encoding="utf-8")
+
+    # The corpus deliverable for wave2-task-1 is "New test function test_wave2_task_1_normalized"
+    assert "test_wave2_task_1_normalized" in suggested_md
+    assert "test_wave2_task_1_normalized" in repair_prompt_md
+
+    # The old fallback name (generated from task_id alone) must NOT appear
+    # as the primary suggestion in suggested_tests.md.
+    # The old default was test_<task_id> = test_wave2_task_1
+    # It may appear in a fallback note, but not as the primary suggested name.
+    lines = suggested_md.split("\n")
+    suggestion_lines = [
+        l for l in lines
+        if "**Suggested test name:**" in l and "`test_" in l
+    ]
+    assert len(suggestion_lines) == 1, f"Expected exactly one suggestion line, got: {suggestion_lines}"
+    assert "test_wave2_task_1_normalized" in suggestion_lines[0]
+    assert "test_wave2_task_1," not in suggestion_lines[0]  # not the fallback
+
+
 def test_one_task_repair_plan_writes_only_under_output_root(
     tmp_path: Path,
     monkeypatch: Any,
