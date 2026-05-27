@@ -513,8 +513,22 @@ def run_autocoder_batch(
         _write_json(output_json_path, result)
         return result
 
+    # --- Normalize task packets before inter-task validation ---
+    # Fill in output_root for any task that has it set to None/null,
+    # so validate_task_constraints sees fully-formed task packets.
+    # This must happen before validate_task_constraints (line ~517)
+    # to prevent HOLD_TASK_PACKET_INVALID for null output_root.
+    normalized_tasks = []
+    for task in tasks:
+        if task.get("output_root") is None:
+            normalized_tasks.append(
+                _normalize_task_packet(task, base_sha, output_root, task["task_id"])
+            )
+        else:
+            normalized_tasks.append(task)
+
     # --- Validate task constraints ---
-    valid, err = validate_task_constraints(tasks)
+    valid, err = validate_task_constraints(normalized_tasks)
     if not valid:
         status = State.HOLD_TASK_PACKET_INVALID
         result = {
@@ -576,8 +590,12 @@ def run_autocoder_batch(
             warnings.append(f"worktree creation failed for {task_id}, continuing: {diag}")
             continue
 
-        # Normalize task packet
-        normalized_task = _normalize_task_packet(task, base_sha, output_root, task_id)
+        # Use the pre-normalized task (already normalized before validation).
+        # Avoid re-normalizing to keep output_root consistent with what
+        # validate_task_constraints saw.  _normalize_task_packet only fills
+        # in missing fields so calling it again on an already-normalized task
+        # is safe, but using normalized_tasks[i] eliminates any risk of drift.
+        normalized_task = normalized_tasks[i]
 
         # Write normalized task packet
         task_output_dir = batch_tasks_dir / task_id

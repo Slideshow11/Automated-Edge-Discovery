@@ -765,56 +765,52 @@ class TestTaskNormalization:
         assert result["status"] != "HOLD_BATCH_PACKET_INVALID"
 
     def test_output_root_null_normalized_before_validation(self, tmp_path):
-        """_normalize_task_packet sets output_root to batch_tasks_dir/task_id,
-        and validate_task_constraints passes on the normalized result.
+        """Regression: batch controller must normalize output_root: null before
+        validate_task_constraints rejects it. If the controller calls
+        validate_task_constraints before _normalize_task_packet, the batch
+        returns HOLD_TASK_PACKET_INVALID instead of READY.
 
-        Guards against a future refactor that reverses the call order
-        (validate before normalize), which would cause null output_root
-        to be rejected.
+        This mirrors test_task_output_root_normalized_to_batch_tasks_dir but
+        with output_root explicitly set to None (the regression case).
         """
-        import sys
-        sys.path.insert(0, str(SCRIPT_DIR))
-        try:
-            import run_autocoder_batch as batch_module
-        finally:
-            sys.path.pop(0)
+        import uuid
 
-        batch_output_root = tmp_path / "batch_root"
-        task_id = "task-null-root"
-        base_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        def fake_run(argv):
+            class CP:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+                def __init__(self):
+                    pass
+            return CP()
 
-        # Task packet with null output_root
-        raw_task = {
-            "packet_kind": "aed.autocoder.single_task.v0",
-            "task_id": task_id,
-            "goal": "Test null output_root normalization.",
-            "allowed_files": [f"docs/null_root_{task_id}.md"],
-            "forbidden_files": None,
-            "max_changed_files": 5,
-            "required_tests": None,
-            "output_root": None,  # null — the regression case
-            "branch_name": "apply/test-null-root",
-            "suggested_pr_title": "test: null output_root",
-            "suggested_pr_body": "test",
-            "execution_mode": "mocked",
-            "base_sha": base_sha,
-        }
+        # Use truly unique identifiers so no worktree collision occurs
+        uid = uuid.uuid4().hex[:8]
+        task_id = f"task-null-root-{uid}"
+        branch_name = f"apply/test-null-root-{uid}"
 
-        # validate_task_constraints on raw task fails with empty/null output_root
-        raw_ok, raw_err = batch_module.validate_task_constraints([raw_task])
-        assert not raw_ok, "raw task with null output_root must fail validation"
-        assert "output_root" in raw_err.lower()
+        task = make_task(task_id=task_id, output_root=None,
+                         branch_name=branch_name,
+                         allowed_files=[f"docs/null_root_{uid}.md"])
+        batch = make_batch(batch_id=f"test-null-root-batch-{uid}", tasks=[task])
 
-        # Normalize — _normalize_task_packet fills in output_root
-        normalized = batch_module._normalize_task_packet(
-            raw_task, base_sha, batch_output_root, task_id
+        result = run_batch_via_module(batch, tmp_path / "out.json",
+                                      tmp_path / "out.md",
+                                      monkeypatch_runner=fake_run)
+
+        # The batch must not reject the task as invalid at validation time.
+        # HOLD_TASK_PACKET_INVALID means validate_task_constraints ran on
+        # the raw null-output_root task before _normalize_task_packet filled it.
+        # After the fix, normalization happens first so validation passes.
+        # The batch may still be HOLD_TASK_FAILED (task execution failed) or
+        # BATCH_READY (task succeeded) — both are fine. The bug was
+        # HOLD_TASK_PACKET_INVALID which would have come from validation
+        # rejecting null output_root before any normalization.
+        assert result["status"] != "HOLD_TASK_PACKET_INVALID", (
+            f"Got HOLD_TASK_PACKET_INVALID — validate_task_constraints "
+            "rejected null output_root before normalization. "
+            "rgr-319 may not be fixed in production code."
         )
-        expected_output_root = str(batch_output_root / "tasks" / task_id)
-        assert normalized["output_root"] == expected_output_root
-
-        # validate_task_constraints on normalized task passes
-        norm_ok, norm_err = batch_module.validate_task_constraints([normalized])
-        assert norm_ok, f"normalized task must pass validation, got: {norm_err}"
 
 
 # ---------------------------------------------------------------------------
