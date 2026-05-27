@@ -8,7 +8,15 @@
   "created_at": "2026-05-26T00:00:00Z",
   "base_sha_policy": "current_main",
   "scope": {
-    "prs": [314, 315, 316, 317, 318, 319, 320],
+    "prs": [
+      314,
+      315,
+      316,
+      317,
+      318,
+      319,
+      320
+    ],
     "wave": 2,
     "finding_count": 2,
     "p1_count": 1,
@@ -24,11 +32,12 @@
   "wave_definitions": {
     "1": "See corpus/codex-remediation-pr314-320.json",
     "2": {
-      "description": "Regression tests for output_root null normalization and repo-root propagation. Mock execution only. Unlocked after Wave 1 completion report is reviewed and approved.",
+      "description": "Regression tests for output_root null normalization and repo-root propagation. Repair-plan artifact generation approved. Live execution, live Claude, and autocoder batch are NOT approved. Unlocked after Wave 1 completion report is reviewed and approved.",
       "task_ids": [
         "rgr-319-output-root-null-normalization",
         "rgr-317-repo-root-propagation"
-      ]
+      ],
+      "execution_mode": "repair-plan"
     }
   },
   "tasks": [
