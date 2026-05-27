@@ -43,6 +43,7 @@ python3 scripts/local/wait_for_pr_ready.py \
 | `--require-pmg` | No | False | Run PMG compare |
 | `--require-final-gates` | No | False | Run final_gate_status.py |
 | `--require-merge-ready` | No | False | Run verify_final_head_merge_command.py |
+| `--required-checks` | No | (see default list) | Override default required CI check names |
 | `--output-json` | Yes | — | Path to JSON report |
 | `--output-md` | No | — | Path to Markdown report |
 
@@ -96,11 +97,19 @@ even if the overall CI would otherwise green-light the PR:
 
 The `pending` state is not a failure — it triggers another poll cycle.
 
-Default required checks (can be overridden via `--required-checks`):
+Default required checks for this repository:
 - `test (3.11)` or `test` (any Python version)
 - `review-comment-gate`
 - `validator`
 - `governance-validators`
+- `pr-gate-live-smoke`
+
+The waiter must fail closed if any default required check is missing from the poll
+result, pending past the timeout, failed, cancelled, skipped when required, or
+returned with an unknown conclusion. The default list is the minimum gate set for
+this repository — it is not an optional example. Future implementations may support
+repo-specific check configuration via `--required-checks`, but the AED default must
+always include `pr-gate-live-smoke`.
 
 ### 3. Review-comment gate runs only after CI is green
 
