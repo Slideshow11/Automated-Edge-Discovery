@@ -45,8 +45,14 @@ DEFAULT_REQUIRED_CHECKS = [
     "pr-gate-live-smoke",
 ]
 
+# Repository and working-directory context.
+# These are overridden by --repo and --repo-root CLI arguments.
 REPO = "Slideshow11/Automated-Edge-Discovery"
 HERMES_ROOT = os.path.expanduser("~/.hermes")
+
+# Populate REPO_CONTEXT and REPO_ROOT from CLI args in main().
+REPO_CONTEXT: List[str] = []   # ["--repo", REPO] — passed to every gh command
+REPO_ROOT: str = ""            # Absolute path to the AED repo root
 
 # ---------------------------------------------------------------------------
 # Status constants
@@ -79,9 +85,26 @@ def gh_run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
     "checks pending" but data is still valid) and for get_pr_state / get_live_head_sha
     where a nonzero exit must be caught and converted into a structured HOLD/ERROR
     status rather than raising before JSON/MD reports can be written.
+
+    All calls include explicit --repo context from REPO_CONTEXT so the waiter
+    works from any working directory.
     """
+    GH_REPO_SUBCMDS = {"pr", "issue", "api", "run", "secret", "label", "milestone", "release"}
+
+    def _add_repo_context(args: List[str]) -> List[str]:
+        """Add --repo after the gh subcommand, but only for gh API subcommands.
+
+        PMG compare/snapshot and other non-gh-script helpers do not accept --repo.
+        """
+        if not args:
+            return args
+        # args[0] is the gh subcommand (e.g. "pr", "issue", "compare")
+        if args[0] in GH_REPO_SUBCMDS and "--repo" not in args:
+            return args + REPO_CONTEXT
+        return args
+
     result = subprocess.run(
-        ["gh"] + args,
+        ["gh"] + _add_repo_context(args),
         capture_output=True,
         text=True,
         shell=False,
@@ -98,6 +121,7 @@ def gh_run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
 def run_external_script(
     cmd: List[str],
     check: bool = True,
+    cwd: Optional[str] = None,
 ) -> subprocess.CompletedProcess:
     """Run an external Python script. Always uses shell=False."""
     result = subprocess.run(
@@ -105,6 +129,7 @@ def run_external_script(
         capture_output=True,
         text=True,
         shell=False,
+        cwd=cwd or REPO_ROOT or None,
     )
     if check and result.returncode != 0:
         raise RuntimeError(f"command {' '.join(cmd)} failed: {result.stderr.strip()}")
@@ -193,7 +218,14 @@ def poll_ci_checks(
             except json.JSONDecodeError as e:
                 return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"JSON parse failed: {e}"}, f"JSON parse failed: {e}"
 
-        reported = {c["name"]: c for c in checks}
+        # Group checks by name to handle duplicate entries from parallel workflow runs.
+        # If a required check appears multiple times (e.g., two workflows running on the same
+        # head), we apply precedence: SUCCESS wins over SKIPPED/FAILURE/PENDING.
+        # This prevents a transient SKIPPED entry from overwriting a SUCCESS entry.
+        from collections import defaultdict
+        checks_by_name: Dict[str, List[Dict]] = defaultdict(list)
+        for c in checks:
+            checks_by_name[c["name"]].append(c)
 
         failed_checks = []
         pending_checks = []
@@ -201,30 +233,47 @@ def poll_ci_checks(
         unknown_checks = []
 
         for name in required_checks:
-            if name not in reported:
+            records = checks_by_name.get(name, [])
+            if not records:
                 missing_checks.append(name)
                 continue
-            state_val = reported[name].get("state", "")
-            lower = state_val.lower()
-            if lower == "success":
-                pass  # green
-            elif lower in ("failure", "cancelled", "skipped"):
-                failed_checks.append(name)
-            elif lower in ("neutral", "timed_out", "action_required"):
-                failed_checks.append(name)
-            elif lower == "pending":
-                pending_checks.append(name)
-            elif not state_val or lower in ("in_progress", "queued", "requested", "waiting"):
-                pending_checks.append(name)
-            else:
-                unknown_checks.append(f"{name} (state={state_val})")
 
-        if failed_checks or missing_checks or unknown_checks:
+            # Evaluate all records for this check name using precedence:
+            # SUCCESS > PENDING/IN_PROGRESS > FAILURE/CANCELLED/SKIPPED > UNKNOWN
+            state_vals = [r.get("state", "").lower() for r in records]
+
+            if any(s == "success" for s in state_vals):
+                pass  # at least one SUCCESS — check satisfied
+            elif any(s in ("pending", "in_progress", "queued", "requested", "waiting") or not s for s in state_vals):
+                pending_checks.append(name)
+            elif any(s in ("failure", "cancelled", "skipped", "neutral", "timed_out", "action_required") for s in state_vals):
+                failed_checks.append(name)
+            else:
+                unknown_checks.append(f"{name} (states={state_vals})")
+
+        # During polling window: a missing required check means the CI workflow
+        # has not yet posted results for that check (workflow may still be spinning
+        # up). Treat as pending — keep polling — so we do not false-fail on a
+        # transient missing check (e.g., pr-gate-live-smoke not yet posted).
+        #
+        # Fail-closed ONLY when:
+        #   (a) timeout reached with still-missing checks  → HOLD_TIMEOUT
+        #   (b) check appears with only FAILURE/SKIPPED   → HOLD_CI_FAILED
+        #   (c) check appears with unknown state          → HOLD_CI_FAILED
+        #
+        # SKIPPED is fail-closed because a check that ran and was deliberately
+        # skipped is not equivalent to "check has not started yet".
+        if missing_checks:
+            pending_checks.extend(missing_checks)
+            # Do NOT add to failed_checks — keep them separate so the
+            # fail-closed path (HOLD_CI_FAILED) only triggers on checks that
+            # actually appeared with a terminal non-success state.
+            missing_checks = []  # consumed into pending_checks
+
+        if failed_checks or unknown_checks:
             reason = []
             if failed_checks:
                 reason.append(f"failed/cancelled/skipped: {failed_checks}")
-            if missing_checks:
-                reason.append(f"missing required: {missing_checks}")
             if unknown_checks:
                 reason.append(f"unknown state: {unknown_checks}")
             return STATUS_HOLD_CI_FAILED, {"checks": checks, "polled_at": datetime.now(timezone.utc).isoformat()}, "; ".join(reason)
@@ -461,8 +510,29 @@ def main():
         action="store_true",
         help="Take a PMG snapshot at start (used automatically with --require-pmg)",
     )
+    parser.add_argument(
+        "--repo",
+        type=str,
+        default=None,
+        help="GitHub repository in 'owner/name' form (default: Slideshow11/Automated-Edge-Discovery)",
+    )
+    parser.add_argument(
+        "--repo-root",
+        type=str,
+        default=None,
+        help="Absolute path to the AED repository root (default: auto-detected from script location)",
+    )
 
     args = parser.parse_args()
+
+    # Populate global repo context for gh commands and working directory for local scripts.
+    global REPO_CONTEXT, REPO_ROOT
+    REPO_CONTEXT = ["--repo", args.repo or "Slideshow11/Automated-Edge-Discovery"]
+    if args.repo_root:
+        REPO_ROOT = str(Path(args.repo_root).resolve())
+    else:
+        # Auto-detect: script is in <repo_root>/scripts/local/wait_for_pr_ready.py
+        REPO_ROOT = str(Path(__file__).resolve().parent.parent.parent)
 
     if args.required_checks:
         required_checks = [c.strip() for c in args.required_checks.split(",") if c.strip()]

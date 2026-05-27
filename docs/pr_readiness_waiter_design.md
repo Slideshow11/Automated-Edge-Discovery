@@ -91,7 +91,10 @@ even if the overall CI would otherwise green-light the PR:
 - Any check with state `failure` → `HOLD_CI_FAILED`
 - Any check with state `cancelled` → `HOLD_CI_FAILED`
 - Any required check with state `skipped` → `HOLD_CI_FAILED`
-- Any required check absent from the list → `HOLD_CI_FAILED`
+- Any required check absent from the list → treated as **pending** (keep polling);
+  fail-closed as `HOLD_TIMEOUT` only when the deadline is reached with the check
+  still missing. This prevents false `HOLD_CI_FAILED` during CI workflow startup
+  when pr-gate-live-smoke has not yet posted results.
 - Any check with an unknown state (not pass/failure/cancelled/skipped/pending) →
   `ERROR_TOOLING` with detail logged
 
@@ -201,6 +204,39 @@ Investigate tooling error in logs. Do not merge until resolved.
 
 All `subprocess.run` calls use `shell=False`. Arguments are passed as list items,
 never interpolated into shell strings. `gh pr merge` is never called by this tool.
+
+### 9. Repo-context independence
+
+The waiter must work from any working directory. All `gh` commands use explicit
+`--repo owner/name` so the tool works when invoked from `/tmp`, a hermes cron
+job, or any non-repo context. Local scripts (PMG, final_gate_status,
+check_pr_review_comments) run with `cwd=REPO_ROOT` so they also work from
+anywhere.
+
+Two CLI arguments support this:
+- `--repo` — GitHub repository in `'owner/name'` form (default:
+  `Slideshow11/Automated-Edge-Discovery`)
+- `--repo-root` — absolute path to the AED repository root (default:
+  auto-detected from script location: `<script>/../../../`)
+
+### 10. Gate semantics — HARD stops vs. merge candidates
+
+`final_gate_status.py` returns `HOLD_*` statuses (e.g., `HOLD_CI_RED`,
+`HOLD_REVIEW_COMMENTS_BLOCKED`, `HOLD_PMG_DIRTY`). These are **hard stops**:
+the PR must not be merged while any `HOLD_*` is active. `HOLD_CI_RED` means CI
+has failed and is not a candidate for merge.
+
+`verify_final_head_merge_command.py` returns `MERGE_READY_CANDIDATE` only when
+ALL of its prerequisite conditions are satisfied. A `HOLD_*` from
+`final_gate_status.py` is not a `MERGE_READY_CANDIDATE`.
+
+**Process deviation (PR #338)**: PR #338 was manually merged despite
+`final_gate_status.py` returning `HOLD_CI_RED`. The CI failure on PR #338 was
+a pre-existing infrastructure issue (not a code defect in the changed file),
+but the manual override bypassed a designed gate. This pattern must not repeat.
+If `final_gate_status.py` returns any `HOLD_*` status, a separate documented
+human override process (with a written decision record) is required before the
+merge proceeds. The waiter itself never merges and never bypasses gates.
 
 ## File Layout
 
