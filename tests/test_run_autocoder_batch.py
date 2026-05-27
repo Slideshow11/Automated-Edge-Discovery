@@ -764,6 +764,58 @@ class TestTaskNormalization:
         # Should not fail on output_root validation
         assert result["status"] != "HOLD_BATCH_PACKET_INVALID"
 
+    def test_output_root_null_normalized_before_validation(self, tmp_path):
+        """_normalize_task_packet sets output_root to batch_tasks_dir/task_id,
+        and validate_task_constraints passes on the normalized result.
+
+        Guards against a future refactor that reverses the call order
+        (validate before normalize), which would cause null output_root
+        to be rejected.
+        """
+        import sys
+        sys.path.insert(0, str(SCRIPT_DIR))
+        try:
+            import run_autocoder_batch as batch_module
+        finally:
+            sys.path.pop(0)
+
+        batch_output_root = tmp_path / "batch_root"
+        task_id = "task-null-root"
+        base_sha = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
+        # Task packet with null output_root
+        raw_task = {
+            "packet_kind": "aed.autocoder.single_task.v0",
+            "task_id": task_id,
+            "goal": "Test null output_root normalization.",
+            "allowed_files": [f"docs/null_root_{task_id}.md"],
+            "forbidden_files": None,
+            "max_changed_files": 5,
+            "required_tests": None,
+            "output_root": None,  # null — the regression case
+            "branch_name": "apply/test-null-root",
+            "suggested_pr_title": "test: null output_root",
+            "suggested_pr_body": "test",
+            "execution_mode": "mocked",
+            "base_sha": base_sha,
+        }
+
+        # validate_task_constraints on raw task fails with empty/null output_root
+        raw_ok, raw_err = batch_module.validate_task_constraints([raw_task])
+        assert not raw_ok, "raw task with null output_root must fail validation"
+        assert "output_root" in raw_err.lower()
+
+        # Normalize — _normalize_task_packet fills in output_root
+        normalized = batch_module._normalize_task_packet(
+            raw_task, base_sha, batch_output_root, task_id
+        )
+        expected_output_root = str(batch_output_root / "tasks" / task_id)
+        assert normalized["output_root"] == expected_output_root
+
+        # validate_task_constraints on normalized task passes
+        norm_ok, norm_err = batch_module.validate_task_constraints([normalized])
+        assert norm_ok, f"normalized task must pass validation, got: {norm_err}"
+
 
 # ---------------------------------------------------------------------------
 # Execution tests (mocked subprocess)
