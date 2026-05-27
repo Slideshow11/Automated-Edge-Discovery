@@ -546,6 +546,283 @@ class TestFinalGates:
             f"stages={stage_names}"
         )
 
+    def test_pmg_compare_json_is_used_for_final_gate_status(self, output_dir, output_json):
+        """
+        When --require-pmg and --require-final-gates are both set, the waiter
+        must pass the PMG COMPARE output JSON (status=clean/blocked) to
+        final_gate_status.py -- NOT the before-snapshot JSON (which has no status field).
+
+        This is verified by patching subprocess.run to capture the exact argv
+        passed to final_gate_status.py and asserting the pmg_compare path
+        (not pmg_before path) appears in --pmg-guard-state-json.
+        """
+        import importlib.util
+        import subprocess
+        import sys
+
+        captured_cmds = []
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                args = [a for a in cmd[1:] if a != "--repo"]
+                gh_args = args
+
+                if gh_args[:2] == ["pr", "view"]:
+                    # Route based on --jq expression to match real waiter behavior
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        else:
+                            m.stdout = ''
+                    else:
+                        m.stdout = ''
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'check_pr_review_comments' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+                elif 'check_persistent_mutation_guard' in cmd_str:
+                    if 'compare' in cmd_str:
+                        # Real PMG compare output — has status field
+                        with open(out_path, 'w') as f:
+                            json.dump({'status': 'clean', 'blocked_changes': [], 'recommendation': 'PASS'}, f)
+                    else:
+                        # snapshot command — write a before JSON so waiter can proceed
+                        with open(out_path, 'w') as f:
+                            json.dump({'guard_version': 1, 'snapshot_at': '2026-05-27T00:00:00Z', 'root': '/home/max/.hermes', 'files': []}, f)
+                elif 'final_gate_status' in cmd_str:
+                    # Capture this call's --pmg-guard-state-json value
+                    pmg_arg = None
+                    for i, a in enumerate(cmd):
+                        if a == '--pmg-guard-state-json' and i + 1 < len(cmd):
+                            pmg_arg = cmd[i + 1]
+                            break
+                    captured_cmds.append({'script': 'final_gate_status', 'pmg_guard_state_json': pmg_arg})
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    pmg_arg = None
+                    for i, a in enumerate(cmd):
+                        if a == '--pmg-guard-state-json' and i + 1 < len(cmd):
+                            pmg_arg = cmd[i + 1]
+                            break
+                    captured_cmds.append({'script': 'verify_final_head', 'pmg_guard_state_json': pmg_arg})
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'MERGE_READY_CANDIDATE', 'head_sha_match': True}, f)
+
+            return m
+
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-pmg",
+            "--require-final-gates",
+        ]
+
+        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        # Find the final_gate_status invocation
+        fgs = next((c for c in captured_cmds if c['script'] == 'final_gate_status'), None)
+        assert fgs is not None, f"final_gate_status not called; captured_cmds={captured_cmds}"
+
+        # The pmg_guard_state_json must be the COMPARE output, not the BEFORE snapshot
+        # Waiter naming convention: <output>.json → <output>_pmg_before.json (snapshot)
+        #                             <output>.json → <output>_pmg_compare.json (compare result)
+        base = out_json.replace(".json", "")
+        expected_compare = f"{base}_pmg_compare.json"
+        expected_before = f"{base}_pmg_before.json"
+
+        assert fgs['pmg_guard_state_json'] == expected_compare, (
+            f"final_gate_status must receive _pmg_compare.json (compare output), "
+            f"not _pmg_before.json (snapshot). "
+            f"Got: {fgs['pmg_guard_state_json']!r}, "
+            f"Expected: {expected_compare!r}"
+        )
+        # Confirm the before-snapshot path would NOT be sent
+        assert fgs['pmg_guard_state_json'] != expected_before, (
+            f"before-snapshot must not be passed to final_gate_status; got: {fgs['pmg_guard_state_json']}"
+        )
+
+    def test_pmg_dirty_result_blocks_ready_to_merge_candidate(self, output_dir, output_json):
+        """
+        When final_gate_status.py returns HOLD_PMG_DIRTY (e.g. because pmg_compare
+        returned status=blocked), the waiter must NOT emit READY_TO_MERGE_CANDIDATE.
+        It must stop with a HOLD status and a next_safe_action that contains no
+        merge command.
+        """
+        import importlib.util
+        import subprocess
+        import sys
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                args = [a for a in cmd[1:] if a != "--repo"]
+                gh_args = args
+
+                if gh_args[:2] == ["pr", "view"]:
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        else:
+                            m.stdout = ''
+                    else:
+                        m.stdout = ''
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'check_pr_review_comments' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+                elif 'check_persistent_mutation_guard' in cmd_str:
+                    if 'compare' in cmd_str:
+                        # PMG dirty — blocked changes detected
+                        with open(out_path, 'w') as f:
+                            json.dump({'status': 'blocked', 'blocked_changes': [
+                                {'relative_path': 'skills/new_skill/SKILL.md', 'change': 'added'}
+                            ], 'recommendation': 'BLOCK'}, f)
+                elif 'final_gate_status' in cmd_str:
+                    # final_gate_status receives pmg_compare (blocked) → HOLD_PMG_DIRTY
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'HOLD_PMG_DIRTY', 'blockers': [
+                            'PMG guard state invalid: PMG status is \'blocked\''
+                        ]}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'BLOCK', 'verification_errors': [
+                            'persistent_mutation_guard: PMG status is \'blocked\''
+                        ]}, f)
+                else:
+                    with open(out_path, 'w') as f:
+                        json.dump({}, f)
+
+            return m
+
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-pmg",
+            "--require-final-gates",
+        ]
+
+        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        data = read_json(out_json)
+        # Must NOT be READY_TO_MERGE_CANDIDATE — final_gate_status returned HOLD_PMG_DIRTY
+        assert data["status"] != "READY_TO_MERGE_CANDIDATE", (
+            f"HOLD_PMG_DIRTY must block READY_TO_MERGE_CANDIDATE; got: {data['status']}"
+        )
+        assert data["status"].startswith("HOLD_") or data["status"] == "ERROR_TOOLING", (
+            f"Expected HOLD_* or ERROR_TOOLING but got: {data['status']}"
+        )
+        # next_safe_action must not contain a merge command
+        next_action = data.get("next_safe_action", "")
+        assert "gh pr merge" not in next_action, (
+            f"HOLD_PMG_DIRTY must not emit merge command; next_action={next_action!r}"
+        )
+
 
 class TestWaiterCLI:
     """Test the command-line interface."""
