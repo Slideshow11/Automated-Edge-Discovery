@@ -815,6 +815,21 @@ def build_safety_checklist_md(task: dict, repo: Path) -> str:
     return "\n".join(lines)
 
 
+def _extract_test_name_from_deliverable(deliverable: str) -> str | None:
+    """Extract a 'test_<identifier>' function name from the deliverable text.
+
+    Returns the matched name if the deliverable contains an explicit pytest
+    test function reference (e.g. 'test_output_root_null_normalized_before_validation'),
+    otherwise returns None to signal the caller should fall back to the
+    task-id-based generated name.
+    """
+    # Exclude test_PATH/ where PATH starts with identifier char (test_path/, test_rgr/)
+    # This prevents matching file-path-internal bare identifiers at directory boundaries.
+    pattern = r'(?<![A-Za-z0-9_/])test_(?![A-Za-z_]*run_)(?![A-Za-z_]*path[/])(?=[A-Za-z_])[A-Za-z_][A-Za-z0-9_]*(?![A-Za-z0-9_])'
+    m = re.search(pattern, deliverable)
+    return m.group(0) if m else None
+
+
 def build_suggested_tests_md(task: dict) -> str:
     """Build suggested_tests.md from the task action block."""
     task_id = task["task_id"]
@@ -823,8 +838,11 @@ def build_suggested_tests_md(task: dict) -> str:
     success_criteria = action.get("success_criteria", "")
     deliverable = action.get("deliverable", "")
 
-    # Extract a suggested test name from the deliverable if possible
-    test_name = f"test_{task_id.replace('-', '_')}"
+    # Prefer the explicit test name from the deliverable; fall back to
+    # the task-id-based generated name when no explicit name is present.
+    test_name = _extract_test_name_from_deliverable(deliverable)
+    if test_name is None:
+        test_name = f"test_{task_id.replace('-', '_')}"
 
     lines = [
         f"# Suggested Test — {task_id}",
