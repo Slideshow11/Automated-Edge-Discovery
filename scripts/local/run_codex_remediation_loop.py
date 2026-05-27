@@ -76,7 +76,9 @@ VALID_ACTION_TYPES = frozenset({
 })
 
 # Forbidden: live Claude enablement flags, dangerous API calls, and GitHub/git mutation.
-# Does NOT match "No live Claude" or "No git push/merge" style documentation notes.
+# git/gh patterns use word-boundary matching to reduce false positives on
+# prohibition references like "No git push/merge" (which contains "git push"
+# as a substring but is not itself a command invocation).
 FORBIDDEN_SAFETY_PATTERNS = [
     re.compile(r"--enable-real-claude-executor"),
     re.compile(r"fact_store"),
@@ -88,6 +90,14 @@ FORBIDDEN_SAFETY_PATTERNS = [
     re.compile(r"deleteReview"),
     re.compile(r"dismissReview"),
     re.compile(r"shell\s*=\s*True", re.IGNORECASE),
+    # GitHub CLI mutation
+    re.compile(r"\bgh\s+pr\s+(?:merge|close|edit)\b"),
+    # Git subcommands that modify repo state.
+    # Negative lookahead (?!\S*[\w/]) prevents matching slash-separated lists like
+    # "No git push/merge" where the command is followed by / not whitespace.
+    # Pattern matches: "git push", "git merge", "git commit --amend"
+    # Pattern rejects: "No git push/merge" (slash after command, not a command invocation)
+    re.compile(r"\bgit\s+(?:merge|push|commit|add)(?!\S*[\w/])"),
 ]
 
 # Unsafe task_id pattern (path traversal risk)
@@ -304,18 +314,20 @@ def build_task_packet(
       task_packet_dir/safety_notes_verified.txt (empty marker)
     """
     task_id = task["task_id"]
-    task_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Validate task_id
+    # Validate task_id before creating any directories (prevent path traversal)
     valid, err = validate_task_id(task_id)
     if not valid:
         return False, f"task_id validation failed: {err}"
 
-    # Validate safety_notes
+    # Validate safety_notes before writing anything
     safety_notes = task.get("safety_notes", [])
     valid, err = validate_safety_notes(safety_notes)
     if not valid:
         return False, f"safety_notes validation failed: {err}"
+
+    # Only now create the task output directory
+    task_output_dir.mkdir(parents=True, exist_ok=True)
 
     # Check allowed_files
     action = task.get("action", {})
