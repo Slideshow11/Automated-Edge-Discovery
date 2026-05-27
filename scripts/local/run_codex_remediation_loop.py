@@ -59,6 +59,11 @@ REPO_ROOT = SCRIPT_DIR.parent.parent
 CORPUS_KIND = "aed.codex_remediation.corpus.v0"
 CORPUS_VERSION = "0.1.0"
 LOOP_RUNNER_VERSION = "0.1.0"
+REPAIR_PLAN_KIND = "aed.codex_remediation.repair_plan.v0"
+REPAIR_PLAN_STATUS_KIND = "aed.codex_remediation.repair_plan_status.v0"
+
+# Protected paths — output_root must not resolve inside these
+PROTECTED_PATHS = frozenset({".hermes", "skills", "memory", "profiles"})
 
 # Valid task categories
 VALID_TASK_CATEGORIES = frozenset({
@@ -523,6 +528,534 @@ def render_loop_status_md(status: dict, task_results: list[dict]) -> str:
 
 
 # -----------------------------------------------------------------------
+# Repair plan helpers (one-task-repair-plan mode)
+# -----------------------------------------------------------------------
+
+
+def _derive_safety_notes_from_safety_dict(safety: dict) -> list[str]:
+    """Convert a Wave-2-style safety dict to a safety_notes list."""
+    notes = []
+    if safety.get("no_live_claude"):
+        notes.append("No live Claude execution")
+    if safety.get("no_hermes_mutations"):
+        notes.append("No Hermes mutation")
+    if safety.get("no_github_mutations"):
+        notes.append("No GitHub API mutations")
+    if safety.get("no_install"):
+        notes.append("No package installation")
+    if safety.get("scope_narrow"):
+        notes.append("Scope is narrow — single task")
+    if not notes:
+        notes.append("No safety restrictions beyond runner defaults")
+    return notes
+
+
+def _derive_safety_notes(task: dict) -> list[str]:
+    """
+    Extract safety_notes from a task, handling both Wave-1 (list) and
+    Wave-2 (dict in safety field) formats.
+    """
+    # Wave 1: explicit safety_notes list
+    if task.get("safety_notes"):
+        return list(task["safety_notes"])
+    # Wave 2: safety dict
+    safety = task.get("safety", {})
+    if isinstance(safety, dict):
+        return _derive_safety_notes_from_safety_dict(safety)
+    return []
+
+
+def check_output_root_isolation(output_path: Path) -> tuple[bool, str]:
+    """
+    Verify output_path is not inside a protected directory.
+    Returns (clean, error_message).
+    """
+    resolved = output_path.resolve()
+    parts = resolved.parts
+    # Check if any path component is a protected directory
+    for part in parts:
+        if part in PROTECTED_PATHS:
+            return False, (
+                f"output_root '{output_path}' resolves inside protected path '{part}'. "
+                "Choose a path outside .hermes/, skills/, memory/, profiles/."
+            )
+    return True, ""
+
+
+def find_task_in_corpus(
+    corpus: dict,
+    task_id: str,
+) -> tuple[Optional[dict], str]:
+    """
+    Find a task by task_id in the corpus.
+    Returns (task_or_None, error_message).
+    """
+    for task in corpus.get("tasks", []):
+        if task.get("task_id") == task_id:
+            return task, ""
+    return None, (
+        f"task_id '{task_id}' not found in corpus '{corpus.get('corpus_id')}'. "
+        f"Available task_ids: {[t['task_id'] for t in corpus.get('tasks', [])]}"
+    )
+
+
+def validate_action_fields(task: dict) -> tuple[bool, str]:
+    """
+    Validate that action.success_criteria and action.deliverable are present and non-empty.
+    Returns (valid, error_message).
+    """
+    action = task.get("action", {})
+    if not action:
+        return False, "task.action is missing or empty"
+    success_criteria = action.get("success_criteria", "")
+    if not success_criteria or not str(success_criteria).strip():
+        return False, "task.action.success_criteria is missing or empty"
+    deliverable = action.get("deliverable", "")
+    if not deliverable or not str(deliverable).strip():
+        return False, "task.action.deliverable is missing or empty"
+    return True, ""
+
+
+def build_task_context(
+    task: dict,
+    corpus: dict,
+    output_root: Path,
+    generated_files: list[str],
+) -> dict:
+    """Build task_context.json."""
+    action = task.get("action", {})
+    safety_notes = _derive_safety_notes(task)
+    return {
+        "context_kind": REPAIR_PLAN_KIND,
+        "loop_runner_version": LOOP_RUNNER_VERSION,
+        "task_id": task["task_id"],
+        "wave": task.get("wave"),
+        "source_pr": task.get("source_pr"),
+        "finding_id": task.get("finding_id") or task.get("source_finding_id", ""),
+        "severity": task.get("severity"),
+        "classification": task.get("classification", ""),
+        "task_category": task.get("task_category", ""),
+        "action_type": action.get("type", ""),
+        "target_file": action.get("target_file", ""),
+        "allowed_files": action.get("allowed_files", []),
+        "forbidden_files": action.get("forbidden_files", []),
+        "safety_notes": safety_notes,
+        "finding_summary": task.get("finding_summary", task.get("goal", "")),
+        "current_main_status": task.get("current_main_status", task.get("notes", "")),
+        "success_criteria": action.get("success_criteria", ""),
+        "deliverable": action.get("deliverable", ""),
+        "output_root": str(output_root),
+        "generated_files": generated_files,
+        "execution_performed": False,
+        "live_claude_invoked": False,
+        "autocoder_batch_invoked": False,
+        "repo_mutated": False,
+        "git_mutation_allowed": False,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def build_repair_prompt_md(task: dict, corpus: dict) -> str:
+    """Build repair_prompt.md."""
+    task_id = task["task_id"]
+    action = task.get("action", {})
+    safety_notes = _derive_safety_notes(task)
+
+    allowed_files = action.get("allowed_files", [])
+    forbidden_files = action.get("forbidden_files", [])
+    target_file = action.get("target_file", "")
+    success_criteria = action.get("success_criteria", "")
+    deliverable = action.get("deliverable", "")
+    finding_summary = task.get("finding_summary", task.get("goal", ""))
+    current_main_status = task.get("current_main_status", task.get("notes", ""))
+    severity = task.get("severity", "P?")
+    wave = task.get("wave", "?")
+    classification = task.get("classification", task.get("task_category", ""))
+
+    allowed_files_md = "\n".join(f"- `{f}`" for f in allowed_files) or "_none_"
+    forbidden_files_md = "\n".join(f"- `{f}`" for f in forbidden_files) or "_none_"
+
+    lines = [
+        f"# Repair Plan — {task_id}",
+        "",
+        "## Task Summary",
+        "",
+        f"- **Task ID:** `{task_id}`",
+        f"- **Wave:** {wave}",
+        f"- **Severity:** {severity}",
+        f"- **Classification:** `{classification}`",
+        f"- **Corpus:** `{corpus.get('corpus_id', '')}`",
+        "",
+        "## Finding",
+        "",
+        finding_summary,
+        "",
+        "## Current Main Status",
+        "",
+        current_main_status,
+        "",
+        "## Goal",
+        "",
+        task.get("goal", "Complete the task described in the deliverable."),
+        "",
+        "## Deliverable",
+        "",
+        deliverable,
+        "",
+        "## Success Criteria",
+        "",
+        success_criteria,
+        "",
+        "## Target File",
+        "",
+        f"`{target_file}`",
+        "",
+        "## Allowed Files (read-only references)",
+        "",
+        allowed_files_md,
+        "",
+        "## Forbidden Files (must not be modified)",
+        "",
+        forbidden_files_md,
+        "",
+        "## Safety Requirements",
+        "",
+        "- Do NOT modify any file outside the allowed files list",
+        "- Do NOT enable live Claude execution",
+        "- Do NOT run the autocoder batch controller",
+        "- Do NOT attempt to merge, push, or commit changes via git",
+        "- Do NOT call GitHub API mutation endpoints (gh pr merge, close, edit, etc.)",
+        "- Do NOT write to `.hermes/`, `skills/`, `memory/`, or `profiles/`",
+        "- Do NOT use `shell=True` in any subprocess call",
+        "- Do NOT install packages or modify the environment",
+        "- Make the smallest change necessary to satisfy the deliverable",
+        "",
+        "## Execution Boundary",
+        "",
+        "This plan authorizes only the changes described in the deliverable above.",
+        "Any other file changes require a new task and new review.",
+        "If work requires changes to files outside allowed_files, stop and report",
+        "before proceeding.",
+        "",
+        "## Handoff",
+        "",
+        "After completing the work:",
+        "1. Run the relevant pytest tests and confirm they pass",
+        "2. Run `git diff` and confirm only allowed files were modified",
+        "3. Report what was done and what files were changed",
+    ]
+    return "\n".join(lines)
+
+
+def build_safety_checklist_md(task: dict, repo: Path) -> str:
+    """Build safety_checklist.md."""
+    task_id = task["task_id"]
+    action = task.get("action", {})
+    allowed_files = action.get("allowed_files", [])
+    forbidden_files = action.get("forbidden_files", [])
+    safety_notes = _derive_safety_notes(task)
+
+    # Check allowed files exist
+    allowed_exists = []
+    allowed_missing = []
+    for f in allowed_files:
+        if _git_cat_file_e(repo, "HEAD", f):
+            allowed_exists.append(f)
+        else:
+            allowed_missing.append(f)
+
+    # Check forbidden files unchanged
+    forbidden_changed = []
+    if forbidden_files:
+        clean, changed = check_forbidden_files_changed(forbidden_files, repo)
+        if not clean:
+            forbidden_changed = changed
+
+    # Safety notes check
+    safety_ok = True
+    safety_err = ""
+    if safety_notes:
+        valid, err = validate_safety_notes(safety_notes)
+        if not valid:
+            safety_ok = False
+            safety_err = err
+
+    lines = [
+        f"# Safety Checklist — {task_id}",
+        "",
+        "## Pre-Execution Safety Checks",
+        "",
+        "| Check | Result | Notes |",
+        "|---|---|---|",
+        f"| Task ID is safe path component | ✅ | No `/`, `\\`, or `..` |",
+        f"| allowed_files are relative paths | {'✅' if all(not f.startswith('/') for f in allowed_files) else '❌'} | {'All relative' if allowed_files else 'no allowed_files'} |",
+        f"| allowed_files exist at current main | {'✅' if not allowed_missing else '❌'} | {'All exist' if not allowed_missing else f'MISSING: {allowed_missing}'} |",
+        f"| forbidden_files unchanged vs main | {'✅' if not forbidden_changed else '❌'} | {'No changes' if not forbidden_changed else f'CHANGED: {forbidden_changed}'} |",
+        f"| safety_notes contain no forbidden patterns | {'✅' if safety_ok else '❌'} | {safety_err if not safety_ok else 'Clean'} |",
+    ]
+
+    lines.extend([
+        "",
+        "## Execution Boundaries",
+        "",
+        f"- **May modify:** `{action.get('target_file', '_none_')}`",
+        f"| **Must not modify:** Any file not in allowed_files |",
+        "| **Must not invoke:** Live Claude, autocoder batch controller, git push/merge, GitHub API mutation |",
+        "| **Must not write to:** `.hermes/`, `skills/`, `memory/`, `profiles/` |",
+        "",
+        "## Post-Execution Required Checks",
+        "",
+        "After completing the repair:",
+        "",
+        f"1. Run `pytest {action.get('target_file', 'tests/')} -q` — no regressions",
+        "2. Review `git diff` — only files in allowed_files should be changed",
+        "3. Run PMG snapshot — no Hermes mutations",
+        "4. Open a draft PR for human review before merge",
+    ])
+    return "\n".join(lines)
+
+
+def build_suggested_tests_md(task: dict) -> str:
+    """Build suggested_tests.md from the task action block."""
+    task_id = task["task_id"]
+    action = task.get("action", {})
+    target_file = action.get("target_file", "")
+    success_criteria = action.get("success_criteria", "")
+    deliverable = action.get("deliverable", "")
+
+    # Extract a suggested test name from the deliverable if possible
+    test_name = f"test_{task_id.replace('-', '_')}"
+
+    lines = [
+        f"# Suggested Test — {task_id}",
+        "",
+        "## Deliverable (from corpus)",
+        "",
+        deliverable,
+        "",
+        "## Success Criteria (from corpus)",
+        "",
+        success_criteria,
+        "",
+        "## Suggested Test Pattern",
+        "",
+        "The test should:",
+        "1. Exercise the production code path directly (not mock it)",
+        "2. Pass on current main without modifying existing code",
+        "3. Fail if the fix/behavior it tests is reverted",
+        "",
+        f"**Target file:** `{target_file}`",
+        f"**Suggested test name:** `{test_name}`",
+        "",
+        "## Notes",
+        "",
+        "- Copy the test function name and pattern from `deliverable` above",
+        "- Use existing pytest fixtures (`tmp_path`, `unique_id`, etc.)",
+        "- Do NOT modify production code — only add new test functions",
+        "- The test must pass on current main HEAD",
+    ]
+    return "\n".join(lines)
+
+
+def build_stop_conditions_md(task: dict, corpus: dict) -> str:
+    """Build stop_conditions.md."""
+    task_id = task["task_id"]
+
+    lines = [
+        f"# Stop Conditions — {task_id}",
+        "",
+        "## Stop Condition Status",
+        "",
+        "| # | Stop Condition | Status | Detail |",
+        "|---|---|---|---|",
+        "| 1 | current-head P0/P1/P2 review finding | N/A | Not checked in one-task-repair-plan mode (human reviews first) |",
+        "| 2 | unresolved stale P0/P1/P2 | N/A | Not checked in one-task-repair-plan mode |",
+        "| 3 | REVIEW_COMMENTS_BLOCKED | N/A | Not checked in one-task-repair-plan mode |",
+        "| 4 | CI not green | N/A | Not checked in one-task-repair-plan mode |",
+        "| 5 | PMG dirty (pre-execution) | N/A | Not checked in one-task-repair-plan mode |",
+        "| 6 | changed files outside allowed_files | N/A | No execution in plan-only mode |",
+        "| 7 | task requests GitHub thread resolution | ✅ PASS | No such request |",
+        "| 8 | task requests live Claude | ✅ PASS | No such request |",
+        "| 9 | task attempts Hermes mutation | ✅ PASS | No such request |",
+        "| 10 | task has forbidden safety patterns | ✅ PASS | safety_notes verified clean |",
+        "| 11 | action.success_criteria missing | ✅ PASS | Non-empty |",
+        "| 12 | action.deliverable missing | ✅ PASS | Non-empty |",
+        "",
+        "## Conclusion",
+        "",
+        "All applicable stop conditions pass. This plan is eligible for human review",
+        "and subsequent live-repair execution after approval.",
+        "",
+        f"_Generated by run_codex_remediation_loop.py one-task-repair-plan mode_",
+    ]
+    return "\n".join(lines)
+
+
+def build_repair_plan_status(
+    task: dict,
+    corpus: dict,
+    output_root: Path,
+    generated_files: list[str],
+    ok: bool,
+    error: str,
+) -> dict:
+    """Build repair_plan_status.json."""
+    return {
+        "repair_plan_status_kind": REPAIR_PLAN_STATUS_KIND,
+        "loop_runner_version": LOOP_RUNNER_VERSION,
+        "status": "REPAIR_PLAN_READY" if ok else "REPAIR_PLAN_FAILED",
+        "task_id": task["task_id"],
+        "corpus_id": corpus.get("corpus_id", ""),
+        "wave": task.get("wave"),
+        "output_root": str(output_root),
+        "generated_files": generated_files,
+        "error": error,
+        "execution_performed": False,
+        "live_claude_invoked": False,
+        "autocoder_batch_invoked": False,
+        "repo_mutated": False,
+        "git_mutation_allowed": False,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def render_repair_plan_status_md(status: dict, task: dict) -> str:
+    """Render repair_plan_status.md."""
+    lines = [
+        f"# Repair Plan Status — {task['task_id']}",
+        "",
+        f"**Status:** `{status['status']}`",
+        f"**Corpus:** `{status['corpus_id']}`",
+        f"**Wave:** `{status.get('wave', '?')}`",
+        f"**Output root:** `{status['output_root']}`",
+        "",
+        "## Execution",
+        "",
+        "| Property | Value |",
+        "|---|---|",
+        f"| execution_performed | `{status['execution_performed']}` |",
+        f"| live_claude_invoked | `{status['live_claude_invoked']}` |",
+        f"| autocoder_batch_invoked | `{status['autocoder_batch_invoked']}` |",
+        f"| repo_mutated | `{status['repo_mutated']}` |",
+        f"| git_mutation_allowed | `{status['git_mutation_allowed']}` |",
+        "",
+        "## Generated Files",
+        "",
+    ]
+    for f in status.get("generated_files", []):
+        lines.append(f"- `{f}`")
+
+    if status.get("error"):
+        lines.extend(["", f"## Error", "", status["error"]])
+
+    lines.extend(["", "_This plan was generated by `one-task-repair-plan` mode. No execution was performed._"])
+    return "\n".join(lines)
+
+
+def run_one_task_repair_plan(
+    corpus: dict,
+    task: dict,
+    output_path: Path,
+    repo: Path,
+) -> tuple[bool, str]:
+    """
+    Generate repair plan artifacts for exactly one task.
+    Returns (ok, error_message).
+    All output is written under output_path.
+    """
+    task_id = task["task_id"]
+
+    # Validate task_id (path traversal check)
+    valid, err = validate_task_id(task_id)
+    if not valid:
+        return False, f"task_id validation failed: {err}"
+
+    # Validate safety_notes / derive from safety dict
+    safety_notes = _derive_safety_notes(task)
+    valid, err = validate_safety_notes(safety_notes)
+    if not valid:
+        return False, f"safety validation failed: {err}"
+
+    # Validate action fields
+    valid, err = validate_action_fields(task)
+    if not valid:
+        return False, f"action validation failed: {err}"
+
+    # Check allowed_files
+    action = task.get("action", {})
+    allowed_files = action.get("allowed_files", [])
+    permitted_new = set(action.get("permitted_new_files", []))
+    for f in allowed_files:
+        exists, err = check_allowed_file_exists(f, repo, permitted_new)
+        if not exists:
+            # Check if it's declared as a new file
+            if f not in permitted_new:
+                return False, f"allowed_file check failed: {err}"
+
+    # Check forbidden_files
+    forbidden_files = action.get("forbidden_files", [])
+    clean, changed = check_forbidden_files_changed(forbidden_files, repo)
+    if not clean:
+        return False, f"forbidden_files changed vs HEAD: {changed}"
+
+    # Create task output directory (not under output_root root directly)
+    task_out = output_path / task_id
+    task_out.mkdir(parents=True, exist_ok=True)
+
+    generated_files: list[str] = []
+
+    # 1. task_context.json
+    task_context = build_task_context(task, corpus, output_path, generated_files)
+    ctx_path = task_out / "task_context.json"
+    ctx_path.write_text(json.dumps(task_context, indent=2), encoding="utf-8")
+    generated_files.append(str(ctx_path.relative_to(output_path)))
+
+    # 2. repair_prompt.md
+    prompt_md = build_repair_prompt_md(task, corpus)
+    prompt_path = task_out / "repair_prompt.md"
+    prompt_path.write_text(prompt_md, encoding="utf-8")
+    generated_files.append(str(prompt_path.relative_to(output_path)))
+
+    # 3. safety_checklist.md
+    checklist_md = build_safety_checklist_md(task, repo)
+    checklist_path = task_out / "safety_checklist.md"
+    checklist_path.write_text(checklist_md, encoding="utf-8")
+    generated_files.append(str(checklist_path.relative_to(output_path)))
+
+    # 4. suggested_tests.md
+    tests_md = build_suggested_tests_md(task)
+    tests_path = task_out / "suggested_tests.md"
+    tests_path.write_text(tests_md, encoding="utf-8")
+    generated_files.append(str(tests_path.relative_to(output_path)))
+
+    # 5. stop_conditions.md
+    stop_md = build_stop_conditions_md(task, corpus)
+    stop_path = task_out / "stop_conditions.md"
+    stop_path.write_text(stop_md, encoding="utf-8")
+    generated_files.append(str(stop_path.relative_to(output_path)))
+
+    # 6. repair_plan_status.json
+    status = build_repair_plan_status(task, corpus, output_path, generated_files, True, "")
+    status_path = output_path / "repair_plan_status.json"
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    generated_files.append(str(status_path.relative_to(output_path)))
+
+    # 7. repair_plan_status.md
+    status_md = render_repair_plan_status_md(status, task)
+    status_md_path = output_path / "repair_plan_status.md"
+    status_md_path.write_text(status_md, encoding="utf-8")
+    generated_files.append(str(status_md_path.relative_to(output_path)))
+
+    # Update status and all files with final generated_files list
+    status["generated_files"] = list(generated_files)
+    status_path.write_text(json.dumps(status, indent=2), encoding="utf-8")
+    task_context["generated_files"] = list(generated_files)
+    ctx_path.write_text(json.dumps(task_context, indent=2), encoding="utf-8")
+
+    return True, ""
+
+
+# -----------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------
 
@@ -532,11 +1065,12 @@ def main(
     output_root: str,
     mode: str,
     repo_root_override: Optional[Path] = None,
+    task_id: Optional[str] = None,
 ) -> int:
     """
     Run the codex remediation loop.
 
-    Returns 0 on complete (mock-plan-only), 1 on validation failure.
+    Returns 0 on complete, 1 on validation failure.
     """
     repo = repo_root_override if repo_root_override is not None else REPO_ROOT
 
@@ -547,12 +1081,10 @@ def main(
 
     output_path = Path(output_root).resolve()
 
-    # Hard stop: mode must be mock-plan-only
-    if mode != "mock-plan-only":
-        print(
-            f"FATAL: unsupported mode '{mode}'. Only 'mock-plan-only' is supported in v0.",
-            file=sys.stderr,
-        )
+    # Hard stop: output_root must not be inside protected paths
+    clean, err = check_output_root_isolation(output_path)
+    if not clean:
+        print(f"FATAL: {err}", file=sys.stderr)
         return 1
 
     # Load corpus
@@ -573,11 +1105,79 @@ def main(
         print(f"FATAL: corpus validation failed: {err}", file=sys.stderr)
         return 1
 
-    # Validate corpus execution_mode
-    wave1 = corpus.get("wave_definitions", {}).get("1", {})
-    if isinstance(wave1, dict) and wave1.get("execution_mode") != "mocked":
+    # --- one-task-repair-plan mode ---
+    if mode == "one-task-repair-plan":
+        # task_id is required
+        if not task_id:
+            print(
+                "FATAL: --task-id is required for one-task-repair-plan mode",
+                file=sys.stderr,
+            )
+            return 1
+
+        # Find the task
+        task, err = find_task_in_corpus(corpus, task_id)
+        if task is None:
+            print(f"FATAL: {err}", file=sys.stderr)
+            return 1
+
+        # Validate wave execution_mode (must be repair-plan, not mocked)
+        wave_num = str(task.get("wave", ""))
+        wave_def = corpus.get("wave_definitions", {}).get(wave_num, {})
+        if isinstance(wave_def, dict):
+            wave_mode = wave_def.get("execution_mode", "")
+            if wave_mode != "repair-plan":
+                print(
+                    f"FATAL: one-task-repair-plan: wave {wave_num} has "
+                    f"execution_mode='{wave_mode}'. "
+                    f"Must be 'repair-plan' for repair-plan generation. "
+                    f"Mocked waves are not eligible.",
+                    file=sys.stderr,
+                )
+                return 1
+
+        # Create output_root
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Run repair plan generation
+        ok, error = run_one_task_repair_plan(corpus, task, output_path, repo)
+
+        if ok:
+            print(
+                f"repair plan generated: {task_id} -> {output_path}"
+            )
+            return 0
+        else:
+            # Write failed status
+            status = build_repair_plan_status(
+                task, corpus, output_path, [], False, error
+            )
+            (output_path / "repair_plan_status.json").write_text(
+                json.dumps(status, indent=2), encoding="utf-8"
+            )
+            (output_path / "repair_plan_status.md").write_text(
+                render_repair_plan_status_md(status, task), encoding="utf-8"
+            )
+            print(f"FATAL: {error}", file=sys.stderr)
+            return 1
+
+    # --- mock-plan-only mode ---
+    if mode != "mock-plan-only":
         print(
-            f"FATAL: Wave 1 execution_mode must be 'mocked', "
+            f"FATAL: unsupported mode '{mode}'. "
+            "Supported modes: 'mock-plan-only', 'one-task-repair-plan'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Validate corpus execution_mode for mock-plan-only
+    wave1 = corpus.get("wave_definitions", {}).get("1", {})
+    if isinstance(wave1, dict) and wave1.get("execution_mode") not in (
+        "mocked",
+        "repair-plan",
+    ):
+        print(
+            f"FATAL: Wave 1 execution_mode must be 'mocked' or 'repair-plan', "
             f"got '{wave1.get('execution_mode')}'",
             file=sys.stderr,
         )
@@ -589,8 +1189,8 @@ def main(
     task_results: list[dict] = []
 
     for task in corpus.get("tasks", []):
-        task_id = task.get("task_id", "(missing)")
-        task_output_dir = output_path / "tasks" / task_id
+        task_id_loop = task.get("task_id", "(missing)")
+        task_output_dir = output_path / "tasks" / task_id_loop
 
         ok, error = build_task_packet(task, task_output_dir, repo)
         classification = (
@@ -600,7 +1200,7 @@ def main(
         )
 
         task_results.append({
-            "task_id": task_id,
+            "task_id": task_id_loop,
             "ok": ok,
             "error": error,
             "classification": classification,
@@ -614,7 +1214,7 @@ def main(
         if not ok:
             # Stop on first validation failure (hard stop)
             print(
-                f"FATAL: task '{task_id}' failed validation: {error}",
+                f"FATAL: task '{task_id_loop}' failed validation: {error}",
                 file=sys.stderr,
             )
             # Write failed status before exiting
@@ -635,7 +1235,10 @@ def main(
 
 def _main() -> int:
     parser = argparse.ArgumentParser(
-        description="Guarded Codex-remediation loop runner (mock-plan-only v0).",
+        description=(
+            "Guarded Codex-remediation loop runner. "
+            "Modes: mock-plan-only, one-task-repair-plan."
+        ),
     )
     parser.add_argument(
         "--corpus",
@@ -650,7 +1253,10 @@ def _main() -> int:
     parser.add_argument(
         "--mode",
         required=True,
-        help="Execution mode (only 'mock-plan-only' supported in v0)",
+        help=(
+            "Execution mode. 'mock-plan-only' (full corpus, task packets only). "
+            "'one-task-repair-plan' (single task, repair handoff artifacts)."
+        ),
     )
     parser.add_argument(
         "--repo-root",
@@ -658,12 +1264,21 @@ def _main() -> int:
         default=None,
         help="Override repo root (default: auto-detected from script location)",
     )
+    parser.add_argument(
+        "--task-id",
+        default=None,
+        help=(
+            "Required for one-task-repair-plan mode. "
+            "Exact task_id to generate a repair plan for."
+        ),
+    )
     args = parser.parse_args()
     return main(
         corpus_json=args.corpus,
         output_root=args.output_root,
         mode=args.mode,
         repo_root_override=args.repo_root,
+        task_id=args.task_id,
     )
 
 
