@@ -55,6 +55,27 @@ jobs:
           name: coverage_xml
           path: coverage.xml
 
+      - name: Gather eval corpus test artifacts
+        if: always()
+        run: |
+          set -e
+          mkdir -p /tmp/test_eval_artifacts
+          # Find eval_out dirs in pytest temp dirs and copy them
+          find /tmp/pytest-of-runner -maxdepth 3 -name "eval_out" -type d 2>/dev/null | while read dir; do
+            parent=$(basename "$(dirname "$dir")")
+            cp -r "$dir" "/tmp/test_eval_artifacts/${parent}_eval_out" 2>/dev/null && echo "Copied: $dir" || echo "Skipped: $dir"
+          done
+          echo "=== Eval artifact summary ==="
+          find /tmp/test_eval_artifacts -type f 2>/dev/null || echo "(no files found)"
+          echo "=== End ==="
+
+      - name: Upload eval corpus test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test_eval_artifacts
+          path: /tmp/test_eval_artifacts
+
   validator:
     runs-on: ubuntu-latest
     steps:
