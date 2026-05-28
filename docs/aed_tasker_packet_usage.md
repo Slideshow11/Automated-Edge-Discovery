@@ -202,7 +202,7 @@ The validator enforces:
 | `recommended_next_prs` IDs must exist in `candidate_prs` | fails |
 | `candidate_id` values must be unique | fails |
 | Every candidate must have `allowed_files` and `forbidden_files` | fails |
-| No candidate may allow `~/.hermes` (or subpaths) | fails |
+| No candidate may allow `/home/max/.hermes` (or subpaths) | fails |
 | Registry/ledger file mutations require `registry_mutation_mode: locked\|future` | fails |
 | `final_recommendation` must be a valid candidate_id or recognized action (`defer`, `blocked`, `no-candidate`) | fails |
 | `generated_at` must be valid ISO-8601 | fails |
