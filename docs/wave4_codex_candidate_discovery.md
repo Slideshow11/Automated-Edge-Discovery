@@ -22,7 +22,7 @@ All Wave 1/2/3 Codex remediation candidates are closed:
 | `doc-323-applied-status-name` | CLOSED_DOCS_ONLY_FIXED | PR #323 |
 | `doc-323-enable-real-claude-executor-claim` | CLOSED_DOCS_ONLY_FIXED | PR #323 |
 
-**Zero NEEDS_TRIAGE candidates remain from the Wave 1/2/3 backlog.** The last closeout (PR #347) confirmed all 9 corpus entries are fully closed.
+**Zero NEEDS_TRIAGE candidates remain from the Wave 1/2/3 backlog.**
 
 ---
 
@@ -44,7 +44,7 @@ All Wave 1/2/3 Codex remediation candidates are closed:
 
 - `shell=True` — no occurrences in production scripts (protected via design)
 - `subprocess.returncode` handling — present in aed_final_gate.py, apply_temp_worktree_patch_to_branch.py, wait_for_pr_ready.py; well-structured with explicit exit-code checks
-- `except Exception` — present in wait_for_pr_ready.py (lines 157, 336, 376, 425, 466, 639, 750); review-comment gate (lines 331, 373); PMG runner; broad coverage in waiter outer-try block
+- `except Exception` — present in waiter (lines 157, 336, 376, 425, 466, 639, 750); review-comment gate; PMG runner
 - `HOLD_UNKNOWN` — used as sentinel in wait_for_pr_ready.py; used in audit_claude_invocation.py
 - `TEST_MODE` / `mock` patterns — abundant in test files; audit_claude_invocation.py uses mock vs real detection
 - Hermes mutation (skill_manage, memory, fact_store, profile) — documented as forbidden in executor packet design; not called in production scripts
@@ -55,109 +55,80 @@ All Wave 1/2/3 Codex remediation candidates are closed:
 
 ---
 
-## 4. Fresh Wave 4 Candidate Cards
+## 4. Wave 4 Candidate Cards
 
-### W4-2026-001: wait_for_pr_ready.py — outer try block swallows all exceptions including KeyboardInterrupt
+### W4-2026-001: wait_for_pr_ready.py — outer try block swallows exceptions
 
-**Suspected issue:** `wait_for_pr_ready.py:750` has `except Exception as e:` in the outer try block of `main()`. This catches **all** exceptions including `KeyboardInterrupt`, `SystemExit`, and `BrokenPipeError`. If the waiter is interrupted by SIGTERM (e.g. external 240s timeout kill), the script writes a partial JSON with `STATUS_ERROR_TOOLING` and exits cleanly — masking the real cause.
+**Classification:** `FALSE_POSITIVE_REVIEW_INVALIDATED`
 
-**Current evidence:**
-```python
-# wait_for_pr_ready.py:748-755
-try:
-    ...
-except Exception as e:
-    report["fatal_error"] = str(e)
-    report["status"] = STATUS_ERROR_TOOLING  # "ERROR_TOOLING"
-    report["next_safe_action"] = next_action_for_status(STATUS_ERROR_TOOLING, ...)
-    ...
-    sys.exit(0)  # clean exit despite fatal error
-```
+**Original claim:** `wait_for_pr_ready.py:750` has `except Exception as e:` that catches `KeyboardInterrupt`, `SystemExit`, and masks SIGTERM kills as `ERROR_TOOLING`.
 
-Also: lines 336, 376, 425, 466 all catch `Exception as e` and return `STATUS_ERROR_TOOLING`.
+**Review correction:** `KeyboardInterrupt` and `SystemExit` inherit from `BaseException`, not `Exception`. An ordinary SIGTERM terminates the process without raising an exception at all — the try block never catches it because the process is killed asynchronously. The `except Exception` block cannot produce the failure mode described. This candidate was based on a false Python exception model and is **not a valid remediation target**.
 
 **Likely production files:** `scripts/local/wait_for_pr_ready.py`
 **Likely test files:** `tests/test_wait_for_pr_ready.py`
 
-**Why it matters:** When the waiter is killed by an external timeout, the operator sees `ERROR_TOOLING` with no distinction between "script had a bug" and "script was killed externally." This confounds post-mortem analysis of waiter failures.
+**Confidence: N/A — INVALIDATED BY CODEX P2 REVIEW**
 
-**Why not duplicate of closed Wave 1/3 work:** This is a new finding about `wait_for_pr_ready.py` behavior under external SIGTERM, not related to task_id validation, stop_on_first_hold, subprocess RC guards, or path traversal. The Wave 3 evidence audit covered `run_autocoder_batch.py` and `run_autocoder_eval_corpus.py`, not the waiter itself.
-
-**Confidence: MEDIUM** — the pattern is observable; whether it causes real harm in practice depends on whether external kills actually happen in normal operation.
-
-**Priority: MEDIUM**
-
-**Recommended next action:** Evidence-only audit: run the waiter under SIGTERM and verify whether the JSON output is useful or misleading. Document whether `ERROR_TOOLING` is distinguishable from a real tooling error under kill conditions.
+**Recommended next action:** None. No repair needed.
 
 ---
 
-### W4-2026-002: check_pr_review_comments.py — bare `except Exception` hides JSON parse failures as CLEAN
+### W4-2026-002: check_pr_review_comments.py — silent fallback on exception reports CLEAN
 
-**Suspected issue:** `check_pr_review_comments.py:331` has `except Exception:` that falls through to `return ("review_comments_clean", [], "unknown")` — meaning any exception (including JSONDecodeError from malformed API responses) is reported as CLEAN, silently passing a review-comment gate that may not have been evaluated.
+**Classification:** `FALSE_POSITIVE_REVIEW_INVALIDATED`
 
-**Current evidence:**
-```python
-# check_pr_review_comments.py:329-333
-except Exception:
-    # silently pass — review comment gate cannot block on tooling error
-    return ("review_comments_clean", [], "unknown")
-```
+**Original claim:** `check_pr_review_comments.py:331` has `except Exception:` falling through to `return ("review_comments_clean", [], "unknown")`, silently passing the review-comment gate when JSON parse fails.
 
-Compare this with wait_for_pr_ready.py:336 which correctly returns `STATUS_ERROR_TOOLING` on exception. The inconsistency means `check_pr_review_comments.py` can report CLEAN while actually being unable to parse comments.
+**Review correction:** The cited line (331) is inside `dedup_findings`, not the review-comment gate path. Invalid JSON from `gh_api` is returned as an error that is later included in `api_errors`, producing `REVIEW_COMMENTS_INCONCLUSIVE` — which fails closed (blocks), not clean. This candidate was fabricated from misreading the source. The gate already fails closed on tooling errors.
 
 **Likely production files:** `scripts/local/check_pr_review_comments.py`
 **Likely test files:** `tests/test_check_pr_review_comments.py`
 
-**Why it matters:** If the GitHub API returns an unexpectedly formatted response (e.g., a new comment type, a reaction instead of a review, an unusually long comment body), the script silently reports CLEAN and the PR proceeds to merge without actual review-comment gate evaluation.
+**Confidence: N/A — INVALIDATED BY CODEX P2 REVIEW**
 
-**Why not duplicate of closed Wave 1/3 work:** This is a waiter-gate concern, not a task_id/path/bool/RC concern from Wave 1/2/3. The Wave 3 audit did not cover `check_pr_review_comments.py`.
-
-**Confidence: MEDIUM** — the silent-fallback pattern is clearly present. The risk is conditional on unexpected API responses, which may or may not have occurred in practice.
-
-**Priority: MEDIUM**
-
-**Recommended next action:** Evidence-only audit: add a synthetic malformed JSON response to the API mock and confirm whether the gate reports CLEAN or ERROR_TOOLING. Document the gap between expected and actual behavior.
+**Recommended next action:** None. No repair needed.
 
 ---
 
-### W4-2026-003: review_comment_gate — severity keyword scanning may misclassify P2 blockers as UNSPECIFIED_INFO when they contain certain words
+### W4-2026-003: review_comment_gate — blocking-word dictionary may misclassify P2 phrasing
 
-**Suspected issue:** The review comment gate classifies comments by scanning for severity keywords (P0, P1, P2) and blocking words. If a P2 blocker uses words that don't match the blocking dictionary, it may be classified as `UNSPECIFIED_INFO` or `COMMENTED` instead of a blocking finding. This would cause a real P2 to pass the gate silently.
+**Suspected issue:** The review comment gate classifies comments by scanning for severity keywords (P0, P1, P2) and blocking words. If a P2 blocker uses non-obvious phrasing, it could be classified as `UNSPECIFIED_INFO` or `COMMENTED` instead of a blocking finding.
 
-**Current evidence:** The gate logic in `check_pr_review_comments.py` uses keyword matching. The exact blocking-word dictionary is not visible in static triage output — but the pattern of `severity P2 + non-blocking words → COMMENTED` is structurally possible.
+**Current evidence:** Static triage found the gate uses keyword matching; the exact blocking-word dictionary is not fully visible from static analysis alone.
 
 **Likely production files:** `scripts/local/check_pr_review_comments.py`
 **Likely test files:** `tests/test_check_pr_review_comments.py`
 
-**Why it matters:** If a P2 blocker from Codex uses nuanced language (e.g., "recommend not reopening" vs "do not reopen"), it could be classified as non-blocking when it should block. The PR #347 Codex P2 (which correctly flagged the duplicate `rgr-320-base-sha-catfile` classification) used the phrase "Do not reopen" — which the gate correctly caught as blocking. But less explicit phrasing could slip through.
+**Why it matters:** If a P2 blocker from Codex uses nuanced language that doesn't match the blocking dictionary, it could pass the gate silently. The PR #348 Codex P2 itself used clear phrasing ("Do not reopen the closed cat-file candidate") which the gate correctly caught. But weaker phrasing could slip through in future reviews.
 
-**Why not duplicate of closed Wave 1/3 work:** This is a review-comment gate classification concern, separate from the three Wave 3 candidates (task_id, stop_on_first_hold, subprocess RC). The Wave 3 audit did not inspect the blocking-word dictionary in detail.
+**Why not duplicate of closed Wave 1/3 work:** This is a review-comment gate classification concern, separate from the three Wave 3 candidates (task_id, stop_on_first_hold, subprocess RC).
 
-**Confidence: LOW** — the blocking-word dictionary is not fully visible from static analysis alone; the concern is structurally possible but not confirmed.
-
-**Priority: LOW** — requires reading the gate source to confirm whether weak P2 phrasing can slip through.
-
-**Recommended next action:** Human review: inspect the blocking-word dictionary in `check_pr_review_comments.py` and assess whether P2 comments with non-obvious phrasing are correctly classified.
-
----
-
-### W4-2026-004: aed_executor_packet.py — `dict.get()` with mutable default arguments could produce unexpected behavior
-
-**Suspected issue:** Multiple uses of `dict.get(key, [])` or `dict.get(key, {})` where the mutable default is a list or dict. In Python, default mutable arguments are shared across calls. However, for `dict.get()` specifically (unlike function default args), this is safe — `dict.get()` evaluates the default at call time, not at definition time. So this pattern is **not a bug** in Python 3.
-
-**Current evidence:** `aed_executor_packet.py:139` — `forbidden = pr_plan.get("forbidden_files", [])` — safe due to Python dict.get semantics.
-
-**Confidence: LOW** — Python dict.get is safe for mutable defaults. Marking as LOW since the pattern was scanned but does not constitute a bug.
+**Confidence: LOW** — requires human inspection of the blocking-word dictionary to assess whether weak P2 phrasing can slip through.
 
 **Priority: LOW**
 
-**Recommended next action:** No action needed. This is a static-triage false positive. The pattern is safe.
+**Recommended next action:** Human review: inspect the keyword matching logic in `check_pr_review_comments.py` and assess whether P2 comments with non-obvious phrasing are correctly classified.
 
 ---
 
-### W4-2026-005: apply_temp_worktree_patch_to_branch.py — path containment check uses `.startswith()` which is fragile for directory traversal edge cases
+### W4-2026-004: aed_executor_packet.py — `dict.get()` with mutable default arguments
 
-**Suspected issue:** The path containment check uses `str(Path(path).resolve()).startswith(str(repo_root.resolve()))`. While `resolve()` resolves symlinks and removes `..` components, the `startswith` check is not the same as a true containment check. For example, if `repo_root` is `/home/user/repo` and a path resolves to `/home/user/repo2/subdir`, `startswith` would incorrectly treat it as contained (since `/home/user/repo2` starts with `/home/user/repo`). However, `resolve()` on the repo_root would canonicalize the path, so this may be safe in practice.
+**Classification:** `NOT_A_BUG`
+
+**Original claim:** Multiple uses of `dict.get(key, [])` where the mutable default is a list or dict. In Python, default mutable arguments to *functions* are shared across calls. However, for `dict.get()` itself, the default is evaluated at call time, not definition time — so this is safe.
+
+**Current evidence:** `aed_executor_packet.py:139` — `forbidden = pr_plan.get("forbidden_files", [])` — safe due to Python dict.get semantics. The default object is not stored or mutated across calls.
+
+**Confidence: N/A — NOT A BUG per Python semantics**
+
+**Recommended next action:** None. No repair needed.
+
+---
+
+### W4-2026-005: apply_temp_worktree_patch_to_branch.py — path containment check uses `.startswith()`
+
+**Suspected issue:** The path containment check uses `str(Path(path).resolve()).startswith(str(repo_root.resolve()))`. While `resolve()` canonicalizes paths and resolves symlinks, the `startswith` check could be fragile for directory traversal edge cases (e.g., if `repo_root` is `/home/user/repo` and a path resolves to `/home/user/repo2/subdir`, it incorrectly matches).
 
 **Current evidence:**
 ```python
@@ -172,7 +143,7 @@ return str(Path(path).resolve()).startswith(str(repo_root.resolve()))
 
 **Why not duplicate of closed Wave 1/3 work:** This is about path containment in the temp-worktree apply script, different from `run_autocoder_batch.py:377` path traversal concern (rgr-314). The containment logic uses `startswith` rather than `re.fullmatch`.
 
-**Confidence: LOW** — the `resolve()` canonicalization likely closes the gap; requires testing with adversarial paths to confirm.
+**Confidence: LOW** — `resolve()` canonicalization likely closes the gap; requires adversarial path testing to confirm.
 
 **Priority: LOW**
 
@@ -180,17 +151,43 @@ return str(Path(path).resolve()).startswith(str(repo_root.resolve()))
 
 ---
 
-## 5. Top 3 Recommended Evidence Audits
+## 5. Final Wave 4 Candidate Summary
 
-1. **W4-2026-001** (MEDIUM confidence) — `wait_for_pr_ready.py` outer try block swallows `KeyboardInterrupt`/`SIGTERM` and reports `ERROR_TOOLING` instead. Evidence-only: run waiter under SIGTERM and confirm JSON output is diagnostic or misleading.
+| Candidate | Classification | Confidence | Priority | Recommended Action |
+|---|---|---|---|---|
+| W4-2026-001 | FALSE_POSITIVE_REVIEW_INVALIDATED | N/A | N/A | None — no repair needed |
+| W4-2026-002 | FALSE_POSITIVE_REVIEW_INVALIDATED | N/A | N/A | None — no repair needed |
+| W4-2026-003 | LOW_CONFIDENCE_HUMAN_REVIEW | LOW | LOW | Human review of blocking-word dictionary |
+| W4-2026-004 | NOT_A_BUG | N/A | N/A | None — not a bug |
+| W4-2026-005 | LOW_CONFIDENCE_EVIDENCE_ONLY | LOW | LOW | Evidence-only audit (adversarial path test) |
 
-2. **W4-2026-002** (MEDIUM confidence) — `check_pr_review_comments.py` silent-fallback on exception reports `CLEAN` when unable to parse. Evidence-only: inject malformed JSON via mock and confirm gate behavior.
-
-3. **W4-2026-003** (LOW confidence) — review-comment gate blocking-word dictionary may misclassify certain P2 phrasing. Human review: inspect the keyword matching logic in `check_pr_review_comments.py`.
+**No high-confidence Wave 4 remediation candidates were found.** All high-confidence candidates (W4-2026-001, W4-2026-002) were invalidated by Codex P2 review. Remaining items are LOW confidence and do not require immediate action.
 
 ---
 
-## 6. Duplicate-Exclusion List
+## 6. Top Remaining Candidates (fewer than 3 valid)
+
+Fewer than 3 valid candidates remain after review correction. The two candidates requiring human review/evidence-only action are:
+
+1. **W4-2026-005** — Evidence-only path containment audit (LOW confidence)
+2. **W4-2026-003** — Human review of blocking-word dictionary (LOW confidence)
+
+No repair execution is warranted for either at this time.
+
+---
+
+## 7. Review Correction History
+
+| Finding ID | Severity | Description |
+|---|---|---|
+| `codex-2954261db6cd` | P2 | W4-2026-001 invalidated — `except Exception` cannot catch `KeyboardInterrupt`/`SystemExit`; SIGTERM kills without raising |
+| `codex-48f767fe665f` | P2 | W4-2026-002 invalidated — cited fallback does not exist; invalid JSON fails closed as `REVIEW_COMMENTS_INCONCLUSIVE` |
+
+Both findings were correctly addressed by the review-comment gate on PR #348. The document was corrected to remove false candidates and re-classify remaining items appropriately. No production code or tests were changed.
+
+---
+
+## 8. Duplicate-Exclusion List
 
 These closed items from Wave 1/2/3 are NOT being reopened:
 
@@ -206,13 +203,13 @@ These closed items from Wave 1/2/3 are NOT being reopened:
 
 ---
 
-## 7. Operational Note
+## 9. Operational Note
 
 For AED repo audits, use terminal-only commands (git grep, python3, sed) instead of search_files/read_file. This avoids potential blocking when the AED workspace is in a certain state. All inspection in this scan used bounded terminal commands with explicit timeouts and output caps.
 
 ---
 
-## 8. Explicit Statements
+## 10. Explicit Statements
 
 - **No production code changed.**
 - **No tests changed.**
