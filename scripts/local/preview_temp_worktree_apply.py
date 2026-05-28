@@ -225,6 +225,13 @@ def parse_args() -> argparse.Namespace:
         "--allow-output-inside-repo", action="store_true",
         help="Allow output JSON/MD to be inside the repo (default: false)"
     )
+    parser.add_argument(
+        "--execution-mode",
+        default="real",
+        choices=["real", "mock"],
+        help="Execution mode: 'real' checks repo git status; 'mock' skips the check "
+             "(mock edits stage changes via git add which would always dirty the worktree)"
+    )
     return parser.parse_args()
 
 
@@ -241,6 +248,7 @@ def preview(
     require_apply_ready: bool,
     allow_output_inside_repo: bool,
     branch_name: str | None,
+    execution_mode: str = "real",
 ) -> tuple[str, dict]:
     """
     Run all preview checks. Returns (status, checks_dict).
@@ -334,11 +342,16 @@ def preview(
     checks["head_match"] = True
 
     # ── 8. Repo git status clean ──────────────────────────────────────────────
-    repo_clean = _git_status_clean(repo_root)
-    checks["repo_git_status_clean"] = repo_clean
-    if not repo_clean:
-        return STATE_REPO_DIRTY, {**checks, "repo_status_dirty": True}
-    checks["repo_clean"] = True
+    # In mock mode, apply_mock_edits stages changes via `git add`, making the
+    # worktree always dirty after mock execution. Skip this check for mock.
+    if execution_mode == "mock":
+        checks["repo_git_status_clean"] = None  # not checked in mock mode
+    else:
+        repo_clean = _git_status_clean(repo_root)
+        checks["repo_git_status_clean"] = repo_clean
+        if not repo_clean:
+            return STATE_REPO_DIRTY, {**checks, "repo_status_dirty": True}
+        checks["repo_clean"] = True
 
     # ── 9. Result status ──────────────────────────────────────────────────────
     result_status = result.get("status", "")
@@ -435,7 +448,9 @@ def preview(
         checks["pmg_clean"] = True
 
     # ── 17. Real Claude confirmation (if mode is claude) ───────────────────────
-    execution_mode = result.get("execution", {}).get("mode") or result.get("mode")
+    # Prefer detection from result; fall back to CLI-passed execution_mode.
+    detected = result.get("execution", {}).get("mode") or result.get("mode")
+    execution_mode = detected if detected else execution_mode
     real_claude_invoked = result.get("real_claude_invoked", None)
     checks["execution_mode"] = execution_mode
     checks["real_claude_invoked"] = real_claude_invoked
@@ -742,6 +757,7 @@ def main() -> int:
             require_apply_ready,
             allow_output_inside_repo,
             branch_name,
+            execution_mode=args.execution_mode,
         )
     except Exception as e:
         status = STATE_UNKNOWN

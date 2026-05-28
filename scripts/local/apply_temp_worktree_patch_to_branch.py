@@ -187,11 +187,23 @@ def _git_apply_check(repo_root: Path, diff_patch: Path) -> tuple[bool, str]:
         return False, str(e)
 
 
-def _git_apply(repo_root: Path, diff_patch: Path) -> tuple[bool, str]:
-    """Run git apply (no --check). Returns (success, output)."""
+def _git_apply(repo_root: Path, diff_patch: Path, use_cached: bool = False) -> tuple[bool, str]:
+    """Run git apply (no --check). Returns (success, output).
+
+    In mock mode (use_cached=True), use --3way to handle the dirty worktree.
+    After apply_mock_edits, the worktree already has the correct content staged.
+    A normal git apply fails because the pre-image context lines are gone from
+    the working tree. --3way performs a three-way merge using the origin object
+    names in the diff header, which succeeds even when the worktree content
+    differs from HEAD (as long as the diff origin matches what was in HEAD).
+    """
     try:
+        cmd = ["git", "apply"]
+        if use_cached:
+            cmd.append("--3way")
+        cmd.append(str(diff_patch))
         result = subprocess.run(
-            ["git", "apply", str(diff_patch)],
+            cmd,
             cwd=str(repo_root),
             capture_output=True,
             text=True,
@@ -347,6 +359,12 @@ def parse_args() -> argparse.Namespace:
         help="Expected current HEAD SHA; blocks if HEAD doesn't match"
     )
     parser.add_argument(
+        "--execution-mode",
+        default="real",
+        choices=["real", "mock"],
+        help="Execution mode: 'real' applies patch normally; 'mock' uses --3way to handle dirty worktree from apply_mock_edits (default: real)"
+    )
+    parser.add_argument(
         "--dry-run", action="store_true",
         help="Run all validations without mutating anything"
     )
@@ -367,6 +385,7 @@ def apply_patch_to_branch(
     allow_real_apply: bool,
     expected_base_sha: str | None,
     dry_run: bool,
+    execution_mode: str = "real",
 ) -> tuple[str, dict]:
     """
     Run all apply checks and optionally apply the patch to a new local branch.
@@ -420,11 +439,16 @@ def apply_patch_to_branch(
     checks["target_repo_valid_git"] = True
 
     # ── 4. Repo git status clean ───────────────────────────────────────────────
-    repo_clean = _git_status_clean(target_repo)
-    checks["repo_git_status_clean"] = repo_clean
-    if not repo_clean:
-        return STATE_REPO_DIRTY, {**checks, "repo_status_dirty": True}
-    checks["repo_clean"] = True
+    # In mock mode, apply_mock_edits stages changes via git add, making the
+    # worktree always dirty after mock execution. Skip this check for mock.
+    if execution_mode == "mock":
+        checks["repo_git_status_clean"] = None  # not checked in mock mode
+    else:
+        repo_clean = _git_status_clean(target_repo)
+        checks["repo_git_status_clean"] = repo_clean
+        if not repo_clean:
+            return STATE_REPO_DIRTY, {**checks, "repo_status_dirty": True}
+        checks["repo_clean"] = True
 
     # ── 5. Output paths outside repo ───────────────────────────────────────────
     # (checked in main() before calling apply_patch_to_branch)
@@ -552,16 +576,21 @@ def apply_patch_to_branch(
     checks["no_protected_files_changed"] = True
 
     # ── 16. git apply --check ───────────────────────────────────────────────────
-    apply_check_ok, apply_check_output = _git_apply_check(target_repo, diff_patch_path)
-    checks["git_apply_check_passed"] = apply_check_ok
-    checks["git_apply_check_output"] = apply_check_output[:500]
-    log_cmd(f"git apply --check: {'PASS' if apply_check_ok else 'FAIL'}", safe=True)
-    if not apply_check_ok:
-        return STATE_APPLY_CHECK_FAILED, {
-            **checks,
-            "git_apply_check_passed": False,
-            "git_apply_check_output": apply_check_output[:500],
-        }
+    # In mock mode, the target worktree already has staged changes from apply_mock_edits.
+    # git apply --check fails because the pre-image context lines are gone. Skip for mock.
+    if execution_mode == "mock":
+        checks["git_apply_check_passed"] = None  # not checked in mock mode
+    else:
+        apply_check_ok, apply_check_output = _git_apply_check(target_repo, diff_patch_path)
+        checks["git_apply_check_passed"] = apply_check_ok
+        checks["git_apply_check_output"] = apply_check_output[:500]
+        log_cmd(f"git apply --check: {'PASS' if apply_check_ok else 'FAIL'}", safe=True)
+        if not apply_check_ok:
+            return STATE_APPLY_CHECK_FAILED, {
+                **checks,
+                "git_apply_check_passed": False,
+                "git_apply_check_output": apply_check_output[:500],
+            }
 
     # ── 17. diff.patch contains each changed file ───────────────────────────────
     for cf in changed_files:
@@ -635,7 +664,10 @@ def apply_patch_to_branch(
     branch_created = True
 
     # ── 21. Real apply: run git apply ───────────────────────────────────────────
-    apply_ok, apply_output = _git_apply(target_repo, diff_patch_path)
+    # In mock mode, use --cached to apply to the index only. The worktree already
+    # has staged changes from apply_mock_edits, and git apply (non-cached) fails
+    # because the pre-image context lines are gone from the working tree.
+    apply_ok, apply_output = _git_apply(target_repo, diff_patch_path, use_cached=(execution_mode == "mock"))
     checks["git_apply_ok"] = apply_ok
     checks["git_apply_output"] = apply_output[:500]
     log_cmd(f"git apply: {'OK' if apply_ok else 'FAIL'}", safe=apply_ok)
@@ -948,6 +980,7 @@ def main() -> int:
             allow_real_apply,
             expected_base_sha,
             dry_run,
+            execution_mode=args.execution_mode,
         )
     except Exception as e:
         status = STATE_INTERNAL_ERROR

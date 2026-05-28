@@ -361,6 +361,9 @@ def build_execution_packet(task_packet: dict, plan_sha: str, approved_plan_file:
         "task_id": task_id,
         # base_sha for worktree creation
         "base_sha": base_sha,
+        # Worktree root: when present, run_temp_worktree_execution uses this
+        # instead of computing WORKTREE_BASE / run_id.
+        "worktree_root": task_packet.get("worktree_root"),
         # Execution mode (nested, as required by run_temp_worktree_execution.py)
         "execution": {
             "mode": exec_mode,
@@ -557,6 +560,10 @@ def run_autocoder_single_task(
     # Determine diff.patch path from stage 2 result
     diff_patch_path = Path(stage2_data.get("diff_patch", str(output_root / "diff.patch")))
 
+    # Execution mode from execution packet (not in result.json, must read from file)
+    exec_packet = _load_json(execution_packet_path) or {}
+    exec_mode = exec_packet.get("execution", {}).get("mode", "real")
+
     stage3_argv = [
         "python3",
         str(SCRIPT_DIR / "verify_temp_worktree_apply_readiness.py"),
@@ -566,6 +573,7 @@ def run_autocoder_single_task(
         "--output-json", str(apply_readiness_json_path),
         "--output-md", str(apply_readiness_md_path),
         "--require-pmg-clean",
+        "--execution-mode", exec_mode,
     ]
     rc3, stdout3, stderr3 = run_stage(stage3_argv, effective_repo_root)
     del stage3_argv
@@ -600,6 +608,7 @@ def run_autocoder_single_task(
         "--expected-head", str(base_sha),
         "--output-json", str(apply_preview_json_path),
         "--output-md", str(apply_preview_md_path),
+        "--execution-mode", exec_mode,
     ]
     rc4, stdout4, stderr4 = run_stage(stage4_argv, effective_repo_root)
     del stage4_argv
@@ -650,6 +659,7 @@ def run_autocoder_single_task(
         "--output-json", str(apply_to_branch_json_path),
         "--output-md", str(apply_to_branch_md_path),
         "--allow-real-apply",
+        "--execution-mode", exec_mode,
     ]
     rc5, stdout5, stderr5 = run_stage(stage5_argv, effective_repo_root)
     del stage5_argv

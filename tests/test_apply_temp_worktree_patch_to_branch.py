@@ -677,7 +677,7 @@ class TestUntrackedNewFileAfterApply:
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
 
-        def mock_apply_ok(repo_root, diff_patch):
+        def mock_apply_ok(repo_root, diff_patch, use_cached=False):
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
 
@@ -738,7 +738,7 @@ class TestUntrackedNewFileAfterApply:
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
 
-        def mock_apply_ok(repo_root, diff_patch):
+        def mock_apply_ok(repo_root, diff_patch, use_cached=False):
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
 
@@ -801,7 +801,7 @@ class TestUnexpectedUntrackedFileBlocks:
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
 
-        def mock_apply_ok(repo_root, diff_patch):
+        def mock_apply_ok(repo_root, diff_patch, use_cached=False):
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
 
@@ -858,7 +858,7 @@ class TestMissingFileStillBlocked:
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply_check", mock_apply_check_ok)
 
-        def mock_apply_ok(repo_root, diff_patch):
+        def mock_apply_ok(repo_root, diff_patch, use_cached=False):
             return True, ""
         monkeypatch.setattr(aptb, "_git_apply", mock_apply_ok)
 
