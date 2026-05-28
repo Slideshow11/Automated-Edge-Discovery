@@ -26,8 +26,8 @@ load_preearn_example(name)
 ```bash
 PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
   --example basic \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --dry-run \
   --registry-path .wfa/preearn_lifecycle_smoke/registry.jsonl \
   --ledger-path .wfa/preearn_lifecycle_smoke/ledger.jsonl \
@@ -39,8 +39,8 @@ PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
 ```bash
 PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
   --example coarse \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --dry-run \
   --output-dir .wfa/preearn_lifecycle_smoke_coarse
 ```
@@ -52,8 +52,8 @@ PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
 ```bash
 PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
   --example basic \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --real-run \
   --timeout 60 \
   --output-dir .wfa/preearn_lifecycle_smoke_real

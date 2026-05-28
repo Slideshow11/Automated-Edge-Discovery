@@ -133,7 +133,7 @@ Both default to `dry-run`. Both require `--real-run` explicitly for actual backt
 
 ## 4. Pre-Earnings Repo Boundary
 
-AED treats `/home/max/engine_linux_main` as an external system. The boundary is intentional and enforced by the adapter pattern.
+AED treats `/path/to/engine_linux_main` as an external system. The boundary is intentional and enforced by the adapter pattern.
 
 **The only AED code that touches the pre-earnings repo is:**
 
@@ -142,7 +142,7 @@ AED treats `/home/max/engine_linux_main` as an external system. The boundary is 
 This module calls **one script** and nothing else:
 
 ```
-python3 /home/max/engine_linux_main/scripts/run_options_backtest_v1.py \
+python3 /path/to/engine_linux_main/scripts/run_options_backtest_v1.py \
   --options-db PATH \
   --run-id ID \
   --entry-dpe N \
@@ -209,8 +209,8 @@ Manual smoke: builds an inline `HypothesisSpec`, runs `run_candidate_batch`, the
 
 ```bash
 PYTHONPATH=. python3 scripts/local/smoke_preearn_bridge.py \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --dry-run \
   --output-dir .wfa/preearn_bridge_smoke
 ```
@@ -222,8 +222,8 @@ Manual smoke: loads an example via `load_preearn_example`, runs `register_and_ru
 ```bash
 PYTHONPATH=. python3 scripts/local/smoke_preearn_lifecycle.py \
   --example basic \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --dry-run \
   --output-dir .wfa/preearn_lifecycle_smoke
 ```

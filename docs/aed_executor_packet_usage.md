@@ -24,7 +24,7 @@ The `from-roadmap` subcommand reads a `ROADMAP_PACKET.json`, locates the selecte
 
 ```bash
 python3 scripts/local/aed_executor_packet.py from-roadmap \
-  --roadmap-packet /home/max/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json \
+  --roadmap-packet /path/to/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json \
   --candidate-id AED-CAND-202 \
   --output-json /tmp/EXECUTOR_PACKET.json \
   --output-md /tmp/AED_EXECUTION_PLAN.md
@@ -91,13 +91,13 @@ PR #196 closes the packet format gap. PRs for Specifier and Builder dispatch fol
 
 ```bash
 # 1. Tasker has already run and produced a roadmap packet
-#    (from /home/max/aed_tasker_runs/clean_tasker_run_after_pr195/)
+#    (from /path/to/aed_tasker_runs/clean_tasker_run_after_pr195/)
 
 # 2. Human selects AED-CAND-202 as the next candidate
 
 # 3. Executor generates draft packet
 python3 scripts/local/aed_executor_packet.py from-roadmap \
-  --roadmap-packet /home/max/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json \
+  --roadmap-packet /path/to/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json \
   --candidate-id AED-CAND-202 \
   --output-json /tmp/EXECUTOR_PACKET.json \
   --output-md /tmp/AED_EXECUTION_PLAN.md
@@ -138,7 +138,7 @@ python3 scripts/local/aed_executor_packet.py from-roadmap \
   "schema_version": 1,
   "generated_at": "2026-05-11T00:00:00Z",
   "source_roadmap_packet": {
-    "path": "/home/max/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json",
+    "path": "/path/to/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json",
     "packet_kind": "aed.tasker.report.v1",
     "selected_candidate_id": "AED-CAND-202"
   },
@@ -222,7 +222,7 @@ python3 scripts/local/aed_executor_packet.py from-roadmap \
 
 **Generated**: 2026-05-11T00:00:00Z
 **Candidate**: AED-CAND-202 — Add Executor planning packet scaffold and validator
-**Source roadmap**: /home/max/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json
+**Source roadmap**: /path/to/aed_tasker_runs/clean_tasker_run_after_pr195/ROADMAP_PACKET.json
 **Candidate ID**: AED-CAND-202
 
 ## 1. Goal

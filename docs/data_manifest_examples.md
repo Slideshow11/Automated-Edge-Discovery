@@ -49,7 +49,7 @@ print(result.warnings)
 
 ## Path portability
 
-The example manifests contain **machine-specific absolute paths** (`/home/max/engine_linux_main/...`). These reflect the local environment where AED is developed and tested.
+The example manifests contain placeholder paths (e.g. `./examples/local_only/options_2021_lane_0.sqlite`). Replace with your local dataset paths. AED does not download or generate data.
 
 If you run AED on a different machine:
 1. Update `path` in the manifest to point to your local dataset location

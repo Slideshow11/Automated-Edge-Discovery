@@ -125,10 +125,10 @@ Purpose:
 
 CLI:
   python3 scripts/local/preview_temp_worktree_apply.py \
-    --result-json /tmp/aed_runs/first_live_claude_smoke_005/result.json \
-    --diff-patch /tmp/aed_runs/first_live_claude_smoke_005/diff.patch \
-    --apply-readiness-json /tmp/aed_runs/first_live_claude_smoke_005/apply_readiness.json \
-    --repo-root /home/max/Automated-Edge-Discovery \
+    --result-json /tmp/aed_runs/example_run/result.json \
+    --diff-patch /tmp/aed_runs/example_run/diff.patch \
+    --apply-readiness-json /tmp/aed_runs/example_run/apply_readiness.json \
+    --repo-root /path/to/Automated-Edge-Discovery \
     --expected-head 295d74bb9544b7d5f08acc9012feafb12ef24cac \
     --approval-token "I approve applying this patch" \
     --output-json /tmp/apply_preview.json \
@@ -149,8 +149,8 @@ CLI:
 {
   "status": "APPLY_PREVIEW_READY",
   "preview": {
-    "git_apply_check_command": "cd /home/max/Automated-Edge-Discovery && git apply --check /tmp/aed_runs/first_live_claude_smoke_005/diff.patch",
-    "git_apply_command": "cd /home/max/Automated-Edge-Discovery && git apply /tmp/aed_runs/first_live_claude_smoke_005/diff.patch",
+    "git_apply_check_command": "cd /path/to/Automated-Edge-Discovery && git apply --check /tmp/aed_runs/example_run/diff.patch",
+    "git_apply_command": "cd /path/to/Automated-Edge-Discovery && git apply /tmp/aed_runs/example_run/diff.patch",
     "branch_name": "apply/first_live_claude_smoke_005-2026-05-22",
     "expected_head": "295d74bb9544b7d5f08acc9012feafb12ef24cac",
     "changed_files": ["docs/live_smoke_scratch.md"],
@@ -159,9 +159,9 @@ CLI:
   "pre_apply_checklist": [
     "Verify git status is clean before running git apply",
     "Verify HEAD is 295d74bb9544b7d5f08acc9012feafb12ef24cac",
-    "Run: git apply --check /tmp/aed_runs/first_live_claude_smoke_005/diff.patch",
-    "Review the diff at /tmp/aed_runs/first_live_claude_smoke_005/diff.patch",
-    "Run: git apply /tmp/aed_runs/first_live_claude_smoke_005/diff.patch",
+    "Run: git apply --check /tmp/aed_runs/example_run/diff.patch",
+    "Review the diff at /tmp/aed_runs/example_run/diff.patch",
+    "Run: git apply /tmp/aed_runs/example_run/diff.patch",
     "Run: pytest tests/ -q",
     "Run: python3 scripts/local/check_persistent_mutation_guard.py",
     "Push and open PR if all checks pass"
@@ -200,10 +200,10 @@ Purpose:
 
 CLI:
   python3 scripts/local/apply_temp_worktree_patch_to_branch.py \
-    --result-json /tmp/aed_runs/first_live_claude_smoke_005/result.json \
-    --diff-patch /tmp/aed_runs/first_live_claude_smoke_005/diff.patch \
-    --apply-readiness-json /tmp/aed_runs/first_live_claude_smoke_005/apply_readiness.json \
-    --repo-root /home/max/Automated-Edge-Discovery \
+    --result-json /tmp/aed_runs/example_run/result.json \
+    --diff-patch /tmp/aed_runs/example_run/diff.patch \
+    --apply-readiness-json /tmp/aed_runs/example_run/apply_readiness.json \
+    --repo-root /path/to/Automated-Edge-Discovery \
     --expected-head 295d74bb9544b7d5f08acc9012feafb12ef24cac \
     --approval-token "I approve applying this patch" \
     --branch-name apply/first_live_claude_smoke_005-2026-05-22 \
@@ -278,7 +278,7 @@ Purpose:
 
 CLI:
   python3 scripts/local/verify_temp_worktree_applied_branch.py \
-    --repo-root /home/max/Automated-Edge-Discovery \
+    --repo-root /path/to/Automated-Edge-Discovery \
     --branch-name apply/smoke-005-2026-05-22 \
     --expected-base-sha a1e8bec... \
     --result-json /tmp/aed_run/result.json \
@@ -317,7 +317,7 @@ Purpose:
 
 CLI:
   python3 scripts/local/preview_applied_branch_pr.py \
-    --repo-root /home/max/Automated-Edge-Discovery \
+    --repo-root /path/to/Automated-Edge-Discovery \
     --applied-branch-json /tmp/apply_branch_readiness.json \
     --branch-name apply/smoke-005-2026-05-22 \
     --base-branch main \

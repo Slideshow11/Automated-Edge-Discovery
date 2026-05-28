@@ -48,8 +48,8 @@ python3 scripts/local/run_overnight_autocoder_harness.py \
   --tasks-jsonl <tasks.jsonl> \
   --workspace /tmp/aed_runs/<run_id> \
   --integration-branch <branch> \
-  --hermes-root /home/max/.hermes \
-  --repo-root /home/max/Automated-Edge-Discovery \
+  --hermes-root ~/.hermes \
+  --repo-root /path/to/Automated-Edge-Discovery \
   --mode dry-run
 
 # Packet-prep mode
@@ -58,8 +58,8 @@ python3 scripts/local/run_overnight_autocoder_harness.py \
   --tasks-jsonl <tasks.jsonl> \
   --workspace /tmp/aed_runs/<run_id> \
   --integration-branch <branch> \
-  --hermes-root /home/max/.hermes \
-  --repo-root /home/max/Automated-Edge-Discovery \
+  --hermes-root ~/.hermes \
+  --repo-root /path/to/Automated-Edge-Discovery \
   --mode packet-prep
 ```
 
@@ -284,14 +284,14 @@ The harness runs two guard commands in both modes:
 **Snapshot (pre-run):**
 ```bash
 python3 scripts/local/check_persistent_mutation_guard.py snapshot \
-  --root /home/max/.hermes \
+  --root ~/.hermes \
   --output <workspace>/persistent_state_before.json
 ```
 
 **Compare (post-run):**
 ```bash
 python3 scripts/local/check_persistent_mutation_guard.py compare \
-  --root /home/max/.hermes \
+  --root ~/.hermes \
   --before <workspace>/persistent_state_before.json \
   --output-json <workspace>/persistent_state_after.json \
   --output-md <workspace>/persistent_state_report.md
@@ -378,8 +378,8 @@ python3 scripts/local/run_overnight_autocoder_harness.py \
   --tasks-jsonl /tmp/aed_runs/overnight-001/TASKS.jsonl \
   --workspace /tmp/aed_runs/overnight-001 \
   --integration-branch integration/overnight-001 \
-  --hermes-root /home/max/.hermes \
-  --repo-root /home/max/Automated-Edge-Discovery \
+  --hermes-root ~/.hermes \
+  --repo-root /path/to/Automated-Edge-Discovery \
   --mode packet-prep
 
 # Inspect result

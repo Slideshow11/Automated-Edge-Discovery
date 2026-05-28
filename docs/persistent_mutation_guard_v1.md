@@ -51,7 +51,7 @@ Each monitored file produces:
 
 ```json
 {
-  "path": "/home/max/.hermes/skills/project/aed-pr-workflow/SKILL.md",
+  "path": "~/.hermes/skills/project/aed-pr-workflow/SKILL.md",
   "relative_path": "skills/project/aed-pr-workflow/SKILL.md",
   "exists": true,
   "size_bytes": 4096,
@@ -66,7 +66,7 @@ Snapshot file:
 {
   "guard_version": 1,
   "snapshot_at": "2026-05-18T12:00:00Z",
-  "root": "/home/max/.hermes",
+  "root": "~/.hermes",
   "files": [...]
 }
 ```
@@ -129,12 +129,12 @@ The PMG supports an optional allowlist JSON file for post-incident recovery or a
 ```bash
 # Phase 1: snapshot current state before work
 python3 scripts/local/check_persistent_mutation_guard.py snapshot \
-  --root /home/max/.hermes \
+  --root ~/.hermes \
   --output /tmp/aed_runs/<run_id>/persistent_state_before.json
 
 # Phase 3: compare state after work
 python3 scripts/local/check_persistent_mutation_guard.py compare \
-  --root /home/max/.hermes \
+  --root ~/.hermes \
   --before /tmp/aed_runs/<run_id>/persistent_state_before.json \
   --output-json /tmp/aed_runs/<run_id>/persistent_state_after.json \
   --output-md /tmp/aed_runs/<run_id>/persistent_state_report.md \
