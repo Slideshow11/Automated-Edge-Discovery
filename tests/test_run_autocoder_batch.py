@@ -688,7 +688,7 @@ class TestStopOnFirstHoldType:
             f"stop_on_first_hold=true must not cause type error, got: {result.get('status')}"
 
     def test_stop_on_first_hold_string_false_rejected(self, tmp_path):
-        """stop_on_first_hold="false" (string) must be rejected, not treated as truthy."""
+        """stop_on_first_hold=\"false\" (string) must be rejected as HOLD_BATCH_PACKET_INVALID."""
         task1 = make_task(task_id="task-hold-c001", branch_name="apply/test-str-false")
         batch = make_batch(
             batch_id="test-batch-stop-str",
@@ -698,10 +698,41 @@ class TestStopOnFirstHoldType:
         out_json = tmp_path / "out.json"
         out_md = tmp_path / "out.md"
         result = run_batch(batch, out_json, out_md)
-        # stop_on_first_hold='false' string is rejected with an error status.
-        # The error message must mention "bool" (not silently treated as truthy).
-        assert result["status"] in ("HOLD_BATCH_PACKET_INVALID", "HOLD_UNKNOWN", "ERROR", "NO_OUTPUT"), \
-            f"stop_on_first_hold='false' string must be rejected, got: {result['status']}"
+        # Must fail with explicit packet validation, not broad exception fallback.
+        assert result["status"] == "HOLD_BATCH_PACKET_INVALID", \
+            f"stop_on_first_hold='false' string must yield HOLD_BATCH_PACKET_INVALID, got: {result['status']}"
+        assert "bool" in result.get("error", "").lower(), \
+            f"error must mention 'bool' type requirement, got: {result.get('error')}"
+
+    def test_stop_on_first_hold_non_boolean_string_rejected(self, tmp_path):
+        """stop_on_first_hold=\"yes\" (non-bool string) must be rejected as HOLD_BATCH_PACKET_INVALID."""
+        task1 = make_task(task_id="task-hold-d001", branch_name="apply/test-str-yes")
+        batch = make_batch(
+            batch_id="test-batch-stop-yes",
+            tasks=[task1],
+            stop_on_first_hold="yes",  # STRING "yes" — non-bool, must be rejected
+        )
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        assert result["status"] == "HOLD_BATCH_PACKET_INVALID", \
+            f"stop_on_first_hold='yes' string must yield HOLD_BATCH_PACKET_INVALID, got: {result['status']}"
+        assert "bool" in result.get("error", "").lower(), \
+            f"error must mention 'bool' type requirement, got: {result.get('error')}"
+
+    def test_stop_on_first_hold_null_rejected_with_batch_packet_invalid(self, tmp_path):
+        """stop_on_first_hold=null (key present, value null) must be rejected as HOLD_BATCH_PACKET_INVALID."""
+        task1 = make_task(task_id="task-hold-e001", branch_name="apply/test-null")
+        batch = make_batch(
+            batch_id="test-batch-stop-null",
+            tasks=[task1],
+            stop_on_first_hold=None,  # null — present but null, must be rejected
+        )
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        result = run_batch(batch, out_json, out_md)
+        assert result["status"] == "HOLD_BATCH_PACKET_INVALID", \
+            f"stop_on_first_hold=None must yield HOLD_BATCH_PACKET_INVALID, got: {result['status']}"
         assert "bool" in result.get("error", "").lower(), \
             f"error must mention 'bool' type requirement, got: {result.get('error')}"
 
