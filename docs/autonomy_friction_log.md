@@ -141,17 +141,20 @@ name, which in some race conditions gave the old (stale) check result.
 Root cause: `gh` does not deduplicate by name across SHA runs. A PR can
 have two "test (3.11)" checks from different commit SHAs.
 
-**Correct behavior**
-
-When multiple checks share the same name, take the most recent one
-(completedAt timestamp). Do not assume the first occurrence is the
-correct one.
-
 **Rule**
 
-> Duplicate CI check names are a force-push signal, not a guaranteed
-> pass. Always prefer the most recent completed check by timestamp. Never
-> let a skipped/stale check overwrite a successful check.
+> Duplicate check handling must be current-head aware. A successful check
+> from an old SHA must not satisfy a required check for the current PR head.
+> If the current-head check is pending, missing, absent, or cannot be
+> distinguished from stale duplicate records, the waiter must keep polling
+> during the timeout window and fail closed after timeout. Completed-time
+> ordering is insufficient by itself because pending current-head checks
+> may not have completedAt values.
+
+**Note**
+
+> This log records the safer requirement. It must not be read as
+> authorization to implement timestamp-only deduplication.
 
 **Reference**
 
