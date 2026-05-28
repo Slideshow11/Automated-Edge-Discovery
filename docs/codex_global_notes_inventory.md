@@ -30,7 +30,7 @@
 ## Backlog Table
 
 | ID | Status | Evidence count | Sample |
-|---|---|---:|---|---:|
+|---|---|---|---|
 | W4-2026-001 | LIKELY_FALSE_POSITIVE | 1 | # Wave 4 Codex Candidate Discovery  **Scan date:** 2026-05-28T10:50:20-04:00 **main HEAD:** `27e62f0e5566f6ef9ff78a48d0e9187f9826c724` **Method:** Terminal-only bounded commands (git grep, python3 JSO |
 | W4-2026-002 | LIKELY_FALSE_POSITIVE | 2 | # Wave 4 Codex Candidate Discovery  **Scan date:** 2026-05-28T10:50:20-04:00 **main HEAD:** `27e62f0e5566f6ef9ff78a48d0e9187f9826c724` **Method:** Terminal-only bounded commands (git grep, python3 JSO |
 | W4-2026-003 | LIKELY_FALSE_POSITIVE | 1 | # Wave 4 Codex Candidate Discovery  **Scan date:** 2026-05-28T10:50:20-04:00 **main HEAD:** `27e62f0e5566f6ef9ff78a48d0e9187f9826c724` **Method:** Terminal-only bounded commands (git grep, python3 JSO |
