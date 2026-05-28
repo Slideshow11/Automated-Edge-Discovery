@@ -73,7 +73,7 @@ if `live_smoke_scratch.md` is not desirable.
       "scripts/local/audit_claude_invocation.py",
       "scripts/local/run_plan_preview.py",
       "scripts/local/plan_preview_eval_status.py",
-      "/home/max/.hermes/",
+      "~/.hermes/",
       "audit/",
       "boards/",
       "memory/",

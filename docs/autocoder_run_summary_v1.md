@@ -28,7 +28,7 @@ python3 scripts/local/build_autocoder_run_summary.py \
   --bundle-root /path/to/bundles \
   --output-json /path/to/RUN_SUMMARY.json \
   --output-md /path/to/RUN_SUMMARY.md \
-  [--repo /home/max/Automated-Edge-Discovery] \
+  [--repo /path/to/Automated-Edge-Discovery] \
   [--base-sha <sha>] \
   [--integration-branch integration/aed-run-2026-05-17-001] \
   [--expected-tasks-json '["task1","task2"]'] \
@@ -96,7 +96,7 @@ The tool reads from the `bundle_root` directory, looking for per-task subdirecto
   "summary_version": 1,
   "run_id": "aed-run-2026-05-17-001",
   "generated_at": "2026-05-17T02:00:00Z",
-  "repo": "/home/max/Automated-Edge-Discovery",
+  "repo": "/path/to/Automated-Edge-Discovery",
   "base_sha": "51eb88ac7c6602774e2e522120515a943d14409c",
   "integration_branch": "integration/aed-run-2026-05-17-001",
   "bundle_index_path": "/path/to/BUNDLE_INDEX.json",
@@ -258,7 +258,7 @@ python3 scripts/local/build_autocoder_run_summary.py \
   --bundle-root /path/to/bundles \
   --output-json /path/to/RUN_SUMMARY.json \
   --output-md /path/to/RUN_SUMMARY.md \
-  --repo /home/max/Automated-Edge-Discovery \
+  --repo /path/to/Automated-Edge-Discovery \
   --base-sha a93416482a1b742abba5b7b3051675f69ec5a5fb \
   --integration-branch integration/aed-run-2026-05-17-001
 ```
@@ -346,7 +346,7 @@ The following are surfaced as warnings but do not cause hard failure (future mod
 **Run ID:** `aed-run-2026-05-17-001`
 **Overall Status:** `PARTIAL_READY`
 **Generated:** 2026-05-17T02:00:00Z
-**Repo:** /home/max/Automated-Edge-Discovery
+**Repo:** /path/to/Automated-Edge-Discovery
 **Base SHA:** 51eb88ac...
 **Integration Branch:** integration/aed-run-2026-05-17-001
 

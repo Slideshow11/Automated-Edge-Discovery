@@ -5,7 +5,7 @@
 The AED merge-action audit log is an append-only JSONL file that records every significant action taken by Hermes during AED PR workflow execution. It lives at:
 
 ```
-/home/max/.hermes/aed/audit/log.jsonl
+/path/to/hermes/aed/audit/log.jsonl
 ```
 
 ## Event Types
@@ -125,7 +125,7 @@ Usage:
 
 ```bash
 python3 scripts/local/validate_merge_action_audit_log.py \
-  --input /home/max/.hermes/aed/audit/log.jsonl \
+  --input /path/to/hermes/aed/audit/log.jsonl \
   --output-json /tmp/report.json \
   --output-md /tmp/report.md \
   --allow-legacy \
@@ -143,7 +143,7 @@ Flags:
 
 ```bash
 python3 scripts/local/validate_merge_action_audit_log.py \
-  --input /home/max/.hermes/aed/audit/log.jsonl \
+  --input /path/to/hermes/aed/audit/log.jsonl \
   --output-json /tmp/report.json \
   --output-md /tmp/report.md \
   --allow-legacy \

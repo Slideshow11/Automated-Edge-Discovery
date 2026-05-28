@@ -132,7 +132,7 @@ python scripts/local/aed_tasker_packet.py render-md path/to/ROADMAP_PACKET.json 
   "schema_version": 1,
   "generated_at": "2026-05-11T12:00:00+00:00",
   "repo": {
-    "path": "/home/max/Automated-Edge-Discovery",
+    "path": "/path/to/Automated-Edge-Discovery",
     "head_sha": "82f05db5e92d4ed5ac2b6d7a8afe6d67f1758ef3",
     "branch": "main",
     "clean_status": "clean"
@@ -213,7 +213,7 @@ The validator enforces:
 ```
 # AED Tasker Roadmap Memo
 
-> Generated: 2026-05-11T12:00:00+00:00 | Repo: /home/max/Automated-Edge-Discovery | Head: 82f05db5
+> Generated: 2026-05-11T12:00:00+00:00 | Repo: /path/to/Automated-Edge-Discovery | Head: 82f05db5
 
 ## Repository Status
   **Branch:** main

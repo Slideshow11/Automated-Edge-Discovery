@@ -12,3 +12,30 @@ build/
 .wfa/
 
 audit_reports/
+
+# Data and artifact patterns
+*.sqlite
+*.sqlite3
+*.db
+*.parquet
+*.feather
+*.xlsx
+*.xls
+*.zip
+*.tar
+*.gz
+*.7z
+*.log
+*.tmp
+.ipynb_checkpoints/
+
+# Output and data directories
+artifacts/
+outputs/
+results/
+raw/
+data/
+vendor_data/
+
+# Local data manifests (user-specific)
+examples/local_only/

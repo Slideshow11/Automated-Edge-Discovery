@@ -94,7 +94,7 @@ The controller writes `CONTROLLER_STATE.json` with the following structure:
   },
   "persistent_mutation_guard": {
     "status": "not_started",
-    "root": "/home/max/.hermes",
+    "root": "~/.hermes",
     "snapshot_path": null,
     "compare_json_path": null,
     "compare_md_path": null,
@@ -318,13 +318,13 @@ python3 scripts/local/autocoder_run_controller.py finalize-run \
 ### Record persistent mutation guard snapshot
 
 Record the guard snapshot path before AED work begins. The runner should already
-have executed `check_persistent_mutation_guard.py snapshot --root /home/max/.hermes --output <path>`.
+have executed `check_persistent_mutation_guard.py snapshot --root ~/.hermes --output <path>`.
 The controller only records the path — it does NOT execute the guard.
 
 ```bash
 python3 scripts/local/autocoder_run_controller.py record-persistent-guard-snapshot \
   --state /tmp/aed_run/CONTROLLER_STATE.json \
-  --root /home/max/.hermes \
+  --root ~/.hermes \
   --snapshot-path /tmp/aed_runs/aed-run-001/persistent_state_before.json
 ```
 

@@ -241,7 +241,7 @@ The memo and packet must include:
 {
   "packet_kind": "aed.tasker.report.v1",
   "schema_version": 1,
-  "repo": "/home/max/Automated-Edge-Discovery",
+  "repo": "/path/to/Automated-Edge-Discovery",
   "base_ref": "origin/main",
   "observed_head": "<sha>",
   "generated_at": "<iso8601>",
@@ -312,7 +312,7 @@ The output must include:
   "packet_kind": "aed.executor.plan.v1",
   "schema_version": 1,
   "candidate_id": "AED-CAND-001",
-  "repo": "/home/max/Automated-Edge-Discovery",
+  "repo": "/path/to/Automated-Edge-Discovery",
   "base_branch": "main",
   "observed_head": "<sha>",
   "generated_at": "<iso8601>",
@@ -359,7 +359,7 @@ Kanban comments should carry machine-readable packet blocks using explicit senti
 {
   "packet_kind": "aed.pr_gate.state.v1",
   "schema_version": 1,
-  "repo": "/home/max/Automated-Edge-Discovery",
+  "repo": "/path/to/Automated-Edge-Discovery",
   "observed_head": "<sha>",
   "generated_at": "<iso8601>"
 }

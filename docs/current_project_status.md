@@ -293,8 +293,8 @@ See [docs/domain_neutral_modularity_audit.md](./domain_neutral_modularity_audit.
 
 ## Operational notes
 
-- run commands from /home/max/aed_audit_clean or use git -C /home/max/aed_audit_clean
-- duplicate helper files may exist outside the repo under /home/max and should not be treated as repo files
+- run commands from /path/to/aed_audit_clean or use git -C /path/to/aed_audit_clean
+- duplicate helper files may exist outside the repo under /path/to/user and should not be treated as repo files
 - do not remove files outside the repo during normal PR work
 - registry CSV is manual v1 only
 

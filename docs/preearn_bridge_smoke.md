@@ -27,8 +27,8 @@ Safety and modes
 Example dry-run
 ---------------
 PYTHONPATH=. python3 scripts/local/smoke_preearn_bridge.py \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --dry-run \
   --output-dir .wfa/preearn_bridge_smoke \
   --ledger-path .wfa/preearn_bridge_smoke/ledger.jsonl
@@ -36,8 +36,8 @@ PYTHONPATH=. python3 scripts/local/smoke_preearn_bridge.py \
 Example real-run (local only)
 ----------------------------
 PYTHONPATH=. python3 scripts/local/smoke_preearn_bridge.py \
-  --preearn-repo-path /home/max/engine_linux_main \
-  --options-db-path /home/max/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
+  --preearn-repo-path /path/to/engine_linux_main \
+  --options-db-path /path/to/engine_linux_main/cache/scratch/options_2021_lane_0.sqlite \
   --real-run \
   --max-candidates 1 \
   --timeout 60 \

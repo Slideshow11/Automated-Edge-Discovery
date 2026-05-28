@@ -96,12 +96,12 @@ When a cron job is desired, the watchdog can be run on a schedule. The cron-frie
 
 ```bash
 # Every 15 minutes, watch PR #191
-*/15 * * * * cd /home/max/Automated-Edge-Discovery && python scripts/local/watch_pr_gate_state.py \
+*/15 * * * * cd /path/to/Automated-Edge-Discovery && python scripts/local/watch_pr_gate_state.py \
   --repo-owner Slideshow11 \
   --repo-name Automated-Edge-Discovery \
   --pr-number 191 \
   --exit-code-only \
-  >> /home/max/.hermes/cron/output/pr191_watch.log 2>&1
+  >> /path/to/hermes/cron/output/pr191_watch.log 2>&1
 ```
 
 Exit codes for scripting:
