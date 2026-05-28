@@ -328,6 +328,15 @@ def validate_batch_packet(packet: dict) -> tuple[bool, str]:
         if not isinstance(max_tasks, int) or max_tasks < 1:
             return False, "max_tasks must be a positive integer or null"
 
+    # stop_on_first_hold — present-but-null is invalid; absent is valid (defaults to True at runtime)
+    if "stop_on_first_hold" in packet:
+        stop_on_first_hold_raw = packet["stop_on_first_hold"]
+        if not isinstance(stop_on_first_hold_raw, bool):
+            return False, (
+                f"stop_on_first_hold must be a bool, got {type(stop_on_first_hold_raw).__name__}: "
+                f"{stop_on_first_hold_raw!r}. Null and non-bool values are not accepted."
+            )
+
     # tasks
     tasks = packet.get("tasks")
     if tasks is None:
