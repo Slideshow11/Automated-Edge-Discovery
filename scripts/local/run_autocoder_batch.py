@@ -606,6 +606,10 @@ def run_autocoder_batch(
         # is safe, but using normalized_tasks[i] eliminates any risk of drift.
         normalized_task = normalized_tasks[i]
 
+        # Propagate the pre-created task worktree path into the task packet
+        # so the execution script uses it instead of computing its own path.
+        normalized_task["worktree_root"] = str(task_worktree_path)
+
         # Write normalized task packet
         task_output_dir = batch_tasks_dir / task_id
         task_packet_json_path = task_output_dir / "task_packet.json"

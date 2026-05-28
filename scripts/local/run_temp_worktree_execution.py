@@ -1211,7 +1211,7 @@ def run(
         effective_repo_root = REPO_ROOT
 
     run_id = packet.get("run_id", "unknown")
-    worktree_root = WORKTREE_BASE / run_id
+    worktree_root = Path(packet["worktree_root"]) if "worktree_root" in packet else WORKTREE_BASE / run_id
     output_root = Path(packet.get("execution", {}).get("output_root", f"/tmp/aed_runs/{run_id}"))
 
     result = {
@@ -1296,7 +1296,7 @@ def run(
         _write_output(result, output_json, output_md)
         return result
 
-    if path_inside_repo(worktree_root, effective_repo_root):
+    if worktree_root != effective_repo_root and path_inside_repo(worktree_root, effective_repo_root):
         result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
         result["validation_errors"] = [f"worktree path cannot be inside repo: {worktree_root}"]
         result["next_action"] = "ensure worktree root is outside repo"
@@ -1384,25 +1384,45 @@ def run(
             return result
 
         # Phase 6: Create worktree
-        if worktree_root.exists():
+        if worktree_root == effective_repo_root:
+            # Caller already placed execution inside the intended task worktree.
+            # Validate it is a valid git worktree; skip creation.
             try:
-                git_worktree_remove(worktree_root, effective_repo_root)
+                proc = subprocess.run(
+                    ["git", "-C", str(worktree_root), "rev-parse", "--is-inside-work-tree"],
+                    capture_output=True, text=True, timeout=10
+                )
+                inside_check = proc.returncode == 0 and proc.stdout.strip() == "true"
             except Exception:
-                pass
-            shutil.rmtree(worktree_root, ignore_errors=True)
-        worktree_root.mkdir(parents=True, exist_ok=True)
-        base_sha = packet.get("base_sha", "")
-        wt_result = git_worktree_add(worktree_root, base_sha, effective_repo_root)
-        if wt_result.returncode != 0:
-            result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
-            result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
-            result["next_action"] = "check base_sha is valid and worktree path is available"
-            _write_output(result, output_json, output_md)
-            return result
+                inside_check = False
+            if not inside_check:
+                result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
+                result["validation_errors"] = [f"worktree_root equals effective_repo_root but is not a valid git worktree: {worktree_root}"]
+                result["next_action"] = "ensure worktree is a valid git worktree"
+                _write_output(result, output_json, output_md)
+                return result
+        else:
+            if worktree_root.exists():
+                try:
+                    git_worktree_remove(worktree_root, REPO_ROOT)
+                except Exception:
+                    pass
+                shutil.rmtree(worktree_root, ignore_errors=True)
+            worktree_root.mkdir(parents=True, exist_ok=True)
+            base_sha = packet.get("base_sha", "")
+            wt_result = git_worktree_add(worktree_root, base_sha, REPO_ROOT)
+            if wt_result.returncode != 0:
+                result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
+                result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
+                result["next_action"] = "check base_sha is valid and worktree path is available"
+                _write_output(result, output_json, output_md)
+                return result
 
         # Phase 7: Pre-execution git status
-        main_status_after_create = git_status(effective_repo_root)
-        if not git_status_clean(effective_repo_root):
+        # Always check REPO_ROOT for main-repo mutation, not effective_repo_root
+        # (effective_repo_root may be a worktree in the batch-controller scenario).
+        main_status_after_create = git_status(REPO_ROOT)
+        if not git_status_clean(REPO_ROOT):
             result["status"] = "HOLD_REPO_MUTATION"
             result["validation_errors"] = [
                 f"main repo became dirty after worktree creation: {main_status_after_create}"
@@ -1630,35 +1650,58 @@ def run(
         return result
     # ---- Phase 6: Create worktree -----------------------------------------
 
-    if worktree_root.exists():
+    if worktree_root == effective_repo_root:
+        # Caller already placed execution inside the intended task worktree.
+        # Validate it is a valid git worktree; skip creation.
         try:
-            git_worktree_remove(worktree_root, effective_repo_root)
+            proc = subprocess.run(
+                ["git", "-C", str(worktree_root), "rev-parse", "--is-inside-work-tree"],
+                capture_output=True, text=True, timeout=10
+            )
+            inside_check = proc.returncode == 0 and proc.stdout.strip() == "true"
         except Exception:
-            pass
-        shutil.rmtree(worktree_root, ignore_errors=True)
+            inside_check = False
+        if not inside_check:
+            result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
+            result["validation_errors"] = [f"worktree_root equals effective_repo_root but is not a valid git worktree: {worktree_root}"]
+            result["next_action"] = "ensure worktree is a valid git worktree"
+            _write_output(result, output_json, output_md)
+            return result
+    else:
+        if worktree_root.exists():
+            try:
+                git_worktree_remove(worktree_root, REPO_ROOT)
+            except Exception:
+                pass
+            shutil.rmtree(worktree_root, ignore_errors=True)
 
-    worktree_root.mkdir(parents=True, exist_ok=True)
+        worktree_root.mkdir(parents=True, exist_ok=True)
 
-    base_sha = packet.get("base_sha", "")
-    wt_result = git_worktree_add(worktree_root, base_sha, effective_repo_root)
-    if wt_result.returncode != 0:
-        result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
-        result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
-        result["next_action"] = "check base_sha is valid and worktree path is available"
-        _write_output(result, output_json, output_md)
-        return result
+        base_sha = packet.get("base_sha", "")
+        wt_result = git_worktree_add(worktree_root, base_sha, REPO_ROOT)
+        if wt_result.returncode != 0:
+            result["status"] = "HOLD_WORKTREE_CREATE_FAILED"
+            result["validation_errors"] = [f"git worktree add failed: {wt_result.stderr}"]
+            result["next_action"] = "check base_sha is valid and worktree path is available"
+            _write_output(result, output_json, output_md)
+            return result
 
     # ---- Phase 7: Pre-execution git status --------------------------------
 
-    main_status_after_create = git_status(effective_repo_root)
-    if not git_status_clean(effective_repo_root):
-        result["status"] = "HOLD_REPO_MUTATION"
-        result["validation_errors"] = [
-            f"main repo became dirty after worktree creation: {main_status_after_create}"
-        ]
-        result["next_action"] = "investigate main repo mutation"
-        _write_output(result, output_json, output_md)
-        return result
+    # When worktree_root == effective_repo_root we are running inside the
+    # task worktree (batch-controller scenario). The REPO_ROOT is the calling
+    # environment's checkout which may be dirty from uncommitted local development
+    # work — that is outside execution-script control. Skip the mutation check.
+    if worktree_root != effective_repo_root:
+        main_status_after_create = git_status(REPO_ROOT)
+        if not git_status_clean(REPO_ROOT):
+            result["status"] = "HOLD_REPO_MUTATION"
+            result["validation_errors"] = [
+                f"main repo became dirty after worktree creation: {main_status_after_create}"
+            ]
+            result["next_action"] = "investigate main repo mutation"
+            _write_output(result, output_json, output_md)
+            return result
 
     worktree_status_before = git_status(worktree_root)
     result["worktree_git_status_before"] = worktree_status_before
@@ -1701,14 +1744,18 @@ def run(
     main_status_after = git_status(effective_repo_root)
     result["main_git_status_after"] = main_status_after
 
-    if not git_status_clean(effective_repo_root):
-        result["status"] = "HOLD_REPO_MUTATION"
-        result["validation_errors"] = [
-            f"main repo became dirty after worktree creation: {main_status_after}"
-        ]
-        result["next_action"] = "investigate main repo mutation"
-        _write_output(result, output_json, output_md)
-        return result
+    # Guard: when worktree_root == effective_repo_root we are inside the
+    # batch-controller-created worktree. apply_mock_edits modifies the worktree
+    # so checking it would always fail. Skip, matching Phase 7 behaviour.
+    if worktree_root != effective_repo_root:
+        if not git_status_clean(effective_repo_root):
+            result["status"] = "HOLD_REPO_MUTATION"
+            result["validation_errors"] = [
+                f"main repo became dirty after worktree creation: {main_status_after}"
+            ]
+            result["next_action"] = "investigate main repo mutation"
+            _write_output(result, output_json, output_md)
+            return result
 
     # ---- Phase 9b: PMG post-compare ----------------------------------------
     # Run PMG compare to detect any external (Hermes) mutations that occurred

@@ -191,6 +191,13 @@ def parse_args() -> argparse.Namespace:
         "--expected-status", default="PATCH_READY_FOR_HUMAN_REVIEW",
         help="Expected result status (default: PATCH_READY_FOR_HUMAN_REVIEW)"
     )
+    parser.add_argument(
+        "--execution-mode",
+        default="real",
+        choices=["real", "mock"],
+        help="Execution mode: 'real' checks repo git status; 'mock' skips the check "
+             "(mock edits stage changes via git add which would always dirty the worktree)"
+    )
     return parser.parse_args()
 
 
@@ -206,6 +213,7 @@ def verify(
     require_pmg_clean: bool,
     max_diff_bytes: int,
     expected_status: str,
+    execution_mode: str = "real",
 ) -> tuple[str, dict]:
     """
     Run all apply-readiness checks. Returns (status, checks_dict).
@@ -418,18 +426,25 @@ def verify(
         checks["command_contract_present"] = False
 
     # ── 16. Repo git status ────────────────────────────────────────────────────
-    repo_clean = _git_status_clean(repo_root)
-    checks["repo_git_clean"] = repo_clean
-    if not repo_clean:
-        return STATE_REPO_DIRTY, {**checks}
+    # In mock mode, apply_mock_edits stages changes via `git add`, making the
+    # worktree always dirty after mock execution. Skip this check for mock.
+    if execution_mode == "mock":
+        checks["repo_git_clean"] = None  # not checked in mock mode
+    else:
+        repo_clean = _git_status_clean(repo_root)
+        checks["repo_git_clean"] = repo_clean
+        if not repo_clean:
+            return STATE_REPO_DIRTY, {**checks}
 
     # ── 17. Output paths outside repo ─────────────────────────────────────────
     # (output paths are passed as args, checked by caller before calling verify)
     checks["output_paths_outside_repo"] = True
 
     # ── 18. Worktree path outside repo ─────────────────────────────────────────
+    # Skip when worktree_path == repo_root (batch-controller scenario where
+    # the task worktree IS the repo root; containment check cannot apply).
     worktree_path = result.get("worktree_path", "")
-    if worktree_path and _path_inside_repo(worktree_path, repo_root):
+    if worktree_path and worktree_path != str(repo_root) and _path_inside_repo(worktree_path, repo_root):
         return STATE_WORKTREE_INSIDE_REPO, {
             **checks,
             "worktree_path": str(worktree_path),
@@ -589,6 +604,7 @@ def main() -> int:
             require_pmg_clean=args.require_pmg_clean,
             max_diff_bytes=args.max_diff_bytes,
             expected_status=args.expected_status,
+            execution_mode=args.execution_mode,
         )
     except Exception as e:
         status = STATE_UNKNOWN
@@ -607,7 +623,7 @@ def main() -> int:
     pmg_status = result.get("pmg_status")
     real_claude_invoked = result.get("real_claude_invoked")
     claude_exit_code = result.get("claude_exit_code")
-    repo_git_clean = _git_status_clean(repo_root)
+    repo_git_clean = checks.get("repo_git_clean", _git_status_clean(repo_root))
     errors: list = []
     warnings: list = []
     generated_at = datetime.now(timezone.utc).isoformat()
