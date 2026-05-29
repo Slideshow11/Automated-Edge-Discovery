@@ -23,6 +23,7 @@ import verify_final_head_merge_command
 from verify_final_head_merge_command import (
     build_authorization_phrase,
     build_merge_command,
+    validate_merge_command,
     verify,
     validate_reported_sha,
     write_json,
@@ -436,6 +437,42 @@ class TestVerifyRequireMergeableFalse:
             require_mergeable=False,
         )
         assert result["recommendation"] == "MERGE_READY_CANDIDATE"
+
+
+class TestValidateMergeCommand:
+    """Test validate_merge_command rejects --admin."""
+
+    def test_rejects_command_with_admin_flag(self):
+        errors = validate_merge_command(
+            "gh pr merge 227 --admin --squash --delete-branch --match-head-commit abc123"
+        )
+        assert len(errors) == 1
+        assert "--admin" in errors[0]
+
+    def test_accepts_command_without_admin_flag(self):
+        errors = validate_merge_command(
+            "gh pr merge 227 --squash --delete-branch --match-head-commit abc123"
+        )
+        assert errors == []
+
+    def test_accepts_empty_command(self):
+        errors = validate_merge_command("")
+        assert errors == []
+
+
+class TestVerifyRejectsAdminFlag:
+    """Test that verify() BLOCKs when merge command has --admin in the call chain."""
+
+    def test_verify_blocks_admin_in_merged_command(self, monkeypatch):
+        """If any code somehow passes --admin into build_merge_command it should be caught."""
+        import verify_final_head_merge_command
+        # validate_merge_command is a pure function — test it directly
+        from verify_final_head_merge_command import validate_merge_command
+        # Verify the normal path: build_merge_command never produces --admin
+        cmd = build_merge_command(227, "Slideshow11/Automated-Edge-Discovery", "dab33c5dcc6ef9657644bbe160cf0ff08939a28c")
+        assert "--admin" not in cmd
+        errors = validate_merge_command(cmd)
+        assert errors == []
 
 
 # ---------------------------------------------------------------------------

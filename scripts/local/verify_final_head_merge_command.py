@@ -70,7 +70,11 @@ def _run(cmd: list[str]) -> tuple[int, str, str]:
 
 
 def build_merge_command(pr_number: int, repo: str, head_sha: str) -> str:
-    """Generate the safe merge command using the canonical GitHub head SHA."""
+    """Generate the safe merge command using the canonical GitHub head SHA.
+
+    NEVER includes --admin. Any merge command containing --admin must be rejected
+    by the caller before execution.
+    """
     return (
         f"gh pr merge {pr_number} \\\n"
         f"  --repo {repo} \\\n"
@@ -78,6 +82,23 @@ def build_merge_command(pr_number: int, repo: str, head_sha: str) -> str:
         f"  --delete-branch \\\n"
         f"  --match-head-commit {head_sha}"
     )
+
+
+def validate_merge_command(cmd: str) -> list[str]:
+    """
+    Validate that a merge command is safe to execute.
+
+    Returns a list of errors. Empty list means the command is valid.
+    Commands containing --admin are always rejected — using administrator
+    privileges to bypass branch protection is never permitted in AED workflow.
+    """
+    errors = []
+    if "--admin" in cmd:
+        errors.append(
+            "merge command contains --admin flag which bypasses branch protection. "
+            "Do not use --admin for normal AED merges."
+        )
+    return errors
 
 
 def build_authorization_phrase(pr_number: int, head_sha: str) -> str:
@@ -170,6 +191,15 @@ def verify(
 
     auth_phrase = build_authorization_phrase(pr_number, canonical_head_sha)
     merge_cmd = build_merge_command(pr_number, repo, canonical_head_sha)
+
+    # Reject merge commands containing --admin — never permitted in AED workflow.
+    admin_errors = validate_merge_command(merge_cmd)
+    if admin_errors:
+        auth_phrase = ""
+        merge_cmd = ""
+        errors.extend(admin_errors)
+        if recommendation == "MERGE_READY_CANDIDATE":
+            recommendation = "BLOCK"
 
     # PMG mandatory enforcement: if PMG is required but not supplied,
     # this tool cannot emit final authorization. Withhold auth phrase
