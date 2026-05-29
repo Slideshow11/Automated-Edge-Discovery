@@ -69,6 +69,22 @@ HOLD_STATUSES = (
 
 
 # ---------------------------------------------------------------------------
+# REST path helper
+# ---------------------------------------------------------------------------
+
+def repo_api_path(repo: str, *parts: str) -> str:
+    """Build a GitHub REST API path from owner/name and trailing segments.
+
+    >>> repo_api_path("Slideshow11/Automated-Edge-Discovery", "pulls", "364")
+    'repos/Slideshow11/Automated-Edge-Discovery/pulls/364'
+    >>> repo_api_path("Slideshow11/Automated-Edge-Discovery", "compare", "main...abc123")
+    'repos/Slideshow11/Automated-Edge-Discovery/compare/main...abc123'
+    """
+    owner, name = repo.split("/", 1)
+    return "/".join(["repos", owner, name, *parts])
+
+
+# ---------------------------------------------------------------------------
 # GitHub API helpers (list-argv, no shell=True)
 # ---------------------------------------------------------------------------
 
@@ -89,7 +105,7 @@ def gh_api(*args: str) -> dict:
 
 def fetch_pr_state_and_head(repo: str, pr_number: int) -> tuple[str, str]:
     """Return (state, head_sha) for a PR via REST."""
-    data = gh_api("repos", repo, "pulls", str(pr_number))
+    data = gh_api(repo_api_path(repo, "pulls", str(pr_number)))
     return data.get("state", "UNKNOWN"), data.get("head", {}).get("sha", "")
 
 
@@ -123,7 +139,7 @@ def fetch_compare_diff(repo: str, base_ref: str, head_sha: str) -> str:
     Uses GitHub compare API (base...head) so it captures the full PR diff
     regardless of local checkout state. Never uses 'git diff HEAD'.
     """
-    data = gh_api("repos", repo, "compare", f"{base_ref}...{head_sha}")
+    data = gh_api(repo_api_path(repo, "compare", f"{base_ref}...{head_sha}"))
     parts = []
     for commit in data.get("commits", []):
         for file in commit.get("files", []):

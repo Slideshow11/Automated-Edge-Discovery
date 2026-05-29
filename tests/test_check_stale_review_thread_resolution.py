@@ -13,7 +13,18 @@ class GhApiPatcher:
     def __enter__(self):
         self._saved = csr.gh_api
         def fake(*args):
-            if args[0] == "repos": return self.pr_resp if args[2] == "pulls" else self.comp_resp
+            # REST path call: single string starting with "repos/..."
+            # e.g. "repos/Slideshow11/Automated-Edge-Discovery/pulls/364"
+            if len(args) == 1 and isinstance(args[0], str) and args[0].startswith("repos/"):
+                path = args[0]
+                if "/pulls/" in path:
+                    return self.pr_resp
+                elif "/compare/" in path:
+                    return self.comp_resp
+                return {}
+            # Variadic args: ["repos", owner, name, "pulls", n] or ["graphql", ...]
+            if args[0] == "repos":
+                return self.pr_resp if args[2] == "pulls" else self.comp_resp
             return self.gql_resp
         csr.gh_api = fake; return self
     def __exit__(self, *a): csr.gh_api = self._saved
@@ -146,5 +157,111 @@ class T13(unittest.TestCase):
             self.assertEqual(s, csr.HOLD_DIFF_FETCH_FAILED)
         finally:
             csr.fetch_compare_diff = saved
+
+
+class TestFetchPrStateAndHeadUsesRestPath(unittest.TestCase):
+    """T14: fetch_pr_state_and_head calls gh_api with a single REST path string."""
+
+    def test_single_rest_path_for_pr(self):
+        calls = []
+        saved = csr.subprocess.run
+        def capture(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return make_cp('{"state": "open", "head": {"sha": "abc123aaa"}}')
+        csr.subprocess.run = capture
+        try:
+            csr.fetch_pr_state_and_head("Slideshow11/Automated-Edge-Discovery", 364)
+        finally:
+            csr.subprocess.run = saved
+
+        # Must be a single path string after "gh api"
+        gh_cmd = calls[0]
+        idx = gh_cmd.index("api")
+        rest_args = gh_cmd[idx + 1:]
+        self.assertEqual(len(rest_args), 1,
+            f"Expected exactly 1 REST path arg, got {rest_args!r}")
+        self.assertEqual(rest_args[0], "repos/Slideshow11/Automated-Edge-Discovery/pulls/364")
+
+    def test_not_variadic_repos_owner_name_pulls(self):
+        """gh api must NOT be called as: gh api repos OWNER NAME pulls N"""
+        calls = []
+        saved = csr.subprocess.run
+        def capture(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return make_cp('{"state": "open", "head": {"sha": "abc123aaa"}}')
+        csr.subprocess.run = capture
+        try:
+            csr.fetch_pr_state_and_head("Slideshow11/Automated-Edge-Discovery", 364)
+        finally:
+            csr.subprocess.run = saved
+
+        gh_cmd = calls[0]
+        idx = gh_cmd.index("api")
+        rest_args = gh_cmd[idx + 1:]
+        # Should be ONE token: repos/Slideshow11/Automated-Edge-Discovery/pulls/364
+        # Should NOT be 5 tokens: repos Slideshow11 Automated-Edge-Discovery pulls 364
+        self.assertEqual(len(rest_args), 1)
+        self.assertNotRegex(rest_args[0], r"^repos\s",
+            f"Variadic format found in {rest_args!r}: 'gh api repos OWNER NAME pulls N' detected")
+
+
+class TestFetchCompareDiffUsesRestPath(unittest.TestCase):
+    """T15: fetch_compare_diff calls gh_api with a single REST path string."""
+
+    def test_single_rest_path_for_compare(self):
+        calls = []
+        saved = csr.subprocess.run
+        def capture(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return make_cp('{"commits": []}')
+        csr.subprocess.run = capture
+        try:
+            csr.fetch_compare_diff("Slideshow11/Automated-Edge-Discovery", "main", "abc123aaa")
+        finally:
+            csr.subprocess.run = saved
+
+        gh_cmd = calls[0]
+        idx = gh_cmd.index("api")
+        rest_args = gh_cmd[idx + 1:]
+        self.assertEqual(len(rest_args), 1,
+            f"Expected exactly 1 REST path arg, got {rest_args!r}")
+        self.assertEqual(rest_args[0], "repos/Slideshow11/Automated-Edge-Discovery/compare/main...abc123aaa")
+
+    def test_not_variadic_repos_owner_name_compare(self):
+        """gh api must NOT be called as: gh api repos OWNER NAME compare BASE...HEAD"""
+        calls = []
+        saved = csr.subprocess.run
+        def capture(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return make_cp('{"commits": []}')
+        csr.subprocess.run = capture
+        try:
+            csr.fetch_compare_diff("Slideshow11/Automated-Edge-Discovery", "main", "abc123aaa")
+        finally:
+            csr.subprocess.run = saved
+
+        gh_cmd = calls[0]
+        idx = gh_cmd.index("api")
+        rest_args = gh_cmd[idx + 1:]
+        self.assertEqual(len(rest_args), 1)
+        self.assertNotRegex(rest_args[0], r"^repos\s",
+            f"Variadic format found in {rest_args!r}: 'gh api repos OWNER NAME compare ...' detected")
+
+
+class TestRepoApiPath(unittest.TestCase):
+    """T16: repo_api_path helper builds correct REST paths."""
+
+    def test_pulls_path(self):
+        path = csr.repo_api_path("Slideshow11/Automated-Edge-Discovery", "pulls", "364")
+        self.assertEqual(path, "repos/Slideshow11/Automated-Edge-Discovery/pulls/364")
+
+    def test_compare_path(self):
+        path = csr.repo_api_path("Slideshow11/Automated-Edge-Discovery", "compare", "main...abc123")
+        self.assertEqual(path, "repos/Slideshow11/Automated-Edge-Discovery/compare/main...abc123")
+
+    def test_single_segment(self):
+        path = csr.repo_api_path("OWNER/REPO", "releases")
+        self.assertEqual(path, "repos/OWNER/REPO/releases")
+
 
 if __name__ == "__main__": unittest.main()
