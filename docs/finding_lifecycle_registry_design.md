@@ -54,7 +54,14 @@ enforcement of conversation resolution remain the authoritative merge gates.
 #### `OPEN`
 - **Meaning**: The finding is active on the current PR head.
 - **Blocking**: Must block merge if severity (P0/P1/P2) and policy require it.
-- **Exit**: Transitions to `RESOLVED_BY_PATCH`, `ESCALATED`, `WAIVED`, `SUPERSEDED`, or `INVALID`.
+  Specifically, AED's `review_comment_gate` treats P0, P1, and P2 review-comment
+  findings as merge-blocking unless the finding is cleared by one of the permitted
+  `OPEN` exit transitions. P2 is **not informational by default**; it blocks
+  merge unless explicitly waived, superseded, invalidated with proof, fixed by
+  patch, or escalated.
+- **Exit**: Transitions to `RESOLVED_BY_PATCH`, `ESCALATED`, `WAIVED`, `SUPERSEDED`,
+  or `INVALID`. There is no path from `OPEN` directly to `RESOLVED_BY_POLICY`
+  — that transition applies only to `STALE` findings.
 
 #### `STALE`
 - **Meaning**: The finding belongs to an old commit or thread. The current diff no longer
@@ -157,6 +164,18 @@ resolution_method:   string   # "resolveReviewThread" | "patch_applied" | "waive
 waiter_status:        string   # last waiter stage result for this finding's PR
 ci_status:            string   # last CI result for this finding's PR
 pmg_status:           string   # last PMG result for this finding's PR
+
+# Gate decision (records why the finding blocks or does not block merge)
+blocking_level:       string   # P0 | P1 | P2 | P3 | UNSPECIFIED_BLOCKING | UNSPECIFIED_INFO |
+                              #   null — severity of the finding (same as `severity`)
+merge_blocking:       boolean  # true if this finding blocks merge under active policy;
+                              #   false if it does not. Derived from `severity` + `lifecycle_state`
+                              #   against the active gate policy.
+gate_source:          string   # which gate made the blocking decision:
+                              #   "review_comment_gate" | "conversation_resolution_check" |
+                              #   "pmg" | "final_gate_status" | "ci" | null
+gate_policy_version:  string   # version identifier for the gate policy in effect
+                              #   at the time merge_blocking was set (e.g., "v1.0", "v2.1")
 ```
 
 ### Field Constraints
@@ -175,12 +194,17 @@ pmg_status:           string   # last PMG result for this finding's PR
 
 ### State Transition Diagram
 
+> **P2 is blocking by default.** `OPEN` findings with severity P2 must be resolved
+> via `RESOLVED_BY_PATCH`, `WAIVED`, `SUPERSEDED`, `INVALID` (with proof), or
+> `ESCALATED`. There is no assumption that P2 is informational or non-blocking.
+> The `review_comment_gate` treats P2 as a merge blocker.
+
 ```
 OPEN → RESOLVED_BY_PATCH      # code/docs/test eliminated root cause
 OPEN → ESCALATED              # human decision needed
 OPEN → WAIVED                 # explicit waiver granted
 OPEN → SUPERSEDED             # newer finding replaces this one
-OPEN → INVALID                # finding is factually wrong
+OPEN → INVALID                # finding is factually wrong with proof
 
 STALE → RESOLVED_BY_POLICY    # policy checker proved eligibility; thread resolved
 STALE → ESCALATED             # human decision needed
@@ -196,20 +220,22 @@ INVALID → RESOLVED_BY_POLICY
 
 ### Forbidden Transitions
 
-| From | To | Reason |
-|------|----|--------|
-| `OPEN` | `RESOLVED_BY_POLICY` | Finding is on current head; must be resolved by patch or escalation |
-| `OPEN` | *(deleted)* | Findings are never deleted; state is durable |
-| `STALE` | `RESOLVED_BY_PATCH` | Patch resolution requires finding to still exist on current head |
-| `WAIVED` | *(any)* | Waivers are terminal unless escalated |
-| `SUPERSEDED` | *(any)* | Superseded findings are terminal |
-| `ESCALATED` | *(any)* | Escalated findings require human resolution |
-| `INVALID` | `WAIVED` | Invalid findings are disproven, not waived |
-| `INVALID` | `SUPERSEDED` | Invalid findings are already closed |
-| `*` | `comment deletion` | Never delete review comments |
-| `*` | `review dismissal` | Never dismiss GitHub reviews |
-| `*` | `--admin` merge | Never use admin bypass |
-| `*` | branch protection change | Never mutate GitHub settings |
+|| From | To | Reason |
+||------|----|--------|
+|| `OPEN` | `RESOLVED_BY_POLICY` | Finding is on current head; must be resolved by patch or escalation |
+|| `OPEN` | *(deleted)* | Findings are never deleted; state is durable |
+|| `OPEN P2` | *(silently non-blocking)* | P2 blocks merge by default; must be explicitly cleared |
+|| `OPEN P2` | `STALE` | Stale requires the finding to be on an old commit; current-head P2 cannot self-classify as stale |
+|| `STALE` | `RESOLVED_BY_PATCH` | Patch resolution requires finding to still exist on current head |
+|| `WAIVED` | *(any)* | Waivers are terminal unless escalated |
+|| `SUPERSEDED` | *(any)* | Superseded findings are terminal |
+|| `ESCALATED` | *(any)* | Escalated findings require human resolution |
+|| `INVALID` | `WAIVED` | Invalid findings are disproven, not waived |
+|| `INVALID` | `SUPERSEDED` | Invalid findings are already closed |
+|| `*` | `comment deletion` | Never delete review comments |
+|| `*` | `review dismissal` | Never dismiss GitHub reviews |
+|| `*` | `--admin` merge | Never use admin bypass |
+|| `*` | branch protection change | Never mutate GitHub settings |
 
 ---
 
@@ -364,7 +390,47 @@ constitute the evidence.
 }
 ```
 
-### Example 3: Invalid Codex finding disproven by gh api proof
+### Example 3: Current-head P2 docs/tooling finding (merge-blocking)
+
+```json
+{
+  "finding_id": "codex-p2-design-gap",
+  "pr_number": 364,
+  "thread_id": "PRRT_kwDOSHFpYM6FwTqS",
+  "comment_id": "8888888888",
+  "source": "check_pr_review_comments",
+  "author": "chatgpt-codex-connector[bot]",
+  "severity": "P2",
+  "title": "Include P2 blockers in the merge-time registry check",
+  "body_summary": "In this repo, `check_pr_review_comments.py` documents that P2 findings block...",
+  "path": "docs/finding_lifecycle_registry_design.md",
+  "line": 1,
+  "flagged_pattern": "Include P2 blockers in the merge-time registry check",
+  "replacement_pattern": null,
+  "original_commit_sha": "4cf8ae8b20cd",
+  "current_head_sha": "4cf8ae8b20cd",
+  "base_sha": "177b387",
+  "lifecycle_state": "OPEN",
+  "status_reason": "Active P2 finding on current head. The design doc must explicitly model P2 merge-blockers in the registry schema and safety rules. Finding is blocking merge.",
+  "evidence_commands": [],
+  "evidence_summary": "P2 finding on docs/finding_lifecycle_registry_design.md. Current-head, not stale. Blocks merge unless cleared by patch, waiver, invalidation, supersession, or escalation.",
+  "audit_log_path": null,
+  "created_at": "2026-05-29T18:00:00Z",
+  "updated_at": "2026-05-29T18:00:00Z",
+  "resolved_at": null,
+  "resolved_by": null,
+  "resolution_method": null,
+  "waiter_status": "HOLD_REVIEW_COMMENTS_BLOCKED",
+  "ci_status": "SUCCESS",
+  "pmg_status": "CLEAN",
+  "merge_blocking": true,
+  "blocking_level": "P2",
+  "gate_source": "review_comment_gate",
+  "gate_policy_version": "v1.0"
+}
+```
+
+### Example 4: Invalid Codex finding disproven by gh api proof
 
 ```json
 {
@@ -559,6 +625,25 @@ any optimization goal:
 8. **Audit every policy resolution.** Every `RESOLVED_BY_POLICY` transition must include
    `checker_status`, `thread_id`, `current_head_sha`, `diff_clean` evidence,
    `ci_green` confirmation, and `pmg_clean` confirmation.
+
+9. **Current-head P0/P1/P2 findings block merge.** Any `OPEN` finding with severity
+   P0, P1, or P2 on the current PR head must be cleared before merge. Clearing
+   requires a patch that eliminates the root cause, an explicit waiver with
+   rationale, invalidation with factual proof, supersession by a more accurate
+   finding, or escalation to human decision. There is no default assumption that
+   P2 is non-blocking or informational.
+
+10. **The registry must mirror the `review_comment_gate`'s blocking policy.** The
+    registry records gate decisions — it does not override them. If the
+    `review_comment_gate` treats P2 as blocking, the registry must record P2
+    findings with `merge_blocking: true`. The registry must not silently drop
+    or deprioritize P2 findings to make merge appear cleaner than the gate
+    actually allows.
+
+11. **The registry records gate decisions; it does not override them.** A
+    `RESOLVED_BY_POLICY` record means the policy checker found the stale thread
+    eligible for resolution. GitHub's `required_conversation_resolution` is
+    authoritative; the registry cannot override it.
 
 ---
 
