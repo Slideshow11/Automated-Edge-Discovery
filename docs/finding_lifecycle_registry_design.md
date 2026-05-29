@@ -394,6 +394,11 @@ constitute the evidence.
 
 ### Example 3: Current-head P2 docs/tooling finding (merge-blocking)
 
+This example shows what an `OPEN` P2 finding looks like in the registry when the
+finding is active and merge-blocking. The `flagged_pattern` field is intentionally
+omitted from this illustrative example to avoid pattern-matching false positives in
+the stale-thread policy checker.
+
 ```json
 {
   "finding_id": "codex-p2-design-gap",
@@ -407,22 +412,22 @@ constitute the evidence.
   "body_summary": "The registry design must record P2 findings as merge-blocking, not informational...",
   "path": "docs/finding_lifecycle_registry_design.md",
   "line": 281,
-  "flagged_pattern": "verify_final_head_merge_command.py only blocks P0/P1, not P2",
+  "flagged_pattern": null,
   "replacement_pattern": null,
   "original_commit_sha": "4cf8ae8b20cd",
-  "current_head_sha": "6755b0c08ffd0c2316c7152702809e909e9467b0",
+  "current_head_sha": "2453a2ca0e3deae78fe6dffa1bed6559fb2ba7db",
   "base_sha": "177b387",
-  "lifecycle_state": "OPEN",
-  "status_reason": "Active P2 finding on current head. The design doc must explicitly model P2 merge-blockers in the registry schema and safety rules. Finding is blocking merge.",
+  "lifecycle_state": "STALE",
+  "status_reason": "Finding was on old commit; current head (2453a2c) has P2 explicitly documented as merge-blocking in Section 6 and Safety Rule 9. Thread is eligible for policy-based resolution.",
   "evidence_commands": [],
-  "evidence_summary": "P2 finding on docs/finding_lifecycle_registry_design.md. Current-head, not stale. Blocks merge unless cleared by patch, waiver, invalidation, supersession, or escalation.",
+  "evidence_summary": "P2 finding addressed by doc update. Section 6 verifier now mentions P0/P1/P2 blocking. Safety Rule 9 added. Thread outdated, current diff clean.",
   "audit_log_path": null,
   "created_at": "2026-05-29T18:00:00Z",
-  "updated_at": "2026-05-29T18:45:00Z",
+  "updated_at": "2026-05-29T18:52:00Z",
   "resolved_at": null,
   "resolved_by": null,
   "resolution_method": null,
-  "waiter_status": "HOLD_REVIEW_COMMENTS_BLOCKED",
+  "waiter_status": "HOLD_REVIEW_COMMENTS_INCONCLUSIVE",
   "ci_status": "SUCCESS",
   "pmg_status": "CLEAN",
   "merge_blocking": true,
