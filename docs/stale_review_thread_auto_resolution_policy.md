@@ -81,7 +81,7 @@ All 14 of the following must be true before resolving a single thread:
 | 4 | Thread is outdated | Comment body cites a pattern absent from current diff |
 | 5 | Thread is unresolved | Thread `state != "RESOLVED"` in GitHub API |
 | 6 | Comment body maps to a specific flagged pattern | Comment body contains a concrete reference (variable, path, function) that can be grepped |
-| 7 | Current diff no longer contains the flagged pattern | `git diff HEAD -- {files}` does not contain the pattern |
+| 7 | Current diff no longer contains the flagged pattern | `git fetch origin <base-branch> && git diff origin/<base-branch>...HEAD -- {files}` shows the pattern is absent. Alternatively, compare `https://github.com/{owner}/{repo}/compare/{base-branch}...<head-sha>` or use `git log --oneline -1 origin/<base-branch>` to find merge-base and diff from there. Never use `git diff HEAD -- {files}` in a clean checkout — that compares the working tree to HEAD and is always empty. |
 | 8 | Current diff contains the replacement/fix if applicable | If the pattern implies a fix, the replacement is present in the diff |
 | 9 | CI is green | All required branch-protection checks pass on the current head SHA |
 | 10 | PMG is clean | `pmg snapshot` vs `pmg compare` shows no blocked changes |
