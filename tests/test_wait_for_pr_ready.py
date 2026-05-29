@@ -577,8 +577,20 @@ class TestFinalGates:
             m.stderr = ''
 
             if cmd and cmd[0] == "gh":
-                args = [a for a in cmd[1:] if a != "--repo"]
-                gh_args = args
+                # Strip --repo and the owner/repo argument from gh commands.
+                # gh api ... --repo owner/repo puts --repo at the END, so filter
+                # both the flag and the value that follows it.
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)  # skip the repo name
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
 
                 if gh_args[:2] == ["pr", "view"]:
                     # Route based on --jq expression to match real waiter behavior
@@ -721,8 +733,20 @@ class TestFinalGates:
             m.stderr = ''
 
             if cmd and cmd[0] == "gh":
-                args = [a for a in cmd[1:] if a != "--repo"]
-                gh_args = args
+                # Strip --repo and the owner/repo argument from gh commands.
+                # gh api ... --repo owner/repo puts --repo at the END, so filter
+                # both the flag and the value that follows it.
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)  # skip the repo name
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
 
                 if gh_args[:2] == ["pr", "view"]:
                     if '--jq' in gh_args:
@@ -1607,6 +1631,380 @@ class TestRepoContextAndCwd:
         action = mod.next_action_for_status(mod.STATUS_HOLD_CI_FAILED, 999, "abc1234")
         assert "gh pr merge" not in action, \
             f"HOLD_CI_FAILED must not emit merge command; got: {action}"
+
+
+class TestConversationResolutionEnforcement:
+    """Test that branch protection conversation_resolution requirement is enforced."""
+
+    def test_hold_when_conversation_resolution_required_but_flag_not_set(self, output_dir, output_json):
+        """
+        When branch protection has required_conversation_resolution=true AND
+        --require-review-comments-clean was NOT set, the waiter must return
+        HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION and emit no merge command.
+        """
+        import importlib.util
+        import subprocess
+        import sys
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                # Strip --repo and the owner/repo argument from gh commands.
+                # gh api ... --repo owner/repo puts --repo at the END, so filter
+                # both the flag and the value that follows it.
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)  # skip the repo name
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
+
+                if gh_args[:2] == ["pr", "view"]:
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        elif '.baseRefName' in jq_expr:
+                            m.stdout = '"main"'
+                        else:
+                            m.stdout = ''
+                    return m
+
+                if gh_args[0] == "api":
+                    if 'branches/main/protection' in ' '.join(gh_args):
+                        m.stdout = json.dumps({
+                            "required_conversation_resolution": {"enabled": True}
+                        })
+                    else:
+                        m.stdout = '{}'
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'final_gate_status' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'MERGE_READY_CANDIDATE', 'head_sha_match': True}, f)
+
+            return m
+
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-final-gates",
+        ]
+
+        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        assert os.path.exists(out_json), f"JSON not written: {out_json}"
+        data = read_json(out_json)
+        assert data["status"] == "HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION", (
+            f"Expected HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION but got {data['status']}"
+        )
+        action = data.get("next_safe_action", "")
+        assert "gh pr merge" not in action, (
+            f"HOLD must not contain merge command; got: {action}"
+        )
+
+    def test_proceeds_when_conversation_resolution_required_and_flag_set(self, output_dir, output_json):
+        """
+        When branch protection has required_conversation_resolution=true AND
+        --require-review-comments-clean IS set, the waiter proceeds normally
+        if the review comment gate is clean.
+        """
+        import importlib.util
+        import subprocess
+        import sys
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                # Strip --repo and the owner/repo argument from gh commands.
+                # gh api ... --repo owner/repo puts --repo at the END, so filter
+                # both the flag and the value that follows it.
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)  # skip the repo name
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
+
+                if gh_args[:2] == ["pr", "view"]:
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        elif '.baseRefName' in jq_expr:
+                            m.stdout = '"main"'
+                        else:
+                            m.stdout = ''
+                    return m
+
+                if gh_args[0] == "api":
+                    if 'branches/main/protection' in ' '.join(gh_args):
+                        m.stdout = json.dumps({
+                            "required_conversation_resolution": {"enabled": True}
+                        })
+                    else:
+                        m.stdout = '{}'
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'check_pr_review_comments' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+                elif 'final_gate_status' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'MERGE_READY_CANDIDATE', 'head_sha_match': True}, f)
+
+            return m
+
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        data = read_json(out_json)
+        assert data["status"] == "READY_TO_MERGE_CANDIDATE", (
+            f"Expected READY_TO_MERGE_CANDIDATE with flag set; got {data['status']}"
+        )
+
+
+class TestConversationResolutionBranchProtectionDisabled:
+    """Test that conversation resolution is not enforced when branch protection has it disabled."""
+
+    def test_merges_when_conversation_resolution_not_required(self, output_dir, output_json):
+        """
+        When branch protection has required_conversation_resolution=false (or not set),
+        --require-review-comments-clean was NOT set, waiter must still return
+        READY_TO_MERGE_CANDIDATE (old behavior preserved).
+        """
+        import importlib.util
+        import subprocess
+        import sys
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                # Strip --repo and the owner/repo argument from gh commands.
+                # gh api ... --repo owner/repo puts --repo at the END, so filter
+                # both the flag and the value that follows it.
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)  # skip the repo name
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
+
+                if gh_args[:2] == ["pr", "view"]:
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        elif '.baseRefName' in jq_expr:
+                            m.stdout = '"main"'
+                        else:
+                            m.stdout = ''
+                    return m
+
+                if gh_args[0] == "api":
+                    if 'branches/main/protection' in ' '.join(gh_args):
+                        m.stdout = json.dumps({
+                            "required_conversation_resolution": {"enabled": False}
+                        })
+                    else:
+                        m.stdout = '{}'
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'final_gate_status' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'MERGE_READY_CANDIDATE', 'head_sha_match': True}, f)
+
+            return m
+
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-final-gates",
+        ]
+
+        with patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                mod.main()
+            except SystemExit:
+                pass
+            finally:
+                sys.argv = old_argv
+
+        data = read_json(out_json)
+        assert data["status"] == "READY_TO_MERGE_CANDIDATE", (
+            f"Expected READY_TO_MERGE_CANDIDATE when conversation_resolution not required; got {data['status']}"
+        )
 
 
 class TestSubprocessCalls:

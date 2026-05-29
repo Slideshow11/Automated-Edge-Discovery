@@ -65,6 +65,7 @@ STATUS_HOLD_CI_PENDING = "HOLD_CI_PENDING"
 STATUS_HOLD_CI_FAILED = "HOLD_CI_FAILED"
 STATUS_HOLD_REVIEW_COMMENTS_BLOCKED = "HOLD_REVIEW_COMMENTS_BLOCKED"
 STATUS_HOLD_REVIEW_COMMENTS_INCONCLUSIVE = "HOLD_REVIEW_COMMENTS_INCONCLUSIVE"
+STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION = "HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION"
 STATUS_HOLD_PMG_DIRTY = "HOLD_PMG_DIRTY"
 STATUS_HOLD_HEAD_CHANGED = "HOLD_HEAD_CHANGED"
 STATUS_HOLD_TIMEOUT = "HOLD_TIMEOUT"
@@ -165,6 +166,40 @@ def get_live_head_sha(pr_number: int) -> str:
         check=True,
     )
     return result.stdout.strip()
+
+
+def get_branch_protection(repo: str, branch: str) -> Optional[dict]:
+    """
+    Fetch branch protection settings for the given repo and branch.
+
+    Returns the protection dict or None if the API call fails.
+    """
+    try:
+        result = gh_run(
+            ["api", f"repos/{repo}/branches/{branch}/protection"],
+            check=True,
+        )
+        return json.loads(result.stdout.strip())
+    except Exception:
+        return None
+
+
+def conversation_resolution_required(repo: str, base_branch: str) -> bool:
+    """
+    Return True if the base branch has required_conversation_resolution enabled
+    in its branch protection settings.
+
+    Catches all errors (network, auth, parse) and returns False so a failure
+    to read branch protection is treated as "not required" — fail open on
+    tooling errors, fail closed on actual policy.
+    """
+    try:
+        protection = get_branch_protection(repo, base_branch)
+        if protection is None:
+            return False
+        return bool(protection.get("required_conversation_resolution", {}).get("enabled", False))
+    except Exception:
+        return False
 
 
 def poll_ci_checks(
@@ -675,6 +710,32 @@ def main():
             if rg_status != STATUS_READY_FOR_FINAL_GATES:
                 _write_report(rg_status, next_action_for_status(rg_status, args.pr_number, current_head_sha))
                 sys.exit(0)
+
+        # ---- Conversation resolution enforcement ----
+        # If branch protection requires conversation resolution, the review-comment
+        # gate must have been run. Omitting --require-review-comments-clean when the
+        # base branch mandates conversation resolution is a policy violation.
+        # Detect it here and fail closed.
+        repo_name = args.repo or "Slideshow11/Automated-Edge-Discovery"
+        # Get base branch name from the PR
+        pr_view_result = gh_run(
+            ["pr", "view", str(args.pr_number), "--json", "baseRefName", "--jq", ".baseRefName"],
+            check=True,
+        )
+        base_branch = pr_view_result.stdout.strip().strip('"')
+        if conversation_resolution_required(repo_name, base_branch) and not args.require_review_comments_clean:
+            _add_stage(
+                "conversation_resolution_enforcement",
+                STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION,
+                f"branch protection requires conversation resolution but "
+                f"--require-review-comments-clean was not set; set the flag or "
+                f"remove the conversation_resolution requirement from the base branch",
+            )
+            _write_report(
+                STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION,
+                next_action_for_status(STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION, args.pr_number, current_head_sha),
+            )
+            sys.exit(0)
 
         # ---- Stage 4: PMG compare (optional) ----
         pmg_compare_json = args.output_json.replace(".json", "_pmg_compare.json")
