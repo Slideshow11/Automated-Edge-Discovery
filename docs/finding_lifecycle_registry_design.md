@@ -278,8 +278,10 @@ confirm that the finding's root cause was eliminated by the current patch.
 ### `verify_final_head_merge_command.py`
 
 Reads the registry to confirm no `OPEN` blockers remain at merge time. If any
-`lifecycle_state=OPEN` finding exists for the PR with P0/P1 severity, merge is blocked
-even if GitHub has not yet raised a blocking thread.
+`lifecycle_state=OPEN` finding exists for the PR with P0, P1, or P2 severity,
+merge is blocked even if GitHub has not yet raised a blocking thread. P2 is
+blocking by default under AED's `review_comment_gate` policy; the verifier
+must not apply a weaker standard.
 
 ### Branch protection `required_conversation_resolution`
 
@@ -404,11 +406,11 @@ constitute the evidence.
   "title": "Document P2 severity as merge-blocking in lifecycle schema",
   "body_summary": "The registry design must record P2 findings as merge-blocking, not informational...",
   "path": "docs/finding_lifecycle_registry_design.md",
-  "line": 1,
-  "flagged_pattern": "Document P2 severity as merge-blocking in lifecycle schema",
+  "line": 281,
+  "flagged_pattern": "verify_final_head_merge_command.py only blocks P0/P1, not P2",
   "replacement_pattern": null,
   "original_commit_sha": "4cf8ae8b20cd",
-  "current_head_sha": "54433205bde8a1124a0a0bcad5b4a80886466f14",
+  "current_head_sha": "6755b0c08ffd0c2316c7152702809e909e9467b0",
   "base_sha": "177b387",
   "lifecycle_state": "OPEN",
   "status_reason": "Active P2 finding on current head. The design doc must explicitly model P2 merge-blockers in the registry schema and safety rules. Finding is blocking merge.",
@@ -416,7 +418,7 @@ constitute the evidence.
   "evidence_summary": "P2 finding on docs/finding_lifecycle_registry_design.md. Current-head, not stale. Blocks merge unless cleared by patch, waiver, invalidation, supersession, or escalation.",
   "audit_log_path": null,
   "created_at": "2026-05-29T18:00:00Z",
-  "updated_at": "2026-05-29T18:37:00Z",
+  "updated_at": "2026-05-29T18:45:00Z",
   "resolved_at": null,
   "resolved_by": null,
   "resolution_method": null,
