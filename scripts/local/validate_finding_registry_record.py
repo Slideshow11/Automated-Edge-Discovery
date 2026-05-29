@@ -221,11 +221,28 @@ def validate_record(raw: dict) -> tuple[str, list[str], list[str]]:
                 f"got: {resolution_method!r} (OPEN/STALE are non-terminal states)"
             )
 
+    # --- State-specific resolution_method validation ---------------------
+    # OPEN/STALE must not have resolution_method (checked above).
+    # Terminal/transition states must use only documented methods or None.
+    VALID_RESOLUTION_METHODS_BY_STATE = {
+        "WAIVED": {"waiver", "manual_override", "not_applicable", None},
+        "SUPERSEDED": {"not_applicable", None},
+        "INVALID": {"not_applicable", None},
+        "RESOLVED_BY_PATCH": {"patch_applied", "not_applicable", None},
+    }
+    if lifecycle_state in VALID_RESOLUTION_METHODS_BY_STATE:
+        allowed = VALID_RESOLUTION_METHODS_BY_STATE[lifecycle_state]
+        if resolution_method not in allowed:
+            errors.append(
+                f"{lifecycle_state} resolution_method must be one of "
+                f"{sorted(allowed - {None})} or null, got: {resolution_method!r}"
+            )
+
     # --- RESOLVED_BY_POLICY requirements ----------------------------------
     if lifecycle_state == "RESOLVED_BY_POLICY":
         # Required fields for RESOLVED_BY_POLICY
         for field in ("thread_id", "current_head_sha", "evidence_summary",
-                      "audit_log_path", "resolution_method"):
+                      "evidence_commands", "audit_log_path", "resolution_method"):
             if not raw.get(field):
                 errors.append(f"RESOLVED_BY_POLICY requires {field}")
 

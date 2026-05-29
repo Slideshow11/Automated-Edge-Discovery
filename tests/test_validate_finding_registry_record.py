@@ -99,6 +99,7 @@ class TestValidResolvedByPolicy(unittest.TestCase):
             status_reason="Stale thread, checker returned ELIGIBLE.",
             thread_id="PRRT_kwDOSHFpYM6Fxyz",
             evidence_summary="Pattern not in current diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
             audit_log_path="/tmp/audit.json",
             resolution_method="resolveReviewThread",
             resolved_at="2026-05-29T21:00:00Z",
@@ -728,6 +729,7 @@ class TestOpenStaleRejectsResolutionMethod(unittest.TestCase):
             resolution_method="resolveReviewThread",
             thread_id="PRRT_kwDOSHFpYM6Fxyz",
             evidence_summary="Pattern not in diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
             audit_log_path="/tmp/audit.json",
             resolved_at="2026-01-01T00:00:00Z",
             resolved_by="policy_checker",
@@ -735,6 +737,173 @@ class TestOpenStaleRejectsResolutionMethod(unittest.TestCase):
         )
         s, e, w = vfr.validate_record(rec)
         self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+
+class TestResolvedByPolicyRequiresEvidenceCommands(unittest.TestCase):
+    """RESOLVED_BY_POLICY must have evidence_commands field."""
+
+    def test_missing_evidence_commands_fails(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="resolveReviewThread",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        # evidence_commands is missing
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("RESOLVED_BY_POLICY requires evidence_commands" in x for x in e))
+
+    def test_empty_evidence_commands_fails(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="resolveReviewThread",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            evidence_commands=[],
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("RESOLVED_BY_POLICY requires evidence_commands" in x for x in e))
+
+    def test_evidence_commands_present_passes(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="resolveReviewThread",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_resolved_by_policy_with_deletePullRequestReviewComment_fails(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="deletePullRequestReviewComment",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("resolveReviewThread" in x for x in e))
+
+    def test_resolved_by_policy_with_dismissReview_fails(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="dismissReview",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("dismissReview" in x or "resolveReviewThread" in x for x in e))
+
+    def test_resolved_by_policy_with_admin_merge_fails(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="admin_merge",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            evidence_commands=["gh api repos/.../pulls/comments/1234"],
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("admin_merge" in x or "resolveReviewThread" in x for x in e))
+
+
+class TestUnknownResolutionMethodsRejected(unittest.TestCase):
+    """WAIVED/SUPERSEDED/INVALID/RESOLVED_BY_PATCH reject unknown resolution_method values."""
+
+    def test_waived_unknown_method_fails(self):
+        rec = make_record(lifecycle_state="WAIVED", resolution_method="banana",
+                          status_reason="Waived.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                          evidence_summary="Waiver filed.")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("banana" in x for x in e))
+
+    def test_superseded_unknown_method_fails(self):
+        rec = make_record(lifecycle_state="SUPERSEDED", resolution_method="random_method",
+                          status_reason="Superseded.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                          evidence_summary="Superseded by newer finding.")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("random_method" in x for x in e))
+
+    def test_invalid_unknown_method_fails(self):
+        rec = make_record(lifecycle_state="INVALID", resolution_method="typo",
+                          status_reason="Finding is wrong.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                          evidence_summary="Factually incorrect finding.")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("typo" in x for x in e))
+
+    def test_resolved_by_patch_unknown_method_fails(self):
+        rec = make_record(lifecycle_state="RESOLVED_BY_PATCH", resolution_method="unknown_method",
+                          status_reason="Patch applied.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                          evidence_summary="Patch applied.")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("unknown_method" in x for x in e))
+
+    def test_waived_known_methods_pass(self):
+        for method in ("waiver", "manual_override", "not_applicable", None):
+            rec = make_record(lifecycle_state="WAIVED", resolution_method=method,
+                              status_reason="Waived.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                              evidence_summary="Waiver filed.")
+            s, e, w = vfr.validate_record(rec)
+            self.assertEqual(s, vfr.VALID_FINDING_RECORD), f"method={method} should pass"
+
+    def test_superseded_known_methods_pass(self):
+        for method in ("not_applicable", None):
+            rec = make_record(lifecycle_state="SUPERSEDED", resolution_method=method,
+                              status_reason="Superseded.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                              evidence_summary="Superseded by newer finding.")
+            s, e, w = vfr.validate_record(rec)
+            self.assertEqual(s, vfr.VALID_FINDING_RECORD), f"method={method} should pass"
+
+    def test_invalid_known_methods_pass(self):
+        for method in ("not_applicable", None):
+            rec = make_record(lifecycle_state="INVALID", resolution_method=method,
+                              status_reason="Finding is wrong.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                              evidence_summary="Factually incorrect finding.")
+            s, e, w = vfr.validate_record(rec)
+            self.assertEqual(s, vfr.VALID_FINDING_RECORD), f"method={method} should pass"
+
+    def test_resolved_by_patch_known_methods_pass(self):
+        for method in ("patch_applied", "not_applicable", None):
+            rec = make_record(lifecycle_state="RESOLVED_BY_PATCH", resolution_method=method,
+                              status_reason="Patch applied.", resolved_by="operator", resolved_at="2026-01-01T00:00:00Z",
+                              evidence_summary="Patch applied.")
+            s, e, w = vfr.validate_record(rec)
+            self.assertEqual(s, vfr.VALID_FINDING_RECORD), f"method={method} should pass"
 
 
 if __name__ == "__main__":
