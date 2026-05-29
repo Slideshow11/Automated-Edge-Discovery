@@ -77,9 +77,9 @@ All 14 of the following must be true before resolving a single thread:
 |---|-----------|---------------------|
 | 1 | PR is open | GitHub API: `GET /repos/{owner}/{repo}/pulls/{pr}` — `state == "open"` |
 | 2 | Exact head SHA verified | `gh pr view --json headRefOid` matches reported SHA |
-| 3 | Target thread exists | GitHub API: `GET /repos/{owner}/{repo}/pulls/{pr}/comments` — thread ID confirmed |
-| 4 | Thread is outdated | Comment body cites a pattern absent from current diff |
-| 5 | Thread is unresolved | Thread `state != "RESOLVED"` in GitHub API |
+| 3 | Target thread exists | GraphQL: `reviewThreads` query on the PR — confirm thread ID exists by `id` field. REST `GET /repos/{owner}/{repo}/pulls/{pr}/comments` returns comment records, not thread records, and does not include `isResolved`/`isOutdated`. |
+| 4 | Thread is outdated | GraphQL: `reviewThreads[].isOutdated == true`. Do not rely on comment-body pattern matching alone to determine outdatedness. |
+| 5 | Thread is unresolved | GraphQL: `reviewThreads[].isResolved == false`. Do not use REST API thread state — it does not expose resolved/outdated at thread level. |
 | 6 | Comment body maps to a specific flagged pattern | Comment body contains a concrete reference (variable, path, function) that can be grepped |
 | 7 | Current diff no longer contains the flagged pattern | `git fetch origin <base-branch> && git diff origin/<base-branch>...HEAD -- {files}` shows the pattern is absent. Alternatively, compare `https://github.com/{owner}/{repo}/compare/{base-branch}...<head-sha>` or use `git log --oneline -1 origin/<base-branch>` to find merge-base and diff from there. Never use `git diff HEAD -- {files}` in a clean checkout — that compares the working tree to HEAD and is always empty. |
 | 8 | Current diff contains the replacement/fix if applicable | If the pattern implies a fix, the replacement is present in the diff |
