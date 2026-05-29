@@ -68,7 +68,7 @@ VALID_LIFECYCLE_STATES = {
     "INVALID",
 }
 
-VALID_SEVERITIES = {"INFO", "P3", "P2", "P1", "P0"}
+VALID_SEVERITIES = {"INFO", "P3", "P2", "P1", "P0", "UNSPECIFIED_BLOCKING", "UNSPECIFIED_INFO"}
 
 VALID_RESOLUTION_METHODS = {
     "resolveReviewThread",
@@ -193,6 +193,14 @@ def validate_record(raw: dict) -> tuple[str, list[str], list[str]]:
                 f"OPEN {severity} finding must have merge_blocking=true "
                 "(P2 is blocking by default under AED policy)"
             )
+    # UNSPECIFIED_BLOCKING is a documented blocking severity
+    if severity == "UNSPECIFIED_BLOCKING" and lifecycle_state == "OPEN":
+        if merge_blocking is not True:
+            errors.append(
+                "OPEN UNSPECIFIED_BLOCKING finding must have merge_blocking=true "
+                "(UNSPECIFIED_BLOCKING is a merge-blocking severity per "
+                "docs/finding_lifecycle_registry_design.md)"
+            )
 
     # --- policy violations: forbidden resolution methods -------------------
     resolution_method = raw.get("resolution_method")
@@ -202,6 +210,16 @@ def validate_record(raw: dict) -> tuple[str, list[str], list[str]]:
             "must not use deleteReviewComment, deletePullRequestReviewComment, "
             "dismissReview, or admin_merge"
         )
+
+    # --- OPEN/STALE must not carry resolution_method -----------------------
+    # Per docs/finding_lifecycle_registry_design.md lines 186-187,
+    # OPEN and STALE are non-terminal states; resolution_method must be null.
+    if lifecycle_state in ("OPEN", "STALE"):
+        if resolution_method is not None:
+            errors.append(
+                f"{lifecycle_state} finding must not have resolution_method; "
+                f"got: {resolution_method!r} (OPEN/STALE are non-terminal states)"
+            )
 
     # --- RESOLVED_BY_POLICY requirements ----------------------------------
     if lifecycle_state == "RESOLVED_BY_POLICY":

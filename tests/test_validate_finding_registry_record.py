@@ -647,5 +647,95 @@ class TestGateSourceRequiredWhenBlocking(unittest.TestCase):
         self.assertTrue(any("gate_source" in x or "missing" in x for x in e))
 
 
+class TestUnspecifiedSeverityAcceptance(unittest.TestCase):
+    """UNSPECIFIED_BLOCKING and UNSPECIFIED_INFO are valid severities per design doc."""
+
+    def test_unspecified_blocking_valid(self):
+        rec = make_record(severity="UNSPECIFIED_BLOCKING", merge_blocking=True)
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_unspecified_info_valid(self):
+        rec = make_record(severity="UNSPECIFIED_INFO")
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_unspecified_blocking_open_requires_merge_blocking(self):
+        rec = make_record(severity="UNSPECIFIED_BLOCKING", lifecycle_state="OPEN", merge_blocking=False)
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("UNSPECIFIED_BLOCKING" in x and "merge_blocking=true" in x for x in e))
+
+    def test_unspecified_info_no_merge_blocking_required(self):
+        # UNSPECIFIED_INFO is not a blocking severity
+        rec = make_record(severity="UNSPECIFIED_INFO", merge_blocking=False)
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_random_unspecified_fails(self):
+        rec = make_record(severity="UNKNOWN_SEVERITY")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("severity must be one of" in x for x in e))
+
+
+class TestOpenStaleRejectsResolutionMethod(unittest.TestCase):
+    """OPEN and STALE findings must not carry resolution_method."""
+
+    def test_open_with_resolveReviewThread_fails(self):
+        rec = make_record(lifecycle_state="OPEN", resolution_method="resolveReviewThread")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("OPEN" in x and "resolution_method" in x for x in e))
+
+    def test_stale_with_resolveReviewThread_fails(self):
+        rec = make_record(lifecycle_state="STALE", resolution_method="resolveReviewThread")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("STALE" in x and "resolution_method" in x for x in e))
+
+    def test_open_with_patch_applied_fails(self):
+        rec = make_record(lifecycle_state="OPEN", resolution_method="patch_applied")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("OPEN" in x and "resolution_method" in x for x in e))
+
+    def test_open_with_waiver_fails(self):
+        rec = make_record(lifecycle_state="OPEN", resolution_method="waiver")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("OPEN" in x and "resolution_method" in x for x in e))
+
+    def test_open_with_dismissReview_fails(self):
+        rec = make_record(lifecycle_state="OPEN", resolution_method="dismissReview")
+        s, e, w = vfr.validate_record(rec)
+        self.assertNotEqual(s, vfr.VALID_FINDING_RECORD)
+        self.assertTrue(any("dismissReview" in x or "OPEN" in x for x in e))
+
+    def test_open_no_resolution_method_passes(self):
+        rec = make_record(lifecycle_state="OPEN", resolution_method=None)
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_stale_no_resolution_method_passes(self):
+        rec = make_record(lifecycle_state="STALE", resolution_method=None)
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+    def test_resolved_by_policy_with_resolveReviewThread_passes(self):
+        rec = make_record(
+            lifecycle_state="RESOLVED_BY_POLICY",
+            resolution_method="resolveReviewThread",
+            thread_id="PRRT_kwDOSHFpYM6Fxyz",
+            evidence_summary="Pattern not in diff.",
+            audit_log_path="/tmp/audit.json",
+            resolved_at="2026-01-01T00:00:00Z",
+            resolved_by="policy_checker",
+            merge_blocking=False,
+        )
+        s, e, w = vfr.validate_record(rec)
+        self.assertEqual(s, vfr.VALID_FINDING_RECORD)
+
+
 if __name__ == "__main__":
     unittest.main()
