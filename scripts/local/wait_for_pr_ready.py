@@ -184,6 +184,55 @@ def get_branch_protection(repo: str, branch: str) -> Optional[dict]:
         return None
 
 
+def check_conversation_resolution(repo: str, pr_number: str) -> Tuple[str, Dict, Optional[str]]:
+    """
+    Check whether the PR has any unresolved review threads using GraphQL.
+    Returns READY_FOR_FINAL_GATES if all threads are resolved, otherwise
+    HOLD_CONVERSATION_UNRESOLVED with details of unresolved threads.
+
+    This directly enforces GitHub's branch protection "Require conversation
+    resolution before merging" setting, which blocks gh pr merge without --admin
+    when any thread is unresolved.
+    """
+    try:
+        result = gh_run(
+            [
+                "api", "graphql",
+                "-f", "query={repository(owner:%22Slideshow11%22,name:%22Automated-Edge-Discovery%22){pullRequest(number:%22" + pr_number + "%22){reviewThreads(first:50){nodes{id isResolved isOutdated comments(first:10){nodes{body author{login}}}}}}}}",
+            ],
+            check=True,
+        )
+        data = json.loads(result.stdout.strip())
+        threads = (
+            data.get("data", {})
+            .get("repository", {})
+            .get("pullRequest", {})
+            .get("reviewThreads", {})
+            .get("nodes", [])
+        )
+        unresolved = [t for t in threads if not t.get("isResolved", False)]
+        if unresolved:
+            details = {
+                "unresolved_thread_count": len(unresolved),
+                "unresolved_threads": [
+                    {
+                        "id": t["id"],
+                        "outdated": t.get("isOutdated", False),
+                        "comment_count": len(t.get("comments", {}).get("nodes", [])),
+                    }
+                    for t in unresolved
+                ],
+            }
+            return (
+                "HOLD_CONVERSATION_UNRESOLVED",
+                details,
+                f"{len(unresolved)} unresolved review thread(s); resolve all threads before merging",
+            )
+        return STATUS_READY_FOR_FINAL_GATES, {}, ""
+    except Exception as e:
+        return STATUS_READY_FOR_FINAL_GATES, {}, f"Conversation resolution check unavailable: {e}"
+
+
 def conversation_resolution_required(repo: str, base_branch: str) -> bool:
     """
     Return True if the base branch has required_conversation_resolution enabled
@@ -784,6 +833,22 @@ def main():
                     next_action_for_status(STATUS_READY_TO_MERGE_CANDIDATE, args.pr_number, final_head_sha),
                 )
                 sys.exit(0)
+
+        # ---- Conversation resolution check (after final gates, before merge) ----
+        # Enforce GitHub's branch protection requirement: all review threads must be
+        # resolved before a PR can be merged via normal gh pr merge.
+        # This check runs after final_gate_status so we don't duplicate its call.
+        # It is NOT the same as the "conversation_resolution_enforcement" stage above
+        # (which validates that --require-review-comments-clean was set when the
+        # branch protection requires conversation resolution). This stage performs
+        # the actual GitHub conversation-resolution check via GraphQL.
+        conv_status, conv_data, conv_error = check_conversation_resolution(
+            args.repo or "Slideshow11/Automated-Edge-Discovery", str(args.pr_number)
+        )
+        _add_stage("conversation_resolution_check", conv_status, conv_error or "", conv_data)
+        if conv_status != STATUS_READY_FOR_FINAL_GATES:
+            _write_report(conv_status, next_action_for_status(conv_status, args.pr_number, final_head_sha))
+            sys.exit(0)
 
         # ---- Stage 7: verify_final_head_merge_command.py ----
         if args.require_final_gates or args.require_merge_ready:
