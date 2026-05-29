@@ -1419,6 +1419,108 @@ class TestIntegration(unittest.TestCase):
         self.assertIn("resolved_stale_blockers", data.get("stale_findings_summary", {}))
 
 
+class TestGhPrViewREST:
+    """
+    Tests for the gh_pr_view REST fix.
+
+    Root cause: gh_pr_view originally used `gh pr view`, which invokes
+    git status internally. When run from /tmp (no .git), it fails with
+      "failed to run git: fatal: not a git repository"
+
+    Fix: gh_pr_view now uses `gh api repos/{repo}/pulls/{n}` which does not
+    require a git repository in the caller's cwd.
+
+    These tests verify the REST-based implementation is called correctly
+    and returns normalised data.
+    """
+
+    def test_gh_pr_view_uses_rest_endpoint(self):
+        """gh_pr_view must call repos/{repo}/pulls/{pr_number}, not gh pr view."""
+        captured = []
+
+        def capture_run(cmd, **kwargs):
+            captured.append(cmd)
+            return FakeResult(stdout=json.dumps({
+                "sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "state": "OPEN",
+                "url": "https://github.com/OWNER/REPO/pull/1",
+            }))
+
+        with mock.patch.object(subprocess, "run", capture_run):
+            ok, data, err = crc.gh_pr_view("OWNER/REPO", 1)
+
+        assert ok, f"gh_pr_view failed: {err}"
+        assert "repos/OWNER/REPO/pulls/1" in " ".join(captured[0]), \
+            f"Expected repos endpoint, got: {captured[0]}"
+        assert "pr" not in " ".join(captured[0]).lower() or "pulls" in " ".join(captured[0]), \
+            f"gh pr view must not be called: {captured[0]}"
+
+    def test_gh_pr_view_normalises_sha_to_headRefOid(self):
+        """REST returns sha under .head.sha; gh_pr_view must map it to headRefOid."""
+        def fake_run(cmd, **kwargs):
+            return FakeResult(stdout=json.dumps({
+                "sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "state": "OPEN",
+                "url": "https://github.com/OWNER/REPO/pull/1",
+            }))
+
+        with mock.patch.object(subprocess, "run", fake_run):
+            ok, data, err = crc.gh_pr_view("OWNER/REPO", 1)
+
+        assert ok, f"gh_pr_view failed: {err}"
+        assert data.get("headRefOid") == "abc123abc123abc123abc123abc123abc123abcd12", \
+            f"Expected headRefOid mapped from sha, got: {data}"
+        assert data.get("state") == "OPEN"
+        assert data.get("url") == "https://github.com/OWNER/REPO/pull/1"
+
+    def test_gh_pr_view_works_from_tmp_dir_no_git(self):
+        """gh_pr_view must not require git in cwd; uses REST API only."""
+        # Simulate /tmp by patching subprocess.run to succeed (no git involved)
+        def fake_run(cmd, **kwargs):
+            # gh api repos/.../pulls/{n} has no git dependency
+            return FakeResult(stdout=json.dumps({
+                "sha": "abc123abc123abc123abc123abc123abc123abcd12",
+                "state": "OPEN",
+                "url": "https://github.com/OWNER/REPO/pull/1",
+            }))
+
+        with mock.patch.object(subprocess, "run", fake_run):
+            ok, data, err = crc.gh_pr_view("OWNER/REPO", 1)
+
+        assert ok, f"gh_pr_view failed from non-git cwd: {err}"
+        # If this had used `gh pr view`, it would have called git and failed
+
+    def test_gh_pr_view_error_returncode_propagates(self):
+        """Non-zero exit from gh api must return error tuple, not raise."""
+        def fake_run(cmd, **kwargs):
+            return FakeResult(
+                returncode=1,
+                stderr="Not Found",
+                stdout="",
+            )
+
+        with mock.patch.object(subprocess, "run", fake_run):
+            ok, data, err = crc.gh_pr_view("OWNER/REPO", 999)
+
+        assert not ok, "Expected failure for returncode=1"
+        assert "gh api returned 1" in err, f"Expected error prefix, got: {err}"
+
+    def test_gh_pr_view_non_json_stderr_propagates(self):
+        """Non-JSON stdout must return error tuple."""
+        def fake_run(cmd, **kwargs):
+            return FakeResult(
+                returncode=0,
+                stdout="this is not json",
+                stderr="",
+            )
+
+        with mock.patch.object(subprocess, "run", fake_run):
+            ok, data, err = crc.gh_pr_view("OWNER/REPO", 1)
+
+        assert not ok, "Expected failure for non-JSON stdout"
+        assert "non-JSON" in err, f"Expected non-JSON error, got: {err}"
+
+
 import tempfile
 
 if __name__ == "__main__":

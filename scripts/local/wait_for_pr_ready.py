@@ -184,32 +184,73 @@ def get_branch_protection(repo: str, branch: str) -> Optional[dict]:
         return None
 
 
-def check_conversation_resolution(repo: str, pr_number: str) -> Tuple[str, Dict, Optional[str]]:
+def check_conversation_resolution(
+    repo: str, pr_number: str, require_conv_resolution: bool
+) -> Tuple[str, Dict, Optional[str]]:
     """
     Check whether the PR has any unresolved review threads using GraphQL.
-    Returns READY_FOR_FINAL_GATES if all threads are resolved, otherwise
-    HOLD_CONVERSATION_UNRESOLVED with details of unresolved threads.
 
     This directly enforces GitHub's branch protection "Require conversation
     resolution before merging" setting, which blocks gh pr merge without --admin
     when any thread is unresolved.
+
+    Behavior:
+    - If branch protection does NOT require conversation resolution: returns
+      READY_FOR_FINAL_GATES immediately (no API call needed).
+    - If branch protection DOES require conversation resolution AND GraphQL call
+      fails: returns HOLD_CONVERSATION_CHECK_UNAVAILABLE (fail closed — if we
+      cannot verify, we must not merge).
+    - If any unresolved review thread exists: returns HOLD_CONVERSATION_UNRESOLVED.
+    - If GraphQL returns hasNextPage=true: returns
+      HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED (pagination not yet implemented).
+    - If all threads resolved: returns READY_FOR_FINAL_GATES.
     """
+    if not require_conv_resolution:
+        return STATUS_READY_FOR_FINAL_GATES, {}, ""
+
+    owner, name = repo.split("/", 1)
+
     try:
+        query = """query PullRequestReviewThreads($owner:String!,$name:String!,$number:Int!) {
+  repository(owner:$owner, name:$name) {
+    pullRequest(number:$number) {
+      reviewThreads(first:100) {
+        pageInfo { hasNextPage }
+        nodes {
+          id
+          isResolved
+          isOutdated
+          comments(first:10) {
+            nodes {
+              id
+              body
+              author { login }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
         result = gh_run(
-            [
-                "api", "graphql",
-                "-f", "query={repository(owner:%22Slideshow11%22,name:%22Automated-Edge-Discovery%22){pullRequest(number:%22" + pr_number + "%22){reviewThreads(first:50){nodes{id isResolved isOutdated comments(first:10){nodes{body author{login}}}}}}}}",
-            ],
+            ["api", "graphql", "-f", f"query={query}", "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}"],
             check=True,
         )
         data = json.loads(result.stdout.strip())
-        threads = (
+        threads_data = (
             data.get("data", {})
             .get("repository", {})
             .get("pullRequest", {})
             .get("reviewThreads", {})
-            .get("nodes", [])
         )
+        page_info = threads_data.get("pageInfo", {})
+        if page_info.get("hasNextPage", False):
+            return (
+                "HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED",
+                {},
+                "reviewThreads pageInfo.hasNextPage=true; pagination not implemented; resolve all threads or implement cursor-based pagination before merging",
+            )
+        threads = threads_data.get("nodes", [])
         unresolved = [t for t in threads if not t.get("isResolved", False)]
         if unresolved:
             details = {
@@ -230,7 +271,11 @@ def check_conversation_resolution(repo: str, pr_number: str) -> Tuple[str, Dict,
             )
         return STATUS_READY_FOR_FINAL_GATES, {}, ""
     except Exception as e:
-        return STATUS_READY_FOR_FINAL_GATES, {}, f"Conversation resolution check unavailable: {e}"
+        return (
+            "HOLD_CONVERSATION_CHECK_UNAVAILABLE",
+            {},
+            f"conversation resolution check failed: {e}",
+        )
 
 
 def conversation_resolution_required(repo: str, base_branch: str) -> bool:
@@ -842,8 +887,14 @@ def main():
         # (which validates that --require-review-comments-clean was set when the
         # branch protection requires conversation resolution). This stage performs
         # the actual GitHub conversation-resolution check via GraphQL.
+        # Use repo_name and base_branch already fetched above.
+        # conversation_resolution_enforcement stage (above) exits early if
+        # required but --require-review-comments-clean is missing; so reaching
+        # here means either the setting is off (skip check) or the flag is set
+        # (perform actual GitHub thread check).
+        require_conv = conversation_resolution_required(repo_name, base_branch)
         conv_status, conv_data, conv_error = check_conversation_resolution(
-            args.repo or "Slideshow11/Automated-Edge-Discovery", str(args.pr_number)
+            repo_name, str(args.pr_number), require_conv
         )
         _add_stage("conversation_resolution_check", conv_status, conv_error or "", conv_data)
         if conv_status != STATUS_READY_FOR_FINAL_GATES:
