@@ -57,6 +57,9 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: /tmp/aed-hermes-home
+      COVERAGE_FILE: /tmp/aed-wfa-coverage/.coverage
     strategy:
       matrix:
         python-version: ['3.10', '3.11']
@@ -83,9 +86,12 @@ jobs:
           pip install -e .
           pip install pytest pytest-cov numpy pandas statsmodels pyyaml
 
+      - name: Create Hermes home and coverage dir
+        run: mkdir -p "$HERMES_HOME" /tmp/aed-wfa-coverage
+
       - name: Run tests (pytest + coverage)
         run: |
-          pytest -q --cov=engine --cov-report=xml
+          pytest -q --cov=engine --cov-report=xml:/tmp/aed-wfa-coverage/coverage.xml
 
       - name: Upload pytest cache
         if: always()
@@ -101,4 +107,4 @@ jobs:
         uses: codecov/codecov-action@v4
         with:
           token: ${{ env.CODECOV_TOKEN }}
-          files: ./coverage.xml
+          files: /tmp/aed-wfa-coverage/coverage.xml
