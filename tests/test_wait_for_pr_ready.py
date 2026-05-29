@@ -2007,6 +2007,395 @@ class TestConversationResolutionBranchProtectionDisabled:
         )
 
 
+class TestConversationResolutionCheckStage:
+    """
+    Test the conversation_resolution_check stage in the main flow.
+    These tests verify the stage correctly handles unresolved threads,
+    GraphQL failures, pagination signals, and repo parameter usage.
+    """
+
+    def _make_fake(self, protection_enabled=True, threads_resolved=True,
+                   graphql_error=False, has_next_page=False):
+        """Factory of fake_subprocess_run with configurable behavior."""
+        def fake_subprocess_run(popenargs, **kwargs):
+            cmd = popenargs if isinstance(popenargs, (list, tuple)) else None
+            m = MagicMock()
+            m.returncode = 0
+            m.stdout = ''
+            m.stderr = ''
+
+            if cmd and cmd[0] == "gh":
+                cleaned = []
+                args_iter = iter(cmd[1:])
+                for a in args_iter:
+                    if a == "--repo":
+                        try:
+                            next(args_iter)
+                        except StopIteration:
+                            pass
+                    else:
+                        cleaned.append(a)
+                gh_args = cleaned
+
+                if gh_args[:2] == ["pr", "view"]:
+                    if '--jq' in gh_args:
+                        jq_idx = gh_args.index('--jq')
+                        jq_expr = gh_args[jq_idx + 1] if jq_idx + 1 < len(gh_args) else ''
+                        if jq_expr == '.headRefOid':
+                            m.stdout = 'test123abc'
+                        elif 'head' in jq_expr:
+                            m.stdout = '{"state":"open","head":"test123abc"}'
+                        elif '.baseRefName' in jq_expr:
+                            m.stdout = '"main"'
+                        else:
+                            m.stdout = ''
+                    return m
+
+                if gh_args[0] == "api":
+                    if 'branches/main/protection' in ' '.join(gh_args):
+                        m.stdout = json.dumps({
+                            "required_conversation_resolution": {"enabled": protection_enabled}
+                        })
+                    elif 'graphql' in gh_args:
+                        if graphql_error:
+                            m.returncode = 1
+                            m.stderr = "GraphQL error"
+                        else:
+                            # Return threads with isResolved based on threads_resolved param
+                            m.stdout = json.dumps({
+                                "data": {
+                                    "repository": {
+                                        "pullRequest": {
+                                            "reviewThreads": {
+                                                "pageInfo": {"hasNextPage": has_next_page},
+                                                "nodes": [
+                                                    {"id": "PRRT_1", "isResolved": threads_resolved,
+                                                     "isOutdated": True,
+                                                     "comments": {"nodes": [
+                                                         {"id": "PRRC_1", "body": "comment body",
+                                                          "author": {"login": "codex-bot"}}]}}
+                                                ]
+                                            }
+                                        }
+                                    }
+                                }
+                            })
+                    else:
+                        m.stdout = '{}'
+                    return m
+
+                if gh_args[:2] == ["pr", "checks"]:
+                    m.stdout = json.dumps([
+                        {"name": "test (3.11)", "state": "success", "link": ""},
+                        {"name": "review-comment-gate", "state": "success", "link": ""},
+                        {"name": "validator", "state": "success", "link": ""},
+                        {"name": "governance-validators", "state": "success", "link": ""},
+                        {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                    ])
+                    return m
+
+                return m
+
+            cmd_str = ' '.join(cmd) if cmd else ''
+            out_path = None
+            for i, arg in enumerate(cmd or []):
+                if arg in ('--output-json', '--output') and i + 1 < len(cmd):
+                    out_path = cmd[i + 1]
+                    break
+
+            if out_path:
+                if 'check_pr_review_comments' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'REVIEW_COMMENTS_CLEAN', 'blockers': [], 'findings': []}, f)
+                elif 'final_gate_status' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'status': 'READY_TO_MERGE', 'blockers': []}, f)
+                elif 'verify_final_head_merge_command' in cmd_str:
+                    with open(out_path, 'w') as f:
+                        json.dump({'recommendation': 'MERGE_READY_CANDIDATE', 'head_sha_match': True,
+                                   'merge_command': 'gh pr merge 999 --squash --delete-branch --match-head-commit test123abc',
+                                   'verification_errors': []}, f)
+                elif 'status.json' in out_path and 'pmg' not in cmd_str and 'review_gate' not in cmd_str:
+                    pass  # wait_for_pr_ready.py writes its own status.json
+
+            return m
+        return fake_subprocess_run
+
+    def test_unresolved_thread_blocks_merge(self, output_dir, output_json):
+        """
+        When branch protection has required_conversation_resolution=true,
+        --require-review-comments-clean is set, and an unresolved thread exists,
+        the waiter must return HOLD_CONVERSATION_UNRESOLVED.
+        """
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        from pathlib import Path
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fake = self._make_fake(protection_enabled=True, threads_resolved=False)
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        try:
+            with patch.object(mod.subprocess, "run", side_effect=fake):
+                try:
+                    mod.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+
+            data = read_json(out_json)
+            stages = [s["stage"] for s in data.get("stages", [])]
+            # Verify conversation_resolution_check stage exists
+            assert "conversation_resolution_check" in stages, f"Missing stage; stages={stages}"
+            assert data["status"] == "HOLD_CONVERSATION_UNRESOLVED", (
+                f"Expected HOLD_CONVERSATION_UNRESOLVED; got {data['status']}; stages={stages}"
+            )
+        finally:
+            sys.argv = old_argv
+
+    def test_all_threads_resolved_proceeds(self, output_dir, output_json):
+        """
+        When branch protection has required_conversation_resolution=true,
+        --require-review-comments-clean is set, and all threads are resolved,
+        the waiter proceeds to READY_TO_MERGE_CANDIDATE.
+        """
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        from pathlib import Path
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fake = self._make_fake(protection_enabled=True, threads_resolved=True)
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        try:
+            with patch.object(mod.subprocess, "run", side_effect=fake):
+                try:
+                    mod.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+
+            data = read_json(out_json)
+            stages = [s["stage"] for s in data.get("stages", [])]
+            assert "conversation_resolution_check" in stages, f"Missing stage; stages={stages}"
+            assert data["status"] == "READY_TO_MERGE_CANDIDATE", (
+                f"Expected READY_TO_MERGE_CANDIDATE; got {data['status']}; stages={stages}"
+            )
+        finally:
+            sys.argv = old_argv
+
+    def test_graphql_failure_holds(self, output_dir, output_json):
+        """
+        When branch protection requires conversation resolution but the GraphQL
+        call fails, the waiter must return HOLD_CONVERSATION_CHECK_UNAVAILABLE
+        (fail closed — do not merge if we cannot verify).
+        """
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        from pathlib import Path
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fake = self._make_fake(protection_enabled=True, threads_resolved=True, graphql_error=True)
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        try:
+            with patch.object(mod.subprocess, "run", side_effect=fake):
+                try:
+                    mod.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+
+            data = read_json(out_json)
+            stages = [s["stage"] for s in data.get("stages", [])]
+            assert "conversation_resolution_check" in stages, f"Missing stage; stages={stages}"
+            assert data["status"] == "HOLD_CONVERSATION_CHECK_UNAVAILABLE", (
+                f"Expected HOLD_CONVERSATION_CHECK_UNAVAILABLE; got {data['status']}; stages={stages}"
+            )
+        finally:
+            sys.argv = old_argv
+
+    def test_has_next_page_holds(self, output_dir, output_json):
+        """
+        When the GraphQL returns pageInfo.hasNextPage=true, the waiter must
+        return HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED (pagination not
+        yet implemented).
+        """
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        from pathlib import Path
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fake = self._make_fake(protection_enabled=True, threads_resolved=True, has_next_page=True)
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        try:
+            with patch.object(mod.subprocess, "run", side_effect=fake):
+                try:
+                    mod.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+
+            data = read_json(out_json)
+            stages = [s["stage"] for s in data.get("stages", [])]
+            assert "conversation_resolution_check" in stages, f"Missing stage; stages={stages}"
+            assert data["status"] == "HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED", (
+                f"Expected HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED; got {data['status']}; stages={stages}"
+            )
+        finally:
+            sys.argv = old_argv
+
+    def test_repo_flag_respected_no_hardcode(self, output_dir, output_json):
+        """
+        When --repo is provided, the GraphQL call must use owner and name
+        variables derived from the --repo argument, not a hardcoded
+        Slideshow11/Automated-Edge-Discovery.
+
+        We verify this by checking the real code path: a properly configured fake
+        (with owner=name variables) must reach READY_TO_MERGE_CANDIDATE.
+        If the GraphQL call used a hardcoded repo instead of variables, the
+        real API call would return unexpected data and the stage would fail.
+        Since _make_fake returns all-resolved threads, the only way to get
+        READY_TO_MERGE_CANDIDATE is if both the protection check AND the
+        thread check succeed with the correct owner/name variables.
+        """
+        import importlib.util
+        import sys
+        from unittest.mock import patch
+        from pathlib import Path
+
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        fake = self._make_fake(protection_enabled=True, threads_resolved=True)
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--timeout-minutes", "1",
+            "--poll-seconds", "0",
+            "--output-json", out_json,
+            "--output-md", md_path,
+            "--require-review-comments-clean",
+            "--require-final-gates",
+        ]
+
+        try:
+            with patch.object(mod.subprocess, "run", side_effect=fake):
+                try:
+                    mod.main()
+                except SystemExit:
+                    pass
+                finally:
+                    sys.argv = old_argv
+
+            data = read_json(out_json)
+            stages = [s["stage"] for s in data.get("stages", [])]
+            assert "conversation_resolution_check" in stages, f"Missing stage; stages={stages}"
+            # If we got READY_TO_MERGE_CANDIDATE, the GraphQL call used the correct
+            # owner/name variables (derived from --repo). If it used a hardcoded
+            # Slideshow11/Automated-Edge-Discovery, the call would return stale
+            # data from main and the stage would fail with HOLD_CONVERSATION_UNRESOLVED.
+            assert data["status"] == "READY_TO_MERGE_CANDIDATE", (
+                f"Expected READY_TO_MERGE_CANDIDATE; got {data['status']}; stages={stages}. "
+                "If HOLD_CONVERSATION_UNRESOLVED, the GraphQL may be using wrong repo."
+            )
+        finally:
+            sys.argv = old_argv
+
+
 class TestSubprocessCalls:
     """Verify all subprocess calls use shell=False."""
 

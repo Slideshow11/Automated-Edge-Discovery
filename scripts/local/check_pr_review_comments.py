@@ -201,21 +201,30 @@ def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
 
 
 def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
-    """Return --json fields needed for SHA alignment check."""
+    """Return --json fields needed for SHA alignment check.
+
+    Uses `gh api repos/.../pulls/{n}` rather than `gh pr view` to avoid
+    a git-repository requirement in the caller's cwd.  `gh pr view` invokes
+    git status internally, which fails when run from /tmp or any non-git
+    directory.  The REST call returns the same headRefOid field.
+    """
     cmd = [
-        "gh", "pr", "view", str(pr_number),
-        "--json", "headRefOid,state,url",
+        "gh", "api",
+        f"repos/{repo}/pulls/{pr_number}",
+        "--jq", "{sha:.head.sha, state:.state, url:.url}",
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
     except OSError as exc:
-        return False, {}, f"gh pr view invocation failed: {exc}"
+        return False, {}, f"gh api invocation failed: {exc}"
     if result.returncode != 0:
-        return False, {}, f"gh pr view returned {result.returncode}: {result.stderr[:300]}"
+        return False, {}, f"gh api returned {result.returncode}: {result.stderr[:300]}"
     try:
-        return True, json.loads(result.stdout), ""
+        parsed = json.loads(result.stdout)
+        # Normalise key names to match what the rest of the module expects
+        return True, {"headRefOid": parsed.get("sha", ""), "state": parsed.get("state", ""), "url": parsed.get("url", "")}, ""
     except json.JSONDecodeError:
-        return False, {}, "gh pr view returned non-JSON"
+        return False, {}, "gh api --jq returned non-JSON"
 
 
 # ---------------------------------------------------------------------------
