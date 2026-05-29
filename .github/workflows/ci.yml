@@ -17,6 +17,8 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: /tmp/aed-hermes-home
     strategy:
       matrix:
         python: [3.11]
@@ -36,6 +38,9 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
           pip install pytest coverage
+
+      - name: Create Hermes home for PMG snapshot
+        run: mkdir -p "$HERMES_HOME"
 
       - name: Run tests with coverage
         run: |
