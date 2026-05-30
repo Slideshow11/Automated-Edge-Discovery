@@ -467,6 +467,206 @@ class TestReviewCommentGate:
                 "ERROR_TOOLING",
             ), f"Unexpected status: {status}"
 
+    def test_disallowed_ignore_user_fails_closed(self, output_dir, output_json):
+        """
+        When --ignore-users requests a user not in ALLOWED_REVIEW_IGNORE_USERS,
+        run_review_comment_gate returns HOLD_DISALLOWED_IGNORE_USER and does NOT
+        call check_pr_review_comments.py. This is the fail-closed behavior required
+        by the Codex adversarial review finding.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        run_review_comment_gate = mod.run_review_comment_gate
+        STATUS_HOLD_DISALLOWED_IGNORE_USER = mod.STATUS_HOLD_DISALLOWED_IGNORE_USER
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = str(Path(tmp) / "out.json")
+            md_out = str(Path(tmp) / "out.md")
+
+            status, data, error = run_review_comment_gate(
+                pr_number=336,
+                head_sha="a" * 40,
+                output_json=json_out,
+                output_md=md_out,
+                ignore_users="random-user-not-allowed",
+            )
+
+            assert status == STATUS_HOLD_DISALLOWED_IGNORE_USER, (
+                f"Expected HOLD_DISALLOWED_IGNORE_USER but got {status}"
+            )
+            assert "disallowed_ignore_users_requested" in data
+            assert "random-user-not-allowed" in data["disallowed_ignore_users_requested"]
+            # Subprocess must not be called — no output JSON should be written
+            assert not os.path.exists(json_out), (
+                "check_pr_review_comments.py was called despite disallowed ignore user"
+            )
+
+    def test_disallowed_ignore_user_appears_in_error_detail(self, output_dir, output_json):
+        """
+        The error detail returned for a disallowed ignore user must name the
+        offending user so an operator can understand why the gate failed.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        run_review_comment_gate = mod.run_review_comment_gate
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = str(Path(tmp) / "out.json")
+            md_out = str(Path(tmp) / "out.md")
+
+            status, data, error = run_review_comment_gate(
+                pr_number=336,
+                head_sha="a" * 40,
+                output_json=json_out,
+                output_md=md_out,
+                ignore_users="evil-bot",
+            )
+
+            assert "evil-bot" in error, f"Error detail must name the disallowed user: {error}"
+
+    def test_allowed_ignore_user_audited_in_stage_json(self, output_dir, output_json):
+        """
+        When the allowlisted user (chatgpt-codex-connector[bot]) is passed,
+        the gate result must include ignored_users and suppression_used so
+        READY is auditable and not silently ambiguous.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ALLOWED_REVIEW_IGNORE_USERS = mod.ALLOWED_REVIEW_IGNORE_USERS
+        run_review_comment_gate = mod.run_review_comment_gate
+
+        # Mock subprocess.run so check_pr_review_comments.py is never called.
+        # The mock lets the function read the pre-created JSON without
+        # the subprocess overwriting it.
+        def mock_run(cmd, *args, **kwargs):
+            # The function expects check_pr_review_comments.py to have written
+            # output_json already; doing nothing means no overwrite — the
+            # pre-created clean status stays intact.
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_result.stderr = ""
+            return mock_result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with tempfile.TemporaryDirectory() as tmp:
+                json_out = str(Path(tmp) / "out.json")
+                md_out = str(Path(tmp) / "out.md")
+                # Pre-create a mock check_pr_review_comments.py output so the
+                # gate can read it and stamp audit fields onto it.
+                mock_output = {
+                    "status": "REVIEW_COMMENTS_CLEAN",
+                    "blockers": [],
+                }
+                with open(json_out, "w") as f:
+                    json.dump(mock_output, f)
+
+                status, data, error = run_review_comment_gate(
+                    pr_number=336,
+                    head_sha="a" * 40,
+                    output_json=json_out,
+                    output_md=md_out,
+                    ignore_users="chatgpt-codex-connector[bot]",
+                )
+
+            assert status == "READY_FOR_FINAL_GATES", f"Expected READY but got {status}"
+            assert "ignored_users" in data
+            assert data["ignored_users"] == ["chatgpt-codex-connector[bot]"]
+            assert data["suppression_used"] is True
+            assert "ignore_users_allowlist" in data
+            assert "chatgpt-codex-connector[bot]" in data["ignore_users_allowlist"]
+
+    def test_omitted_ignore_users_results_in_empty_audit_list(self, output_dir, output_json):
+        """
+        When --ignore-users is not provided (empty string), the gate result
+        must have ignored_users=[] and suppression_used=False, preserving
+        backward compatibility and making the unfiltered case unambiguous.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        run_review_comment_gate = mod.run_review_comment_gate
+
+        def mock_run(cmd, *args, **kwargs):
+            mock_result = MagicMock()
+            mock_result.returncode = 0
+            mock_result.stdout = ""
+            mock_result.stderr = ""
+            return mock_result
+
+        with patch("subprocess.run", side_effect=mock_run):
+            with tempfile.TemporaryDirectory() as tmp:
+                json_out = str(Path(tmp) / "out.json")
+                md_out = str(Path(tmp) / "out.md")
+                mock_output = {
+                    "status": "REVIEW_COMMENTS_CLEAN",
+                    "blockers": [],
+                }
+                with open(json_out, "w") as f:
+                    json.dump(mock_output, f)
+
+                status, data, error = run_review_comment_gate(
+                    pr_number=336,
+                    head_sha="a" * 40,
+                    output_json=json_out,
+                    output_md=md_out,
+                    ignore_users="",
+                )
+
+            assert "ignored_users" in data
+            assert data["ignored_users"] == []
+            assert data["suppression_used"] is False
+
+    def test_disallowed_ignore_user_not_forwarded_to_subprocess(self, output_dir, output_json):
+        """
+        Verify that when a disallowed user is provided, run_review_comment_gate
+        does not call subprocess.run at all. The allowlist check is a pre-flight
+        guard that runs before any external tool is invoked.
+        """
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        run_review_comment_gate = mod.run_review_comment_gate
+
+        call_count = 0
+        original_run = subprocess.run
+
+        def counting_run(cmd, *args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            return original_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=counting_run):
+            with tempfile.TemporaryDirectory() as tmp:
+                json_out = str(Path(tmp) / "out.json")
+                md_out = str(Path(tmp) / "out.md")
+
+                status, data, error = run_review_comment_gate(
+                    pr_number=336,
+                    head_sha="a" * 40,
+                    output_json=json_out,
+                    output_md=md_out,
+                    ignore_users="random-user",
+                )
+
+        assert call_count == 0, (
+            f"subprocess.run should NOT be called when ignore user is disallowed, "
+            f"but was called {call_count} time(s)"
+        )
+
 
 class TestPMGGate:
     """Test PMG integration."""
