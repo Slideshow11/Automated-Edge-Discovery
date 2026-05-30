@@ -440,8 +440,12 @@ class TestReviewCommentGate:
         run_review_comment_gate without ignore_users argument behaves identically
         to the old signature (backward compatible).
         """
-        from scripts.local.wait_for_pr_ready import run_review_comment_gate
-        import tempfile
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wait_for_pr_ready", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        run_review_comment_gate = mod.run_review_comment_gate
 
         with tempfile.TemporaryDirectory() as tmp:
             json_out = str(Path(tmp) / "out.json")
