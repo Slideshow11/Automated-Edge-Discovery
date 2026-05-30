@@ -109,6 +109,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--repo-root",
+        default=None,
+        help=(
+            "Path to the local repository root. Used for local git status/diff checks. "
+            "Defaults to the directory containing this script. "
+            "Required when the script is invoked from a different working directory (e.g. /tmp)."
+        ),
+    )
+    parser.add_argument(
         "--review-comments-json",
         help=(
             "Path to a check_pr_review_comments.py output JSON. "
@@ -189,18 +198,18 @@ def fetch_pr_state(pr_number: int, repo: str) -> dict:
     return pr_data
 
 
-def get_pr_changed_files(pr_number: int, repo: str, head_sha: str) -> list[str]:
+def get_pr_changed_files(pr_number: int, repo: str, head_sha: str, repo_root: str) -> list[str]:
     """
     Return the list of files changed between main and the given head SHA.
 
     Uses ``git diff --name-only main...<head_sha>`` locally so it respects
     local branch state and never touches the network beyond the local repo.
-    cwd is always the current working directory (the local repo root), not
-    the GitHub repo slug passed via --repo.
+    cwd is always repo_root (the local repo root), not the caller's cwd.
     """
     try:
         result = subprocess.run(
             ["git", "diff", "--name-only", f"main...{head_sha}"],
+            cwd=repo_root,
             capture_output=True,
             text=True,
             timeout=15,
@@ -611,6 +620,14 @@ def evaluate(args: argparse.Namespace) -> dict:
     repo = args.repo
     pr_number = args.pr_number
 
+    # Resolve repo_root: use explicit --repo-root, or script dir as fallback.
+    # This ensures local git checks (is_git_clean, get_pr_changed_files) work
+    # even when the script is invoked from /tmp or another non-repo directory.
+    if args.repo_root:
+        repo_root = str(Path(args.repo_root).resolve())
+    else:
+        repo_root = str(Path(__file__).resolve().parent)
+
     # --- Fetch PR state ---
     try:
         pr_data = fetch_pr_state(pr_number, repo)
@@ -687,7 +704,7 @@ def evaluate(args: argparse.Namespace) -> dict:
     if not codex_sha and args.allow_docs_only_codex_waiver:
         # Fetch changed files for this PR to determine if it is docs-only.
         try:
-            changed_files = get_pr_changed_files(pr_number, repo, canonical_head_sha)
+            changed_files = get_pr_changed_files(pr_number, repo, canonical_head_sha, repo_root)
             if is_docs_only(changed_files):
                 docs_waiver_used = True
                 # Set codex_sha equal to head so the existing SHA-match logic
@@ -739,7 +756,7 @@ def evaluate(args: argparse.Namespace) -> dict:
         )
 
     # --- Check 7: Git status must be clean ---
-    git_clean, git_reason = is_git_clean()
+    git_clean, git_reason = is_git_clean(repo_root)
     if not git_clean:
         blockers = [f"Git status is not clean: {git_reason.split(chr(10))[0]}"]
         return compute_result(
