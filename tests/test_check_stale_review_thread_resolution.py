@@ -274,18 +274,23 @@ class TestCollectPatchParts(unittest.TestCase):
             "files": [{"filename": "x.py", "patch": "+importlib.util.spec_from_file_location"}],
         }
         parts = csr._collect_patch_parts(data)
-        self.assertIn("+importlib.util.spec_from_file_location", parts)
+        # Patch is prefixed with +++ b/x.py\n
+        self.assertEqual(len(parts), 1)
+        self.assertIn("importlib.util.spec_from_file_location", parts[0])
+        self.assertIn("+++ b/x.py", parts[0])
 
     def test_top_level_and_commit_level_both_present_deduped(self):
-        """Same patch in both top-level and commit-level appears only once."""
+        """Same patch text in both top-level and commit-level appears only once."""
         patch_text = "+importlib.util.spec_from_file_location"
         data = {
             "commits": [{"files": [{"filename": "x.py", "patch": patch_text}]}],
             "files": [{"filename": "x.py", "patch": patch_text}],
         }
         parts = csr._collect_patch_parts(data)
-        count = parts.count(patch_text)
-        self.assertEqual(count, 1, f"Patch should appear once, got {count}")
+        # The prefixed top-level patch is the canonical entry; commit-level is skipped as dup
+        self.assertEqual(len(parts), 1)
+        # Dedup is by full string including prefix
+        self.assertIn("+++ b/x.py", parts[0])
 
     def test_commit_level_fallback_when_top_level_files_absent(self):
         """When top-level files is absent, commit-level patches still work."""
@@ -305,8 +310,32 @@ class TestCollectPatchParts(unittest.TestCase):
             ],
         }
         parts = csr._collect_patch_parts(data)
+        # b.txt has empty patch → excluded; c.txt is included with +++ b/ prefix
+        self.assertEqual(len(parts), 1)
         self.assertNotIn("", parts)
-        self.assertIn("--- c\n+++ c\n@@", parts)
+        self.assertIn("+++ b/c.txt", parts[0])
+        self.assertIn("--- c\n+++ c\n@@", parts[0])
+
+    def test_top_level_files_include_filename_prefix(self):
+        """Top-level files are prefixed with '+++ b/filename' so scope checks work."""
+        data = {
+            "commits": [{"files": []}],
+            "files": [
+                {
+                    "filename": "scripts/local/check_stale_review_thread_resolution.py",
+                    "patch": "+importlib.util.spec_from_file_location",
+                },
+                {
+                    "filename": "tests/test_check_stale_review_thread_resolution.py",
+                    "patch": "+def test_new(): pass",
+                },
+            ],
+        }
+        parts = csr._collect_patch_parts(data)
+        self.assertIn("+++ b/scripts/local/check_stale_review_thread_resolution.py", parts[0])
+        self.assertIn("+++ b/tests/test_check_stale_review_thread_resolution.py", parts[1])
+        self.assertIn("+importlib.util.spec_from_file_location", parts[0])
+        self.assertIn("+def test_new(): pass", parts[1])
 
 
 class TestFetchCompareDiffTopLevelFiles(unittest.TestCase):

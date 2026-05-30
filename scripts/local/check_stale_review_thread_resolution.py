@@ -140,16 +140,25 @@ def _collect_patch_parts(data: dict) -> list[str]:
     - Top-level data["files"] — primary carrier of changed-file details and patches
     - Per-commit data["commits"][n]["files"] — supplementary carrier (may overlap)
 
+    For top-level files, prefix each patch with '+++ b/{filename}' so that
+    evaluate()'s scope check (which scans for '+++ b/' lines) works correctly.
+    Per-commit file patches retain their original format.
+
     Deduplicates by patch string so identical content from both sources appears once.
     """
     seen: set[str] = set()
     parts: list[str] = []
     # Top-level files array is the primary source on GitHub's compare API.
+    # Prefix with +++ b/ so evaluate()'s filename extraction works.
     for file in data.get("files", []):
         patch = file.get("patch", "")
+        filename = file.get("filename", "")
         if patch and patch not in seen:
             seen.add(patch)
-            parts.append(patch)
+            if filename:
+                parts.append(f"+++ b/{filename}\n{patch}")
+            else:
+                parts.append(patch)
     # Per-commit files arrays are supplementary; include any patches not already collected.
     for commit in data.get("commits", []):
         for file in commit.get("files", []):
