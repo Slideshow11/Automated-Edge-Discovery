@@ -529,6 +529,7 @@ def run_final_gate_status(
         "--codex-reviewed-sha", head_sha,
         "--output-json", output_json,
         "--output-md", output_md,
+        "--repo-root", REPO_ROOT,
     ]
     if pmg_state_json:
         cmd.extend(["--pmg-guard-state-json", pmg_state_json])

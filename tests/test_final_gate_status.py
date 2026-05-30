@@ -33,6 +33,7 @@ def make_args(
     repo="Slideshow11/Automated-Edge-Discovery",
     allow_docs_only_codex_waiver=False,
     review_comments_json=None,
+    repo_root=None,
 ):
     return type(
         "Args",
@@ -47,6 +48,7 @@ def make_args(
             "repo": repo,
             "allow_docs_only_codex_waiver": allow_docs_only_codex_waiver,
             "review_comments_json": review_comments_json,
+            "repo_root": repo_root,
         },
     )()
 
@@ -297,8 +299,9 @@ class TestGitClean:
                  "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
                  "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
         )
-        monkeypatch.chdir(str(repodir))
-        is_clean, reason = fgs.is_git_clean()
+        # Call from a different directory — repo_root drives the git check
+        monkeypatch.chdir(str(tmp_path))
+        is_clean, reason = fgs.is_git_clean(str(repodir))
         assert is_clean is True
 
     def test_dirty_git_status_returns_false(self, tmp_path, monkeypatch):
@@ -314,10 +317,55 @@ class TestGitClean:
                  "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
         )
         repodir.joinpath("dirty.txt").write_text("dirty")
-        monkeypatch.chdir(str(repodir))
-        is_clean, reason = fgs.is_git_clean()
+        # Call from a different directory — repo_root drives the git check
+        monkeypatch.chdir(str(tmp_path))
+        is_clean, reason = fgs.is_git_clean(str(repodir))
         assert is_clean is False
         assert "dirty.txt" in reason
+
+    def test_is_git_clean_uses_repo_root_not_cwd(self, tmp_path, monkeypatch):
+        """When cwd is /tmp and repo_root is a real repo, git status uses repo_root."""
+        repodir = tmp_path / "real_repo"
+        repodir.mkdir()
+        repodir.joinpath("README.md").write_text("test")
+        subprocess.run(["git", "init"], cwd=str(repodir), capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=str(repodir), capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(repodir),
+            capture_output=True,
+            env={**os.environ,
+                 "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
+                 "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
+        )
+        # Simulate /tmp (no git repo there)
+        monkeypatch.chdir(str(tmp_path))
+        # is_git_clean called with repodir as repo_root, not cwd
+        is_clean, reason = fgs.is_git_clean(str(repodir))
+        assert is_clean is True  # repo is clean; we didn't check /tmp
+
+    def test_is_git_clean_false_positive_prevented(self, tmp_path, monkeypatch):
+        """A dirty /tmp should not make a clean repo appear dirty."""
+        repodir = tmp_path / "real_repo"
+        repodir.mkdir()
+        repodir.joinpath("README.md").write_text("test")
+        subprocess.run(["git", "init"], cwd=str(repodir), capture_output=True)
+        subprocess.run(["git", "add", "."], cwd=str(repodir), capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "init"],
+            cwd=str(repodir),
+            capture_output=True,
+            env={**os.environ,
+                 "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@test.com",
+                 "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@test.com"},
+        )
+        # Create a dirty /tmp (chdir to tmp_path which has no .git)
+        monkeypatch.chdir(str(tmp_path))
+        # Dirtied by creating dirty.txt in /tmp — but we check repodir
+        (tmp_path / "dirty.txt").write_text("x")
+        is_clean, reason = fgs.is_git_clean(str(repodir))
+        # The repo itself is clean; /tmp dirtiness is irrelevant
+        assert is_clean is True
 
 
 # ---------------------------------------------------------------------------
