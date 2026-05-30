@@ -74,7 +74,27 @@ STATUS_HOLD_PR_NOT_OPEN = "HOLD_PR_NOT_OPEN"
 STATUS_ERROR_TOOLING = "ERROR_TOOLING"
 
 # ---------------------------------------------------------------------------
-# Subprocess helpers (shell=False only)
+# Review-comment gate — allowed ignore users (auditable suppression allowlist)
+# ---------------------------------------------------------------------------
+
+ALLOWED_REVIEW_IGNORE_USERS: set = {"chatgpt-codex-connector[bot]"}
+STATUS_HOLD_DISALLOWED_IGNORE_USER = "HOLD_DISALLOWED_IGNORE_USER"
+
+
+def validate_ignore_users(ignore_users_str: str) -> Tuple[bool, List[str]]:
+    """
+    Validate --ignore-users value against ALLOWED_REVIEW_IGNORE_USERS.
+
+    Returns:
+        (is_valid, disallowed_users)
+        is_valid=True  → all users are in the allowlist
+        is_valid=False → disallowed_users lists every user not in the allowlist
+    """
+    if not ignore_users_str:
+        return True, []
+    requested = [u.strip() for u in ignore_users_str.split(",") if u.strip()]
+    disallowed = [u for u in requested if u not in ALLOWED_REVIEW_IGNORE_USERS]
+    return len(disallowed) == 0, disallowed
 # ---------------------------------------------------------------------------
 
 def gh_run(args: List[str], check: bool = True) -> subprocess.CompletedProcess:
@@ -421,6 +441,7 @@ def run_review_comment_gate(
     head_sha: str,
     output_json: str,
     output_md: str,
+    ignore_users: str = "",
 ) -> Tuple[str, Dict, Optional[str]]:
     """
     Run check_pr_review_comments.py and return the status.
@@ -433,7 +454,27 @@ def run_review_comment_gate(
         STATUS_HOLD_REVIEW_COMMENTS_BLOCKED   — blocking comments found
         STATUS_HOLD_REVIEW_COMMENTS_INCONCLUSIVE — could not determine
         STATUS_ERROR_TOOLING                   — tool itself failed
+        STATUS_HOLD_DISALLOWED_IGNORE_USER    — ignore user not in allowlist
     """
+    # Parse and validate ignored users before calling the subprocess
+    ignored_users_list: List[str] = []
+    if ignore_users:
+        valid, disallowed = validate_ignore_users(ignore_users)
+        if not valid:
+            # Fail closed — disallowed ignore user is never forwarded
+            error_data = {
+                "ignored_users": [],
+                "ignore_users_allowlist": sorted(ALLOWED_REVIEW_IGNORE_USERS),
+                "disallowed_ignore_users_requested": disallowed,
+                "suppression_used": False,
+            }
+            return (
+                STATUS_HOLD_DISALLOWED_IGNORE_USER,
+                error_data,
+                f"ignore user(s) not in allowlist: {disallowed}",
+            )
+        ignored_users_list = [u.strip() for u in ignore_users.split(",") if u.strip()]
+
     script = Path(__file__).parent / "check_pr_review_comments.py"
     cmd = [
         sys.executable,
@@ -444,10 +485,17 @@ def run_review_comment_gate(
         "--output-json", output_json,
         "--output-md", output_md,
     ]
+    if ignore_users:
+        cmd += ["--ignore-users", ignore_users]
     try:
         result = run_external_script(cmd, check=False)
         with open(output_json, "r") as f:
             data = json.load(f)
+        # Stamp audit fields into the gate result so the caller can see
+        # exactly what suppression was active and whether it was allowed.
+        data["ignored_users"] = ignored_users_list
+        data["ignore_users_allowlist"] = sorted(ALLOWED_REVIEW_IGNORE_USERS)
+        data["suppression_used"] = bool(ignored_users_list)
         status_str = data.get("status", "")
         blockers = data.get("blockers", [])
         if status_str == "REVIEW_COMMENTS_CLEAN":
@@ -641,6 +689,12 @@ def main():
         help="Take a PMG snapshot at start (used automatically with --require-pmg)",
     )
     parser.add_argument(
+        "--ignore-users",
+        type=str,
+        default="",
+        help="Comma-separated GitHub usernames to ignore in review-comment gate (default: none, matching CI config)",
+    )
+    parser.add_argument(
         "--repo",
         type=str,
         default=None,
@@ -717,6 +771,15 @@ def main():
             lines.append(f"_Polled at: {stage.get('timestamp', '?')}_")
             if stage.get("detail"):
                 lines.append(f"_{stage['detail']}_")
+            # Auditable suppression field: if review_comment_gate is present,
+            # surface the ignored_users list so READY is not silently ambiguous.
+            if stage["stage"] == "review_comment_gate":
+                rcg = r.get("review_comment_gate", {})
+                ignored = rcg.get("ignored_users", [])
+                if ignored:
+                    lines.append(f"_Ignored review users: {', '.join(ignored)}_")
+                else:
+                    lines.append(f"_Ignored review users: none_")
             lines.append("")
         with open(path, "w") as f:
             f.write("\n".join(lines))
@@ -799,6 +862,7 @@ def main():
                 current_head_sha,
                 review_gate_json,
                 (args.output_md or "").replace(".md", "_review_gate.md"),
+                args.ignore_users,
             )
             report["review_comment_gate"] = rg_data
             _add_stage("review_comment_gate", rg_status, rg_error or "", rg_data)
