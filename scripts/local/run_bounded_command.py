@@ -3,9 +3,9 @@
 Bounded command runner — model-agnostic safeguard for local shell commands.
 
 Enforces:
-- Command timeouts
+- Command timeouts with process-group cleanup
 - Denylisted unsafe operations (--admin, deletion mutations, watch mode, etc.)
-- Tailed stdout/stderr (no unlimited storage)
+- Streaming bounded stdout/stderr (fixed ring buffer, no unlimited storage)
 - Structured JSON + Markdown output
 - No shell=True ever
 
@@ -26,81 +26,229 @@ Optional flags:
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Policy denylist
+# Streaming ring buffer
 # ---------------------------------------------------------------------------
 
-DENYLIST_PATTERNS_ALWAYS = [
-    # Watch mode — stalls
-    "gh run watch",
-    "gh pr checks --watch",
-    # Admin bypass — dangerous
-    "--admin",
-    # Deletion mutations — destroys audit history
-    "deleteReviewComment",
-    "deletePullRequestReviewComment",
-    "dismissReview",
-    # PUT/PATCH mutations to branch protection API
-    "-X PUT",
-    "-X PATCH",
-    "/branches/main/protection",
-    "/required_status_checks",
-    "/enforce_admins",
-    "/required_pull_request_reviews",
-    # Hermes kanban mutation strings (heuristic)
-    "hermes kanban",
-    "kanban move",
-    "kanban add",
-]
+class RingBuffer:
+    """Fixed-size ring buffer keeping the last max_bytes."""
 
-DENYLIST_PATTERNS_GATED = [
-    # GraphQL mutations — require --allow-gh-api-mutation
-    "mutation ",
-]
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self._buf = bytearray()
 
+    def write(self, data: bytes) -> None:
+        """Append data, discarding oldest bytes if over max_bytes."""
+        self._buf.extend(data)
+        if len(self._buf) > self.max_bytes:
+            # Keep only the last max_bytes
+            self._buf = self._buf[-self.max_bytes:]
+
+    def read(self) -> str:
+        """Return decoded content, errors replaced."""
+        return self._buf.decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Background reader threads
+# ---------------------------------------------------------------------------
+
+def _reader_thread(fd, buffer: RingBuffer, closed_event: threading.Event):
+    """Drain fd until EOF, writing chunks into buffer."""
+    try:
+        while True:
+            chunk = fd.read(8192)
+            if not chunk:
+                break
+            buffer.write(chunk)
+    except Exception:
+        pass
+    finally:
+        try:
+            fd.close()
+        except Exception:
+            pass
+        closed_event.set()
+
+
+# ---------------------------------------------------------------------------
+# Policy denylist helpers
+# ---------------------------------------------------------------------------
+
+def _norm(s: str) -> str:
+    """Normalize a string for policy matching: strip and collapse whitespace."""
+    return " ".join(s.strip().split())
+
+
+def _lower_args(args: list[str]) -> list[str]:
+    return [a.lower() for a in args]
+
+
+def _cmd_str(args: list[str]) -> str:
+    return " ".join(args)
+
+
+def _has_shell_wrapper(args: list[str]) -> bool:
+    """Check for shell invocation wrappers that spawn a new shell process."""
+    wrapper_patterns = [
+        "bash -c", "sh -c", "zsh -c", "fish -c",
+        "powershell -command", "pwsh -command", "cmd /c",
+    ]
+    cmd = _cmd_str(args).lower()
+    for p in wrapper_patterns:
+        if p in cmd:
+            return True
+    return False
+
+
+def _is_gh_api_command(args: list[str]) -> bool:
+    return len(args) >= 3 and args[0] == "gh" and args[1] == "api"
+
+
+def _extract_gh_api_method(args: list[str]) -> str | None:
+    """Extract the HTTP method from a gh api command."""
+    # gh api [--method <METHOD>] <endpoint>
+    # gh api -X<METHOD> <endpoint>
+    # gh api --method=<METHOD> <endpoint>
+    for i, arg in enumerate(args):
+        if arg in ("--method", "-X"):
+            if i + 1 < len(args):
+                return args[i + 1].upper()
+        if arg.startswith("--method="):
+            return arg.split("=", 1)[1].upper()
+        if arg.startswith("-X"):
+            return arg[2:].upper()
+        if arg.startswith("-X"):
+            return arg[2:].upper()
+    # Also check standalone REST verbs as first positional after gh api
+    methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+    for arg in args[2:]:
+        if arg.upper() in methods and not arg.startswith("-"):
+            return arg.upper()
+    return None
+
+
+def _is_gh_graphql_mutation(args: list[str]) -> bool:
+    """Check if gh api graphql command contains a mutation."""
+    # GraphQL queries use: gh api graphql -f query='...'
+    # Mutations use: gh api graphql -f query='mutation {...}'
+    # The mutation keyword may appear in the -f / -F / --field value
+    # We join the full command string and look for 'mutation ' in
+    # the query value portion.
+    if not (_is_gh_api_command(args) and "graphql" in args):
+        return False
+    # The -f / -F / --field flag value contains the GraphQL string
+    # We join args as a string and look for 'mutation ' or 'Mutation '
+    cmd_lower = _cmd_str(args).lower()
+    # Check if this is a mutation by looking for 'mutation {' or 'mutation\n'
+    # in the joined command (this catches the -f query=... form)
+    import re
+    return bool(re.search(r"mutation\s*[{]", cmd_lower))
+
+
+def _is_mutation_denylist_pattern(args: list[str]) -> bool:
+    """Check for dangerous GraphQL mutation names regardless of keyword."""
+    # Even if the word 'mutation' is somehow bypassed, certain mutation
+    # names in the command are unambiguously dangerous.
+    mutation_names_lower = [
+        "deletereviewcomment",
+        "deletepullrequestreviewcomment",
+        "dismissreview",
+        "resolvesreviewthread",
+        "resolvereviewthread",
+        "addcomment",
+        "addpullrequestreview",
+    ]
+    cmd_lower = _cmd_str(args).lower()
+    for name in mutation_names_lower:
+        if name in cmd_lower:
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Policy check
+# ---------------------------------------------------------------------------
 
 def _check_policy(command: list[str], allow_gh_api_mutation: bool) -> list[str]:
     """
     Return list of policy errors. Empty list means command is allowed.
-
-    Checks:
-    - Always-active denylisted patterns
-    - GraphQL mutation detection (requires --allow-gh-api-mutation)
     """
     errors = []
-    cmd_str = " ".join(command)
+    cmd_lower = _cmd_str(command).lower()
+    args = command
 
-    for pattern in DENYLIST_PATTERNS_ALWAYS:
-        if pattern in cmd_str:
+    # ---- Always-active denylist ----
+    always_blocked = {
+        # Admin bypass
+        "--admin",
+        # Deletion mutations
+        "deletereviewcomment",
+        "deletepullrequestreviewcomment",
+        "dismissreview",
+        "resolvesreviewthread",
+        "resolvereviewthread",
+        # Watch mode — stalls
+        "gh run watch",
+        "gh pr checks --watch",
+        "gh pr checks -w",
+        # Shell invocation wrappers
+        "bash -c",
+        "sh -c",
+        "zsh -c",
+        "fish -c",
+        "powershell -command",
+        "pwsh -command",
+        "cmd /c",
+    }
+    for pattern in always_blocked:
+        if pattern in cmd_lower:
             errors.append(f"Deny-listed pattern in command: {pattern!r}")
 
-    # GraphQL mutation detection — gated by flag
+    # ---- GitHub API mutation detection ----
+    if _is_gh_api_command(args):
+        method = _extract_gh_api_method(args)
+        if method and method in {"PUT", "PATCH", "POST", "DELETE"}:
+            # Block mutation-worthy methods on certain paths
+            endpoint = _cmd_str(args)
+            dangerous_paths = [
+                "/branches/",
+                "/protection",
+                "/required_status_checks",
+                "/enforce_admins",
+                "/required_pull_request_reviews",
+                "/comments/",
+                "/reviews/",
+                "/pulls/comments",
+                "/issues/comments",
+                "/replies",
+            ]
+            for path in dangerous_paths:
+                if path in endpoint:
+                    errors.append(
+                        f"GitHub API mutates protected path: "
+                        f"{method} {endpoint}"
+                    )
+                    break
+
+    # ---- GraphQL mutation ----
     if not allow_gh_api_mutation:
-        for pattern in DENYLIST_PATTERNS_GATED:
-            if pattern in cmd_str:
-                errors.append(f"GraphQL mutation requires --allow-gh-api-mutation")
-                break
+        if _is_gh_graphql_mutation(args) or _is_mutation_denylist_pattern(args):
+            errors.append("GraphQL mutation requires --allow-gh-api-mutation")
+
+    # ---- Hermes kanban mutation (heuristic) ----
+    if "hermes" in cmd_lower and any(k in cmd_lower for k in ["kanban move", "kanban add", "kanban update", "kanban delete"]):
+        errors.append("Hermes kanban mutation not allowed")
 
     return errors
-
-
-def _tail(data: str, max_bytes: int) -> str:
-    """Return last at most max_bytes of data, preserving newlines."""
-    if len(data.encode("utf-8")) <= max_bytes:
-        return data
-    # Encode to get byte length, then decode back
-    encoded = data.encode("utf-8")
-    truncated = encoded[-max_bytes:]
-    # Find nearest newline to avoid splitting a line
-    newline_idx = truncated.find(b"\n")
-    if newline_idx >= 0:
-        return truncated[newline_idx + 1:].decode("utf-8", errors="replace")
-    return truncated.decode("utf-8", errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +388,8 @@ def build_result(
     started_at: datetime,
     ended_at: datetime,
     exit_code: int | None,
-    stdout: str,
-    stderr: str,
+    stdout_tail: str,
+    stderr_tail: str,
     killed: bool,
     policy_errors: list[str],
     status: str,
@@ -256,8 +404,8 @@ def build_result(
         "ended_at": ended_at.isoformat(),
         "duration_seconds": round(duration, 3),
         "exit_code": exit_code,
-        "stdout_tail": _tail(stdout, 12000),
-        "stderr_tail": _tail(stderr, 12000),
+        "stdout_tail": stdout_tail,
+        "stderr_tail": stderr_tail,
         "killed": killed,
         "policy_errors": policy_errors,
     }
@@ -276,7 +424,8 @@ def run_bounded_command(
     allow_gh_api_mutation: bool,
 ) -> dict:
     """
-    Run a bounded command with policy checks and tailed output.
+    Run a bounded command with policy checks, streaming bounded output,
+    and process-group timeout cleanup.
 
     Returns a result dict (same schema as JSON output).
     """
@@ -293,8 +442,8 @@ def run_bounded_command(
             started_at=started,
             ended_at=ended,
             exit_code=None,
-            stdout="",
-            stderr="",
+            stdout_tail="",
+            stderr_tail="",
             killed=False,
             policy_errors=policy_errors,
             status="COMMAND_POLICY_DENIED",
@@ -305,40 +454,110 @@ def run_bounded_command(
     started = datetime.now(timezone.utc)
     killed = False
     exit_code: int | None = None
-    stdout_bytes: bytes = b""
-    stderr_bytes: bytes = b""
     status = "COMMAND_UNKNOWN_ERROR"
 
+    # Streaming ring buffers
+    stdout_buf = RingBuffer(stdout_tail_bytes)
+    stderr_buf = RingBuffer(stderr_tail_bytes)
+    stdout_closed = threading.Event()
+    stderr_closed = threading.Event()
+
     try:
-        proc = subprocess.Popen(
-            command,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            shell=False,  # never shell=True
+        # Build Popen kwargs
+        popen_kwargs = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "cwd": cwd,
+            "shell": False,  # never shell=True
+        }
+        # On POSIX, start in a new session so we can kill the whole group
+        if sys.platform != "win32":
+            popen_kwargs["start_new_session"] = True
+
+        proc = subprocess.Popen(command, **popen_kwargs)
+
+        # Start background reader threads
+        stdout_thread = threading.Thread(
+            target=_reader_thread,
+            args=(proc.stdout, stdout_buf, stdout_closed),
+            daemon=True,
         )
+        stderr_thread = threading.Thread(
+            target=_reader_thread,
+            args=(proc.stderr, stderr_buf, stderr_closed),
+            daemon=True,
+        )
+        stdout_thread.start()
+        stderr_thread.start()
+
+        # Wait for process with timeout
         try:
-            stdout_bytes, stderr_bytes = proc.communicate(timeout=timeout_seconds)
+            proc.wait(timeout=timeout_seconds)
             exit_code = proc.returncode
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout_bytes, stderr_bytes = proc.communicate()
+            # Timeout — try graceful termination of the process group first
             killed = True
-            exit_code = -1
             status = "COMMAND_TIMEOUT"
+            exit_code = -1
+
+            if sys.platform != "win32":
+                # Try SIGTERM on the process group
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    # Give it 2 seconds to clean up gracefully
+                    gone = proc.wait(timeout=2)
+                except (ProcessLookupError, OSError):
+                    # Process already gone
+                    pass
+                except Exception:
+                    pass
+                else:
+                    # If still alive after 2s, SIGKILL
+                    if proc.poll() is None:
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                            proc.wait(timeout=2)
+                        except Exception:
+                            pass
+            else:
+                # Windows fallback — proc.terminate() then proc.kill()
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    except Exception:
+                        pass
+
         ended = datetime.now(timezone.utc)
+
     except FileNotFoundError:
         ended = datetime.now(timezone.utc)
-        stdout_bytes = f"Command not found: {command[0]}".encode()
-        stderr_bytes = b""
         exit_code = 127
         status = "COMMAND_UNKNOWN_ERROR"
+
     except Exception as e:
         ended = datetime.now(timezone.utc)
-        stdout_bytes = b""
-        stderr_bytes = str(e).encode()
         exit_code = 1
         status = "COMMAND_UNKNOWN_ERROR"
+        # Return early with what we have
+        return build_result(
+            command=command,
+            cwd=cwd or os.getcwd(),
+            timeout_seconds=timeout_seconds,
+            started_at=started,
+            ended_at=ended,
+            exit_code=exit_code,
+            stdout_tail=stdout_buf.read(),
+            stderr_tail=stderr_buf.read(),
+            killed=killed,
+            policy_errors=[],
+            status=status,
+        )
 
     if status == "COMMAND_UNKNOWN_ERROR":
         if killed:
@@ -348,10 +567,9 @@ def run_bounded_command(
         else:
             status = "COMMAND_FAILED"
 
-    # Apply byte limits (already applied via _tail in build_result, but
-    # we want to apply the per-output-type limit here)
-    stdout = _tail(stdout_bytes.decode("utf-8", errors="replace"), stdout_tail_bytes)
-    stderr = _tail(stderr_bytes.decode("utf-8", errors="replace"), stderr_tail_bytes)
+    # Read final tails from ring buffers
+    stdout_tail = stdout_buf.read()
+    stderr_tail = stderr_buf.read()
 
     return build_result(
         command=command,
@@ -360,8 +578,8 @@ def run_bounded_command(
         started_at=started,
         ended_at=ended,
         exit_code=exit_code,
-        stdout=stdout,
-        stderr=stderr,
+        stdout_tail=stdout_tail,
+        stderr_tail=stderr_tail,
         killed=killed,
         policy_errors=[],
         status=status,
@@ -390,7 +608,7 @@ def main() -> None:
         }
         write_json_output(args.output_json, result)
         write_md_output(args.output_md, result)
-        sys.exit(0)  # Exit 0 so the runner itself doesn't fail on invalid input
+        sys.exit(0)  # Runner itself doesn't fail on invalid input
 
     # Run
     result = run_bounded_command(
@@ -405,8 +623,8 @@ def main() -> None:
     write_json_output(args.output_json, result)
     write_md_output(args.output_md, result)
 
-    # Exit code reflects command result
-    sys.exit(0)  # Runner always exits 0; status in JSON is the contract
+    # Exit code: runner always exits 0; JSON status is the contract
+    sys.exit(0)
 
 
 if __name__ == "__main__":
