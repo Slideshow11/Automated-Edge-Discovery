@@ -421,6 +421,7 @@ def run_review_comment_gate(
     head_sha: str,
     output_json: str,
     output_md: str,
+    ignore_users: str = "",
 ) -> Tuple[str, Dict, Optional[str]]:
     """
     Run check_pr_review_comments.py and return the status.
@@ -444,6 +445,8 @@ def run_review_comment_gate(
         "--output-json", output_json,
         "--output-md", output_md,
     ]
+    if ignore_users:
+        cmd += ["--ignore-users", ignore_users]
     try:
         result = run_external_script(cmd, check=False)
         with open(output_json, "r") as f:
@@ -641,6 +644,12 @@ def main():
         help="Take a PMG snapshot at start (used automatically with --require-pmg)",
     )
     parser.add_argument(
+        "--ignore-users",
+        type=str,
+        default="",
+        help="Comma-separated GitHub usernames to ignore in review-comment gate (default: none, matching CI config)",
+    )
+    parser.add_argument(
         "--repo",
         type=str,
         default=None,
@@ -799,6 +808,7 @@ def main():
                 current_head_sha,
                 review_gate_json,
                 (args.output_md or "").replace(".md", "_review_gate.md"),
+                args.ignore_users,
             )
             report["review_comment_gate"] = rg_data
             _add_stage("review_comment_gate", rg_status, rg_error or "", rg_data)

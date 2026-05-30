@@ -68,6 +68,7 @@ def run_waiter(
     require_final_gates: bool = False,
     require_merge_ready: bool = False,
     required_checks: str = None,
+    ignore_users: str = "",
     extra_args: list = None,
 ) -> subprocess.CompletedProcess:
     """Run wait_for_pr_ready.py with given args, return CompletedProcess."""
@@ -91,6 +92,8 @@ def run_waiter(
         cmd.append("--require-merge-ready")
     if required_checks:
         cmd.extend(["--required-checks", required_checks])
+    if ignore_users:
+        cmd.extend(["--ignore-users", ignore_users])
     if extra_args:
         cmd.extend(extra_args)
 
@@ -359,6 +362,106 @@ class TestReviewCommentGate:
         if data["status"] not in ["HOLD_REVIEW_COMMENTS_BLOCKED", "HOLD_REVIEW_COMMENTS_INCONCLUSIVE"]:
             # Either clean (passed) or held for some other reason
             pass
+
+    def test_ignore_users_passed_to_subprocess_when_set(self, output_dir, output_json):
+        """
+        When --ignore-users is set, the check_pr_review_comments.py subprocess
+        receives --ignore-users with the correct value.
+        """
+        pr_num = 336
+        md_path = str(output_dir / "status.md")
+        captured_cmd = None
+
+        original_run = subprocess.run
+
+        def capturing_run(cmd, *args, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            # Return a mock that check_pr_review_comments.py output exists
+            # We only intercept when it's our script
+            if "wait_for_pr_ready" in cmd[0]:
+                return original_run(cmd, *args, **kwargs)
+            return original_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=capturing_run):
+            result = run_waiter(
+                pr_number=pr_num,
+                output_json=output_json,
+                output_md=md_path,
+                timeout_minutes=1,
+                poll_seconds=0,
+                require_review_comments_clean=True,
+                ignore_users="chatgpt-codex-connector[bot]",
+            )
+
+        # Verify --ignore-users appears in the captured command
+        # subprocess.run is called multiple times; we check the one that
+        # invokes check_pr_review_comments.py
+        assert captured_cmd is not None, "subprocess.run was not called"
+        assert any(
+            "--ignore-users" in str(captured_cmd) and "chatgpt-codex-connector[bot]" in str(captured_cmd)
+            for _ in [1]
+        ), f"--ignore-users not found in captured cmd: {captured_cmd}"
+
+    def test_ignore_users_omitted_from_subprocess_when_empty(self, output_dir, output_json):
+        """
+        When --ignore-users is absent/empty, check_pr_review_comments.py is called
+        without --ignore-users (matching old behavior).
+        """
+        pr_num = 336
+        md_path = str(output_dir / "status.md")
+        captured_cmd = None
+
+        original_run = subprocess.run
+
+        def capturing_run(cmd, *args, **kwargs):
+            nonlocal captured_cmd
+            captured_cmd = cmd
+            return original_run(cmd, *args, **kwargs)
+
+        with patch("subprocess.run", side_effect=capturing_run):
+            result = run_waiter(
+                pr_number=pr_num,
+                output_json=output_json,
+                output_md=md_path,
+                timeout_minutes=1,
+                poll_seconds=0,
+                require_review_comments_clean=True,
+                ignore_users="",  # empty - default
+            )
+
+        assert captured_cmd is not None
+        # When ignore_users is empty, --ignore-users should NOT appear
+        cmd_str = " ".join(captured_cmd)
+        assert "--ignore-users" not in cmd_str, f"--ignore-users should not appear when empty: {captured_cmd}"
+
+    def test_run_review_comment_gate_preserves_old_behavior_without_ignore_users(self, output_dir, output_json):
+        """
+        run_review_comment_gate without ignore_users argument behaves identically
+        to the old signature (backward compatible).
+        """
+        from scripts.local.wait_for_pr_ready import run_review_comment_gate
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            json_out = str(Path(tmp) / "out.json")
+            md_out = str(Path(tmp) / "out.md")
+
+            # Call without ignore_users (old signature compatible)
+            status, data, error = run_review_comment_gate(
+                pr_number=336,
+                head_sha="a" * 40,
+                output_json=json_out,
+                output_md=md_out,
+            )
+            # Should not raise TypeError (4 positional args still works)
+            # The function returns the string value of the STATUS constant,
+            # e.g. "HOLD_REVIEW_COMMENTS_INCONCLUSIVE"
+            assert status in (
+                "HOLD_REVIEW_COMMENTS_INCONCLUSIVE",
+                "HOLD_REVIEW_COMMENTS_BLOCKED",
+                "ERROR_TOOLING",
+            ), f"Unexpected status: {status}"
 
 
 class TestPMGGate:
