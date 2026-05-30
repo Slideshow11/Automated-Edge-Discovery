@@ -133,20 +133,44 @@ def fetch_thread(repo: str, pr_number: int, thread_id: str) -> Optional[dict]:
     return None
 
 
+def _collect_patch_parts(data: dict) -> list[str]:
+    """Collect all non-empty patch strings from a GitHub compare response.
+
+    Handles two sources that may overlap on GitHub's compare API:
+    - Top-level data["files"] — primary carrier of changed-file details and patches
+    - Per-commit data["commits"][n]["files"] — supplementary carrier (may overlap)
+
+    Deduplicates by patch string so identical content from both sources appears once.
+    """
+    seen: set[str] = set()
+    parts: list[str] = []
+    # Top-level files array is the primary source on GitHub's compare API.
+    for file in data.get("files", []):
+        patch = file.get("patch", "")
+        if patch and patch not in seen:
+            seen.add(patch)
+            parts.append(patch)
+    # Per-commit files arrays are supplementary; include any patches not already collected.
+    for commit in data.get("commits", []):
+        for file in commit.get("files", []):
+            patch = file.get("patch", "")
+            if patch and patch not in seen:
+                seen.add(patch)
+                parts.append(patch)
+    return parts
+
+
 def fetch_compare_diff(repo: str, base_ref: str, head_sha: str) -> str:
     """Fetch the patch text for all files changed between base_ref and head_sha.
 
     Uses GitHub compare API (base...head) so it captures the full PR diff
     regardless of local checkout state. Never uses 'git diff HEAD'.
+
+    Collects from both top-level files array and per-commit file arrays,
+    deduplicating identical patches.
     """
     data = gh_api(repo_api_path(repo, "compare", f"{base_ref}...{head_sha}"))
-    parts = []
-    for commit in data.get("commits", []):
-        for file in commit.get("files", []):
-            patch = file.get("patch", "")
-            if patch:
-                parts.append(patch)
-    return "\n".join(parts)
+    return "\n".join(_collect_patch_parts(data))
 
 
 # ---------------------------------------------------------------------------

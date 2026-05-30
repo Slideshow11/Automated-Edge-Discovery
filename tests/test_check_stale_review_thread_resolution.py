@@ -264,4 +264,162 @@ class TestRepoApiPath(unittest.TestCase):
         self.assertEqual(path, "repos/OWNER/REPO/releases")
 
 
+class TestCollectPatchParts(unittest.TestCase):
+    """T17: _collect_patch_parts reads top-level files and dedupes with commit-level."""
+
+    def test_top_level_files_patch_included(self):
+        """Top-level data['files'] patch is included even when commit-level files is empty."""
+        data = {
+            "commits": [{"files": []}],
+            "files": [{"filename": "x.py", "patch": "+importlib.util.spec_from_file_location"}],
+        }
+        parts = csr._collect_patch_parts(data)
+        self.assertIn("+importlib.util.spec_from_file_location", parts)
+
+    def test_top_level_and_commit_level_both_present_deduped(self):
+        """Same patch in both top-level and commit-level appears only once."""
+        patch_text = "+importlib.util.spec_from_file_location"
+        data = {
+            "commits": [{"files": [{"filename": "x.py", "patch": patch_text}]}],
+            "files": [{"filename": "x.py", "patch": patch_text}],
+        }
+        parts = csr._collect_patch_parts(data)
+        count = parts.count(patch_text)
+        self.assertEqual(count, 1, f"Patch should appear once, got {count}")
+
+    def test_commit_level_fallback_when_top_level_files_absent(self):
+        """When top-level files is absent, commit-level patches still work."""
+        data = {
+            "commits": [{"files": [{"filename": "d/p.md", "patch": "origin/base...HEAD"}]}],
+        }
+        parts = csr._collect_patch_parts(data)
+        self.assertIn("origin/base...HEAD", parts)
+
+    def test_empty_patch_strings_ignored(self):
+        """Files with missing or empty patch fields are silently skipped."""
+        data = {
+            "commits": [{"files": [{"filename": "a.txt"}]}],
+            "files": [
+                {"filename": "b.txt", "patch": ""},
+                {"filename": "c.txt", "patch": "--- c\n+++ c\n@@"},
+            ],
+        }
+        parts = csr._collect_patch_parts(data)
+        self.assertNotIn("", parts)
+        self.assertIn("--- c\n+++ c\n@@", parts)
+
+
+class TestFetchCompareDiffTopLevelFiles(unittest.TestCase):
+    """T18: fetch_compare_diff uses top-level files array."""
+
+    def test_top_level_files_patch_in_result(self):
+        """fetch_compare_diff returns patch text from top-level files array."""
+        # GhApiPatcher returns comp_resp for compare calls
+        pr = {"state": "open", "head": {"sha": "abc123aaa"}}
+        comp = {
+            "commits": [{"files": []}],
+            "files": [{"filename": "x.py", "patch": "+importlib.util.spec_from_file_location"}],
+        }
+        gql = {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}}
+        with GhApiPatcher(pr, comp, gql):
+            diff = csr.fetch_compare_diff("OWNER/REPO", "main", "abc123aaa")
+        self.assertIn("importlib.util.spec_from_file_location", diff)
+
+
+class TestEndToEndStaleCheckerWithTopLevelFiles(unittest.TestCase):
+    """T19: end-to-end stale checker returns ELIGIBLE when replacement is in top-level files."""
+
+    def test_eligible_when_replacement_in_top_level_files(self):
+        """evaluate() returns ELIGIBLE when replacement pattern is in top-level files patch."""
+        pr = {"state": "open", "head": {"sha": "abc123aaa"}}
+        comp = {
+            "commits": [{"files": []}],
+            "files": [{"filename": "x.py", "patch": "+importlib.util.spec_from_file_location"}],
+        }
+        gql = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "PRRT_top",
+                                    "isOutdated": True,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "body": "ModuleNotFoundError: No module named 'scripts'",
+                                                "author": {"login": "bot"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        with GhApiPatcher(pr, comp, gql):
+            s, a = csr.evaluate(
+                "OWNER/REPO",
+                1,
+                "PRRT_top",
+                "abc123aaa",
+                "main",
+                "ModuleNotFoundError: No module named 'scripts'",
+                replacement_pattern="importlib.util.spec_from_file_location",
+            )
+        self.assertEqual(s, csr.ELIGIBLE_STALE_THREAD_RESOLUTION, f"Got {s}: {a}")
+
+
+class TestHoldReplacementPatternMissingWithTopLevelFiles(unittest.TestCase):
+    """T20: HOLD_REPLACEMENT_PATTERN_MISSING when replacement absent from top-level files."""
+
+    def test_hold_when_replacement_not_in_top_level_files(self):
+        """evaluate() returns HOLD_REPLACEMENT_PATTERN_MISSING when replacement not in top-level files."""
+        pr = {"state": "open", "head": {"sha": "abc123aaa"}}
+        comp = {
+            "commits": [{"files": []}],
+            "files": [{"filename": "x.py", "patch": "+something_else"}],
+        }
+        gql = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "id": "PRRT_no_replacement",
+                                    "isOutdated": True,
+                                    "isResolved": False,
+                                    "comments": {
+                                        "nodes": [
+                                            {
+                                                "body": "ModuleNotFoundError: No module named 'scripts'",
+                                                "author": {"login": "bot"},
+                                            }
+                                        ]
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+        with GhApiPatcher(pr, comp, gql):
+            s, a = csr.evaluate(
+                "OWNER/REPO",
+                1,
+                "PRRT_no_replacement",
+                "abc123aaa",
+                "main",
+                "ModuleNotFoundError: No module named 'scripts'",
+                replacement_pattern="importlib.util.spec_from_file_location",
+            )
+        self.assertEqual(s, csr.HOLD_REPLACEMENT_PATTERN_MISSING, f"Got {s}: {a}")
+
+
 if __name__ == "__main__": unittest.main()
