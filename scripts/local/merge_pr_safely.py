@@ -192,7 +192,20 @@ def run_waiter(
     if ignore_users:
         cmd.extend(["--ignore-users", ignore_users])
 
-    _run(cmd, check=False, timeout=timeout_minutes * 60 + 30)
+    # Remove any stale waiter output from previous runs so a prior
+    # READY_TO_MERGE_CANDIDATE cannot be reused after a failure.
+    for stale in [waiter_json, waiter_md]:
+        if os.path.exists(stale):
+            os.remove(stale)
+
+    result = _run(cmd, check=False, timeout=timeout_minutes * 60 + 30)
+    if result.returncode != 0:
+        return STATUS_ERROR_TOOL_FAILURE, {
+            "error": f"waiter subprocess exited {result.returncode}",
+            "waiter_returncode": result.returncode,
+            "waiter_stderr": result.stderr.strip()[:500],
+        }
+
     try:
         with open(waiter_json, "r") as f:
             data = json.load(f)
@@ -243,6 +256,7 @@ def verify_merge_command(
     verify_json = os.path.join(output_dir, "command_verifier.json")
     cmd = [
         sys.executable, str(verifier_script),
+        "--repo", repo,
         "--pr-number", str(pr_number),
         "--reported-head-sha", head_sha,
         "--output-json", verify_json,
@@ -439,6 +453,38 @@ def main() -> int:
     waiter_json_path = os.path.join(output_dir, "waiter_status.json")
 
     # ---- 5. Determine status ----
+    # ERROR_TOOL_FAILURE means the waiter subprocess itself crashed —
+    # report it as an error, not as a hold.
+    if waiter_status == STATUS_ERROR_TOOL_FAILURE:
+        report = {
+            "status": STATUS_ERROR_TOOL_FAILURE,
+            "admin_refused": False,
+            "pr_number": args.pr_number,
+            "repo": args.repo,
+            "repo_root": args.repo_root,
+            "head_sha": head_sha,
+            "waiter_status": waiter_status,
+            "waiter_json_path": waiter_json_path,
+            "safe_merge_command_text": "",
+            "safe_merge_command_list": [],
+            "command_verified": False,
+            "execute_merge_supported": False,
+            "merged": False,
+            "mutated_github": False,
+            "waiter_stages": waiter_data.get("stages", []),
+        }
+        # Forward waiter failure details if present
+        if "error" in waiter_data:
+            report["error"] = waiter_data["error"]
+        if "waiter_returncode" in waiter_data:
+            report["waiter_returncode"] = waiter_data["waiter_returncode"]
+        if "waiter_stderr" in waiter_data:
+            report["waiter_stderr"] = waiter_data["waiter_stderr"]
+        write_json_report(args.output_json, report)
+        write_md_report(md_path, report)
+        print(f"ERROR_TOOL_FAILURE: waiter subprocess failed: {waiter_data.get('error', waiter_status)}")
+        return 0
+
     if waiter_status != "READY_TO_MERGE_CANDIDATE":
         report = {
             "status": STATUS_HOLD_WAITER_NOT_READY,

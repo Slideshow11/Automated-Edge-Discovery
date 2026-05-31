@@ -627,3 +627,164 @@ def test_subprocess_no_shell(tmp_path):
             f"shell=True found in call: {call['argv'][:3]}"
         assert isinstance(call["argv"], list), \
             f"argv is not a list: {type(call['argv'])}"
+
+
+# ------------------------------------------------------------------
+# Test 13: waiter failure → ERROR_TOOL_FAILURE, no SAFE status
+# ------------------------------------------------------------------
+
+def test_waiter_subprocess_failure_returns_error(tmp_path):
+    """
+    When wait_for_pr_ready.py exits non-zero, merge_pr_safely.py returns
+    ERROR_TOOL_FAILURE and does NOT emit a ready merge command.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "a" * 32
+    waiter_json = tmp_path / "waiter_status.json"
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            # Do NOT write any status JSON — simulates crash mid-run
+            return fake_proc(stderr="internal error", returncode=1)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status.json"),
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    with open(tmp_path / "status.json") as f:
+        data = json.load(f)
+
+    assert data["status"] == "ERROR_TOOL_FAILURE"
+    assert data["safe_merge_command_text"] == ""
+    assert data["command_verified"] is False
+    assert data["mutated_github"] is False
+    assert data["merged"] is False
+    assert data.get("waiter_returncode") == 1
+
+
+# ------------------------------------------------------------------
+# Test 14: stale waiter JSON from previous run does not trigger ready
+# ------------------------------------------------------------------
+
+def test_stale_waiter_output_ignored_on_rerun(tmp_path):
+    """
+    If a stale waiter_status.json from a previous run claims READY but
+    the waiter subprocess fails this run, merge_pr_safely.py must NOT
+    emit a ready merge command.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "b" * 32
+    waiter_json = tmp_path / "waiter_status.json"
+
+    # Pre-write a stale READY file from a previous run
+    waiter_json.write_text(json.dumps({
+        "status": "READY_TO_MERGE_CANDIDATE",
+        "stages": [],
+        "next_safe_action": "gh pr merge",
+    }))
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            # Simulate failure — no new JSON written
+            return fake_proc(stderr="timeout", returncode=2)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status.json"),
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    with open(tmp_path / "status.json") as f:
+        data = json.load(f)
+
+    assert data["status"] == "ERROR_TOOL_FAILURE"
+    assert data["safe_merge_command_text"] == ""
+    assert data["command_verified"] is False
+
+
+# ------------------------------------------------------------------
+# Test 15: verifier receives --repo argument
+# ------------------------------------------------------------------
+
+def test_verifier_receives_repo_argument(tmp_path):
+    """
+    verify_final_head_merge_command.py is called with --repo forwarding
+    the repository passed to merge_pr_safely.py.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    verify_merge_command = mod.verify_merge_command
+
+    head_sha = "deadbeef" + "c" * 32
+    verifier_calls = []
+
+    def capturing_run(argv, **kwargs):
+        verifier_calls.append(list(argv))
+        if "verify_final_head_merge_command.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            verify_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(verify_json_path), exist_ok=True)
+            with open(verify_json_path, "w") as f:
+                json.dump({
+                    "recommendation": "MERGE_READY_CANDIDATE",
+                    "verification_errors": [],
+                }, f)
+            return fake_proc("", "", 0)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=capturing_run):
+        verified, _ = verify_merge_command(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=371,
+            head_sha=head_sha,
+            pmg_state_json=None,
+            output_dir=str(tmp_path),
+        )
+
+    assert verified is True
+    assert len(verifier_calls) == 1
+    assert "--repo" in verifier_calls[0], \
+        f"--repo not in verifier call: {verifier_calls[0]}"
+    repo_idx = verifier_calls[0].index("--repo")
+    assert verifier_calls[0][repo_idx + 1] == "Slideshow11/Automated-Edge-Discovery", \
+        f"wrong repo forwarded: {verifier_calls[0][repo_idx + 1]}"
