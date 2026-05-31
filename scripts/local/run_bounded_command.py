@@ -26,6 +26,7 @@ Optional flags:
 import argparse
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -136,22 +137,36 @@ def _extract_gh_api_method(args: list[str]) -> str | None:
     return None
 
 
+def _contains_graphql_mutation_operation(text: str) -> bool:
+    """
+    Detect a GraphQL mutation keyword followed by an operation body.
+
+    Handles all common forms:
+      mutation{...}
+      mutation { ... }
+      mutation    {
+      mutation<whitespace>{
+      mutation OperationName { ... }
+      mutation OperationName($id:ID!){...}
+      Mutation{...}  (case-insensitive)
+
+    Does NOT match:
+      - words that merely contain 'mutation' as a substring
+        (immutable, permutation, etc.)
+      - GraphQL queries: query { ... } or { viewer { ... } }
+    """
+    # GraphQL operation keyword (\bmutation\b), then any chars except opening brace,
+    # then the opening brace — catches mutation{ mutation { mutation name(args){ etc.
+    # The [^{]* is non-greedy; the DOTALL flag is not needed since we stop at {.
+    return bool(re.search(r'\bmutation\b[^{]*\{', text, flags=re.IGNORECASE))
+
+
 def _is_gh_graphql_mutation(args: list[str]) -> bool:
     """Check if gh api graphql command contains a mutation."""
-    # GraphQL queries use: gh api graphql -f query='...'
-    # Mutations use: gh api graphql -f query='mutation {...}'
-    # The mutation keyword may appear in the -f / -F / --field value
-    # We join the full command string and look for 'mutation ' in
-    # the query value portion.
     if not (_is_gh_api_command(args) and "graphql" in args):
         return False
-    # The -f / -F / --field flag value contains the GraphQL string
-    # We join args as a string and look for 'mutation ' or 'Mutation '
-    cmd_lower = _cmd_str(args).lower()
-    # Check if this is a mutation by looking for 'mutation {' or 'mutation\n'
-    # in the joined command (this catches the -f query=... form)
-    import re
-    return bool(re.search(r"mutation\s*[{]", cmd_lower))
+    cmd = _cmd_str(args)
+    return _contains_graphql_mutation_operation(cmd)
 
 
 def _is_mutation_denylist_pattern(args: list[str]) -> bool:

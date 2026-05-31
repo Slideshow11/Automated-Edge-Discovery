@@ -314,6 +314,60 @@ def test_allow_gh_api_mutation_enables_graphql_mutation():
         f"Policy denied even with flag: {j['policy_errors']}"
 
 
+# --------------------------------------------------------------------------
+# Policy: GraphQL mutation detection — robust operation-body matching
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # mutation{ (no space) — the exact bypass form from QEA
+    '["gh", "api", "graphql", "-f", "query=mutation{viewer{login}}"]',
+    # mutation followed by space then {
+    '["gh", "api", "graphql", "-f", "query=mutation { viewer { login } }"]',
+    # mutation with multiple spaces before {
+    '["gh", "api", "graphql", "-f", "query=mutation   { viewer { login } }"]',
+    # mutation followed by newline before {
+    '["gh", "api", "graphql", "-f", "query=mutation\\n{ viewer { login } }"]',
+    # mutation with operation name
+    '["gh", "api", "graphql", "-f", "query=mutation MyOp { viewer { login } }"]',
+    # mutation with operation name and variables
+    '["gh", "api", "graphql", "-f", "query=mutation MarkDone($id:ID!){completeTask(id:$id){id}}"]',
+    # mixed-case Mutation
+    '["gh", "api", "graphql", "-f", "query=Mutation { viewer { login } }"]',
+    # uppercase MUTATION
+    '["gh", "api", "graphql", "-f", "query=MUTATION{viewer{login}}"]',
+])
+def test_graphql_mutation_operation_bypass_forms_denied(cmd_json):
+    """All common mutation operation forms must be policy-denied."""
+    rc, j, _ = run_cli(cmd_json)
+    assert j["status"] == "COMMAND_POLICY_DENIED", \
+        f"Expected POLICY_DENIED for {cmd_json}, got {j['status']}: {j['policy_errors']}"
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # 'immutable' contains 'mutation' as substring but is not a GraphQL operation
+    '["python", "-c", "print(\'immutable_state\')"]',
+    # 'permutation' contains 'mutation' as substring
+    '["python", "-c", "import itertools; print(list(itertools.permutations([1,2])))"]',
+    # 'mutation' inside a string argument that is not a GraphQL operation
+    '["echo", "no-mutation-here"]',
+])
+def test_mutation_substring_not_blocked(cmd_json):
+    """Words containing 'mutation' as a substring must not be policy-blocked."""
+    rc, j, _ = run_cli(cmd_json)
+    assert j["status"] != "COMMAND_POLICY_DENIED", \
+        f"Unexpected policy denial for '{cmd_json}': {j['policy_errors']}"
+
+
+def test_graphql_query_not_mutation():
+    """A query {...} without 'mutation' keyword must not be blocked by the mutation guard."""
+    rc, j, _ = run_cli(
+        '["gh", "api", "graphql", "-f", "query={viewer{login}}"]',
+    )
+    assert j["status"] != "COMMAND_POLICY_DENIED", \
+        f"Query should not be blocked: {j['policy_errors']}"
+
+
 # ---------------------------------------------------------------------------
 # Policy: shell invocation wrappers denied
 # ---------------------------------------------------------------------------
