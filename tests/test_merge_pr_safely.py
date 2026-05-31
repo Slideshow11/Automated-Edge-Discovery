@@ -145,7 +145,7 @@ def test_ignore_users_passed_to_waiter(tmp_path):
             timeout_minutes=5,
             poll_seconds=30,
             ignore_users="chatgpt-codex-connector,hermes-agent",
-            output_dir=str(tmp_path),
+            artifact_dir=str(tmp_path / "artifacts"),
         )
 
     assert len(waiter_calls) >= 1, f"waiter never called: {waiter_calls}"
@@ -333,7 +333,7 @@ def test_verifier_called_and_result_used(tmp_path):
             pr_number=368,
             head_sha=head_sha,
             pmg_state_json=None,
-            output_dir=str(tmp_path),
+            artifact_dir=str(tmp_path / "artifacts"),
         )
 
     assert verified is True
@@ -774,11 +774,11 @@ def test_verifier_receives_repo_argument(tmp_path):
 
     with mock.patch("subprocess.run", side_effect=capturing_run):
         verified, _ = verify_merge_command(
-            repo="Slideshow11/Automated-Edge-Discovery",
+            repo="ExampleOrg/ExampleRepo",
             pr_number=371,
             head_sha=head_sha,
             pmg_state_json=None,
-            output_dir=str(tmp_path),
+            artifact_dir=str(tmp_path / "artifacts"),
         )
 
     assert verified is True
@@ -786,5 +786,239 @@ def test_verifier_receives_repo_argument(tmp_path):
     assert "--repo" in verifier_calls[0], \
         f"--repo not in verifier call: {verifier_calls[0]}"
     repo_idx = verifier_calls[0].index("--repo")
-    assert verifier_calls[0][repo_idx + 1] == "Slideshow11/Automated-Edge-Discovery", \
+    assert verifier_calls[0][repo_idx + 1] == "ExampleOrg/ExampleRepo", \
         f"wrong repo forwarded: {verifier_calls[0][repo_idx + 1]}"
+
+
+# ------------------------------------------------------------------
+# Test 16: artifact_dir appears in JSON report
+# ------------------------------------------------------------------
+
+def test_artifact_dir_in_json_report(tmp_path):
+    """JSON report includes artifact_dir and waiter_json_path under it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "d" * 32
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            waiter_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(waiter_json_path), exist_ok=True)
+            with open(waiter_json_path, "w") as f:
+                json.dump({"status": "READY_TO_MERGE_CANDIDATE", "stages": []}, f)
+            return fake_proc("", "", 0)
+        if "verify_final_head_merge_command.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            verify_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(verify_json_path), exist_ok=True)
+            with open(verify_json_path, "w") as f:
+                json.dump({"recommendation": "MERGE_READY_CANDIDATE",
+                           "verification_errors": []}, f)
+            return fake_proc("", "", 0)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status.json"),
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    with open(tmp_path / "status.json") as f:
+        data = json.load(f)
+
+    assert "artifact_dir" in data
+    assert "merge_pr_safely_artifacts" in data["artifact_dir"]
+    assert "waiter_json_path" in data
+    assert "merge_pr_safely_artifacts" in data["waiter_json_path"]
+
+
+# ------------------------------------------------------------------
+# Test 17: final JSON and waiter JSON paths are distinct
+# ------------------------------------------------------------------
+
+def test_final_json_differs_from_waiter_json(tmp_path):
+    """Final output-json path must differ from the nested waiter JSON path."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "e" * 32
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            waiter_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(waiter_json_path), exist_ok=True)
+            with open(waiter_json_path, "w") as f:
+                json.dump({"status": "READY_TO_MERGE_CANDIDATE", "stages": []}, f)
+            return fake_proc("", "", 0)
+        if "verify_final_head_merge_command.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            verify_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(verify_json_path), exist_ok=True)
+            with open(verify_json_path, "w") as f:
+                json.dump({"recommendation": "MERGE_READY_CANDIDATE",
+                           "verification_errors": []}, f)
+            return fake_proc("", "", 0)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status.json"),
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    with open(tmp_path / "status.json") as f:
+        data = json.load(f)
+
+    final_json = str(tmp_path / "status.json")
+    assert data["waiter_json_path"] != final_json, \
+        f"waiter JSON collides with final JSON: {data['waiter_json_path']}"
+
+
+# ------------------------------------------------------------------
+# Test 18: Markdown report includes artifact_dir section
+# ------------------------------------------------------------------
+
+def test_artifact_dir_in_markdown_report(tmp_path):
+    """Markdown report includes an Artifact Directory section."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "f" * 32
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            waiter_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(waiter_json_path), exist_ok=True)
+            with open(waiter_json_path, "w") as f:
+                json.dump({"status": "READY_TO_MERGE_CANDIDATE", "stages": []}, f)
+            return fake_proc("", "", 0)
+        if "verify_final_head_merge_command.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            verify_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(verify_json_path), exist_ok=True)
+            with open(verify_json_path, "w") as f:
+                json.dump({"recommendation": "MERGE_READY_CANDIDATE",
+                           "verification_errors": []}, f)
+            return fake_proc("", "", 0)
+        return fake_proc("", "", 0)
+
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status.json"),
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    with open(tmp_path / "status.md") as f:
+        md = f.read()
+
+    assert "## Artifact Directory" in md
+    assert "merge_pr_safely_artifacts" in md
+
+
+# ------------------------------------------------------------------
+# Test 19: md_path with no .json suffix still gets distinct path
+# ------------------------------------------------------------------
+
+def test_md_derivation_no_json_suffix(tmp_path):
+    """When output-json has no .json suffix, md_path is still distinct."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("merge_pr_safely", SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    main = mod.main
+
+    head_sha = "deadbeef" + "g" * 32
+
+    def tracking_run(argv, **kwargs):
+        if argv[0] == "git" and "rev-parse" in argv:
+            return fake_proc(stdout="true", returncode=0)
+        if argv[0] == "git" and "status" in argv:
+            return fake_proc(stdout="", returncode=0)
+        if "gh" in argv and "view" in argv:
+            return fake_proc(stdout=head_sha, returncode=0)
+        if "wait_for_pr_ready.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            waiter_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(waiter_json_path), exist_ok=True)
+            with open(waiter_json_path, "w") as f:
+                json.dump({"status": "READY_TO_MERGE_CANDIDATE", "stages": []}, f)
+            return fake_proc("", "", 0)
+        if "verify_final_head_merge_command.py" in " ".join(argv):
+            output_arg_idx = argv.index("--output-json")
+            verify_json_path = argv[output_arg_idx + 1]
+            os.makedirs(os.path.dirname(verify_json_path), exist_ok=True)
+            with open(verify_json_path, "w") as f:
+                json.dump({"recommendation": "MERGE_READY_CANDIDATE",
+                           "verification_errors": []}, f)
+            return fake_proc("", "", 0)
+        return fake_proc("", "", 0)
+
+    # Pass output-json WITHOUT .json suffix
+    with mock.patch("subprocess.run", side_effect=tracking_run):
+        with mock.patch("sys.argv", [
+            "merge_pr_safely.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--repo-root", str(tmp_path),
+            "--pr-number", "371",
+            "--output-json", str(tmp_path / "status"),  # no .json
+            "--output-md", str(tmp_path / "status.md"),
+        ]):
+            rc = main()
+
+    assert rc == 0
+    # Both files must exist and be distinct
+    import os
+    final_json = str(tmp_path / "status")
+    final_md = str(tmp_path / "status.md")
+    assert os.path.exists(final_json), f"final JSON missing: {final_json}"
+    assert os.path.exists(final_md), f"final MD missing: {final_md}"
+    assert final_json != final_md, "final JSON and MD must differ"

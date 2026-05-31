@@ -163,18 +163,22 @@ def run_waiter(
     timeout_minutes: int,
     poll_seconds: int,
     ignore_users: Optional[str],
-    output_dir: str,
+    artifact_dir: str,
 ) -> Tuple[str, dict]:
     """
     Invoke wait_for_pr_ready.py with all required gates.
+    artifact_dir: directory for nested waiter outputs (never the final report directory).
     Returns (waiter_status, waiter_result_dict).
     """
     waiter_script = Path(__file__).parent / "wait_for_pr_ready.py"
     if not waiter_script.exists():
         return STATUS_ERROR_TOOL_FAILURE, {"error": f"waiter script not found: {waiter_script}"}
 
-    waiter_json = os.path.join(output_dir, "waiter_status.json")
-    waiter_md   = os.path.join(output_dir, "waiter_status.md")
+    # All waiter output goes under artifact_dir to avoid collision with
+    # the final merge_pr_safely report paths.
+    os.makedirs(artifact_dir, exist_ok=True)
+    waiter_json = os.path.join(artifact_dir, "waiter_status.json")
+    waiter_md   = os.path.join(artifact_dir, "waiter_status.md")
 
     cmd = [
         sys.executable, str(waiter_script),
@@ -243,17 +247,19 @@ def verify_merge_command(
     pr_number: int,
     head_sha: str,
     pmg_state_json: Optional[str],
-    output_dir: str,
+    artifact_dir: str,
 ) -> Tuple[bool, dict]:
     """
     Run verify_final_head_merge_command.py to verify the merge command.
+    artifact_dir: directory for nested verifier outputs (never the final report directory).
     Returns (verified, verifier_result_dict).
     """
     verifier_script = Path(__file__).parent / "verify_final_head_merge_command.py"
     if not verifier_script.exists():
         return False, {"error": f"verifier script not found: {verifier_script}"}
 
-    verify_json = os.path.join(output_dir, "command_verifier.json")
+    os.makedirs(artifact_dir, exist_ok=True)
+    verify_json = os.path.join(artifact_dir, "command_verifier.json")
     cmd = [
         sys.executable, str(verifier_script),
         "--repo", repo,
@@ -300,9 +306,12 @@ def write_md_report(path: str, data: dict) -> None:
         "## Repo Root",
         f"- **Path**: {data['repo_root']}",
         "",
+        "## Artifact Directory",
+        f"- **Path**: {data.get('artifact_dir', 'n/a')}",
+        "",
         "## Waiter",
         f"- **Status**: `{data['waiter_status']}`",
-        f"- **Report**: {data.get('waiter_json_path', 'n/a')}",
+        f"- **Artifact JSON**: {data.get('waiter_json_path', 'n/a')}",
         "",
         "## Merge Command",
     ]
@@ -361,9 +370,21 @@ def main() -> int:
                         help="Path to Markdown report (optional)")
     args = parser.parse_args()
 
-    # Normalize output path
-    output_dir = os.path.dirname(os.path.abspath(args.output_json))
-    md_path = args.output_md or args.output_json.replace(".json", ".md")
+    # Derive artifact subdirectory — all nested outputs live here,
+    # never in the same directory as the final merge_pr_safely reports.
+    artifact_dir = os.path.join(os.path.dirname(os.path.abspath(args.output_json)),
+                                "merge_pr_safely_artifacts")
+    # md_path must not collide with artifact_dir contents or final output-json.
+    # Use Path.with_suffix() to safely derive a distinct .md path,
+    # falling back to a sibling with .md suffix if the original has no extension.
+    if args.output_md:
+        md_path = args.output_md
+    else:
+        json_path = Path(args.output_json)
+        md_path = str(json_path.with_suffix(".md"))
+        # If with_suffix replaced nothing (no .json suffix), use explicit sibling.
+        if md_path == args.output_json:
+            md_path = args.output_json + ".md"
 
     # ---- 1. Admin guard ----
     try:
@@ -377,6 +398,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": "",
+            "artifact_dir": artifact_dir,
             "waiter_status": "",
             "waiter_json_path": "",
             "safe_merge_command_text": "",
@@ -401,6 +423,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": "",
+            "artifact_dir": artifact_dir,
             "waiter_status": "",
             "waiter_json_path": "",
             "safe_merge_command_text": "",
@@ -426,6 +449,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": "",
+            "artifact_dir": artifact_dir,
             "waiter_status": "",
             "waiter_json_path": "",
             "safe_merge_command_text": "",
@@ -448,9 +472,9 @@ def main() -> int:
         timeout_minutes=args.timeout_minutes,
         poll_seconds=args.poll_seconds,
         ignore_users=args.ignore_users,
-        output_dir=output_dir,
+        artifact_dir=artifact_dir,
     )
-    waiter_json_path = os.path.join(output_dir, "waiter_status.json")
+    waiter_json_path = os.path.join(artifact_dir, "waiter_status.json")
 
     # ---- 5. Determine status ----
     # ERROR_TOOL_FAILURE means the waiter subprocess itself crashed —
@@ -463,6 +487,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": head_sha,
+            "artifact_dir": artifact_dir,
             "waiter_status": waiter_status,
             "waiter_json_path": waiter_json_path,
             "safe_merge_command_text": "",
@@ -493,6 +518,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": head_sha,
+            "artifact_dir": artifact_dir,
             "waiter_status": waiter_status,
             "waiter_json_path": waiter_json_path,
             "safe_merge_command_text": "",
@@ -519,7 +545,7 @@ def main() -> int:
         pr_number=args.pr_number,
         head_sha=head_sha,
         pmg_state_json=pmg_json,
-        output_dir=output_dir,
+        artifact_dir=artifact_dir,
     )
 
     if not verified:
@@ -530,6 +556,7 @@ def main() -> int:
             "repo": args.repo,
             "repo_root": args.repo_root,
             "head_sha": head_sha,
+            "artifact_dir": artifact_dir,
             "waiter_status": waiter_status,
             "waiter_json_path": waiter_json_path,
             "safe_merge_command_text": merge_cmd_text,
@@ -554,6 +581,7 @@ def main() -> int:
         "repo": args.repo,
         "repo_root": args.repo_root,
         "head_sha": head_sha,
+        "artifact_dir": artifact_dir,
         "waiter_status": waiter_status,
         "waiter_json_path": waiter_json_path,
         "safe_merge_command_text": merge_cmd_text,
