@@ -158,11 +158,15 @@ def is_companion_test(file_path: str, source_path: str) -> bool:
 def scan_added_lines_for_patterns(
     patch: str,
     patterns: list[re.Pattern[str]],
+    skip_files: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Scan added lines (+, not +++) for regex matches. Return match records."""
+    if skip_files is None:
+        skip_files = set()
     matches: list[dict[str, Any]] = []
     current_file = ""
     current_hunk = ""
+    _skip_current_file = False
 
     for line in patch.splitlines():
         if line.startswith("diff --git"):
@@ -171,9 +175,12 @@ def scan_added_lines_for_patterns(
             if len(parts) == 2:
                 current_file = parts[1].split()[0]
             current_hunk = ""
+            _skip_current_file = current_file in skip_files
         elif line.startswith("@@"):
             current_hunk = line
         elif line.startswith("+") and not line.startswith("+++"):
+            if _skip_current_file:
+                continue
             text = line[1:]
             for pat in patterns:
                 if pat.search(text):
@@ -299,8 +306,14 @@ def audit_scope(
         })
 
     # Step 5: scan diff for forbidden patterns
+    # Exclude scope_guard's own source files from diff scanning — they
+    # necessarily contain the forbid-diff-regex literal strings as the
+    # built-in pattern list and would always trigger false positives.
     forbid_patterns = list(forbid_diff_patterns)
-    forbidden_diff_matches = scan_added_lines_for_patterns(patch, forbid_patterns)
+    scope_guard_own_files = {"scripts/local/scope_guard.py", "tests/test_scope_guard.py"}
+    forbidden_diff_matches = scan_added_lines_for_patterns(
+        patch, forbid_patterns, skip_files=scope_guard_own_files
+    )
 
     # Step 6: determine status
     if forbidden_diff_matches:
