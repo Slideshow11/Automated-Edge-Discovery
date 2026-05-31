@@ -1090,3 +1090,235 @@ def test_multiple_threads_correct_counts(tmp_path, monkeypatch):
     assert data["status"] == "HOLD_CURRENT_THREADS_PRESENT"
     assert len(data["suggested_checker_invocations"]) == 1
     assert data["suggested_checker_invocations"][0]["thread_id"] == "O1"
+
+
+# ---------------------------------------------------------------------------
+# Test 20: Markdown command quotes flagged pattern with spaces
+# ---------------------------------------------------------------------------
+
+def test_markdown_command_quotes_pattern_with_spaces(tmp_path, monkeypatch):
+    """A flagged-pattern containing spaces is quoted in the Markdown code block."""
+    pr_response = json.dumps({
+        "number": 372, "title": "Test PR", "state": "OPEN",
+        "headRefOid": "abc123",
+        "url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/372",
+    })
+
+    threads_response = json.dumps({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {"id": "PRRT_SP", "isResolved": False, "isOutdated": True,
+                             "path": "foo.py", "line": None,
+                             "comments": {"nodes": [
+                                 {"body": "The `hard-coded worktree path` needs fixing.",
+                                  "author": {"login": "alice"}}
+                             ]}},
+                        ],
+                    },
+                },
+            },
+        },
+    })
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[1] == "pr" and cmd[2] == "view":
+            return fake_proc(stdout=pr_response)
+        if "graphql" in cmd:
+            return fake_proc(stdout=threads_response)
+        return fake_proc(stdout="{}")
+
+    json_out = tmp_path / "threads.json"
+    md_out = tmp_path / "threads.md"
+    mod = load_script()
+    with monkeypatch.context() as m:
+        m.setattr(subprocess, "run", fake_run)
+        m.setattr(sys, "argv", [
+            "resolve_stale_threads_for_pr.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--pr-number", "372",
+            "--output-json", str(json_out),
+            "--output-md", str(md_out),
+        ])
+        rc = mod.main()
+    assert rc == 0
+
+    import shlex
+    data = json.loads(json_out.read_text())
+    assert len(data["suggested_checker_invocations"]) == 1
+    suggestion = data["suggested_checker_invocations"][0]
+
+    # The command string in JSON should use shlex.join, so --flagged-pattern
+    # is a single quoted argument even with spaces
+    assert "--flagged-pattern" in suggestion["command"]
+    assert suggestion["command_parts"] == suggestion["command_parts"]  # unchanged
+
+    # Verify round-trip: shlex.split(command) == command_parts
+    rejoined = shlex.split(suggestion["command"])
+    assert rejoined == suggestion["command_parts"]
+
+    # Markdown contains quoted form
+    md_text = md_out.read_text()
+    assert "hard-coded worktree path" in md_text
+    # The code block should not have an unquoted multi-word token
+    # e.g. it should NOT be "--flagged-pattern hard-coded worktree path"
+    # but instead "--flagged-pattern 'hard-coded worktree path'"
+    import re
+    code_blocks = re.findall(r'```bash\n(.*?)\n```', md_text, re.DOTALL)
+    assert len(code_blocks) >= 1
+    # Verify no bare unquoted multi-word token after --flagged-pattern
+    for block in code_blocks:
+        lines = block.strip().splitlines()
+        for line in lines:
+            if "--flagged-pattern" in line:
+                # Should have quoting (single or double quotes around the value)
+                assert ("'" in line or '"' in line), \
+                    f"Unquoted --flagged-pattern value in Markdown: {line}"
+
+
+# ---------------------------------------------------------------------------
+# Test 21: Markdown command quotes shell metacharacters
+# ---------------------------------------------------------------------------
+
+def test_markdown_command_quotes_metacharacters(tmp_path, monkeypatch):
+    """A flagged-pattern containing shell metacharacters is safely quoted."""
+    pr_response = json.dumps({
+        "number": 372, "title": "Test PR", "state": "OPEN",
+        "headRefOid": "abc123",
+        "url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/372",
+    })
+
+    threads_response = json.dumps({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {"id": "PRRT_META", "isResolved": False, "isOutdated": True,
+                             "path": "foo.py", "line": None,
+                             "comments": {"nodes": [
+                                 {"body": "The `foo; rm -rf /` pattern is dangerous if not quoted.",
+                                  "author": {"login": "alice"}}
+                             ]}},
+                        ],
+                    },
+                },
+            },
+        },
+    })
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[1] == "pr" and cmd[2] == "view":
+            return fake_proc(stdout=pr_response)
+        if "graphql" in cmd:
+            return fake_proc(stdout=threads_response)
+        return fake_proc(stdout="{}")
+
+    json_out = tmp_path / "threads.json"
+    md_out = tmp_path / "threads.md"
+    mod = load_script()
+    with monkeypatch.context() as m:
+        m.setattr(subprocess, "run", fake_run)
+        m.setattr(sys, "argv", [
+            "resolve_stale_threads_for_pr.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--pr-number", "372",
+            "--output-json", str(json_out),
+            "--output-md", str(md_out),
+        ])
+        rc = mod.main()
+    assert rc == 0
+
+    import shlex
+    import re
+    data = json.loads(json_out.read_text())
+    suggestion = data["suggested_checker_invocations"][0]
+
+    # Round-trip must preserve all parts including the semicolon
+    rejoined = shlex.split(suggestion["command"])
+    assert rejoined == suggestion["command_parts"]
+    # The semicolon must be inside quotes, not split
+    assert any("foo; rm -rf /" in part for part in suggestion["command_parts"])
+
+    md_text = md_out.read_text()
+    code_blocks = re.findall(r'```bash\n(.*?)\n```', md_text, re.DOTALL)
+    for block in code_blocks:
+        # Semicolon should be inside quotes, not splitting tokens
+        assert block.strip().count(";") == 0 or "'" in block or '"' in block
+
+
+# ---------------------------------------------------------------------------
+# Test 22: JSON preserves structured argv parts alongside rendered command
+# ---------------------------------------------------------------------------
+
+def test_json_preserves_command_parts_with_quoted_render(tmp_path, monkeypatch):
+    """JSON report includes both command (shlex-quoted) and command_parts (list)."""
+    pr_response = json.dumps({
+        "number": 372, "title": "Test PR", "state": "OPEN",
+        "headRefOid": "abc123",
+        "url": "https://github.com/Slideshow11/Automated-Edge-Discovery/pull/372",
+    })
+
+    threads_response = json.dumps({
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {"id": "PRRT_STR", "isResolved": False, "isOutdated": True,
+                             "path": "foo.py", "line": None,
+                             "comments": {"nodes": [
+                                 {"body": "Pattern: `my multi-word pattern` is stale.",
+                                  "author": {"login": "alice"}}
+                             ]}},
+                        ],
+                    },
+                },
+            },
+        },
+    })
+
+    def fake_run(cmd, *args, **kwargs):
+        if cmd[1] == "pr" and cmd[2] == "view":
+            return fake_proc(stdout=pr_response)
+        if "graphql" in cmd:
+            return fake_proc(stdout=threads_response)
+        return fake_proc(stdout="{}")
+
+    json_out = tmp_path / "threads.json"
+    md_out = tmp_path / "threads.md"
+    mod = load_script()
+    with monkeypatch.context() as m:
+        m.setattr(subprocess, "run", fake_run)
+        m.setattr(sys, "argv", [
+            "resolve_stale_threads_for_pr.py",
+            "--repo", "Slideshow11/Automated-Edge-Discovery",
+            "--pr-number", "372",
+            "--output-json", str(json_out),
+            "--output-md", str(md_out),
+        ])
+        rc = mod.main()
+    assert rc == 0
+
+    import shlex
+    data = json.loads(json_out.read_text())
+    suggestion = data["suggested_checker_invocations"][0]
+
+    # Both fields must exist
+    assert "command" in suggestion
+    assert "command_parts" in suggestion
+    assert isinstance(suggestion["command_parts"], list)
+    assert len(suggestion["command_parts"]) > 0
+
+    # Round-trip: shlex.split(command) must equal command_parts exactly
+    assert shlex.split(suggestion["command"]) == suggestion["command_parts"]
+
+    # command_parts[0] is "python3", not quoted
+    assert suggestion["command_parts"][0] == "python3"
+    # --repo argument is present and not quoted (no spaces)
+    assert "--repo" in suggestion["command_parts"]

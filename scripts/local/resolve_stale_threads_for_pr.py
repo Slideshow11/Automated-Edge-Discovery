@@ -35,6 +35,7 @@ Status values (JSON report.status):
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 import re
@@ -333,7 +334,7 @@ def build_checker_suggestion(
         "thread_line": thread.get("line"),
         "author": thread.get("author", ""),
         "severity": thread.get("severity", "unknown"),
-        "command": " ".join(cmd_parts),
+        "command": shlex.join(cmd_parts),
         "command_parts": cmd_parts,
         "primary_candidate_pattern": primary_pattern,
         "candidate_patterns": suggestions,
