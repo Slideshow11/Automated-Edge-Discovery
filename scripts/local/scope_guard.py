@@ -95,6 +95,47 @@ def compute_changed_files(repo_root: Path, base_ref: str, head_ref: str) -> tupl
     return files, ""
 
 
+def compute_changed_file_records(
+    repo_root: Path, base_ref: str, head_ref: str
+) -> tuple[list[dict[str, Any]], str]:
+    """Return (records, stderr) from git diff --name-status -M base...head.
+
+    Each record has:
+      - path        : primary path (destination for R/C, the file for M/A/D)
+      - old_path    : source path for R (rename) and C (copy); absent otherwise
+      - new_path    : destination path for R and C; absent otherwise
+      - status      : R/C/M/A/D
+    """
+    result = run_git(
+        ["diff", "--name-status", "-M", f"{base_ref}...{head_ref}"], repo_root
+    )
+    if result.returncode != 0:
+        return [], result.stderr
+    records: list[dict[str, Any]] = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        status = parts[0]
+        if status in ("R", "C"):
+            if len(parts) >= 3:
+                records.append({
+                    "path": parts[2],
+                    "old_path": parts[1],
+                    "new_path": parts[2],
+                    "status": status,
+                })
+        else:
+            path = parts[1] if len(parts) >= 2 else ""
+            records.append({
+                "path": path,
+                "old_path": None,
+                "new_path": None,
+                "status": status,
+            })
+    return records, ""
+
+
 def compute_diff_patch(
     repo_root: Path,
     base_ref: str,
@@ -128,9 +169,73 @@ def compute_diff_patch(
     return patch, added_lines, ""
 
 
+def _path_glob_matches(pattern: str, path: str) -> bool:
+    """Return True if path matches the glob pattern with path-segment semantics.
+
+    - "*" matches within one path segment only (no "/" allowed in the match).
+    - "?" matches within one path segment only.
+    - "**" may match across "/" boundaries (zero or more segments).
+    - All other characters match literally.
+
+    Examples:
+      pattern "scripts/*.py" matches "scripts/foo.py"
+      pattern "scripts/*.py" does NOT match "scripts/local/foo.py"
+      pattern "scripts/**/*.py" matches "scripts/local/foo.py"
+      pattern ".github/workflows/**" matches ".github/workflows/ci.yml"
+    """
+    # Normalize to POSIX-style forward slashes
+    norm_pat = pattern.replace("\\", "/")
+    norm_path = path.replace("\\", "/")
+
+    pat_parts = norm_pat.split("/")
+    path_parts = norm_path.split("/")
+
+    def match_segments(pi: int, pj: int, xi: int, xj: int) -> bool:
+        """Match pat_parts[pi:pj] against path_parts[xi:xj]."""
+        while pi < pj and xi < xj:
+            pp = pat_parts[pi]
+            xp = path_parts[xi]
+            if pp == "**":
+                # ** can match zero or more segments; try all possibilities
+                for k in range(xi, xj + 1):
+                    if match_segments(pi + 1, pj, k, xj):
+                        return True
+                return False
+            elif pp == "*":
+                # * matches any single segment (no "/" in segment)
+                if "/" in xp:
+                    return False
+                pi += 1
+                xi += 1
+            elif pp == "?":
+                # ? matches any single character, no "/"
+                if "/" in xp or len(xp) != 1:
+                    return False
+                pi += 1
+                xi += 1
+            else:
+                # Literal segment — must match exactly
+                if not fnmatch.fnmatchcase(xp, pp):
+                    return False
+                pi += 1
+                xi += 1
+        # Handle trailing ** that can consume remaining path segments
+        if pi < pj and pat_parts[pi] == "**":
+            return True
+        if pi < pj and pat_parts[pi] == "*":
+            # Trailing * must not consume "/" segments
+            for k in range(xi, xj):
+                if "/" in path_parts[k]:
+                    return False
+            return True
+        return pi == pj and xi == xj
+
+    return match_segments(0, len(pat_parts), 0, len(path_parts))
+
+
 def matches_glob(path: str, pattern: str) -> bool:
-    """Return True if path matches the glob pattern (supports **)."""
-    return fnmatch.fnmatch(path, pattern)
+    """Return True if path matches the glob pattern (path-segment aware)."""
+    return _path_glob_matches(pattern, path)
 
 
 def is_companion_test(file_path: str, source_path: str) -> bool:
@@ -226,11 +331,14 @@ def audit_scope(
                              f"Failed to resolve head-ref: {head_result.stderr}")
     head_sha = head_result.stdout.strip()
 
-    # Step 2: compute changed files
-    changed_files, err = compute_changed_files(repo_root, base_ref, head_ref)
-    if err and not changed_files:
+    # Step 2: compute changed file records (with rename/copy metadata)
+    file_records, rec_err = compute_changed_file_records(repo_root, base_ref, head_ref)
+    if rec_err and not file_records:
         return _error_report(repo_root, base_ref, head_ref, "ERROR_TOOL_FAILURE",
-                             f"git diff failed: {err}")
+                             f"git diff --name-status failed: {rec_err}")
+
+    # Derive simple changed_files list for backward compatibility
+    changed_files = [rec["path"] for rec in file_records]
 
     # Step 3: compute diff patch
     patch, added_line_count, diff_err = compute_diff_patch(
@@ -247,9 +355,10 @@ def audit_scope(
             STATUS_HOLD_GIT_DIFF_TOO_LARGE,
             allow_files, allow_globs, forbid_files, forbid_globs,
             allow_companion_tests, source_paths,
+            file_records=[],
         )
 
-    # Step 4: classify files
+    # Step 4: classify files (including rename/copy source paths)
     file_results: list[dict[str, Any]] = []
     forbidden_path_matches: list[dict[str, Any]] = []
     not_allowlisted_files: list[str] = []
@@ -257,53 +366,77 @@ def audit_scope(
 
     has_allowlist = bool(allow_files or allow_globs)
 
-    for f in changed_files:
-        classification = "allowed"
-        reason = ""
+    for rec in file_records:
+        # Collect all paths that need classification for this record
+        paths_to_check: list[tuple[str, str | None]] = []
+        paths_to_check.append((rec["path"], None))  # (path, matched_side)
+        if rec["status"] in ("R", "C") and rec["old_path"]:
+            paths_to_check.append((rec["old_path"], "old_path"))
+        if rec["status"] in ("R", "C") and rec["new_path"]:
+            paths_to_check.append((rec["new_path"], "new_path"))
 
-        # Check forbidden exact paths
-        if f in forbid_files:
-            classification = "forbidden_file"
-            reason = f"exact forbid-file match: {f}"
-            forbidden_path_matches.append({"file": f, "type": "forbidden_file", "match": f})
-        # Check forbidden globs
-        else:
-            for glob_pat in forbid_globs:
-                if matches_glob(f, glob_pat):
-                    classification = "forbidden_glob"
-                    reason = f"forbid-glob match: {glob_pat}"
-                    forbidden_path_matches.append({"file": f, "type": "forbidden_glob", "match": glob_pat})
-                    break
+        record_has_forbidden = False
+        record_file_results: list[dict[str, Any]] = []
 
-        # Check allowlist (if provided)
-        if classification == "allowed" and has_allowlist:
-            allowed = False
-            if f in allow_files:
-                allowed = True
+        for path, side in paths_to_check:
+            classification = "allowed"
+            reason = ""
+
+            # Check forbidden exact paths
+            if path in forbid_files:
+                classification = "forbidden_file"
+                reason = f"exact forbid-file match: {path}"
+                forbidden_path_matches.append({
+                    "file": path, "type": "forbidden_file", "match": path,
+                    "old_path": rec.get("old_path"), "new_path": rec.get("new_path"),
+                    "status": rec["status"], "matched_side": side or "path",
+                })
+                record_has_forbidden = True
             else:
-                for g in allow_globs:
-                    if matches_glob(f, g):
-                        allowed = True
+                for glob_pat in forbid_globs:
+                    if matches_glob(path, glob_pat):
+                        classification = "forbidden_glob"
+                        reason = f"forbid-glob match: {glob_pat}"
+                        forbidden_path_matches.append({
+                            "file": path, "type": "forbidden_glob", "match": glob_pat,
+                            "old_path": rec.get("old_path"), "new_path": rec.get("new_path"),
+                            "status": rec["status"], "matched_side": side or "path",
+                        })
+                        record_has_forbidden = True
                         break
-            if not allowed:
-                # Companion test allowance
-                if allow_companion_tests:
-                    for src in source_paths:
-                        if is_companion_test(f, src):
-                            classification = "companion_test_allowed"
-                            companion_test_files.append(f)
-                            reason = f"companion test for {src}"
-                            break
-                if classification == "allowed":
-                    classification = "not_allowlisted"
-                    reason = f"not in allowlist"
-                    not_allowlisted_files.append(f)
 
-        file_results.append({
-            "file": f,
-            "classification": classification,
-            "reason": reason,
-        })
+            # Check allowlist (if provided)
+            if classification == "allowed" and has_allowlist:
+                allowed = False
+                if path in allow_files:
+                    allowed = True
+                else:
+                    for g in allow_globs:
+                        if matches_glob(path, g):
+                            allowed = True
+                            break
+                if not allowed:
+                    if allow_companion_tests:
+                        for src in source_paths:
+                            if is_companion_test(path, src):
+                                classification = "companion_test_allowed"
+                                companion_test_files.append(path)
+                                reason = f"companion test for {src}"
+                                break
+                    if classification == "allowed":
+                        classification = "not_allowlisted"
+                        reason = f"not in allowlist"
+                        not_allowlisted_files.append(path)
+
+            record_file_results.append({
+                "file": path,
+                "classification": classification,
+                "reason": reason,
+                "matched_side": side or "path",
+            })
+
+        # Store primary path result
+        file_results.append(record_file_results[0])
 
     # Step 5: scan diff for forbidden patterns
     # Exclude scope_guard's own source files from diff scanning — they
@@ -330,6 +463,7 @@ def audit_scope(
         status,
         allow_files, allow_globs, forbid_files, forbid_globs,
         allow_companion_tests, source_paths,
+        file_records=file_records,
     )
 
 
@@ -381,7 +515,10 @@ def _build_report(
     forbid_globs: list[str],
     allow_companion_tests: bool,
     source_paths: list[str],
+    file_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    if file_records is None:
+        file_records = []
     return {
         "status": status,
         "repo_root": str(repo_root),
@@ -406,6 +543,7 @@ def _build_report(
         "audit_only": True,
         "companion_tests_used": allow_companion_tests,
         "source_paths": source_paths,
+        "changed_file_records": file_records,
     }
 
 
