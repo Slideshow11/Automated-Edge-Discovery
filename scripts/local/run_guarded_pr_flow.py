@@ -208,7 +208,70 @@ def write_md_report(path: str, data: dict) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-def main() -> int:
+def _find_forbidden_token(raw_args: list[str]) -> str | None:
+    """Return the first forbidden token found, or None."""
+    for token in raw_args:
+        if token in _FORBIDDEN_TOKENS:
+            return token
+    return None
+
+
+def _write_forbidden_report(
+    json_path: str | None,
+    md_path: str | None,
+    error: str,
+) -> None:
+    """Write JSON and/or Markdown report for forbidden-token rejection."""
+    # Build a complete report dict so write_md_report has all required fields.
+    now = datetime.now(timezone.utc).isoformat()
+    report = {
+        "status": STATUS_ERROR_TOOL_FAILURE,
+        "error": error,
+        "repo": "",
+        "repo_root": "",
+        "pr_number": 0,
+        "expected_head": "",
+        "output_dir": "",
+        "gate_order": PLANNED_GATE_ORDER,
+        "started_at": now,
+        "finished_at": now,
+        "elapsed_seconds": 0.0,
+        "audit_only": True,
+        "merge_executed": False,
+        "mutated_github": False,
+        "used_admin": False,
+        "used_auto": False,
+        "comments_deleted": False,
+        "reviews_dismissed": False,
+        "threads_resolved": False,
+        "workflows_changed": False,
+        "branch_protection_changed": False,
+    }
+    if json_path:
+        write_json_report(json_path, report)
+    if md_path:
+        # write_md_report needs the report to have repo, pr_number, etc.
+        write_md_report(md_path, report)
+
+
+def main(argv: list[str] | None = None) -> int:
+    # ---- Collect raw args BEFORE argparse parses anything ----
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+
+    # ---- Check forbidden tokens before parse_args can exit ----
+    forbidden = _find_forbidden_token(raw_args)
+    if forbidden:
+        json_path = None
+        md_path = None
+        for i, tok in enumerate(raw_args):
+            if tok == "--output-json" and i + 1 < len(raw_args):
+                json_path = raw_args[i + 1]
+            elif tok == "--output-md" and i + 1 < len(raw_args):
+                md_path = raw_args[i + 1]
+        _write_forbidden_report(json_path, md_path, f"Forbidden token in argv: {forbidden}")
+        print(f"ERROR_TOOL_FAILURE: Forbidden token in argv: {forbidden}", file=sys.stderr)
+        return 1
+
     parser = argparse.ArgumentParser(
         description="Guarded PR flow orchestrator — v1 skeleton (audit-only, no gate calls).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -224,28 +287,7 @@ def main() -> int:
                         help="Skip waiter gate (future use)")
     parser.add_argument("--skip-merge-verifier", action="store_true", default=False,
                         help="Skip merge verifier gate (future use)")
-    args = parser.parse_args()
-
-    # ---- Forbidden token guard ----
-    try:
-        reject_forbidden_tokens(sys.argv)
-    except ValueError as e:
-        report = build_report(
-            status=STATUS_ERROR_TOOL_FAILURE,
-            repo=args.repo,
-            repo_root=args.repo_root,
-            pr_number=args.pr_number,
-            expected_head=args.expected_head,
-            output_dir=args.output_dir,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            finished_at=datetime.now(timezone.utc).isoformat(),
-            elapsed_seconds=0.0,
-        )
-        report["error"] = str(e)
-        write_json_report(args.output_json, report)
-        write_md_report(args.output_md, report)
-        print(f"ERROR_TOOL_FAILURE: {e}", file=sys.stderr)
-        return 1
+    args = parser.parse_args(raw_args)
 
     started_at = datetime.now(timezone.utc).isoformat()
 
