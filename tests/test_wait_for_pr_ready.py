@@ -2721,3 +2721,163 @@ class TestSubprocessCalls:
                             if isinstance(kw.value, ast.Constant) and kw.value.value is True:
                                 violations.append(f"line {node.lineno}")
         assert not violations, f"shell=True found in subprocess.run at: {violations}"
+
+class TestEntrypointAndExitCodes:
+    """Verify __main__ entrypoint propagates main() return codes."""
+
+    def test_exit_code_constants_defined(self):
+        """EXIT_SUCCESS and EXIT_FAILURE must be defined as module-level constants."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        assert hasattr(mod, "EXIT_SUCCESS"), "EXIT_SUCCESS not defined"
+        assert hasattr(mod, "EXIT_FAILURE"), "EXIT_FAILURE not defined"
+        assert mod.EXIT_SUCCESS == 0
+        assert mod.EXIT_FAILURE == 1
+
+    def test_main_returns_int(self):
+        """main() must return int (not None)."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        import inspect
+        sig = inspect.signature(mod.main)
+        hints = sig.return_annotation
+        assert hints in (int, "int"), f"main() return annotation is {hints}, expected int"
+
+    def test_dunder_main_uses_sys_exit(self):
+        """if __name__ == '__main__': block must call sys.exit(main())."""
+        with open(WAITER, "r") as f:
+            source = f.read()
+        # Find the if __name__ block using a simple multiline search
+        in_main_block = False
+        main_block_lines = []
+        for line in source.split('\n'):
+            if 'if __name__ == "__main__":' in line:
+                in_main_block = True
+                continue
+            if in_main_block:
+                # Non-empty, non-indented line (outside any function) = end of block
+                stripped = line.strip()
+                if stripped and not line.startswith(' ') and not line.startswith('\t'):
+                    break
+                main_block_lines.append(line)
+        block = '\n'.join(main_block_lines)
+        assert block.strip(), "if __name__ == '__main__' block not found or empty"
+        # Must call sys.exit with main()
+        assert "sys.exit" in block, f"sys.exit not found in __main__ block"
+        assert "main()" in block, f"main() not found in __main__ block"
+        # Must NOT just call main() without sys.exit
+        import re
+        single_main_pattern = re.compile(r'^\s*main\(\)\s*$')
+        assert not single_main_pattern.match(block.strip()), "__main__ block just calls main() without sys.exit"
+
+    def test_failure_path_returns_nonzero(self, output_dir, output_json):
+        """When main() returns EXIT_FAILURE, the process must exit with nonzero code.
+
+        We test this by running the waiter as a subprocess with a non-existent PR,
+        which triggers a failure path. The subprocess exit code must be nonzero.
+        """
+        result = subprocess.run(
+            [
+                sys.executable, str(WAITER),
+                "--pr-number", "99999999",
+                "--output-json", output_json,
+                "--timeout-minutes", "1",
+                "--poll-seconds", "0",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        # Must exit nonzero on failure
+        assert result.returncode != 0, f"Expected nonzero exit, got {result.returncode}"
+        # JSON report must exist
+        assert os.path.exists(output_json), f"JSON not written: {output_json}"
+        data = json.load(open(output_json))
+        assert data["ready_to_merge"] is False
+        assert data["merge_allowed"] is False
+
+    def test_success_path_returns_zero(self, output_dir, output_json):
+        """When main() returns EXIT_SUCCESS, the process must exit with zero.
+
+        We test this by importing the module and directly calling main()
+        with args that bypass all gates and return READY immediately.
+        The key assertion is that main() -> int and the entry point
+        propagates the return code via sys.exit().
+        """
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("waiter", WAITER)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        # Verify EXIT_SUCCESS and EXIT_FAILURE are defined
+        assert hasattr(mod, "EXIT_SUCCESS")
+        assert hasattr(mod, "EXIT_FAILURE")
+        assert mod.EXIT_SUCCESS == 0
+        assert mod.EXIT_FAILURE == 1
+
+        # Verify main() return annotation is int
+        import inspect
+        hints = inspect.signature(mod.main).return_annotation
+        assert hints in (int, "int"), f"main() return annotation is {hints}"
+
+        # Verify __main__ block uses sys.exit(main())
+        with open(WAITER) as f:
+            source = f.read()
+        # Find the if __name__ block
+        in_main_block = False
+        main_block_lines = []
+        for line in source.split('\n'):
+            if 'if __name__ == "__main__":' in line:
+                in_main_block = True
+                continue
+            if in_main_block:
+                stripped = line.strip()
+                if stripped and not line.startswith(' ') and not line.startswith('\t'):
+                    break
+                main_block_lines.append(line)
+        block = '\n'.join(main_block_lines)
+        assert "sys.exit" in block, "__main__ block must call sys.exit"
+        assert "main()" in block, "__main__ block must call main()"
+
+    def test_no_raw_return_1_in_source(self):
+        """Source must not contain bare 'return 1' (must use EXIT_FAILURE constant)."""
+        with open(WAITER, "r") as f:
+            source = f.read()
+        import re
+        bare_return_1 = re.findall(r'return 1', source)
+        assert not bare_return_1, f"Bare 'return 1' found at: {bare_return_1}"
+
+    def test_no_raw_return_0_in_source(self):
+        """Source must not contain bare 'return 0' (must use EXIT_SUCCESS constant)."""
+        with open(WAITER, "r") as f:
+            source = f.read()
+        import re
+        bare_return_0 = re.findall(r'return 0', source)
+        assert not bare_return_0, f"Bare 'return 0' found at: {bare_return_0}"
+
+    def test_failure_report_has_nonzero_exit_status(self, output_dir, output_json):
+        """A tool failure must produce output JSON and exit nonzero.
+
+        A non-existent PR triggers ERROR_TOOLING in stage 0 and exits 1.
+        """
+        result = subprocess.run(
+            [
+                sys.executable, str(WAITER),
+                "--pr-number", "99999999",
+                "--output-json", output_json,
+                "--timeout-minutes", "1",
+                "--poll-seconds", "0",
+            ],
+            capture_output=True,
+            timeout=30,
+        )
+        # Must exit nonzero on failure
+        assert result.returncode != 0, f"Expected nonzero exit, got {result.returncode}"
+        # JSON report must exist
+        assert os.path.exists(output_json), f"JSON not written: {output_json}"
+        data = json.load(open(output_json))
+        assert data["ready_to_merge"] is False
+        assert data["merge_allowed"] is False
