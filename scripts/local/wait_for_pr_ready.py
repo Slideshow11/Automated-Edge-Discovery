@@ -78,6 +78,10 @@ STATUS_INTERRUPTED_WAIT_FOR_READY = "INTERRUPTED_WAIT_FOR_READY"
 STATUS_ERROR_UNEXPECTED_EXCEPTION = "ERROR_UNEXPECTED_EXCEPTION"
 STATUS_ERROR_TOOL_TIMEOUT = "ERROR_TOOL_TIMEOUT"
 
+# Exit codes for the process
+EXIT_SUCCESS = 0
+EXIT_FAILURE = 1
+
 # ---------------------------------------------------------------------------
 # Review-comment gate — allowed ignore users (auditable suppression allowlist)
 # ---------------------------------------------------------------------------
@@ -1071,7 +1075,7 @@ def main() -> int:
             _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
             _REPORT["next_safe_action"] = next_action_for_status(STATUS_ERROR_TOOLING, args.pr_number, initial_head_sha or "unknown")
             _write_final(STATUS_ERROR_TOOLING, initial_head_sha or "", _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         if pr_state == "merged":
             _add_stage("merged_pr_check", STATUS_READY_PR_ALREADY_MERGED, "PR is already merged")
@@ -1084,7 +1088,7 @@ def main() -> int:
                 True,
                 True,
             )
-            return 0
+            return EXIT_SUCCESS
 
         if pr_state == "closed":
             _add_stage("closed_pr_check", STATUS_HOLD_PR_NOT_OPEN, "PR is closed and cannot be merged")
@@ -1095,7 +1099,7 @@ def main() -> int:
                 False,
                 False,
             )
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage PMG snapshot (if needed) ----
         pmg_before_json = None
@@ -1119,7 +1123,7 @@ def main() -> int:
                 _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
                 _REPORT["next_safe_action"] = next_action_for_status(STATUS_ERROR_TOOLING, args.pr_number, initial_head_sha)
                 _write_final(STATUS_ERROR_TOOLING, initial_head_sha, _REPORT["next_safe_action"], False, False)
-                return 1
+                return EXIT_FAILURE
 
         # ---- Stage 1: Poll CI ----
         _REPORT["current_phase"] = "ci_poll"
@@ -1138,7 +1142,7 @@ def main() -> int:
             _REPORT["error_type"] = "TIMEOUT_WAIT_FOR_READY"
             _REPORT["next_safe_action"] = next_action_for_status(ci_status, args.pr_number, initial_head_sha)
             _write_final(ci_status, initial_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         if ci_status != STATUS_READY_FOR_FINAL_GATES:
             _REPORT["last_known_state"] = f"ci_poll_{ci_status}"
@@ -1146,7 +1150,7 @@ def main() -> int:
             _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
             _REPORT["next_safe_action"] = next_action_for_status(ci_status, args.pr_number, initial_head_sha)
             _write_final(ci_status, initial_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage 2: Re-read head SHA (detect change after CI) ----
         current_head_sha = get_live_head_sha(args.pr_number)
@@ -1157,7 +1161,7 @@ def main() -> int:
             _REPORT["error_type"] = "HOLD_HEAD_CHANGED"
             _REPORT["next_safe_action"] = next_action_for_status(STATUS_HOLD_HEAD_CHANGED, args.pr_number, current_head_sha)
             _write_final(STATUS_HOLD_HEAD_CHANGED, current_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage 3: Review-comment gate (optional) ----
         review_gate_json = args.output_json.replace(".json", "_review_gate.json")
@@ -1178,7 +1182,7 @@ def main() -> int:
                 _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
                 _REPORT["next_safe_action"] = next_action_for_status(rg_status, args.pr_number, current_head_sha)
                 _write_final(rg_status, current_head_sha, _REPORT["next_safe_action"], False, False)
-                return 1
+                return EXIT_FAILURE
 
         # ---- Conversation resolution enforcement ----
         pr_view_result = gh_run(
@@ -1197,7 +1201,7 @@ def main() -> int:
             _REPORT["error_type"] = "HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION"
             _REPORT["next_safe_action"] = next_action_for_status(STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION, args.pr_number, current_head_sha)
             _write_final(STATUS_HOLD_REVIEW_COMMENTS_REQUIRED_BY_BRANCH_PROTECTION, current_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage 4: PMG compare (optional) ----
         pmg_compare_json = args.output_json.replace(".json", "_pmg_compare.json")
@@ -1216,7 +1220,7 @@ def main() -> int:
                 _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
                 _REPORT["next_safe_action"] = next_action_for_status(pmg_status, args.pr_number, current_head_sha)
                 _write_final(pmg_status, current_head_sha, _REPORT["next_safe_action"], False, False)
-                return 1
+                return EXIT_FAILURE
 
         # ---- Stage 5: Re-read head SHA (final check before final gates) ----
         final_head_sha = get_live_head_sha(args.pr_number)
@@ -1227,7 +1231,7 @@ def main() -> int:
             _REPORT["error_type"] = "HOLD_HEAD_CHANGED"
             _REPORT["next_safe_action"] = next_action_for_status(STATUS_HOLD_HEAD_CHANGED, args.pr_number, final_head_sha)
             _write_final(STATUS_HOLD_HEAD_CHANGED, final_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage 6: final_gate_status.py (optional) ----
         final_gate_json = args.output_json.replace(".json", "_final_gate.json")
@@ -1250,7 +1254,7 @@ def main() -> int:
                 _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
                 _REPORT["next_safe_action"] = next_action_for_status(fg_status, args.pr_number, final_head_sha)
                 _write_final(fg_status, final_head_sha, _REPORT["next_safe_action"], False, False)
-                return 1
+                return EXIT_FAILURE
             if fg_status == STATUS_HOLD_PR_NOT_OPEN:
                 _add_stage("complete", STATUS_READY_TO_MERGE_CANDIDATE, "PR merged during wait; CI was green")
                 _REPORT["ready_to_merge"] = True
@@ -1262,7 +1266,7 @@ def main() -> int:
                     True,
                     True,
                 )
-                return 0
+                return EXIT_SUCCESS
 
         # ---- Conversation resolution check ----
         require_conv = conversation_resolution_required(repo_name, base_branch)
@@ -1276,7 +1280,7 @@ def main() -> int:
             _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
             _REPORT["next_safe_action"] = next_action_for_status(conv_status, args.pr_number, final_head_sha)
             _write_final(conv_status, final_head_sha, _REPORT["next_safe_action"], False, False)
-            return 1
+            return EXIT_FAILURE
 
         # ---- Stage 7: verify_final_head_merge_command.py ----
         if args.require_final_gates or args.require_merge_ready:
@@ -1296,7 +1300,7 @@ def main() -> int:
                 _REPORT["error_type"] = "ERROR_TOOL_FAILURE"
                 _REPORT["next_safe_action"] = next_action_for_status(vr_status, args.pr_number, final_head_sha)
                 _write_final(vr_status, final_head_sha, _REPORT["next_safe_action"], False, False)
-                return 1
+                return EXIT_FAILURE
 
         # ---- All gates passed ----
         _add_stage("complete", STATUS_READY_TO_MERGE_CANDIDATE, "all gates passed")
@@ -1309,7 +1313,7 @@ def main() -> int:
             True,
             True,
         )
-        return 0
+        return EXIT_SUCCESS
 
     except KeyboardInterrupt:
         _REPORT["status"] = STATUS_INTERRUPTED_WAIT_FOR_READY
@@ -1320,7 +1324,7 @@ def main() -> int:
         _REPORT["ready_to_merge"] = False
         _REPORT["merge_allowed"] = False
         write_reports(_REPORT, args.output_json, _REPORT_OUTPUT_MD)
-        return 1
+        return EXIT_FAILURE
 
     except Exception as e:
         _REPORT["status"] = STATUS_ERROR_UNEXPECTED_EXCEPTION
@@ -1332,7 +1336,7 @@ def main() -> int:
         _REPORT["ready_to_merge"] = False
         _REPORT["merge_allowed"] = False
         write_reports(_REPORT, args.output_json, _REPORT_OUTPUT_MD)
-        return 1
+        return EXIT_FAILURE
 
 
 
