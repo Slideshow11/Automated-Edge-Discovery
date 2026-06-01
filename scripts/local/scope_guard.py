@@ -86,25 +86,16 @@ def run_git(args: list[str], repo_root: Path, timeout: int = 60) -> subprocess.C
     return subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
 
 
-def compute_changed_files(repo_root: Path, base_ref: str, head_ref: str) -> tuple[list[str], str]:
-    """Return (files, stderr) from git diff --name-only base...head."""
-    result = run_git(["diff", "--name-only", f"{base_ref}...{head_ref}"], repo_root)
-    if result.returncode != 0:
-        return [], result.stderr
-    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-    return files, ""
-
-
 def compute_changed_file_records(
     repo_root: Path, base_ref: str, head_ref: str
 ) -> tuple[list[dict[str, Any]], str]:
     """Return (records, stderr) from git diff --name-status -M base...head.
 
     Each record has:
-      - path        : primary path (destination for R/C, the file for M/A/D)
-      - old_path    : source path for R (rename) and C (copy); absent otherwise
-      - new_path    : destination path for R and C; absent otherwise
-      - status      : R/C/M/A/D
+      - path     : primary path (destination for R/C, the file for M/A/D)
+      - old_path : source path for R (rename) and C (copy); absent otherwise
+      - new_path : destination path for R and C; absent otherwise
+      - status   : R/C/M/A/D
     """
     result = run_git(
         ["diff", "--name-status", "-M", f"{base_ref}...{head_ref}"], repo_root
