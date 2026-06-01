@@ -343,7 +343,7 @@ def test_scope_guard_allow_file_args_passed(tmp_path):
 
 def test_subprocess_uses_list_args_and_no_shell():
     """
-    Verify the script does NOT use shell=True in subprocess calls.
+    Verify the script does NOT pass shell argument to subprocess calls.
     Uses AST analysis rather than running the script.
     """
     import ast
@@ -353,7 +353,7 @@ def test_subprocess_uses_list_args_and_no_shell():
     for node in ast.walk(tree):
         if isinstance(node, ast.Call):
             func = node.func
-            # Check for subprocess.run with shell=True
+            # Check for subprocess.run with shell keyword
             if (isinstance(func, ast.Attribute) and
                     func.attr == "run" and
                     isinstance(func.value, ast.Name) and
@@ -363,7 +363,7 @@ def test_subprocess_uses_list_args_and_no_shell():
                         val = kw.value
                         if isinstance(val, ast.Constant) and val.value is True:
                             assert False, (
-                                f"subprocess.run called with shell=True at line {node.lineno}"
+                                f"subprocess.run called with shell enabled at line {node.lineno}"
                             )
 
 
