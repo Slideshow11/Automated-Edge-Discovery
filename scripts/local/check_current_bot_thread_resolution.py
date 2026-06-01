@@ -176,33 +176,135 @@ def fetch_pr_state_and_head(repo: str, pr_number: int) -> Tuple[str, str]:
     return data.get("state", "UNKNOWN"), data.get("head", {}).get("sha", "")
 
 
-def fetch_thread(repo: str, pr_number: int, thread_id: str) -> Optional[dict]:
-    """Fetch a single review thread via a read-only GraphQL query.
+# ------------------------------------------------------------------
+# Pagination knobs
+# ------------------------------------------------------------------
 
-    Returns the thread dict (with isResolved/isOutdated/comments) or None
-    if the thread is not present. No write operation is ever constructed
-    here.
+# Threads per page when scanning pullRequest.reviewThreads. GitHub's
+# Relay-style connection accepts any value; 50 keeps the per-page
+# payload small and lets us fan out across the most common PRs.
+THREAD_PAGE_SIZE = 50
+
+# Comments per page when reading thread.comments. 50 mirrors the
+# thread page size so a single bot thread with up to 50 comments
+# fits in one round trip.
+COMMENT_PAGE_SIZE = 50
+
+# Defensive upper bound on pages scanned. 40 pages * 50 = 2000,
+# which is many orders of magnitude above a typical PR but caps
+# pathological inputs (corrupt cursors, GitHub API bugs, etc.).
+MAX_THREAD_PAGES = 40
+MAX_COMMENT_PAGES = 40
+
+
+def fetch_thread(repo: str, pr_number: int, thread_id: str) -> Optional[dict]:
+    """Fetch a single review thread via paginated, read-only GraphQL.
+
+    Phase 1 pages through pullRequest.reviewThreads using
+    pageInfo.hasNextPage / endCursor until the target thread is found
+    or all pages are exhausted. Phase 2 then pages the target thread's
+    comments using comments.pageInfo until every comment is collected.
+
+    Returns a thread dict with all comments merged, or None if the
+    target thread is not present after the full scan. No write
+    operation is ever constructed here; every gh_api call is a
+    read-only query.
     """
     owner, name = repo.split("/", 1)
-    q = (
-        '{repository(owner:"' + owner + '",name:"' + name + '"){'
-        'pullRequest(number:' + str(pr_number) + '){'
-        'reviewThreads(first:100){nodes{'
-        'id isResolved isOutdated '
-        'comments(first:10){nodes{body author{login}}}}}}}}'
-    )
-    data = gh_api("graphql", "--field", f"query={q}")
-    nodes = (
-        data.get("data", {})
-        .get("repository", {})
-        .get("pullRequest", {})
-        .get("reviewThreads", {})
-        .get("nodes", [])
-    )
-    for node in nodes:
-        if node.get("id") == thread_id:
-            return node
-    return None
+
+    # ----- Phase 1: page through reviewThreads to find the target ---
+    cursor_arg = "null"
+    pages_scanned = 0
+    target_meta: Optional[dict] = None
+    while pages_scanned < MAX_THREAD_PAGES:
+        pages_scanned += 1
+        q = (
+            '{repository(owner:"' + owner + '",name:"' + name + '"){'
+            'pullRequest(number:' + str(pr_number) + '){'
+            'reviewThreads(first:' + str(THREAD_PAGE_SIZE)
+            + ',after:' + cursor_arg + '){'
+            'pageInfo{hasNextPage endCursor}'
+            'nodes{id isResolved isOutdated path line}'
+            '}}}}'
+        )
+        data = gh_api("graphql", "--field", f"query={q}")
+        conn = (
+            data.get("data", {})
+            .get("repository", {})
+            .get("pullRequest", {})
+            .get("reviewThreads", {})
+        ) or {}
+        for node in conn.get("nodes") or []:
+            if node.get("id") == thread_id:
+                target_meta = node
+                break
+        if target_meta is not None:
+            break
+        page_info = conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            return None
+        cursor_arg = '"' + (page_info.get("endCursor") or "") + '"'
+
+    if target_meta is None:
+        # Defensive: bounded scan reached the page limit without
+        # finding the target. Treat as not-found rather than
+        # silently truncating.
+        return None
+
+    # ----- Phase 2: page through comments on the target thread -------
+    return _fetch_thread_with_all_comments(target_meta)
+
+
+def _fetch_thread_with_all_comments(thread_meta: dict) -> Optional[dict]:
+    """Fetch every comment on the given thread via paginated GraphQL.
+
+    Pages thread.comments using comments.pageInfo.hasNextPage /
+    endCursor until the connection is exhausted. Returns a fully
+    populated thread dict with all comments merged into a single
+    "comments": {"nodes": [...]} list, or None if the node lookup
+    fails. The function only issues read-only queries and never
+    mutates GitHub state.
+    """
+    thread_id = thread_meta.get("id", "")
+    if not thread_id:
+        return None
+
+    cursor_arg = "null"
+    pages_scanned = 0
+    all_comments: list = []
+    last_node: dict = {}
+    while pages_scanned < MAX_COMMENT_PAGES:
+        pages_scanned += 1
+        q = (
+            '{node(id:"' + thread_id + '"){'
+            '... on PullRequestReviewThread{'
+            'id isResolved isOutdated path line '
+            'comments(first:' + str(COMMENT_PAGE_SIZE)
+            + ',after:' + cursor_arg + '){'
+            'pageInfo{hasNextPage endCursor}'
+            'nodes{body author{login} createdAt}'
+            '}}}}'
+        )
+        data = gh_api("graphql", "--field", f"query={q}")
+        node = data.get("data", {}).get("node")
+        if not node:
+            return None
+        last_node = node
+        comments_conn = node.get("comments") or {}
+        all_comments.extend(comments_conn.get("nodes") or [])
+        page_info = comments_conn.get("pageInfo") or {}
+        if not page_info.get("hasNextPage"):
+            break
+        cursor_arg = '"' + (page_info.get("endCursor") or "") + '"'
+
+    return {
+        "id": last_node.get("id"),
+        "isResolved": last_node.get("isResolved"),
+        "isOutdated": last_node.get("isOutdated"),
+        "path": last_node.get("path"),
+        "line": last_node.get("line"),
+        "comments": {"nodes": all_comments},
+    }
 
 
 def parse_approved_bots(raw: Optional[Iterable[str]]) -> Set[str]:
