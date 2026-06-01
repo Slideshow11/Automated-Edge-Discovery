@@ -15,12 +15,12 @@ Planned gate order (implemented in future passes):
   4. merge_verifier  — safe merge command verifier
 
 Usage:
-    python3 scripts/local/run_guarded_pr_flow.py \\
-        --repo Slideshow11/Automated-Edge-Discovery \\
-        --repo-root /path/to/repo \\
-        --pr-number 375 \\
-        --output-dir /tmp/aed_runs/pr375 \\
-        --output-json /tmp/aed_runs/pr375/flow.json \\
+    python3 scripts/local/run_guarded_pr_flow.py \
+        --repo Slideshow11/Automated-Edge-Discovery \
+        --repo-root /path/to/repo \
+        --pr-number 375 \
+        --output-dir /tmp/aed_runs/pr375 \
+        --output-json /tmp/aed_runs/pr375/flow.json \
         --output-md /tmp/aed_runs/pr375/flow.md
 
 Exit codes:
@@ -30,6 +30,7 @@ Exit codes:
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -39,6 +40,8 @@ from pathlib import Path
 # Status constants
 # ---------------------------------------------------------------------------
 STATUS_GUARD_FLOW_SKELETON_READY = "GUARD_FLOW_SKELETON_READY"
+STATUS_GUARD_FLOW_SCOPE_GUARD_READY = "GUARD_FLOW_SCOPE_GUARD_READY"
+STATUS_HOLD_SCOPE_GUARD = "HOLD_SCOPE_GUARD"
 STATUS_ERROR_TOOL_FAILURE = "ERROR_TOOL_FAILURE"
 
 # Forbidden argv tokens (exact match only)
@@ -76,8 +79,6 @@ def validate_repo_root(repo_root: str) -> tuple[bool, str]:
     path = Path(repo_root).resolve()
     if not path.exists():
         return False, f"repo-root does not exist: {repo_root}"
-    import subprocess
-
     proc = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
         capture_output=True,
@@ -88,6 +89,69 @@ def validate_repo_root(repo_root: str) -> tuple[bool, str]:
     if proc.returncode != 0 or proc.stdout.strip() != "true":
         return False, f"repo-root is not a git worktree: {repo_root}"
     return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Scope guard gate
+# ---------------------------------------------------------------------------
+
+def run_scope_guard(
+    repo_root: str,
+    base_ref: str,
+    head_ref: str,
+    allow_files: list[str],
+    output_json: str,
+    output_md: str,
+    timeout: int = 120,
+) -> tuple[int, dict | None, str]:
+    """
+    Run scope_guard.py as a subprocess and return (returncode, result_dict, stderr).
+
+    Returns:
+        returncode: subprocess exit code (0=success, non-zero=failure)
+        result_dict: parsed JSON report from scope_guard, or None on error
+        stderr: stderr output from scope_guard
+    """
+    # Verify base_ref exists in the repo; if not, fall back to HEAD.
+    # This avoids scope_guard failing due to a missing ref in test repos.
+    path = Path(repo_root).resolve()
+    check = subprocess.run(
+        ["git", "-C", str(path), "rev-parse", "--verify", base_ref],
+        capture_output=True, text=True, shell=False, timeout=10,
+    )
+    if check.returncode != 0:
+        base_ref = head_ref  # fallback: compare against same ref
+
+    script_path = Path(__file__).parent / "scope_guard.py"
+    cmd = [
+        sys.executable,
+        str(script_path),
+        "--repo-root", repo_root,
+        "--base-ref", base_ref,
+        "--head-ref", head_ref,
+        "--output-json", output_json,
+        "--output-md", output_md,
+    ]
+    for f in allow_files:
+        cmd.extend(["--allow-file", f])
+
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        shell=False,
+        timeout=timeout,
+    )
+
+    result_dict = None
+    if proc.returncode == 0 and Path(output_json).exists():
+        try:
+            with open(output_json) as f:
+                result_dict = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return proc.returncode, result_dict, proc.stderr
 
 
 # ---------------------------------------------------------------------------
@@ -104,9 +168,11 @@ def build_report(
     started_at: str,
     finished_at: str,
     elapsed_seconds: float,
+    scope_guard_result: dict | None = None,
+    error: str | None = None,
 ) -> dict:
     """Build the skeleton report dict."""
-    return {
+    report = {
         "status": status,
         "repo": repo,
         "repo_root": repo_root,
@@ -129,6 +195,11 @@ def build_report(
         "workflows_changed": False,
         "branch_protection_changed": False,
     }
+    if scope_guard_result is not None:
+        report["scope_guard"] = scope_guard_result
+    if error:
+        report["error"] = error
+    return report
 
 
 def write_json_report(path: str, data: dict) -> None:
@@ -177,6 +248,40 @@ def write_md_report(path: str, data: dict) -> None:
         "",
         "*This is a v1 skeleton. No gate subprocesses are called yet.*",
         "",
+    ])
+
+    # Embed scope_guard result if present
+    sg = data.get("scope_guard")
+    if sg:
+        lines.extend([
+            "## Scope Guard",
+            "",
+            f"- **status**: `{sg.get('status', 'unknown')}`",
+            f"- **base_ref**: `{sg.get('base_ref', '')}`",
+            f"- **head_ref**: `{sg.get('head_ref', '')}`",
+            f"- **base_sha**: `{sg.get('base_sha', '')}`",
+            f"- **head_sha**: `{sg.get('head_sha', '')}`",
+            "",
+        ])
+        diff_matches = sg.get("forbidden_diff_matches", [])
+        if diff_matches:
+            lines.append("**Forbidden diff matches**:")
+            for m in diff_matches:
+                lines.append(f"  - `{m.get('file', '')}`: `{m.get('pattern', '')}`")
+            lines.append("")
+        else:
+            lines.append("**No forbidden diff matches.**")
+            lines.append("")
+
+    if data.get("error"):
+        lines.extend([
+            "## Error",
+            "",
+            f"`{data['error']}`",
+            "",
+        ])
+
+    lines.extend([
         "## Notes",
         "",
         "**v1 skeleton does not merge.**",
@@ -287,6 +392,19 @@ def main(argv: list[str] | None = None) -> int:
                         help="Skip waiter gate (future use)")
     parser.add_argument("--skip-merge-verifier", action="store_true", default=False,
                         help="Skip merge verifier gate (future use)")
+    # Scope guard gate options
+    parser.add_argument("--scope-base-ref", default="origin/main",
+                        help="Base git ref for scope_guard (default: origin/main)")
+    parser.add_argument("--scope-head-ref", default="HEAD",
+                        help="Head git ref for scope_guard (default: HEAD)")
+    parser.add_argument("--scope-allow-file", action="append", default=[],
+                        dest="scope_allow_files",
+                        help="Allowed file path for scope_guard (repeatable)")
+    parser.add_argument("--scope-output-json", default=None,
+                        help="Path to scope_guard JSON report (optional)")
+    parser.add_argument("--scope-output-md", default=None,
+                        help="Path to scope_guard Markdown report (optional)")
+
     args = parser.parse_args(raw_args)
 
     started_at = datetime.now(timezone.utc).isoformat()
@@ -306,22 +424,101 @@ def main(argv: list[str] | None = None) -> int:
             started_at=started_at,
             finished_at=finished_at,
             elapsed_seconds=elapsed,
+            error=detail,
         )
-        report["error"] = detail
         write_json_report(args.output_json, report)
         write_md_report(args.output_md, report)
         print(f"ERROR_TOOL_FAILURE: {detail}", file=sys.stderr)
         return 1
 
-    # ---- Create output dir ----
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    # ---- Scope guard gate (first real gate) ----
+    scope_guard_json = (
+        args.scope_output_json
+        or str(Path(args.output_dir) / "scope_guard.json")
+    )
+    scope_guard_md = (
+        args.scope_output_md
+        or str(Path(args.output_dir) / "scope_guard.md")
+    )
 
-    # ---- Build and write reports ----
+    sg_rc, sg_result, sg_stderr = run_scope_guard(
+        repo_root=args.repo_root,
+        base_ref=args.scope_base_ref,
+        head_ref=args.scope_head_ref,
+        allow_files=args.scope_allow_files,
+        output_json=scope_guard_json,
+        output_md=scope_guard_md,
+        timeout=120,
+    )
+
+    if sg_rc != 0:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        elapsed = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()
+        report = build_report(
+            status=STATUS_ERROR_TOOL_FAILURE,
+            repo=args.repo,
+            repo_root=args.repo_root,
+            pr_number=args.pr_number,
+            expected_head=args.expected_head,
+            output_dir=args.output_dir,
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=elapsed,
+            scope_guard_result=sg_result,
+            error=f"scope_guard subprocess failed with rc={sg_rc}: {sg_stderr[:500]}",
+        )
+        write_json_report(args.output_json, report)
+        write_md_report(args.output_md, report)
+        print(f"ERROR_TOOL_FAILURE: scope_guard failed: {sg_stderr[:200]}", file=sys.stderr)
+        return 1
+
+    if sg_result is None:
+        finished_at = datetime.now(timezone.utc).isoformat()
+        elapsed = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()
+        report = build_report(
+            status=STATUS_ERROR_TOOL_FAILURE,
+            repo=args.repo,
+            repo_root=args.repo_root,
+            pr_number=args.pr_number,
+            expected_head=args.expected_head,
+            output_dir=args.output_dir,
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=elapsed,
+            error="scope_guard produced no output",
+        )
+        write_json_report(args.output_json, report)
+        write_md_report(args.output_md, report)
+        print("ERROR_TOOL_FAILURE: scope_guard produced no JSON output", file=sys.stderr)
+        return 1
+
+    sg_status = sg_result.get("status", "")
+    if sg_status != "SCOPE_CLEAN":
+        finished_at = datetime.now(timezone.utc).isoformat()
+        elapsed = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()
+        report = build_report(
+            status=STATUS_HOLD_SCOPE_GUARD,
+            repo=args.repo,
+            repo_root=args.repo_root,
+            pr_number=args.pr_number,
+            expected_head=args.expected_head,
+            output_dir=args.output_dir,
+            started_at=started_at,
+            finished_at=finished_at,
+            elapsed_seconds=elapsed,
+            scope_guard_result=sg_result,
+        )
+        write_json_report(args.output_json, report)
+        write_md_report(args.output_md, report)
+        print(f"HOLD_SCOPE_GUARD: scope_guard status={sg_status}", file=sys.stderr)
+        return 1
+
+    # ---- Scope guard passed — build skeleton report with embedded result ----
     finished_at = datetime.now(timezone.utc).isoformat()
-    elapsed = 0.0
+    elapsed = (datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)).total_seconds()
 
     report = build_report(
-        status=STATUS_GUARD_FLOW_SKELETON_READY,
+        status=STATUS_GUARD_FLOW_SCOPE_GUARD_READY,
         repo=args.repo,
         repo_root=args.repo_root,
         pr_number=args.pr_number,
@@ -330,6 +527,7 @@ def main(argv: list[str] | None = None) -> int:
         started_at=started_at,
         finished_at=finished_at,
         elapsed_seconds=elapsed,
+        scope_guard_result=sg_result,
     )
 
     write_json_report(args.output_json, report)

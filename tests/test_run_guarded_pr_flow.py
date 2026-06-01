@@ -1,7 +1,7 @@
 """
 tests/test_run_guarded_pr_flow.py
 =================================
-Unit tests for run_guarded_pr_flow.py v1 skeleton.
+Unit tests for run_guarded_pr_flow.py (scope guard gate).
 
 All tests are mocked/local — no network, no GitHub calls.
 """
@@ -12,27 +12,17 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 
 import pytest
 
-# The module under test — import via importlib to force re-load each time
+# The module under test
 MODULE_PATH = Path(__file__).parent.parent / "scripts" / "local" / "run_guarded_pr_flow.py"
 
 
 # ---------------------------------------------------------------------------
 # Helpers
-# -----------------------------------------------------------------------
-
-def _load_module():
-    """Load the module fresh, bypassing any cached imports."""
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("run_guarded_pr_flow", MODULE_PATH)
-    assert spec is not None and spec.loader is not None
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["run_guarded_pr_flow"] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
+# ---------------------------------------------------------------------------
 
 def _run_script(argv: list[str]) -> tuple[int, str, str]:
     """Run the script with given argv, return (rc, stdout, stderr)."""
@@ -46,7 +36,7 @@ def _run_script(argv: list[str]) -> tuple[int, str, str]:
 
 
 def _init_git_repo(path: Path) -> None:
-    """Initialise a bare git repo in path."""
+    """Initialise a git repo in path with a commit."""
     subprocess.run(["git", "init", str(path)], capture_output=True, shell=False)
     subprocess.run(
         ["git", "-C", str(path), "config", "user.email", "test@test.local"],
@@ -134,7 +124,7 @@ def test_rejects_admin_writes_markdown(tmp_path):
 
 
 def test_administrator_not_rejected():
-    """--administrator (different token) is NOT rejected."""
+    """--administrator (different token) is NOT rejected by pre-parse check."""
     json_path = "/tmp/out_admin_test.json"
     md_path = "/tmp/out_admin_test.md"
     rc, stdout, stderr = _run_script(
@@ -142,10 +132,7 @@ def test_administrator_not_rejected():
          "--output-dir", "/tmp/out_admin_test", "--output-json", json_path,
          "--output-md", md_path, "--administrator"]
     )
-    # Should not be rejected as forbidden (--administrator != --admin)
-    # argparse will reject it as an unknown option, but not our pre-parse check
     assert rc in (1, 2), f"expected rc 1 or 2, got {rc}: {stderr}"
-    # Should NOT contain our custom forbidden-token message
     assert "Forbidden token in argv: --administrator" not in stderr
 
 
@@ -187,7 +174,7 @@ def test_no_resolve_threads_option():
 
 
 # ---------------------------------------------------------------------------
-# Test 9-10: Repo-root validation
+# Test 9: Invalid repo root
 # ---------------------------------------------------------------------------
 
 def test_invalid_repo_root_returns_error():
@@ -205,99 +192,93 @@ def test_invalid_repo_root_returns_error():
     assert data["status"] == "ERROR_TOOL_FAILURE"
 
 
-def test_valid_temp_git_repo_returns_skeleton_ready(tmp_path):
-    """A valid temporary git repo returns GUARD_FLOW_SKELETON_READY."""
+# ---------------------------------------------------------------------------
+# Test 10-18: Scope guard gate — real integration tests (no mocking)
+# ---------------------------------------------------------------------------
+
+def test_clean_scope_guard_produces_scope_guard_ready(tmp_path):
+    """
+    With a clean scope (no changes), scope_guard returns SCOPE_CLEAN
+    and the flow produces GUARD_FLOW_SCOPE_GUARD_READY.
+    """
     _init_git_repo(tmp_path)
     json_path = str(tmp_path / "out.json")
     md_path = str(tmp_path / "out.md")
     out_dir = str(tmp_path / "out")
+
+    # Default args include no --scope-allow-file, so scope_guard sees no changes
     rc, stdout, stderr = _run_script(
-        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "1",
+        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
          "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
     )
-    assert rc == 0, f"stderr: {stderr}"
+
+    assert rc == 0, f"expected rc=0, got {rc}: {stderr}"
     assert Path(json_path).exists()
     data = json.loads(Path(json_path).read_text())
-    assert data["status"] == "GUARD_FLOW_SKELETON_READY"
-
-
-# ---------------------------------------------------------------------------
-# Test 11-17: Report content
-# ---------------------------------------------------------------------------
-
-def test_json_includes_audit_only_true(tmp_path):
-    """JSON report includes audit_only=true."""
-    _init_git_repo(tmp_path)
-    json_path = str(tmp_path / "out.json")
-    md_path = str(tmp_path / "out.md")
-    out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
-        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
-         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
-    )
-    assert rc == 0
-    data = json.loads(Path(json_path).read_text())
+    assert data["status"] == "GUARD_FLOW_SCOPE_GUARD_READY", f"unexpected status: {data['status']}"
     assert data["audit_only"] is True
-
-
-def test_json_includes_merge_executed_false(tmp_path):
-    """JSON report includes merge_executed=false."""
-    _init_git_repo(tmp_path)
-    json_path = str(tmp_path / "out.json")
-    md_path = str(tmp_path / "out.md")
-    out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
-        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
-         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
-    )
-    assert rc == 0
-    data = json.loads(Path(json_path).read_text())
     assert data["merge_executed"] is False
-
-
-def test_json_includes_mutated_github_false(tmp_path):
-    """JSON report includes mutated_github=false."""
-    _init_git_repo(tmp_path)
-    json_path = str(tmp_path / "out.json")
-    md_path = str(tmp_path / "out.md")
-    out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
-        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
-         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
-    )
-    assert rc == 0
-    data = json.loads(Path(json_path).read_text())
     assert data["mutated_github"] is False
 
 
-def test_json_includes_used_admin_false_and_used_auto_false(tmp_path):
-    """JSON report includes used_admin=false and used_auto=false."""
+def test_scope_guard_result_embedded_in_json(tmp_path):
+    """scope_guard result is embedded in the JSON report."""
     _init_git_repo(tmp_path)
     json_path = str(tmp_path / "out.json")
     md_path = str(tmp_path / "out.md")
     out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
+
+    rc, stdout, stderr = _run_script(
         ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
          "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
     )
+
     assert rc == 0
     data = json.loads(Path(json_path).read_text())
+    assert "scope_guard" in data
+    assert data["scope_guard"]["status"] == "SCOPE_CLEAN"
+    # base_ref is the provided value or the fallback (HEAD when origin/main is absent)
+    assert data["scope_guard"]["base_ref"] in ("origin/main", "HEAD")
+    assert data["scope_guard"]["head_ref"] == "HEAD"
+
+
+def test_scope_guard_section_in_markdown(tmp_path):
+    """scope_guard section appears in Markdown report."""
+    _init_git_repo(tmp_path)
+    json_path = str(tmp_path / "out.json")
+    md_path = str(tmp_path / "out.md")
+    out_dir = str(tmp_path / "out")
+
+    rc, stdout, stderr = _run_script(
+        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
+         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
+    )
+
+    assert rc == 0
+    md_text = Path(md_path).read_text()
+    assert "Scope Guard" in md_text
+    assert "SCOPE_CLEAN" in md_text
+
+
+def test_all_safety_invariants_false_in_clean_report(tmp_path):
+    """Clean scope_guard report has audit_only=True and all write flags False."""
+    _init_git_repo(tmp_path)
+    json_path = str(tmp_path / "out.json")
+    md_path = str(tmp_path / "out.md")
+    out_dir = str(tmp_path / "out")
+
+    rc, stdout, stderr = _run_script(
+        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
+         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
+    )
+
+    assert rc == 0
+    data = json.loads(Path(json_path).read_text())
+    assert data["audit_only"] is True
+    assert data["merge_executed"] is False
+    assert data["mutated_github"] is False
     assert data["used_admin"] is False
     assert data["used_auto"] is False
-
-
-def test_json_includes_safety_flags(tmp_path):
-    """JSON report includes all safety flags as False."""
-    _init_git_repo(tmp_path)
-    json_path = str(tmp_path / "out.json")
-    md_path = str(tmp_path / "out.md")
-    out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
-        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
-         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
-    )
-    assert rc == 0
-    data = json.loads(Path(json_path).read_text())
     assert data["comments_deleted"] is False
     assert data["reviews_dismissed"] is False
     assert data["threads_resolved"] is False
@@ -305,34 +286,85 @@ def test_json_includes_safety_flags(tmp_path):
     assert data["branch_protection_changed"] is False
 
 
-def test_markdown_says_skeleton_does_not_merge(tmp_path):
-    """Markdown report explicitly states v1 skeleton does not merge."""
+def test_planned_gate_order_unchanged(tmp_path):
+    """gate_order still lists all four planned gates."""
     _init_git_repo(tmp_path)
     json_path = str(tmp_path / "out.json")
     md_path = str(tmp_path / "out.md")
     out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
+
+    rc, stdout, stderr = _run_script(
         ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
          "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
     )
+
+    assert rc == 0
+    data = json.loads(Path(json_path).read_text())
+    assert data["gate_order"] == ["scope_guard", "review_threads", "waiter", "merge_verifier"]
+
+
+def test_markdown_says_does_not_merge(tmp_path):
+    """Markdown report explicitly states it does not merge."""
+    _init_git_repo(tmp_path)
+    json_path = str(tmp_path / "out.json")
+    md_path = str(tmp_path / "out.md")
+    out_dir = str(tmp_path / "out")
+
+    rc, stdout, stderr = _run_script(
+        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
+         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
+    )
+
     assert rc == 0
     md_text = Path(md_path).read_text()
     assert "does not merge" in md_text.lower()
 
 
-def test_planned_gate_order_includes_all_four_gates(tmp_path):
-    """gate_order lists scope_guard, review_threads, waiter, merge_verifier."""
+def test_scope_guard_allow_file_args_passed(tmp_path):
+    """--scope-allow-file args are passed through to scope_guard."""
     _init_git_repo(tmp_path)
     json_path = str(tmp_path / "out.json")
     md_path = str(tmp_path / "out.md")
     out_dir = str(tmp_path / "out")
-    rc, _, _ = _run_script(
+
+    rc, stdout, stderr = _run_script(
         ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
-         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path]
+         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path,
+         "--scope-allow-file", "scripts/local/run_guarded_pr_flow.py",
+         "--scope-allow-file", "tests/test_run_guarded_pr_flow.py"]
     )
+
     assert rc == 0
     data = json.loads(Path(json_path).read_text())
-    assert data["gate_order"] == ["scope_guard", "review_threads", "waiter", "merge_verifier"]
+    # With allow_files matching the changed files, scope should be clean
+    assert data["status"] == "GUARD_FLOW_SCOPE_GUARD_READY"
+    assert data["scope_guard"]["status"] == "SCOPE_CLEAN"
+
+
+def test_subprocess_uses_list_args_and_no_shell():
+    """
+    Verify the script does NOT use shell=True in subprocess calls.
+    Uses AST analysis rather than running the script.
+    """
+    import ast
+    src = MODULE_PATH.read_text()
+    tree = ast.parse(src)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call):
+            func = node.func
+            # Check for subprocess.run with shell=True
+            if (isinstance(func, ast.Attribute) and
+                    func.attr == "run" and
+                    isinstance(func.value, ast.Name) and
+                    func.value.id == "subprocess"):
+                for kw in node.keywords:
+                    if kw.arg == "shell":
+                        val = kw.value
+                        if isinstance(val, ast.Constant) and val.value is True:
+                            assert False, (
+                                f"subprocess.run called with shell=True at line {node.lineno}"
+                            )
 
 
 # ---------------------------------------------------------------------------
