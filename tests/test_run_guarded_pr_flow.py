@@ -36,7 +36,7 @@ def _run_script(argv: list[str]) -> tuple[int, str, str]:
 
 
 def _init_git_repo(path: Path) -> None:
-    """Initialise a git repo in path with a commit."""
+    """Initialise a git repo in path with a commit and local origin/main."""
     subprocess.run(["git", "init", str(path)], capture_output=True, shell=False)
     subprocess.run(
         ["git", "-C", str(path), "config", "user.email", "test@test.local"],
@@ -48,6 +48,20 @@ def _init_git_repo(path: Path) -> None:
     )
     subprocess.run(
         ["git", "-C", str(path), "commit", "--allow-empty", "-m", "init"],
+        capture_output=True, shell=False,
+    )
+    # Create main branch so origin/main can be set up
+    subprocess.run(
+        ["git", "-C", str(path), "branch", "main", "HEAD"],
+        capture_output=True, shell=False,
+    )
+    # Create a local origin remote pointing to the same repo so origin/main resolves
+    subprocess.run(
+        ["git", "-C", str(path), "remote", "add", "origin", str(path)],
+        capture_output=True, shell=False,
+    )
+    subprocess.run(
+        ["git", "-C", str(path), "fetch", "origin", "--no-prune"],
         capture_output=True, shell=False,
     )
 
@@ -221,6 +235,35 @@ def test_clean_scope_guard_produces_scope_guard_ready(tmp_path):
     assert data["mutated_github"] is False
 
 
+def test_missing_base_ref_fails_closed(tmp_path):
+    """An unresolvable base ref causes ERROR_TOOL_FAILURE, not a false SCOPE_CLEAN."""
+    _init_git_repo(tmp_path)
+    json_path = str(tmp_path / "out.json")
+    md_path = str(tmp_path / "out.md")
+    out_dir = str(tmp_path / "out")
+
+    # Request a base ref that does not exist in the repo
+    rc, stdout, stderr = _run_script(
+        ["--repo", "o/r", "--repo-root", str(tmp_path), "--pr-number", "375",
+         "--output-dir", out_dir, "--output-json", json_path, "--output-md", md_path,
+         "--scope-base-ref", "nonexistent/ref"]
+    )
+
+    # Must fail closed, not fall back to HEAD...HEAD
+    assert rc != 0, f"expected non-zero exit, got {rc}"
+
+    data = json.loads(Path(json_path).read_text())
+    # Status must be ERROR_TOOL_FAILURE (not SCOPE_CLEAN from a zero-diff fallback)
+    assert data["status"] in ("ERROR_TOOL_FAILURE",), (
+        f"expected ERROR_TOOL_FAILURE, got {data['status']}"
+    )
+    # scope_guard result is embedded when base ref is unresolved
+    assert "scope_guard" in data
+    # The error field must identify the missing base ref
+    assert "nonexistent/ref" in data.get("scope_guard", {}).get("error", "") or \
+           "nonexistent/ref" in data.get("error", "")
+
+
 def test_scope_guard_result_embedded_in_json(tmp_path):
     """scope_guard result is embedded in the JSON report."""
     _init_git_repo(tmp_path)
@@ -236,9 +279,9 @@ def test_scope_guard_result_embedded_in_json(tmp_path):
     assert rc == 0
     data = json.loads(Path(json_path).read_text())
     assert "scope_guard" in data
+    # With a resolvable base_ref, scope is clean
     assert data["scope_guard"]["status"] == "SCOPE_CLEAN"
-    # base_ref is the provided value or the fallback (HEAD when origin/main is absent)
-    assert data["scope_guard"]["base_ref"] in ("origin/main", "HEAD")
+    assert data["scope_guard"]["base_ref"] == "origin/main"
     assert data["scope_guard"]["head_ref"] == "HEAD"
 
 

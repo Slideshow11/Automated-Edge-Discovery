@@ -112,15 +112,44 @@ def run_scope_guard(
         result_dict: parsed JSON report from scope_guard, or None on error
         stderr: stderr output from scope_guard
     """
-    # Verify base_ref exists in the repo; if not, fall back to HEAD.
-    # This avoids scope_guard failing due to a missing ref in test repos.
     path = Path(repo_root).resolve()
     check = subprocess.run(
         ["git", "-C", str(path), "rev-parse", "--verify", base_ref],
         capture_output=True, text=True, shell=False, timeout=10,
     )
     if check.returncode != 0:
-        base_ref = head_ref  # fallback: compare against same ref
+        # Fail closed — do not silently fall back to HEAD vs HEAD (zero diff)
+        # which would produce a false SCOPE_CLEAN from scope_guard.
+        error_msg = f"base ref '{base_ref}' cannot be resolved in repo"
+        fallback_result = {
+            "status": "ERROR_TOOL_FAILURE",
+            "repo_root": str(path),
+            "base_ref": base_ref,
+            "head_ref": head_ref,
+            "error": error_msg,
+            "forbidden_diff_matches": [],
+            "forbidden_path_matches": [],
+            "mutated_github": False,
+            "modified_files": False,
+            "audit_only": True,
+        }
+        # Ensure output directory exists
+        Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_json, "w") as f:
+            json.dump(fallback_result, f, indent=2)
+        Path(output_md).parent.mkdir(parents=True, exist_ok=True)
+        md_content = (
+            "# Guarded PR Flow — Scope Guard Report\n\n"
+            f"**Status**: `ERROR_TOOL_FAILURE`\n\n"
+            f"**Error**: {error_msg}\n\n"
+            f"- base_ref: `{base_ref}`  \n"
+            f"- head_ref: `{head_ref}`  \n"
+            f"- repo_root: `{path}`  \n\n"
+            "*No gate passed. Fix the base ref before retrying.*\n"
+        )
+        with open(output_md, "w") as f:
+            f.write(md_content)
+        return 1, fallback_result, error_msg
 
     script_path = Path(__file__).parent / "scope_guard.py"
     cmd = [
@@ -134,6 +163,10 @@ def run_scope_guard(
     ]
     for f in allow_files:
         cmd.extend(["--allow-file", f])
+
+    # Ensure output directory exists before invoking scope_guard
+    Path(output_json).parent.mkdir(parents=True, exist_ok=True)
+    Path(output_md).parent.mkdir(parents=True, exist_ok=True)
 
     proc = subprocess.run(
         cmd,
