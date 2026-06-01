@@ -32,7 +32,6 @@ Exit codes:
 """
 
 import argparse
-import fnmatch
 import json
 import re
 import subprocess
@@ -160,6 +159,61 @@ def compute_diff_patch(
     return patch, added_lines, ""
 
 
+
+def _segment_matches_glob(pattern_seg: str, path_seg: str) -> bool:
+    """Return True if path_seg matches pattern_seg using glob semantics.
+
+    Uses re.translate internally to convert glob to regex.
+    """
+    # Translate glob pattern segment to regex
+    regex_pat = _glob_to_regex(pattern_seg)
+    return bool(re.match(regex_pat, path_seg))
+
+
+def _glob_to_regex(pattern: str) -> str:
+    """Convert a single-segment glob pattern to a regex pattern string.
+
+    Handles: * (any chars), ? (single char), [abc] (char class).
+    Does NOT handle / (path separator) — caller splits on / first.
+    """
+    result = []
+    i = 0
+    while i < len(pattern):
+        c = pattern[i]
+        if c == "*":
+            result.append("[^/]*")
+            i += 1
+        elif c == "?":
+            result.append("[^/]")
+            i += 1
+        elif c == "[":
+            # Find closing ]
+            j = i + 1
+            if j < len(pattern) and pattern[j] == "!":
+                result.append("[^")
+                j += 1
+            elif j < len(pattern) and pattern[j] == "^":
+                result.append("[^")
+                j += 1
+            else:
+                result.append("[")
+            while j < len(pattern) and pattern[j] != "]":
+                if pattern[j] in r"\^$.|()[]+{}":
+                    result.append("\\")
+                result.append(pattern[j])
+                j += 1
+            if j < len(pattern):
+                result.append(pattern[j])  # include ]
+                i = j + 1
+            else:
+                i = j
+        else:
+            if c in r"\^$.|()[]+{}?":
+                result.append("\\")
+            result.append(c)
+            i += 1
+    return "".join(result)
+
 def _path_glob_matches(pattern: str, path: str) -> bool:
     """Return True if path matches the glob pattern with path-segment semantics.
 
@@ -206,7 +260,7 @@ def _path_glob_matches(pattern: str, path: str) -> bool:
                 xi += 1
             else:
                 # Literal segment — must match exactly
-                if not fnmatch.fnmatchcase(xp, pp):
+                if not _segment_matches_glob(pp, xp):
                     return False
                 pi += 1
                 xi += 1
