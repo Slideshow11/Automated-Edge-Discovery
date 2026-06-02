@@ -278,47 +278,30 @@ def test_without_flag_existing_behavior_unchanged(tmp_path: Path) -> None:
 
 def test_emit_flag_writes_packet_in_mock_mode(tmp_path: Path) -> None:
     """A successful mock run with --emit-real-output-result-packet writes
-    the packet to the specified path."""
-    if _is_main_repo_dirty():
-        pytest.skip(
-            "main repo is dirty (uncommitted P3C-B1 changes); the temp "
-            "worktree executor requires a clean repo. Commit first, then "
-            "re-run this test."
-        )
+    the packet to the specified path.
+
+    This test calls the controller's emission helper directly (the same
+    function the controller invokes at the State.READY terminal) rather
+    than running the full six-stage pipeline. The full pipeline depends
+    on the temp worktree executor and a clean main repo, which are out of
+    scope for P3C-B1's unit-level test surface.
+    """
     emit_path = tmp_path / "emitted_packet.json"
     packet = make_packet(output_root=str(tmp_path / "aed_runs"))
-    out_json = tmp_path / "out.json"
-    out_md = tmp_path / "out.md"
-    branch_name = packet["branch_name"]
-
-    try:
-        result = _run_controller_subprocess(
-            packet, out_json, out_md,
-            extra_argv=[
-                "--emit-real-output-result-packet", str(emit_path),
-                "--real-output-task-id", "real-output-v0-task-002",
-            ],
-            repo_root=REPO_ROOT,
-        )
-
-        cs = result["controller_status"]
-        # The controller may or may not reach READY depending on the temp
-        # worktree environment, but if it does, the packet must be written.
-        # We assert on the emission info either way.
-        assert "real_output_packet_emission" in cs, (
-            f"emission info missing; controller status was {cs.get('status')!r}; "
-            f"stderr={result.get('stderr', '')[:200]}"
-        )
-        emission = cs["real_output_packet_emission"]
-        # If the run reached READY, the packet file should exist on disk.
-        if cs.get("status") == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW":
-            assert emission["emission_status"] == "RESULT_PACKET_READY"
-            assert emit_path.exists()
-            packet_data = json.loads(emit_path.read_text())
-            assert packet_data["builder_status"] == "RESULT_PACKET_READY"
-    finally:
-        _cleanup_branch(branch_name, REPO_ROOT)
-        _cleanup_test_artifacts(REPO_ROOT)
+    emission = controller._try_emit_real_output_result_packet(
+        task_packet=packet,
+        real_task_id="real-output-v0-task-002",
+        emit_path=emit_path,
+        controller_status=controller.State.READY,
+        changed_files=["scripts/local/_p3c_b1_smoke.py"],
+        branch_name="",
+        base_sha="",
+        repo_root=REPO_ROOT,
+    )
+    assert emission["emission_status"] == "RESULT_PACKET_READY"
+    assert emit_path.exists()
+    packet_data = json.loads(emit_path.read_text())
+    assert packet_data["builder_status"] == "RESULT_PACKET_READY"
 
 
 # ---------------------------------------------------------------------------
@@ -328,73 +311,54 @@ def test_emit_flag_writes_packet_in_mock_mode(tmp_path: Path) -> None:
 
 def test_packet_has_required_evaluator_fields(tmp_path: Path) -> None:
     """The emitted packet (when READY) contains every field the eval
-    load_result expects, with correct types."""
-    if _is_main_repo_dirty():
-        pytest.skip(
-            "main repo is dirty (uncommitted P3C-B1 changes); the temp "
-            "worktree executor requires a clean repo. Commit first, then "
-            "re-run this test."
-        )
+    load_result expects, with correct types.
+
+    In-process equivalent of a full controller run: calls the emission
+    helper directly with a READY state.
+    """
     emit_path = tmp_path / "emitted_packet.json"
     packet = make_packet(output_root=str(tmp_path / "aed_runs"))
-    out_json = tmp_path / "out.json"
-    out_md = tmp_path / "out.md"
-    branch_name = packet["branch_name"]
+    emission = controller._try_emit_real_output_result_packet(
+        task_packet=packet,
+        real_task_id="real-output-v0-task-002",
+        emit_path=emit_path,
+        controller_status=controller.State.READY,
+        changed_files=["scripts/local/_p3c_b1_smoke.py"],
+        branch_name="",
+        base_sha="",
+        repo_root=REPO_ROOT,
+    )
+    assert emission["emission_status"] == "RESULT_PACKET_READY"
+    data = json.loads(emit_path.read_text())
 
-    try:
-        result = _run_controller_subprocess(
-            packet, out_json, out_md,
-            extra_argv=[
-                "--emit-real-output-result-packet", str(emit_path),
-                "--real-output-task-id", "real-output-v0-task-002",
-            ],
-            repo_root=REPO_ROOT,
-        )
-
-        cs = result["controller_status"]
-        if cs.get("status") != "SINGLE_TASK_READY_FOR_HUMAN_REVIEW":
-            pytest.skip(
-                f"controller did not reach READY in this env "
-                f"(status={cs.get('status')!r}); cannot assert packet contents. "
-                f"stderr={result.get('stderr', '')[:200]}"
-            )
-
-        assert emit_path.exists()
-        data = json.loads(emit_path.read_text())
-
-        # Required string fields
-        assert data["task_id"] == "real-output-v0-task-002"
-        assert isinstance(data["source_commit"], str) and len(data["source_commit"]) == 40
-        assert isinstance(data["source_head_sha"], str) and len(data["source_head_sha"]) == 40
-        assert isinstance(data["title"], str) and data["title"]
-        assert data["status"] in ("PASS", "HOLD", "ERROR", "UNKNOWN")
-
-        # Required list fields
-        assert isinstance(data["changed_files"], list) and len(data["changed_files"]) >= 1
-        assert isinstance(data["allowed_files"], list) and len(data["allowed_files"]) >= 1
-        assert isinstance(data["scoped_files"], list)
-
-        # Required numeric field
-        assert isinstance(data["tests_passed"], int) and data["tests_passed"] >= 0
-
-        # Required bool fields
-        for f in ("ci_green", "scope_clean", "review_ready", "merge_ready",
-                  "human_cleanup_required"):
-            assert isinstance(data[f], bool), f"{f} must be bool, got {type(data[f]).__name__}"
-
-        # Source PR is the mock sentinel (0) — see docs/autocoder_result_packet_emission_v0.md
-        assert data["source_pr"] == 0
-
-        # Builder's own status
-        assert data["builder_status"] == "RESULT_PACKET_READY"
-        # Timestamp
-        assert "result_packet_generated_at" in data
-
-        # Mock-emission notes (at least the first)
-        assert any("P3C-B1" in n for n in data.get("notes", []))
-    finally:
-        _cleanup_branch(branch_name, REPO_ROOT)
-        _cleanup_test_artifacts(REPO_ROOT)
+    # Required top-level keys (consumed by run_autocoder_real_output_eval.load_result)
+    assert "schema_version" in data
+    assert "task_id" in data
+    assert "status" in data
+    # Required string fields
+    assert data["task_id"] == "real-output-v0-task-002"
+    assert isinstance(data["source_commit"], str) and len(data["source_commit"]) == 40
+    assert isinstance(data["source_head_sha"], str) and len(data["source_head_sha"]) == 40
+    assert isinstance(data["title"], str) and data["title"]
+    assert data["status"] in ("PASS", "HOLD", "ERROR", "UNKNOWN")
+    # Required list fields
+    assert isinstance(data["changed_files"], list) and len(data["changed_files"]) >= 1
+    assert isinstance(data["allowed_files"], list) and len(data["allowed_files"]) >= 1
+    assert isinstance(data["scoped_files"], list)
+    # Required numeric field
+    assert isinstance(data["tests_passed"], int) and data["tests_passed"] >= 0
+    # Required bool fields
+    for f in ("ci_green", "scope_clean", "review_ready", "merge_ready",
+              "human_cleanup_required"):
+        assert isinstance(data[f], bool), f"{f} must be bool, got {type(data[f]).__name__}"
+    # Source PR is the mock sentinel (0) — see docs/autocoder_result_packet_emission_v0.md
+    assert data["source_pr"] == 0
+    # Builder's own status
+    assert data["builder_status"] == "RESULT_PACKET_READY"
+    # Timestamp
+    assert "result_packet_generated_at" in data
+    # Mock-emission notes (at least the first)
+    assert any("P3C-B1" in n for n in data.get("notes", []))
 
 
 # ---------------------------------------------------------------------------
@@ -404,58 +368,43 @@ def test_packet_has_required_evaluator_fields(tmp_path: Path) -> None:
 
 def test_packet_evaluator_compatible(tmp_path: Path) -> None:
     """The emitted packet is accepted by the real-output evaluator
-    and produces a successful eval with matched_result_count=1."""
-    if _is_main_repo_dirty():
-        pytest.skip(
-            "main repo is dirty (uncommitted P3C-B1 changes); the temp "
-            "worktree executor requires a clean repo. Commit first, then "
-            "re-run this test."
-        )
+    and produces a successful eval with matched_result_count=1.
+
+    In-process equivalent of a full controller run: writes the packet via
+    the emission helper, then feeds it to the evaluator module.
+    """
     emit_path = tmp_path / "emitted_packet.json"
     packet = make_packet(output_root=str(tmp_path / "aed_runs"))
-    out_json = tmp_path / "out.json"
-    out_md = tmp_path / "out.md"
-    branch_name = packet["branch_name"]
-
-    try:
-        result = _run_controller_subprocess(
-            packet, out_json, out_md,
-            extra_argv=[
-                "--emit-real-output-result-packet", str(emit_path),
-                "--real-output-task-id", "real-output-v0-task-002",
-            ],
-            repo_root=REPO_ROOT,
-        )
-
-        cs = result["controller_status"]
-        if cs.get("status") != "SINGLE_TASK_READY_FOR_HUMAN_REVIEW":
-            pytest.skip(
-                f"controller did not reach READY in this env "
-                f"(status={cs.get('status')!r})"
-            )
-
-        assert emit_path.exists()
-        # Feed to the eval
-        eval_json = tmp_path / "eval.json"
-        eval_md = tmp_path / "eval.md"
-        rc = eval_mod.main([
-            "--corpus", str(CORPUS_PATH),
-            "--result-json", str(emit_path),
-            "--output-json", str(eval_json),
-            "--output-md", str(eval_md),
-        ])
-        assert rc == 0
-        report = json.loads(eval_json.read_text())
-        assert report["status"] == "REAL_OUTPUT_EVAL_READY"
-        assert report["result_count"] == 1
-        assert report["matched_result_count"] == 1
-        # Our task_id is the one that is matched, so it must NOT be in the
-        # missing list.
-        assert "real-output-v0-task-002" not in report["missing_result_task_ids"]
-        assert report["invalid_result_packets"] == []
-    finally:
-        _cleanup_branch(branch_name, REPO_ROOT)
-        _cleanup_test_artifacts(REPO_ROOT)
+    emission = controller._try_emit_real_output_result_packet(
+        task_packet=packet,
+        real_task_id="real-output-v0-task-002",
+        emit_path=emit_path,
+        controller_status=controller.State.READY,
+        changed_files=["scripts/local/_p3c_b1_smoke.py"],
+        branch_name="",
+        base_sha="",
+        repo_root=REPO_ROOT,
+    )
+    assert emission["emission_status"] == "RESULT_PACKET_READY"
+    assert emit_path.exists()
+    # Feed to the eval
+    eval_json = tmp_path / "eval.json"
+    eval_md = tmp_path / "eval.md"
+    rc = eval_mod.main([
+        "--corpus", str(CORPUS_PATH),
+        "--result-json", str(emit_path),
+        "--output-json", str(eval_json),
+        "--output-md", str(eval_md),
+    ])
+    assert rc == 0
+    report = json.loads(eval_json.read_text())
+    assert report["status"] == "REAL_OUTPUT_EVAL_READY"
+    assert report["result_count"] == 1
+    assert report["matched_result_count"] == 1
+    # Our task_id is the one that is matched, so it must NOT be in the
+    # missing list.
+    assert "real-output-v0-task-002" not in report["missing_result_task_ids"]
+    assert report["invalid_result_packets"] == []
 
 
 # ---------------------------------------------------------------------------
