@@ -1,0 +1,30 @@
+{
+  "packet_kind": "aed.autocoder.result.v0",
+  "schema_version": 1,
+  "task_id": "real-output-v0-task-002",
+  "source_pr": 379,
+  "source_commit": "aa551d04ab5aa310290231c5f5b5e7c2133706e0",
+  "source_head_sha": "630cd42fe04dee46191d69f795186396cd28cf78",
+  "title": "tooling: add post-merge CI audit helper",
+  "status": "PASS",
+  "changed_files": [
+    "scripts/local/audit_main_ci_for_head.py"
+  ],
+  "allowed_files": [
+    "scripts/local/audit_main_ci_for_head.py",
+    "tests/test_audit_main_ci_for_head.py"
+  ],
+  "forbidden_files": [],
+  "tests_passed": 19,
+  "tests_failed": 0,
+  "tests_total": 19,
+  "ci_green": true,
+  "scope_clean": true,
+  "review_ready": true,
+  "merge_ready": true,
+  "human_cleanup_required": true,
+  "hold_reason": "",
+  "error_reason": "",
+  "notes": "Added a read-only post-merge main CI audit helper. The script polls GitHub Actions workflow runs for a main-branch head SHA, checks that the three required workflows (CI, Edge Discovery audit tests, WFA) all produced success runs, and emits a JSON+Markdown audit packet. human_cleanup_required=true because Codex raised P2 review threads that required manual stale-thread resolution before merge.",
+  "result_packet_generated_at": "2026-06-02T06:10:00Z"
+}
