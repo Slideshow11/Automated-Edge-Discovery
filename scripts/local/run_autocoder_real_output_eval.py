@@ -598,24 +598,28 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
     # gate immediately after this loop. This loop is the review anchor: the
     # collection is named invalid_result_packets (not "unknown_results") and
     # the gate is right next to the loop so the relationship is obvious.
+    #
+    # The loop is structured as explicit if/else branches (no `continue`)
+    # so the structurally-invalid branch is unmistakable at the review site.
     results_by_task: Dict[str, Dict[str, Any]] = {}
     invalid_result_packets: List[str] = []
     for rj in args.result_json:
         result, result_errors = load_result(rj)
         if result is None:
-            # STRUCTURALLY INVALID result packet. This is NOT an ignorable
-            # "unknown" result — it is a hard error that MUST cause
-            # HOLD_REAL_OUTPUT_RESULT_INVALID. The check below the loop is
-            # the gate; do not "soften" the append into a plain log line.
+            # ── STRUCTURALLY INVALID result packet (the review anchor) ──
+            # This is NOT an ignorable "unknown" result. A malformed packet
+            # is a hard error that MUST cause HOLD_REAL_OUTPUT_RESULT_INVALID.
+            # The gate immediately below this loop enforces that contract;
+            # do not soften the append into a plain log line.
             invalid_result_packets.append(rj)
             errors.extend([f"{rj}: {e}" for e in result_errors])
-            continue
-        tid = result.get("task_id", "")
-        if tid in results_by_task:
-            # duplicate result for the same task — keep first, log the dup
-            errors.append(f"duplicate result for task_id {tid!r} ({rj}); keeping first")
-            continue
-        results_by_task[tid] = result
+        else:
+            tid = result.get("task_id", "")
+            if tid in results_by_task:
+                # duplicate result for the same task — keep first, log the dup
+                errors.append(f"duplicate result for task_id {tid!r} ({rj}); keeping first")
+            else:
+                results_by_task[tid] = result
 
     # Compute everything the hard gate below needs in one block, so the gate
     # can return a fully-populated packet without falling through.
