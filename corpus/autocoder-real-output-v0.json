@@ -1,0 +1,203 @@
+{
+  "packet_kind": "aed.autocoder.real_output_corpus.v0",
+  "schema_version": 1,
+  "corpus_id": "autocoder-real-output-v0",
+  "created_at": "2026-06-02T00:00:00Z",
+  "description": "Starter corpus for post-hoc evaluation of autocoder-produced patch outputs. This corpus defines what we want to MEASURE, not tasks to execute. Each entry below is an evaluation definition: a goal, the allowed file surface, expected artifacts, expected tests, scoring dimensions, risk, and non-goals. A report-only evaluator (scripts/local/run_autocoder_real_output_eval.py) reads this corpus and one or more result packets and emits a metrics report. v0 is intentionally tolerant and report-only; it does not execute models and does not mutate GitHub.",
+  "tasks": [
+    {
+      "task_id": "real-output-v0-task-001",
+      "title": "Append a single documentation line",
+      "task_type": "docs",
+      "goal": "Append one validation line to a single docs/*.md file without altering any other file.",
+      "allowed_files": [
+        "docs/*.md"
+      ],
+      "forbidden_files": [
+        "scripts/**",
+        "tests/**",
+        ".github/**",
+        "*.py"
+      ],
+      "expected_artifacts": [
+        "docs/*.md (one file modified, +1 line, -0 lines)"
+      ],
+      "expected_tests": [],
+      "scoring": {
+        "patches_produced": 1,
+        "scope_clean": 1,
+        "tests_passed": 0,
+        "ci_green": 1,
+        "review_ready": 1,
+        "merge_ready": 1,
+        "human_cleanup_required": 0,
+        "hold_count": 0,
+        "error_count": 0
+      },
+      "risk_level": "low",
+      "non_goals": [
+        "Do not run live Claude",
+        "Do not modify any Python file",
+        "Do not touch CI workflow files"
+      ]
+    },
+    {
+      "task_id": "real-output-v0-task-002",
+      "title": "Add a small report-only helper script",
+      "task_type": "report_only_tool",
+      "goal": "Add a single new script under scripts/local/ that is read-only (no GitHub mutation, no model execution, no shell-mode subprocess invocation). The script must write a JSON and/or Markdown artifact. It must be reviewed and merged without follow-up cleanup.",
+      "allowed_files": [
+        "scripts/local/*.py"
+      ],
+      "forbidden_files": [
+        "tests/**",
+        ".github/**",
+        "docs/**",
+        "*.json",
+        "*.md"
+      ],
+      "expected_artifacts": [
+        "scripts/local/*.py (one new file)",
+        "/tmp/*.json (script output, if applicable)",
+        "/tmp/*.md (script output, if applicable)"
+      ],
+      "expected_tests": [
+        "tests/test_*.py"
+      ],
+      "scoring": {
+        "patches_produced": 1,
+        "scope_clean": 1,
+        "tests_passed": 1,
+        "ci_green": 1,
+        "review_ready": 1,
+        "merge_ready": 1,
+        "human_cleanup_required": 0,
+        "hold_count": 0,
+        "error_count": 0
+      },
+      "risk_level": "low",
+      "non_goals": [
+        "Do not introduce gh mutation strings",
+        "Do not invoke live Claude",
+        "Do not use shell-mode subprocess flag"
+      ]
+    },
+    {
+      "task_id": "real-output-v0-task-003",
+      "title": "Add a regression test for an existing helper",
+      "task_type": "test_only",
+      "goal": "Add one new test under tests/ that covers an edge case in an existing helper. No production code is changed. The test must pass on the first CI run.",
+      "allowed_files": [
+        "tests/test_*.py"
+      ],
+      "forbidden_files": [
+        "scripts/**",
+        "docs/**",
+        ".github/**"
+      ],
+      "expected_artifacts": [
+        "tests/test_*.py (one file modified, +1 test function)"
+      ],
+      "expected_tests": [
+        "tests/test_*.py::test_*"
+      ],
+      "scoring": {
+        "patches_produced": 1,
+        "scope_clean": 1,
+        "tests_passed": 1,
+        "ci_green": 1,
+        "review_ready": 1,
+        "merge_ready": 1,
+        "human_cleanup_required": 0,
+        "hold_count": 0,
+        "error_count": 0
+      },
+      "risk_level": "low",
+      "non_goals": [
+        "Do not modify any script under scripts/",
+        "Do not skip or xfail the new test"
+      ]
+    },
+    {
+      "task_id": "real-output-v0-task-004",
+      "title": "Narrow a checker behavior with explicit guard",
+      "task_type": "narrow_code_fix",
+      "goal": "Tighten the behavior of a single local script (under scripts/local/) by replacing an early-return-on-bad-pattern with a bounded-poll loop. Must be guarded by a new test that fails on the old behavior and passes on the new one. Must not change CLI flags.",
+      "allowed_files": [
+        "scripts/local/*.py",
+        "tests/test_*.py"
+      ],
+      "forbidden_files": [
+        ".github/**",
+        "docs/**",
+        "*.json",
+        "*.md"
+      ],
+      "expected_artifacts": [
+        "scripts/local/*.py (one file modified, early-return removed)",
+        "tests/test_*.py (one file modified, +1 regression test)"
+      ],
+      "expected_tests": [
+        "tests/test_*.py::test_*"
+      ],
+      "scoring": {
+        "patches_produced": 1,
+        "scope_clean": 1,
+        "tests_passed": 1,
+        "ci_green": 1,
+        "review_ready": 1,
+        "merge_ready": 1,
+        "human_cleanup_required": 0,
+        "hold_count": 0,
+        "error_count": 0
+      },
+      "risk_level": "medium",
+      "non_goals": [
+        "Do not add a CLI flag",
+        "Do not change the helper's output schema",
+        "Do not introduce a fallback path that masks the original bug"
+      ]
+    },
+    {
+      "task_id": "real-output-v0-task-005",
+      "title": "Validate a packet schema and emit a report",
+      "task_type": "small_packet_validation",
+      "goal": "Add a small packet validator that reads a JSON file matching a declared schema (packet_kind, schema_version, and a small set of required fields). Emit a JSON and Markdown validation report. The validator must be tolerant of unknown fields and must reject only missing required fields, wrong types, or wrong packet_kind.",
+      "allowed_files": [
+        "scripts/local/*.py",
+        "tests/test_*.py"
+      ],
+      "forbidden_files": [
+        ".github/**",
+        "docs/**",
+        "*.json"
+      ],
+      "expected_artifacts": [
+        "scripts/local/*.py (one new file)",
+        "tests/test_*.py (one new file)",
+        "/tmp/*_validation_report.json (script output)",
+        "/tmp/*_validation_report.md (script output)"
+      ],
+      "expected_tests": [
+        "tests/test_*.py::test_*"
+      ],
+      "scoring": {
+        "patches_produced": 1,
+        "scope_clean": 1,
+        "tests_passed": 4,
+        "ci_green": 1,
+        "review_ready": 1,
+        "merge_ready": 1,
+        "human_cleanup_required": 0,
+        "hold_count": 0,
+        "error_count": 0
+      },
+      "risk_level": "low",
+      "non_goals": [
+        "Do not depend on an external schema library",
+        "Do not introduce gh mutation",
+        "Do not introduce live model invocation"
+      ]
+    }
+  ]
+}
