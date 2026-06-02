@@ -46,6 +46,36 @@ REQUIRED_RESULT_FIELDS = (
 )
 
 
+# The actual full source diff for each seed PR (verified against the
+# GitHub PRs API in the patch session that produced this v0). These are
+# the literal `changed_files` the source PRs produced. The evaluator
+# passes them straight to `scope_violation()`, so the scope-clean
+# metric is honest regardless of whether the diff fits the corpus task.
+EXPECTED_FULL_DIFFS: dict[int, list[str]] = {
+    379: [
+        "scripts/local/audit_main_ci_for_head.py",
+        "tests/test_audit_main_ci_for_head.py",
+    ],
+    380: [
+        "corpus/autocoder-real-output-v0.json",
+        "scripts/local/run_autocoder_real_output_eval.py",
+        "tests/test_run_autocoder_real_output_eval.py",
+    ],
+    381: [
+        ".github/workflows/post-merge-main-ci-audit.yml",
+        "tests/test_post_merge_main_ci_audit_workflow.py",
+    ],
+}
+
+
+# The expected scope_clean_count after running the evaluator on these
+# patches. This is computed honestly: each PR's actual diff includes at
+# least one file that does not match the corpus task's allowed_files
+# pattern, so the script's scope_violation() function returns a
+# non-empty list for every record, and scope_clean_count == 0.
+EXPECTED_SCOPE_CLEAN_COUNT = 0
+
+
 class TestAutocoderRealOutputEvalFixtures(unittest.TestCase):
     """Validates seed result packets + an end-to-end evaluator run."""
 
@@ -118,6 +148,76 @@ class TestAutocoderRealOutputEvalFixtures(unittest.TestCase):
                 len(pkt["changed_files"]),
                 0,
                 f"{name}: changed_files must be non-empty",
+            )
+
+    def test_changed_files_equals_full_actual_source_diff(self):
+        """`changed_files` must equal the full actual source PR diff,
+        not a curated subset chosen for corpus fit.
+        """
+        for name, pkt in self.result_packets.items():
+            source_pr = pkt["source_pr"]
+            self.assertIn(
+                source_pr,
+                EXPECTED_FULL_DIFFS,
+                f"no expected full diff registered for source_pr={source_pr}",
+            )
+            expected = sorted(EXPECTED_FULL_DIFFS[source_pr])
+            actual = sorted(pkt["changed_files"])
+            self.assertEqual(
+                actual,
+                expected,
+                f"{name}: changed_files must equal the full actual source PR "
+                f"diff for PR #{source_pr}. "
+                f"expected={expected}, actual={actual}",
+            )
+
+    def test_changed_files_includes_out_of_scope_files(self):
+        """Each seed's `changed_files` must include the file that the
+        source PR actually changed but is out-of-scope for the mapped
+        corpus task. This is the regression guard against the earlier
+        P2 finding (omitting out-of-scope files to make scope_clean
+        look better).
+        """
+        for name, pkt in self.result_packets.items():
+            changed = set(pkt["changed_files"])
+            # The known out-of-scope file for each source PR (relative
+            # to the mapped corpus task). If this assertion ever fails,
+            # the packet is silently reverting to the pre-patch state.
+            out_of_scope = {
+                379: "tests/test_audit_main_ci_for_head.py",
+                380: "corpus/autocoder-real-output-v0.json",
+                381: ".github/workflows/post-merge-main-ci-audit.yml",
+            }[pkt["source_pr"]]
+            self.assertIn(
+                out_of_scope,
+                changed,
+                f"{name}: changed_files must include {out_of_scope!r} "
+                f"(the actual out-of-scope file from PR #{pkt['source_pr']}). "
+                f"Pre-patch packets hid this file to make scope_clean look better.",
+            )
+
+    def test_scoped_files_separate_from_changed_files_when_present(self):
+        """`scoped_files` (if present) is descriptive only and must be
+        a subset of `changed_files`. It must NOT be the same as
+        `changed_files` (that would defeat its descriptive purpose).
+        """
+        for name, pkt in self.result_packets.items():
+            if "scoped_files" not in pkt:
+                # Optional field; skip if the packet doesn't carry it.
+                continue
+            scoped = set(pkt["scoped_files"])
+            changed = set(pkt["changed_files"])
+            self.assertTrue(
+                scoped.issubset(changed),
+                f"{name}: scoped_files must be a subset of changed_files "
+                f"(scoped={scoped}, changed={changed})",
+            )
+            self.assertLess(
+                len(scoped),
+                len(changed),
+                f"{name}: scoped_files should be a narrower view than "
+                f"changed_files; if they are equal the field is not adding "
+                f"information (scoped={scoped}, changed={changed})",
             )
 
     def test_each_packet_allowed_files_nonempty(self):
@@ -242,6 +342,28 @@ class TestAutocoderRealOutputEvalFixtures(unittest.TestCase):
                 1,
                 "at least one seed packet should have human_cleanup_required=true",
             )
+
+            # scope_clean_count must reflect the HONEST calculation
+            # from full changed_files, not a hard-coded 3. Each PR's
+            # actual diff includes a file outside the mapped corpus
+            # task's allowed_files, so scope_clean_count must be 0.
+            self.assertEqual(
+                metrics.get("scope_clean_count"),
+                EXPECTED_SCOPE_CLEAN_COUNT,
+                f"scope_clean_count must reflect the honest full-diff "
+                f"calculation, not a curated subset. "
+                f"expected={EXPECTED_SCOPE_CLEAN_COUNT}, "
+                f"actual={metrics.get('scope_clean_count')}",
+            )
+
+            # Per-record scope_clean must also be false for every seed.
+            for rec in packet.get("records", []):
+                if rec.get("has_result") and rec.get("result_status") == "PASS":
+                    self.assertFalse(
+                        rec.get("scope_clean", True),
+                        f"record {rec.get('task_id')!r} should be scope_clean=false "
+                        f"because its changed_files includes an out-of-scope file",
+                    )
 
             # invalid_result_packets must be empty (all 3 are well-formed).
             self.assertEqual(packet.get("invalid_result_packets"), [])

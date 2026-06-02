@@ -8,23 +8,26 @@
   "title": "tooling: automate post-merge main CI audit",
   "status": "PASS",
   "changed_files": [
+    ".github/workflows/post-merge-main-ci-audit.yml",
+    "tests/test_post_merge_main_ci_audit_workflow.py"
+  ],
+  "scoped_files": [
     "tests/test_post_merge_main_ci_audit_workflow.py"
   ],
   "allowed_files": [
-    "tests/test_post_merge_main_ci_audit_workflow.py",
-    ".github/workflows/post-merge-main-ci-audit.yml"
+    "tests/test_post_merge_main_ci_audit_workflow.py"
   ],
   "forbidden_files": [],
   "tests_passed": 32,
   "tests_failed": 0,
   "tests_total": 32,
   "ci_green": true,
-  "scope_clean": true,
+  "scope_clean": false,
   "review_ready": true,
   "merge_ready": true,
   "human_cleanup_required": true,
   "hold_reason": "",
   "error_reason": "",
-  "notes": "Added an automated post-merge main CI audit workflow. The workflow file (.github/workflows/post-merge-main-ci-audit.yml) is a workflow-scope exception \u2014 none of the corpus tasks permit .github/**, so the workflow file is listed in allowed_files for traceability but excluded from changed_files to keep scope_clean=true. human_cleanup_required=true for two reasons: (1) the task explicitly authorized a workflow edit (a scope_guard HOLD_SCOPE_VIOLATION that required human override), and (2) Codex raised a P2 review thread about WFA's path filter that required a follow-up commit making the WFA requirement conditional.",
+  "notes": "Added an automated post-merge main CI audit workflow. The actual PR diff (changed_files) includes the workflow file .github/workflows/post-merge-main-ci-audit.yml, which is in forbidden_files (.github/**) for task-004 (and for all other corpus tasks \u2014 no corpus task permits workflow edits). The narrower scoped_files field lists the test file that fits inside the task-004 allowed_files pattern. scope_clean is false here because the script's scope check uses the full changed_files, not scoped_files. human_cleanup_required=true for two reasons: (1) the task explicitly authorized a workflow edit (a scope_guard HOLD_SCOPE_VIOLATION that required human override), and (2) Codex raised a P2 review thread about WFA's path filter that required a follow-up commit making the WFA requirement conditional.",
   "result_packet_generated_at": "2026-06-02T06:10:00Z"
 }
