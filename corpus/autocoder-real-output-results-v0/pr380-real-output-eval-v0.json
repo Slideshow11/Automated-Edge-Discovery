@@ -1,0 +1,36 @@
+{
+  "packet_kind": "aed.autocoder.result.v0",
+  "schema_version": 1,
+  "task_id": "real-output-v0-task-005",
+  "source_pr": 380,
+  "source_commit": "cf97940975e4650d6ccee35b029508c67ae35907",
+  "source_head_sha": "1273e3c131aa63154bb2337b64f8214c5d9a6109",
+  "title": "tooling: add real-output autocoder eval v0",
+  "status": "PASS",
+  "changed_files": [
+    "corpus/autocoder-real-output-v0.json",
+    "scripts/local/run_autocoder_real_output_eval.py",
+    "tests/test_run_autocoder_real_output_eval.py"
+  ],
+  "scoped_files": [
+    "scripts/local/run_autocoder_real_output_eval.py",
+    "tests/test_run_autocoder_real_output_eval.py"
+  ],
+  "allowed_files": [
+    "scripts/local/run_autocoder_real_output_eval.py",
+    "tests/test_run_autocoder_real_output_eval.py"
+  ],
+  "forbidden_files": [],
+  "tests_passed": 25,
+  "tests_failed": 0,
+  "tests_total": 25,
+  "ci_green": true,
+  "scope_clean": false,
+  "review_ready": true,
+  "merge_ready": true,
+  "human_cleanup_required": true,
+  "hold_reason": "",
+  "error_reason": "",
+  "notes": "Added the P3A real-output autocoder evaluator (corpus + evaluator + tests). The actual PR diff (changed_files) includes the corpus data file corpus/autocoder-real-output-v0.json, which is in forbidden_files (*.json) for task-005. The narrower scoped_files field lists the script and test files that fit inside the task-005 allowed_files pattern. scope_clean is false here because the script's scope check uses the full changed_files, not scoped_files. human_cleanup_required=true because Codex raised multiple P2 review threads (malformed result handling, matched_result_count semantics, corpus placeholder paths) that each required a follow-up commit before the PR could merge.",
+  "result_packet_generated_at": "2026-06-02T06:10:00Z"
+}

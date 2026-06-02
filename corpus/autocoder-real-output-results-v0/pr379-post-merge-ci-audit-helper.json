@@ -1,0 +1,33 @@
+{
+  "packet_kind": "aed.autocoder.result.v0",
+  "schema_version": 1,
+  "task_id": "real-output-v0-task-002",
+  "source_pr": 379,
+  "source_commit": "aa551d04ab5aa310290231c5f5b5e7c2133706e0",
+  "source_head_sha": "630cd42fe04dee46191d69f795186396cd28cf78",
+  "title": "tooling: add post-merge CI audit helper",
+  "status": "PASS",
+  "changed_files": [
+    "scripts/local/audit_main_ci_for_head.py",
+    "tests/test_audit_main_ci_for_head.py"
+  ],
+  "scoped_files": [
+    "scripts/local/audit_main_ci_for_head.py"
+  ],
+  "allowed_files": [
+    "scripts/local/audit_main_ci_for_head.py"
+  ],
+  "forbidden_files": [],
+  "tests_passed": 19,
+  "tests_failed": 0,
+  "tests_total": 19,
+  "ci_green": true,
+  "scope_clean": false,
+  "review_ready": true,
+  "merge_ready": true,
+  "human_cleanup_required": true,
+  "hold_reason": "",
+  "error_reason": "",
+  "notes": "Added a read-only post-merge main CI audit helper. The actual PR diff (changed_files) includes the test file tests/test_audit_main_ci_for_head.py, which is in scope for task-004 (narrow_code_fix) but is forbidden by the task-002 (report_only_tool) allowed_files pattern. The narrower scoped_files field lists the file that fits inside the task-002 allowed_files pattern. scope_clean is false here because the script's scope check uses the full changed_files, not scoped_files. human_cleanup_required=true because Codex raised P2 review threads that required manual stale-thread resolution before merge.",
+  "result_packet_generated_at": "2026-06-02T06:10:00Z"
+}
