@@ -28,7 +28,7 @@ python3 scripts/local/build_autocoder_real_output_result_packet.py \
   --title "<short title>" \
   --status PASS \
   --changed-file scripts/local/example.py \
-  --allowed-file scripts/local/*.py \
+  --allowed-file 'scripts/local/*.py' \
   --tests-passed 1 \
   --ci-green true \
   --scope-clean true \
@@ -135,7 +135,7 @@ python3 scripts/local/build_autocoder_real_output_result_packet.py \
   --title "smoke result packet" \
   --status PASS \
   --changed-file scripts/local/example.py \
-  --allowed-file scripts/local/*.py \
+  --allowed-file 'scripts/local/*.py' \
   --tests-passed 1 \
   --ci-green true \
   --scope-clean true \

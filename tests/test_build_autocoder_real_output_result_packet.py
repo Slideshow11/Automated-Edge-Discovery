@@ -18,6 +18,10 @@ Covers:
 13. result_packet_generated_at is a valid ISO 8601 UTC timestamp
 14. builder_status is RESULT_PACKET_READY on success
 15. hold_reason and error_reason are omitted when not provided
+16. docs regression: smoke command in
+    docs/autocoder_real_output_result_packet_builder_v0.md uses
+    shell-quoted globs (so a copy-paste into a real shell does not
+    glob-expand the literal pattern)
 """
 
 from __future__ import annotations
@@ -543,3 +547,30 @@ def test_builder_cli_runs_as_subprocess(tmp_path: Path) -> None:
     packet = json.loads(out_path.read_text(encoding="utf-8"))
     assert packet["builder_status"] == "RESULT_PACKET_READY"
     assert "RESULT_PACKET_READY" in proc.stdout
+
+
+# ---------------------------------------------------------------------------
+# 16. docs regression: smoke command uses shell-quoted globs
+# ---------------------------------------------------------------------------
+
+DOCS_PATH = REPO_ROOT / "docs" / "autocoder_real_output_result_packet_builder_v0.md"
+
+
+def test_docs_smoke_command_uses_quoted_glob() -> None:
+    """The smoke command in the docs must use shell-quoted globs so a
+    copy-paste into a real shell does not glob-expand the literal pattern
+    before argparse sees it. (See PR #383 P2 Codex comment.)"""
+    assert DOCS_PATH.exists(), f"docs file missing: {DOCS_PATH}"
+    text = DOCS_PATH.read_text(encoding="utf-8")
+
+    # The good form must appear (single-quoted glob is what we want).
+    assert "--allowed-file 'scripts/local/*.py'" in text, (
+        "docs are missing the shell-quoted form of the smoke command"
+    )
+    # The bad form must NOT appear. We check the exact unquoted substring
+    # (with a leading space, the same form argparse would receive if a
+    # user copy-pasted the docs into bash unquoted).
+    bad_form = "--allowed-file scripts/local/*.py"
+    assert bad_form not in text, (
+        f"docs still contain the unquoted glob form: {bad_form!r}"
+    )
