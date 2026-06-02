@@ -371,9 +371,72 @@ def verify(
         }
     checks["no_unexpected_dirty_tracked"] = True
 
+    # ── 14b.3. Staged-added files — apply_mock_edits in
+    #         run_temp_worktree_execution.py writes the mock-edit content and
+    #         then stages the file via the `git ... add` subcommand, so
+    #         `git status --short` shows status "A" (staged add). The
+    #         apply_to_branch stage (stage 5) already counts these as
+    #         "modified" via the M/A/D/R check and reports applied=true. This
+    #         verifier must count them too, otherwise a clean mock pipeline
+    #         will always halt at HOLD_BRANCH_DIFF_MISMATCH.
+    #         Stage codes we treat as staged-added:
+    #           "A " = added in index, not in worktree
+    #           "AM" = added in index, modified in worktree
+    #           "A." = added in index, type-change in worktree (rare)
+    staged_added = []
+    if r_status.returncode == 0:
+        for line in r_status.stdout.strip().splitlines():
+            if not line:
+                continue
+            ls = line.lstrip()
+            parts = ls.split(" ", 1)
+            if len(parts) < 2:
+                continue
+            stage = parts[0]
+            # First column == "A" means staged add. Worktree-column (second char)
+            # can be ' ' (clean), 'M' (modified in worktree), or '.' (unmodified).
+            is_staged_added = (
+                len(stage) >= 1
+                and stage[0] == "A"
+                and stage != "??"
+            )
+            if is_staged_added:
+                path = parts[1].strip()
+                if path:
+                    staged_added.append(path)
+
+    staged_added_expected = sorted(f for f in staged_added if f in expected_set)
+    staged_added_unexpected = sorted(f for f in staged_added if f not in expected_set)
+
+    checks["staged_added"] = staged_added
+    checks["staged_added_expected"] = staged_added_expected
+    checks["staged_added_unexpected"] = staged_added_unexpected
+
+    # Block unexpected staged-added files — fail closed.
+    # An arbitrary file that has been staged via the `git ... add` subcommand
+    # but is not in the expected changed_files list is just as suspicious as
+    # an unexpected untracked file.
+    if staged_added_unexpected:
+        return STATE_HOLD_UNEXPECTED_UNTRACKED, {
+            **checks,
+            "unexpected_staged_added_files": staged_added_unexpected,
+        }
+    checks["no_unexpected_staged_added"] = True
+
     # ── 15. Branch diff must contain exactly the result changed_files ─────────
-    #        Include expected untracked files and expected tracked modified files.
-    actual_applied = set(branch_changed_files) | set(untracked_expected) | set(tracked_modified_expected)
+    #        Include expected untracked files, expected tracked-modified files,
+    #        and expected staged-added files. The branch tree itself is rarely
+    #        populated in mock mode because apply_to_branch explicitly does not
+    #        commit (see apply_temp_worktree_patch_to_branch.py docstring line 15:
+    #        "patch applied to local branch (not committed)"). The expected
+    #        files appear in the working tree / index instead, surfaced via the
+    #        buckets above.
+    actual_applied = (
+        set(branch_changed_files)
+        | set(untracked_expected)
+        | set(tracked_modified_expected)
+        | set(staged_added_expected)
+    )
     branch_set = actual_applied
     if branch_set != expected_set:
         extra = sorted(branch_set - expected_set)

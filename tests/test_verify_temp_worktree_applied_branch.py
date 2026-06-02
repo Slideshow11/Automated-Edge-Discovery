@@ -742,6 +742,127 @@ class TestUntrackedFilesUnexpected:
         assert "junk2.log" in checks.get("unexpected_untracked_files", [])
 
 
+class TestStagedAddedFilesExpected:
+    """APPLIED_BRANCH_READY when expected file is staged-added (apply_mock_edits).
+
+    The mock controller pipeline's apply_mock_edits writes the file content
+    and then stages it, so `git status --short` shows "A " for the new
+    file. This mirrors the real controller's behavior and exercises the
+    verifier's new staged-added bucket.
+    """
+
+    def test_expected_file_staged_added_after_apply(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Create parent directory as a tracked file so the new file lands
+        # inside a tracked path (otherwise the diff also includes a new dir).
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Create the expected file and STAGE it (do not commit). This is what
+        # apply_mock_edits produces.
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        assert "docs/scratch.md" in checks.get("staged_added_expected", [])
+        assert "docs/scratch.md" not in checks.get("staged_added_unexpected", [])
+        assert checks.get("no_unexpected_staged_added") is True
+        assert checks.get("branch_diff_matches_expected") is True
+
+    def test_expected_file_staged_added_with_worktree_modification(self, tmp_path):
+        """AM status (added in index, modified in worktree) is also accepted.
+
+        apply_mock_edits could be followed by a subsequent touch of the file
+        in the worktree, producing AM status. The verifier's first-column 'A'
+        check covers both A and AM.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Stage-add then re-touch the worktree file -> AM status
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        p.write_text("hello world v2\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY"
+        # The AM status is recognized by the first-column 'A' check; it lands
+        # in the staged_added bucket, not in tracked_modified (which is keyed
+        # on first-column 'M').
+        assert "docs/scratch.md" in checks.get("staged_added_expected", [])
+
+
+class TestStagedAddedFilesUnexpected:
+    """HOLD_UNEXPECTED_UNTRACKED_FILE when an unexpected staged-added file is present."""
+
+    def test_unexpected_staged_added_blocks(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Commit the expected file properly
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Create an UNEXPECTED file and stage it
+        unexpected = repo / "secrets.txt"
+        unexpected.write_text("password123\n", encoding="utf-8")
+        subprocess.run(["git", "add", "secrets.txt"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # The unexpected staged-added file must be blocked. It surfaces as
+        # HOLD_UNEXPECTED_UNTRACKED_FILE (the verifier's catch-all for dirty
+        # working tree state) and the per-bucket list records which file.
+        assert status == "HOLD_UNEXPECTED_UNTRACKED_FILE"
+        assert "secrets.txt" in checks.get("unexpected_staged_added_files", [])
+
+
 class TestMixedCommittedAndUntracked:
     """APPLIED_BRANCH_READY when some files are committed and others are expected untracked."""
 

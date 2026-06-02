@@ -530,3 +530,115 @@ class TestRepoRootArg:
         # May fail at later stage since docs/test.md may not exist, but
         # not with "not a git repository"
         assert "not a git repository" not in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Full mock controller regression (P3C-B1 unblocker)
+# ---------------------------------------------------------------------------
+
+class TestFullMockRunReachesReady:
+    """End-to-end mock controller run reaches SINGLE_TASK_READY_FOR_HUMAN_REVIEW.
+
+    This is the regression test for the pre-existing mock controller pipeline
+    blocker: stage 5 (apply_to_branch) treated staged-added files as
+    applied, but stage 6 (verify_temp_worktree_applied_branch) did not. The
+    test runs the full controller CLI with a valid mock task packet and
+    asserts the terminal state is READY (not HOLD_BRANCH_DIFF_MISMATCH).
+    """
+
+    def test_full_mock_run_reaches_ready(self, tmp_path):
+        # Use a unique task_id and a temp output_root / worktree_root outside
+        # the repo to avoid collisions with concurrent runs and to keep the
+        # AED worktree clean.
+        import uuid as _uuid
+        task_id = f"full-mock-{_uuid.uuid4().hex[:8]}"
+        output_root = tmp_path / "aed_runs" / task_id
+        worktree_root = tmp_path / "wt" / task_id
+        branch_name = f"autocoder-full-mock-{task_id}"
+        # The mock edit must target a path under the actual AED repo because
+        # the controller's apply_to_branch expects the change to land in the
+        # repo's working tree. Pick a path under scripts/local/ which is
+        # already in the allowed_files glob of the task packet.
+        mock_path = f"scripts/local/_full_mock_{task_id}.py"
+        packet = make_packet(
+            task_id=task_id,
+            allowed_files=[
+                "scripts/local/*.py",
+                mock_path,
+            ],
+            forbidden_files=[".github/**", "*.json", "*.md", "bin/", "examples/"],
+            max_changed_files=3,
+            required_tests=None,
+            output_root=str(output_root),
+            worktree_root=str(worktree_root),
+            branch_name=branch_name,
+            suggested_pr_title=f"tooling: full mock regression {task_id}",
+            suggested_pr_body="P3C-B1 unblocker regression test.",
+            execution_mode="mocked",
+            mock_edits=[{"path": mock_path, "content": f"# full mock {task_id}\n"}],
+        )
+
+        # Write packet
+        pkt_path = tmp_path / "packet.json"
+        with open(pkt_path, "w") as f:
+            json.dump(packet, f)
+
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        script_path = REPO_ROOT / "scripts" / "local" / "run_autocoder_single_task.py"
+
+        # Pre-clean any leftover branch from a prior failed run
+        subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "branch", "-D", branch_name],
+            capture_output=True, text=True,
+        )
+
+        try:
+            argv = [
+                "python3", str(script_path),
+                "--task-packet-json", str(pkt_path),
+                "--output-json", str(out_json),
+                "--output-md", str(out_md),
+                "--repo-root", str(REPO_ROOT),
+            ]
+            result = subprocess.run(
+                argv,
+                cwd=str(REPO_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            assert out_json.exists(), (
+                f"controller produced no output JSON; rc={result.returncode}; "
+                f"stderr={result.stderr[:300]}"
+            )
+            cs = json.loads(out_json.read_text())
+            # Pre-fix this was HOLD_APPLIED_BRANCH_NOT_READY / HOLD_BRANCH_DIFF_MISMATCH.
+            # Post-fix it should be SINGLE_TASK_READY_FOR_HUMAN_REVIEW.
+            assert cs.get("status") == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW", (
+                f"expected SINGLE_TASK_READY_FOR_HUMAN_REVIEW, got "
+                f"{cs.get('status')!r}; stage={cs.get('stage')!r}; "
+                f"actual={cs.get('actual')!r}; expected={cs.get('expected')!r}"
+            )
+        finally:
+            # Clean up: delete the branch and the mock-edit file from the
+            # worktree (in case the controller left it staged).
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "reset", "HEAD", "--", mock_path],
+                capture_output=True, text=True,
+            )
+            mock_full = REPO_ROOT / mock_path
+            if mock_full.exists():
+                mock_full.unlink()
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "branch", "-D", branch_name],
+                capture_output=True, text=True,
+            )
+            # Also clean any temp worktree the controller may have created
+            if worktree_root.exists():
+                subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                     "--force", str(worktree_root)],
+                    capture_output=True, text=True,
+                )
