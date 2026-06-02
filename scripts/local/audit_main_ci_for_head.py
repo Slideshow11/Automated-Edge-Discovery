@@ -370,6 +370,25 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     lines.append(f"**Polls used**: {packet['polls_used']} of {packet['max_polls']} (poll-seconds={packet['poll_seconds']})")
     lines.append(f"**Recommendation**: {packet.get('recommendation','')}")
     lines.append("")
+    status = packet.get("status", "")
+    if status == STATUS_HOLD_MISSING:
+        lines.append("## Polling outcome")
+        lines.append("")
+        lines.append(
+            "Bounded polling exhausted with one or more **required workflows still missing** "
+            "for the exact head SHA. Re-run later; GitHub may not have surfaced the run yet, "
+            "or the workflow was never triggered for this head."
+        )
+        lines.append("")
+    elif status == STATUS_HOLD_PENDING:
+        lines.append("## Polling outcome")
+        lines.append("")
+        lines.append(
+            "Bounded polling exhausted with **required workflows present but still in flight** "
+            "for the exact head SHA. Re-run later; the workflows are running and have not yet "
+            "posted a terminal conclusion."
+        )
+        lines.append("")
     lines.append("## Required workflows")
     if packet.get("required_workflows"):
         for w in packet["required_workflows"]:
@@ -511,21 +530,15 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
             found_names = sorted(
                 {str(r.get("workflowName") or "") for r in runs_for_head}
             )
+            # Record missing required workflows but DO NOT return early.
+            # Missing required workflows are treated as pending until the
+            # bounded polling window is exhausted. Only then do we report
+            # HOLD_MAIN_CI_MISSING_REQUIRED_WORKFLOW. This matches the
+            # wait_for_pr_ready.py convention: absent checks during the
+            # polling window are not yet "missing" — GitHub may not have
+            # surfaced the run yet.
             missing = missing_required_workflows(required, found_names)
-            if missing:
-                return build_packet(
-                    args=args,
-                    status=STATUS_HOLD_MISSING,
-                    runs_for_head=runs_for_head,
-                    pending_runs=[],
-                    failed_runs=[],
-                    successful_runs=[],
-                    missing_required=missing,
-                    polls_used=polls_used,
-                    commands_run=commands_run,
-                    errors=errors,
-                )
-            target_workflow_names = list(required)
+            target_workflow_names = [w for w in required if w in set(found_names)]
         else:
             if not runs_for_head:
                 return build_packet(
@@ -543,28 +556,27 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
             target_workflow_names = sorted(
                 {str(r.get("workflowName") or "") for r in runs_for_head}
             )
+            missing = []
 
         target_runs = [
             r
             for r in runs_for_head
             if str(r.get("workflowName") or "") in set(target_workflow_names)
         ]
-        status, pending, failed, successful = classify_runs(target_runs)
 
-        if status == STATUS_GREEN:
-            return build_packet(
-                args=args,
-                status=STATUS_GREEN,
-                runs_for_head=runs_for_head,
-                pending_runs=pending,
-                failed_runs=failed,
-                successful_runs=successful,
-                missing_required=missing,
-                polls_used=polls_used,
-                commands_run=commands_run,
-                errors=errors,
+        if target_runs:
+            status, pending, failed, successful = classify_runs(target_runs)
+        else:
+            # No target runs in this poll (e.g., all required workflows are
+            # still missing). Treat as pending — keep polling.
+            status, pending, failed, successful = (
+                STATUS_HOLD_PENDING,
+                [],
+                [],
+                [],
             )
-        if status == STATUS_HOLD_FAILED:
+
+        if failed:
             return build_packet(
                 args=args,
                 status=STATUS_HOLD_FAILED,
@@ -572,18 +584,50 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
                 pending_runs=pending,
                 failed_runs=failed,
                 successful_runs=successful,
-                missing_required=missing,
+                missing_required=list(missing),
                 polls_used=polls_used,
                 commands_run=commands_run,
                 errors=errors,
             )
 
-        # Status is PENDING (or no target runs after filtering — but that case
-        # is handled above by HOLD_NO_RUNS / HOLD_MISSING). Continue polling.
+        # GREEN is only reachable when no required workflow is missing AND
+        # every present required run is completed successfully. If any
+        # required workflow is still missing we must keep polling — a partial
+        # green during the polling window is not the final verdict.
+        if not missing and status == STATUS_GREEN:
+            return build_packet(
+                args=args,
+                status=STATUS_GREEN,
+                runs_for_head=runs_for_head,
+                pending_runs=pending,
+                failed_runs=failed,
+                successful_runs=successful,
+                missing_required=[],
+                polls_used=polls_used,
+                commands_run=commands_run,
+                errors=errors,
+            )
+
+        # Either some required workflow is still missing, or some target
+        # run is still in flight, or both. Continue polling.
         if poll_index < args.max_polls - 1:
             time.sleep(args.poll_seconds)
 
-    # Loop exhausted with pending runs
+    # Polling bound exhausted. Distinguish MISSING from PENDING based on
+    # whether any required workflow never appeared.
+    if missing:
+        return build_packet(
+            args=args,
+            status=STATUS_HOLD_MISSING,
+            runs_for_head=runs_for_head,
+            pending_runs=pending,
+            failed_runs=failed,
+            successful_runs=successful,
+            missing_required=list(missing),
+            polls_used=polls_used,
+            commands_run=commands_run,
+            errors=errors,
+        )
     return build_packet(
         args=args,
         status=STATUS_HOLD_PENDING,
@@ -591,7 +635,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
         pending_runs=pending,
         failed_runs=failed,
         successful_runs=successful,
-        missing_required=missing,
+        missing_required=[],
         polls_used=polls_used,
         commands_run=commands_run,
         errors=errors,

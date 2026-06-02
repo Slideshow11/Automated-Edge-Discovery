@@ -194,7 +194,12 @@ def test_failed_status_one_run_completed_failure(tmp_path, monkeypatch):
 
 
 def test_missing_required_workflow(tmp_path, monkeypatch):
-    monkeypatch.setattr("time.sleep", FakeSleep())
+    """Existing test: --required-workflow CI is requested but only Edge
+    Discovery audit tests exists. With the new behavior the audit must
+    exhaust the polling bound before declaring the workflow missing.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
 
     runs = [
         make_run("Edge Discovery audit tests", "completed", "success"),
@@ -203,13 +208,14 @@ def test_missing_required_workflow(tmp_path, monkeypatch):
 
     json_out = str(tmp_path / "audit.json")
     md_out = str(tmp_path / "audit.md")
+    max_polls = 3
     rc = mod.main(
         [
             "--repo", REPO,
             "--head-sha", HEAD,
             "--branch", "main",
             "--required-workflow", "CI",
-            "--max-polls", "3",
+            "--max-polls", str(max_polls),
             "--poll-seconds", "5",
             "--output-json", json_out,
             "--output-md", md_out,
@@ -219,6 +225,197 @@ def test_missing_required_workflow(tmp_path, monkeypatch):
     packet = json.loads(Path(json_out).read_text())
     assert packet["status"] == mod.STATUS_HOLD_MISSING
     assert packet["missing_required_workflows"] == ["CI"]
+    # New behavior: polls_used equals max_polls and sleep is called N-1 times
+    assert packet["polls_used"] == max_polls
+    assert len(sleep.calls) == max_polls - 1
+
+
+def test_missing_required_workflow_appears_on_later_poll(tmp_path, monkeypatch):
+    """New behavior: required workflow appears on a later poll and completes
+    successfully. Final status must be MAIN_CI_AUDIT_GREEN, with the
+    successful run counted and no missing list.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    # State: poll 1 has only the unrelated workflow; poll 2 has CI completed
+    poll_1 = [make_run("Unrelated", "completed", "success")]
+    poll_2 = [
+        make_run("Unrelated", "completed", "success"),
+        make_run("CI", "completed", "success"),
+    ]
+    responses = [poll_1, poll_2]
+    counter = {"i": 0}
+
+    def mock_gh(args):
+        idx = counter["i"]
+        counter["i"] += 1
+        return responses[idx] if idx < len(responses) else responses[-1]
+
+    monkeypatch.setattr(mod, "run_gh_run_list", mock_gh)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    max_polls = 4
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--max-polls", str(max_polls),
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_GREEN
+    assert packet["polls_used"] == 2
+    assert packet["missing_required_workflows"] == []
+    # runs_for_head includes Unrelated + CI; successful_runs includes only the
+    # required CI run.
+    assert len(packet["runs_for_head"]) == 2
+    assert len(packet["successful_runs"]) == 1
+    assert packet["successful_runs"][0]["workflowName"] == "CI"
+    assert len(sleep.calls) == 1  # one sleep between poll 1 and poll 2
+
+
+def test_required_workflow_pending_at_final_poll(tmp_path, monkeypatch):
+    """New behavior: required workflow appears but is still in_progress at
+    the final poll. Final status must be HOLD_MAIN_CI_PENDING (not MISSING).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    # CI is present but in_progress across all polls
+    in_progress_run = make_run("CI", "in_progress", "")
+    responses = [[in_progress_run]] * 3
+    counter = {"i": 0}
+
+    def mock_gh(args):
+        idx = counter["i"]
+        counter["i"] += 1
+        return responses[idx] if idx < len(responses) else responses[-1]
+
+    monkeypatch.setattr(mod, "run_gh_run_list", mock_gh)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    max_polls = 3
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--max-polls", str(max_polls),
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    assert packet["missing_required_workflows"] == []
+    assert packet["polls_used"] == max_polls
+    assert len(sleep.calls) == max_polls - 1
+    assert len(packet["pending_runs"]) == 1
+
+
+def test_required_workflow_appears_with_failure(tmp_path, monkeypatch):
+    """New behavior: required workflow appears with a failure on a later
+    poll. Final status must be HOLD_MAIN_CI_FAILED and reported immediately.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    # Poll 1: only unrelated. Poll 2: CI present but failed.
+    poll_1 = [make_run("Unrelated", "completed", "success")]
+    poll_2 = [
+        make_run("Unrelated", "completed", "success"),
+        make_run("CI", "completed", "failure"),
+    ]
+    responses = [poll_1, poll_2]
+    counter = {"i": 0}
+
+    def mock_gh(args):
+        idx = counter["i"]
+        counter["i"] += 1
+        return responses[idx] if idx < len(responses) else responses[-1]
+
+    monkeypatch.setattr(mod, "run_gh_run_list", mock_gh)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    max_polls = 5
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--max-polls", str(max_polls),
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_HOLD_FAILED
+    assert packet["polls_used"] == 2
+    assert len(packet["failed_runs"]) == 1
+    # Polling stops immediately on failure — sleep is called only once
+    # (between poll 1 and poll 2), not max_polls-1 times.
+    assert len(sleep.calls) == 1
+
+
+def test_missing_required_workflow_partial_appearances_through_polls(tmp_path, monkeypatch):
+    """New behavior: when one of several required workflows is missing
+    throughout, the audit must report MISSING with only the still-missing
+    workflow listed, not all required workflows.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    # 'WFA' is present and completes success; 'CI' is never present.
+    wfa = make_run("WFA", "completed", "success")
+    responses = [[wfa]] * 3
+    counter = {"i": 0}
+
+    def mock_gh(args):
+        idx = counter["i"]
+        counter["i"] += 1
+        return responses[idx] if idx < len(responses) else responses[-1]
+
+    monkeypatch.setattr(mod, "run_gh_run_list", mock_gh)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    max_polls = 3
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--required-workflow", "WFA",
+            "--max-polls", str(max_polls),
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_HOLD_MISSING
+    assert packet["missing_required_workflows"] == ["CI"]
+    # WFA is reported as successful
+    assert len(packet["successful_runs"]) == 1
+    assert packet["polls_used"] == max_polls
 
 
 # ---------------------------------------------------------------------------
