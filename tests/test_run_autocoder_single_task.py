@@ -555,6 +555,12 @@ class TestFullMockRunReachesReady:
         output_root = tmp_path / "aed_runs" / task_id
         worktree_root = tmp_path / "wt" / task_id
         branch_name = f"autocoder-full-mock-{task_id}"
+        original_branch_result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        original_branch = original_branch_result.stdout.strip()
         # The mock edit must target a path under the actual AED repo because
         # the controller's apply_to_branch expects the change to land in the
         # repo's working tree. Pick a path under scripts/local/ which is
@@ -587,11 +593,45 @@ class TestFullMockRunReachesReady:
         out_md = tmp_path / "out.md"
         script_path = REPO_ROOT / "scripts" / "local" / "run_autocoder_single_task.py"
 
-        # Pre-clean any leftover branch from a prior failed run
-        subprocess.run(
-            ["git", "-C", str(REPO_ROOT), "branch", "-D", branch_name],
-            capture_output=True, text=True,
-        )
+        def cleanup_mock_run() -> None:
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "reset", "HEAD", "--", mock_path],
+                capture_output=True,
+                text=True,
+            )
+            mock_full = REPO_ROOT / mock_path
+            if mock_full.exists():
+                mock_full.unlink()
+            current_branch_result = subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            if (
+                current_branch_result.stdout.strip() == branch_name
+                and original_branch
+                and original_branch != branch_name
+            ):
+                subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "switch", original_branch],
+                    capture_output=True,
+                    text=True,
+                )
+            subprocess.run(
+                ["git", "-C", str(REPO_ROOT), "branch", "-D", branch_name],
+                capture_output=True,
+                text=True,
+            )
+            # Also clean any temp worktree the controller may have created
+            if worktree_root.exists():
+                subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                     "--force", str(worktree_root)],
+                    capture_output=True, text=True,
+                )
+
+        # Pre-clean any leftover branch from a prior failed run.
+        cleanup_mock_run()
 
         try:
             argv = [
@@ -621,24 +661,16 @@ class TestFullMockRunReachesReady:
                 f"{cs.get('status')!r}; stage={cs.get('stage')!r}; "
                 f"actual={cs.get('actual')!r}; expected={cs.get('expected')!r}"
             )
+
+            artifacts = cs["artifacts"]
+            apply_to_branch = json.loads(Path(artifacts["apply_to_branch_json"]).read_text(encoding="utf-8"))
+            applied_branch = json.loads(Path(artifacts["applied_branch_verification_json"]).read_text(encoding="utf-8"))
+
+            assert apply_to_branch["status"] == "APPLY_TO_BRANCH_APPLIED"
+            assert applied_branch["status"] == "APPLIED_BRANCH_READY"
+            assert mock_path in applied_branch["checks"]["staged_added_expected"]
+            assert mock_path in applied_branch["changed_files_actual"]
+            assert mock_path in applied_branch["generated_human_commands"]["git_index_diff"]
+            assert applied_branch["checks"].get("missing_files_from_branch", []) == []
         finally:
-            # Clean up: delete the branch and the mock-edit file from the
-            # worktree (in case the controller left it staged).
-            subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "reset", "HEAD", "--", mock_path],
-                capture_output=True, text=True,
-            )
-            mock_full = REPO_ROOT / mock_path
-            if mock_full.exists():
-                mock_full.unlink()
-            subprocess.run(
-                ["git", "-C", str(REPO_ROOT), "branch", "-D", branch_name],
-                capture_output=True, text=True,
-            )
-            # Also clean any temp worktree the controller may have created
-            if worktree_root.exists():
-                subprocess.run(
-                    ["git", "-C", str(REPO_ROOT), "worktree", "remove",
-                     "--force", str(worktree_root)],
-                    capture_output=True, text=True,
-                )
+            cleanup_mock_run()

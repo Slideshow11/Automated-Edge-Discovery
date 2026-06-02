@@ -607,6 +607,10 @@ def write_md_output(
         f"# View full diff",
         f"git -C {repo_root} diff {expected_base_sha}...refs/heads/{branch_name}",
         f"#",
+        f"# View staged/index diff (for staged-added mock edits)",
+        f"git -C {repo_root} diff --cached --stat",
+        f"git -C {repo_root} diff --cached",
+        f"#",
         f"# Suggested tests",
         f"{generated_human_commands.get('suggested_tests', '')}",
         f"```",
@@ -690,6 +694,8 @@ def main() -> int:
     # Build generated human commands (text only, not executed)
     git_diff_stat = ""
     git_diff = ""
+    git_index_diff_stat = ""
+    git_index_diff = ""
     suggested_tests = "pytest tests/ -q  # run from repo root"
 
     try:
@@ -714,9 +720,25 @@ def main() -> int:
     except Exception:
         pass
 
+    try:
+        r = _run_git(repo_root, "diff", "--cached", "--stat")
+        if r.returncode == 0:
+            git_index_diff_stat = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "diff", "--cached")
+        if r.returncode == 0:
+            git_index_diff = r.stdout.strip()
+    except Exception:
+        pass
+
     generated_human_commands = {
         "git_diff_stat": git_diff_stat,
         "git_diff": git_diff[:2000] + ("..." if len(git_diff) > 2000 else ""),
+        "git_index_diff_stat": git_index_diff_stat,
+        "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
         "suggested_tests": suggested_tests,
         "note": "Commands are TEXT ONLY — not executed by this verifier.",
     }
