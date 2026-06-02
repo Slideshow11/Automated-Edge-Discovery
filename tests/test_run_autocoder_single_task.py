@@ -563,6 +563,18 @@ class TestFullMockRunReachesReady:
             timeout=30,
         )
         assert setup_result.returncode == 0, setup_result.stderr
+        base_branch_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "rev-parse", "--verify", "refs/heads/main"],
+            capture_output=True,
+            text=True,
+        )
+        if base_branch_result.returncode != 0:
+            create_base_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "branch", "main", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            assert create_base_result.returncode == 0, create_base_result.stderr
         original_branch_result = subprocess.run(
             ["git", "-C", str(repo_under_test), "rev-parse", "--abbrev-ref", "HEAD"],
             capture_output=True,
