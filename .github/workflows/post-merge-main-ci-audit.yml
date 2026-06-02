@@ -1,12 +1,26 @@
 name: Post-merge main CI audit
 
 # Trigger A: push to main — immediate audit on the new HEAD.
-# Trigger B: workflow_run completed for the three required workflows —
+# Trigger B: workflow_run completed for the required upstream workflows —
 #            follow-up audit that closes the loop when a slow upstream
 #            workflow finishes after the merge push.
 #
 # IMPORTANT: this workflow must NEVER appear in its own required-workflow
 # list. It is an auditor, not a thing-being-audited.
+#
+# Required workflows:
+#   * `CI`                — always required (runs on every push to main)
+#   * `Edge Discovery audit tests` — always required (runs on every push to main)
+#   * `WFA`               — CONDITIONALLY required. WFA's own workflow has a
+#     path filter (`engine/**`, `scripts/**`, `src/**`, `examples/**`,
+#     `tests/**`, `schemas/**`, `Makefile`, `pyproject.toml`,
+#     `requirements.txt`, `.github/workflows/wfa.yml`). When the audited
+#     commit does not touch any of those paths, no WFA run is created
+#     and unconditionally requiring it would always fail with
+#     `HOLD_MAIN_CI_MISSING_REQUIRED_WORKFLOW`. The `Compute changed
+#     files and decide WFA requirement` step below mirrors the WFA
+#     filter and only adds `--required-workflow WFA` when the audited
+#     commit would actually have produced a WFA run.
 
 'on':
   push:
@@ -87,13 +101,70 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ steps.audit_sha.outputs.audit_sha }}
-          fetch-depth: 1
+          # Need the parent commit so the diff step can compute changed
+          # files against AUDIT_SHA^1. depth=2 gives us AUDIT_SHA and its
+          # first parent.
+          fetch-depth: 2
 
       - name: Set up Python
         if: steps.audit_sha.outputs.skip != 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
+
+      - name: Compute changed files and decide WFA requirement
+        id: wfa_decision
+        if: steps.audit_sha.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          SHA="${{ steps.audit_sha.outputs.audit_sha }}"
+          echo "Computing changed files for ${SHA}..."
+          # Try the parent-diff first. Fall back to the commit's own
+          # file list if the commit has no parent (e.g. repo-root commit).
+          if CHANGED_FILES="$(git diff --name-only "${SHA}^1" "${SHA}" 2>/dev/null)"; then
+            :
+          else
+            echo "::notice title=No parent for ${SHA}::Falling back to the commit's own file list."
+            CHANGED_FILES="$(git show --pretty='' --name-only "${SHA}" 2>/dev/null || true)"
+          fi
+          CHANGED_COUNT="$(printf '%s\n' "${CHANGED_FILES}" | awk 'NF{c++} END{print c+0}')"
+          echo "Changed files (${CHANGED_COUNT}):"
+          if [ -n "${CHANGED_FILES}" ]; then
+            printf '  %s\n' ${CHANGED_FILES}
+          fi
+          # WFA-relevant paths — mirror of .github/workflows/wfa.yml's
+          # push.paths filter. Keep these in sync with wfa.yml if that
+          # filter ever changes.
+          WFA_PATTERN='^(engine|scripts|src|examples|tests|schemas)/.*$|^Makefile$|^pyproject\.toml$|^requirements\.txt$|^\.github/workflows/wfa\.yml$'
+          WFA_MATCHES="$(printf '%s\n' "${CHANGED_FILES}" | grep -E "${WFA_PATTERN}" || true)"
+          WFA_REQUIRED="false"
+          if [ -n "${WFA_MATCHES}" ]; then
+            WFA_REQUIRED="true"
+          fi
+          echo "WFA-relevant matches:"
+          if [ -n "${WFA_MATCHES}" ]; then
+            printf '  %s\n' ${WFA_MATCHES}
+          else
+            echo "  (none)"
+          fi
+          echo "WFA required: ${WFA_REQUIRED}"
+          echo "wfa_required=${WFA_REQUIRED}" >> "$GITHUB_OUTPUT"
+          echo "changed_files_count=${CHANGED_COUNT}" >> "$GITHUB_OUTPUT"
+          # Persist the decision as a separate artifact so reviewers can
+          # see why WFA was required or skipped for any audited SHA.
+          {
+            echo "# WFA audit decision"
+            echo ""
+            echo "- **Audit SHA**: \`${SHA}\`"
+            echo "- **Changed files**: ${CHANGED_COUNT}"
+            echo "- **WFA required**: **${WFA_REQUIRED}**"
+            if [ "${WFA_REQUIRED}" = "true" ]; then
+              echo "- **WFA-relevant files**:"
+              printf '  - `%s`\n' ${WFA_MATCHES}
+            else
+              echo "- **WFA-relevant files**: (none)"
+            fi
+          } > /tmp/aed_post_merge_wfa_decision.md
 
       - name: Run post-merge main CI audit
         id: audit
@@ -102,13 +173,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          # Always-required workflows.
+          REQUIRED_WORKFLOW_ARGS=(
+            --required-workflow CI
+            --required-workflow "Edge Discovery audit tests"
+          )
+          # Conditionally require WFA when the audited commit would have
+          # produced a WFA run (see "Compute changed files and decide WFA
+          # requirement" step for the path-match logic).
+          if [ "${{ steps.wfa_decision.outputs.wfa_required }}" = "true" ]; then
+            REQUIRED_WORKFLOW_ARGS+=(--required-workflow WFA)
+            echo "WFA will be required for this audit (changed files match WFA-relevant paths)."
+          else
+            echo "WFA will NOT be required for this audit (no changed files match WFA-relevant paths)."
+          fi
           python3 scripts/local/audit_main_ci_for_head.py \
             --repo "${REPO}" \
             --branch "${BRANCH}" \
             --head-sha "${{ steps.audit_sha.outputs.audit_sha }}" \
-            --required-workflow CI \
-            --required-workflow "Edge Discovery audit tests" \
-            --required-workflow WFA \
+            "${REQUIRED_WORKFLOW_ARGS[@]}" \
             --max-polls 6 \
             --poll-seconds 30 \
             --output-json /tmp/aed_post_merge_main_ci_audit.json \
@@ -125,13 +208,14 @@ jobs:
           path: |
             /tmp/aed_post_merge_main_ci_audit.json
             /tmp/aed_post_merge_main_ci_audit.md
+            /tmp/aed_post_merge_wfa_decision.md
           if-no-files-found: warn
           retention-days: 30
 
       - name: Status — MAIN_CI_AUDIT_GREEN
         if: steps.audit.outputs.status == 'MAIN_CI_AUDIT_GREEN'
         run: |
-          echo "All three required workflows succeeded on ${{ steps.audit_sha.outputs.audit_sha }}."
+          echo "All required workflows succeeded on ${{ steps.audit_sha.outputs.audit_sha }} (WFA required: ${{ steps.wfa_decision.outputs.wfa_required }})."
 
       - name: Status — HOLD_MAIN_CI_PENDING (non-failing, follow-up will close the loop)
         if: steps.audit.outputs.status == 'HOLD_MAIN_CI_PENDING'
