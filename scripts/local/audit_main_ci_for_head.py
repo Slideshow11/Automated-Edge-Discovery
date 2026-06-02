@@ -1,0 +1,675 @@
+#!/usr/bin/env python3
+"""
+audit_main_ci_for_head.py — Read-only post-merge CI audit helper.
+
+Polls GitHub Actions workflow runs for an exact main-branch head SHA and
+classifies them as GREEN / HOLD_PENDING / HOLD_FAILED / HOLD_MISSING /
+HOLD_NO_RUNS / ERROR_INVALID_ARGS / ERROR_TOOL_FAILURE.
+
+This helper is REPORT-ONLY. It performs only read operations against
+GitHub and never mutates repository or branch state. It parses JSON in
+Python and invokes gh via list-form argv through subprocess.run.
+
+Usage:
+    python3 scripts/local/audit_main_ci_for_head.py \\
+        --repo Slideshow11/Automated-Edge-Discovery \\
+        --branch main \\
+        --head-sha dd0b4e2b932b2e6b85a59c12d5aa24774b8994bf \\
+        --required-workflow CI \\
+        --required-workflow "Edge Discovery audit tests" \\
+        --max-polls 6 \\
+        --poll-seconds 30 \\
+        --output-json /tmp/audit.json \\
+        --output-md /tmp/audit.md
+
+Exit codes:
+    0 — report written (status may be any value)
+    2 — invalid CLI args (ERROR_INVALID_ARGS)
+    1 — unexpected internal error
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# Status taxonomy
+# ---------------------------------------------------------------------------
+
+STATUS_GREEN = "MAIN_CI_AUDIT_GREEN"
+STATUS_HOLD_PENDING = "HOLD_MAIN_CI_PENDING"
+STATUS_HOLD_FAILED = "HOLD_MAIN_CI_FAILED"
+STATUS_HOLD_MISSING = "HOLD_MAIN_CI_MISSING_REQUIRED_WORKFLOW"
+STATUS_HOLD_NO_RUNS = "HOLD_MAIN_CI_NO_RUNS_FOR_HEAD"
+STATUS_ERROR_INVALID_ARGS = "ERROR_INVALID_ARGS"
+STATUS_ERROR_TOOL_FAILURE = "ERROR_TOOL_FAILURE"
+
+# Statuses that indicate "do not proceed"
+HOLD_STATUSES = frozenset(
+    {
+        STATUS_HOLD_PENDING,
+        STATUS_HOLD_FAILED,
+        STATUS_HOLD_MISSING,
+        STATUS_HOLD_NO_RUNS,
+    }
+)
+
+# Recommendation text per status
+RECOMMENDATIONS = {
+    STATUS_GREEN: "Main CI is green for the exact head.",
+    STATUS_HOLD_PENDING: "Re-run the audit later; bounded polling expired with pending runs.",
+    STATUS_HOLD_FAILED: "Do not proceed; inspect failed workflow runs.",
+    STATUS_HOLD_MISSING: "Do not proceed; required workflow run missing for this head.",
+    STATUS_HOLD_NO_RUNS: "Do not proceed; no workflow runs found for this exact head.",
+    STATUS_ERROR_INVALID_ARGS: "Stop and inspect tool error.",
+    STATUS_ERROR_TOOL_FAILURE: "Stop and inspect tool error.",
+}
+
+# GitHub Actions status values that mean "still in flight"
+PENDING_STATUSES = frozenset(
+    {"queued", "pending", "in_progress", "requested", "waiting"}
+)
+
+# Exact 40-character lowercase hex
+SHA_REGEX = re.compile(r"^[0-9a-f]{40}$")
+
+# Fields extracted from each gh run list row
+RUN_JSON_FIELDS = (
+    "databaseId",
+    "name",
+    "workflowName",
+    "status",
+    "conclusion",
+    "headSha",
+    "headBranch",
+    "event",
+    "createdAt",
+    "updatedAt",
+    "url",
+    "displayTitle",
+)
+
+PACKET_KIND = "aed.main_ci.audit.v0"
+SCHEMA_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="audit_main_ci_for_head.py",
+        description="Read-only post-merge CI audit helper for an exact head SHA.",
+    )
+    parser.add_argument(
+        "--repo", required=True, help="OWNER/REPO (e.g. Slideshow11/Automated-Edge-Discovery)"
+    )
+    parser.add_argument("--head-sha", required=True, help="Exact 40-char hex commit SHA")
+    parser.add_argument("--branch", default="main", help="Branch name (default: main)")
+    parser.add_argument(
+        "--required-workflow",
+        action="append",
+        default=[],
+        dest="required_workflow",
+        help="Required workflow name (repeatable). Optional.",
+    )
+    parser.add_argument(
+        "--limit", type=int, default=20, help="gh run list --limit (default 20)"
+    )
+    parser.add_argument(
+        "--max-polls", type=int, default=6, help="Maximum polls (default 6, min 1)"
+    )
+    parser.add_argument(
+        "--poll-seconds",
+        type=int,
+        default=30,
+        help="Seconds between polls (default 30, max 30)",
+    )
+    parser.add_argument(
+        "--output-json", required=True, help="Path to write JSON artifact"
+    )
+    parser.add_argument("--output-md", required=True, help="Path to write Markdown artifact")
+    return parser.parse_args(argv)
+
+
+def validate_args(args: argparse.Namespace) -> Tuple[bool, str]:
+    if not SHA_REGEX.match(args.head_sha or ""):
+        return False, f"head_sha must be exactly 40 lowercase hex chars: got {args.head_sha!r}"
+    if not args.repo or "/" not in args.repo:
+        return False, f"repo must be OWNER/REPO: got {args.repo!r}"
+    if not args.branch:
+        return False, "branch must be non-empty"
+    if args.poll_seconds > 30:
+        return False, f"poll-seconds must be <=30: got {args.poll_seconds}"
+    if args.max_polls < 1:
+        return False, f"max-polls must be >=1: got {args.max_polls}"
+    if args.limit < 1:
+        return False, f"limit must be >=1: got {args.limit}"
+    for wf in args.required_workflow or []:
+        if not wf or not isinstance(wf, str):
+            return False, f"required-workflow must be non-empty string: got {wf!r}"
+    if not args.output_json or not args.output_md:
+        return False, "output-json and output-md are required"
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# gh invocation
+# ---------------------------------------------------------------------------
+
+
+def run_gh_run_list(args: argparse.Namespace) -> List[Dict[str, Any]]:
+    """Invoke `gh run list` with list-form argv. Return parsed JSON list.
+
+    Raises RuntimeError on subprocess failure, JSON parse failure, or shape errors.
+    """
+    argv = [
+        "gh",
+        "run",
+        "list",
+        "--repo",
+        args.repo,
+        "--branch",
+        args.branch,
+        "--limit",
+        str(args.limit),
+        "--json",
+        ",".join(RUN_JSON_FIELDS),
+    ]
+    try:
+        result = subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        raise RuntimeError(
+            f"gh run list failed (rc={exc.returncode}): {stderr or '<no stderr>'}"
+        ) from exc
+    except FileNotFoundError as exc:
+        raise RuntimeError("gh executable not found on PATH") from exc
+    except OSError as exc:
+        raise RuntimeError(f"gh run list OS error: {exc}") from exc
+
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh run list returned invalid JSON: {exc}") from exc
+
+    if not isinstance(data, list):
+        raise RuntimeError(
+            f"gh run list returned non-list JSON: {type(data).__name__}"
+        )
+    return data
+
+
+# ---------------------------------------------------------------------------
+# Filtering and classification
+# ---------------------------------------------------------------------------
+
+
+def filter_runs_for_head(
+    runs: List[Dict[str, Any]], head_sha: str
+) -> List[Dict[str, Any]]:
+    """Return only runs whose headSha exactly equals head_sha (case-insensitive)."""
+    target = (head_sha or "").lower()
+    out = []
+    for r in runs:
+        sha = (r.get("headSha") or "").lower()
+        if sha == target:
+            out.append(r)
+    return out
+
+
+def classify_runs(
+    target_runs: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Classify target runs.
+
+    Returns (status, pending_runs, failed_runs, successful_runs).
+    Priority: if any failed -> FAILED; else if all completed success -> GREEN;
+    else -> PENDING (any still in flight).
+    """
+    pending: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    successful: List[Dict[str, Any]] = []
+    if not target_runs:
+        return STATUS_HOLD_NO_RUNS, pending, failed, successful
+    for r in target_runs:
+        status = (r.get("status") or "").lower()
+        conclusion = (r.get("conclusion") or "").lower()
+        if status == "completed" and conclusion == "success":
+            successful.append(r)
+        elif status == "completed":
+            failed.append(r)
+        else:
+            pending.append(r)
+    if failed:
+        return STATUS_HOLD_FAILED, pending, failed, successful
+    if pending:
+        return STATUS_HOLD_PENDING, pending, failed, successful
+    return STATUS_GREEN, pending, failed, successful
+
+
+def missing_required_workflows(
+    required: List[str], found_workflow_names: List[str]
+) -> List[str]:
+    found = set(found_workflow_names)
+    return [w for w in required if w not in found]
+
+
+# ---------------------------------------------------------------------------
+# Packet building
+# ---------------------------------------------------------------------------
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_packet(
+    args: argparse.Namespace,
+    status: str,
+    runs_for_head: List[Dict[str, Any]],
+    pending_runs: List[Dict[str, Any]],
+    failed_runs: List[Dict[str, Any]],
+    successful_runs: List[Dict[str, Any]],
+    missing_required: List[str],
+    polls_used: int,
+    commands_run: List[List[str]],
+    errors: List[str],
+) -> Dict[str, Any]:
+    target_workflow_names = list(args.required_workflow or [])
+    if not target_workflow_names:
+        target_workflow_names = sorted(
+            {str(r.get("workflowName") or "") for r in runs_for_head if r.get("workflowName")}
+        )
+    summary_counts = {
+        "runs_for_head_total": len(runs_for_head),
+        "pending": len(pending_runs),
+        "failed": len(failed_runs),
+        "successful": len(successful_runs),
+        "missing_required_workflows": len(missing_required),
+    }
+    return {
+        "packet_kind": PACKET_KIND,
+        "schema_version": SCHEMA_VERSION,
+        "generated_at": _now_iso(),
+        "repo": args.repo,
+        "branch": args.branch,
+        "head_sha": args.head_sha,
+        "status": status,
+        "max_polls": args.max_polls,
+        "poll_seconds": args.poll_seconds,
+        "polls_used": polls_used,
+        "required_workflows": list(args.required_workflow or []),
+        "target_workflow_names": target_workflow_names,
+        "runs_for_head": runs_for_head,
+        "missing_required_workflows": missing_required,
+        "pending_runs": pending_runs,
+        "failed_runs": failed_runs,
+        "successful_runs": successful_runs,
+        "summary": summary_counts,
+        "errors": errors,
+        "commands_run": commands_run,
+        "recommendation": RECOMMENDATIONS.get(status, "Stop and inspect tool error."),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Markdown rendering
+# ---------------------------------------------------------------------------
+
+
+def _md_escape(s: Any) -> str:
+    return str(s).replace("|", "\\|").replace("\n", " ")
+
+
+def _md_run_table(runs: List[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    lines.append("| databaseId | workflowName | status | conclusion | updatedAt | url |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    if not runs:
+        lines.append("|  | _(none)_ |  |  |  |  |")
+        return lines
+    for r in runs:
+        lines.append(
+            "| {dbid} | {wf} | {st} | {con} | {upd} | {url} |".format(
+                dbid=_md_escape(r.get("databaseId", "")),
+                wf=_md_escape(r.get("workflowName", "")),
+                st=_md_escape(r.get("status", "")),
+                con=_md_escape(r.get("conclusion", "")),
+                upd=_md_escape(r.get("updatedAt", "")),
+                url=_md_escape(r.get("url", "")),
+            )
+        )
+    return lines
+
+
+def render_markdown(packet: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append("# Post-Merge CI Audit")
+    lines.append("")
+    lines.append(f"**Repo**: `{packet['repo']}`")
+    lines.append(f"**Branch**: `{packet['branch']}`")
+    lines.append(f"**Head SHA**: `{packet['head_sha']}`")
+    lines.append(f"**Final status**: `{packet['status']}`")
+    lines.append(f"**Polls used**: {packet['polls_used']} of {packet['max_polls']} (poll-seconds={packet['poll_seconds']})")
+    lines.append(f"**Recommendation**: {packet.get('recommendation','')}")
+    lines.append("")
+    status = packet.get("status", "")
+    if status == STATUS_HOLD_MISSING:
+        lines.append("## Polling outcome")
+        lines.append("")
+        lines.append(
+            "Bounded polling exhausted with one or more **required workflows still missing** "
+            "for the exact head SHA. Re-run later; GitHub may not have surfaced the run yet, "
+            "or the workflow was never triggered for this head."
+        )
+        lines.append("")
+    elif status == STATUS_HOLD_PENDING:
+        lines.append("## Polling outcome")
+        lines.append("")
+        lines.append(
+            "Bounded polling exhausted with **required workflows present but still in flight** "
+            "for the exact head SHA. Re-run later; the workflows are running and have not yet "
+            "posted a terminal conclusion."
+        )
+        lines.append("")
+    lines.append("## Required workflows")
+    if packet.get("required_workflows"):
+        for w in packet["required_workflows"]:
+            lines.append(f"- `{w}`")
+    else:
+        lines.append("_(none specified — all runs found for the exact head are evaluated)_")
+    lines.append("")
+    lines.append("## Target runs for head")
+    lines.extend(_md_run_table(packet.get("runs_for_head", [])))
+    lines.append("")
+    lines.append("## Missing required workflows")
+    if packet.get("missing_required_workflows"):
+        for w in packet["missing_required_workflows"]:
+            lines.append(f"- `{w}`")
+    else:
+        lines.append("_(none)_")
+    lines.append("")
+    lines.append("## Pending runs")
+    lines.extend(_md_run_table(packet.get("pending_runs", [])))
+    lines.append("")
+    lines.append("## Failed runs")
+    lines.extend(_md_run_table(packet.get("failed_runs", [])))
+    lines.append("")
+    lines.append("## Successful runs")
+    lines.extend(_md_run_table(packet.get("successful_runs", [])))
+    lines.append("")
+    lines.append("## Commands run")
+    if packet.get("commands_run"):
+        for cmd in packet["commands_run"]:
+            lines.append("- `" + " ".join(_md_escape(part) for part in cmd) + "`")
+    else:
+        lines.append("_(none — exit before any gh call)_")
+    lines.append("")
+    lines.append("## Errors")
+    if packet.get("errors"):
+        for e in packet["errors"]:
+            lines.append(f"- {e}")
+    else:
+        lines.append("_(none)_")
+    lines.append("")
+    lines.append("## Summary")
+    for k, v in packet.get("summary", {}).items():
+        lines.append(f"- **{k}**: {v}")
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Output writing
+# ---------------------------------------------------------------------------
+
+
+def write_outputs(
+    packet: Dict[str, Any], output_json: str, output_md: str
+) -> Tuple[bool, str]:
+    try:
+        json_path = Path(output_json)
+        md_path = Path(output_md)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        md_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(packet, indent=2, sort_keys=False) + "\n")
+        md_path.write_text(render_markdown(packet))
+    except OSError as exc:
+        return False, f"write_outputs failed: {exc}"
+    return True, "ok"
+
+
+# ---------------------------------------------------------------------------
+# Main audit loop
+# ---------------------------------------------------------------------------
+
+
+def _error_packet(
+    args: argparse.Namespace,
+    status: str,
+    error_msg: str,
+    commands_run: List[List[str]],
+) -> Dict[str, Any]:
+    return build_packet(
+        args=args,
+        status=status,
+        runs_for_head=[],
+        pending_runs=[],
+        failed_runs=[],
+        successful_runs=[],
+        missing_required=[],
+        polls_used=0,
+        commands_run=commands_run,
+        errors=[error_msg],
+    )
+
+
+def audit(args: argparse.Namespace) -> Dict[str, Any]:
+    """Run the audit. Return the JSON-serializable packet dict.
+
+    Side effect: sleeps via time.sleep between polls.
+    """
+    commands_run: List[List[str]] = []
+    errors: List[str] = []
+    required = list(args.required_workflow or [])
+    require_workflow_list = bool(required)
+
+    runs_for_head: List[Dict[str, Any]] = []
+    pending: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    successful: List[Dict[str, Any]] = []
+    missing: List[str] = []
+
+    polls_used = 0
+    target_workflow_names: List[str] = []
+
+    for poll_index in range(args.max_polls):
+        polls_used += 1
+        argv = [
+            "gh",
+            "run",
+            "list",
+            "--repo",
+            args.repo,
+            "--branch",
+            args.branch,
+            "--limit",
+            str(args.limit),
+            "--json",
+            ",".join(RUN_JSON_FIELDS),
+        ]
+        commands_run.append(list(argv))
+        try:
+            runs_all = run_gh_run_list(args)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+            return _error_packet(
+                args, STATUS_ERROR_TOOL_FAILURE, str(exc), commands_run
+            )
+
+        runs_for_head = filter_runs_for_head(runs_all, args.head_sha)
+
+        if require_workflow_list:
+            found_names = sorted(
+                {str(r.get("workflowName") or "") for r in runs_for_head}
+            )
+            # Record missing required workflows but DO NOT return early.
+            # Missing required workflows are treated as pending until the
+            # bounded polling window is exhausted. Only then do we report
+            # HOLD_MAIN_CI_MISSING_REQUIRED_WORKFLOW. This matches the
+            # wait_for_pr_ready.py convention: absent checks during the
+            # polling window are not yet "missing" — GitHub may not have
+            # surfaced the run yet.
+            missing = missing_required_workflows(required, found_names)
+            target_workflow_names = [w for w in required if w in set(found_names)]
+        else:
+            if not runs_for_head:
+                return build_packet(
+                    args=args,
+                    status=STATUS_HOLD_NO_RUNS,
+                    runs_for_head=[],
+                    pending_runs=[],
+                    failed_runs=[],
+                    successful_runs=[],
+                    missing_required=[],
+                    polls_used=polls_used,
+                    commands_run=commands_run,
+                    errors=errors,
+                )
+            target_workflow_names = sorted(
+                {str(r.get("workflowName") or "") for r in runs_for_head}
+            )
+            missing = []
+
+        target_runs = [
+            r
+            for r in runs_for_head
+            if str(r.get("workflowName") or "") in set(target_workflow_names)
+        ]
+
+        if target_runs:
+            status, pending, failed, successful = classify_runs(target_runs)
+        else:
+            # No target runs in this poll (e.g., all required workflows are
+            # still missing). Treat as pending — keep polling.
+            status, pending, failed, successful = (
+                STATUS_HOLD_PENDING,
+                [],
+                [],
+                [],
+            )
+
+        if failed:
+            return build_packet(
+                args=args,
+                status=STATUS_HOLD_FAILED,
+                runs_for_head=runs_for_head,
+                pending_runs=pending,
+                failed_runs=failed,
+                successful_runs=successful,
+                missing_required=list(missing),
+                polls_used=polls_used,
+                commands_run=commands_run,
+                errors=errors,
+            )
+
+        # GREEN is only reachable when no required workflow is missing AND
+        # every present required run is completed successfully. If any
+        # required workflow is still missing we must keep polling — a partial
+        # green during the polling window is not the final verdict.
+        if not missing and status == STATUS_GREEN:
+            return build_packet(
+                args=args,
+                status=STATUS_GREEN,
+                runs_for_head=runs_for_head,
+                pending_runs=pending,
+                failed_runs=failed,
+                successful_runs=successful,
+                missing_required=[],
+                polls_used=polls_used,
+                commands_run=commands_run,
+                errors=errors,
+            )
+
+        # Either some required workflow is still missing, or some target
+        # run is still in flight, or both. Continue polling.
+        if poll_index < args.max_polls - 1:
+            time.sleep(args.poll_seconds)
+
+    # Polling bound exhausted. Distinguish MISSING from PENDING based on
+    # whether any required workflow never appeared.
+    if missing:
+        return build_packet(
+            args=args,
+            status=STATUS_HOLD_MISSING,
+            runs_for_head=runs_for_head,
+            pending_runs=pending,
+            failed_runs=failed,
+            successful_runs=successful,
+            missing_required=list(missing),
+            polls_used=polls_used,
+            commands_run=commands_run,
+            errors=errors,
+        )
+    return build_packet(
+        args=args,
+        status=STATUS_HOLD_PENDING,
+        runs_for_head=runs_for_head,
+        pending_runs=pending,
+        failed_runs=failed,
+        successful_runs=successful,
+        missing_required=[],
+        polls_used=polls_used,
+        commands_run=commands_run,
+        errors=errors,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    ok, msg = validate_args(args)
+    if not ok:
+        packet = _error_packet(args, STATUS_ERROR_INVALID_ARGS, msg, commands_run=[])
+        write_outputs(packet, args.output_json, args.output_md)
+        return 2
+    packet = audit(args)
+    write_ok, write_err = write_outputs(packet, args.output_json, args.output_md)
+    if not write_ok:
+        # Already wrote once; best-effort re-emit with ERROR_TOOL_FAILURE
+        packet["errors"].append(write_err)
+        packet["status"] = STATUS_ERROR_TOOL_FAILURE
+        packet["recommendation"] = RECOMMENDATIONS[STATUS_ERROR_TOOL_FAILURE]
+        try:
+            Path(args.output_json).write_text(
+                json.dumps(packet, indent=2, sort_keys=False) + "\n"
+            )
+        except OSError:
+            pass
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
