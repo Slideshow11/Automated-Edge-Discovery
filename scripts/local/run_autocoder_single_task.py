@@ -78,6 +78,200 @@ def _git_rev_parse(repo: Path, ref: str = "HEAD") -> str:
 
 
 # ---------------------------------------------------------------------------
+# P3C-B1: real-output result-packet emission (mock mode only)
+# ---------------------------------------------------------------------------
+#
+# This block adds optional emission of a P3C-A-compatible result packet
+# after a successful mock-mode single-task run. The packet is consumed by
+# scripts/local/run_autocoder_real_output_eval.py. The schema is owned by
+# the P3C-A builder (scripts/local/build_autocoder_real_output_result_packet.py);
+# we import its build_packet / write_packet to guarantee the schema stays
+# aligned.
+#
+# Hard rules for this block (see docs/autocoder_result_packet_emission_v0.md):
+#   - Mock mode only. Live/real/claude modes are rejected upstream.
+#   - Report-only. Does not call models. Does not mutate GitHub.
+#   - Never invokes subprocess with a shell. The stdlib `subprocess` module is already
+#     imported by this file (line above) for stage plumbing; we reuse
+#     _git_rev_parse() instead of adding new subprocess calls.
+#   - The P3C-A builder's source-safety test is a separate file; we do
+#     not duplicate those assertions here.
+
+# When source_pr=0 (mock / unopened PR) is passed to P3C-A's
+# validate_args(), it is rejected (the P3C-A builder requires positive
+# ints). P3C-B1 bypasses P3C-A's validation by calling build_packet()
+# directly, which is a pure dict-builder that does not enforce the
+# positivity rule. This is intentional and documented.
+MOCK_SOURCE_PR = 0
+
+# Mock-safe placeholder for source_commit / source_head_sha when no real
+# commit exists (e.g. controller failed before stage 5 created a branch).
+# A 40-character hex string of zeros is what the P3C-A builder expects
+# for a SHA, but a real SHA is always preferred when available.
+MOCK_SHA_PLACEHOLDER = "0" * 40
+
+# How many characters of suggested_pr_title to keep for the packet
+# title field. The P3C-A builder truncates by accepting any length,
+# but long titles hurt readability of the eval report.
+TITLE_MAX_LEN = 200
+
+
+def _try_emit_real_output_result_packet(
+    task_packet: dict,
+    real_task_id: str,
+    emit_path: Path,
+    controller_status: str,
+    changed_files: list,
+    branch_name: str,
+    base_sha: str,
+    repo_root: Path,
+) -> dict:
+    """Build and write a P3C-A-compatible result packet for a completed
+    single-task autocoder run (mock mode only).
+
+    Imports the P3C-A builder (scripts/local/build_autocoder_real_output_result_packet.py)
+    at call time to guarantee the schema stays aligned with the evaluator.
+    Returns a small dict describing what was written (or the failure mode).
+    """
+    # Local import: scripts/local is not a package. We add it to sys.path
+    # only inside this function so we do not pollute the module-level
+    # import table or change behavior for callers that do not use the
+    # emit feature.
+    if str(SCRIPT_DIR) not in sys.path:
+        sys.path.insert(0, str(SCRIPT_DIR))
+    try:
+        from build_autocoder_real_output_result_packet import (  # type: ignore
+            build_packet as p3ca_build_packet,
+            write_packet as p3ca_write_packet,
+        )
+    except Exception as e:  # noqa: BLE001 — surface to caller as emission failure
+        return {
+            "emission_status": "ERROR_P3CA_IMPORT_FAILED",
+            "error": f"could not import P3C-A builder: {e}",
+        }
+
+    # Determine source SHA. Prefer the branch head (real commit produced
+    # by this run). Fall back to base_sha (the SHA the run was based on).
+    # Final fallback: a mock-safe placeholder.
+    branch_head_sha = _git_rev_parse(repo_root, branch_name) if branch_name else ""
+    source_sha = branch_head_sha or base_sha or MOCK_SHA_PLACEHOLDER
+    if not isinstance(source_sha, str) or len(source_sha) != 40:
+        source_sha = MOCK_SHA_PLACEHOLDER
+
+    # Map controller status -> P3C-A packet status.
+    if controller_status == State.READY:
+        packet_status = "PASS"
+        hold_reason = None
+        error_reason = None
+    elif controller_status.startswith("HOLD_"):
+        packet_status = "HOLD"
+        hold_reason = f"controller status: {controller_status}"
+        error_reason = None
+    else:
+        packet_status = "ERROR"
+        hold_reason = None
+        error_reason = f"controller status: {controller_status}"
+
+    # changed_files must be non-empty per the P3C-A builder contract.
+    # The mock controller may legitimately produce zero changes; in that
+    # case we emit a single placeholder entry so the packet is well-formed
+    # and downstream scope checks evaluate to "in scope".
+    if not changed_files:
+        changed_files = ["(no changes in mock)"]
+
+    scoped = list(changed_files)  # mock: all changes were in scope
+
+    title = (task_packet.get("suggested_pr_title") or
+             task_packet.get("goal") or
+             "mock single-task autocoder run")
+    if isinstance(title, str) and len(title) > TITLE_MAX_LEN:
+        title = title[:TITLE_MAX_LEN]
+
+    notes = [
+        "emitted from run_autocoder_single_task.py mock mode (P3C-B1)",
+        f"controller status: {controller_status}",
+        f"branch_name: {branch_name}",
+        "source_pr=0 indicates mock/unopened PR; real production runs will populate this",
+    ]
+
+    # allowed_files must be non-empty per P3C-A. Fall back to a
+    # match-all wildcard when the task packet has no allowed_files
+    # declared. The notes field documents this fallback for the
+    # evaluator reader.
+    allowed = task_packet.get("allowed_files") or []
+    if not allowed:
+        allowed = ["*"]
+        notes.append(
+            "task packet had no allowed_files; using ['*'] wildcard "
+            "to satisfy P3C-A schema"
+        )
+
+    # Build the Namespace that P3C-A's build_packet() expects. The
+    # build_packet function does not validate (it only builds the dict),
+    # so we can pass source_pr=0 (which P3C-A's main() entry would reject).
+    p3ca_args = argparse.Namespace(
+        task_id=real_task_id,
+        source_pr=MOCK_SOURCE_PR,
+        source_commit=source_sha,
+        source_head_sha=source_sha,
+        title=title,
+        status=packet_status,
+        changed_files=list(changed_files),
+        allowed_files=list(allowed),
+        scoped_files=scoped,
+        tests_passed=0,  # mock does not run real tests
+        # P3C-A accepts lowercase "true"/"false" strings only.
+        ci_green="false",
+        scope_clean="true" if controller_status == State.READY else "false",
+        review_ready="true" if controller_status == State.READY else "false",
+        merge_ready="false",  # mock: no merge gates ran
+        human_cleanup_required="true",  # mock: human review always required
+        hold_reason=hold_reason,
+        error_reason=error_reason,
+        notes=notes,
+        output_json=str(emit_path),
+    )
+
+    try:
+        packet = p3ca_build_packet(p3ca_args)
+        ok, write_err = p3ca_write_packet(packet, str(emit_path))
+    except Exception as e:  # noqa: BLE001
+        return {
+            "emission_status": "ERROR_P3CA_BUILD_OR_WRITE_FAILED",
+            "error": f"P3C-A builder raised: {e}",
+        }
+
+    if not ok:
+        return {
+            "emission_status": "ERROR_P3CA_WRITE_FAILED",
+            "error": write_err,
+        }
+
+    return {
+        "emission_status": "RESULT_PACKET_READY",
+        "emit_path": str(emit_path),
+        "task_id": real_task_id,
+        "packet_status": packet_status,
+        "builder_status": packet.get("builder_status"),
+        "source_sha": source_sha,
+        "source_pr": MOCK_SOURCE_PR,
+    }
+
+
+def _extract_changed_files_from_stage2(result_json_path: Path) -> list:
+    """Read stage 2 (temp worktree execution) result.json and return its
+    changed_files list. Returns an empty list if the file is missing or
+    the field is absent."""
+    data = _load_json(result_json_path)
+    if not isinstance(data, dict):
+        return []
+    cf = data.get("changed_files")
+    if isinstance(cf, list):
+        return [str(x) for x in cf if isinstance(x, str)]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # State definitions
 # ---------------------------------------------------------------------------
 
@@ -446,6 +640,8 @@ def run_autocoder_single_task(
     task_packet_path: Path,
     output_json_path: Path,
     output_md_path: Path,
+    emit_packet_path: Optional[Path] = None,
+    real_task_id: Optional[str] = None,
 ) -> dict:
     """
     Run the single-task autocoder controller.
@@ -833,6 +1029,31 @@ def run_autocoder_single_task(
     }
     _write_json(output_json_path, result)
 
+    # P3C-B1: optionally emit a P3C-A-compatible result packet. Only on
+    # the successful terminal state (State.READY). The emission uses
+    # scripts/local/build_autocoder_real_output_result_packet.py so the
+    # schema stays aligned with the evaluator. The helper returns a
+    # small dict that we attach to the main result for observability.
+    # The two parameters are None unless the caller passed the new
+    # --emit-real-output-result-packet and --real-output-task-id flags.
+    if emit_packet_path is not None and real_task_id is not None:
+        changed_files = _extract_changed_files_from_stage2(result_json_path)
+        emission_info = _try_emit_real_output_result_packet(
+            task_packet=task_packet,
+            real_task_id=real_task_id,
+            emit_path=Path(emit_packet_path),
+            controller_status=State.READY,
+            changed_files=changed_files,
+            branch_name=branch_name,
+            base_sha=base_sha,
+            repo_root=effective_repo_root,
+        )
+        result["real_output_packet_emission"] = emission_info
+        # Re-write the main result with the emission info attached so
+        # callers reading output_json_path get a single self-describing
+        # artifact.
+        _write_json(output_json_path, result)
+
     # Write markdown summary
     md_summary_lines = [
         f"# Single-Task Autocoder — Final Status",
@@ -899,8 +1120,48 @@ def main() -> int:
             "Must be a valid git repository."
         ),
     )
+    # P3C-B1: optional emission of a P3C-A-compatible result packet after
+    # a successful mock-mode run. Both flags must be supplied together.
+    # Without these flags, the controller's behavior is unchanged.
+    parser.add_argument(
+        "--emit-real-output-result-packet",
+        required=False,
+        default=None,
+        help=(
+            "P3C-B1: if set, write a P3C-A-compatible result packet to this "
+            "path after a successful mock-mode terminal state. Requires "
+            "--real-output-task-id. Mock mode only; live/real/claude modes "
+            "are rejected upstream by HOLD_TASK_PACKET_INVALID."
+        ),
+    )
+    parser.add_argument(
+        "--real-output-task-id",
+        required=False,
+        default=None,
+        help=(
+            "P3C-B1: the corpus task_id to embed in the emitted result "
+            "packet. Required iff --emit-real-output-result-packet is set."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # P3C-B1: validate the emit / task-id pair before any work begins.
+    # This is a fail-fast check; it does not depend on the task packet.
+    if args.emit_real_output_result_packet and not args.real_output_task_id:
+        print(
+            "FATAL: --real-output-task-id is required when "
+            "--emit-real-output-result-packet is set",
+            file=sys.stderr,
+        )
+        return 1
+    if args.real_output_task_id and not args.emit_real_output_result_packet:
+        print(
+            "FATAL: --emit-real-output-result-packet is required when "
+            "--real-output-task-id is set",
+            file=sys.stderr,
+        )
+        return 1
 
     # Set effective_repo_root before any controller logic runs.
     if args.repo_root:
@@ -947,6 +1208,12 @@ def main() -> int:
             task_packet_path=task_packet_path,
             output_json_path=output_json_path,
             output_md_path=output_md_path,
+            emit_packet_path=(
+                Path(args.emit_real_output_result_packet)
+                if args.emit_real_output_result_packet
+                else None
+            ),
+            real_task_id=args.real_output_task_id,
         )
         print(f"Status: {result['status']}")
         print(f"Output JSON: {output_json_path}")
