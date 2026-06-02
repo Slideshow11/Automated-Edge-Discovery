@@ -585,7 +585,7 @@ def test_malformed_only_result_packets_return_hold_result_invalid(tmp_path: Path
     _write_corpus(corpus_path, VALID_CORPUS)
 
     # Both results have a non-string task_id (an int) — load_result will
-    # reject them as structurally invalid, putting both into unknown_results.
+    # reject them as structurally invalid, putting both into invalid_result_packets.
     r1 = {"task_id": 12345, "status": "PASS"}
     r2 = {"task_id": 67890, "status": "PASS"}
     p1 = tmp_path / "r1.json"; _write_result(p1, r1)
@@ -597,12 +597,72 @@ def test_malformed_only_result_packets_return_hold_result_invalid(tmp_path: Path
     assert rc == 0
     packet = json.loads(json_out.read_text())
     assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
-    # Both packet paths are reported in unknown_result_paths
-    assert len(packet["unknown_result_paths"]) == 2
+    # Both packet paths are reported in invalid_result_packets
+    assert len(packet["invalid_result_packets"]) == 2
     # matched_result_count is 0 because no result matched a corpus task
     assert packet["matched_result_count"] == 0
     # The errors should explicitly mention structural invalidity
     assert any("structurally invalid" in e for e in packet["errors"])
+
+
+def test_malformed_task_id_is_structurally_invalid(tmp_path: Path) -> None:
+    """A result packet whose task_id is structurally invalid (not a non-empty
+    string) is treated as a structurally invalid packet and forces HOLD, even
+    when every other field is well-formed. This pins the contract that
+    task_id validation is part of structural validity."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    # Several variations of invalid task_id; all must be treated as invalid.
+    cases = [
+        {"task_id": 12345, "status": "PASS"},         # int instead of string
+        {"task_id": ["a", "b"], "status": "PASS"},   # list instead of string
+        {"task_id": {"k": "v"}, "status": "PASS"},    # dict instead of string
+        {"task_id": None, "status": "PASS"},          # explicit null
+        {"task_id": "", "status": "PASS"},            # empty string
+        {"status": "PASS"},                            # missing task_id
+    ]
+    paths = []
+    for i, r in enumerate(cases):
+        p = tmp_path / f"r{i}.json"
+        _write_result(p, r)
+        paths.append(p)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, paths, json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
+    # All 6 packets are reported as invalid
+    assert len(packet["invalid_result_packets"]) == 6
+    assert packet["matched_result_count"] == 0
+    # The MD report should also list invalid result packets under the renamed section
+    md = md_out.read_text(encoding="utf-8")
+    assert "## Invalid result packets" in md
+
+
+def test_invalid_result_packets_field_replaces_unknown_result_paths(tmp_path: Path) -> None:
+    """The output packet field is named ``invalid_result_packets`` (not the
+    older ``unknown_result_paths``). The OLD field name MUST NOT appear
+    anywhere in the report."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    # Force an invalid packet so the field is populated.
+    r = {"task_id": 42, "status": "PASS"}
+    p = tmp_path / "r.json"; _write_result(p, r)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    # The new field exists
+    assert "invalid_result_packets" in packet
+    assert len(packet["invalid_result_packets"]) == 1
+    # The old field MUST NOT exist
+    assert "unknown_result_paths" not in packet
 
 
 def test_mixed_valid_and_malformed_result_packets_return_hold_result_invalid(tmp_path: Path) -> None:
@@ -623,7 +683,7 @@ def test_mixed_valid_and_malformed_result_packets_return_hold_result_invalid(tmp
     packet = json.loads(json_out.read_text())
     # HOLD, not READY — the malformed packet is a hard signal
     assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
-    assert len(packet["unknown_result_paths"]) == 1
+    assert len(packet["invalid_result_packets"]) == 1
     # Even with one valid match, the malformed packet forces HOLD
     assert packet["matched_result_count"] == 1
 

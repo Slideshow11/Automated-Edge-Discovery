@@ -386,7 +386,7 @@ def compute_task_record(
 def compute_metrics(
     corpus: Dict[str, Any],
     results_by_task: Dict[str, Dict[str, Any]],
-    unknown_results: List[str],
+    invalid_result_packets: List[str],
 ) -> Tuple[Dict[str, int], List[Dict[str, Any]]]:
     """Compute aggregate metrics and per-task records."""
     metrics = empty_metrics()
@@ -424,9 +424,10 @@ def compute_metrics(
         else:
             metrics["unknown_count"] += 1
 
-    if unknown_results:
-        # An unknown-result is also a tool-level concern; count it as an error.
-        metrics["error_count"] += len(unknown_results)
+    if invalid_result_packets:
+        # Any structurally invalid result packet is also a tool-level concern;
+        # count it as an error.
+        metrics["error_count"] += len(invalid_result_packets)
     return metrics, records
 
 
@@ -439,7 +440,7 @@ def build_packet(
     status: str,
     corpus: Optional[Dict[str, Any]],
     results_by_task: Dict[str, Dict[str, Any]],
-    unknown_results: List[str],
+    invalid_result_packets: List[str],
     metrics: Dict[str, int],
     records: List[Dict[str, Any]],
     missing_result_task_ids: List[str],
@@ -449,7 +450,9 @@ def build_packet(
     """Build the eval packet. matched_in_corpus_count is the number of result
     packets whose task_id exists in the corpus (i.e. true matches). It is
     computed by evaluate() and passed in so that the count never includes
-    results referencing unknown task_ids."""
+    results referencing unknown task_ids. invalid_result_packets is the list
+    of paths of structurally invalid result packets (those that failed to
+    load); it is the same collection that drives the hard HOLD gate."""
     packet: Dict[str, Any] = {
         "packet_kind": PACKET_KIND_EVAL,
         "schema_version": SCHEMA_VERSION,
@@ -461,7 +464,7 @@ def build_packet(
         "result_count": len(args.result_json),
         "matched_result_count": matched_in_corpus_count,
         "missing_result_task_ids": missing_result_task_ids,
-        "unknown_result_paths": unknown_results,
+        "invalid_result_packets": invalid_result_packets,
         "metrics": metrics,
         "tasks": records,
         "errors": errors,
@@ -510,10 +513,10 @@ def render_markdown(packet: Dict[str, Any]) -> str:
         lines.append(f"- missing_result_task_ids: {', '.join(missing)}")
     else:
         lines.append("- missing_result_task_ids: _(none)_")
-    unknowns = packet.get("unknown_result_paths", [])
+    unknowns = packet.get("invalid_result_packets", [])
     if unknowns:
         lines.append("")
-        lines.append("## Unknown result packets")
+        lines.append("## Invalid result packets")
         lines.append("")
         for u in unknowns:
             lines.append(f"- `{u}`")
@@ -579,7 +582,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
             status=STATUS_HOLD_CORPUS_INVALID,
             corpus=None,
             results_by_task={},
-            unknown_results=[],
+            invalid_result_packets=[],
             metrics=empty_metrics(),
             records=[],
             missing_result_task_ids=[],
@@ -587,13 +590,24 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
         )
         return STATUS_HOLD_CORPUS_INVALID, packet
 
-    # 2. Load result packets; bucket by task_id; collect unknown results
+    # 2. Load result packets; bucket by task_id; collect invalid packets.
+    #
+    # A result packet is "structurally invalid" if it fails to load (malformed
+    # JSON, missing required fields, wrong types, or an invalid task_id). The
+    # presence of ANY structurally invalid packet forces a hard HOLD — see the
+    # gate immediately after this loop. This loop is the review anchor: the
+    # collection is named invalid_result_packets (not "unknown_results") and
+    # the gate is right next to the loop so the relationship is obvious.
     results_by_task: Dict[str, Dict[str, Any]] = {}
-    unknown_results: List[str] = []
+    invalid_result_packets: List[str] = []
     for rj in args.result_json:
         result, result_errors = load_result(rj)
         if result is None:
-            unknown_results.append(rj)
+            # STRUCTURALLY INVALID result packet. This is NOT an ignorable
+            # "unknown" result — it is a hard error that MUST cause
+            # HOLD_REAL_OUTPUT_RESULT_INVALID. The check below the loop is
+            # the gate; do not "soften" the append into a plain log line.
+            invalid_result_packets.append(rj)
             errors.extend([f"{rj}: {e}" for e in result_errors])
             continue
         tid = result.get("task_id", "")
@@ -603,36 +617,32 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
             continue
         results_by_task[tid] = result
 
-    # 3. Compute metrics
-    metrics, records = compute_metrics(corpus, results_by_task, unknown_results)
-
-    # 4. Missing result task ids (corpus tasks with no result)
+    # Compute everything the hard gate below needs in one block, so the gate
+    # can return a fully-populated packet without falling through.
+    metrics, records = compute_metrics(corpus, results_by_task, invalid_result_packets)
     corpus_task_ids = {t["task_id"] for t in corpus["tasks"]}
     matched_task_ids = set(results_by_task.keys())
     matched_in_corpus = matched_task_ids & corpus_task_ids
     extra_results = matched_task_ids - corpus_task_ids  # results for tasks not in corpus
     missing_result_task_ids = sorted(corpus_task_ids - matched_task_ids)
     matched_in_corpus_count = len(matched_in_corpus)
-
-    # Update records' matched flag
     for rec in records:
         rec["matched_in_corpus"] = rec["task_id"] in {tid for tid in matched_in_corpus}
 
-    # 5. Determine overall status.
-    # Any structurally invalid result packet (failed to load) means the
-    # caller produced a malformed result set, which is a hard HOLD signal.
-    # This applies whether or not other results happen to match corpus tasks.
-    if unknown_results:
+    # HARD GATE: any structurally invalid result packet forces
+    # HOLD_REAL_OUTPUT_RESULT_INVALID. This gate is placed immediately after
+    # the loop that detects them so the relationship is direct and obvious.
+    if invalid_result_packets:
         errors.append(
-            f"{len(unknown_results)} result packet(s) are structurally invalid: "
-            + ", ".join(unknown_results)
+            f"{len(invalid_result_packets)} result packet(s) are structurally invalid: "
+            + ", ".join(invalid_result_packets)
         )
         packet = build_packet(
             args=args,
             status=STATUS_HOLD_RESULT_INVALID,
             corpus=corpus,
             results_by_task=results_by_task,
-            unknown_results=unknown_results,
+            invalid_result_packets=invalid_result_packets,
             metrics=metrics,
             records=records,
             missing_result_task_ids=missing_result_task_ids,
@@ -641,6 +651,12 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
         )
         return STATUS_HOLD_RESULT_INVALID, packet
 
+    # 4. Determine overall status.
+    # Now that the structural-invalidity gate has been handled above, the
+    # only remaining reason to escalate to HOLD_RESULT_INVALID is
+    # extra_results: result packets whose task_id is well-formed but not
+    # in the corpus. If every well-formed result is extra, the report is
+    # useless → HOLD. If at least one is in-corpus, downgrade to a warning.
     if extra_results:
         # Count each extra result (task_id not in corpus) as an error
         # regardless of whether we return HOLD_RESULT_INVALID or READY.
@@ -656,7 +672,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
                 status=STATUS_HOLD_RESULT_INVALID,
                 corpus=corpus,
                 results_by_task=results_by_task,
-                unknown_results=unknown_results,
+                invalid_result_packets=invalid_result_packets,
                 metrics=metrics,
                 records=records,
                 missing_result_task_ids=missing_result_task_ids,
@@ -675,7 +691,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
         status=status,
         corpus=corpus,
         results_by_task=results_by_task,
-        unknown_results=unknown_results,
+        invalid_result_packets=invalid_result_packets,
         metrics=metrics,
         records=records,
         missing_result_task_ids=missing_result_task_ids,
@@ -701,7 +717,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "result_count": 0,
             "matched_result_count": 0,
             "missing_result_task_ids": [],
-            "unknown_result_paths": [],
+            "invalid_result_packets": [],
             "metrics": empty_metrics(),
             "tasks": [],
             "errors": [msg],
@@ -728,7 +744,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             "result_count": 0,
             "matched_result_count": 0,
             "missing_result_task_ids": [],
-            "unknown_result_paths": [],
+            "invalid_result_packets": [],
             "metrics": empty_metrics(),
             "tasks": [],
             "errors": [f"unexpected error: {e}"],
