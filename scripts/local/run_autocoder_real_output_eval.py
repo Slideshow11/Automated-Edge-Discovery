@@ -444,7 +444,12 @@ def build_packet(
     records: List[Dict[str, Any]],
     missing_result_task_ids: List[str],
     errors: List[str],
+    matched_in_corpus_count: int = 0,
 ) -> Dict[str, Any]:
+    """Build the eval packet. matched_in_corpus_count is the number of result
+    packets whose task_id exists in the corpus (i.e. true matches). It is
+    computed by evaluate() and passed in so that the count never includes
+    results referencing unknown task_ids."""
     packet: Dict[str, Any] = {
         "packet_kind": PACKET_KIND_EVAL,
         "schema_version": SCHEMA_VERSION,
@@ -454,7 +459,7 @@ def build_packet(
         "status": status,
         "task_count": metrics["tasks_total"],
         "result_count": len(args.result_json),
-        "matched_result_count": len(results_by_task),
+        "matched_result_count": matched_in_corpus_count,
         "missing_result_task_ids": missing_result_task_ids,
         "unknown_result_paths": unknown_results,
         "metrics": metrics,
@@ -607,12 +612,35 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
     matched_in_corpus = matched_task_ids & corpus_task_ids
     extra_results = matched_task_ids - corpus_task_ids  # results for tasks not in corpus
     missing_result_task_ids = sorted(corpus_task_ids - matched_task_ids)
+    matched_in_corpus_count = len(matched_in_corpus)
 
     # Update records' matched flag
     for rec in records:
         rec["matched_in_corpus"] = rec["task_id"] in {tid for tid in matched_in_corpus}
 
-    # 5. Determine overall status
+    # 5. Determine overall status.
+    # Any structurally invalid result packet (failed to load) means the
+    # caller produced a malformed result set, which is a hard HOLD signal.
+    # This applies whether or not other results happen to match corpus tasks.
+    if unknown_results:
+        errors.append(
+            f"{len(unknown_results)} result packet(s) are structurally invalid: "
+            + ", ".join(unknown_results)
+        )
+        packet = build_packet(
+            args=args,
+            status=STATUS_HOLD_RESULT_INVALID,
+            corpus=corpus,
+            results_by_task=results_by_task,
+            unknown_results=unknown_results,
+            metrics=metrics,
+            records=records,
+            missing_result_task_ids=missing_result_task_ids,
+            errors=errors,
+            matched_in_corpus_count=matched_in_corpus_count,
+        )
+        return STATUS_HOLD_RESULT_INVALID, packet
+
     if extra_results:
         # Count each extra result (task_id not in corpus) as an error
         # regardless of whether we return HOLD_RESULT_INVALID or READY.
@@ -633,6 +661,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
                 records=records,
                 missing_result_task_ids=missing_result_task_ids,
                 errors=errors,
+                matched_in_corpus_count=matched_in_corpus_count,
             )
             return STATUS_HOLD_RESULT_INVALID, packet
         else:
@@ -651,6 +680,7 @@ def evaluate(args: argparse.Namespace) -> Tuple[str, Dict[str, Any]]:
         records=records,
         missing_result_task_ids=missing_result_task_ids,
         errors=errors,
+        matched_in_corpus_count=matched_in_corpus_count,
     )
     return status, packet
 

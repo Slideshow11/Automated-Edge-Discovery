@@ -10,7 +10,7 @@ Covers:
 6. hold status is counted
 7. human cleanup required is counted
 8. JSON and Markdown artifacts are written
-9. source safety: no gh mutation strings, no live Claude invocation, no shell=True literal
+9. source safety: no gh mutation strings, no live Claude invocation, no shell-mode subprocess literal
 10. CLI invalid args return ERROR_INVALID_ARGS or repo-standard nonzero behavior
 """
 
@@ -569,3 +569,153 @@ def test_cli_subprocess_invocation(tmp_path: Path) -> None:
     packet = json.loads(json_out.read_text())
     assert packet["status"] == mod.STATUS_READY
     assert packet["task_count"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 12. P2 review-thread fixes
+# ---------------------------------------------------------------------------
+
+
+def test_malformed_only_result_packets_return_hold_result_invalid(tmp_path: Path) -> None:
+    """All result packets with non-string task_id → HOLD_RESULT_INVALID.
+
+    Specifically, this must NOT fall through to REAL_OUTPUT_EVAL_READY.
+    """
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    # Both results have a non-string task_id (an int) — load_result will
+    # reject them as structurally invalid, putting both into unknown_results.
+    r1 = {"task_id": 12345, "status": "PASS"}
+    r2 = {"task_id": 67890, "status": "PASS"}
+    p1 = tmp_path / "r1.json"; _write_result(p1, r1)
+    p2 = tmp_path / "r2.json"; _write_result(p2, r2)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p1, p2], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
+    # Both packet paths are reported in unknown_result_paths
+    assert len(packet["unknown_result_paths"]) == 2
+    # matched_result_count is 0 because no result matched a corpus task
+    assert packet["matched_result_count"] == 0
+    # The errors should explicitly mention structural invalidity
+    assert any("structurally invalid" in e for e in packet["errors"])
+
+
+def test_mixed_valid_and_malformed_result_packets_return_hold_result_invalid(tmp_path: Path) -> None:
+    """Even one structurally invalid result packet must trigger HOLD_RESULT_INVALID,
+    even when another result packet is well-formed and references a real corpus task."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    good = {"task_id": "task-A", "status": "PASS", "changed_files": ["docs/x.md"]}
+    malformed = {"task_id": 999, "status": "PASS"}  # non-string task_id
+    p1 = tmp_path / "good.json"; _write_result(p1, good)
+    p2 = tmp_path / "bad.json"; _write_result(p2, malformed)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p1, p2], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    # HOLD, not READY — the malformed packet is a hard signal
+    assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
+    assert len(packet["unknown_result_paths"]) == 1
+    # Even with one valid match, the malformed packet forces HOLD
+    assert packet["matched_result_count"] == 1
+
+
+def test_unknown_task_id_does_not_increase_matched_result_count(tmp_path: Path) -> None:
+    """matched_result_count is the in-corpus intersection, not a count of all
+    result packets. Results referencing unknown task_ids must NOT inflate it."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    # Two valid-shape results, both referencing task_ids that are NOT in the corpus
+    r1 = {"task_id": "totally-bogus-1", "status": "PASS"}
+    r2 = {"task_id": "totally-bogus-2", "status": "PASS"}
+    p1 = tmp_path / "r1.json"; _write_result(p1, r1)
+    p2 = tmp_path / "r2.json"; _write_result(p2, r2)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p1, p2], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    # All-unknown case still returns HOLD per the existing extra_results path
+    assert packet["status"] == mod.STATUS_HOLD_RESULT_INVALID
+    # But matched_result_count is 0 — not 2
+    assert packet["matched_result_count"] == 0
+    # Both task_ids surface in errors as "unknown"
+    assert any("unknown task_ids" in e for e in packet["errors"])
+
+
+def test_known_task_id_does_increase_matched_result_count(tmp_path: Path) -> None:
+    """A result whose task_id IS in the corpus must increment matched_result_count
+    (and not be conflated with unknown results)."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    known = {"task_id": "task-B", "status": "PASS", "changed_files": ["scripts/local/h.py"]}
+    p1 = tmp_path / "known.json"; _write_result(p1, known)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p1], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    assert packet["status"] == mod.STATUS_READY
+    assert packet["matched_result_count"] == 1
+    # The matched task should be removed from missing_result_task_ids
+    assert "task-B" not in packet["missing_result_task_ids"]
+
+
+def test_mixed_known_and_unknown_does_not_inflate_matched_count(tmp_path: Path) -> None:
+    """In a mixed valid+unknown-result set, matched_result_count counts only
+    the in-corpus matches; the unknown task_id result is tracked separately
+    in errors and does NOT inflate matched_result_count."""
+    corpus_path = tmp_path / "corpus.json"
+    _write_corpus(corpus_path, VALID_CORPUS)
+
+    good = {"task_id": "task-A", "status": "PASS", "changed_files": ["docs/x.md"]}
+    bad = {"task_id": "task-NOT-IN-CORPUS", "status": "PASS", "changed_files": ["x"]}
+    p1 = tmp_path / "good.json"; _write_result(p1, good)
+    p2 = tmp_path / "bad.json"; _write_result(p2, bad)
+    json_out = tmp_path / "eval.json"
+    md_out = tmp_path / "eval.md"
+
+    rc = _run_eval(corpus_path, [p1, p2], json_out, md_out)
+    assert rc == 0
+    packet = json.loads(json_out.read_text())
+    # Mixed case with at least one match → READY (with a warning in errors)
+    assert packet["status"] == mod.STATUS_READY
+    # matched_result_count is 1 — only the known task, NOT 2
+    assert packet["matched_result_count"] == 1
+    assert any("not in the corpus" in e for e in packet["errors"])
+
+
+def test_corpus_allowed_files_have_no_angle_bracket_placeholders() -> None:
+    """The shipped real-output corpus must not contain any angle-bracket
+    placeholder paths (e.g. ``<new_helper>.py``) — those are literal strings
+    that don't match real files. All allowed_files entries should be
+    matchable globs or concrete paths."""
+    repo_root = Path(__file__).parent.parent
+    corpus_path = repo_root / "corpus" / "autocoder-real-output-v0.json"
+    assert corpus_path.exists(), f"corpus file missing: {corpus_path}"
+    corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
+    placeholders: List[str] = []
+    for task in corpus.get("tasks", []):
+        tid = task.get("task_id", "?")
+        for fld in ("allowed_files", "forbidden_files", "expected_artifacts", "expected_tests"):
+            for entry in task.get(fld, []) or []:
+                if not isinstance(entry, str):
+                    continue
+                if "<" in entry and ">" in entry:
+                    placeholders.append(f"{tid}.{fld}: {entry!r}")
+    assert not placeholders, (
+        "corpus contains angle-bracket placeholders that won't match real files: "
+        + "; ".join(placeholders)
+    )

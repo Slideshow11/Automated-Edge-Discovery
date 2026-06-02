@@ -9,9 +9,9 @@
       "task_id": "real-output-v0-task-001",
       "title": "Append a single documentation line",
       "task_type": "docs",
-      "goal": "Append one validation line to docs/wfa_next_steps.md without altering any other file.",
+      "goal": "Append one validation line to a single docs/*.md file without altering any other file.",
       "allowed_files": [
-        "docs/wfa_next_steps.md"
+        "docs/*.md"
       ],
       "forbidden_files": [
         "scripts/**",
@@ -20,7 +20,7 @@
         "*.py"
       ],
       "expected_artifacts": [
-        "docs/wfa_next_steps.md (modified, +1 line, -0 lines)"
+        "docs/*.md (one file modified, +1 line, -0 lines)"
       ],
       "expected_tests": [],
       "scoring": {
@@ -45,9 +45,9 @@
       "task_id": "real-output-v0-task-002",
       "title": "Add a small report-only helper script",
       "task_type": "report_only_tool",
-      "goal": "Add a single new script under scripts/local/ that is read-only (no GitHub mutation, no model execution, no shell=True). The script must write a JSON and/or Markdown artifact. It must be reviewed and merged without follow-up cleanup.",
+      "goal": "Add a single new script under scripts/local/ that is read-only (no GitHub mutation, no model execution, no shell-mode subprocess invocation). The script must write a JSON and/or Markdown artifact. It must be reviewed and merged without follow-up cleanup.",
       "allowed_files": [
-        "scripts/local/<new_helper>.py"
+        "scripts/local/*.py"
       ],
       "forbidden_files": [
         "tests/**",
@@ -57,12 +57,12 @@
         "*.md"
       ],
       "expected_artifacts": [
-        "scripts/local/<new_helper>.py (new file)",
-        "/tmp/<artifact>.json (script output)",
-        "/tmp/<artifact>.md (script output, if applicable)"
+        "scripts/local/*.py (one new file)",
+        "/tmp/*.json (script output, if applicable)",
+        "/tmp/*.md (script output, if applicable)"
       ],
       "expected_tests": [
-        "tests/test_<new_helper>.py"
+        "tests/test_*.py"
       ],
       "scoring": {
         "patches_produced": 1,
@@ -79,7 +79,7 @@
       "non_goals": [
         "Do not introduce gh mutation strings",
         "Do not invoke live Claude",
-        "Do not use shell=True"
+        "Do not use shell-mode subprocess flag"
       ]
     },
     {
@@ -88,7 +88,7 @@
       "task_type": "test_only",
       "goal": "Add one new test under tests/ that covers an edge case in an existing helper. No production code is changed. The test must pass on the first CI run.",
       "allowed_files": [
-        "tests/test_<existing_helper>.py"
+        "tests/test_*.py"
       ],
       "forbidden_files": [
         "scripts/**",
@@ -96,10 +96,10 @@
         ".github/**"
       ],
       "expected_artifacts": [
-        "tests/test_<existing_helper>.py (modified, +1 test function)"
+        "tests/test_*.py (one file modified, +1 test function)"
       ],
       "expected_tests": [
-        "tests/test_<existing_helper>.py::test_<new_edge_case>"
+        "tests/test_*.py::test_*"
       ],
       "scoring": {
         "patches_produced": 1,
@@ -124,8 +124,8 @@
       "task_type": "narrow_code_fix",
       "goal": "Tighten the behavior of a single local script (under scripts/local/) by replacing an early-return-on-bad-pattern with a bounded-poll loop. Must be guarded by a new test that fails on the old behavior and passes on the new one. Must not change CLI flags.",
       "allowed_files": [
-        "scripts/local/<existing_checker>.py",
-        "tests/test_<existing_checker>.py"
+        "scripts/local/*.py",
+        "tests/test_*.py"
       ],
       "forbidden_files": [
         ".github/**",
@@ -134,11 +134,11 @@
         "*.md"
       ],
       "expected_artifacts": [
-        "scripts/local/<existing_checker>.py (modified, early-return removed)",
-        "tests/test_<existing_checker>.py (modified, +1 regression test)"
+        "scripts/local/*.py (one file modified, early-return removed)",
+        "tests/test_*.py (one file modified, +1 regression test)"
       ],
       "expected_tests": [
-        "tests/test_<existing_checker>.py::test_<old_behavior_now_fails_closed>"
+        "tests/test_*.py::test_*"
       ],
       "scoring": {
         "patches_produced": 1,
@@ -164,8 +164,8 @@
       "task_type": "small_packet_validation",
       "goal": "Add a small packet validator that reads a JSON file matching a declared schema (packet_kind, schema_version, and a small set of required fields). Emit a JSON and Markdown validation report. The validator must be tolerant of unknown fields and must reject only missing required fields, wrong types, or wrong packet_kind.",
       "allowed_files": [
-        "scripts/local/<packet_validator>.py",
-        "tests/test_<packet_validator>.py"
+        "scripts/local/*.py",
+        "tests/test_*.py"
       ],
       "forbidden_files": [
         ".github/**",
@@ -173,16 +173,13 @@
         "*.json"
       ],
       "expected_artifacts": [
-        "scripts/local/<packet_validator>.py (new file)",
-        "tests/test_<packet_validator>.py (new file)",
-        "/tmp/<packet>_validation_report.json (script output)",
-        "/tmp/<packet>_validation_report.md (script output)"
+        "scripts/local/*.py (one new file)",
+        "tests/test_*.py (one new file)",
+        "/tmp/*_validation_report.json (script output)",
+        "/tmp/*_validation_report.md (script output)"
       ],
       "expected_tests": [
-        "tests/test_<packet_validator>.py::test_valid_packet_passes",
-        "tests/test_<packet_validator>.py::test_missing_required_field_fails",
-        "tests/test_<packet_validator>.py::test_wrong_packet_kind_fails",
-        "tests/test_<packet_validator>.py::test_unknown_fields_are_tolerated"
+        "tests/test_*.py::test_*"
       ],
       "scoring": {
         "patches_produced": 1,
