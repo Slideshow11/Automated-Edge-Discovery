@@ -168,6 +168,14 @@ def _get_allowed_dirty_paths(verification: dict) -> set[str]:
         for f in untracked_expected:
             if f:
                 allowed.add(f)
+        staged_added_expected = checks.get("staged_added_expected") or []
+        for f in staged_added_expected:
+            if f:
+                allowed.add(f)
+        tracked_modified_expected = checks.get("tracked_modified_expected") or []
+        for f in tracked_modified_expected:
+            if f:
+                allowed.add(f)
     return allowed
 
 
@@ -477,6 +485,7 @@ def write_json_output(
     expected_base_sha: str,
     changed_files: list,
     diff_stat: str,
+    review_diff_sources: dict,
     generated_commands: dict,
     suggested_pr_title: str,
     suggested_pr_body: str,
@@ -495,6 +504,7 @@ def write_json_output(
         "expected_base_sha": expected_base_sha,
         "changed_files": changed_files,
         "diff_stat": diff_stat,
+        "review_diff_sources": review_diff_sources,
         "generated_commands": generated_commands,
         "suggested_pr_title": suggested_pr_title,
         "suggested_pr_body": suggested_pr_body,
@@ -521,6 +531,7 @@ def write_md_output(
     expected_base_sha: str,
     changed_files: list,
     diff_stat: str,
+    review_diff_sources: dict,
     generated_commands: dict,
     suggested_pr_title: str,
     suggested_pr_body: str,
@@ -551,15 +562,66 @@ def write_md_output(
     for f in sorted(changed_files):
         lines.append(f"- `{f}`")
 
-    if diff_stat:
+    branch_tree_diff_stat = review_diff_sources.get("branch_tree_diff_stat", "")
+    branch_tree_diff = review_diff_sources.get("branch_tree_diff", "")
+    git_index_diff_stat = review_diff_sources.get("git_index_diff_stat", "")
+    git_index_diff = review_diff_sources.get("git_index_diff", "")
+    git_status_short = review_diff_sources.get("git_status_short", "")
+    staged_added_expected = review_diff_sources.get("staged_added_expected", [])
+
+    lines.extend([
+        f"",
+        f"## Review Diff Sources",
+        f"",
+        f"Branch tree diff and staged/index diff are separate review sources. "
+        f"The branch HEAD may equal the base while staged expected files are present.",
+        f"",
+        f"### Branch Tree Diff",
+        f"",
+        f"```",
+        branch_tree_diff_stat or "(empty branch tree diff)",
+        f"```",
+    ])
+    if branch_tree_diff:
         lines.extend([
             f"",
-            f"## Diff stat",
-            f"",
-            f"```",
-            f"{diff_stat}",
+            f"```diff",
+            branch_tree_diff,
             f"```",
         ])
+
+    lines.extend([
+        f"",
+        f"### Staged/Index Diff",
+        f"",
+        f"```",
+        git_index_diff_stat or "(empty staged/index diff)",
+        f"```",
+    ])
+    if git_index_diff:
+        lines.extend([
+            f"",
+            f"```diff",
+            git_index_diff,
+            f"```",
+        ])
+
+    if staged_added_expected:
+        lines.extend([
+            f"",
+            f"**Staged-added expected files:** {len(staged_added_expected)}",
+        ])
+        for f in sorted(staged_added_expected):
+            lines.append(f"- `{f}`")
+
+    lines.extend([
+        f"",
+        f"### Git Status",
+        f"",
+        f"```",
+        git_status_short or "(clean)",
+        f"```",
+    ])
 
     lines.extend([
         f"",
@@ -577,8 +639,15 @@ def write_md_output(
         f"## Human Review Commands (TEXT ONLY — NOT EXECUTED)",
         f"",
         f"```bash",
-        f"# View full diff",
+        f"# View branch tree full diff",
         f"git -C {repo_root} diff {expected_base_sha}...refs/heads/{branch_name}",
+        f"#",
+        f"# View staged/index diff",
+        f"git -C {repo_root} diff --cached --stat",
+        f"git -C {repo_root} diff --cached",
+        f"#",
+        f"# View git status for staged/index and worktree state",
+        f"git -C {repo_root} status --short",
         f"#",
         f"# Push branch (after human approval)",
         f"git -C {repo_root} push origin {branch_name}",
@@ -645,13 +714,66 @@ def main() -> int:
         or verification.get("changed_files_expected")
         or []
     )
-    diff_stat = ""
+    branch_tree_diff_stat = ""
+    branch_tree_diff = ""
+    git_index_diff_stat = ""
+    git_index_diff = ""
+    git_status_short = ""
     try:
         r = _run_git(repo_root, "diff", "--stat", f"{expected_base_sha}...refs/heads/{branch_name}")
         if r.returncode == 0:
-            diff_stat = r.stdout.strip()
+            branch_tree_diff_stat = r.stdout.strip()
     except Exception:
         pass
+
+    try:
+        r = _run_git(repo_root, "diff", f"{expected_base_sha}...refs/heads/{branch_name}")
+        if r.returncode == 0:
+            branch_tree_diff = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "diff", "--cached", "--stat")
+        if r.returncode == 0:
+            git_index_diff_stat = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "diff", "--cached")
+        if r.returncode == 0:
+            git_index_diff = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "status", "--short")
+        if r.returncode == 0:
+            git_status_short = r.stdout.strip()
+    except Exception:
+        pass
+
+    checks_data = verification.get("checks", {})
+    if not isinstance(checks_data, dict):
+        checks_data = {}
+    staged_added_expected = checks_data.get("staged_added_expected") or []
+    review_diff_sources = {
+        "branch_tree_diff_stat": branch_tree_diff_stat,
+        "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "git_index_diff_stat": git_index_diff_stat,
+        "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "git_status_short": git_status_short,
+        "staged_added_expected": staged_added_expected,
+        "branch_tree_diff_empty": not bool(branch_tree_diff_stat or branch_tree_diff),
+        "staged_index_diff_present": bool(git_index_diff_stat or git_index_diff),
+        "note": (
+            "Branch tree diff and staged/index diff are separate. For staged-added "
+            "mock edits, the branch tree diff may be empty while the staged/index "
+            "diff carries the expected file content."
+        ),
+    }
+    checks["review_diff_sources"] = review_diff_sources
 
     # Suggested PR title and body
     suggested_pr_title = args.suggested_pr_title
@@ -664,7 +786,7 @@ def main() -> int:
         if body_path.exists():
             suggested_pr_body = body_path.read_text(encoding="utf-8")
     if not suggested_pr_body:
-        suggested_pr_body = _generate_pr_body(branch_name, base_branch, changed_files, diff_stat)
+        suggested_pr_body = _generate_pr_body(branch_name, base_branch, changed_files, branch_tree_diff_stat)
 
     # Repo path for gh commands
     repo_name = f"{repo_root.name}"
@@ -672,20 +794,17 @@ def main() -> int:
 
     # Build generated commands (text only, not executed)
     generated_commands = {
-        "git_diff_stat": diff_stat,
-        "git_diff": "",
+        "git_diff_stat": branch_tree_diff_stat,
+        "git_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "branch_tree_diff_stat": branch_tree_diff_stat,
+        "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "git_index_diff_stat": git_index_diff_stat,
+        "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "git_status_short": git_status_short,
         "suggested_pr_create_command_text_only": _make_gh_pr_create_command(gh_repo, branch_name, suggested_pr_title),
         "suggested_pr_view_command_text_only": f"gh pr view {branch_name} --repo {gh_repo}",
         "note": "Commands are TEXT ONLY — not executed by this tool.",
     }
-
-    # Try to get full diff for output
-    try:
-        r = _run_git(repo_root, "diff", f"{expected_base_sha}...refs/heads/{branch_name}")
-        if r.returncode == 0:
-            generated_commands["git_diff"] = r.stdout.strip()
-    except Exception:
-        pass
 
     # Checklist
     checklist = [
@@ -709,7 +828,7 @@ def main() -> int:
         write_json_output(
             output_json, status, pr_preview_ready, checks,
             str(repo_root), base_branch, branch_name, expected_base_sha,
-            changed_files, diff_stat, generated_commands,
+            changed_files, branch_tree_diff_stat, review_diff_sources, generated_commands,
             suggested_pr_title, suggested_pr_body, checklist,
             errors, warnings, generated_at, safety_statement,
         )
@@ -721,7 +840,7 @@ def main() -> int:
         write_md_output(
             output_md, status, pr_preview_ready, checks,
             str(repo_root), base_branch, branch_name, expected_base_sha,
-            changed_files, diff_stat, generated_commands,
+            changed_files, branch_tree_diff_stat, review_diff_sources, generated_commands,
             suggested_pr_title, suggested_pr_body, checklist,
             errors, warnings, generated_at, safety_statement,
         )

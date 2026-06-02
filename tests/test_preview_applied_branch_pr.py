@@ -508,6 +508,120 @@ class TestVerifiedDirtyWorktreeAllowed:
         # verified_dirty_worktree_allowed must be present in checks
         assert "verified_dirty_worktree_allowed" in checks
 
+    def test_staged_added_preview_includes_index_diff_sources(self, tmp_path):
+        """Staged-only additions are visible in PR preview JSON and Markdown."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        staged_file = repo / "docs" / "staged.md"
+        staged_file.parent.mkdir(parents=True, exist_ok=True)
+        staged_file.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged.md"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/staged.md"],
+            changed_files_actual=["docs/staged.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/staged.md"],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+        assert checks.get("branch_diff_skipped_dirty_allowed") is True
+        assert "docs/staged.md" in checks.get("dirty_paths", [])
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": subprocess.run(
+                ["git", "diff", "--cached", "--stat"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "git_index_diff": subprocess.run(
+                ["git", "diff", "--cached"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "git_status_short": subprocess.run(
+                ["git", "status", "--short"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "staged_added_expected": ["docs/staged.md"],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+        }
+
+        pap.write_json_output(
+            output_json,
+            "PR_PREVIEW_READY",
+            True,
+            checks,
+            str(repo),
+            "main",
+            "apply/test",
+            base_sha,
+            ["docs/staged.md"],
+            "",
+            review_diff_sources,
+            generated_commands,
+            "test title",
+            "test body",
+            [],
+            [],
+            [],
+            "2026-05-22T00:00:00Z",
+            "safe",
+        )
+        pap.write_md_output(
+            output_md,
+            "PR_PREVIEW_READY",
+            True,
+            checks,
+            str(repo),
+            "main",
+            "apply/test",
+            base_sha,
+            ["docs/staged.md"],
+            "",
+            review_diff_sources,
+            generated_commands,
+            "test title",
+            "test body",
+            [],
+            [],
+            [],
+            "2026-05-22T00:00:00Z",
+            "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        md = output_md.read_text(encoding="utf-8")
+        assert preview["review_diff_sources"]["branch_tree_diff_empty"] is True
+        assert "docs/staged.md" in preview["review_diff_sources"]["git_index_diff"]
+        assert "Staged/Index Diff" in md
+        assert "git -C" in md and "diff --cached" in md
+        assert "docs/staged.md" in md
+
 
 class TestNoGitAddInPreviewTool:
     """Source inspection: preview tool must not call git add."""

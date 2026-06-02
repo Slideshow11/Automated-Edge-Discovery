@@ -591,25 +591,42 @@ def write_md_output(
 
     lines.extend([
         f"",
-        f"**Actual (branch diff):** {len(changed_files_actual)}",
+        f"**Actual applied (branch tree + verified index/worktree):** {len(changed_files_actual)}",
     ])
     for f in sorted(changed_files_actual):
         lines.append(f"- `{f}`")
+
+    staged_added_expected = checks.get("staged_added_expected") or []
+    if staged_added_expected:
+        lines.extend([
+            f"",
+            f"## Review Diff Sources",
+            f"",
+            f"Expected staged-added files are part of the ready state. "
+            f"The branch HEAD may still equal the base while staged/index changes exist.",
+            f"",
+            f"**Staged-added expected:** {len(staged_added_expected)}",
+        ])
+        for f in sorted(staged_added_expected):
+            lines.append(f"- `{f}`")
 
     lines.extend([
         f"",
         f"## Human Review Commands",
         f"",
         f"```bash",
-        f"# View diff summary",
+        f"# View branch tree diff summary",
         f"git -C {repo_root} diff --stat {expected_base_sha}...refs/heads/{branch_name}",
         f"#",
-        f"# View full diff",
+        f"# View branch tree full diff",
         f"git -C {repo_root} diff {expected_base_sha}...refs/heads/{branch_name}",
         f"#",
         f"# View staged/index diff (for staged-added mock edits)",
         f"git -C {repo_root} diff --cached --stat",
         f"git -C {repo_root} diff --cached",
+        f"#",
+        f"# View git status for staged/index and worktree state",
+        f"git -C {repo_root} status --short",
         f"#",
         f"# Suggested tests",
         f"{generated_human_commands.get('suggested_tests', '')}",
@@ -692,10 +709,11 @@ def main() -> int:
     )
 
     # Build generated human commands (text only, not executed)
-    git_diff_stat = ""
-    git_diff = ""
+    branch_tree_diff_stat = ""
+    branch_tree_diff = ""
     git_index_diff_stat = ""
     git_index_diff = ""
+    git_status_short = ""
     suggested_tests = "pytest tests/ -q  # run from repo root"
 
     try:
@@ -705,7 +723,7 @@ def main() -> int:
             f"{expected_base_sha}...refs/heads/{branch_name}",
         )
         if r.returncode == 0:
-            git_diff_stat = r.stdout.strip()
+            branch_tree_diff_stat = r.stdout.strip()
     except Exception:
         pass
 
@@ -716,7 +734,7 @@ def main() -> int:
             f"{expected_base_sha}...refs/heads/{branch_name}",
         )
         if r.returncode == 0:
-            git_diff = r.stdout.strip()
+            branch_tree_diff = r.stdout.strip()
     except Exception:
         pass
 
@@ -734,11 +752,47 @@ def main() -> int:
     except Exception:
         pass
 
+    try:
+        r = _run_git(repo_root, "status", "--short")
+        if r.returncode == 0:
+            git_status_short = r.stdout.strip()
+    except Exception:
+        pass
+
+    review_diff_sources = {
+        "branch_tree_diff": {
+            "stat_key": "branch_tree_diff_stat",
+            "diff_key": "branch_tree_diff",
+            "command_stat": f"git -C {repo_root} diff --stat {expected_base_sha}...refs/heads/{branch_name}",
+            "command_diff": f"git -C {repo_root} diff {expected_base_sha}...refs/heads/{branch_name}",
+            "may_be_empty_when_staged_index_changes_exist": bool(checks.get("staged_added_expected")),
+        },
+        "staged_index_diff": {
+            "stat_key": "git_index_diff_stat",
+            "diff_key": "git_index_diff",
+            "command_stat": f"git -C {repo_root} diff --cached --stat",
+            "command_diff": f"git -C {repo_root} diff --cached",
+            "covers_staged_added_expected": bool(checks.get("staged_added_expected")),
+        },
+        "status": {
+            "key": "git_status_short",
+            "command": f"git -C {repo_root} status --short",
+        },
+        "note": (
+            "For staged-added mock edits, the branch tree diff may be empty "
+            "while the staged/index diff carries the expected file content."
+        ),
+    }
+
     generated_human_commands = {
-        "git_diff_stat": git_diff_stat,
-        "git_diff": git_diff[:2000] + ("..." if len(git_diff) > 2000 else ""),
+        "git_diff_stat": branch_tree_diff_stat,
+        "git_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "branch_tree_diff_stat": branch_tree_diff_stat,
+        "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
         "git_index_diff_stat": git_index_diff_stat,
         "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "git_status_short": git_status_short,
+        "review_diff_sources": review_diff_sources,
         "suggested_tests": suggested_tests,
         "note": "Commands are TEXT ONLY — not executed by this verifier.",
     }

@@ -5,6 +5,7 @@ Tests for run_autocoder_single_task.py
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -555,6 +556,13 @@ class TestFullMockRunReachesReady:
         output_root = tmp_path / "aed_runs" / task_id
         worktree_root = tmp_path / "wt" / task_id
         repo_under_test = tmp_path / "repo_under_test"
+        temp_hermes_home = tmp_path / ".hermes"
+        temp_hermes_home.mkdir()
+        assert temp_hermes_home != Path.home() / ".hermes"
+        controller_env = {
+            **os.environ,
+            "HERMES_HOME": str(temp_hermes_home),
+        }
         branch_name = f"autocoder-full-mock-{task_id}"
         setup_result = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "worktree", "add", "--detach", str(repo_under_test), "HEAD"],
@@ -563,6 +571,43 @@ class TestFullMockRunReachesReady:
             timeout=30,
         )
         assert setup_result.returncode == 0, setup_result.stderr
+        controller_source_paths = [
+            Path("scripts/local/preview_applied_branch_pr.py"),
+            Path("scripts/local/verify_temp_worktree_applied_branch.py"),
+        ]
+        for rel_path in controller_source_paths:
+            target = repo_under_test / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / rel_path, target)
+        source_status_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "status", "--porcelain", "--"]
+            + [str(p) for p in controller_source_paths],
+            capture_output=True,
+            text=True,
+        )
+        if source_status_result.stdout.strip():
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.email", "test@test.test"],
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.name", "Test"],
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "add", "--"]
+                + [str(p) for p in controller_source_paths],
+                capture_output=True,
+                text=True,
+            )
+            commit_sources_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "commit", "-m", "test controller script sources"],
+                capture_output=True,
+                text=True,
+            )
+            assert commit_sources_result.returncode == 0, commit_sources_result.stderr
         base_branch_result = subprocess.run(
             ["git", "-C", str(repo_under_test), "rev-parse", "--verify", "refs/heads/main"],
             capture_output=True,
@@ -617,7 +662,7 @@ class TestFullMockRunReachesReady:
 
         out_json = tmp_path / "out.json"
         out_md = tmp_path / "out.md"
-        script_path = REPO_ROOT / "scripts" / "local" / "run_autocoder_single_task.py"
+        script_path = repo_under_test / "scripts" / "local" / "run_autocoder_single_task.py"
 
         def cleanup_mock_run(*, remove_repo: bool = False) -> None:
             subprocess.run(
@@ -683,6 +728,7 @@ class TestFullMockRunReachesReady:
             result = subprocess.run(
                 argv,
                 cwd=str(repo_under_test),
+                env=controller_env,
                 capture_output=True,
                 text=True,
                 timeout=120,
@@ -704,12 +750,19 @@ class TestFullMockRunReachesReady:
             artifacts = cs["artifacts"]
             apply_to_branch = json.loads(Path(artifacts["apply_to_branch_json"]).read_text(encoding="utf-8"))
             applied_branch = json.loads(Path(artifacts["applied_branch_verification_json"]).read_text(encoding="utf-8"))
+            pr_preview = json.loads(Path(artifacts["pr_preview_json"]).read_text(encoding="utf-8"))
+            applied_branch_md = Path(artifacts["applied_branch_verification_json"]).with_suffix(".md").read_text(encoding="utf-8")
+            pr_preview_md = Path(artifacts["pr_preview_json"]).with_suffix(".md").read_text(encoding="utf-8")
 
             assert apply_to_branch["status"] == "APPLY_TO_BRANCH_APPLIED"
             assert applied_branch["status"] == "APPLIED_BRANCH_READY"
             assert mock_path in applied_branch["checks"]["staged_added_expected"]
             assert mock_path in applied_branch["changed_files_actual"]
             assert mock_path in applied_branch["generated_human_commands"]["git_index_diff"]
+            assert mock_path in pr_preview["review_diff_sources"]["git_index_diff"]
+            assert "git -C" in applied_branch_md and "diff --cached" in applied_branch_md
+            assert "Staged/Index Diff" in pr_preview_md
+            assert mock_path in pr_preview_md
             assert applied_branch["checks"].get("missing_files_from_branch", []) == []
         finally:
             cleanup_mock_run(remove_repo=True)
