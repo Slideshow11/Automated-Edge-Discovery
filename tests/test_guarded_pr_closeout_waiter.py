@@ -278,6 +278,21 @@ def test_merge_command_verifier_failure_blocks(tmp_path):
     assert report["status"] == waiter.HOLD_MERGE_COMMAND_NOT_VERIFIED
 
 
+def test_merge_command_with_auto_blocked_at_dry_run_gate(tmp_path):
+    cfg = make_cfg(tmp_path)
+    helpers = FakeHelpers(merge_verifier={
+        "recommendation": "MERGE_READY_CANDIDATE",
+        "canonical_head_sha": HEAD,
+        "merge_command": (
+            f"gh pr merge 385 --repo Slideshow11/Automated-Edge-Discovery "
+            f"--squash --delete-branch --auto --match-head-commit {HEAD}"
+        ),
+    })
+    report, _ = run_waiter(cfg, FakeClient(), helpers)
+    assert report["status"] == waiter.HOLD_MERGE_COMMAND_NOT_VERIFIED
+    assert "auto" in report["merge_verifier"]["merge_command"]
+
+
 def test_json_and_markdown_outputs_include_required_summary(tmp_path):
     cfg = make_cfg(tmp_path)
     report, _ = run_waiter(cfg, FakeClient(), FakeHelpers())
