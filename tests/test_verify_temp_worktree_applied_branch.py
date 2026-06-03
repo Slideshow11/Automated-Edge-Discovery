@@ -1598,3 +1598,292 @@ class TestUnstagedWorktreeDiff:
         md = output_md.read_text(encoding="utf-8")
         # No Pre-push Blockers section when no blockers
         assert "Pre-push Blockers" not in md, "Did not expect Pre-push Blockers section when no blockers"
+# P2 Gu-dW: status-column preservation must correctly classify all
+# XY<space>path git-status short-format variants, and P2 Gvbo6: the
+# pre-push blocker must fire when the branch has committed changes
+# plus a staged-only expected addition.
+class TestStatusColumnPreservation:
+    """P2 Gu-dW: fixed-column status parsing for staged-added detection.
+
+    The previous lstrip()-based parser collapsed " A" (intent-to-add)
+    to "A" and mis-classified worktree-only adds as staged adds. The
+    new parser uses line[0] for index, line[1] for worktree, line[2]
+    for the separator space, line[3:] for the path. This class
+    exercises the matrix of two-column status codes.
+    """
+
+    def _setup_repo(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        return repo, r_base.stdout.strip()
+
+    def test_intent_to_add_is_not_staged_added(self, tmp_path):
+        """An intent-to-add file (" A docs/x.md") must NOT be classified
+        as staged-added. It is a worktree-only addition that has not
+        been `git add`ed; a commit/push would not carry the file content."""
+        repo, base_sha = self._setup_repo(tmp_path)
+        p = repo / "docs" / "intent.md"
+        p.write_text("intent content\n", encoding="utf-8")
+        # intent-to-add via `git add -N` produces " A" in --short
+        subprocess.run(["git", "add", "-N", "docs/intent.md"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/intent.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/intent.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+        # Status will not be APPLIED_BRANCH_READY because the file is
+        # worktree-only (not in branch), but the staged-added bucket
+        # must not falsely claim it.
+        assert "docs/intent.md" not in checks.get("staged_added_expected", []), (
+            f"Intent-to-add should not be in staged_added_expected, got: {checks.get('staged_added_expected')}"
+        )
+        assert "docs/intent.md" not in checks.get("staged_added", []), (
+            f"Intent-to-add should not be in staged_added, got: {checks.get('staged_added')}"
+        )
+
+    def test_worktree_modified_is_not_staged_added(self, tmp_path):
+        """A " M docs/x.md" file (worktree-only modification, index clean)
+        must NOT be classified as staged-added. The branch ref carries
+        nothing; a commit/push would still include the file only after
+        the human stages it."""
+        repo, base_sha = self._setup_repo(tmp_path)
+        p = repo / "docs" / "worktree_only.md"
+        p.write_text("worktree change\n", encoding="utf-8")
+        # Do NOT stage. Status is " M" (worktree-modified, not staged).
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/worktree_only.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/worktree_only.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+        assert "docs/worktree_only.md" not in checks.get("staged_added", []), (
+            f"Worktree-only mod should not be in staged_added, got: {checks.get('staged_added')}"
+        )
+
+    def test_untracked_is_not_staged_added(self, tmp_path):
+        """A "??" untracked file must NOT be classified as staged-added.
+        This is also the existing untracked bucket's domain."""
+        repo, base_sha = self._setup_repo(tmp_path)
+        p = repo / "docs" / "untracked.md"
+        p.write_text("untracked content\n", encoding="utf-8")
+        # No git add at all. Status is "??".
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/untracked.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/untracked.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+        assert "docs/untracked.md" not in checks.get("staged_added", []), (
+            f"Untracked should not be in staged_added, got: {checks.get('staged_added')}"
+        )
+        # It should still be in untracked_expected (handled by the
+        # untracked-files bucket, not the staged-added bucket).
+        assert "docs/untracked.md" in checks.get("untracked_expected", []), (
+            f"Untracked should be in untracked_expected, got: {checks.get('untracked_expected')}"
+        )
+
+    def test_staged_added_clean_worktree_is_staged_added(self, tmp_path):
+        """An "A  docs/x.md" file (staged add, worktree clean) MUST be
+        classified as staged-added. Two spaces separate XY from path
+        when Y is the clean-worktree space."""
+        repo, base_sha = self._setup_repo(tmp_path)
+        p = repo / "docs" / "staged_clean.md"
+        p.write_text("staged clean content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged_clean.md"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/staged_clean.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/staged_clean.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        assert "docs/staged_clean.md" in checks.get("staged_added_expected", []), (
+            f"Staged-add-clean should be in staged_added_expected, got: {checks.get('staged_added_expected')}"
+        )
+
+    def test_am_status_classified_in_both_buckets(self, tmp_path):
+        """An "AM docs/x.md" file MUST appear in BOTH staged_added_expected
+        AND am_worktree_modified. Verifies the AM block also uses the
+        fixed-column parser."""
+        repo, base_sha = self._setup_repo(tmp_path)
+        p = repo / "docs" / "am_file.md"
+        p.write_text("v1 staged\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/am_file.md"], cwd=repo, capture_output=True, text=True)
+        p.write_text("v2 worktree\n", encoding="utf-8")  # touch worktree -> AM
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/am_file.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/am_file.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        assert "docs/am_file.md" in checks.get("staged_added_expected", []), (
+            f"AM should be in staged_added_expected, got: {checks.get('staged_added_expected')}"
+        )
+        am_key = "am_worktree_modified"
+        assert "docs/am_file.md" in checks.get(am_key, []), (
+            f"AM should be in {am_key}, got: {checks.get(am_key)}"
+        )
+
+
+class TestCommittedPlusStagedOnlyBlocker:
+    """P2 Gvbo6: pre-push blocker must fire when branch has committed
+    changes plus a staged-only expected addition. A plain `git push`
+    would push the commits but still omit the staged file from the PR."""
+
+    def _setup_repo(self, tmp_path, branch_name, base_sha, commit_path, stage_path):
+        """Create branch, commit `commit_path`, stage `stage_path` only."""
+        repo = make_temp_git_repo()
+        subprocess.run(["git", "checkout", "-b", branch_name, base_sha], cwd=repo, capture_output=True, text=True)
+        # Make sure docs dir is tracked
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        new_base = r_base.stdout.strip()
+        # Commit one file (this becomes part of the branch ref)
+        p1 = repo / commit_path
+        p1.parent.mkdir(parents=True, exist_ok=True)
+        p1.write_text("committed content\n", encoding="utf-8")
+        subprocess.run(["git", "add", commit_path], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", f"add {commit_path}"], cwd=repo, capture_output=True, text=True)
+        # Stage another file (do not commit)
+        p2 = repo / stage_path
+        p2.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", stage_path], cwd=repo, capture_output=True, text=True)
+        return repo, new_base
+
+    def test_committed_plus_staged_only_produces_pre_push_blocker(self, tmp_path):
+        """A branch with one committed change plus a staged-only
+        expected file must surface a staged_only_no_branch_commit
+        pre-push blocker. APPLIED_BRANCH_READY is preserved for
+        controller compatibility."""
+        # Build base sha first
+        base_repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=base_repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        repo, real_base = self._setup_repo(
+            tmp_path, "apply/test", base_sha,
+            commit_path="docs/committed.md",
+            stage_path="docs/staged_only.md",
+        )
+        result_path = make_result_json(
+            tmp_path, changed_files=["docs/committed.md", "docs/staged_only.md"]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/committed.md", "docs/staged_only.md"]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        # Status preserved for controller compat
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        # Pre-push blocker must be present
+        blockers = checks.get("pre_push_blockers") or []
+        assert any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers), (
+            f"Expected staged_only_no_branch_commit blocker, got: {blockers}"
+        )
+        # The blocker must list the staged-only path (not the committed one)
+        kind_block = next(b for b in blockers if b.get("kind") == "staged_only_no_branch_commit")
+        assert "docs/staged_only.md" in kind_block.get("paths", []), (
+            f"Expected staged-only path in blocker, got: {kind_block.get('paths')}"
+        )
+        assert "docs/committed.md" not in kind_block.get("paths", []), (
+            f"Committed path should NOT be in blocker, got: {kind_block.get('paths')}"
+        )
+        # Warning must also be raised
+        warnings = checks.get("warnings") or []
+        assert any("PRE-PUSH BLOCKER" in w for w in warnings), (
+            f"Expected pre-push warning, got: {warnings}"
+        )
+
+    def test_only_staged_only_no_committed_change_produces_blocker(self, tmp_path):
+        """The original behavior (branch tree empty, only staged-only
+        expected) must still produce a blocker. (Regression guard.)"""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        real_base = r_base.stdout.strip()
+        p = repo / "docs" / "staged_only.md"
+        p.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged_only.md"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/staged_only.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/staged_only.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        blockers = checks.get("pre_push_blockers") or []
+        assert any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers), (
+            f"Expected blocker when only staged-only, got: {blockers}"
+        )
+
+    def test_no_blocker_when_everything_committed(self, tmp_path):
+        """When the branch has committed ALL expected files (staged
+        additions have been committed), no blocker should fire."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        real_base = r_base.stdout.strip()
+        # Commit everything
+        p = repo / "docs" / "committed.md"
+        p.write_text("committed content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/committed.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add committed"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/committed.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/committed.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        blockers = checks.get("pre_push_blockers") or []
+        # No staged-only blocker because everything is committed
+        assert not any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers), (
+            f"Expected NO staged-only blocker, got: {blockers}"
+        )

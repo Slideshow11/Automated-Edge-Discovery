@@ -388,22 +388,40 @@ def verify(
         for line in r_status.stdout.strip().splitlines():
             if not line:
                 continue
-            ls = line.lstrip()
-            parts = ls.split(" ", 1)
-            if len(parts) < 2:
+            # P2 Gu-dW: Parse the two-column git-status short format
+            # without losing the leading space. The format is
+            #   XY<space>path
+            # where X is the index status and Y is the worktree status.
+            # Both columns may be ' ', 'M', 'A', 'D', '?', etc.
+            # Examples:
+            #   "A  docs/new.md"  index=A staged, worktree=' ' clean
+            #   "AM docs/am.md"   index=A staged, worktree=M modified
+            #   " M docs/mod.md"  index=' ' not staged, worktree=M modified
+            #   " A docs/intent"  index=' ' not staged, worktree=A added
+            #                     (intent-to-add via the -N intent flag)
+            #   "?? docs/untracked"  untracked (X='?', Y='?')
+            # lstrip would collapse " A" to "A" and mis-classify an
+            # intent-to-add as a staged add. Use fixed-column slicing.
+            if len(line) < 4:
+                # Need at least XY + space + path-start
                 continue
-            stage = parts[0]
-            # First column == "A" means staged add. Worktree-column (second char)
-            # can be ' ' (clean), 'M' (modified in worktree), or '.' (unmodified).
-            is_staged_added = (
-                len(stage) >= 1
-                and stage[0] == "A"
-                and stage != "??"
-            )
+            x_status = line[0]
+            y_status = line[1]
+            # line[2] should be a space separating the two columns from
+            # the path. Some porcelain configurations use '->' for renames
+            # but the verify pipeline does not exercise renames.
+            sep = line[2]
+            if sep != " ":
+                # Malformed or rename arrow — skip conservatively
+                continue
+            path = line[3:].strip()
+            if not path:
+                continue
+            # First column == "A" means staged add. Worktree-column (second
+            # char) can be ' ' (clean), 'M' (modified), or '.' (unmodified).
+            is_staged_added = x_status == "A"
             if is_staged_added:
-                path = parts[1].strip()
-                if path:
-                    staged_added.append(path)
+                staged_added.append(path)
 
     # Split staged-added into expected vs unexpected.
     # An AM status file (added in index, modified in worktree) still counts
@@ -427,15 +445,21 @@ def verify(
         for line in r_status.stdout.strip().splitlines():
             if not line:
                 continue
-            ls = line.lstrip()
-            parts = ls.split(" ", 1)
-            if len(parts) < 2:
+            # P2 Gu-dW: Use the same fixed-column parser as the
+            # staged-added bucket above. AM = index added, worktree
+            # modified. "AM docs/am.md" has X='A', Y='M'.
+            if len(line) < 4:
                 continue
-            stage = parts[0]
-            # AM = index added, worktree modified (length 2, second char 'M')
-            if len(stage) >= 2 and stage[0] == "A" and stage[1] == "M":
-                path = parts[1].strip()
-                if path and path in expected_set:
+            x_status = line[0]
+            y_status = line[1]
+            sep = line[2]
+            if sep != " ":
+                continue
+            path = line[3:].strip()
+            if not path:
+                continue
+            if x_status == "A" and y_status == "M":
+                if path in expected_set:
                     am_worktree_modified.append(path)
 
     am_worktree_modified = sorted(am_worktree_modified)
@@ -543,15 +567,27 @@ def verify(
     # depends on APPLIED_BRANCH_READY in this case — but the blockers list
     # is exported in JSON/Markdown and the human command checklist must
     # be visibly guarded.
+    # P2 Gvbo6: The blocker is based on whether any staged-added
+    # expected paths are absent from the branch tree, not on whether
+    # the branch tree is entirely empty. A branch that has committed
+    # changes plus a staged-only expected file will still push a PR
+    # that omits the staged content, so the human must reconcile
+    # (commit the staged changes or restore the index).
     pre_push_blockers: list[dict] = []
-    if staged_added_expected and not branch_changed_files:
+    branch_changed_files_set = set(branch_changed_files or [])
+    staged_only_paths = sorted(
+        f for f in staged_added_expected
+        if f not in branch_changed_files_set
+    )
+    if staged_only_paths:
         pre_push_blockers.append({
             "kind": "staged_only_no_branch_commit",
-            "paths": sorted(staged_added_expected),
+            "paths": staged_only_paths,
             "human_action": (
                 "Run `git -C <repo> commit -m 'apply staged changes'` "
                 "(or equivalent) before `git push origin <branch>` to "
-                "ensure the branch ref carries the staged file content."
+                "ensure the branch ref carries the staged file content. "
+                "Affected paths are not in refs/heads/<branch> yet."
             ),
         })
     if am_worktree_modified:
