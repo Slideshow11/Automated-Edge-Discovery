@@ -585,8 +585,8 @@ def write_md_output(
         f"**Status:** {verdict}",
         f"**Push Boundary:** **{push_boundary_label}**",
         f"**Branch-ref contains all expected:** "
-        f"{{_hr_yes if branch_ref_contains_all_expected else _hr_no}}",
-        f"**Human review ready:** {{_hr_yes if human_review_ready else _hr_no}}",
+        f"{_hr_yes if branch_ref_contains_all_expected else _hr_no}",
+        f"**Human review ready:** {_hr_yes if human_review_ready else _hr_no}",
         f"",
         f"**Repo:** `{repo_root}`",
         f"**Base branch:** `{base_branch}`",

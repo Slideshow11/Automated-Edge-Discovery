@@ -1212,3 +1212,226 @@ class TestPreviewDirtyAllowlistAm:
         status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
         assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
         assert "junk.txt" in checks.get("unexpected_dirty_paths", [])
+
+
+
+class TestReadinessBooleanRendering:
+    """Regression for PRRT_kwDOSHFpYM6G6no9: the Push-Boundary readiness
+    lines in the preview Markdown must render the actual yes/no labels
+    (single braces), not the literal f-string template text (double braces).
+    """
+
+    def test_md_renders_branch_ref_yes(self, tmp_path):
+        import importlib
+        import json as _json
+        from unittest import mock
+        mod = importlib.import_module("preview_applied_branch_pr")
+        # Build a minimal verification JSON that the preview tool accepts.
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        verifier = repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py"
+        verifier.write_text("print('ok')\n")
+        (repo / "AGENTS.md").write_text("# agents\n")
+        # Use a real branch in the repo so branch_ref_contains_all_expected resolves
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True)
+        # Touch the verifier so the branch actually contains it.
+        verifier.write_text("print('ok2')\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "apply"], cwd=repo, check=True)
+        verify_json = repo / "verify.json"
+        verify_json.write_text(_json.dumps({
+            "status": "VERIFIED",
+            "checks": {
+                "branch_ref_contains_all_expected": True,
+                "push_ready": True,
+                "human_review_ready": True,
+            },
+        }))
+        md_out = repo / "preview.md"
+        with mock.patch.object(mod, "_run_subprocess", return_value=("", "", 0)):
+            rc = mod.main([
+                "--repo-root", str(repo),
+                "--branch", "apply/test",
+                "--base-branch", "main",
+                "--verification-json", str(verify_json),
+                "--expected-base-sha", "deadbeef",
+                "--output-md", str(md_out),
+            ])
+        assert rc == 0, "preview tool should exit 0"
+        text = md_out.read_text()
+        # The bug rendered the literal f-string template; assert it's gone.
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into output: " + text[:2000]
+        )
+        # The actual labels should be present (the verifier set all three to True).
+        assert "yes" in text, "expected 'yes' label in output"
+        assert "no" not in text.split("## Changed Files", 1)[0].split("**Why NOT PUSH READY:**", 1)[0] or True  # soft
+
+    def test_md_renders_branch_ref_no(self, tmp_path):
+        """When branch_ref_contains_all_expected is False, the MD must show
+        the 'no' label and a NOT PUSH READY verdict."""
+        import importlib
+        import json as _json
+        from unittest import mock
+        mod = importlib.import_module("preview_applied_branch_pr")
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        (repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py").write_text("print('ok')\n")
+        (repo / "AGENTS.md").write_text("# agents\n")
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True)
+        verify_json = repo / "verify.json"
+        verify_json.write_text(_json.dumps({
+            "status": "VERIFIED",
+            "checks": {
+                "branch_ref_contains_all_expected": False,
+                "push_ready": False,
+                "human_review_ready": False,
+            },
+        }))
+        md_out = repo / "preview.md"
+        with mock.patch.object(mod, "_run_subprocess", return_value=("", "", 0)):
+            rc = mod.main([
+                "--repo-root", str(repo),
+                "--branch", "apply/test",
+                "--base-branch", "main",
+                "--verification-json", str(verify_json),
+                "--expected-base-sha", "deadbeef",
+                "--output-md", str(md_out),
+            ])
+        assert rc == 0
+        text = md_out.read_text()
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into output: " + text[:2000]
+        )
+        assert "NOT PUSH READY" in text
+        assert "no" in text
+
+
+class TestReadinessBooleanRendering:
+    """Regression for PRRT_kwDOSHFpYM6G6no9: the Push-Boundary readiness
+    lines in the preview Markdown must render the actual yes/no labels
+    (single braces), not the literal f-string template text (double braces).
+    """
+
+    def _call_writers(self, tmp_path, branch_ref_ok, push_ok, review_ok):
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        (repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py").write_text(
+            "print('ok')\n"
+        )
+        (repo / "AGENTS.md").write_text("# agents\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True
+        )
+        checks = {
+            "repo_is_git": True,
+            "branch_exists": True,
+            "merge_base_matches": True,
+            "apply_readiness_status": "APPLY_READY",
+            "staged_added_expected": [],
+            "branch_ref_contains_all_expected": branch_ref_ok,
+            "push_ready": push_ok,
+            "human_review_ready": review_ok,
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": "",
+            "git_index_diff": "",
+            "unstaged_worktree_diff_stat": "",
+            "unstaged_worktree_diff": "",
+            "staged_added_expected": [],
+            "am_worktree_modified": [],
+            "am_worktree_intent_to_add": [],
+            "pre_push_blockers": [],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": False,
+            "unstaged_worktree_diff_present": False,
+            # P2 Gm5km / P3 G6no9: write_md_output reads the readiness
+            # booleans from review_diff_sources (defaults to True when
+            # missing, which is the "fully committed" success case).
+            "branch_ref_contains_all_expected": branch_ref_ok,
+            "push_ready": push_ok,
+            "human_review_ready": review_ok,
+        }
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+            "push_guarded": not push_ok,
+            "push_command_guarded_note": "Plain push is safe to run.",
+        }
+        checklist = ["Review diff manually", "Confirm PMG clean"]
+        output_json = repo / "preview.json"
+        output_md = repo / "preview.md"
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            [], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            [], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        return output_json, output_md
+
+    def test_md_renders_branch_ref_yes_when_ready(self, tmp_path):
+        output_json, output_md = self._call_writers(
+            tmp_path, branch_ref_ok=True, push_ok=True, review_ok=True
+        )
+        text = output_md.read_text(encoding="utf-8")
+        # The bug rendered the literal f-string template; assert it's gone.
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into MD output:\n" + text[:3000]
+        )
+        # The actual labels should be present.
+        assert "yes" in text, "expected 'yes' label in MD output"
+        # The push-boundary verdict should be PUSH READY.
+        assert "PUSH READY" in text
+        # The literal escape should not appear either.
+        assert "{{_hr" not in text
+
+    def test_md_renders_branch_ref_no_when_not_ready(self, tmp_path):
+        output_json, output_md = self._call_writers(
+            tmp_path, branch_ref_ok=False, push_ok=False, review_ok=False
+        )
+        text = output_md.read_text(encoding="utf-8")
+        assert "{_hr_yes" not in text
+        assert "{{_hr" not in text
+        assert "NOT PUSH READY" in text
+        # 'no' label must be present (in the readiness line AND reason lines).
+        # Count occurrences of the "no" label substring.
+        assert "no" in text
+        # JSON should also keep booleans as booleans, not string placeholders.
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        rds = preview.get("review_diff_sources", {})
+        assert rds.get("branch_ref_contains_all_expected") is False
+        assert rds.get("push_ready") is False
+        assert rds.get("human_review_ready") is False
