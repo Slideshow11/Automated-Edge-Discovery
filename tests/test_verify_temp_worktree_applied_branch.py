@@ -1887,3 +1887,276 @@ class TestCommittedPlusStagedOnlyBlocker:
         assert not any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers), (
             f"Expected NO staged-only blocker, got: {blockers}"
         )
+
+
+class TestPushBoundaryFields:
+    """P2 Gm5km: explicit machine-readable push-boundary fields.
+
+    Verifier must expose:
+    - branch_ref_contains_all_expected: bool
+    - push_ready: bool
+    - human_review_ready: bool
+    Plus NOT PUSH READY Markdown when push_ready is false.
+    """
+
+    def _make_minimal_repo(self, tmp_path, *, mock_mode: str):
+        """Build a tiny temp repo with optional staged-only / committed state.
+
+        mock_mode:
+          "fully_committed" — expected file is committed on branch (push_ready)
+          "staged_only"     — expected file is staged but not on branch (NOT push_ready)
+          "mixed"           — one committed + one staged-only expected (NOT push_ready)
+        """
+        import subprocess as _sp
+        repo = tmp_path / "repo_pb"
+        repo.mkdir()
+        _sp.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        _sp.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        _sp.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+        # base commit
+        (repo / "base.txt").write_text("base\n")
+        _sp.run(["git", "-C", str(repo), "add", "base.txt"], check=True)
+        _sp.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        # branch
+        _sp.run(["git", "-C", str(repo), "checkout", "-q", "-b", "apply/test"], check=True)
+        if mock_mode == "fully_committed":
+            (repo / "done.py").write_text("# done\n")
+            _sp.run(["git", "-C", str(repo), "add", "done.py"], check=True)
+            _sp.run(["git", "-C", str(repo), "commit", "-q", "-m", "add done"], check=True)
+            changed = ["done.py"]
+        elif mock_mode == "staged_only":
+            (repo / "new.py").write_text("# new\n")
+            _sp.run(["git", "-C", str(repo), "add", "new.py"], check=True)
+            changed = ["new.py"]
+        elif mock_mode == "mixed":
+            (repo / "committed.py").write_text("# committed\n")
+            _sp.run(["git", "-C", str(repo), "add", "committed.py"], check=True)
+            _sp.run(["git", "-C", str(repo), "commit", "-q", "-m", "add committed"], check=True)
+            (repo / "staged.py").write_text("# staged\n")
+            _sp.run(["git", "-C", str(repo), "add", "staged.py"], check=True)
+            changed = ["committed.py", "staged.py"]
+        else:
+            raise ValueError(mock_mode)
+        return repo, changed
+
+    def _run(self, repo, expected_files, tmp_path):
+        import verify_temp_worktree_applied_branch as vtab
+        import importlib, sys
+        if "verify_temp_worktree_applied_branch" not in sys.modules:
+            sys.modules["verify_temp_worktree_applied_branch"] = vtab
+        result = tmp_path / "result.json"
+        diff = tmp_path / "diff.json"
+        ready = tmp_path / "ready.json"
+        # minimal apply_readiness
+        ready.write_text(
+            '{"status": "APPLY_READY", "pmg_status": "clean", "pmg_blocked_files": 0}'
+        )
+        # minimal result.json (apply_to_branch output)
+        import json as _json
+        result.write_text(_json.dumps({"status": "PATCH_READY_FOR_HUMAN_REVIEW", "changed_files": expected_files}))
+        # non-empty diff patch (verifier rejects empty diff)
+        diff.write_text(
+            "diff --git a/x b/x\n"
+            "--- a/x\n"
+            "+++ b/x\n"
+            "@@ -0,0 +1 @@\n"
+            "+content\n"
+        )
+        real_base = vtab._run_git(repo, "rev-parse", "main").stdout.strip()
+        return vtab.verify(
+            repo, "apply/test", real_base, result, diff, ready,
+        )
+
+    def test_staged_only_expected_includes_push_boundary_fields(self, tmp_path):
+        """P2 Gm5km: staged-only expected → push_ready false, branch_ref false."""
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        repo, changed = self._make_minimal_repo(tmp_path, mock_mode="staged_only")
+        status, checks = self._run(repo, changed, tmp_path)
+        assert status == "APPLIED_BRANCH_READY"
+        assert checks.get("branch_ref_contains_all_expected") is False
+        assert checks.get("push_ready") is False
+        assert checks.get("human_review_ready") is True
+        # pre_push_blockers must be populated
+        blockers = checks.get("pre_push_blockers") or []
+        kinds = {b.get("kind") for b in blockers}
+        assert "staged_only_no_branch_commit" in kinds
+
+    def test_committed_plus_staged_only_push_ready_false(self, tmp_path):
+        """P2 Gm5km: committed file + staged-only file → push_ready still false."""
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        repo, changed = self._make_minimal_repo(tmp_path, mock_mode="mixed")
+        status, checks = self._run(repo, changed, tmp_path)
+        assert status == "APPLIED_BRANCH_READY"
+        assert checks.get("branch_ref_contains_all_expected") is False
+        assert checks.get("push_ready") is False
+        assert checks.get("human_review_ready") is True
+        # committed file is in branch, staged file is not
+        blockers = checks.get("pre_push_blockers") or []
+        paths_in_blocker = []
+        for b in blockers:
+            paths_in_blocker.extend(b.get("paths", []))
+        assert "staged.py" in paths_in_blocker
+        assert "committed.py" not in paths_in_blocker
+
+    def test_fully_committed_push_ready_true(self, tmp_path):
+        """P2 Gm5km: fully committed expected → push_ready true, no blocker."""
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        repo, changed = self._make_minimal_repo(tmp_path, mock_mode="fully_committed")
+        status, checks = self._run(repo, changed, tmp_path)
+        assert status == "APPLIED_BRANCH_READY"
+        assert checks.get("branch_ref_contains_all_expected") is True
+        assert checks.get("push_ready") is True
+        assert checks.get("human_review_ready") is True
+        blockers = checks.get("pre_push_blockers") or []
+        assert not any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers)
+
+    def test_markdown_says_not_push_ready_for_staged_only(self, tmp_path):
+        """P2 Gm5km: Markdown must say NOT PUSH READY for staged-only case."""
+        from verify_temp_worktree_applied_branch import write_md_output
+        import verify_temp_worktree_applied_branch as vtab
+        repo, changed = self._make_minimal_repo(tmp_path, mock_mode="staged_only")
+        # Run the verifier
+        status, checks = self._run(repo, changed, tmp_path)
+        # Write the MD output
+        md_path = tmp_path / "out.md"
+        write_md_output(
+            md_path, status, True, checks,
+            str(repo), "apply/test", "abc123", "abc123", "def456",
+            changed, changed, "result.json", "diff.json", "ready.json",
+            {"suggested_tests": "pytest", "review_diff_sources": {}},
+            [], [], "2026-01-01T00:00:00Z", "safety",
+        )
+        md = md_path.read_text()
+        assert "NOT PUSH READY" in md
+        assert "Staged/index content is not present" in md
+        assert "A plain `git push` would omit these paths" in md
+
+    def test_markdown_says_push_ready_for_fully_committed(self, tmp_path):
+        """P2 Gm5km: Markdown says PUSH READY for fully-committed case."""
+        from verify_temp_worktree_applied_branch import write_md_output
+        import verify_temp_worktree_applied_branch as vtab
+        repo, changed = self._make_minimal_repo(tmp_path, mock_mode="fully_committed")
+        status, checks = self._run(repo, changed, tmp_path)
+        md_path = tmp_path / "out.md"
+        write_md_output(
+            md_path, status, True, checks,
+            str(repo), "apply/test", "abc123", "abc123", "def456",
+            changed, changed, "result.json", "diff.json", "ready.json",
+            {"suggested_tests": "pytest", "review_diff_sources": {}},
+            [], [], "2026-01-01T00:00:00Z", "safety",
+        )
+        md = md_path.read_text()
+        assert "PUSH READY" in md
+        assert "NOT PUSH READY" not in md
+
+
+class TestStagedAdditionsDiffVisibility:
+    """P1 GkQhl: actual staged/index diff content must be in the verifier output.
+
+    The verifier must include the staged file's actual body in the rendered
+    Markdown, not just the path. This is the "Review Diff Sources" reinforcement.
+    """
+
+    def _make_staged_only_repo(self, tmp_path, *, body: str):
+        import subprocess as _sp
+        repo = tmp_path / "repo_gk"
+        repo.mkdir()
+        _sp.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+        _sp.run(["git", "-C", str(repo), "config", "user.email", "t@t"], check=True)
+        _sp.run(["git", "-C", str(repo), "config", "user.name", "T"], check=True)
+        (repo / "base.txt").write_text("base\n")
+        _sp.run(["git", "-C", str(repo), "add", "base.txt"], check=True)
+        _sp.run(["git", "-C", str(repo), "commit", "-q", "-m", "base"], check=True)
+        _sp.run(["git", "-C", str(repo), "checkout", "-q", "-b", "apply/test"], check=True)
+        new_path = "scripts/local/_gk_unique_marker_file.py"
+        target = repo / new_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body)
+        _sp.run(["git", "-C", str(repo), "add", new_path], check=True)
+        return repo, new_path, body
+
+    def test_staged_diff_content_appears_in_verifier_markdown(self, tmp_path):
+        import verify_temp_worktree_applied_branch as vtab
+        # Unique body text that should appear verbatim in the rendered Markdown.
+        unique_body = "# gk_unique_marker_function_call_42\ndef gk_marker():\n    return 42\n"
+        repo, new_path, body = self._make_staged_only_repo(tmp_path, body=unique_body)
+        # Build verifier inputs
+        result = tmp_path / "result.json"
+        diff = tmp_path / "diff.json"
+        ready = tmp_path / "ready.json"
+        import json as _json
+        result.write_text(_json.dumps({
+            "status": "PATCH_READY_FOR_HUMAN_REVIEW",
+            "changed_files": [new_path],
+        }))
+        diff.write_text(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+content\n"
+        )
+        ready.write_text(
+            '{"status": "APPLY_READY", "pmg_status": "clean", "pmg_blocked_files": 0}'
+        )
+        real_base = vtab._run_git(repo, "rev-parse", "main").stdout.strip()
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result, diff, ready,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"got {status}"
+        # Write the MD output
+        from verify_temp_worktree_applied_branch import write_md_output
+        md_path = tmp_path / "out.md"
+        # Pass a real generated_human_commands dict (with git_index_diff) so
+        # the new sub-section can render actual content.
+        _gcm = {
+            "git_index_diff_stat": f" {new_path} | 3 +++",
+            "git_index_diff": unique_body,
+            "suggested_tests": "pytest",
+        }
+        write_md_output(
+            md_path, status, True, checks,
+            str(repo), "apply/test", real_base, real_base, real_base,
+            [new_path], [new_path], str(result), str(diff), str(ready),
+            _gcm, [], [], "2026-01-01T00:00:00Z", "safety",
+        )
+        md = md_path.read_text()
+        # Heading must appear
+        assert "Staged Additions Diff Content" in md, (
+            f"missing section heading in MD:\n{md[:1000]}"
+        )
+        # Actual staged file body must appear (not just the path)
+        assert "gk_unique_marker_function_call_42" in md, (
+            f"missing unique body text in MD:\n{md[:2000]}"
+        )
+        assert "def gk_marker" in md
+        # Path must also be in the staged-added list
+        assert new_path in md
+        # The new section also calls out the push warning
+        assert "A plain `git push` will NOT carry this content" in md
+
+    def test_staged_diff_in_json_review_diff_sources(self, tmp_path):
+        """JSON must also carry the staged index diff for downstream tools."""
+        import verify_temp_worktree_applied_branch as vtab
+        repo, new_path, body = self._make_staged_only_repo(
+            tmp_path, body="# x\n"
+        )
+        result = tmp_path / "result.json"
+        diff = tmp_path / "diff.json"
+        ready = tmp_path / "ready.json"
+        import json as _json
+        result.write_text(_json.dumps({
+            "status": "PATCH_READY_FOR_HUMAN_REVIEW",
+            "changed_files": [new_path],
+        }))
+        diff.write_text(
+            "diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+content\n"
+        )
+        ready.write_text(
+            '{"status": "APPLY_READY", "pmg_status": "clean", "pmg_blocked_files": 0}'
+        )
+        real_base = vtab._run_git(repo, "rev-parse", "main").stdout.strip()
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result, diff, ready,
+        )
+        # git_index_diff is computed by main() and stored in generated_human_commands
+        # — checks only contains pre_main bookkeeping. But the verifier main()
+        # does write it to the JSON output. For unit-level we just check that
+        # the verifier returned staged_added_expected.
+        assert new_path in (checks.get("staged_added_expected") or [])

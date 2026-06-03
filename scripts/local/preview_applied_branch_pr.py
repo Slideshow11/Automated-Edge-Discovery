@@ -551,10 +551,42 @@ def write_md_output(
 ) -> None:
     verdict = "✅ PR_PREVIEW_READY" if pr_preview_ready else f"❌ {status}"
 
+    # P2 Gm5km: read explicit push-boundary fields from review_diff_sources.
+    # Defaults match the "fully committed" success case so older callers
+    # without the new fields still get a sensible verdict.
+    _pre_push_blockers_md = review_diff_sources.get("pre_push_blockers") or []
+    push_ready = bool(review_diff_sources.get("push_ready", True))
+    branch_ref_contains_all_expected = bool(
+        review_diff_sources.get("branch_ref_contains_all_expected", True)
+    )
+    human_review_ready = bool(
+        review_diff_sources.get("human_review_ready", True)
+    )
+    push_boundary_label = "PUSH READY" if push_ready else "NOT PUSH READY"
+    push_boundary_reason_lines = []
+    if not branch_ref_contains_all_expected:
+        push_boundary_reason_lines.append(
+            f"Staged/index content is not present in refs/heads/{branch_name}."
+        )
+        push_boundary_reason_lines.append(
+            "A plain `git push` would omit these paths."
+        )
+    if _pre_push_blockers_md:
+        push_boundary_reason_lines.append(
+            "Pre-push blockers are present (see Pre-push Blockers section)."
+        )
+
+    _hr_yes = "✅ yes"
+    _hr_no = "❌ no"
+
     lines = [
         f"# Temp-Worktree Applied Branch PR Preview",
         f"",
         f"**Status:** {verdict}",
+        f"**Push Boundary:** **{push_boundary_label}**",
+        f"**Branch-ref contains all expected:** "
+        f"{{_hr_yes if branch_ref_contains_all_expected else _hr_no}}",
+        f"**Human review ready:** {{_hr_yes if human_review_ready else _hr_no}}",
         f"",
         f"**Repo:** `{repo_root}`",
         f"**Base branch:** `{base_branch}`",
@@ -564,9 +596,20 @@ def write_md_output(
         f"## Verdict",
         f"",
         f"**{verdict}**",
+        f"**{push_boundary_label}**",
         f"",
-        f"## Changed Files ({len(changed_files)})",
     ]
+    if push_boundary_reason_lines:
+        lines.extend([
+            f"**Why NOT PUSH READY:**",
+            f"",
+        ])
+        for reason in push_boundary_reason_lines:
+            lines.append(f"- {reason}")
+        lines.append(f"")
+    lines.extend([
+        f"## Changed Files ({len(changed_files)})",
+    ])
     for f in sorted(changed_files):
         lines.append(f"- `{f}`")
 
@@ -714,8 +757,8 @@ def write_md_output(
         f"# View git status for staged/index and worktree state",
         f"git -C {repo_root} status --short",
         f"#",
-        f"# Push branch (after human approval AND blocker resolution)",
-        f"git -C {repo_root} push origin {branch_name}",
+        f"# Push branch (only if Push Boundary above shows PUSH READY)",
+        f"# " + ("PUSH BLOCKED \u2014 see Pre-push Blockers above." if not push_ready else "Plain push is safe to run.") + f" `git -C {repo_root} push origin {branch_name}`",
         f"#",
         f"# Suggested gh pr create command (after human approval)",
         generated_commands.get("suggested_pr_create_command_text_only", "gh pr create ..."),
@@ -856,6 +899,23 @@ def main() -> int:
     staged_added_expected = checks_data.get("staged_added_expected") or []
     am_worktree_modified_paths = checks_data.get("am_worktree_modified") or []
     pre_push_blockers = checks_data.get("pre_push_blockers") or []
+    # P2 Gm5km: explicit push-boundary fields. Defaults are the
+    # "fully committed" success case so older callers without the new
+    # fields still get a sensible verdict.
+    _branch_changed_files = set(checks_data.get("branch_changed_files") or [])
+    _staged_only_paths = sorted(
+        f for f in staged_added_expected if f not in _branch_changed_files
+    )
+    branch_ref_contains_all_expected = bool(checks_data.get(
+        "branch_ref_contains_all_expected", not _staged_only_paths
+    ))
+    push_ready = bool(checks_data.get(
+        "push_ready",
+        branch_ref_contains_all_expected and not pre_push_blockers,
+    ))
+    human_review_ready = bool(checks_data.get(
+        "human_review_ready", True
+    ))
     review_diff_sources = {
         "branch_tree_diff_stat": branch_tree_diff_stat,
         "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
@@ -872,6 +932,9 @@ def main() -> int:
         "branch_tree_diff_empty": not bool(branch_tree_diff_stat or branch_tree_diff),
         "staged_index_diff_present": bool(git_index_diff_stat or git_index_diff),
         "unstaged_worktree_diff_present": bool(unstaged_worktree_diff_stat or unstaged_worktree_diff),
+        "branch_ref_contains_all_expected": branch_ref_contains_all_expected,
+        "push_ready": push_ready,
+        "human_review_ready": human_review_ready,
         "note": (
             "Branch tree diff and staged/index diff are separate. For staged-added "
             "mock edits, the branch tree diff may be empty while the staged/index "

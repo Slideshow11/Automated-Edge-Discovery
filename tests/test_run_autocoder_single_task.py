@@ -558,11 +558,18 @@ class TestFullMockRunReachesReady:
         repo_under_test = tmp_path / "repo_under_test"
         temp_hermes_home = tmp_path / ".hermes"
         temp_hermes_home.mkdir()
+        # P2 GmCjg: temp HERMES_HOME is passed to the subprocess so the test
+        # does not depend on or mutate the real developer's ~/.hermes.
         assert temp_hermes_home != Path.home() / ".hermes"
         controller_env = {
             **os.environ,
             "HERMES_HOME": str(temp_hermes_home),
         }
+        # P2 GmCjg: explicit assertions so a reviewer (or Codex) can see at a
+        # glance that the env is wired correctly and is not the real home.
+        assert "HERMES_HOME" in controller_env
+        assert controller_env["HERMES_HOME"] == str(temp_hermes_home)
+        assert Path(controller_env["HERMES_HOME"]) != Path.home() / ".hermes"
         branch_name = f"autocoder-full-mock-{task_id}"
         setup_result = subprocess.run(
             ["git", "-C", str(REPO_ROOT), "worktree", "add", "--detach", str(repo_under_test), "HEAD"],

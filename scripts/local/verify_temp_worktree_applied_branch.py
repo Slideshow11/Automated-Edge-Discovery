@@ -609,6 +609,33 @@ def verify(
                 f"Affected paths: {', '.join(blk['paths'])}."
             )
 
+    # ── 21. Push boundary (P2 Gm5km) ──────────────────────────────────────────
+    # Make the branch-ref boundary impossible to miss. The status can remain
+    # APPLIED_BRANCH_READY for controller compatibility, but the explicit
+    # fields below let a reviewer and the preview consumer detect
+    # "index-only staged additions" without parsing prose.
+    branch_ref_contains_all_expected = not bool(staged_only_paths)
+    push_ready = bool(branch_ref_contains_all_expected) and not bool(pre_push_blockers)
+    human_review_ready = True  # status == APPLIED_BRANCH_READY path is reached here
+    checks["branch_ref_contains_all_expected"] = branch_ref_contains_all_expected
+    checks["push_ready"] = push_ready
+    checks["human_review_ready"] = human_review_ready
+    if not push_ready:
+        # Surface the reason as a warning so it shows up in the Markdown
+        # Warnings section too.
+        if not branch_ref_contains_all_expected:
+            warnings.append(
+                f"NOT PUSH READY: {len(staged_only_paths)} staged/index "
+                f"expected path(s) are not in refs/heads/{branch_name}. "
+                f"A plain `git push` would omit these paths. "
+                f"Affected: {', '.join(staged_only_paths)}."
+            )
+        if pre_push_blockers:
+            warnings.append(
+                "NOT PUSH READY: pre-push blockers are present. "
+                "See Pre-push Blockers section for required human action."
+            )
+
     # ── All checks passed ─────────────────────────────────────────────────────
     return STATE_APPLIED_BRANCH_READY, {**checks, "errors": errors, "warnings": warnings}
 
@@ -686,10 +713,41 @@ def write_md_output(
 ) -> None:
     verdict = "✅ APPLIED_BRANCH_READY" if applied_branch_ready else f"❌ {status}"
 
+    staged_added_expected = checks.get("staged_added_expected") or []
+    am_worktree_modified = checks.get("am_worktree_modified") or []
+    pre_push_blockers = checks.get("pre_push_blockers") or []
+
+    # P2 Gm5km: read explicit push-boundary fields. Defaults are the
+    # "fully committed" success case so older callers without the new
+    # fields still get a sensible verdict.
+    push_ready = bool(checks.get("push_ready", True))
+    branch_ref_contains_all_expected = bool(
+        checks.get("branch_ref_contains_all_expected", True)
+    )
+    human_review_ready = bool(checks.get("human_review_ready", applied_branch_ready))
+    push_boundary_label = "PUSH READY" if push_ready else "NOT PUSH READY"
+    push_boundary_reason_lines = []
+    if not branch_ref_contains_all_expected:
+        push_boundary_reason_lines.append(
+            "Staged/index content is not present in "
+            f"refs/heads/{branch_name}."
+        )
+        push_boundary_reason_lines.append(
+            "A plain `git push` would omit these paths."
+        )
+    if pre_push_blockers:
+        push_boundary_reason_lines.append(
+            "Pre-push blockers are present (see Pre-push Blockers section)."
+        )
+
     lines = [
         f"# Temp-Worktree Applied Branch Verifier",
         f"",
         f"**Status:** {verdict}",
+        f"**Push Boundary:** **{push_boundary_label}**",
+        f"**Branch-ref contains all expected:** "
+        f"{'✅ yes' if branch_ref_contains_all_expected else '❌ no'}",
+        f"**Human review ready:** {'✅ yes' if human_review_ready else '❌ no'}",
         f"",
         f"**Repo:** `{repo_root}`",
         f"**Branch:** `{branch_name}`",
@@ -700,11 +758,23 @@ def write_md_output(
         f"## Verdict",
         f"",
         f"**{verdict}**",
+        f"**{push_boundary_label}**",
+        f"",
+    ]
+    if push_boundary_reason_lines:
+        lines.extend([
+            f"**Why NOT PUSH READY:**",
+            f"",
+        ])
+        for reason in push_boundary_reason_lines:
+            lines.append(f"- {reason}")
+        lines.append(f"")
+    lines.extend([
         f"",
         f"## Changed Files",
         f"",
         f"**Expected:** {len(changed_files_expected)}",
-    ]
+    ])
     for f in sorted(changed_files_expected):
         lines.append(f"- `{f}`")
 
@@ -733,6 +803,40 @@ def write_md_output(
         ])
         for f in sorted(staged_added_expected):
             lines.append(f"- `{f}`")
+
+        # P1 GkQhl: render the actual staged/index diff body so a
+        # reviewer cannot miss what content is in the index.
+        if staged_added_expected:
+            _idx_stat = generated_human_commands.get("git_index_diff_stat", "")
+            _idx_body = generated_human_commands.get("git_index_diff", "")
+            lines.extend([
+                f"",
+                f"### Staged Additions Diff Content",
+                f"",
+                f"Actual content of staged/index additions. " +
+                f"This is what the human reviewer would see in `git diff --cached`. " +
+                f"A plain `git push` will NOT carry this content unless the staged " +
+                f"changes are first committed to refs/heads/{branch_name}.",
+                f"",
+                f"**Staged-added expected paths:**",
+            ])
+            for f in sorted(staged_added_expected):
+                lines.append(f"- `{f}`")
+            lines.extend([
+                f"",
+                f"**Staged/index diff stat:**",
+                f"```",
+                _idx_stat or "(empty)",
+                f"```",
+            ])
+            if _idx_body:
+                lines.extend([
+                    f"",
+                    f"**Staged/index diff body (bounded excerpt):**",
+                    f"```diff",
+                    _idx_body,
+                    f"```",
+                ])
         if am_worktree_modified_paths:
             lines.extend([
                 f"",

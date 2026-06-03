@@ -998,7 +998,7 @@ class TestPreviewStagedOnlyPrePushBlocker:
             "unstaged_worktree_diff": "",
             "git_status_short": "A  docs/staged.md",
             "staged_added_expected": ["docs/staged.md"],
-            "am_wor...fied": [],
+            "am_worktree_modified": [],
             "pre_push_blockers": [
                 {
                     "kind": "staged_only_no_branch_commit",
@@ -1077,10 +1077,10 @@ class TestPreviewAMWorktreeDiff:
                 "merge_base_matches": True,
                 "apply_readiness_status": "APPLY_READY",
                 "staged_added_expected": ["docs/am.md"],
-                "am_wor...fied": ["docs/am.md"],
+                "am_worktree_modified": ["docs/am.md"],
                 "pre_push_blockers": [
                     {
-                        "kind": "am_wor...fied",
+                        "kind": "am_worktree_modified",
                         "paths": ["docs/am.md"],
                         "human_action": "Reconcile worktree vs staged content.",
                     }
@@ -1105,10 +1105,10 @@ class TestPreviewAMWorktreeDiff:
             "unstaged_worktree_diff": "-v1 staged content\n+v2 worktree content",
             "git_status_short": "AM docs/am.md",
             "staged_added_expected": ["docs/am.md"],
-            "am_wor...fied": ["docs/am.md"],
+            "am_worktree_modified": ["docs/am.md"],
             "pre_push_blockers": [
                 {
-                    "kind": "am_wor...fied",
+                    "kind": "am_worktree_modified",
                     "paths": ["docs/am.md"],
                     "human_action": "Reconcile worktree vs staged content.",
                 }
@@ -1137,7 +1137,7 @@ class TestPreviewAMWorktreeDiff:
         preview = json.loads(output_json.read_text(encoding="utf-8"))
         rds = preview.get("review_diff_sources", {})
         # AM expected path must be in review_diff_sources
-        assert "docs/am.md" in rds.get("am_wor...fied", [])
+        assert "docs/am.md" in rds.get("am_worktree_modified", [])
         # Unstaged/worktree diff must be in JSON
         assert "v2 worktree content" in rds.get("unstaged_worktree_diff", "")
         # Staged content must also be visible
@@ -1168,7 +1168,7 @@ class TestPreviewDirtyAllowlistAm:
                 "untracked_expected": [],
                 "staged_added_expected": [am_path],
                 "tracked_modified_expected": [],
-                "am_wor...fied": [am_path],
+                "am_worktree_modified": [am_path],
             },
         }
         allowed = pap._get_allowed_dirty_paths(verification)
@@ -1176,7 +1176,7 @@ class TestPreviewDirtyAllowlistAm:
 
     def test_unexpected_dirty_still_rejected(self, tmp_path):
         """Negative: an unexpected dirty file (not in changed_files,
-        untracked_expected, staged_added_expected, or am_wor...fied) is
+        untracked_expected, staged_added_expected, or am_worktree_modified) is
         still rejected by the preview verifier."""
         repo = make_temp_git_repo()
         r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
