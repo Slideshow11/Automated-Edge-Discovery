@@ -1750,9 +1750,11 @@ class TestCommittedPlusStagedOnlyBlocker:
     changes plus a staged-only expected addition. A plain `git push`
     would push the commits but still omit the staged file from the PR."""
 
-    def _setup_repo(self, tmp_path, branch_name, base_sha, commit_path, stage_path):
+    def _setup_repo(self, tmp_path, branch_name, commit_path, stage_path):
         """Create branch, commit `commit_path`, stage `stage_path` only."""
         repo = make_temp_git_repo()
+        r_init = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_init.stdout.strip()
         subprocess.run(["git", "checkout", "-b", branch_name, base_sha], cwd=repo, capture_output=True, text=True)
         # Make sure docs dir is tracked
         docs_marker = repo / "docs" / ".gitkeep"
@@ -1779,13 +1781,8 @@ class TestCommittedPlusStagedOnlyBlocker:
         expected file must surface a staged_only_no_branch_commit
         pre-push blocker. APPLIED_BRANCH_READY is preserved for
         controller compatibility."""
-        # Build base sha first
-        base_repo = make_temp_git_repo()
-        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=base_repo, capture_output=True, text=True)
-        base_sha = r.stdout.strip()
-
         repo, real_base = self._setup_repo(
-            tmp_path, "apply/test", base_sha,
+            tmp_path, "apply/test",
             commit_path="docs/committed.md",
             stage_path="docs/staged_only.md",
         )
