@@ -1249,4 +1249,352 @@ class TestTrackedModifiedSameRevision:
 
         assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
         assert "docs/tracked.md" in checks.get("tracked_modified_expected", [])
-        assert "docs/new.md" in checks.get("untracked_expected", [])
+        assert "docs/new.md" in checks.get("untracked_expected", [])#!/usr/bin/env python3
+"""
+Test classes for pre-push blockers and AM worktree-modified handling.
+
+These tests are appended to the existing test_verify_temp_worktree_applied_branch.py
+to cover the P2 Gm5km (index-only branch-applied honesty) and P2 Gm0q4
+(AM worktree diff surfacing) review concerns.
+"""
+
+# P2 Gm5km: When staged-added expected files are present and the branch
+# ref equals the base, the verifier must surface a pre_push_blocker so
+# the human is not led to believe a plain `git push` will produce a
+# meaningful PR.
+class TestPrePushBlockers:
+    """P2 Gm5km: surface human-apply boundary when staged-only/AM exists."""
+
+    def test_staged_only_expected_produces_pre_push_blocker(self, tmp_path):
+        """A staged-only expected file (branch tree diff empty) produces
+        a pre_push_blocker with kind staged_only_no_branch_commit and the
+        APPLIED_BRANCH_READY status is preserved for controller compat."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Stage-add the expected file (do not commit)
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # Status stays APPLIED_BRANCH_READY for controller compatibility
+        assert status == "APPLIED_BRANCH_READY", f"Expected APPLIED_BRANCH_READY, got {status}"
+        # Pre-push blocker is surfaced
+        blockers = checks.get("pre_push_blockers") or []
+        assert any(b.get("kind") == "staged_only_no_branch_commit" for b in blockers), (
+            f"Expected staged_only_no_branch_commit blocker, got: {blockers}"
+        )
+        # The affected path is listed
+        kind_block = next(b for b in blockers if b.get("kind") == "staged_only_no_branch_commit")
+        assert "docs/scratch.md" in kind_block.get("paths", [])
+        # A warning is also raised
+        warnings = checks.get("warnings") or []
+        assert any("PRE-PUSH BLOCKER" in w for w in warnings), (
+            f"Expected pre-push warning, got: {warnings}"
+        )
+
+    def test_am_expected_produces_pre_push_blocker(self, tmp_path):
+        """An AM-status expected file (added in index, modified in worktree)
+        produces a pre_push_blocker with kind am_worktree_modified and is
+        also listed in am_worktree_modified checks."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Stage-add then re-touch the worktree file -> AM status
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        p.write_text("hello world v2\n", encoding="utf-8")
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # AM-status file is detected in am_worktree_modified
+        assert "docs/scratch.md" in checks.get("am_worktree_modified", []), (
+            f"Expected AM file in am_worktree_modified, got: {checks.get('am_worktree_modified')}"
+        )
+        # has_am_status is set
+        assert checks.get("has_am_status") is True
+        # Pre-push blocker is surfaced
+        blockers = checks.get("pre_push_blockers") or []
+        assert any(b.get("kind") == "am_worktree_modified" for b in blockers), (
+            f"Expected am_worktree_modified blocker, got: {blockers}"
+        )
+
+    def test_no_blockers_when_branch_has_commits(self, tmp_path):
+        """When the branch tree diff is non-empty (i.e. expected files were
+        actually committed to the branch ref), no pre-push blockers should
+        be emitted, even if staged-added files also exist."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Commit the expected file (so branch tree diff is non-empty)
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # No blockers since the branch actually has the commit
+        blockers = checks.get("pre_push_blockers") or []
+        assert blockers == [], f"Expected no blockers, got: {blockers}"
+
+
+# P2 Gm0q4: The verifier must surface the unstaged worktree diff in the
+# generated_human_commands and review_diff_sources JSON output, so AM
+# status and other unstaged changes are visible to human reviewers.
+class TestUnstagedWorktreeDiff:
+    """P2 Gm0q4: surface unstaged/worktree diff for human review."""
+
+    def test_staged_only_expected_exposes_unstaged_diff_keys(self, tmp_path):
+        """A staged-only expected file populates unstaged_worktree_diff
+        fields in generated_human_commands. (May be empty if no unstaged
+        modifications, but the keys must be present.)"""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        # Patch write_json_output/write_md_output by re-using main's logic
+        # via a small inline invocation
+        import sys
+        argv_backup = sys.argv
+        try:
+            sys.argv = [
+                "verify_temp_worktree_applied_branch.py",
+                "--repo-root", str(repo),
+                "--branch-name", "apply/test",
+                "--expected-base-sha", base_sha,
+                "--result-json", str(result_path),
+                "--diff-patch", str(diff_path),
+                "--apply-readiness-json", str(readiness_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+            ]
+            vtab.main()
+        finally:
+            sys.argv = argv_backup
+
+        assert output_json.exists()
+        import json as _json
+        data = _json.loads(output_json.read_text(encoding="utf-8"))
+        ghc = data.get("generated_human_commands", {})
+        # The keys must exist (even if values are empty)
+        assert "unstaged_worktree_diff_stat" in ghc, "unstaged_worktree_diff_stat must be in generated_human_commands"
+        assert "unstaged_worktree_diff" in ghc, "unstaged_worktree_diff must be in generated_human_commands"
+        # review_diff_sources should also have the unstaged_worktree_diff entry
+        rds = ghc.get("review_diff_sources", {})
+        assert "unstaged_worktree_diff" in rds, "unstaged_worktree_diff must be in review_diff_sources"
+
+    def test_am_expected_worktree_modification_visible_in_unstaged_diff(self, tmp_path):
+        """An AM-status expected file's worktree modification appears in
+        `git diff` (unstaged/worktree diff) output."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Stage-add then re-touch
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        p.write_text("hello world v2 from worktree\n", encoding="utf-8")
+
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        import sys
+        argv_backup = sys.argv
+        try:
+            sys.argv = [
+                "verify_temp_worktree_applied_branch.py",
+                "--repo-root", str(repo),
+                "--branch-name", "apply/test",
+                "--expected-base-sha", base_sha,
+                "--result-json", str(result_path),
+                "--diff-patch", str(diff_path),
+                "--apply-readiness-json", str(readiness_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+            ]
+            vtab.main()
+        finally:
+            sys.argv = argv_backup
+
+        assert output_json.exists()
+        import json as _json
+        data = _json.loads(output_json.read_text(encoding="utf-8"))
+        ghc = data.get("generated_human_commands", {})
+        unstaged_diff = ghc.get("unstaged_worktree_diff", "")
+        # The worktree modification must be visible in `git diff` output
+        assert "hello world v2" in unstaged_diff, (
+            f"Expected worktree modification in unstaged diff, got: {unstaged_diff!r}"
+        )
+
+    def test_markdown_includes_unstaged_worktree_diff_section(self, tmp_path):
+        """Markdown output for AM-status expected files includes an
+        Unstaged/Worktree Diff command in Human Review Commands."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Stage-add then re-touch
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        p.write_text("hello world v2\n", encoding="utf-8")
+
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        import sys
+        argv_backup = sys.argv
+        try:
+            sys.argv = [
+                "verify_temp_worktree_applied_branch.py",
+                "--repo-root", str(repo),
+                "--branch-name", "apply/test",
+                "--expected-base-sha", base_sha,
+                "--result-json", str(result_path),
+                "--diff-patch", str(diff_path),
+                "--apply-readiness-json", str(readiness_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+            ]
+            vtab.main()
+        finally:
+            sys.argv = argv_backup
+
+        assert output_md.exists()
+        md = output_md.read_text(encoding="utf-8")
+        # Human Review Commands section must include unstaged diff lines
+        assert "git -C" in md and "diff --stat" in md, "Expected 'diff --stat' in markdown"
+        # Pre-push Blockers section appears because of AM
+        assert "Pre-push Blockers" in md, "Expected Pre-push Blockers section in markdown"
+
+    def test_no_blockers_section_when_no_blockers(self, tmp_path):
+        """When the branch has the actual commits (no staged-only, no AM),
+        the Markdown must NOT include the Pre-push Blockers section."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+        # Commit the expected file
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(tmp_path, changed_files=["docs/scratch.md"])
+
+        import sys
+        argv_backup = sys.argv
+        try:
+            sys.argv = [
+                "verify_temp_worktree_applied_branch.py",
+                "--repo-root", str(repo),
+                "--branch-name", "apply/test",
+                "--expected-base-sha", base_sha,
+                "--result-json", str(result_path),
+                "--diff-patch", str(diff_path),
+                "--apply-readiness-json", str(readiness_path),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+            ]
+            vtab.main()
+        finally:
+            sys.argv = argv_backup
+
+        assert output_md.exists()
+        md = output_md.read_text(encoding="utf-8")
+        # No Pre-push Blockers section when no blockers
+        assert "Pre-push Blockers" not in md, "Did not expect Pre-push Blockers section when no blockers"

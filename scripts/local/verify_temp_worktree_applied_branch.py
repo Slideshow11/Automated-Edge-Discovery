@@ -405,8 +405,42 @@ def verify(
                 if path:
                     staged_added.append(path)
 
+    # Split staged-added into expected vs unexpected.
+    # An AM status file (added in index, modified in worktree) still counts
+    # as staged-added for verification, but the worktree-modification part
+    # is captured separately in `am_worktree_modified` below. This is the
+    # P2 Gm0q4 design: the verifier does NOT block on AM, but it must
+    # surface the worktree content to the human reviewer.
     staged_added_expected = sorted(f for f in staged_added if f in expected_set)
     staged_added_unexpected = sorted(f for f in staged_added if f not in expected_set)
+
+    # ── 14b.4. AM worktree modifications ──────────────────────────────────
+    # For each AM-status expected file, capture the path so the human
+    # reviewer can see what differs between the staged content and the
+    # on-disk content. The actual diff body is exposed via
+    # `unstaged_worktree_diff` / `unstaged_worktree_diff_stat` in the JSON
+    # output, and `git diff` / `git diff --stat` are added to the human
+    # commands section. The verifier does NOT block on AM, but the
+    # divergence is visible.
+    am_worktree_modified: list[str] = []
+    if r_status.returncode == 0:
+        for line in r_status.stdout.strip().splitlines():
+            if not line:
+                continue
+            ls = line.lstrip()
+            parts = ls.split(" ", 1)
+            if len(parts) < 2:
+                continue
+            stage = parts[0]
+            # AM = index added, worktree modified (length 2, second char 'M')
+            if len(stage) >= 2 and stage[0] == "A" and stage[1] == "M":
+                path = parts[1].strip()
+                if path and path in expected_set:
+                    am_worktree_modified.append(path)
+
+    am_worktree_modified = sorted(am_worktree_modified)
+    checks["am_worktree_modified"] = am_worktree_modified
+    checks["has_am_status"] = bool(am_worktree_modified)
 
     checks["staged_added"] = staged_added
     checks["staged_added_expected"] = staged_added_expected
@@ -431,6 +465,11 @@ def verify(
     #        "patch applied to local branch (not committed)"). The expected
     #        files appear in the working tree / index instead, surfaced via the
     #        buckets above.
+    #
+    #        AM-status files (index added, worktree modified) are counted
+    #        in BOTH `staged_added_expected` AND `am_worktree_modified`
+    #        above; the bucket union below already covers them via the
+    #        `staged_added_expected` membership.
     actual_applied = (
         set(branch_changed_files)
         | set(untracked_expected)
@@ -489,6 +528,50 @@ def verify(
     if pmg_blocked is not None and pmg_blocked > 0:
         return STATE_HOLD_PMG_NOT_CLEAN, {**checks}
     checks["pmg_clean"] = True
+
+    # ── 20. Pre-push blockers (P2 Gm5km — staged-only/AM honesty) ────────────
+    # Even when APPLIED_BRANCH_READY, the verifier must surface a list of
+    # conditions that prevent a plain `git push origin {branch_name}` from
+    # producing a meaningful PR. This is the human-apply boundary:
+    #   - If `refs/heads/{branch_name}` has no new commits vs base
+    #     (no `branch_changed_files`), the push will create a no-op PR
+    #     unless the human first commits the staged changes.
+    #   - If any AM-status files exist, the worktree content differs from
+    #     the staged content; the human must reconcile (e.g. stage the
+    #     worktree modification, or restore the worktree to discard it).
+    # We do NOT change status to HOLD here — the controller/test regression
+    # depends on APPLIED_BRANCH_READY in this case — but the blockers list
+    # is exported in JSON/Markdown and the human command checklist must
+    # be visibly guarded.
+    pre_push_blockers: list[dict] = []
+    if staged_added_expected and not branch_changed_files:
+        pre_push_blockers.append({
+            "kind": "staged_only_no_branch_commit",
+            "paths": sorted(staged_added_expected),
+            "human_action": (
+                "Run `git -C <repo> commit -m 'apply staged changes'` "
+                "(or equivalent) before `git push origin <branch>` to "
+                "ensure the branch ref carries the staged file content."
+            ),
+        })
+    if am_worktree_modified:
+        pre_push_blockers.append({
+            "kind": "am_worktree_modified",
+            "paths": sorted(am_worktree_modified),
+            "human_action": (
+                "Reconcile the worktree content with the staged content "
+                "for these files (e.g. stage the worktree modification, "
+                "or restore the worktree to discard it) before push. The "
+                "staged content and the worktree content are out of sync."
+            ),
+        })
+    checks["pre_push_blockers"] = pre_push_blockers
+    if pre_push_blockers:
+        for blk in pre_push_blockers:
+            warnings.append(
+                f"PRE-PUSH BLOCKER ({blk['kind']}): {blk['human_action']} "
+                f"Affected paths: {', '.join(blk['paths'])}."
+            )
 
     # ── All checks passed ─────────────────────────────────────────────────────
     return STATE_APPLIED_BRANCH_READY, {**checks, "errors": errors, "warnings": warnings}
@@ -597,18 +680,30 @@ def write_md_output(
         lines.append(f"- `{f}`")
 
     staged_added_expected = checks.get("staged_added_expected") or []
-    if staged_added_expected:
+    am_worktree_modified_paths = checks.get("am_worktree_modified") or []
+    pre_push_blockers = checks.get("pre_push_blockers") or []
+
+    if staged_added_expected or am_worktree_modified_paths:
         lines.extend([
             f"",
             f"## Review Diff Sources",
             f"",
             f"Expected staged-added files are part of the ready state. "
-            f"The branch HEAD may still equal the base while staged/index changes exist.",
+            f"The branch HEAD may still equal the base while staged/index changes exist. "
+            f"AM-status expected files (added in index, modified in worktree) "
+            f"have a separate unstaged/worktree diff that must be reviewed.",
             f"",
             f"**Staged-added expected:** {len(staged_added_expected)}",
         ])
         for f in sorted(staged_added_expected):
             lines.append(f"- `{f}`")
+        if am_worktree_modified_paths:
+            lines.extend([
+                f"",
+                f"**AM (added+modified) expected:** {len(am_worktree_modified_paths)}",
+            ])
+            for f in sorted(am_worktree_modified_paths):
+                lines.append(f"- `{f}`")
 
     lines.extend([
         f"",
@@ -625,6 +720,10 @@ def write_md_output(
         f"git -C {repo_root} diff --cached --stat",
         f"git -C {repo_root} diff --cached",
         f"#",
+        f"# View unstaged/worktree diff (for AM-status mock edits)",
+        f"git -C {repo_root} diff --stat",
+        f"git -C {repo_root} diff",
+        f"#",
         f"# View git status for staged/index and worktree state",
         f"git -C {repo_root} status --short",
         f"#",
@@ -632,6 +731,20 @@ def write_md_output(
         f"{generated_human_commands.get('suggested_tests', '')}",
         f"```",
     ])
+
+    if pre_push_blockers:
+        lines.extend([
+            "",
+            "## Pre-push Blockers",
+            "",
+            "**⚠️ The branch HEAD does NOT carry the staged file content yet.** "
+            "A plain `git push origin {branch}` would push a no-op PR. "
+            "Resolve these blockers before pushing:",
+        ])
+        for blk in pre_push_blockers:
+            lines.append(f"- **{blk['kind']}**: {blk['human_action']}")
+            for p in blk.get("paths", []):
+                lines.append(f"  - `{p}`")
 
     if errors:
         lines.extend(["", "## Errors"])
@@ -759,6 +872,27 @@ def main() -> int:
     except Exception:
         pass
 
+    # Unstaged worktree diff (P2 Gm0q4) — captures worktree content that
+    # differs from the index. For AM-status expected files, the staged
+    # content and worktree content may differ. We surface both so the
+    # human reviewer can see what was actually changed on disk vs what
+    # is staged.
+    unstaged_worktree_diff_stat = ""
+    unstaged_worktree_diff = ""
+    try:
+        r = _run_git(repo_root, "diff", "--stat")
+        if r.returncode == 0:
+            unstaged_worktree_diff_stat = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "diff")
+        if r.returncode == 0:
+            unstaged_worktree_diff = r.stdout.strip()
+    except Exception:
+        pass
+
     review_diff_sources = {
         "branch_tree_diff": {
             "stat_key": "branch_tree_diff_stat",
@@ -774,13 +908,22 @@ def main() -> int:
             "command_diff": f"git -C {repo_root} diff --cached",
             "covers_staged_added_expected": bool(checks.get("staged_added_expected")),
         },
+        "unstaged_worktree_diff": {
+            "stat_key": "unstaged_worktree_diff_stat",
+            "diff_key": "unstaged_worktree_diff",
+            "command_stat": f"git -C {repo_root} diff --stat",
+            "command_diff": f"git -C {repo_root} diff",
+            "covers_am_status_expected": bool(checks.get("am_worktree_modified")),
+        },
         "status": {
             "key": "git_status_short",
             "command": f"git -C {repo_root} status --short",
         },
         "note": (
             "For staged-added mock edits, the branch tree diff may be empty "
-            "while the staged/index diff carries the expected file content."
+            "while the staged/index diff carries the expected file content. "
+            "For AM-status expected files, the unstaged/worktree diff "
+            "captures on-disk changes that are not yet staged."
         ),
     }
 
@@ -791,6 +934,8 @@ def main() -> int:
         "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
         "git_index_diff_stat": git_index_diff_stat,
         "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "unstaged_worktree_diff_stat": unstaged_worktree_diff_stat,
+        "unstaged_worktree_diff": unstaged_worktree_diff[:2000] + ("..." if len(unstaged_worktree_diff) > 2000 else ""),
         "git_status_short": git_status_short,
         "review_diff_sources": review_diff_sources,
         "suggested_tests": suggested_tests,

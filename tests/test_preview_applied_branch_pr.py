@@ -933,3 +933,282 @@ class TestGeneratedGhPrCreateTextOnly:
         assert "Slideshow11/Automated-Edge-Discovery" in cmd
         # It's text, not a subprocess call — no execution happens
         assert not hasattr(pap, "subprocess") or True  # just a text check
+
+
+
+# P2 Gm5km + Gm0q4: preview-side test classes for staged-only and AM
+# worktree-modified expected files.
+class TestPreviewStagedOnlyPrePushBlocker:
+    """P2 Gm5km: staged-only expected file produces a pre-push blocker in
+    the preview JSON and a 'Pre-push Blockers / Human Apply Boundary'
+    section in the Markdown. Push is guarded, not implied as sufficient."""
+
+    def test_staged_only_expected_includes_pre_push_blocker(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        staged_file = repo / "docs" / "staged.md"
+        staged_file.parent.mkdir(parents=True, exist_ok=True)
+        staged_file.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged.md"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/staged.md"],
+            changed_files_actual=["docs/staged.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/staged.md"],
+                "pre_push_blockers": [
+                    {
+                        "kind": "staged_only_no_branch_commit",
+                        "paths": ["docs/staged.md"],
+                        "human_action": "Commit staged content before push.",
+                    }
+                ],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+            "push_guarded": True,
+            "push_command_guarded_note": (
+                "PUSH IS GUARDED: pre-push blockers are present. "
+                "Resolve them before running `git push origin <branch>`."
+            ),
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": " docs/staged.md | 1 +",
+            "git_index_diff": "+staged content",
+            "unstaged_worktree_diff_stat": "",
+            "unstaged_worktree_diff": "",
+            "git_status_short": "A  docs/staged.md",
+            "staged_added_expected": ["docs/staged.md"],
+            "am_wor...fied": [],
+            "pre_push_blockers": [
+                {
+                    "kind": "staged_only_no_branch_commit",
+                    "paths": ["docs/staged.md"],
+                    "human_action": "Commit staged content before push.",
+                }
+            ],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+            "unstaged_worktree_diff_present": False,
+        }
+        checklist = ["Review diff manually", "Confirm PMG clean", "Run tests locally"]
+
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/staged.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/staged.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        # review_diff_sources must include pre_push_blockers
+        rds = preview.get("review_diff_sources", {})
+        assert "pre_push_blockers" in rds
+        assert len(rds["pre_push_blockers"]) >= 1
+        assert rds["pre_push_blockers"][0]["kind"] == "staged_only_no_branch_commit"
+        # generated_commands must include guarded note
+        gc = preview.get("generated_commands", {})
+        assert gc.get("push_guarded") is True
+        assert "PUSH IS GUARDED" in gc.get("push_command_guarded_note", "")
+
+        md = output_md.read_text(encoding="utf-8")
+        # Markdown must include Pre-push Blockers / Human Apply Boundary
+        assert "Pre-push Blockers" in md or "Human Apply Boundary" in md
+        # Markdown must include push guarded note
+        assert "PUSH GUARDED" in md
+        # Markdown must include unstaged/worktree diff hint even when empty
+        assert "git -C" in md and "diff --cached" in md
+        # Markdown must include the staged-added path
+        assert "docs/staged.md" in md
+
+
+class TestPreviewAMWorktreeDiff:
+    """P2 Gm0q4: AM-status expected file surfaces unstaged/worktree diff
+    in the preview JSON and Markdown."""
+
+    def test_am_expected_includes_unstaged_worktree_diff(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        am_file = repo / "docs" / "am.md"
+        am_file.parent.mkdir(parents=True, exist_ok=True)
+        am_file.write_text("v1 staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/am.md"], cwd=repo, capture_output=True, text=True)
+        am_file.write_text("v2 worktree content\n", encoding="utf-8")
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/am.md"],
+            changed_files_actual=["docs/am.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/am.md"],
+                "am_wor...fied": ["docs/am.md"],
+                "pre_push_blockers": [
+                    {
+                        "kind": "am_wor...fied",
+                        "paths": ["docs/am.md"],
+                        "human_action": "Reconcile worktree vs staged content.",
+                    }
+                ],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": " docs/am.md | 1 +",
+            "git_index_diff": "+v1 staged content",
+            "unstaged_worktree_diff_stat": " docs/am.md | 2 +-",
+            "unstaged_worktree_diff": "-v1 staged content\n+v2 worktree content",
+            "git_status_short": "AM docs/am.md",
+            "staged_added_expected": ["docs/am.md"],
+            "am_wor...fied": ["docs/am.md"],
+            "pre_push_blockers": [
+                {
+                    "kind": "am_wor...fied",
+                    "paths": ["docs/am.md"],
+                    "human_action": "Reconcile worktree vs staged content.",
+                }
+            ],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+            "unstaged_worktree_diff_present": True,
+        }
+        checklist = ["Review diff manually"]
+
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/am.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/am.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        rds = preview.get("review_diff_sources", {})
+        # AM expected path must be in review_diff_sources
+        assert "docs/am.md" in rds.get("am_wor...fied", [])
+        # Unstaged/worktree diff must be in JSON
+        assert "v2 worktree content" in rds.get("unstaged_worktree_diff", "")
+        # Staged content must also be visible
+        assert "v1 staged content" in rds.get("staged_index_diff", "") or "v1 staged content" in rds.get("git_index_diff", "")
+
+        md = output_md.read_text(encoding="utf-8")
+        # Markdown must include Unstaged/Worktree Diff section
+        assert "Unstaged/Worktree Diff" in md
+        # Markdown must include both git diff and git diff --cached commands
+        assert "git -C" in md and "diff --cached" in md
+        assert "diff --stat" in md
+        # Markdown must include git status
+        assert "git -C" in md and "status --short" in md
+        # Markdown must include the AM path
+        assert "docs/am.md" in md
+
+
+class TestPreviewDirtyAllowlistAm:
+    """P2 Gm0q4: AM-status expected paths must not be rejected as
+    unexpected dirty paths."""
+
+    def test_am_expected_path_in_allowlist(self):
+        am_path = "docs/am.md"
+        verification = {
+            "changed_files_actual": [am_path],
+            "changed_files_expected": [am_path],
+            "checks": {
+                "untracked_expected": [],
+                "staged_added_expected": [am_path],
+                "tracked_modified_expected": [],
+                "am_wor...fied": [am_path],
+            },
+        }
+        allowed = pap._get_allowed_dirty_paths(verification)
+        assert am_path in allowed, f"AM expected path {am_path} must be in allowed dirty paths"
+
+    def test_unexpected_dirty_still_rejected(self, tmp_path):
+        """Negative: an unexpected dirty file (not in changed_files,
+        untracked_expected, staged_added_expected, or am_wor...fied) is
+        still rejected by the preview verifier."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        # Create expected file
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Create an UNEXPECTED untracked file
+        junk = repo / "junk.txt"
+        junk.write_text("junk\n", encoding="utf-8")
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
+        assert "junk.txt" in checks.get("unexpected_dirty_paths", [])

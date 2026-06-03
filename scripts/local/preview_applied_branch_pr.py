@@ -176,6 +176,14 @@ def _get_allowed_dirty_paths(verification: dict) -> set[str]:
         for f in tracked_modified_expected:
             if f:
                 allowed.add(f)
+        # P2 Gm0q4: AM-status expected files (added in index, modified
+        # in worktree) may also appear dirty in `git status --short`. They
+        # are verified by the verifier, so the preview must NOT reject
+        # them as unexpected dirty paths.
+        am_worktree_modified_paths = checks.get("am_worktree_modified") or []
+        for f in am_worktree_modified_paths:
+            if f:
+                allowed.add(f)
     return allowed
 
 
@@ -566,15 +574,26 @@ def write_md_output(
     branch_tree_diff = review_diff_sources.get("branch_tree_diff", "")
     git_index_diff_stat = review_diff_sources.get("git_index_diff_stat", "")
     git_index_diff = review_diff_sources.get("git_index_diff", "")
+    unstaged_worktree_diff_stat = review_diff_sources.get("unstaged_worktree_diff_stat", "")
+    unstaged_worktree_diff = review_diff_sources.get("unstaged_worktree_diff", "")
     git_status_short = review_diff_sources.get("git_status_short", "")
     staged_added_expected = review_diff_sources.get("staged_added_expected", [])
+    am_worktree_modified_paths = review_diff_sources.get("am_worktree_modified", [])
+    pre_push_blockers = review_diff_sources.get("pre_push_blockers", [])
+
+    # P2 Gm5km: when blockers are present, surface them prominently in
+    # the human-apply boundary section.
+    has_blockers = bool(pre_push_blockers)
 
     lines.extend([
         f"",
         f"## Review Diff Sources",
         f"",
-        f"Branch tree diff and staged/index diff are separate review sources. "
-        f"The branch HEAD may equal the base while staged expected files are present.",
+        f"Branch tree diff, staged/index diff, and unstaged/worktree diff "
+        f"are separate review sources. "
+        f"The branch HEAD may equal the base while staged expected files are present. "
+        f"For AM-status expected files, the unstaged/worktree diff captures on-disk "
+        f"changes that are not yet staged.",
         f"",
         f"### Branch Tree Diff",
         f"",
@@ -606,6 +625,31 @@ def write_md_output(
             f"```",
         ])
 
+    # P2 Gm0q4: add Unstaged/Worktree Diff section
+    if unstaged_worktree_diff_stat or unstaged_worktree_diff or am_worktree_modified_paths:
+        lines.extend([
+            f"",
+            f"### Unstaged/Worktree Diff",
+            f"",
+            f"```",
+            unstaged_worktree_diff_stat or "(empty unstaged/worktree diff)",
+            f"```",
+        ])
+        if unstaged_worktree_diff:
+            lines.extend([
+                f"",
+                f"```diff",
+                unstaged_worktree_diff,
+                f"```",
+            ])
+        if am_worktree_modified_paths:
+            lines.extend([
+                f"",
+                f"**AM (added+modified) expected files:** {len(am_worktree_modified_paths)}",
+            ])
+            for f in sorted(am_worktree_modified_paths):
+                lines.append(f"- `{f}`")
+
     if staged_added_expected:
         lines.extend([
             f"",
@@ -622,6 +666,23 @@ def write_md_output(
         git_status_short or "(clean)",
         f"```",
     ])
+
+    # P2 Gm5km: Pre-push Blockers / Human Apply Boundary section
+    if has_blockers:
+        lines.extend([
+            f"",
+            f"## Pre-push Blockers / Human Apply Boundary",
+            f"",
+            f"**⚠️ The branch HEAD does NOT carry the staged file content yet.** "
+            f"A plain `git push origin {branch_name}` would push a no-op PR "
+            f"because the branch ref still equals the base. "
+            f"Resolve the blockers below before pushing:",
+            f"",
+        ])
+        for blk in pre_push_blockers:
+            lines.append(f"- **{blk['kind']}**: {blk['human_action']}")
+            for p in blk.get("paths", []):
+                lines.append(f"  - `{p}`")
 
     lines.extend([
         f"",
@@ -646,15 +707,30 @@ def write_md_output(
         f"git -C {repo_root} diff --cached --stat",
         f"git -C {repo_root} diff --cached",
         f"#",
+        f"# View unstaged/worktree diff (for AM-status mock edits)",
+        f"git -C {repo_root} diff --stat",
+        f"git -C {repo_root} diff",
+        f"#",
         f"# View git status for staged/index and worktree state",
         f"git -C {repo_root} status --short",
         f"#",
-        f"# Push branch (after human approval)",
+        f"# Push branch (after human approval AND blocker resolution)",
         f"git -C {repo_root} push origin {branch_name}",
         f"#",
         f"# Suggested gh pr create command (after human approval)",
         generated_commands.get("suggested_pr_create_command_text_only", "gh pr create ..."),
         f"```",
+    ])
+    if has_blockers:
+        lines.extend([
+            f"",
+            f"> **PUSH GUARDED:** pre-push blockers are present. "
+            f"Resolve them (commit staged content; reconcile AM worktree) "
+            f"before running `git push origin {branch_name}`. "
+            f"A plain push now would create a no-op or stale-content PR.",
+        ])
+
+    lines.extend([
         f"",
         f"## Pre-push Checklist",
         f"",
@@ -754,23 +830,55 @@ def main() -> int:
     except Exception:
         pass
 
+    # P2 Gm0q4: capture unstaged worktree diff. For AM-status expected
+    # files, the staged content and the on-disk content may differ.
+    # We surface both so the human reviewer can see what was actually
+    # changed on disk vs what is staged.
+    unstaged_worktree_diff_stat = ""
+    unstaged_worktree_diff = ""
+    try:
+        r = _run_git(repo_root, "diff", "--stat")
+        if r.returncode == 0:
+            unstaged_worktree_diff_stat = r.stdout.strip()
+    except Exception:
+        pass
+
+    try:
+        r = _run_git(repo_root, "diff")
+        if r.returncode == 0:
+            unstaged_worktree_diff = r.stdout.strip()
+    except Exception:
+        pass
+
     checks_data = verification.get("checks", {})
     if not isinstance(checks_data, dict):
         checks_data = {}
     staged_added_expected = checks_data.get("staged_added_expected") or []
+    am_worktree_modified_paths = checks_data.get("am_worktree_modified") or []
+    pre_push_blockers = checks_data.get("pre_push_blockers") or []
     review_diff_sources = {
         "branch_tree_diff_stat": branch_tree_diff_stat,
         "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "staged_index_diff_stat": git_index_diff_stat,
+        "staged_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
         "git_index_diff_stat": git_index_diff_stat,
         "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "unstaged_worktree_diff_stat": unstaged_worktree_diff_stat,
+        "unstaged_worktree_diff": unstaged_worktree_diff[:2000] + ("..." if len(unstaged_worktree_diff) > 2000 else ""),
         "git_status_short": git_status_short,
         "staged_added_expected": staged_added_expected,
+        "am_worktree_modified": am_worktree_modified_paths,
+        "pre_push_blockers": pre_push_blockers,
         "branch_tree_diff_empty": not bool(branch_tree_diff_stat or branch_tree_diff),
         "staged_index_diff_present": bool(git_index_diff_stat or git_index_diff),
+        "unstaged_worktree_diff_present": bool(unstaged_worktree_diff_stat or unstaged_worktree_diff),
         "note": (
             "Branch tree diff and staged/index diff are separate. For staged-added "
             "mock edits, the branch tree diff may be empty while the staged/index "
-            "diff carries the expected file content."
+            "diff carries the expected file content. For AM-status expected files, "
+            "the unstaged/worktree diff captures on-disk changes that are not yet "
+            "staged. When pre_push_blockers is non-empty, a plain `git push` will "
+            "produce a no-op PR until the human commits the staged content."
         ),
     }
     checks["review_diff_sources"] = review_diff_sources
@@ -793,16 +901,36 @@ def main() -> int:
     gh_repo = "Slideshow11/Automated-Edge-Discovery"
 
     # Build generated commands (text only, not executed)
+    # P2 Gm5km: When pre_push_blockers is non-empty (e.g. staged-only
+    # expected files with no branch commit), the plain `git push` would
+    # produce a no-op PR. We mark the push as guarded with a clear note
+    # and add a checklist item requiring human reconciliation.
+    push_blocked_by = pre_push_blockers
+    push_command_guarded_note = ""
+    if push_blocked_by:
+        push_command_guarded_note = (
+            "PUSH IS GUARDED: pre-push blockers are present. "
+            "Resolve them (commit staged content, reconcile AM worktree) "
+            "before running `git push origin <branch>`. A plain push now "
+            "would create a no-op or stale-content PR."
+        )
     generated_commands = {
         "git_diff_stat": branch_tree_diff_stat,
         "git_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
         "branch_tree_diff_stat": branch_tree_diff_stat,
         "branch_tree_diff": branch_tree_diff[:2000] + ("..." if len(branch_tree_diff) > 2000 else ""),
+        "staged_index_diff_stat": git_index_diff_stat,
+        "staged_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
         "git_index_diff_stat": git_index_diff_stat,
         "git_index_diff": git_index_diff[:2000] + ("..." if len(git_index_diff) > 2000 else ""),
+        "unstaged_worktree_diff_stat": unstaged_worktree_diff_stat,
+        "unstaged_worktree_diff": unstaged_worktree_diff[:2000] + ("..." if len(unstaged_worktree_diff) > 2000 else ""),
         "git_status_short": git_status_short,
         "suggested_pr_create_command_text_only": _make_gh_pr_create_command(gh_repo, branch_name, suggested_pr_title),
         "suggested_pr_view_command_text_only": f"gh pr view {branch_name} --repo {gh_repo}",
+        "pre_push_blockers": pre_push_blockers,
+        "push_guarded": bool(push_blocked_by),
+        "push_command_guarded_note": push_command_guarded_note,
         "note": "Commands are TEXT ONLY — not executed by this tool.",
     }
 
@@ -814,6 +942,12 @@ def main() -> int:
         "Push only after human approval",
         "Open PR only after human approval",
     ]
+    if push_blocked_by:
+        # P2 Gm5km: when blockers exist, surface the human-apply boundary
+        # step explicitly in the checklist.
+        checklist = [
+            "Resolve all pre-push blockers (commit staged content; reconcile AM worktree) before push",
+        ] + checklist
 
     errors: list = []
     warnings: list = []
