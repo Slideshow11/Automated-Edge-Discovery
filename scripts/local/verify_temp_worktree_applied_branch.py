@@ -590,6 +590,33 @@ def verify(
                 "Affected paths are not in refs/heads/<branch> yet."
             ),
         })
+    # P1 G69nw: any expected path that lives in the worktree only — either
+    # as a tracked modification (M/AM/MM) or as an untracked file (??) — has
+    # content that is *not* present in refs/heads/<branch>. A plain
+    # `git push` would therefore omit that content from the PR. Block on
+    # every such path. (The apply check correctly counts them as applied
+    # via `tracked_modified_expected`/`untracked_expected`; this blocker
+    # only governs the push boundary.)
+    dirty_not_in_branch: list[str] = []
+    _seen_dirty: set[str] = set()
+    for f in list(tracked_modified_expected) + list(untracked_expected):
+        if f in _seen_dirty:
+            continue
+        _seen_dirty.add(f)
+        dirty_not_in_branch.append(f)
+    dirty_not_in_branch = sorted(dirty_not_in_branch)
+    if dirty_not_in_branch:
+        pre_push_blockers.append({
+            "kind": "expected_dirty_not_in_branch_ref",
+            "paths": dirty_not_in_branch,
+            "human_action": (
+                "Stage and commit the expected dirty path(s) (or restore "
+                "the worktree to discard them) before `git push origin "
+                f"<branch>`. refs/heads/{branch_name} does not currently "
+                "carry the expected content for these paths; a plain "
+                "`git push` would omit them from the PR."
+            ),
+        })
     if am_worktree_modified:
         pre_push_blockers.append({
             "kind": "am_worktree_modified",
@@ -609,12 +636,16 @@ def verify(
                 f"Affected paths: {', '.join(blk['paths'])}."
             )
 
-    # ── 21. Push boundary (P2 Gm5km) ──────────────────────────────────────────
+    # ── 21. Push boundary (P2 Gm5km, P1 G69nw) ────────────────────────────────
     # Make the branch-ref boundary impossible to miss. The status can remain
     # APPLIED_BRANCH_READY for controller compatibility, but the explicit
     # fields below let a reviewer and the preview consumer detect
-    # "index-only staged additions" without parsing prose.
-    branch_ref_contains_all_expected = not bool(staged_only_paths)
+    # "index-only staged additions" or "dirty expected paths absent from
+    # the branch ref" without parsing prose.
+    all_expected_dirty_not_in_branch = sorted(
+        set(staged_only_paths) | set(dirty_not_in_branch)
+    )
+    branch_ref_contains_all_expected = not bool(all_expected_dirty_not_in_branch)
     push_ready = bool(branch_ref_contains_all_expected) and not bool(pre_push_blockers)
     human_review_ready = True  # status == APPLIED_BRANCH_READY path is reached here
     checks["branch_ref_contains_all_expected"] = branch_ref_contains_all_expected
@@ -625,10 +656,10 @@ def verify(
         # Warnings section too.
         if not branch_ref_contains_all_expected:
             warnings.append(
-                f"NOT PUSH READY: {len(staged_only_paths)} staged/index "
-                f"expected path(s) are not in refs/heads/{branch_name}. "
-                f"A plain `git push` would omit these paths. "
-                f"Affected: {', '.join(staged_only_paths)}."
+                f"NOT PUSH READY: {len(all_expected_dirty_not_in_branch)} "
+                f"expected dirty path(s) are not in refs/heads/{branch_name}. "
+                "A plain `git push` would omit these paths. "
+                f"Affected: {', '.join(all_expected_dirty_not_in_branch)}."
             )
         if pre_push_blockers:
             warnings.append(

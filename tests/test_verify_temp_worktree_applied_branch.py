@@ -1886,6 +1886,268 @@ class TestCommittedPlusStagedOnlyBlocker:
         )
 
 
+class TestExpectedDirtyNotInBranchRefBlocker:
+    """P1 G69nw: when an *expected* tracked-modified or untracked file is
+    not present in refs/heads/<branch>, the verifier must surface a
+    pre-push blocker. Otherwise a plain `git push` would omit the
+    expected content from the PR even though the apply check counts
+    the change as applied.
+    """
+
+    def _setup_repo(self, tmp_path, branch_name, commit_path, dirty_path, dirty_kind):
+        """Create a branch with one committed file plus one dirty file.
+
+        `dirty_kind` selects how the dirty file is left:
+          - "tracked_modified" → file is tracked, then modified in worktree
+          - "untracked" → file is untracked
+          - "staged_modified" → file is tracked, then modified AND staged
+
+        Returns real_base = the commit BEFORE the expected files are
+        committed, so that the verifier's `branch_changed_files` (diff
+        from real_base to refs/heads/<branch>) includes the committed
+        expected files. This matches the real-world scenario where the
+        apply pipeline commits the expected files into the branch.
+        """
+        repo = make_temp_git_repo()
+        r_init = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_init.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", branch_name, base_sha],
+            cwd=repo, capture_output=True, text=True,
+        )
+        # Make sure docs dir is tracked
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(["git", "commit", "-m", "add docs dir"], cwd=repo, capture_output=True, text=True)
+        # Capture the SHA BEFORE the expected files are committed —
+        # this is the "expected base sha" the verifier will diff against.
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        real_base = r_base.stdout.strip()
+        # Commit the first expected file so the branch ref carries it
+        p_commit = repo / commit_path
+        p_commit.parent.mkdir(parents=True, exist_ok=True)
+        p_commit.write_text("committed content\n", encoding="utf-8")
+        subprocess.run(["git", "add", commit_path], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", f"add {commit_path}"], cwd=repo, capture_output=True, text=True)
+        # Add the dirty file in the requested shape
+        p_dirty = repo / dirty_path
+        p_dirty.parent.mkdir(parents=True, exist_ok=True)
+        p_dirty.write_text("dirty content\n", encoding="utf-8")
+        if dirty_kind == "tracked_modified":
+            subprocess.run(["git", "add", dirty_path], cwd=repo, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", f"track {dirty_path}"], cwd=repo, capture_output=True, text=True)
+            p_dirty.write_text("dirty content v2\n", encoding="utf-8")
+        elif dirty_kind == "untracked":
+            # leave as untracked
+            pass
+        elif dirty_kind == "staged_modified":
+            subprocess.run(["git", "add", dirty_path], cwd=repo, capture_output=True, text=True)
+            subprocess.run(["git", "commit", "-m", f"track {dirty_path}"], cwd=repo, capture_output=True, text=True)
+            p_dirty.write_text("dirty content v2\n", encoding="utf-8")
+            subprocess.run(["git", "add", dirty_path], cwd=repo, capture_output=True, text=True)
+        else:
+            raise ValueError(f"unknown dirty_kind: {dirty_kind}")
+        return repo, real_base, commit_path, dirty_path
+
+    def test_tracked_modified_expected_in_branch_ref_still_blocks_push(self, tmp_path):
+        """Even if the path is committed earlier in the branch ref, a
+        *subsequent* worktree modification of the same path means the
+        worktree's content differs from refs/heads/<branch>. A plain
+        `git push` would still omit the worktree modification, so the
+        expected_dirty_not_in_branch_ref blocker must fire."""
+        repo = make_temp_git_repo()
+        r_init = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_init.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True,
+        )
+        # First, commit an unrelated "real_base" anchor file so we have
+        # something to use as expected_base_sha (so the verifier can
+        # see docs/committed.md in the diff vs refs/heads/<branch>).
+        anchor = repo / "docs" / "anchor.md"
+        anchor.parent.mkdir(parents=True, exist_ok=True)
+        anchor.write_text("anchor\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/anchor.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add anchor"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        real_base = r_base.stdout.strip()
+        # Commit the expected file as part of the branch ref
+        p = repo / "docs" / "committed.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("committed\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/committed.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add committed"], cwd=repo, capture_output=True, text=True)
+        # Now also leave a worktree modification of the same file
+        p.write_text("committed-dirty\n", encoding="utf-8")
+        result_path = make_result_json(
+            tmp_path, changed_files=["docs/committed.md"]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/committed.md"]
+        )
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"got {status}"
+        blockers = checks.get("pre_push_blockers") or []
+        # Path is in tracked_modified_expected → blocker MUST fire
+        assert any(
+            b.get("kind") == "expected_dirty_not_in_branch_ref" for b in blockers
+        ), f"Expected expected_dirty_not_in_branch_ref, got: {blockers}"
+        assert checks.get("push_ready") is False
+        assert checks.get("branch_ref_contains_all_expected") is False
+
+    def test_tracked_modified_expected_absent_from_branch_blocks_push(self, tmp_path):
+        """A committed baseline + a tracked-modified expected file that
+        is NOT in refs/heads/<branch> must surface the
+        expected_dirty_not_in_branch_ref blocker."""
+        repo, real_base, commit_path, dirty_path = self._setup_repo(
+            tmp_path, "apply/test",
+            commit_path="docs/committed.md",
+            dirty_path="docs/dirty_tracked.md",
+            dirty_kind="tracked_modified",
+        )
+        result_path = make_result_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"got {status}"
+        blockers = checks.get("pre_push_blockers") or []
+        kinds = {b.get("kind") for b in blockers}
+        assert "expected_dirty_not_in_branch_ref" in kinds, (
+            f"Expected expected_dirty_not_in_branch_ref, got: {blockers}"
+        )
+        kind_block = next(
+            b for b in blockers if b.get("kind") == "expected_dirty_not_in_branch_ref"
+        )
+        assert dirty_path in kind_block.get("paths", []), (
+            f"Expected {dirty_path} in blocker paths, got: {kind_block.get('paths')}"
+        )
+        assert commit_path not in kind_block.get("paths", []), (
+            f"Committed path should NOT be in blocker, got: {kind_block.get('paths')}"
+        )
+        assert checks.get("push_ready") is False
+        assert checks.get("branch_ref_contains_all_expected") is False
+        assert checks.get("human_review_ready") is True
+
+    def test_untracked_expected_absent_from_branch_blocks_push(self, tmp_path):
+        """A committed baseline + an untracked expected file that is NOT
+        in refs/heads/<branch> must surface the
+        expected_dirty_not_in_branch_ref blocker."""
+        repo, real_base, commit_path, dirty_path = self._setup_repo(
+            tmp_path, "apply/test",
+            commit_path="docs/committed.md",
+            dirty_path="docs/dirty_untracked.md",
+            dirty_kind="untracked",
+        )
+        result_path = make_result_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"got {status}"
+        blockers = checks.get("pre_push_blockers") or []
+        kinds = {b.get("kind") for b in blockers}
+        assert "expected_dirty_not_in_branch_ref" in kinds, (
+            f"Expected expected_dirty_not_in_branch_ref, got: {blockers}"
+        )
+        assert checks.get("push_ready") is False
+        assert checks.get("branch_ref_contains_all_expected") is False
+
+    def test_staged_modified_expected_absent_from_branch_blocks_push(self, tmp_path):
+        """A committed baseline + a staged-modified expected file that is
+        NOT in refs/heads/<branch> must also surface
+        expected_dirty_not_in_branch_ref (in addition to the staged-only
+        blocker, since the path sits in both categories)."""
+        repo, real_base, commit_path, dirty_path = self._setup_repo(
+            tmp_path, "apply/test",
+            commit_path="docs/committed.md",
+            dirty_path="docs/dirty_staged.md",
+            dirty_kind="staged_modified",
+        )
+        result_path = make_result_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        assert status == "APPLIED_BRANCH_READY", f"got {status}"
+        assert checks.get("push_ready") is False
+        assert checks.get("branch_ref_contains_all_expected") is False
+
+    def test_markdown_lists_all_dirty_expected_paths_in_blockers(self, tmp_path):
+        """Markdown must list every dirty expected path in the
+        Pre-push Blockers section, with kind
+        expected_dirty_not_in_branch_ref visible."""
+        repo, real_base, commit_path, dirty_path = self._setup_repo(
+            tmp_path, "apply/test",
+            commit_path="docs/committed.md",
+            dirty_path="docs/dirty_tracked.md",
+            dirty_kind="tracked_modified",
+        )
+        result_path = make_result_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[commit_path, dirty_path]
+        )
+        from verify_temp_worktree_applied_branch import write_md_output  # noqa
+        import verify_temp_worktree_applied_branch as vtab  # noqa
+        status, checks = vtab.verify(
+            repo, "apply/test", real_base, result_path, diff_path, readiness_path,
+        )
+        md_path = tmp_path / "out.md"
+        write_md_output(
+            md_path, status, True, checks,
+            str(repo), "apply/test", "abc123", "abc123", "def456",
+            [commit_path, dirty_path], [commit_path],
+            "result.json", "diff.json", "ready.json",
+            {"suggested_tests": "pytest", "review_diff_sources": {}},
+            [], [], "2026-01-01T00:00:00Z", "safety",
+        )
+        md = md_path.read_text()
+        assert "Pre-push Blockers" in md, "Expected Pre-push Blockers section"
+        assert "expected_dirty_not_in_branch_ref" in md, (
+            f"Expected expected_dirty_not_in_branch_ref in md, got:\n{md}"
+        )
+        assert f"`{dirty_path}`" in md, (
+            f"Expected `{dirty_path}` in markdown, got:\n{md}"
+        )
+        assert "NOT PUSH READY" in md
+
+
 class TestPushBoundaryFields:
     """P2 Gm5km: explicit machine-readable push-boundary fields.
 
