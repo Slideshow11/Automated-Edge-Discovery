@@ -1435,3 +1435,191 @@ class TestReadinessBooleanRendering:
         assert rds.get("branch_ref_contains_all_expected") is False
         assert rds.get("push_ready") is False
         assert rds.get("human_review_ready") is False
+
+
+# ---------------------------------------------------------------------------
+# P2 HP0TN: Normalize quoted staged dirty paths before allowing them.
+# Mirrors the HOvFP fix on the verifier side, but for preview's
+# `_git_dirty_paths()` and its allowlist comparison.
+# ---------------------------------------------------------------------------
+
+class TestParseStatusPath:
+    """P2 HP0TN: helper normalizes git status --short paths."""
+
+    def test_unquoted_path_returned_unchanged(self):
+        """Unquoted path is returned stripped but otherwise unchanged."""
+        assert pap._parse_status_path("docs/simple.md") == "docs/simple.md"
+        assert pap._parse_status_path("  docs/simple.md  ") == "docs/simple.md"
+
+    def test_quoted_path_with_spaces(self):
+        """Quoted path with spaces is unquoted."""
+        assert pap._parse_status_path('"docs/a b.md"') == "docs/a b.md"
+
+    def test_quoted_path_with_parentheses(self):
+        """Quoted path with parentheses is unquoted and preserved."""
+        assert pap._parse_status_path('"docs/paren (1).md"') == "docs/paren (1).md"
+
+    def test_escaped_quote_handled_safely(self):
+        """Path with escaped quote is unescaped via shlex (posix=True)."""
+        # shlex.split('"docs/quote\\"file.md"', posix=True) -> ['docs/quote"file.md']
+        assert pap._parse_status_path('"docs/quote\\"file.md"') == 'docs/quote"file.md'
+
+    def test_malformed_quote_falls_back_without_crashing(self):
+        """Malformed quoted input falls back to the stripped raw text."""
+        # Missing closing quote — shlex.split raises ValueError; helper
+        # must not crash and must return the raw stripped text.
+        result = pap._parse_status_path('"docs/unterminated path')
+        assert result == '"docs/unterminated path'
+
+    def test_empty_string(self):
+        """Empty input returns empty."""
+        assert pap._parse_status_path("") == ""
+        assert pap._parse_status_path("   ") == ""
+
+
+class TestQuotedStatusPathInDirtyDetection:
+    """P2 HP0TN: end-to-end — quoted path is normalized through the preview."""
+
+    def _make_repo_with_spaced_path(self, tmp_path: Path) -> tuple[Path, str]:
+        """Create a temp git repo with a tracked file whose name has a space.
+
+        Returns (repo_root, base_sha). Caller is responsible for setting up
+        the apply branch and the verification JSON.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        # Create a branch and commit a file with a space in the name.
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/spaced", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        spaced = repo / "docs" / "a b.md"
+        spaced.parent.mkdir(parents=True, exist_ok=True)
+        spaced.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/a b.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "spaced path"], cwd=repo, capture_output=True, text=True)
+        return repo, base_sha
+
+    def test_quoted_staged_dirty_path_is_accepted_when_in_allowed(self, tmp_path):
+        """A staged-modified file with a space in its name is shown quoted
+        by `git status --short`; the preview must normalize the path so it
+        matches the unquoted `changed_files_actual` and accept the worktree.
+
+        This is the exact HP0TN scenario: without normalization the
+        preview sees `"docs/a b.md"` (quoted) and the allowed set has
+        `docs/a b.md` (unquoted), so the diff is non-empty and the
+        preview returns `HOLD_UNEXPECTED_DIRTY_FILE`. With the fix the
+        normalized dirty path matches the allowed set and the preview
+        returns `PR_PREVIEW_READY`.
+        """
+        repo, base_sha = self._make_repo_with_spaced_path(tmp_path)
+
+        # Build verification JSON with the unquoted path in
+        # changed_files_actual / changed_files_expected (matches what
+        # the verifier actually emits, since the verifier's
+        # _parse_status_path already unquotes the path on its side).
+        json_data = {
+            "status": "APPLIED_BRANCH_READY",
+            "applied_branch_ready": True,
+            "repo_root": str(repo),
+            "branch_name": "apply/spaced",
+            "expected_base_sha": base_sha,
+            "merge_base_sha": base_sha,
+            "current_head_sha": base_sha,
+            "changed_files_expected": ["docs/a b.md"],
+            "changed_files_actual": ["docs/a b.md"],
+            "checks": {
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+            "errors": [],
+            "warnings": [],
+            "generated_at": "2026-05-22T00:00:00Z",
+            "safety_statement": "Test",
+            "task": {"forbidden_files": []},
+        }
+        json_path = tmp_path / "applied_branch.json"
+        json_path.write_text(json.dumps(json_data), encoding="utf-8")
+
+        # Make the file dirty on disk so `git status --short` reports it.
+        (repo / "docs" / "a b.md").write_text("hello world DIRTY\n", encoding="utf-8")
+
+        # Sanity check: git status --short actually quotes this path on
+        # this filesystem. Skip the test if it doesn't (e.g. filesystem
+        # that doesn't trigger quoting for spaces — should not happen
+        # on real ext4/tmpfs, but the guard keeps the test honest).
+        r = subprocess.run(
+            ["git", "status", "--short", "-uall", "--"],
+            cwd=repo, capture_output=True, text=True
+        )
+        assert "docs/a b.md" in r.stdout, (
+            f"git did not report the spaced path; raw output: {r.stdout!r}"
+        )
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/spaced", "main", base_sha,
+        )
+        # HP0TN regression: must NOT be HOLD_UNEXPECTED_DIRTY_FILE.
+        # The quoted path must normalize to the unquoted one and match
+        # the allowed set, so the preview returns PR_PREVIEW_READY.
+        assert status == "PR_PREVIEW_READY", (
+            f"HP0TN regression: expected PR_PREVIEW_READY for quoted dirty "
+            f"path matching allowed set; got {status} (checks={checks})"
+        )
+        assert checks.get("verified_dirty_worktree_allowed") is True
+
+    def test_quoted_staged_dirty_path_still_rejected_when_not_in_allowed(self, tmp_path):
+        """Normalization must not let a quoted dirty path slip through when
+        the unquoted version is NOT in the allowed set. The preview must
+        still raise `HOLD_UNEXPECTED_DIRTY_FILE` (or a more specific
+        related hold) so we don't get a false ready.
+        """
+        repo, base_sha = self._make_repo_with_spaced_path(tmp_path)
+
+        # Build verification JSON with a DIFFERENT allowed file — the
+        # spaced file is NOT in any allowed set. After normalization the
+        # path is still the unquoted `docs/a b.md`, which is not in
+        # the allowed set, so the preview must reject.
+        json_data = {
+            "status": "APPLIED_BRANCH_READY",
+            "applied_branch_ready": True,
+            "repo_root": str(repo),
+            "branch_name": "apply/spaced",
+            "expected_base_sha": base_sha,
+            "merge_base_sha": base_sha,
+            "current_head_sha": base_sha,
+            "changed_files_expected": ["docs/some_other.md"],
+            "changed_files_actual": ["docs/some_other.md"],
+            "checks": {
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+            "errors": [],
+            "warnings": [],
+            "generated_at": "2026-05-22T00:00:00Z",
+            "safety_statement": "Test",
+            "task": {"forbidden_files": []},
+        }
+        json_path = tmp_path / "applied_branch.json"
+        json_path.write_text(json.dumps(json_data), encoding="utf-8")
+
+        # Make the spaced file dirty (this is the unexpected dirty path).
+        (repo / "docs" / "a b.md").write_text("hello world DIRTY\n", encoding="utf-8")
+
+        status, _checks = pap.verify(
+            repo, json_path, "apply/spaced", "main", base_sha,
+        )
+        # HP0TN correctness check: must NOT be PR_PREVIEW_READY; the
+        # quoted path normalizes to a path that is not in the allowed
+        # set, so the preview rejects.
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE", (
+            f"expected HOLD_UNEXPECTED_DIRTY_FILE for unallowed quoted "
+            f"dirty path; got {status}"
+        )

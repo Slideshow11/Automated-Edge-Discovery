@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -110,6 +111,44 @@ def _git_status_clean(repo_root: Path) -> bool:
     return r.returncode == 0 and r.stdout.strip() == ""
 
 
+def _parse_status_path(raw: str) -> str:
+    """Strip one layer of git-style surrounding quotes from a status line path.
+
+    `git status --short` quotes paths containing spaces or other special
+    characters using C-style backslash-escaped double quotes (e.g.
+    `A  "docs/a b.md"`). This helper returns the unquoted text so that
+    downstream comparison against the unquoted path set returned by
+    verification works correctly. P2 HP0TN: without this, the preview's
+    `_git_dirty_paths()` set contains the quoted form (e.g. `"docs/a b.md"`)
+    while the verification's `changed_files_actual` contains the unquoted
+    form (`docs/a b.md`); the difference triggers `HOLD_UNEXPECTED_DIRTY_FILE`
+    even though the file is the verifier-accepted staged-added path.
+
+    Unquoted input is returned unchanged (after stripping whitespace).
+    Malformed quoted input falls back to the stripped raw text — the
+    preview must not crash on unusual filenames.
+    """
+    s = raw.strip()
+    if not s:
+        return s
+    if not (len(s) >= 2 and s.startswith('"') and s.endswith('"')):
+        # Unquoted path: just trim. shlex.split would tokenize on
+        # whitespace which is wrong for paths that legitimately have
+        # no surrounding quotes.
+        return s
+    # Quoted path: use shlex to handle C-style escapes and embedded
+    # spaces, parentheses, and other safe characters. shlex.split raises
+    # ValueError on truly malformed input; fall back to the raw text
+    # rather than crash the preview.
+    try:
+        parts = shlex.split(s, posix=True)
+    except ValueError:
+        return s
+    if not parts:
+        return s
+    return " ".join(parts)
+
+
 def _git_dirty_paths(repo_root: Path) -> set[str]:
     """
     Return the set of dirty paths (relative to repo root) from git status.
@@ -117,12 +156,25 @@ def _git_dirty_paths(repo_root: Path) -> set[str]:
     Tracked changed files: stage/index status chars (M, D, etc.)
     Untracked files: '??' status
     Returns paths like {'docs/scratch.md', 'scripts/a.py'}
+
+    P2 HP0TN: git status --short emits paths containing whitespace or
+    other special characters as C-style quoted strings (e.g. `"docs/a b.md"`).
+    We normalize each path via `_parse_status_path` before adding to the
+    set so the comparison against `_get_allowed_dirty_paths(verification)`
+    works for quoted filenames. Without this normalization, a verified
+    staged-added file with spaces in its name would land in
+    `unexpected` and the preview would return `HOLD_UNEXPECTED_DIRTY_FILE`.
     """
     r = _run_git(repo_root, "status", "--short", "-uall", "--")
     if r.returncode != 0:
         return set()
     paths: set[str] = set()
-    for line in r.stdout.strip().splitlines():
+    for line in r.stdout.splitlines():
+        # IMPORTANT: do NOT .strip() the whole r.stdout up front — that
+        # would strip the leading space from a ` M "docs/a b.md"` line,
+        # leaving `M "docs/a b.md"`. The parser would then mis-find the
+        # next space (which for a quoted path is inside the path itself,
+        # e.g. between `a` and `b`) and produce a truncated path. P2 HP0TN.
         if len(line) < 3:
             continue
         # Git status --short format: XY path or XY  path (status + space(s) + path)
@@ -132,7 +184,9 @@ def _git_dirty_paths(repo_root: Path) -> set[str]:
             space_idx = line.find(" ", 1)
             if space_idx == -1:
                 continue
-        file_path = line[space_idx + 1:].strip()
+        file_path = _parse_status_path(line[space_idx + 1:])
+        if not file_path:
+            continue
         status_part = line[:2]
         if status_part == "??":  # untracked
             paths.add(file_path)
