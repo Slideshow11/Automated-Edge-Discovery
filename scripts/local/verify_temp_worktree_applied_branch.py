@@ -635,10 +635,15 @@ def verify(
             "kind": "staged_only_no_branch_commit",
             "paths": staged_only_paths,
             "human_action": (
-                "Run `git -C <repo> commit -m 'apply staged changes'` "
-                "(or equivalent) before `git push origin <branch>` to "
-                "ensure the branch ref carries the staged file content. "
-                "Affected paths are not in refs/heads/<branch> yet."
+                "First, make sure the target branch is checked out — "
+                "run `git -C <repo> switch <branch>` (or `git -C <repo> "
+                "checkout <branch>`) if HEAD is on a different branch, "
+                "otherwise the commit below will land on the wrong ref. "
+                "Then run `git -C <repo> commit -m 'apply staged "
+                "changes'` (or equivalent) before `git push origin "
+                "<branch>` to ensure the branch ref carries the staged "
+                "file content. Affected paths are not in "
+                "refs/heads/<branch> yet."
             ),
         })
     # P1 G69nw: any expected path that lives in the worktree only — either
@@ -661,11 +666,15 @@ def verify(
             "kind": "expected_dirty_not_in_branch_ref",
             "paths": dirty_not_in_branch,
             "human_action": (
-                "Stage and commit the expected dirty path(s) (or restore "
-                "the worktree to discard them) before `git push origin "
-                f"<branch>`. refs/heads/{branch_name} does not currently "
-                "carry the expected content for these paths; a plain "
-                "`git push` would omit them from the PR."
+                "First, make sure the target branch is checked out — "
+                "run `git -C <repo> switch <branch>` (or `git -C <repo> "
+                "checkout <branch>`) if HEAD is on a different branch, "
+                "otherwise the commit below will land on the wrong ref. "
+                "Then stage and commit the expected dirty path(s) (or "
+                "restore the worktree to discard them) before `git push "
+                f"origin <branch>`. refs/heads/{branch_name} does not "
+                "currently carry the expected content for these paths; "
+                "a plain `git push` would omit them from the PR."
             ),
         })
     if am_worktree_modified:
@@ -673,10 +682,15 @@ def verify(
             "kind": "am_worktree_modified",
             "paths": sorted(am_worktree_modified),
             "human_action": (
-                "Reconcile the worktree content with the staged content "
-                "for these files (e.g. stage the worktree modification, "
-                "or restore the worktree to discard it) before push. The "
-                "staged content and the worktree content are out of sync."
+                "First, make sure the target branch is checked out — "
+                "run `git -C <repo> switch <branch>` (or `git -C <repo> "
+                "checkout <branch>`) if HEAD is on a different branch, "
+                "otherwise the reconcile/commit below will land on the "
+                "wrong ref. Then reconcile the worktree content with "
+                "the staged content for these files (e.g. stage the "
+                "worktree modification, or restore the worktree to "
+                "discard it) before push. The staged content and the "
+                "worktree content are out of sync."
             ),
         })
     checks["pre_push_blockers"] = pre_push_blockers

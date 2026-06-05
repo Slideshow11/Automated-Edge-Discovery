@@ -1383,6 +1383,255 @@ class TestPrePushBlockers:
         assert blockers == [], f"Expected no blockers, got: {blockers}"
 
 
+class TestPrePushBlockerTargetBranchGuidance:
+    """P2 HO6mA: every pre-push blocker that asks the user to commit
+    before pushing must first tell the user to switch/checkout the
+    target branch. Without this guidance, running the suggested
+    `git commit` while HEAD is on a different branch would land the
+    commit on the wrong ref.
+
+    Each blocker kind's `human_action` text is checked for:
+    - explicit mention of "switch" or "checkout"
+    - the literal target branch placeholder `<branch>`
+    - the existing "before `git push origin <branch>`" tail
+    """
+
+    @staticmethod
+    def _blocker_by_kind(checks: dict, kind: str) -> dict | None:
+        for b in (checks.get("pre_push_blockers") or []):
+            if b.get("kind") == kind:
+                return b
+        return None
+
+    def test_staged_only_blocker_targets_branch_checkout_first(self, tmp_path):
+        """HO6mA: staged_only_no_branch_commit human_action must
+        tell the user to switch/checkout the target branch first."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True,
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+        # Stage-add the expected file (no commit) so staged_only_no_branch_commit fires.
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True)
+
+        result_path = make_result_json(tmp_path, changed_files=["docs/scratch.md"])
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/scratch.md"]
+        )
+        _, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        blocker = self._blocker_by_kind(checks, "staged_only_no_branch_commit")
+        assert blocker is not None, (
+            f"expected staged_only_no_branch_commit blocker, got: "
+            f"{checks.get('pre_push_blockers')}"
+        )
+        action = blocker["human_action"]
+        assert "switch" in action or "checkout" in action, (
+            f"HO6mA: human_action must mention switch/checkout for "
+            f"target branch, got: {action!r}"
+        )
+        assert "<branch>" in action, (
+            f"human_action must include the <branch> placeholder, got: {action!r}"
+        )
+        assert "git push origin <branch>" in action, (
+            f"human_action must keep the 'before git push origin <branch>' "
+            f"tail, got: {action!r}"
+        )
+
+    def test_expected_dirty_blocker_targets_branch_checkout_first(self, tmp_path):
+        """HO6mA: expected_dirty_not_in_branch_ref human_action must
+        tell the user to switch/checkout the target branch first."""
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        # Track a file on main so it can be modified on the apply branch.
+        tracked = repo / "docs" / "tracked.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/tracked.md"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add tracked"],
+            cwd=repo, capture_output=True,
+        )
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True,
+        )
+        # Worktree-only modification (no stage) → expected_dirty_not_in_branch_ref.
+        tracked.write_text("modified by apply\n", encoding="utf-8")
+
+        result_path = make_result_json(
+            tmp_path, changed_files=["docs/tracked.md"]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/tracked.md"]
+        )
+        _, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        blocker = self._blocker_by_kind(
+            checks, "expected_dirty_not_in_branch_ref"
+        )
+        assert blocker is not None, (
+            f"expected expected_dirty_not_in_branch_ref blocker, got: "
+            f"{checks.get('pre_push_blockers')}"
+        )
+        action = blocker["human_action"]
+        assert "switch" in action or "checkout" in action, (
+            f"HO6mA: human_action must mention switch/checkout for "
+            f"target branch, got: {action!r}"
+        )
+        assert "<branch>" in action, (
+            f"human_action must include the <branch> placeholder, got: {action!r}"
+        )
+        assert "git push origin <branch>" in action, (
+            f"human_action must keep the 'before git push origin <branch>' "
+            f"tail, got: {action!r}"
+        )
+
+    def test_am_blocker_targets_branch_checkout_first(self, tmp_path):
+        """HO6mA: am_worktree_modified human_action must tell the user
+        to switch/checkout the target branch first."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True,
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+        # Stage-add then re-touch the worktree file → AM status.
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True)
+        p.write_text("hello v2\n", encoding="utf-8")
+
+        result_path = make_result_json(
+            tmp_path, changed_files=["docs/scratch.md"]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/scratch.md"]
+        )
+        _, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        blocker = self._blocker_by_kind(checks, "am_worktree_modified")
+        assert blocker is not None, (
+            f"expected am_worktree_modified blocker, got: "
+            f"{checks.get('pre_push_blockers')}"
+        )
+        action = blocker["human_action"]
+        assert "switch" in action or "checkout" in action, (
+            f"HO6mA: human_action must mention switch/checkout for "
+            f"target branch, got: {action!r}"
+        )
+        assert "<branch>" in action, (
+            f"human_action must include the <branch> placeholder, got: {action!r}"
+        )
+        # The AM blocker ends with "...before push" rather than the
+        # "before `git push origin <branch>`" tail, so we accept either
+        # form here.
+        assert "before push" in action, (
+            f"human_action must keep the 'before push' tail, got: {action!r}"
+        )
+
+    def test_staged_only_blocker_unchanged_behavior(self, tmp_path):
+        """Sanity: the new wording does not regress the existing
+        staged_only_no_branch_commit behavior — paths are still
+        populated, kind is unchanged, the expected file still gets
+        recognized."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True,
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True,
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+        p = repo / "docs" / "scratch.md"
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True)
+
+        result_path = make_result_json(
+            tmp_path, changed_files=["docs/scratch.md"]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=["docs/scratch.md"]
+        )
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # Verifier still says APPLIED_BRANCH_READY (pre-push blockers
+        # are surfaced but do not flip the status).
+        assert status == "APPLIED_BRANCH_READY"
+        # Path is still in the staged_added bucket.
+        assert "docs/scratch.md" in (
+            checks.get("staged_added_expected") or []
+        )
+        # Pre-push blocker is still emitted with the same kind.
+        blocker = self._blocker_by_kind(
+            checks, "staged_only_no_branch_commit"
+        )
+        assert blocker is not None
+        assert "docs/scratch.md" in blocker["paths"]
+
+
 # P2 Gm0q4: The verifier must surface the unstaged worktree diff in the
 # generated_human_commands and review_diff_sources JSON output, so AM
 # status and other unstaged changes are visible to human reviewers.
