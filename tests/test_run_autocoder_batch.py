@@ -1013,33 +1013,55 @@ class TestExecutionMocked:
                           allowed_files=["docs/fail_001.md"])
         batch = make_batch(batch_id="test-batch-001", tasks=[task1])
 
-        def fake_run(argv):
-            class CP:
-                returncode = 1
-                stdout = ""
-                stderr = "Simulated failure"
-
-                def __init__(self):
-                    pass
-            return CP()
-
-        out_json = tmp_path / "out.json"
-        out_md = tmp_path / "out.md"
-        # The batch controller (scripts/local/run_autocoder_batch.py) captures
-        # the real subprocess.run reference at import time as
-        # `_real_subprocess_run` and uses it for its own subprocess calls,
-        # deliberately bypassing any test-time `subprocess.run` monkey-patch.
-        # Override `_real_subprocess_run` directly so the test exercises the
-        # subprocess-failure path deterministically regardless of the host
-        # environment.
-        import scripts.local.run_autocoder_batch as batch_module
-        original_real_run = batch_module._real_subprocess_run
-        batch_module._real_subprocess_run = fake_run
+        # The batch controller (scripts/local/run_autocoder_batch.py)
+        # captures the real subprocess.run reference at import time as
+        # `_real_subprocess_run` and uses it for BOTH its own git setup
+        # probes (`git worktree add`, `git status`, etc.) AND the per-task
+        # single-task subprocess. We must patch that exact attribute on the
+        # same module object that `run_batch_via_module()` imports
+        # (top-level `run_autocoder_batch`, NOT the package-style
+        # `scripts.local.run_autocoder_batch` — those are distinct module
+        # objects because `scripts` is a namespace package). The dispatch
+        # `fake_run` below returns a deterministic failure for the
+        # single-task subprocess call and falls through to the original
+        # `_real_subprocess_run` for the controller's git probes (otherwise
+        # the controller bails out with HOLD_BATCH_PACKET_INVALID before
+        # the task subprocess is ever spawned).
+        import sys
+        orig_path = list(sys.path)
+        sys.path.insert(0, str(SCRIPT_DIR))
         try:
-            result = run_batch_via_module(batch, out_json, out_md,
-                                          monkeypatch_runner=fake_run)
+            import run_autocoder_batch as batch_module
+            assert batch_module.__name__ == "run_autocoder_batch"
+            _saved_real_subprocess_run = batch_module._real_subprocess_run
+
+            def fake_run(argv, **kwargs):
+                argv_list = list(argv or [])
+                is_single_task_subprocess = any(
+                    "run_autocoder_single_task.py" in str(a) for a in argv_list
+                )
+                if is_single_task_subprocess:
+                    class CP:
+                        returncode = 1
+                        stdout = ""
+                        stderr = "Simulated failure"
+
+                        def __init__(self):
+                            pass
+                    return CP()
+                return _saved_real_subprocess_run(argv, **kwargs)
+
+            out_json = tmp_path / "out.json"
+            out_md = tmp_path / "out.md"
+            original_real_run = batch_module._real_subprocess_run
+            batch_module._real_subprocess_run = fake_run
+            try:
+                result = run_batch_via_module(batch, out_json, out_md,
+                                              monkeypatch_runner=fake_run)
+            finally:
+                batch_module._real_subprocess_run = original_real_run
         finally:
-            batch_module._real_subprocess_run = original_real_run
+            sys.path[:] = orig_path
         assert result["status"] in ("HOLD_TASK_FAILED", "HOLD_SINGLE_TASK_SUBPROCESS_FAILED")
         assert result.get("failed_task_id") == "task-001"
 
