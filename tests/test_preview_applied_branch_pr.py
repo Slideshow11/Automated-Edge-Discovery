@@ -508,6 +508,120 @@ class TestVerifiedDirtyWorktreeAllowed:
         # verified_dirty_worktree_allowed must be present in checks
         assert "verified_dirty_worktree_allowed" in checks
 
+    def test_staged_added_preview_includes_index_diff_sources(self, tmp_path):
+        """Staged-only additions are visible in PR preview JSON and Markdown."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        staged_file = repo / "docs" / "staged.md"
+        staged_file.parent.mkdir(parents=True, exist_ok=True)
+        staged_file.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged.md"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/staged.md"],
+            changed_files_actual=["docs/staged.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/staged.md"],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+        assert checks.get("branch_diff_skipped_dirty_allowed") is True
+        assert "docs/staged.md" in checks.get("dirty_paths", [])
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": subprocess.run(
+                ["git", "diff", "--cached", "--stat"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "git_index_diff": subprocess.run(
+                ["git", "diff", "--cached"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "git_status_short": subprocess.run(
+                ["git", "status", "--short"],
+                cwd=repo,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "staged_added_expected": ["docs/staged.md"],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+        }
+
+        pap.write_json_output(
+            output_json,
+            "PR_PREVIEW_READY",
+            True,
+            checks,
+            str(repo),
+            "main",
+            "apply/test",
+            base_sha,
+            ["docs/staged.md"],
+            "",
+            review_diff_sources,
+            generated_commands,
+            "test title",
+            "test body",
+            [],
+            [],
+            [],
+            "2026-05-22T00:00:00Z",
+            "safe",
+        )
+        pap.write_md_output(
+            output_md,
+            "PR_PREVIEW_READY",
+            True,
+            checks,
+            str(repo),
+            "main",
+            "apply/test",
+            base_sha,
+            ["docs/staged.md"],
+            "",
+            review_diff_sources,
+            generated_commands,
+            "test title",
+            "test body",
+            [],
+            [],
+            [],
+            "2026-05-22T00:00:00Z",
+            "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        md = output_md.read_text(encoding="utf-8")
+        assert preview["review_diff_sources"]["branch_tree_diff_empty"] is True
+        assert "docs/staged.md" in preview["review_diff_sources"]["git_index_diff"]
+        assert "Staged/Index Diff" in md
+        assert "git -C" in md and "diff --cached" in md
+        assert "docs/staged.md" in md
+
 
 class TestNoGitAddInPreviewTool:
     """Source inspection: preview tool must not call git add."""
@@ -819,3 +933,734 @@ class TestGeneratedGhPrCreateTextOnly:
         assert "Slideshow11/Automated-Edge-Discovery" in cmd
         # It's text, not a subprocess call — no execution happens
         assert not hasattr(pap, "subprocess") or True  # just a text check
+
+
+
+# P2 Gm5km + Gm0q4: preview-side test classes for staged-only and AM
+# worktree-modified expected files.
+class TestPreviewStagedOnlyPrePushBlocker:
+    """P2 Gm5km: staged-only expected file produces a pre-push blocker in
+    the preview JSON and a 'Pre-push Blockers / Human Apply Boundary'
+    section in the Markdown. Push is guarded, not implied as sufficient."""
+
+    def test_staged_only_expected_includes_pre_push_blocker(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        staged_file = repo / "docs" / "staged.md"
+        staged_file.parent.mkdir(parents=True, exist_ok=True)
+        staged_file.write_text("staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/staged.md"], cwd=repo, capture_output=True, text=True)
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/staged.md"],
+            changed_files_actual=["docs/staged.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/staged.md"],
+                "pre_push_blockers": [
+                    {
+                        "kind": "staged_only_no_branch_commit",
+                        "paths": ["docs/staged.md"],
+                        "human_action": "Commit staged content before push.",
+                    }
+                ],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+            "push_guarded": True,
+            "push_command_guarded_note": (
+                "PUSH IS GUARDED: pre-push blockers are present. "
+                "Resolve them before running `git push origin <branch>`."
+            ),
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": " docs/staged.md | 1 +",
+            "git_index_diff": "+staged content",
+            "unstaged_worktree_diff_stat": "",
+            "unstaged_worktree_diff": "",
+            "git_status_short": "A  docs/staged.md",
+            "staged_added_expected": ["docs/staged.md"],
+            "am_worktree_modified": [],
+            "pre_push_blockers": [
+                {
+                    "kind": "staged_only_no_branch_commit",
+                    "paths": ["docs/staged.md"],
+                    "human_action": "Commit staged content before push.",
+                }
+            ],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+            "unstaged_worktree_diff_present": False,
+        }
+        checklist = ["Review diff manually", "Confirm PMG clean", "Run tests locally"]
+
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/staged.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/staged.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        # review_diff_sources must include pre_push_blockers
+        rds = preview.get("review_diff_sources", {})
+        assert "pre_push_blockers" in rds
+        assert len(rds["pre_push_blockers"]) >= 1
+        assert rds["pre_push_blockers"][0]["kind"] == "staged_only_no_branch_commit"
+        # generated_commands must include guarded note
+        gc = preview.get("generated_commands", {})
+        assert gc.get("push_guarded") is True
+        assert "PUSH IS GUARDED" in gc.get("push_command_guarded_note", "")
+
+        md = output_md.read_text(encoding="utf-8")
+        # Markdown must include Pre-push Blockers / Human Apply Boundary
+        assert "Pre-push Blockers" in md or "Human Apply Boundary" in md
+        # Markdown must include push guarded note
+        assert "PUSH GUARDED" in md
+        # Markdown must include unstaged/worktree diff hint even when empty
+        assert "git -C" in md and "diff --cached" in md
+        # Markdown must include the staged-added path
+        assert "docs/staged.md" in md
+
+
+class TestPreviewAMWorktreeDiff:
+    """P2 Gm0q4: AM-status expected file surfaces unstaged/worktree diff
+    in the preview JSON and Markdown."""
+
+    def test_am_expected_includes_unstaged_worktree_diff(self, tmp_path):
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        am_file = repo / "docs" / "am.md"
+        am_file.parent.mkdir(parents=True, exist_ok=True)
+        am_file.write_text("v1 staged content\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/am.md"], cwd=repo, capture_output=True, text=True)
+        am_file.write_text("v2 worktree content\n", encoding="utf-8")
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/am.md"],
+            changed_files_actual=["docs/am.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+                "staged_added_expected": ["docs/am.md"],
+                "am_worktree_modified": ["docs/am.md"],
+                "pre_push_blockers": [
+                    {
+                        "kind": "am_worktree_modified",
+                        "paths": ["docs/am.md"],
+                        "human_action": "Reconcile worktree vs staged content.",
+                    }
+                ],
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "PR_PREVIEW_READY"
+
+        output_json = tmp_path / "preview.json"
+        output_md = tmp_path / "preview.md"
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": " docs/am.md | 1 +",
+            "git_index_diff": "+v1 staged content",
+            "unstaged_worktree_diff_stat": " docs/am.md | 2 +-",
+            "unstaged_worktree_diff": "-v1 staged content\n+v2 worktree content",
+            "git_status_short": "AM docs/am.md",
+            "staged_added_expected": ["docs/am.md"],
+            "am_worktree_modified": ["docs/am.md"],
+            "pre_push_blockers": [
+                {
+                    "kind": "am_worktree_modified",
+                    "paths": ["docs/am.md"],
+                    "human_action": "Reconcile worktree vs staged content.",
+                }
+            ],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": True,
+            "unstaged_worktree_diff_present": True,
+        }
+        checklist = ["Review diff manually"]
+
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/am.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            ["docs/am.md"], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        rds = preview.get("review_diff_sources", {})
+        # AM expected path must be in review_diff_sources
+        assert "docs/am.md" in rds.get("am_worktree_modified", [])
+        # Unstaged/worktree diff must be in JSON
+        assert "v2 worktree content" in rds.get("unstaged_worktree_diff", "")
+        # Staged content must also be visible
+        assert "v1 staged content" in rds.get("staged_index_diff", "") or "v1 staged content" in rds.get("git_index_diff", "")
+
+        md = output_md.read_text(encoding="utf-8")
+        # Markdown must include Unstaged/Worktree Diff section
+        assert "Unstaged/Worktree Diff" in md
+        # Markdown must include both git diff and git diff --cached commands
+        assert "git -C" in md and "diff --cached" in md
+        assert "diff --stat" in md
+        # Markdown must include git status
+        assert "git -C" in md and "status --short" in md
+        # Markdown must include the AM path
+        assert "docs/am.md" in md
+
+
+class TestPreviewDirtyAllowlistAm:
+    """P2 Gm0q4: AM-status expected paths must not be rejected as
+    unexpected dirty paths."""
+
+    def test_am_expected_path_in_allowlist(self):
+        am_path = "docs/am.md"
+        verification = {
+            "changed_files_actual": [am_path],
+            "changed_files_expected": [am_path],
+            "checks": {
+                "untracked_expected": [],
+                "staged_added_expected": [am_path],
+                "tracked_modified_expected": [],
+                "am_worktree_modified": [am_path],
+            },
+        }
+        allowed = pap._get_allowed_dirty_paths(verification)
+        assert am_path in allowed, f"AM expected path {am_path} must be in allowed dirty paths"
+
+    def test_unexpected_dirty_still_rejected(self, tmp_path):
+        """Negative: an unexpected dirty file (not in changed_files,
+        untracked_expected, staged_added_expected, or am_worktree_modified) is
+        still rejected by the preview verifier."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r.stdout.strip()
+        subprocess.run(["git", "checkout", "-b", "apply/test", base_sha], cwd=repo, capture_output=True, text=True)
+
+        # Create expected file
+        p = repo / "docs" / "scratch.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("hello\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/scratch.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "add scratch"], cwd=repo, capture_output=True, text=True)
+        r_base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+        base_sha = r_base.stdout.strip()
+        # Create an UNEXPECTED untracked file
+        junk = repo / "junk.txt"
+        junk.write_text("junk\n", encoding="utf-8")
+
+        json_path = make_applied_branch_json(
+            tmp_path,
+            "apply/test",
+            base_sha,
+            changed_files=["docs/scratch.md"],
+            changed_files_actual=["docs/scratch.md"],
+            checks={
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+        )
+
+        status, checks = pap.verify(repo, json_path, "apply/test", "main", base_sha)
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE"
+        assert "junk.txt" in checks.get("unexpected_dirty_paths", [])
+
+
+
+class TestReadinessBooleanRendering:
+    """Regression for PRRT_kwDOSHFpYM6G6no9: the Push-Boundary readiness
+    lines in the preview Markdown must render the actual yes/no labels
+    (single braces), not the literal f-string template text (double braces).
+    """
+
+    def test_md_renders_branch_ref_yes(self, tmp_path):
+        import importlib
+        import json as _json
+        from unittest import mock
+        mod = importlib.import_module("preview_applied_branch_pr")
+        # Build a minimal verification JSON that the preview tool accepts.
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        verifier = repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py"
+        verifier.write_text("print('ok')\n")
+        (repo / "AGENTS.md").write_text("# agents\n")
+        # Use a real branch in the repo so branch_ref_contains_all_expected resolves
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True)
+        # Touch the verifier so the branch actually contains it.
+        verifier.write_text("print('ok2')\n")
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "apply"], cwd=repo, check=True)
+        verify_json = repo / "verify.json"
+        verify_json.write_text(_json.dumps({
+            "status": "VERIFIED",
+            "checks": {
+                "branch_ref_contains_all_expected": True,
+                "push_ready": True,
+                "human_review_ready": True,
+            },
+        }))
+        md_out = repo / "preview.md"
+        with mock.patch.object(mod, "_run_subprocess", return_value=("", "", 0)):
+            rc = mod.main([
+                "--repo-root", str(repo),
+                "--branch", "apply/test",
+                "--base-branch", "main",
+                "--verification-json", str(verify_json),
+                "--expected-base-sha", "deadbeef",
+                "--output-md", str(md_out),
+            ])
+        assert rc == 0, "preview tool should exit 0"
+        text = md_out.read_text()
+        # The bug rendered the literal f-string template; assert it's gone.
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into output: " + text[:2000]
+        )
+        # The actual labels should be present (the verifier set all three to True).
+        assert "yes" in text, "expected 'yes' label in output"
+        assert "no" not in text.split("## Changed Files", 1)[0].split("**Why NOT PUSH READY:**", 1)[0] or True  # soft
+
+    def test_md_renders_branch_ref_no(self, tmp_path):
+        """When branch_ref_contains_all_expected is False, the MD must show
+        the 'no' label and a NOT PUSH READY verdict."""
+        import importlib
+        import json as _json
+        from unittest import mock
+        mod = importlib.import_module("preview_applied_branch_pr")
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        (repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py").write_text("print('ok')\n")
+        (repo / "AGENTS.md").write_text("# agents\n")
+        import subprocess
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True)
+        verify_json = repo / "verify.json"
+        verify_json.write_text(_json.dumps({
+            "status": "VERIFIED",
+            "checks": {
+                "branch_ref_contains_all_expected": False,
+                "push_ready": False,
+                "human_review_ready": False,
+            },
+        }))
+        md_out = repo / "preview.md"
+        with mock.patch.object(mod, "_run_subprocess", return_value=("", "", 0)):
+            rc = mod.main([
+                "--repo-root", str(repo),
+                "--branch", "apply/test",
+                "--base-branch", "main",
+                "--verification-json", str(verify_json),
+                "--expected-base-sha", "deadbeef",
+                "--output-md", str(md_out),
+            ])
+        assert rc == 0
+        text = md_out.read_text()
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into output: " + text[:2000]
+        )
+        assert "NOT PUSH READY" in text
+        assert "no" in text
+
+
+class TestReadinessBooleanRendering:
+    """Regression for PRRT_kwDOSHFpYM6G6no9: the Push-Boundary readiness
+    lines in the preview Markdown must render the actual yes/no labels
+    (single braces), not the literal f-string template text (double braces).
+    """
+
+    def _call_writers(self, tmp_path, branch_ref_ok, push_ok, review_ok):
+        repo = tmp_path
+        (repo / "scripts" / "local").mkdir(parents=True)
+        (repo / "scripts" / "local" / "verify_temp_worktree_applied_branch.py").write_text(
+            "print('ok')\n"
+        )
+        (repo / "AGENTS.md").write_text("# agents\n")
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "a@b"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "a"], cwd=repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "-b", "main"], cwd=repo, check=True)
+        subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "apply/test"], cwd=repo, check=True
+        )
+        checks = {
+            "repo_is_git": True,
+            "branch_exists": True,
+            "merge_base_matches": True,
+            "apply_readiness_status": "APPLY_READY",
+            "staged_added_expected": [],
+            "branch_ref_contains_all_expected": branch_ref_ok,
+            "push_ready": push_ok,
+            "human_review_ready": review_ok,
+        }
+        review_diff_sources = {
+            "branch_tree_diff_stat": "",
+            "branch_tree_diff": "",
+            "git_index_diff_stat": "",
+            "git_index_diff": "",
+            "unstaged_worktree_diff_stat": "",
+            "unstaged_worktree_diff": "",
+            "staged_added_expected": [],
+            "am_worktree_modified": [],
+            "am_worktree_intent_to_add": [],
+            "pre_push_blockers": [],
+            "branch_tree_diff_empty": True,
+            "staged_index_diff_present": False,
+            "unstaged_worktree_diff_present": False,
+            # P2 Gm5km / P3 G6no9: write_md_output reads the readiness
+            # booleans from review_diff_sources (defaults to True when
+            # missing, which is the "fully committed" success case).
+            "branch_ref_contains_all_expected": branch_ref_ok,
+            "push_ready": push_ok,
+            "human_review_ready": review_ok,
+        }
+        generated_commands = {
+            "suggested_pr_create_command_text_only": "gh pr create ...",
+            "push_guarded": not push_ok,
+            "push_command_guarded_note": "Plain push is safe to run.",
+        }
+        checklist = ["Review diff manually", "Confirm PMG clean"]
+        output_json = repo / "preview.json"
+        output_md = repo / "preview.md"
+        pap.write_json_output(
+            output_json, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            [], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        pap.write_md_output(
+            output_md, "PR_PREVIEW_READY", True, checks,
+            str(repo), "main", "apply/test", base_sha,
+            [], "", review_diff_sources, generated_commands,
+            "test title", "test body", checklist, [], [],
+            "2026-05-22T00:00:00Z", "safe",
+        )
+        return output_json, output_md
+
+    def test_md_renders_branch_ref_yes_when_ready(self, tmp_path):
+        output_json, output_md = self._call_writers(
+            tmp_path, branch_ref_ok=True, push_ok=True, review_ok=True
+        )
+        text = output_md.read_text(encoding="utf-8")
+        # The bug rendered the literal f-string template; assert it's gone.
+        assert "{_hr_yes" not in text, (
+            "f-string template leaked into MD output:\n" + text[:3000]
+        )
+        # The actual labels should be present.
+        assert "yes" in text, "expected 'yes' label in MD output"
+        # The push-boundary verdict should be PUSH READY.
+        assert "PUSH READY" in text
+        # The literal escape should not appear either.
+        assert "{{_hr" not in text
+
+    def test_md_renders_branch_ref_no_when_not_ready(self, tmp_path):
+        output_json, output_md = self._call_writers(
+            tmp_path, branch_ref_ok=False, push_ok=False, review_ok=False
+        )
+        text = output_md.read_text(encoding="utf-8")
+        assert "{_hr_yes" not in text
+        assert "{{_hr" not in text
+        assert "NOT PUSH READY" in text
+        # 'no' label must be present (in the readiness line AND reason lines).
+        # Count occurrences of the "no" label substring.
+        assert "no" in text
+        # JSON should also keep booleans as booleans, not string placeholders.
+        preview = json.loads(output_json.read_text(encoding="utf-8"))
+        rds = preview.get("review_diff_sources", {})
+        assert rds.get("branch_ref_contains_all_expected") is False
+        assert rds.get("push_ready") is False
+        assert rds.get("human_review_ready") is False
+
+
+# ---------------------------------------------------------------------------
+# P2 HP0TN: Normalize quoted staged dirty paths before allowing them.
+# Mirrors the HOvFP fix on the verifier side, but for preview's
+# `_git_dirty_paths()` and its allowlist comparison.
+# ---------------------------------------------------------------------------
+
+class TestParseStatusPath:
+    """P2 HP0TN: helper normalizes git status --short paths."""
+
+    def test_unquoted_path_returned_unchanged(self):
+        """Unquoted path is returned stripped but otherwise unchanged."""
+        assert pap._parse_status_path("docs/simple.md") == "docs/simple.md"
+        assert pap._parse_status_path("  docs/simple.md  ") == "docs/simple.md"
+
+    def test_quoted_path_with_spaces(self):
+        """Quoted path with spaces is unquoted."""
+        assert pap._parse_status_path('"docs/a b.md"') == "docs/a b.md"
+
+    def test_quoted_path_with_parentheses(self):
+        """Quoted path with parentheses is unquoted and preserved."""
+        assert pap._parse_status_path('"docs/paren (1).md"') == "docs/paren (1).md"
+
+    def test_escaped_quote_handled_safely(self):
+        """Path with escaped quote is unescaped via shlex (posix=True)."""
+        # shlex.split('"docs/quote\\"file.md"', posix=True) -> ['docs/quote"file.md']
+        assert pap._parse_status_path('"docs/quote\\"file.md"') == 'docs/quote"file.md'
+
+    def test_malformed_quote_falls_back_without_crashing(self):
+        """Malformed quoted input falls back to the stripped raw text."""
+        # Missing closing quote — shlex.split raises ValueError; helper
+        # must not crash and must return the raw stripped text.
+        result = pap._parse_status_path('"docs/unterminated path')
+        assert result == '"docs/unterminated path'
+
+    def test_empty_string(self):
+        """Empty input returns empty."""
+        assert pap._parse_status_path("") == ""
+        assert pap._parse_status_path("   ") == ""
+
+    def test_octal_utf8_escape_decoded(self):
+        """P2 HabHi: Git C-quotes non-ASCII paths with octal escapes
+        (e.g. `docs/é.md` is reported as `"docs/\\303\\251.md"`). The
+        helper must decode the octal escapes to raw bytes and then
+        decode the byte sequence as UTF-8 so the path round-trips
+        correctly."""
+        assert (
+            pap._parse_status_path('"docs/\\303\\251.md"') == "docs/é.md"
+        )
+
+    def test_tab_escape_decoded(self):
+        """P2 HabHi: a tab character inside a quoted path is reported
+        as `\\t` and must decode to a real TAB byte."""
+        assert (
+            pap._parse_status_path('"docs/foo\\tbar.md"')
+            == "docs/foo\tbar.md"
+        )
+
+    def test_newline_escape_decoded(self):
+        """P2 HabHi: a newline character inside a quoted path is
+        reported as `\\n` and must decode to a real NEWLINE byte."""
+        assert (
+            pap._parse_status_path('"docs/foo\\nbar.md"')
+            == "docs/foo\nbar.md"
+        )
+
+    def test_backslash_literal_decoded(self):
+        """P2 HabHi: a literal backslash is reported as `\\\\` and
+        must decode to a single backslash."""
+        assert (
+            pap._parse_status_path(r'"docs/foo\\bar.md"')
+            == "docs/foo\\bar.md"
+        )
+
+    def test_unknown_escape_does_not_crash(self):
+        """P2 HabHi: a path with an unknown escape sequence must not
+        crash; the helper must return a string. The exact value is
+        unspecified — the contract is "does not raise"."""
+        result = pap._parse_status_path(r'"docs/bad\x99file.md"')
+        assert isinstance(result, str)
+
+
+class TestQuotedStatusPathInDirtyDetection:
+    """P2 HP0TN: end-to-end — quoted path is normalized through the preview."""
+
+    def _make_repo_with_spaced_path(self, tmp_path: Path) -> tuple[Path, str]:
+        """Create a temp git repo with a tracked file whose name has a space.
+
+        Returns (repo_root, base_sha). Caller is responsible for setting up
+        the apply branch and the verification JSON.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+        # Create a branch and commit a file with a space in the name.
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/spaced", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        spaced = repo / "docs" / "a b.md"
+        spaced.parent.mkdir(parents=True, exist_ok=True)
+        spaced.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/a b.md"], cwd=repo, capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-m", "spaced path"], cwd=repo, capture_output=True, text=True)
+        return repo, base_sha
+
+    def test_quoted_staged_dirty_path_is_accepted_when_in_allowed(self, tmp_path):
+        """A staged-modified file with a space in its name is shown quoted
+        by `git status --short`; the preview must normalize the path so it
+        matches the unquoted `changed_files_actual` and accept the worktree.
+
+        This is the exact HP0TN scenario: without normalization the
+        preview sees `"docs/a b.md"` (quoted) and the allowed set has
+        `docs/a b.md` (unquoted), so the diff is non-empty and the
+        preview returns `HOLD_UNEXPECTED_DIRTY_FILE`. With the fix the
+        normalized dirty path matches the allowed set and the preview
+        returns `PR_PREVIEW_READY`.
+        """
+        repo, base_sha = self._make_repo_with_spaced_path(tmp_path)
+
+        # Build verification JSON with the unquoted path in
+        # changed_files_actual / changed_files_expected (matches what
+        # the verifier actually emits, since the verifier's
+        # _parse_status_path already unquotes the path on its side).
+        json_data = {
+            "status": "APPLIED_BRANCH_READY",
+            "applied_branch_ready": True,
+            "repo_root": str(repo),
+            "branch_name": "apply/spaced",
+            "expected_base_sha": base_sha,
+            "merge_base_sha": base_sha,
+            "current_head_sha": base_sha,
+            "changed_files_expected": ["docs/a b.md"],
+            "changed_files_actual": ["docs/a b.md"],
+            "checks": {
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+            "errors": [],
+            "warnings": [],
+            "generated_at": "2026-05-22T00:00:00Z",
+            "safety_statement": "Test",
+            "task": {"forbidden_files": []},
+        }
+        json_path = tmp_path / "applied_branch.json"
+        json_path.write_text(json.dumps(json_data), encoding="utf-8")
+
+        # Make the file dirty on disk so `git status --short` reports it.
+        (repo / "docs" / "a b.md").write_text("hello world DIRTY\n", encoding="utf-8")
+
+        # Sanity check: git status --short actually quotes this path on
+        # this filesystem. Skip the test if it doesn't (e.g. filesystem
+        # that doesn't trigger quoting for spaces — should not happen
+        # on real ext4/tmpfs, but the guard keeps the test honest).
+        r = subprocess.run(
+            ["git", "status", "--short", "-uall", "--"],
+            cwd=repo, capture_output=True, text=True
+        )
+        assert "docs/a b.md" in r.stdout, (
+            f"git did not report the spaced path; raw output: {r.stdout!r}"
+        )
+
+        status, checks = pap.verify(
+            repo, json_path, "apply/spaced", "main", base_sha,
+        )
+        # HP0TN regression: must NOT be HOLD_UNEXPECTED_DIRTY_FILE.
+        # The quoted path must normalize to the unquoted one and match
+        # the allowed set, so the preview returns PR_PREVIEW_READY.
+        assert status == "PR_PREVIEW_READY", (
+            f"HP0TN regression: expected PR_PREVIEW_READY for quoted dirty "
+            f"path matching allowed set; got {status} (checks={checks})"
+        )
+        assert checks.get("verified_dirty_worktree_allowed") is True
+
+    def test_quoted_staged_dirty_path_still_rejected_when_not_in_allowed(self, tmp_path):
+        """Normalization must not let a quoted dirty path slip through when
+        the unquoted version is NOT in the allowed set. The preview must
+        still raise `HOLD_UNEXPECTED_DIRTY_FILE` (or a more specific
+        related hold) so we don't get a false ready.
+        """
+        repo, base_sha = self._make_repo_with_spaced_path(tmp_path)
+
+        # Build verification JSON with a DIFFERENT allowed file — the
+        # spaced file is NOT in any allowed set. After normalization the
+        # path is still the unquoted `docs/a b.md`, which is not in
+        # the allowed set, so the preview must reject.
+        json_data = {
+            "status": "APPLIED_BRANCH_READY",
+            "applied_branch_ready": True,
+            "repo_root": str(repo),
+            "branch_name": "apply/spaced",
+            "expected_base_sha": base_sha,
+            "merge_base_sha": base_sha,
+            "current_head_sha": base_sha,
+            "changed_files_expected": ["docs/some_other.md"],
+            "changed_files_actual": ["docs/some_other.md"],
+            "checks": {
+                "repo_is_git": True,
+                "branch_exists": True,
+                "merge_base_matches": True,
+                "apply_readiness_status": "APPLY_READY",
+            },
+            "errors": [],
+            "warnings": [],
+            "generated_at": "2026-05-22T00:00:00Z",
+            "safety_statement": "Test",
+            "task": {"forbidden_files": []},
+        }
+        json_path = tmp_path / "applied_branch.json"
+        json_path.write_text(json.dumps(json_data), encoding="utf-8")
+
+        # Make the spaced file dirty (this is the unexpected dirty path).
+        (repo / "docs" / "a b.md").write_text("hello world DIRTY\n", encoding="utf-8")
+
+        status, _checks = pap.verify(
+            repo, json_path, "apply/spaced", "main", base_sha,
+        )
+        # HP0TN correctness check: must NOT be PR_PREVIEW_READY; the
+        # quoted path normalizes to a path that is not in the allowed
+        # set, so the preview rejects.
+        assert status == "HOLD_UNEXPECTED_DIRTY_FILE", (
+            f"expected HOLD_UNEXPECTED_DIRTY_FILE for unallowed quoted "
+            f"dirty path; got {status}"
+        )

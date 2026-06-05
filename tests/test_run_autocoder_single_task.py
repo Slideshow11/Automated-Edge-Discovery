@@ -5,6 +5,7 @@ Tests for run_autocoder_single_task.py
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -530,3 +531,245 @@ class TestRepoRootArg:
         # May fail at later stage since docs/test.md may not exist, but
         # not with "not a git repository"
         assert "not a git repository" not in result.get("error", "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Full mock controller regression (P3C-B1 unblocker)
+# ---------------------------------------------------------------------------
+
+class TestFullMockRunReachesReady:
+    """End-to-end mock controller run reaches SINGLE_TASK_READY_FOR_HUMAN_REVIEW.
+
+    This is the regression test for the pre-existing mock controller pipeline
+    blocker: stage 5 (apply_to_branch) treated staged-added files as
+    applied, but stage 6 (verify_temp_worktree_applied_branch) did not. The
+    test runs the full controller CLI with a valid mock task packet and
+    asserts the terminal state is READY (not HOLD_BRANCH_DIFF_MISMATCH).
+    """
+
+    def test_full_mock_run_reaches_ready(self, tmp_path):
+        # Use a unique task_id and a temp output_root / worktree_root outside
+        # the repo to avoid collisions with concurrent runs and to keep the
+        # AED worktree clean.
+        import uuid as _uuid
+        task_id = f"full-mock-{_uuid.uuid4().hex[:8]}"
+        output_root = tmp_path / "aed_runs" / task_id
+        worktree_root = tmp_path / "wt" / task_id
+        repo_under_test = tmp_path / "repo_under_test"
+        temp_hermes_home = tmp_path / ".hermes"
+        temp_hermes_home.mkdir()
+        # P2 GmCjg: temp HERMES_HOME is passed to the subprocess so the test
+        # does not depend on or mutate the real developer's ~/.hermes.
+        assert temp_hermes_home != Path.home() / ".hermes"
+        controller_env = {
+            **os.environ,
+            "HERMES_HOME": str(temp_hermes_home),
+        }
+        # P2 GmCjg: explicit assertions so a reviewer (or Codex) can see at a
+        # glance that the env is wired correctly and is not the real home.
+        assert "HERMES_HOME" in controller_env
+        assert controller_env["HERMES_HOME"] == str(temp_hermes_home)
+        assert Path(controller_env["HERMES_HOME"]) != Path.home() / ".hermes"
+        branch_name = f"autocoder-full-mock-{task_id}"
+        setup_result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add", "--detach", str(repo_under_test), "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert setup_result.returncode == 0, setup_result.stderr
+        controller_source_paths = [
+            Path("scripts/local/preview_applied_branch_pr.py"),
+            Path("scripts/local/verify_temp_worktree_applied_branch.py"),
+        ]
+        for rel_path in controller_source_paths:
+            target = repo_under_test / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / rel_path, target)
+        source_status_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "status", "--porcelain", "--"]
+            + [str(p) for p in controller_source_paths],
+            capture_output=True,
+            text=True,
+        )
+        if source_status_result.stdout.strip():
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.email", "test@test.test"],
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.name", "Test"],
+                capture_output=True,
+                text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "add", "--"]
+                + [str(p) for p in controller_source_paths],
+                capture_output=True,
+                text=True,
+            )
+            commit_sources_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "commit", "-m", "test controller script sources"],
+                capture_output=True,
+                text=True,
+            )
+            assert commit_sources_result.returncode == 0, commit_sources_result.stderr
+        base_branch_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "rev-parse", "--verify", "refs/heads/main"],
+            capture_output=True,
+            text=True,
+        )
+        if base_branch_result.returncode != 0:
+            create_base_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "branch", "main", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            assert create_base_result.returncode == 0, create_base_result.stderr
+        original_branch_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        original_branch = original_branch_result.stdout.strip()
+        original_head_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+        )
+        original_head = original_head_result.stdout.strip()
+        # The mock edit must target a path under the actual AED repo because
+        # the controller's apply_to_branch expects the change to land in the
+        # repo's working tree. Pick a path under scripts/local/ which is
+        # already in the allowed_files glob of the task packet.
+        mock_path = f"scripts/local/_full_mock_{task_id}.py"
+        packet = make_packet(
+            task_id=task_id,
+            allowed_files=[
+                "scripts/local/*.py",
+                mock_path,
+            ],
+            forbidden_files=[".github/**", "*.json", "*.md", "bin/", "examples/"],
+            max_changed_files=3,
+            required_tests=None,
+            output_root=str(output_root),
+            worktree_root=str(worktree_root),
+            branch_name=branch_name,
+            suggested_pr_title=f"tooling: full mock regression {task_id}",
+            suggested_pr_body="P3C-B1 unblocker regression test.",
+            execution_mode="mocked",
+            mock_edits=[{"path": mock_path, "content": f"# full mock {task_id}\n"}],
+        )
+
+        # Write packet
+        pkt_path = tmp_path / "packet.json"
+        with open(pkt_path, "w") as f:
+            json.dump(packet, f)
+
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        script_path = repo_under_test / "scripts" / "local" / "run_autocoder_single_task.py"
+
+        def cleanup_mock_run(*, remove_repo: bool = False) -> None:
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "reset", "HEAD", "--", mock_path],
+                capture_output=True,
+                text=True,
+            )
+            mock_full = repo_under_test / mock_path
+            if mock_full.exists():
+                mock_full.unlink()
+            current_branch_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True,
+                text=True,
+            )
+            if (
+                current_branch_result.stdout.strip() == branch_name
+                and original_branch
+                and original_branch != branch_name
+            ):
+                if original_branch == "HEAD":
+                    subprocess.run(
+                        ["git", "-C", str(repo_under_test), "switch", "--detach", original_head],
+                        capture_output=True,
+                        text=True,
+                    )
+                else:
+                    subprocess.run(
+                        ["git", "-C", str(repo_under_test), "switch", original_branch],
+                        capture_output=True,
+                        text=True,
+                    )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "branch", "-D", branch_name],
+                capture_output=True,
+                text=True,
+            )
+            # Also clean any temp worktree the controller may have created
+            if worktree_root.exists():
+                subprocess.run(
+                    ["git", "-C", str(repo_under_test), "worktree", "remove",
+                     "--force", str(worktree_root)],
+                    capture_output=True, text=True,
+                )
+            if remove_repo and repo_under_test.exists():
+                subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                     "--force", str(repo_under_test)],
+                    capture_output=True, text=True,
+                )
+
+        # Pre-clean any leftover branch from a prior failed run.
+        cleanup_mock_run()
+
+        try:
+            argv = [
+                "python3", str(script_path),
+                "--task-packet-json", str(pkt_path),
+                "--output-json", str(out_json),
+                "--output-md", str(out_md),
+                "--repo-root", str(repo_under_test),
+            ]
+            result = subprocess.run(
+                argv,
+                cwd=str(repo_under_test),
+                env=controller_env,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+
+            assert out_json.exists(), (
+                f"controller produced no output JSON; rc={result.returncode}; "
+                f"stderr={result.stderr[:300]}"
+            )
+            cs = json.loads(out_json.read_text())
+            # Pre-fix this was HOLD_APPLIED_BRANCH_NOT_READY / HOLD_BRANCH_DIFF_MISMATCH.
+            # Post-fix it should be SINGLE_TASK_READY_FOR_HUMAN_REVIEW.
+            assert cs.get("status") == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW", (
+                f"expected SINGLE_TASK_READY_FOR_HUMAN_REVIEW, got "
+                f"{cs.get('status')!r}; stage={cs.get('stage')!r}; "
+                f"actual={cs.get('actual')!r}; expected={cs.get('expected')!r}"
+            )
+
+            artifacts = cs["artifacts"]
+            apply_to_branch = json.loads(Path(artifacts["apply_to_branch_json"]).read_text(encoding="utf-8"))
+            applied_branch = json.loads(Path(artifacts["applied_branch_verification_json"]).read_text(encoding="utf-8"))
+            pr_preview = json.loads(Path(artifacts["pr_preview_json"]).read_text(encoding="utf-8"))
+            applied_branch_md = Path(artifacts["applied_branch_verification_json"]).with_suffix(".md").read_text(encoding="utf-8")
+            pr_preview_md = Path(artifacts["pr_preview_json"]).with_suffix(".md").read_text(encoding="utf-8")
+
+            assert apply_to_branch["status"] == "APPLY_TO_BRANCH_APPLIED"
+            assert applied_branch["status"] == "APPLIED_BRANCH_READY"
+            assert mock_path in applied_branch["checks"]["staged_added_expected"]
+            assert mock_path in applied_branch["changed_files_actual"]
+            assert mock_path in applied_branch["generated_human_commands"]["git_index_diff"]
+            assert mock_path in pr_preview["review_diff_sources"]["git_index_diff"]
+            assert "git -C" in applied_branch_md and "diff --cached" in applied_branch_md
+            assert "Staged/Index Diff" in pr_preview_md
+            assert mock_path in pr_preview_md
+            assert applied_branch["checks"].get("missing_files_from_branch", []) == []
+        finally:
+            cleanup_mock_run(remove_repo=True)
