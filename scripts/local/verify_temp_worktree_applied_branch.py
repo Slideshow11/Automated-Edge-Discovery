@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -109,6 +110,42 @@ def _check_duplicate_paths(paths: list[str]) -> list[str] | None:
             dups.append(p)
         seen.add(p)
     return dups if dups else None
+
+
+def _parse_status_path(raw: str) -> str:
+    """Strip one layer of git-style surrounding quotes from a status line path.
+
+    `git status --short` quotes paths containing spaces or other special
+    characters using C-style backslash-escaped double quotes (e.g.
+    `A  "docs/a b.md"`). This helper returns the unquoted text so that
+    downstream comparison against the unquoted `expected_set` works
+    correctly. P2 HOvFP: without this, the staged-added bucket is empty
+    for quoted paths and the verifier falls through to
+    `HOLD_BRANCH_DIFF_MISMATCH` even though the expected file is staged.
+
+    Unquoted input is returned unchanged (after stripping whitespace).
+    Malformed quoted input falls back to the stripped raw text — the
+    verifier must not crash on unusual filenames.
+    """
+    s = raw.strip()
+    if not s:
+        return s
+    if not (len(s) >= 2 and s.startswith('"') and s.endswith('"')):
+        # Unquoted path: just trim. shlex.split would tokenize on
+        # whitespace which is wrong for paths that legitimately have
+        # no surrounding quotes.
+        return s
+    # Quoted path: use shlex to handle C-style escapes and embedded
+    # spaces, parentheses, and other safe characters. shlex.split raises
+    # ValueError on truly malformed input; fall back to the raw text
+    # rather than crash the verifier.
+    try:
+        parts = shlex.split(s, posix=True)
+    except ValueError:
+        return s
+    if not parts:
+        return s
+    return " ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +347,7 @@ def verify(
     untracked_files = []
     if r_status.returncode == 0:
         untracked_files = [
-            line[3:].strip()  # strip "?? " prefix
+            _parse_status_path(line[3:])  # strip "?? " prefix; unquote if git emitted a quoted path
             for line in r_status.stdout.strip().splitlines()
             if line.startswith("?? ")
         ]
@@ -353,7 +390,10 @@ def verify(
             stage = parts[0]
             is_modified = len(stage) >= 1 and stage[0] == "M" and stage != "??"
             if is_modified:
-                path = parts[1].strip()
+                # P2 HOvFP: git status --short quotes paths with spaces
+                # or other special characters; unquote via
+                # _parse_status_path so the expected_set lookup works.
+                path = _parse_status_path(parts[1])
                 if path:
                     tracked_modified.append(path)
 
@@ -414,7 +454,14 @@ def verify(
             if sep != " ":
                 # Malformed or rename arrow — skip conservatively
                 continue
-            path = line[3:].strip()
+            # P2 HOvFP: git status --short quotes paths with spaces or
+            # other special characters (e.g. `A  "docs/a b.md"`). Strip
+            # the surrounding C-style double quotes via _parse_status_path
+            # before comparing against the unquoted expected_set;
+            # otherwise the staged-added bucket ends up empty for those
+            # paths and the verifier falls through to
+            # HOLD_BRANCH_DIFF_MISMATCH.
+            path = _parse_status_path(line[3:])
             if not path:
                 continue
             # First column == "A" means staged add. Worktree-column (second
@@ -455,7 +502,11 @@ def verify(
             sep = line[2]
             if sep != " ":
                 continue
-            path = line[3:].strip()
+            # P2 HOvFP: same as the staged-added parser above — git
+            # status --short quotes paths with spaces or other special
+            # characters; unquote via _parse_status_path so the
+            # expected_set lookup works for AM-status files.
+            path = _parse_status_path(line[3:])
             if not path:
                 continue
             if x_status == "A" and y_status == "M":

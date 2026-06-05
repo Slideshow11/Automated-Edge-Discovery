@@ -2419,3 +2419,451 @@ class TestStagedAdditionsDiffVisibility:
         # does write it to the JSON output. For unit-level we just check that
         # the verifier returned staged_added_expected.
         assert new_path in (checks.get("staged_added_expected") or [])
+
+
+class TestParseQuotedStatusPath:
+    """P2 HOvFP: paths git quotes in `status --short` must be unquoted
+    before being compared against the unquoted expected_set.
+
+    git emits paths with surrounding C-style double quotes when the
+    filename contains spaces, parentheses, or other characters that
+    need escaping (e.g. `A  "docs/a b.md"`). Without unquoting, the
+    staged-added bucket ends up empty for those paths and the verifier
+    falls through to HOLD_BRANCH_DIFF_MISMATCH even though the file
+    is staged.
+    """
+
+    def test_unquoted_path_returned_as_is(self):
+        """Plain unquoted paths come back unchanged (modulo whitespace)."""
+        assert vtab._parse_status_path("docs/simple.md") == "docs/simple.md"
+        assert vtab._parse_status_path("  docs/simple.md  ") == "docs/simple.md"
+        assert vtab._parse_status_path("") == ""
+
+    def test_quoted_path_with_space_unquoted(self):
+        """A path with a space in it comes back unquoted."""
+        assert (
+            vtab._parse_status_path('"docs/a b.md"') == "docs/a b.md"
+        )
+
+    def test_quoted_path_with_parens_and_space_unquoted(self):
+        """A path with parentheses and a space comes back unquoted."""
+        assert (
+            vtab._parse_status_path('"docs/paren (1).md"') == "docs/paren (1).md"
+        )
+
+    def test_quoted_path_with_embedded_quote_unquoted(self):
+        """A path containing a literal double quote comes back with the
+        literal quote (git escapes the embedded quote with backslash)."""
+        assert (
+            vtab._parse_status_path(r'"docs/quote\"file.md"') == 'docs/quote"file.md'
+        )
+
+    def test_malformed_quote_falls_back_without_crashing(self):
+        """A path that starts with `"` but is not properly closed must
+        fall back to the raw stripped text — the verifier must not
+        crash on unusual filenames."""
+        # Missing closing quote — not actually quoted, so passes through.
+        assert (
+            vtab._parse_status_path('"unterminated') == '"unterminated'
+        )
+        # Closing quote without opening — passes through unchanged.
+        assert (
+            vtab._parse_status_path('weird"path') == 'weird"path'
+        )
+        # Path that looks quoted but has a valueError-inducing internal
+        # structure — must not raise. The input below is a balanced
+        # opening + an embedded raw newline that shlex cannot parse;
+        # we verify that the helper returns *something* (the raw text)
+        # rather than raising.
+        result = vtab._parse_status_path('"bad\nvalue"')
+        # Exact value is unspecified (could be raw text); the contract
+        # is "does not raise, returns a string".
+        assert isinstance(result, str)
+
+    def test_staged_added_with_space_in_path_recognized(self, tmp_path):
+        """Integration-style: a staged-added file whose path contains
+        a space must land in staged_added_expected and produce
+        APPLIED_BRANCH_READY, not HOLD_BRANCH_DIFF_MISMATCH.
+
+        This reproduces the exact HOvFP failure mode: pre-fix, git
+        quotes the path as `A  "docs/a b.md"`, the old parser kept the
+        quotes, the expected_set lookup failed, and the verifier
+        returned HOLD_BRANCH_DIFF_MISMATCH.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        # Track a marker so the new file lands inside a tracked path.
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+
+        # Create the expected file with a SPACE in the path and stage it.
+        # git status --short will emit `A  "docs/a b.md"` (quoted).
+        quoted_path = "docs/a b.md"
+        p = repo / "docs" / "a b.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "docs/a b.md"],
+            cwd=repo, capture_output=True, text=True
+        )
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", (
+            f"expected APPLIED_BRANCH_READY for staged-added file with "
+            f"space in path, got {status!r}; checks={checks}"
+        )
+        assert quoted_path in (checks.get("staged_added_expected") or []), (
+            f"expected {quoted_path!r} in staged_added_expected, "
+            f"got {checks.get('staged_added_expected')!r}"
+        )
+        assert quoted_path not in (checks.get("staged_added_unexpected") or [])
+        assert checks.get("no_unexpected_staged_added") is True
+        assert checks.get("branch_diff_matches_expected") is True
+
+    def test_staged_added_with_parens_in_path_recognized(self, tmp_path):
+        """Same as above but with parentheses in the path, which is
+        another case where git quotes the path."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+
+        quoted_path = "docs/paren (1).md"
+        p = repo / "docs" / "paren (1).md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "docs/paren (1).md"],
+            cwd=repo, capture_output=True, text=True
+        )
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", (
+            f"expected APPLIED_BRANCH_READY for staged-added file with "
+            f"parens in path, got {status!r}"
+        )
+        assert quoted_path in (checks.get("staged_added_expected") or [])
+
+    def test_untracked_expected_with_space_in_path_recognized(self, tmp_path):
+        """P2 HOvFP — untracked bucket: an untracked file whose path
+        contains a space must land in untracked_expected and produce
+        APPLIED_BRANCH_READY. Pre-fix, git emits `?? "docs/a b.md"`,
+        the parser kept the quotes, the expected_set lookup failed,
+        and the file was misclassified as unexpected untracked.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        # Track a marker so the new file lands inside a tracked path.
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+
+        # Untracked file with a SPACE in the path. git status --short
+        # will emit `?? "docs/a b.md"` (quoted).
+        quoted_path = "docs/a b.md"
+        p = repo / "docs" / "a b.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        # Do NOT git add — file stays untracked.
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", (
+            f"expected APPLIED_BRANCH_READY for unquoted-path untracked "
+            f"file, got {status!r}; checks={checks}"
+        )
+        assert quoted_path in (checks.get("untracked_expected") or []), (
+            f"expected {quoted_path!r} in untracked_expected, "
+            f"got {checks.get('untracked_expected')!r}"
+        )
+        assert quoted_path not in (checks.get("untracked_unexpected") or [])
+
+    def test_untracked_expected_with_parens_in_path_recognized(self, tmp_path):
+        """P2 HOvFP — untracked bucket with parens in the path."""
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+
+        quoted_path = "docs/paren (1).md"
+        p = repo / "docs" / "paren (1).md"
+        p.write_text("hello world\n", encoding="utf-8")
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", (
+            f"expected APPLIED_BRANCH_READY for parens-path untracked, "
+            f"got {status!r}"
+        )
+        assert quoted_path in (checks.get("untracked_expected") or [])
+
+    def test_tracked_modified_expected_with_space_in_path_recognized(self, tmp_path):
+        """P2 HOvFP — tracked-modified bucket: a tracked file whose path
+        contains a space and which has been modified in the worktree
+        must land in tracked_modified_expected and produce
+        APPLIED_BRANCH_READY.
+
+        Setup: commit a file with a space in the path on the base
+        branch, then create the apply branch and modify the file in
+        the worktree (no commit). Pre-fix, the parser kept the quotes
+        from ` M "docs/a b.md"` and the expected_set lookup failed.
+        """
+        repo = make_temp_git_repo()
+        docs_dir = repo / "docs"
+        docs_dir.mkdir(exist_ok=True)
+        # Commit a tracked file with a SPACE in the path on main.
+        quoted_path = "docs/a b.md"
+        tracked = repo / "docs" / "a b.md"
+        tracked.write_text("original\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "docs/a b.md"],
+            cwd=repo, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "add tracked"],
+            cwd=repo, capture_output=True
+        )
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True
+        )
+        # Simulate git apply: modify the tracked file in the worktree
+        # (not staged) so the status line is ` M "docs/a b.md"`.
+        tracked.write_text("modified by apply\n", encoding="utf-8")
+
+        r = subprocess.run(
+            ["git", "status", "--short", "-uall"],
+            cwd=repo, capture_output=True, text=True
+        )
+        # Sanity: git really does quote the path here.
+        assert ' M "docs/a b.md"' in r.stdout, (
+            f"expected ` M \"docs/a b.md\"` in git status, got {r.stdout!r}"
+        )
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        assert status == "APPLIED_BRANCH_READY", (
+            f"expected APPLIED_BRANCH_READY for tracked-modified file "
+            f"with space in path, got {status!r}; checks={checks}"
+        )
+        assert quoted_path in (checks.get("tracked_modified_expected") or []), (
+            f"expected {quoted_path!r} in tracked_modified_expected, "
+            f"got {checks.get('tracked_modified_expected')!r}"
+        )
+        assert quoted_path not in (
+            checks.get("tracked_modified_unexpected") or []
+        )
+        assert checks.get("no_unexpected_dirty_tracked") is True
+
+    def test_am_status_with_space_in_path_recognized(self, tmp_path):
+        """P2 HOvFP — AM bucket: a stage-added file whose path contains
+        a space and which has been re-touched in the worktree must
+        land in am_worktree_modified and surface the am_worktree_modified
+        pre-push blocker.
+
+        Setup: create a new file with a space in the path, stage it
+        (so X='A'), then re-touch the worktree (so Y='M' → AM).
+        Pre-fix, the parser kept the quotes from
+        `AM "docs/a b.md"` and the expected_set lookup failed.
+        """
+        repo = make_temp_git_repo()
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r.stdout.strip()
+
+        subprocess.run(
+            ["git", "checkout", "-b", "apply/test", base_sha],
+            cwd=repo, capture_output=True, text=True
+        )
+        docs_marker = repo / "docs" / ".gitkeep"
+        docs_marker.parent.mkdir(parents=True, exist_ok=True)
+        docs_marker.write_text("\n", encoding="utf-8")
+        subprocess.run(["git", "add", "docs/.gitkeep"], cwd=repo, capture_output=True)
+        subprocess.run(
+            ["git", "commit", "-m", "add docs dir"],
+            cwd=repo, capture_output=True, text=True
+        )
+        r_base = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo, capture_output=True, text=True
+        )
+        base_sha = r_base.stdout.strip()
+
+        # Stage-add then re-touch the worktree file with a SPACE in path.
+        quoted_path = "docs/a b.md"
+        p = repo / "docs" / "a b.md"
+        p.write_text("hello world\n", encoding="utf-8")
+        subprocess.run(
+            ["git", "add", "docs/a b.md"],
+            cwd=repo, capture_output=True, text=True
+        )
+        p.write_text("hello world v2\n", encoding="utf-8")
+
+        r = subprocess.run(
+            ["git", "status", "--short", "-uall"],
+            cwd=repo, capture_output=True, text=True
+        )
+        # Sanity: git really emits `AM "docs/a b.md"` here.
+        assert 'AM "docs/a b.md"' in r.stdout, (
+            f"expected `AM \"docs/a b.md\"` in git status, got {r.stdout!r}"
+        )
+
+        result_path = make_result_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+        diff_path = make_diff_patch(tmp_path)
+        readiness_path = make_apply_readiness_json(
+            tmp_path, changed_files=[quoted_path]
+        )
+
+        status, checks = vtab.verify(
+            repo, "apply/test", base_sha, result_path, diff_path, readiness_path,
+        )
+
+        # AM file is recognized and has the am bucket populated.
+        assert quoted_path in (checks.get("am_worktree_modified") or []), (
+            f"expected {quoted_path!r} in am_worktree_modified, "
+            f"got {checks.get('am_worktree_modified')!r}"
+        )
+        assert checks.get("has_am_status") is True
+        # The am_worktree_modified pre-push blocker is also surfaced.
+        blockers = checks.get("pre_push_blockers") or []
+        assert any(
+            b.get("kind") == "am_worktree_modified" for b in blockers
+        ), f"expected am_worktree_modified blocker, got: {blockers}"
