@@ -1025,8 +1025,21 @@ class TestExecutionMocked:
 
         out_json = tmp_path / "out.json"
         out_md = tmp_path / "out.md"
-        result = run_batch_via_module(batch, out_json, out_md,
-                                      monkeypatch_runner=fake_run)
+        # The batch controller (scripts/local/run_autocoder_batch.py) captures
+        # the real subprocess.run reference at import time as
+        # `_real_subprocess_run` and uses it for its own subprocess calls,
+        # deliberately bypassing any test-time `subprocess.run` monkey-patch.
+        # Override `_real_subprocess_run` directly so the test exercises the
+        # subprocess-failure path deterministically regardless of the host
+        # environment.
+        import scripts.local.run_autocoder_batch as batch_module
+        original_real_run = batch_module._real_subprocess_run
+        batch_module._real_subprocess_run = fake_run
+        try:
+            result = run_batch_via_module(batch, out_json, out_md,
+                                          monkeypatch_runner=fake_run)
+        finally:
+            batch_module._real_subprocess_run = original_real_run
         assert result["status"] in ("HOLD_TASK_FAILED", "HOLD_SINGLE_TASK_SUBPROCESS_FAILED")
         assert result.get("failed_task_id") == "task-001"
 
