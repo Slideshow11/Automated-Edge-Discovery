@@ -1476,6 +1476,47 @@ class TestParseStatusPath:
         assert pap._parse_status_path("") == ""
         assert pap._parse_status_path("   ") == ""
 
+    def test_octal_utf8_escape_decoded(self):
+        """P2 HabHi: Git C-quotes non-ASCII paths with octal escapes
+        (e.g. `docs/é.md` is reported as `"docs/\\303\\251.md"`). The
+        helper must decode the octal escapes to raw bytes and then
+        decode the byte sequence as UTF-8 so the path round-trips
+        correctly."""
+        assert (
+            pap._parse_status_path('"docs/\\303\\251.md"') == "docs/é.md"
+        )
+
+    def test_tab_escape_decoded(self):
+        """P2 HabHi: a tab character inside a quoted path is reported
+        as `\\t` and must decode to a real TAB byte."""
+        assert (
+            pap._parse_status_path('"docs/foo\\tbar.md"')
+            == "docs/foo\tbar.md"
+        )
+
+    def test_newline_escape_decoded(self):
+        """P2 HabHi: a newline character inside a quoted path is
+        reported as `\\n` and must decode to a real NEWLINE byte."""
+        assert (
+            pap._parse_status_path('"docs/foo\\nbar.md"')
+            == "docs/foo\nbar.md"
+        )
+
+    def test_backslash_literal_decoded(self):
+        """P2 HabHi: a literal backslash is reported as `\\\\` and
+        must decode to a single backslash."""
+        assert (
+            pap._parse_status_path(r'"docs/foo\\bar.md"')
+            == "docs/foo\\bar.md"
+        )
+
+    def test_unknown_escape_does_not_crash(self):
+        """P2 HabHi: a path with an unknown escape sequence must not
+        crash; the helper must return a string. The exact value is
+        unspecified — the contract is "does not raise"."""
+        result = pap._parse_status_path(r'"docs/bad\x99file.md"')
+        assert isinstance(result, str)
+
 
 class TestQuotedStatusPathInDirtyDetection:
     """P2 HP0TN: end-to-end — quoted path is normalized through the preview."""

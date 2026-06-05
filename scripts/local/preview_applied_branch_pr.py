@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -124,6 +123,15 @@ def _parse_status_path(raw: str) -> str:
     form (`docs/a b.md`); the difference triggers `HOLD_UNEXPECTED_DIRTY_FILE`
     even though the file is the verifier-accepted staged-added path.
 
+    P2 HabHi: Git C-style quoting also encodes non-ASCII bytes as octal
+    escapes (e.g. `docs/é.md` is reported as `"docs/\\303\\251.md"` and
+    tabs/newlines are escaped similarly). Plain shell-style unquote leaves
+    the octal escapes intact, so the path no longer matches the unescaped
+    allowlist and the preview would wrongly flag the dirty path as
+    unexpected. This helper now decodes octal escapes to raw bytes and
+    then decodes the byte sequence as UTF-8 (with
+    `errors="surrogateescape"`) so non-ASCII paths round-trip correctly.
+
     Unquoted input is returned unchanged (after stripping whitespace).
     Malformed quoted input falls back to the stripped raw text — the
     preview must not crash on unusual filenames.
@@ -132,21 +140,56 @@ def _parse_status_path(raw: str) -> str:
     if not s:
         return s
     if not (len(s) >= 2 and s.startswith('"') and s.endswith('"')):
-        # Unquoted path: just trim. shlex.split would tokenize on
-        # whitespace which is wrong for paths that legitimately have
-        # no surrounding quotes.
+        # Unquoted path: just trim. Without the surrounding quotes the
+        # path is taken verbatim (modulo outer whitespace).
         return s
-    # Quoted path: use shlex to handle C-style escapes and embedded
-    # spaces, parentheses, and other safe characters. shlex.split raises
-    # ValueError on truly malformed input; fall back to the raw text
-    # rather than crash the preview.
+    # Quoted path: decode the inner contents using Git's C-style quoting
+    # rules. Octal escapes (`\NNN`, 1–3 octal digits) are raw bytes; the
+    # resulting byte sequence is decoded as UTF-8. If anything goes wrong
+    # mid-decode, fall back to the raw stripped text rather than crash.
+    inner = s[1:-1]
+    out = bytearray()
+    i = 0
+    _octal_digits = "01234567"
+    _known_escapes = {
+        "n": 0x0A,
+        "t": 0x09,
+        "r": 0x0D,
+        "b": 0x08,
+        "f": 0x0C,
+        "v": 0x0B,
+        "a": 0x07,
+        "\\": 0x5C,
+        '"': 0x22,
+    }
+    while i < len(inner):
+        c = inner[i]
+        if c == "\\" and i + 1 < len(inner):
+            nxt = inner[i + 1]
+            if nxt in _octal_digits:
+                j = i + 1
+                digits = ""
+                while j < len(inner) and len(digits) < 3 and inner[j] in _octal_digits:
+                    digits += inner[j]
+                    j += 1
+                out.append(int(digits, 8))
+                i = j
+                continue
+            if nxt in _known_escapes:
+                out.append(_known_escapes[nxt])
+                i += 2
+                continue
+            # Unknown escape: keep the escaped character as UTF-8 bytes so
+            # the round-trip is lossless for unusual filenames.
+            out.extend(nxt.encode("utf-8", errors="surrogateescape"))
+            i += 2
+            continue
+        out.extend(c.encode("utf-8", errors="surrogateescape"))
+        i += 1
     try:
-        parts = shlex.split(s, posix=True)
-    except ValueError:
+        return out.decode("utf-8", errors="surrogateescape")
+    except Exception:
         return s
-    if not parts:
-        return s
-    return " ".join(parts)
 
 
 def _git_dirty_paths(repo_root: Path) -> set[str]:
