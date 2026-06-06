@@ -1054,3 +1054,169 @@ class TestRunSummaryReadyPopulatesChangedFiles:
                      "--force", str(repo_under_test)],
                     capture_output=True, text=True,
                 )
+
+
+# ---------------------------------------------------------------------------
+# controller_mode in _build_run_summary
+# ---------------------------------------------------------------------------
+
+class TestRunSummaryControllerMode:
+    """Tests for the controller_mode field in _build_run_summary."""
+
+    def _import_build(self):
+        import sys
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from run_autocoder_single_task import _build_run_summary
+        return _build_run_summary
+
+    def test_default_controller_mode_is_mocked(self, tmp_path):
+        """Default controller_mode is the literal string "mocked"."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {"status": "READY", "task_id": "t1", "artifacts": {}},
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            None,
+        )
+        assert out["controller_mode"] == "mocked"
+
+    def test_controller_mode_packet_is_ignored(self, tmp_path):
+        """Packet-level controller_mode is NOT trusted.
+
+        v0 task packets accept unknown keys, so a user-supplied packet can
+        claim any controller_mode (e.g. "live") while the actual controller
+        path is mocked. _build_run_summary must ignore the packet's value and
+        fall through to the result/default.
+        """
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {"status": "READY", "task_id": "t1", "artifacts": {}},
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            {"controller_mode": "live"},
+        )
+        assert out["controller_mode"] == "mocked"
+
+    def test_controller_mode_result_overrides_packet(self, tmp_path):
+        """When BOTH packet and result carry controller_mode, the result-side
+        value wins. Packet value is never trusted."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {
+                "status": "READY",
+                "task_id": "t1",
+                "artifacts": {},
+                "controller_mode": "claude",
+            },
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            {"controller_mode": "live"},
+        )
+        assert out["controller_mode"] == "claude"
+
+    def test_controller_mode_falls_back_to_result(self, tmp_path):
+        """If packet has no controller_mode, result.controller_mode is used."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {
+                "status": "READY",
+                "task_id": "t1",
+                "artifacts": {},
+                "controller_mode": "live",
+            },
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            None,
+        )
+        assert out["controller_mode"] == "live"
+
+    def test_controller_mode_distinct_from_execution_mode(self, tmp_path):
+        """controller_mode and execution_mode are independent fields."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {
+                "status": "READY",
+                "task_id": "t1",
+                "execution_mode": "mocked",
+                "artifacts": {},
+            },
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            None,
+        )
+        assert "controller_mode" in out
+        assert "execution_mode" in out
+        assert out["controller_mode"] == "mocked"
+        assert out["execution_mode"] == "mocked"
+
+    def test_final_status_outcome_unchanged(self, tmp_path):
+        """_build_run_summary does NOT write final_status.json or .md; the
+        sidecar run_summary.json is the only file produced."""
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(SCRIPT_DIR))
+        from run_autocoder_single_task import (
+            _build_run_summary, _write_run_summary,
+        )
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        result = {
+            "status": "READY",
+            "task_id": "t1",
+            "execution_mode": "mocked",
+            "artifacts": {},
+        }
+        # _build_run_summary alone must not produce any sidecar IO.
+        _build_run_summary(result, out_json, out_md, None)
+        assert not out_json.exists(), (
+            "_build_run_summary must not write final_status.json"
+        )
+        assert not out_md.exists(), (
+            "_build_run_summary must not write final_status.md"
+        )
+        # _write_run_summary must write the run_summary.json sidecar only,
+        # not the final_status paths.
+        summary_path = _write_run_summary(
+            result=result,
+            output_json_path=out_json,
+            output_md_path=out_md,
+            task_packet=None,
+        )
+        assert summary_path is not None
+        assert summary_path.name == "run_summary.json"
+        assert summary_path.exists()
+        assert not out_json.exists(), (
+            "_write_run_summary must not write final_status.json"
+        )
+        assert not out_md.exists(), (
+            "_write_run_summary must not write final_status.md"
+        )
+        with open(summary_path) as f:
+            summary = json.load(f)
+        assert summary["controller_mode"] == "mocked"
+
+    def test_run_summary_includes_known_keys(self, tmp_path):
+        """Sanity guard: the standard key set is preserved (with
+        controller_mode added)."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {"status": "READY", "task_id": "t1", "artifacts": {}},
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            None,
+        )
+        expected_keys = {
+            "run_summary_version", "controller", "controller_mode",
+            "generated_at", "task_id", "packet_kind", "execution_mode",
+            "status", "stage", "hold_reason", "base_sha", "head_sha",
+            "branch_name", "changed_files", "tests_run", "artifacts",
+            "output_json", "output_md",
+        }
+        missing = expected_keys - set(out.keys())
+        assert not missing, f"missing keys: {sorted(missing)}"
