@@ -227,6 +227,7 @@ def _build_run_summary(
         "task_id": pkt.get("task_id") or res.get("task_id"),
         "packet_kind": pkt.get("packet_kind") or res.get("packet_kind"),
         "execution_mode": pkt.get("execution_mode") or res.get("execution_mode"),
+        "controller_mode": pkt.get("controller_mode") or res.get("controller_mode") or "mocked",
         "status": status,
         "stage": stage,
         "hold_reason": hold_reason,
