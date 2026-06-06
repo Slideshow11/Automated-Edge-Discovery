@@ -118,6 +118,151 @@ def _write_json(path: Path, data: dict) -> None:
     tmp.rename(path)
 
 
+# ---------------------------------------------------------------------------
+# Run summary helper (aed.run_summary.v0)
+# ---------------------------------------------------------------------------
+
+RUN_SUMMARY_VERSION = "aed.run_summary.v0"
+RUN_SUMMARY_CONTROLLER = "run_autocoder_single_task.py"
+
+# Artifact keys that may appear in result["<key>_path"] and should be promoted
+# into the run_summary["artifacts"] map when present.
+_RUN_SUMMARY_ARTIFACT_KEYS = (
+    "execution_packet",
+    "result_json",
+    "diff_patch",
+    "apply_readiness_json",
+    "apply_readiness_md",
+    "apply_preview_json",
+    "apply_preview_md",
+    "apply_to_branch_json",
+    "apply_to_branch_md",
+    "applied_branch_verification_json",
+    "applied_branch_verification_md",
+    "pr_preview_json",
+    "pr_preview_md",
+    "final_review_packet_json",
+    "final_review_packet_md",
+    "pmg_snapshot",
+    "pmg_compare",
+    "pmg_compare_md",
+    "task_packet",
+)
+
+
+def _build_run_summary(
+    result: dict,
+    output_json_path: Path,
+    output_md_path: Optional[Path],
+    task_packet: Optional[dict],
+) -> dict:
+    """Build aed.run_summary.v0 payload from the controller result.
+
+    Pure function — no IO. Tolerates partial / fatal-result dicts.
+    """
+    pkt = task_packet if isinstance(task_packet, dict) else {}
+    res = result if isinstance(result, dict) else {}
+
+    status = res.get("status")
+    stage = res.get("stage")
+    # hold_reason: prefer explicit "error"/"hold_reason" fields, fall back to status
+    hold_reason = (
+        res.get("error")
+        or res.get("hold_reason")
+        or res.get("reason")
+        or status
+    )
+
+    base_sha = pkt.get("base_sha") or res.get("base_sha")
+    branch_name = pkt.get("branch_name") or res.get("branch_name")
+    head_sha = res.get("head_sha") or res.get("current_sha")
+
+    # changed_files: accept common shapes
+    changed_files = (
+        res.get("changed_files")
+        or res.get("changed_files_actual")
+        or res.get("files_changed")
+    )
+    if not isinstance(changed_files, list):
+        changed_files = []
+
+    # tests_run: accept result.tests_run or packet.required_tests
+    tests_run = res.get("tests_run")
+    if not isinstance(tests_run, list):
+        tests_run = pkt.get("required_tests") or []
+    if not isinstance(tests_run, list):
+        tests_run = []
+
+    # artifacts: start with result["artifacts"] if a dict, then promote
+    # "<key>_path" entries from the result.
+    artifacts = res.get("artifacts")
+    if not isinstance(artifacts, dict):
+        artifacts = {}
+    for key in _RUN_SUMMARY_ARTIFACT_KEYS:
+        if key in artifacts:
+            continue
+        path_key = f"{key}_path"
+        if path_key in res and isinstance(res[path_key], (str, Path)):
+            artifacts[key] = str(res[path_key])
+
+    # Promote specific result-side path fields that don't follow the _path
+    # suffix convention.
+    if "execution_packet_path" in res and "execution_packet" not in artifacts:
+        artifacts["execution_packet"] = str(res["execution_packet_path"])
+    if "result_json_path" in res and "result_json" not in artifacts:
+        artifacts["result_json"] = str(res["result_json_path"])
+    if "apply_readiness_json_path" in res and "apply_readiness_json" not in artifacts:
+        artifacts["apply_readiness_json"] = str(res["apply_readiness_json_path"])
+    if "final_review_packet_json" in res and "final_review_packet_json" not in artifacts:
+        artifacts["final_review_packet_json"] = str(res["final_review_packet_json"])
+
+    # Always record the primary controller outputs.
+    artifacts["final_status_json"] = str(output_json_path)
+    artifacts["final_status_md"] = str(output_md_path) if output_md_path is not None else None
+
+    return {
+        "run_summary_version": RUN_SUMMARY_VERSION,
+        "controller": RUN_SUMMARY_CONTROLLER,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "task_id": pkt.get("task_id") or res.get("task_id"),
+        "packet_kind": pkt.get("packet_kind") or res.get("packet_kind"),
+        "execution_mode": pkt.get("execution_mode") or res.get("execution_mode"),
+        "status": status,
+        "stage": stage,
+        "hold_reason": hold_reason,
+        "base_sha": base_sha,
+        "head_sha": head_sha,
+        "branch_name": branch_name,
+        "changed_files": changed_files,
+        "tests_run": tests_run,
+        "artifacts": artifacts,
+        "output_json": str(output_json_path),
+        "output_md": str(output_md_path) if output_md_path is not None else None,
+    }
+
+
+def _write_run_summary(
+    *,
+    result: dict,
+    output_json_path: Path,
+    output_md_path: Optional[Path],
+    task_packet: Optional[dict],
+) -> Optional[Path]:
+    """Best-effort write of run_summary.json beside output_json_path.
+
+    Never raises. Returns the summary path on success, None on failure.
+    A failure here MUST NOT change the controller's final_status.json
+    outcome or exit code.
+    """
+    try:
+        summary = _build_run_summary(result, output_json_path, output_md_path, task_packet)
+        summary_path = output_json_path.with_name("run_summary.json")
+        _write_json(summary_path, summary)
+        return summary_path
+    except Exception:
+        return None
+
+
 def _is_path_forbidden(path: str, forbidden: list[str]) -> bool:
     """
     Return True if path is forbidden by the forbidden list.
@@ -463,6 +608,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=None,
+        )
         return result
 
     # Validate
@@ -476,6 +627,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # Extract fields
@@ -552,6 +709,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -593,6 +756,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -628,6 +797,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -682,6 +857,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -720,6 +901,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -759,6 +946,12 @@ def run_autocoder_single_task(
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
         _write_json(output_json_path, result)
+        _write_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+        )
         return result
 
     # -------------------------------------------------------------------------
@@ -832,6 +1025,49 @@ def run_autocoder_single_task(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_json(output_json_path, result)
+
+    # Build a summary-enriched view of the READY result so that
+    # run_summary.json includes the actual changed file list and the
+    # required_tests. The trimmed final-status result intentionally omits
+    # these fields; consumers of run_summary.json (per Codex P2:
+    # PRRT_kwDOSHFpYM6HhRdr / PRRT_kwDOSHFpYM6HhX2n) need them so successful
+    # patches are not reported as no-op runs. The enrichment is applied
+    # to the summary-input dict only; final_status.json is unchanged.
+    summary_result = dict(result)
+    changed_files_summary: list = []
+    if isinstance(stage6_data, dict):
+        for cf_key in ("changed_files_actual", "changed_files"):
+            cf_val = stage6_data.get(cf_key)
+            if isinstance(cf_val, list):
+                changed_files_summary = cf_val
+                break
+        if not changed_files_summary and isinstance(stage6_data.get("checks"), dict):
+            for cf_key in ("changed_files_actual", "changed_files"):
+                cf_val = stage6_data["checks"].get(cf_key)
+                if isinstance(cf_val, list):
+                    changed_files_summary = cf_val
+                    break
+    if not changed_files_summary:
+        # Fallback: stage 2 result.json (temp worktree execution output)
+        stage2_for_summary = _load_json(result_json_path) or {}
+        for cf_key in ("changed_files_actual", "changed_files"):
+            cf_val = stage2_for_summary.get(cf_key)
+            if isinstance(cf_val, list):
+                changed_files_summary = cf_val
+                break
+    if changed_files_summary:
+        summary_result["changed_files"] = changed_files_summary
+        summary_result["changed_files_actual"] = changed_files_summary
+    tests_run_summary = task_packet.get("required_tests")
+    if isinstance(tests_run_summary, list) and tests_run_summary:
+        summary_result["tests_run"] = tests_run_summary
+
+    _write_run_summary(
+        result=summary_result,
+        output_json_path=output_json_path,
+        output_md_path=output_md_path,
+        task_packet=task_packet,
+    )
 
     # Write markdown summary
     md_summary_lines = [
@@ -923,7 +1159,14 @@ def main() -> int:
                 "error": f"--repo-root is not a git repository: {repo_root_path}",
             }
             output_json_path = Path(args.output_json).resolve()
+            output_md_path = Path(args.output_md).resolve()
             _write_json(output_json_path, err)
+            _write_run_summary(
+                result=err,
+                output_json_path=output_json_path,
+                output_md_path=output_md_path,
+                task_packet=None,
+            )
             print(f"FATAL: --repo-root is not a valid git repository: {repo_root_path}", file=sys.stderr)
             return 1
         global effective_repo_root
@@ -939,6 +1182,12 @@ def main() -> int:
     if not task_packet_path.exists():
         err = {"status": "HOLD_TASK_PACKET_INVALID", "error": f"File not found: {task_packet_path}"}
         _write_json(output_json_path, err)
+        _write_run_summary(
+            result=err,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=None,
+        )
         print(f"FATAL: task packet not found: {task_packet_path}", file=sys.stderr)
         return 1
 
@@ -955,6 +1204,12 @@ def main() -> int:
     except Exception as e:
         err = {"status": State.HOLD_UNKNOWN, "error": str(e)}
         _write_json(output_json_path, err)
+        _write_run_summary(
+            result=err,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=None,
+        )
         print(f"FATAL: {e}", file=sys.stderr)
         return 1
 
