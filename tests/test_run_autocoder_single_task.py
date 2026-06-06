@@ -872,3 +872,185 @@ class TestRunSummaryEmission:
         # Primary output paths are still recorded.
         assert summary["output_json"] == str(output_json)
         assert summary["output_md"] == str(output_md)
+
+
+class TestRunSummaryReadyPopulatesChangedFiles:
+    """Codex P2 (PRRT_kwDOSHFpYM6HhRdr / PRRT_kwDOSHFpYM6HhX2n): the READY
+    run_summary.json must include the actual changed file list. Without
+    the fix, the trimmed final-status result has no changed_files and
+    run_summary.json reports changed_files: [] for successful patches.
+    """
+
+    def test_ready_run_summary_includes_changed_files(self, tmp_path):
+        import uuid as _uuid
+        task_id = f"rsum-cf-{_uuid.uuid4().hex[:8]}"
+        output_root = tmp_path / "aed_runs" / task_id
+        worktree_root = tmp_path / "wt" / task_id
+        repo_under_test = tmp_path / "repo_under_test"
+        temp_hermes_home = tmp_path / ".hermes"
+        temp_hermes_home.mkdir()
+        assert temp_hermes_home != Path.home() / ".hermes"
+        controller_env = {**os.environ, "HERMES_HOME": str(temp_hermes_home)}
+        branch_name = f"autocoder-rsum-cf-{task_id}"
+        setup_result = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "worktree", "add", "--detach",
+             str(repo_under_test), "HEAD"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert setup_result.returncode == 0, setup_result.stderr
+        controller_source_paths = [
+            Path("scripts/local/preview_applied_branch_pr.py"),
+            Path("scripts/local/verify_temp_worktree_applied_branch.py"),
+            # Copy the patched controller itself so the subprocess runs
+            # the b2023f05+ fix that populates run_summary.changed_files.
+            Path("scripts/local/run_autocoder_single_task.py"),
+        ]
+        for rel_path in controller_source_paths:
+            target = repo_under_test / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO_ROOT / rel_path, target)
+        # Commit the source modifications (including the patched controller)
+        # so the controller's main_git_status check stays clean.
+        source_status_result = subprocess.run(
+            ["git", "-C", str(repo_under_test), "status", "--porcelain", "--"]
+            + [str(p) for p in controller_source_paths],
+            capture_output=True,
+            text=True,
+        )
+        if source_status_result.stdout.strip():
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.email", "test@test.test"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "config", "user.name", "Test"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "add", "--"]
+                + [str(p) for p in controller_source_paths],
+                capture_output=True,
+                text=True,
+            )
+            commit_sources_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "commit",
+                 "-m", "test controller script sources (with run_summary changed_files fix)"],
+                capture_output=True,
+                text=True,
+            )
+            assert commit_sources_result.returncode == 0, commit_sources_result.stderr
+        # Pre-cleanup: drop any leftover branch / worktree
+        subprocess.run(
+            ["git", "-C", str(repo_under_test), "branch", "-D", branch_name],
+            capture_output=True, text=True,
+        )
+        mock_path = f"scripts/local/_rsum_cf_{task_id}.py"
+        required_tests = [f"tests/test_runsum_cf_{task_id}.py::test_x"]
+        packet = make_packet(
+            task_id=task_id,
+            allowed_files=["scripts/local/*.py", mock_path],
+            forbidden_files=[".github/**", "*.json", "*.md", "bin/", "examples/"],
+            max_changed_files=3,
+            required_tests=required_tests,
+            output_root=str(output_root),
+            worktree_root=str(worktree_root),
+            branch_name=branch_name,
+            suggested_pr_title=f"tooling: rsum changed_files {task_id}",
+            suggested_pr_body="Verify run_summary.json populates changed_files on READY.",
+            execution_mode="mocked",
+            mock_edits=[{"path": mock_path, "content": f"# rsum changed_files {task_id}\n"}],
+        )
+        pkt_path = tmp_path / "packet.json"
+        with open(pkt_path, "w") as f:
+            json.dump(packet, f)
+        out_json = tmp_path / "out.json"
+        out_md = tmp_path / "out.md"
+        script_path = repo_under_test / "scripts" / "local" / "run_autocoder_single_task.py"
+
+        try:
+            argv = [
+                "python3", str(script_path),
+                "--task-packet-json", str(pkt_path),
+                "--output-json", str(out_json),
+                "--output-md", str(out_md),
+                "--repo-root", str(repo_under_test),
+            ]
+            proc = subprocess.run(
+                argv, cwd=str(repo_under_test), env=controller_env,
+                capture_output=True, text=True, timeout=120,
+            )
+            assert out_json.exists(), (
+                f"controller produced no output JSON; rc={proc.returncode}; "
+                f"stderr={proc.stderr[:300]}"
+            )
+            cs = json.loads(out_json.read_text())
+            assert cs.get("status") == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW", (
+                f"expected READY, got {cs.get('status')!r}; "
+                f"stage={cs.get('stage')!r}; actual={cs.get('actual')!r}"
+            )
+
+            summary_path = out_json.with_name("run_summary.json")
+            assert summary_path.exists(), (
+                f"run_summary.json not found at {summary_path}"
+            )
+            summary = json.loads(summary_path.read_text())
+
+            # Schema fields
+            assert summary["run_summary_version"] == "aed.run_summary.v0"
+            assert summary["controller"] == "run_autocoder_single_task.py"
+            assert summary["status"] == "SINGLE_TASK_READY_FOR_HUMAN_REVIEW"
+            assert summary["task_id"] == task_id
+            # The whole point of the fix:
+            assert summary["changed_files"], (
+                "run_summary.changed_files must be populated for READY; "
+                f"got {summary['changed_files']!r}"
+            )
+            assert mock_path in summary["changed_files"], (
+                f"expected {mock_path!r} in run_summary.changed_files; "
+                f"got {summary['changed_files']!r}"
+            )
+            # Final-status JSON must NOT have grown changed_files
+            # (it stays the trimmed shape per the patch contract).
+            assert "changed_files" not in cs, (
+                "final_status.json must remain the trimmed shape; "
+                f"unexpected changed_files key: {cs.get('changed_files')!r}"
+            )
+            # tests_run is also surfaced when the packet provides it
+            assert summary["tests_run"] == required_tests
+            # The artifact map still records the final_status paths.
+            assert summary["artifacts"]["final_status_json"] == str(out_json)
+            assert summary["artifacts"]["final_status_md"] == str(out_md)
+        finally:
+            # Cleanup: reset mock file, drop branch + worktree
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "reset", "HEAD", "--", mock_path],
+                capture_output=True, text=True,
+            )
+            mock_full = repo_under_test / mock_path
+            if mock_full.exists():
+                mock_full.unlink()
+            current_branch_result = subprocess.run(
+                ["git", "-C", str(repo_under_test), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True,
+            )
+            if current_branch_result.stdout.strip() == branch_name:
+                subprocess.run(
+                    ["git", "-C", str(repo_under_test), "switch", "--detach", "HEAD"],
+                    capture_output=True, text=True,
+                )
+            subprocess.run(
+                ["git", "-C", str(repo_under_test), "branch", "-D", branch_name],
+                capture_output=True, text=True,
+            )
+            if worktree_root.exists():
+                subprocess.run(
+                    ["git", "-C", str(repo_under_test), "worktree", "remove",
+                     "--force", str(worktree_root)],
+                    capture_output=True, text=True,
+                )
+            if repo_under_test.exists():
+                subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "worktree", "remove",
+                     "--force", str(repo_under_test)],
+                    capture_output=True, text=True,
+                )

@@ -1025,8 +1025,45 @@ def run_autocoder_single_task(
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
     _write_json(output_json_path, result)
+
+    # Build a summary-enriched view of the READY result so that
+    # run_summary.json includes the actual changed file list and the
+    # required_tests. The trimmed final-status result intentionally omits
+    # these fields; consumers of run_summary.json (per Codex P2:
+    # PRRT_kwDOSHFpYM6HhRdr / PRRT_kwDOSHFpYM6HhX2n) need them so successful
+    # patches are not reported as no-op runs. The enrichment is applied
+    # to the summary-input dict only; final_status.json is unchanged.
+    summary_result = dict(result)
+    changed_files_summary: list = []
+    if isinstance(stage6_data, dict):
+        for cf_key in ("changed_files_actual", "changed_files"):
+            cf_val = stage6_data.get(cf_key)
+            if isinstance(cf_val, list):
+                changed_files_summary = cf_val
+                break
+        if not changed_files_summary and isinstance(stage6_data.get("checks"), dict):
+            for cf_key in ("changed_files_actual", "changed_files"):
+                cf_val = stage6_data["checks"].get(cf_key)
+                if isinstance(cf_val, list):
+                    changed_files_summary = cf_val
+                    break
+    if not changed_files_summary:
+        # Fallback: stage 2 result.json (temp worktree execution output)
+        stage2_for_summary = _load_json(result_json_path) or {}
+        for cf_key in ("changed_files_actual", "changed_files"):
+            cf_val = stage2_for_summary.get(cf_key)
+            if isinstance(cf_val, list):
+                changed_files_summary = cf_val
+                break
+    if changed_files_summary:
+        summary_result["changed_files"] = changed_files_summary
+        summary_result["changed_files_actual"] = changed_files_summary
+    tests_run_summary = task_packet.get("required_tests")
+    if isinstance(tests_run_summary, list) and tests_run_summary:
+        summary_result["tests_run"] = tests_run_summary
+
     _write_run_summary(
-        result=result,
+        result=summary_result,
         output_json_path=output_json_path,
         output_md_path=output_md_path,
         task_packet=task_packet,
