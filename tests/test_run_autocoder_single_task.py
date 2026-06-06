@@ -1081,17 +1081,41 @@ class TestRunSummaryControllerMode:
         )
         assert out["controller_mode"] == "mocked"
 
-    def test_controller_mode_from_task_packet(self, tmp_path):
-        """Packet-level controller_mode overrides the default."""
+    def test_controller_mode_packet_is_ignored(self, tmp_path):
+        """Packet-level controller_mode is NOT trusted.
+
+        v0 task packets accept unknown keys, so a user-supplied packet can
+        claim any controller_mode (e.g. "live") while the actual controller
+        path is mocked. _build_run_summary must ignore the packet's value and
+        fall through to the result/default.
+        """
         from pathlib import Path
         _build_run_summary = self._import_build()
         out = _build_run_summary(
             {"status": "READY", "task_id": "t1", "artifacts": {}},
             Path(str(tmp_path / "_unused.json")),
             None,
-            {"controller_mode": "real"},
+            {"controller_mode": "live"},
         )
-        assert out["controller_mode"] == "real"
+        assert out["controller_mode"] == "mocked"
+
+    def test_controller_mode_result_overrides_packet(self, tmp_path):
+        """When BOTH packet and result carry controller_mode, the result-side
+        value wins. Packet value is never trusted."""
+        from pathlib import Path
+        _build_run_summary = self._import_build()
+        out = _build_run_summary(
+            {
+                "status": "READY",
+                "task_id": "t1",
+                "artifacts": {},
+                "controller_mode": "claude",
+            },
+            Path(str(tmp_path / "_unused.json")),
+            None,
+            {"controller_mode": "live"},
+        )
+        assert out["controller_mode"] == "claude"
 
     def test_controller_mode_falls_back_to_result(self, tmp_path):
         """If packet has no controller_mode, result.controller_mode is used."""
