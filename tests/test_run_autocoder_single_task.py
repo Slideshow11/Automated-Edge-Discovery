@@ -773,3 +773,102 @@ class TestFullMockRunReachesReady:
             assert applied_branch["checks"].get("missing_files_from_branch", []) == []
         finally:
             cleanup_mock_run(remove_repo=True)
+
+
+# ---------------------------------------------------------------------------
+# run_summary.json emission (aed.run_summary.v0)
+# ---------------------------------------------------------------------------
+
+class TestRunSummaryEmission:
+    """Every controller run must emit a sibling run_summary.json next to
+    final_status.json. The summary is best-effort, additive, and must not
+    change final_status.json behavior, exit codes, or batch behavior.
+    """
+
+    def test_run_summary_emitted_on_hold_path(self, tmp_path):
+        """HOLD_TASK_PACKET_INVALID writes both final_status.json and
+        run_summary.json with the aed.run_summary.v0 schema."""
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        # Use an invalid packet (wrong packet_kind) to deterministically hit
+        # the early HOLD_TASK_PACKET_INVALID return without touching the repo.
+        packet = make_packet(packet_kind="bad")
+        result = run_controller(packet, output_json, output_md)
+
+        # final_status.json was written
+        assert result["status"] == "HOLD_TASK_PACKET_INVALID"
+        assert output_json.exists()
+
+        # run_summary.json was written next to final_status.json
+        summary_path = output_json.with_name("run_summary.json")
+        assert summary_path.exists(), (
+            f"run_summary.json not found at {summary_path}; "
+            f"final_status.json was {output_json}"
+        )
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        # Schema fields
+        assert summary["run_summary_version"] == "aed.run_summary.v0"
+        assert summary["controller"] == "run_autocoder_single_task.py"
+        assert summary["status"] == result["status"]
+        # task_id, packet_kind, execution_mode, base_sha, branch_name come
+        # from the packet where available.
+        assert summary["task_id"] == packet["task_id"]
+        assert summary["packet_kind"] == "bad"  # whatever the packet had
+        assert summary["execution_mode"] == packet["execution_mode"]
+        assert summary["branch_name"] == packet["branch_name"]
+        # HOLD path: hold_reason should be the validation error string.
+        assert isinstance(summary["hold_reason"], str)
+        assert summary["hold_reason"]  # non-empty
+        # Artifacts map always includes the primary controller outputs.
+        assert summary["artifacts"]["final_status_json"] == str(output_json)
+        assert summary["artifacts"]["final_status_md"] == str(output_md)
+        # output_json / output_md mirror the actual paths.
+        assert summary["output_json"] == str(output_json)
+        assert summary["output_md"] == str(output_md)
+        # changed_files and tests_run are lists (possibly empty).
+        assert isinstance(summary["changed_files"], list)
+        assert isinstance(summary["tests_run"], list)
+        # generated_at is populated.
+        assert "generated_at" in summary and summary["generated_at"]
+
+    def test_run_summary_emitted_on_fatal_file_not_found(self, tmp_path):
+        """Main() fatal 'task packet not found' must also write run_summary.json."""
+        # Point --output-json to a temp path; --task-packet-json to a
+        # non-existent file so main() short-circuits to the fatal early
+        # return. The controller's run_controller helper writes the
+        # packet to a temp file, so we drive the controller via subprocess
+        # directly to exercise the not-found branch.
+        output_json = tmp_path / "out.json"
+        output_md = tmp_path / "out.md"
+        missing_packet = tmp_path / "does_not_exist.json"
+        script_path = REPO_ROOT / "scripts" / "local" / "run_autocoder_single_task.py"
+        proc = subprocess.run(
+            [
+                "python3", str(script_path),
+                "--task-packet-json", str(missing_packet),
+                "--output-json", str(output_json),
+                "--output-md", str(output_md),
+            ],
+            cwd=str(REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        # main() returns 1 on fatal; the summary must still be emitted.
+        assert proc.returncode == 1
+        assert output_json.exists()
+        summary_path = output_json.with_name("run_summary.json")
+        assert summary_path.exists(), "run_summary.json must be written on fatal paths"
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        assert summary["run_summary_version"] == "aed.run_summary.v0"
+        assert summary["controller"] == "run_autocoder_single_task.py"
+        assert summary["status"] == "HOLD_TASK_PACKET_INVALID"
+        # No packet was available, so task_id / packet_kind are null.
+        assert summary["task_id"] is None
+        assert summary["packet_kind"] is None
+        # hold_reason falls back to the error string.
+        assert "File not found" in summary["hold_reason"]
+        # Primary output paths are still recorded.
+        assert summary["output_json"] == str(output_json)
+        assert summary["output_md"] == str(output_md)
