@@ -453,6 +453,9 @@ def run_final_gate(
     persistent_guard_snapshot: Optional[str] = None,
     persistent_guard_compare_json: Optional[str] = None,
     persistent_guard_compare_md: Optional[str] = None,
+    phase_ledger_path: Optional[str] = None,
+    claimed_phases: Optional[list[str]] = None,
+    require_phase_ledger: bool = False,
 ) -> dict:
     # Detect repo from git
     repo_result = subprocess.run(
@@ -607,6 +610,66 @@ def run_final_gate(
     # PMG BLOCK overrides MERGE_READY but does not override other BLOCK reasons
     guard_blocked = require_persistent_guard and guard_state["status"] in ("blocked", "error", "not_required")
 
+    # Phase-ledger validation: opt-in via require_phase_ledger. When off, this
+    # is a no-op (preserves existing behavior for callers that do not pass
+    # the new flags).
+    phase_ledger_state: dict = {
+        "required": require_phase_ledger,
+        "ledger_path": str(phase_ledger_path) if phase_ledger_path else None,
+        "claimed_phases": list(claimed_phases) if claimed_phases else [],
+        "claimed_count": len(claimed_phases) if claimed_phases else 0,
+        "hold_state": "not_required",
+        "valid": True,
+        "line_count": 0,
+        "error_count": 0,
+        "warning_count": 0,
+        "errors": [],
+        "warnings": [],
+        "message": "phase ledger not required",
+    }
+    phase_ledger_blocked = False
+    if require_phase_ledger:
+        from validate_phase_ledger import (
+            validate as _validate_phase_ledger,
+            HOLD_VALID as _HOLD_VALID,
+        )
+        _ledger_path = Path(phase_ledger_path) if phase_ledger_path else None
+        _claim_list: Optional[list[str]] = list(claimed_phases) if claimed_phases else None
+        if _ledger_path is None:
+            phase_ledger_state["hold_state"] = "HOLD_UNEVIDENCED_PASS"
+            phase_ledger_state["valid"] = False
+            phase_ledger_state["message"] = (
+                "require-phase-ledger is set but no --phase-ledger path was provided"
+            )
+            phase_ledger_state["errors"].append({
+                "phase_id": "<phase_ledger>",
+                "line": 0,
+                "kind": "LEDGER_PATH_MISSING",
+                "detail": "no --phase-ledger path supplied",
+            })
+            phase_ledger_blocked = True
+        else:
+            _vresult = _validate_phase_ledger(_ledger_path, claimed_phases=_claim_list)
+            phase_ledger_state["hold_state"] = _vresult["hold_state"]
+            phase_ledger_state["valid"] = _vresult["valid"]
+            phase_ledger_state["line_count"] = _vresult["line_count"]
+            phase_ledger_state["error_count"] = len(_vresult["errors"])
+            phase_ledger_state["warning_count"] = len(_vresult["warnings"])
+            phase_ledger_state["errors"] = list(_vresult["errors"])
+            phase_ledger_state["warnings"] = list(_vresult["warnings"])
+            if _vresult["valid"]:
+                phase_ledger_state["message"] = (
+                    f"phase ledger valid ({_vresult['line_count']} lines, "
+                    f"{phase_ledger_state['error_count']} errors)"
+                )
+            else:
+                phase_ledger_state["message"] = (
+                    f"phase ledger invalid: {_vresult['hold_state']} "
+                    f"({phase_ledger_state['error_count']} errors)"
+                )
+                if _vresult["hold_state"] != _HOLD_VALID:
+                    phase_ledger_blocked = True
+
     all_hard_gates_valid = all([
         head_valid, ci_valid, scope_valid, pr_valid, local_valid
     ])
@@ -634,6 +697,17 @@ def run_final_gate(
     # PMG BLOCK overrides MERGE_READY but not other BLOCK reasons
     if recommendation == "MERGE_READY" and guard_blocked:
         recommendation = "BLOCK"
+
+    # Phase-ledger evidence gate: when opt-in is set and validation failed,
+    # override MERGE_READY with the specific HOLD state. Other BLOCK reasons
+    # (head SHA, CI red, etc.) are NOT overridden — phase-ledger only adds
+    # a layer on top of MERGE_READY.
+    if (
+        recommendation == "MERGE_READY"
+        and require_phase_ledger
+        and phase_ledger_blocked
+    ):
+        recommendation = phase_ledger_state["hold_state"]
 
     auth_phrase = None
     merge_cmd = None
@@ -677,6 +751,7 @@ def run_final_gate(
             "message": head_msg,
         },
         "persistent_mutation_guard": guard_state,
+        "phase_ledger": phase_ledger_state,
         "final_recommendation": recommendation,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "allow_admin": allow_admin,
@@ -714,6 +789,12 @@ def run_final_gate(
     if require_persistent_guard:
         md_lines.append(f"- **persistent_mutation_guard:** {'✓' if guard_valid else '✗'} {guard_msg_str}")
         md_lines.append("")
+
+    # Phase-ledger line — always shown (matches persistent_mutation_guard style;
+    # when not required, the state is `not_required` and shows as info)
+    pl_mark = "✓" if phase_ledger_state["valid"] else "✗"
+    md_lines.append(f"- **phase_ledger:** {pl_mark} {phase_ledger_state['message']}")
+    md_lines.append("")
 
     md_lines.extend([
         f"## Final Recommendation",
@@ -813,6 +894,37 @@ def main():
         action="store_true",
         help="Require guard validation — BLOCK if compare JSON is missing, malformed, or recommendation=BLOCK",
     )
+    parser.add_argument(
+        "--phase-ledger",
+        dest="phase_ledger",
+        help=(
+            "Path to phase_ledger.jsonl. When --require-phase-ledger is also "
+            "set, the gate emits HOLD_UNEVIDENCED_PASS (or the more specific "
+            "HOLD_PHASE_EVIDENCE_CORRUPTED / HOLD_PHASE_RESULT_INCONSISTENT) "
+            "if the ledger does not back the claimed phases."
+        ),
+    )
+    parser.add_argument(
+        "--claimed-phases",
+        dest="claimed_phases",
+        help=(
+            "Comma-separated list of phase IDs the workflow claims as PASS. "
+            "Used together with --phase-ledger to validate that each claimed "
+            "phase has a canonical (script|phase_exec) ledger entry."
+        ),
+    )
+    parser.add_argument(
+        "--require-phase-ledger",
+        dest="require_phase_ledger",
+        action="store_true",
+        help=(
+            "Require phase-ledger evidence. Default off. When on, the gate "
+            "overrides MERGE_READY with HOLD_UNEVIDENCED_PASS if the ledger "
+            "does not back the claimed phases. Other BLOCK reasons (head "
+            "SHA, CI red, etc.) are not overridden — phase-ledger only "
+            "adds a layer on top of MERGE_READY."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -836,6 +948,12 @@ def main():
         persistent_guard_snapshot=args.persistent_guard_snapshot,
         persistent_guard_compare_json=args.persistent_guard_compare_json,
         persistent_guard_compare_md=args.persistent_guard_compare_md,
+        phase_ledger_path=args.phase_ledger,
+        claimed_phases=(
+            [p.strip() for p in args.claimed_phases.split(",") if p.strip()]
+            if args.claimed_phases else None
+        ),
+        require_phase_ledger=args.require_phase_ledger,
     )
 
     print(json.dumps(gate, indent=2))

@@ -1,0 +1,761 @@
+#!/usr/bin/env python3
+"""
+Tests for the phase execution ledger writer.
+
+Covers:
+1. Append one valid canonical PASS line (script writer).
+2. Append one FAIL line with nonzero exit_code.
+3. Reject missing run_id.
+4. Reject invalid status value.
+5. Script/phase_exec writer requires argv.
+6. Script/phase_exec writer requires absolute stdout/stderr paths.
+7. Agent writer is valid as narrative but does not satisfy claimed PASS evidence.
+8. Append with task-list linkage fields round-trips.
+9. Reader returns all valid lines and skips malformed ones.
+10. find_entry returns matching (run_id, phase_id).
+11. Duplicate (run_id, phase_id) PASS appends two lines (no silent dedupe).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+import pytest
+
+# Ensure scripts/local is importable
+SCRIPT_DIR = Path(__file__).resolve().parent.parent / "scripts" / "local"
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from phase_ledger import (
+    AUDIT_LOG_VERSION,
+    LEDGER_KIND,
+    VALID_STATUSES,
+    build_entry,
+    append_entry,
+    read_entries,
+    find_entry,
+)
+
+
+# -----------------------------------------------------------------------------
+# 1. Append one valid canonical PASS line (script writer)
+# -----------------------------------------------------------------------------
+
+
+def test_append_pass_phase_writes_valid_jsonl(tmp_path):
+    """A canonical script-writer PASS line is appended and parses as JSON."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    entry = build_entry(
+        run_id="run-001",
+        phase_id="PHASE_2_CONFIRM_CI",
+        phase_index=2,
+        writer="script",
+        script="scripts/local/check_pr_state.py",
+        argv=["--pr-number", "389"],
+        exit_code=0,
+        stdout_path=str(tmp_path / "phase_2_stdout.txt"),
+        stderr_path=str(tmp_path / "phase_2_stderr.txt"),
+        observed_summary="5/5 CI checks passed",
+        status="PASS",
+        timestamp="2026-06-06T17:46:32Z",
+    )
+    append_entry(entry, ledger)
+
+    assert ledger.exists()
+    lines = ledger.read_text().strip().split("\n")
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert obj["audit_log_version"] == AUDIT_LOG_VERSION
+    assert obj["ledger_kind"] == LEDGER_KIND
+    assert obj["run_id"] == "run-001"
+    assert obj["phase_id"] == "PHASE_2_CONFIRM_CI"
+    assert obj["writer"] == "script"
+    assert obj["status"] == "PASS"
+    assert obj["exit_code"] == 0
+
+
+def test_ledger_line_has_required_fields(tmp_path):
+    """All required fields are present in the appended line."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path=str(tmp_path / "out.txt"),
+            stderr_path=str(tmp_path / "err.txt"),
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        ),
+        ledger,
+    )
+    obj = json.loads(ledger.read_text().strip())
+    for required in (
+        "audit_log_version",
+        "ledger_kind",
+        "run_id",
+        "phase_id",
+        "writer",
+        "exit_code",
+        "status",
+        "timestamp",
+    ):
+        assert required in obj, f"missing required field: {required}"
+
+
+# -----------------------------------------------------------------------------
+# 2. Append one FAIL line with nonzero exit_code
+# -----------------------------------------------------------------------------
+
+
+def test_append_fail_phase_with_nonzero_exit(tmp_path):
+    """FAIL with exit_code=1 round-trips intact."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_3",
+            writer="script",
+            argv=["false"],
+            exit_code=1,
+            stdout_path=str(tmp_path / "out.txt"),
+            stderr_path=str(tmp_path / "err.txt"),
+            observed_summary="command failed",
+            status="FAIL",
+            timestamp="2026-06-06T00:00:01Z",
+        ),
+        ledger,
+    )
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["status"] == "FAIL"
+    assert obj["exit_code"] == 1
+
+
+# -----------------------------------------------------------------------------
+# 3. Reject missing run_id
+# -----------------------------------------------------------------------------
+
+
+def test_append_rejects_missing_run_id(tmp_path):
+    """build_entry raises ValueError when run_id is empty/None."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/out",
+            stderr_path="/tmp/err",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+# -----------------------------------------------------------------------------
+# 4. Reject invalid status value
+# -----------------------------------------------------------------------------
+
+
+def test_append_rejects_invalid_status(tmp_path):
+    """build_entry raises ValueError when status is not in VALID_STATUSES."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/out",
+            stderr_path="/tmp/err",
+            observed_summary="ok",
+            status="MAYBE",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+def test_all_valid_statuses_accepted():
+    """PASS, FAIL, HOLD, SKIP are all accepted by build_entry."""
+    for s in ("PASS", "FAIL", "HOLD", "SKIP"):
+        e = build_entry(
+            run_id="r1",
+            phase_id=f"PHASE_{s}",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+            observed_summary="ok",
+            status=s,
+            timestamp="2026-06-06T00:00:00Z",
+        )
+        assert e["status"] == s
+
+
+# -----------------------------------------------------------------------------
+# 5. Script/phase_exec writer requires argv
+# -----------------------------------------------------------------------------
+
+
+def test_writer_script_requires_argv(tmp_path):
+    """build_entry raises ValueError when writer=script and argv is empty/None."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=[],
+            exit_code=0,
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+def test_writer_phase_exec_requires_argv(tmp_path):
+    """build_entry raises ValueError when writer=phase_exec and argv is empty."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="phase_exec",
+            argv=[],
+            exit_code=0,
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+# -----------------------------------------------------------------------------
+# 6. Script/phase_exec writer requires absolute stdout/stderr paths
+# -----------------------------------------------------------------------------
+
+
+def test_writer_script_requires_absolute_stdout_path(tmp_path):
+    """build_entry raises ValueError when stdout_path is not absolute for script writer."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="relative/out.txt",
+            stderr_path="/tmp/err.txt",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+def test_writer_phase_exec_requires_absolute_stderr_path(tmp_path):
+    """build_entry raises ValueError when stderr_path is not absolute for phase_exec."""
+    with pytest.raises(ValueError):
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="phase_exec",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/out.txt",
+            stderr_path="err.txt",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        )
+
+
+# -----------------------------------------------------------------------------
+# 7. Agent writer is valid as narrative but does not satisfy claimed PASS evidence
+# -----------------------------------------------------------------------------
+
+
+def test_writer_agent_accepts_no_argv(tmp_path):
+    """writer=agent with no argv is valid (narrative)."""
+    e = build_entry(
+        run_id="r1",
+        phase_id="PHASE_NA",
+        writer="agent",
+        argv=None,
+        exit_code=0,
+        stdout_path=None,
+        stderr_path=None,
+        observed_summary="phase was not executed; reporting narrative only",
+        status="SKIP",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+    assert e["writer"] == "agent"
+    assert e["status"] == "SKIP"
+
+
+def test_writer_agent_does_not_satisfy_claimed_pass(tmp_path):
+    """An agent-writer PASS line is structurally valid but is_marked_as_canonical_passes() returns False."""
+    from phase_ledger import is_canonical_evidence
+
+    e = build_entry(
+        run_id="r1",
+        phase_id="PHASE_X",
+        writer="agent",
+        argv=None,
+        exit_code=0,
+        stdout_path=None,
+        stderr_path=None,
+        observed_summary="narrative",
+        status="PASS",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+    # Structural validity is fine
+    assert e["status"] == "PASS"
+    # But canonical evidence check fails
+    assert is_canonical_evidence(e) is False
+
+
+def test_writer_script_satisfies_claimed_pass(tmp_path):
+    """A script-writer PASS line with absolute paths IS canonical evidence."""
+    from phase_ledger import is_canonical_evidence
+
+    e = build_entry(
+        run_id="r1",
+        phase_id="PHASE_X",
+        writer="script",
+        argv=["true"],
+        exit_code=0,
+        stdout_path="/tmp/out.txt",
+        stderr_path="/tmp/err.txt",
+        observed_summary="ok",
+        status="PASS",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+    assert is_canonical_evidence(e) is True
+
+
+def test_writer_phase_exec_satisfies_claimed_pass(tmp_path):
+    """A phase_exec-writer PASS line IS canonical evidence."""
+    from phase_ledger import is_canonical_evidence
+
+    e = build_entry(
+        run_id="r1",
+        phase_id="PHASE_X",
+        writer="phase_exec",
+        argv=["true"],
+        exit_code=0,
+        stdout_path="/tmp/out.txt",
+        stderr_path="/tmp/err.txt",
+        observed_summary="ok",
+        status="PASS",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+    assert is_canonical_evidence(e) is True
+
+
+# -----------------------------------------------------------------------------
+# 8. Append with task-list linkage fields round-trips
+# -----------------------------------------------------------------------------
+
+
+def test_task_list_linkage_fields_round_trip(tmp_path):
+    """source_task_id, task_packet_id, roadmap_item_id round-trip through append/read."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/out",
+            stderr_path="/tmp/err",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+            source_task_id="aed.phase-ledger.v0",
+            task_packet_id="phase-ledger-pr1",
+            roadmap_item_id="roadmap-item-7",
+        ),
+        ledger,
+    )
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["source_task_id"] == "aed.phase-ledger.v0"
+    assert obj["task_packet_id"] == "phase-ledger-pr1"
+    assert obj["roadmap_item_id"] == "roadmap-item-7"
+
+
+def test_task_list_linkage_fields_default_to_none(tmp_path):
+    """When optional linkage fields are omitted, they default to None and round-trip as null."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        build_entry(
+            run_id="r1",
+            phase_id="PHASE_1",
+            writer="script",
+            argv=["true"],
+            exit_code=0,
+            stdout_path="/tmp/o",
+            stderr_path="/tmp/e",
+            observed_summary="ok",
+            status="PASS",
+            timestamp="2026-06-06T00:00:00Z",
+        ),
+        ledger,
+    )
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["source_task_id"] is None
+    assert obj["task_packet_id"] is None
+    assert obj["roadmap_item_id"] is None
+
+
+# -----------------------------------------------------------------------------
+# 9. Reader returns all valid lines and skips malformed ones
+# -----------------------------------------------------------------------------
+
+
+def test_read_entries_returns_valid_lines_skips_malformed(tmp_path):
+    """Malformed lines are skipped; valid lines are returned."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    ledger.write_text(
+        json.dumps(
+            build_entry(
+                run_id="r1", phase_id="PHASE_1", writer="script",
+                argv=["true"], exit_code=0,
+                stdout_path="/tmp/o", stderr_path="/tmp/e",
+                observed_summary="ok", status="PASS",
+                timestamp="2026-06-06T00:00:00Z",
+            )
+        )
+        + "\n"
+        + "this is not valid json\n"
+        + json.dumps(
+            build_entry(
+                run_id="r1", phase_id="PHASE_2", writer="script",
+                argv=["true"], exit_code=0,
+                stdout_path="/tmp/o", stderr_path="/tmp/e",
+                observed_summary="ok", status="PASS",
+                timestamp="2026-06-06T00:00:01Z",
+            )
+        )
+        + "\n"
+    )
+    entries = read_entries(ledger)
+    assert len(entries) == 2
+    assert entries[0]["phase_id"] == "PHASE_1"
+    assert entries[1]["phase_id"] == "PHASE_2"
+
+
+# -----------------------------------------------------------------------------
+# 10. find_entry returns matching (run_id, phase_id)
+# -----------------------------------------------------------------------------
+
+
+def test_find_entry_returns_matching(tmp_path):
+    """find_entry returns the entry matching both run_id and phase_id."""
+    entries = [
+        {"run_id": "r1", "phase_id": "PHASE_1", "status": "PASS"},
+        {"run_id": "r1", "phase_id": "PHASE_2", "status": "PASS"},
+        {"run_id": "r2", "phase_id": "PHASE_1", "status": "PASS"},
+    ]
+    e = find_entry(entries, "r1", "PHASE_2")
+    assert e is not None
+    assert e["run_id"] == "r1"
+    assert e["phase_id"] == "PHASE_2"
+
+
+def test_find_entry_returns_none_when_missing():
+    """find_entry returns None when no match exists."""
+    entries = [{"run_id": "r1", "phase_id": "PHASE_1", "status": "PASS"}]
+    assert find_entry(entries, "r9", "PHASE_1") is None
+    assert find_entry(entries, "r1", "PHASE_999") is None
+
+
+# -----------------------------------------------------------------------------
+# 11. Duplicate (run_id, phase_id) PASS appends two lines (no silent dedupe)
+# -----------------------------------------------------------------------------
+
+
+def test_duplicate_phase_appends_two_lines(tmp_path):
+    """Two appends with same (run_id, phase_id) produce two lines; validator is responsible for warning."""
+    ledger = tmp_path / "phase_ledger.jsonl"
+    kwargs = dict(
+        run_id="r1", phase_id="PHASE_1", writer="script",
+        argv=["true"], exit_code=0,
+        stdout_path="/tmp/o", stderr_path="/tmp/e",
+        observed_summary="ok", status="PASS",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+    append_entry(build_entry(**kwargs), ledger)
+    append_entry(build_entry(**kwargs), ledger)
+    lines = ledger.read_text().strip().split("\n")
+    assert len(lines) == 2
+
+
+# -----------------------------------------------------------------------------
+# 12. phase_exec.py integration smoke tests
+# -----------------------------------------------------------------------------
+
+
+def test_phase_exec_writes_canonical_ledger_line(tmp_path):
+    """phase_exec.py runs a command, captures artifacts, appends a canonical ledger line."""
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "phase-exec-smoke",
+            "--phase-id", "PHASE_SMOKE",
+            "--phase-index", "1",
+            "--observed-summary", "echo hello produced 6 bytes",
+            "--source-task-id", "aed.phase-ledger.v0",
+            "--task-packet-id", "phase-ledger-pr1",
+            "--", "echo", "hello",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    assert ledger.exists()
+    lines = ledger.read_text().strip().split("\n")
+    assert len(lines) == 1
+    obj = json.loads(lines[0])
+    assert obj["writer"] == "phase_exec"
+    assert obj["status"] == "PASS"
+    assert obj["exit_code"] == 0
+    assert obj["observed_summary"] == "echo hello produced 6 bytes"
+    assert obj["source_task_id"] == "aed.phase-ledger.v0"
+    assert obj["task_packet_id"] == "phase-ledger-pr1"
+    # Artifact files exist
+    from pathlib import Path as _P
+    assert _P(obj["stdout_path"]).exists()
+    assert _P(obj["stderr_path"]).exists()
+    assert _P(obj["stdout_path"]).read_text().strip() == "hello"
+
+
+def test_phase_exec_propagates_nonzero_exit(tmp_path):
+    """phase_exec.py propagates the wrapped command's nonzero exit code."""
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "phase-exec-fail",
+            "--phase-id", "PHASE_FAIL",
+            "--", "false",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode != 0  # `false` returns 1
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["status"] == "FAIL"
+    assert obj["exit_code"] != 0
+
+
+# -----------------------------------------------------------------------------
+# 13. aed_final_gate.py integration tests
+# -----------------------------------------------------------------------------
+
+
+def _make_minimal_gate_mocks(sha="46f3bf2b4fc490f3991409c33448c678c2f6ea10"):
+    """Build the minimal mocks needed to call run_final_gate() without hitting GitHub."""
+    from unittest.mock import MagicMock
+
+    def fake_subprocess_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        if isinstance(cmd, list):
+            if cmd[0] == "git" and len(cmd) >= 4 and cmd[2] == "get-url" and cmd[3] == "origin":
+                return MagicMock(
+                    stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+                    returncode=0,
+                )
+            if cmd[0] == "gh" and "api" in cmd:
+                return MagicMock(stdout="{}", returncode=0)
+        return MagicMock(stdout="{}", returncode=0)
+
+    def fake_gh_pr_info(pr_number, repo):
+        return {
+            "number": 389,
+            "state": "open",
+            "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": [
+                "scripts/local/run_autocoder_single_task.py",
+            ],
+            "base": {"sha": "a844c1a1a95e584220bd16b33a58da549e62e228"},
+        }
+
+    def fake_gh_runs_for_sha(s, repo):
+        return [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+    def fake_gh(query, *args):
+        # Minimal: return an empty file list for the changed-files query
+        return {"files": []}
+
+    return fake_subprocess_run, fake_gh_pr_info, fake_gh_runs_for_sha, fake_gh
+
+
+def test_aed_final_gate_without_new_flags_preserves_behavior(tmp_path):
+    """Without --require-phase-ledger, run_final_gate output keeps the same shape.
+
+    The new phase_ledger field is added (matches persistent_mutation_guard
+    style) but with required=False, status=not_required. final_recommendation
+    is unaffected.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(json.dumps({
+        "tests_collected": 153, "passed": 153, "exit_code": 0,
+    }))
+    codex_file = tmp_path / "codex.md"
+    codex_file.write_text(f"Codex review of commit {sha}\nCLEAN — no issues.\n")
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_minimal_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+        )
+
+    # Default-off phase_ledger field is present but inactive
+    assert "phase_ledger" in gate
+    pl = gate["phase_ledger"]
+    assert pl["required"] is False
+    assert pl["hold_state"] == "not_required"
+    # Final recommendation is unaffected
+    assert gate["final_recommendation"] == "MERGE_READY"
+
+
+def test_aed_final_gate_require_phase_ledger_empty_ledger_returns_hold(tmp_path):
+    """With --require-phase-ledger and an empty/missing ledger + claimed phase, returns HOLD_UNEVIDENCED_PASS."""
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(json.dumps({
+        "tests_collected": 153, "passed": 153, "exit_code": 0,
+    }))
+    codex_file = tmp_path / "codex.md"
+    codex_file.write_text(f"Codex review of commit {sha}\nCLEAN — no issues.\n")
+
+    # Empty ledger file (exists but no lines)
+    empty_ledger = tmp_path / "empty_phase_ledger.jsonl"
+    empty_ledger.write_text("")
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_minimal_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(empty_ledger),
+            claimed_phases=["PHASE_1", "PHASE_2"],
+            require_phase_ledger=True,
+        )
+
+    assert gate["final_recommendation"] == "HOLD_UNEVIDENCED_PASS"
+    pl = gate["phase_ledger"]
+    assert pl["required"] is True
+    assert pl["valid"] is False
+    assert pl["hold_state"] == "HOLD_UNEVIDENCED_PASS"
+    assert pl["line_count"] == 0
+    assert pl["claimed_count"] == 2
+    assert pl["error_count"] >= 1
+
+
+def test_aed_final_gate_require_phase_ledger_with_valid_evidence_keeps_merge_ready(tmp_path):
+    """With --require-phase-ledger and canonical evidence, MERGE_READY is preserved."""
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(json.dumps({
+        "tests_collected": 153, "passed": 153, "exit_code": 0,
+    }))
+    codex_file = tmp_path / "codex.md"
+    codex_file.write_text(f"Codex review of commit {sha}\nCLEAN — no issues.\n")
+
+    # Build a ledger with two canonical evidence lines for PHASE_1 and PHASE_2
+    ledger = tmp_path / "phase_ledger.jsonl"
+    for pid in ("PHASE_1", "PHASE_2"):
+        out, err = tmp_path / f"{pid}_out.txt", tmp_path / f"{pid}_err.txt"
+        out.write_text("ok\n")
+        err.write_text("")
+        append_entry(
+            build_entry(
+                run_id="r1", phase_id=pid, writer="script",
+                script="scripts/local/check_pr_state.py",
+                argv=["--phase", pid], exit_code=0,
+                stdout_path=str(out), stderr_path=str(err),
+                observed_summary=f"{pid} ok", status="PASS",
+                timestamp="2026-06-06T00:00:00Z",
+            ),
+            ledger,
+        )
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_minimal_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(ledger),
+            claimed_phases=["PHASE_1", "PHASE_2"],
+            require_phase_ledger=True,
+        )
+
+    assert gate["final_recommendation"] == "MERGE_READY"
+    pl = gate["phase_ledger"]
+    assert pl["required"] is True
+    assert pl["valid"] is True
+    assert pl["hold_state"] == "HOLD_VALID"
+    assert pl["line_count"] == 2
