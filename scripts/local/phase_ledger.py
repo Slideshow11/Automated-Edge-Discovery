@@ -295,26 +295,65 @@ def append_entry(entry: dict[str, Any], path: Path) -> None:
 def read_entries(path: Path) -> list[dict[str, Any]]:
     """
     Read a JSONL ledger and return a list of valid entries.
-    Malformed lines are silently skipped (the validator is the source of
-    truth for ledger-level errors; this function only returns parseable
-    entries).
+
+    Malformed non-empty lines are silently skipped; for full visibility into
+    parse errors (line number + reason), use read_entries_with_errors
+    instead. This function is preserved for callers that only need the
+    parseable entries; the validator uses the strict variant.
+    """
+    entries, _parse_errors = read_entries_with_errors(path)
+    return entries
+
+
+def read_entries_with_errors(
+    path: Path,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """
+    Read a JSONL ledger and return (entries, parse_errors).
+
+    entries:       list of valid entry dicts (one per well-formed non-empty
+                   JSON object line).
+    parse_errors:  list of {"line": int, "raw": str, "error": str} for
+                   non-empty lines that failed to parse as a JSON object
+                   (or parsed to a non-dict top-level value).
+
+    Blank / whitespace-only lines are silently ignored (no entry, no error).
+    Malformed non-empty lines surface in parse_errors and are NOT included
+    in entries — the validator must surface them as HOLD_PHASE_EVIDENCE_CORRUPTED
+    so that a valid claimed PASS plus a corrupted/tampered extra line does
+    NOT validate as HOLD_VALID.
     """
     if not path.exists():
-        return []
-    out: list[dict[str, Any]] = []
+        return [], []
+    entries: list[dict[str, Any]] = []
+    parse_errors: list[dict[str, Any]] = []
     decoder = json.JSONDecoder()
-    for raw_line in path.read_text().splitlines():
+    text = path.read_text()
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
         stripped = raw_line.strip()
         if not stripped:
-            continue
+            continue  # blank lines are not an error
         try:
-            obj, end = decoder.raw_decode(stripped)
-        except json.JSONDecodeError:
+            obj, _end = decoder.raw_decode(stripped)
+        except json.JSONDecodeError as e:
+            parse_errors.append({
+                "line": line_no,
+                "raw": stripped,
+                "error": f"json.JSONDecodeError: {e.msg} (line {e.lineno}, col {e.colno})",
+            })
             continue
         if not isinstance(obj, dict):
+            parse_errors.append({
+                "line": line_no,
+                "raw": stripped,
+                "error": (
+                    f"top-level JSON value is not a dict, "
+                    f"got {type(obj).__name__}"
+                ),
+            })
             continue
-        out.append(obj)
-    return out
+        entries.append(obj)
+    return entries, parse_errors
 
 
 def find_entry(

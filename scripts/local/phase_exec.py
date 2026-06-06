@@ -40,6 +40,7 @@ import argparse
 import os
 import subprocess
 import sys
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -53,6 +54,20 @@ def _default_timestamp() -> str:
 def _slugify(value: str) -> str:
     """Make a filesystem-friendly slug from a phase_id."""
     return "".join(c if (c.isalnum() or c in "-_") else "_" for c in value)
+
+
+def _unique_artifact_suffix() -> str:
+    """Return a high-entropy suffix for an artifact directory name.
+
+    Combines a microsecond-precision UTC timestamp with a short random
+    uuid hex prefix. This guarantees uniqueness for two rapid invocations
+    of the same phase_id — including invocations within the same wall
+    clock second — so that artifact files (stdout.txt, stderr.txt) and
+    the ledger entries pointing at them are never silently overwritten.
+    """
+    microstamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    nonce = uuid.uuid4().hex[:8]
+    return f"{microstamp}-{nonce}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -119,10 +134,16 @@ def main(argv: list[str] | None = None) -> int:
     artifacts_root.mkdir(parents=True, exist_ok=True)
 
     slug = _slugify(args.phase_id)
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    artifact_dir_name = args.artifacts_dir_name or f"{slug}-{stamp}"
+    if args.artifacts_dir_name:
+        artifact_dir_name = args.artifacts_dir_name
+    else:
+        artifact_dir_name = f"{slug}-{_unique_artifact_suffix()}"
     artifact_dir = artifacts_root / artifact_dir_name
-    artifact_dir.mkdir(parents=True, exist_ok=True)
+    # If the directory already exists, that is a hard error: the unique
+    # suffix should make this impossible for rapid invocations of the
+    # same phase_id, and a pre-existing directory means evidence from a
+    # prior run is about to be silently overwritten.
+    artifact_dir.mkdir(parents=True, exist_ok=False)
 
     stdout_path = artifact_dir / "stdout.txt"
     stderr_path = artifact_dir / "stderr.txt"

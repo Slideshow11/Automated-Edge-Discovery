@@ -392,3 +392,102 @@ def test_cli_returns_unevidenced_exit_code_for_missing_ledger(tmp_path):
         capture_output=True, text=True,
     )
     assert proc.returncode == EXIT_UNEVIDENCED
+
+
+# -----------------------------------------------------------------------------
+# 11. Malformed non-empty JSONL line surfaces as HOLD_PHASE_EVIDENCE_CORRUPTED
+#     (Codex P2 finding on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def test_malformed_nonempty_jsonl_line_returns_evidence_corrupted(tmp_path):
+    """A non-empty malformed JSONL line forces HOLD_PHASE_EVIDENCE_CORRUPTED.
+
+    Regression guard: previously the validator's strict reader silently
+    skipped malformed non-empty lines, so a ledger with a valid line plus
+    a corrupted/tampered extra line could validate as HOLD_VALID. The
+    fix: surface the parse error in errors[] with kind=EVIDENCE_CORRUPTED,
+    which the precedence ladder maps to HOLD_PHASE_EVIDENCE_CORRUPTED.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # Valid canonical line on line 1
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    # Malformed non-empty line on line 2
+    with ledger.open("a") as f:
+        f.write("{this is not valid json\n")
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is False
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] != HOLD_VALID
+    assert result["malformed_count"] == 1
+    # Error detail must include the line number and the error reason
+    malformed_errors = [
+        e for e in result["errors"]
+        if e["kind"] == "EVIDENCE_CORRUPTED" and "malformed JSONL" in e["detail"]
+    ]
+    assert len(malformed_errors) == 1
+    assert malformed_errors[0]["line"] == 2
+    assert "line 2" in malformed_errors[0]["detail"]
+
+
+def test_valid_claimed_pass_plus_malformed_extra_line_returns_evidence_corrupted(tmp_path):
+    """A valid claimed PASS plus a malformed extra line must NOT return HOLD_VALID.
+
+    This is the primary regression guard for the Codex P2 finding: the
+    silent-skip loophole where the validator returned HOLD_VALID despite
+    corrupted ledger content is now closed. The malformed line forces
+    HOLD_PHASE_EVIDENCE_CORRUPTED (precedence: EVIDENCE_CORRUPTED >
+    RESULT_INCONSISTENT > UNEVIDENCED_PASS > VALID).
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # A valid canonical PASS line on line 1 — alone, this would be HOLD_VALID
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    # Trailing truncated/corrupted JSON on line 2 (e.g. partial write or
+    # tampered extra line)
+    with ledger.open("a") as f:
+        f.write('{"run_id":"r1","phase_id":"PHASE_2","writer":"script"')
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is False
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] != HOLD_VALID
+    assert result["malformed_count"] >= 1
+
+
+def test_blank_lines_are_silently_ignored_not_treated_as_malformed(tmp_path):
+    """Blank/whitespace-only lines are not treated as malformed.
+
+    This locks in the convention: only non-empty malformed lines surface
+    as EVIDENCE_CORRUPTED. Blank lines (e.g. trailing newlines from
+    pretty-printers) must remain a no-op.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    with ledger.open("a") as f:
+        f.write("\n   \n\t\n")  # blank and whitespace-only lines
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    assert result["malformed_count"] == 0
+
+
+def test_malformed_line_preserves_valid_evidence_count(tmp_path):
+    """A malformed line does not reduce the count of valid entries.
+
+    The line_count field represents valid entries parsed; malformed_count
+    is tracked separately. The validator's reported line_count must
+    reflect the valid evidence available for claim matching.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_2"), ledger)
+    with ledger.open("a") as f:
+        f.write("garbage line 3\n")
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_3"), ledger)
+
+    result = validate(ledger, claimed_phases=["PHASE_1", "PHASE_2", "PHASE_3"])
+    assert result["line_count"] == 3
+    assert result["malformed_count"] == 1
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED

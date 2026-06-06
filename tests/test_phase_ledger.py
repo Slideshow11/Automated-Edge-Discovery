@@ -568,6 +568,115 @@ def test_phase_exec_propagates_nonzero_exit(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# 12b. phase_exec.py rapid-duplicate artifact directory uniqueness
+#      (Codex P2 finding on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def test_phase_exec_rapid_duplicate_phase_creates_unique_artifact_dirs(tmp_path):
+    """Two rapid invocations of phase_exec with the same phase_id produce distinct artifact dirs.
+
+    Regression guard: previously the directory name used second-precision
+    timestamps, so two invocations within the same second collided on
+    `<phase>-<timestamp>` and `mkdir(..., exist_ok=True)` silently reused
+    the directory. The fix adds microseconds + a uuid nonce to the
+    directory name and fails loudly on any pre-existing directory.
+    """
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    artifacts_root = tmp_path / "artifacts"
+    artifacts_root.mkdir(parents=True, exist_ok=True)
+
+    proc1 = subprocess.run(
+        [
+            _sys.executable, str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "rapid-dup-1",
+            "--phase-id", "PHASE_RAPID_DUP",
+            "--", "echo", "first",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc1.returncode == 0, f"stdout={proc1.stdout!r} stderr={proc1.stderr!r}"
+
+    proc2 = subprocess.run(
+        [
+            _sys.executable, str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "rapid-dup-2",
+            "--phase-id", "PHASE_RAPID_DUP",
+            "--", "echo", "second",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc2.returncode == 0, f"stdout={proc2.stdout!r} stderr={proc2.stderr!r}"
+
+    # Two distinct artifact directories under artifacts_root
+    subdirs = sorted(p for p in artifacts_root.iterdir() if p.is_dir())
+    assert len(subdirs) == 2, f"expected 2 distinct artifact dirs, got {subdirs!r}"
+    assert subdirs[0].name != subdirs[1].name
+
+    # The artifact directory names must NOT collide on second-precision timestamps
+    # (i.e. they should differ on a microsecond or nonce component, not just
+    # the phase slug).
+    for sub in subdirs:
+        assert sub.name.startswith("PHASE_RAPID_DUP-")
+
+
+def test_phase_exec_rapid_duplicate_phase_does_not_overwrite_stdout_stderr(tmp_path):
+    """Two rapid invocations of phase_exec preserve their own stdout/stderr evidence.
+
+    Regression guard: previously a second invocation would overwrite the
+    first invocation's stdout.txt / stderr.txt while the first ledger
+    entry still pointed at those paths. With unique artifact directories
+    the two invocations now keep distinct evidence files.
+    """
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+
+    proc1 = subprocess.run(
+        [
+            _sys.executable, str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "dup-evidence-1",
+            "--phase-id", "PHASE_RAPID",
+            "--", "echo", "alpha",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc1.returncode == 0, f"stdout={proc1.stdout!r} stderr={proc1.stderr!r}"
+
+    proc2 = subprocess.run(
+        [
+            _sys.executable, str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "dup-evidence-2",
+            "--phase-id", "PHASE_RAPID",
+            "--", "echo", "beta",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc2.returncode == 0, f"stdout={proc2.stdout!r} stderr={proc2.stderr!r}"
+
+    # Both ledger entries should point to distinct artifact files,
+    # and each artifact should contain its own invocation's output.
+    lines = ledger.read_text().strip().split("\n")
+    assert len(lines) == 2
+
+    obj1 = json.loads(lines[0])
+    obj2 = json.loads(lines[1])
+    assert obj1["stdout_path"] != obj2["stdout_path"]
+    assert obj1["stderr_path"] != obj2["stderr_path"]
+
+    assert Path(obj1["stdout_path"]).read_text().strip() == "alpha"
+    assert Path(obj2["stdout_path"]).read_text().strip() == "beta"
+
+
+# -----------------------------------------------------------------------------
 # 13. aed_final_gate.py integration tests
 # -----------------------------------------------------------------------------
 

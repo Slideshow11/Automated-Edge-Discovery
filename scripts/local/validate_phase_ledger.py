@@ -50,8 +50,8 @@ from typing import Any, Optional
 
 from phase_ledger import (
     CANONICAL_WRITERS,
-    read_entries,
     is_canonical_evidence,
+    read_entries_with_errors,
 )
 
 
@@ -312,9 +312,28 @@ def validate(
             })
         return result
 
-    entries = read_entries(ledger_path)
+    entries, parse_errors = read_entries_with_errors(ledger_path)
     result["line_count"] = len(entries)
     result["claimed_count"] = len(claimed_phases) if claimed_phases else 0
+    result["malformed_count"] = len(parse_errors)
+
+    # Surface malformed non-empty JSONL lines as EVIDENCE_CORRUPTED. This
+    # closes the loophole where a valid claimed PASS plus a corrupted/
+    # tampered extra line could validate as HOLD_VALID. The raw content
+    # is truncated to keep error lists bounded.
+    for pe in parse_errors:
+        raw_preview = pe["raw"]
+        if len(raw_preview) > 80:
+            raw_preview = raw_preview[:77] + "..."
+        result["errors"].append({
+            "phase_id": "<ledger>",
+            "line": pe["line"],
+            "kind": "EVIDENCE_CORRUPTED",
+            "detail": (
+                f"malformed JSONL line on line {pe['line']}: {pe['error']}; "
+                f"raw={raw_preview!r}"
+            ),
+        })
 
     # Per-line internal-consistency checks (always)
     consistency_errors: list[dict[str, str]] = []
@@ -421,6 +440,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "hold_state": result["hold_state"],
         "line_count": result["line_count"],
         "claimed_count": result["claimed_count"],
+        "malformed_count": result.get("malformed_count", 0),
         "error_count": len(result["errors"]),
         "warning_count": len(result["warnings"]),
     }))
