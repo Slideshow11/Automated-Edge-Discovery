@@ -648,6 +648,29 @@ def run_final_gate(
                 "detail": "no --phase-ledger path supplied",
             })
             phase_ledger_blocked = True
+        elif not _claim_list:
+            # P2 fix (Codex round 4): when --require-phase-ledger is set
+            # but --claimed-phases is missing or empty, fail closed
+            # instead of letting validate() degrade to internal-consistency
+            # only and possibly return HOLD_VALID for an empty ledger.
+            # The opt-in no-unproven-PASS guard must have at least one
+            # explicit claim source to enforce.
+            phase_ledger_state["hold_state"] = "HOLD_UNEVIDENCED_PASS"
+            phase_ledger_state["valid"] = False
+            phase_ledger_state["message"] = (
+                "require-phase-ledger=True requires non-empty claimed_phases"
+            )
+            phase_ledger_state["errors"].append({
+                "phase_id": "<phase_ledger>",
+                "line": 0,
+                "kind": "MISSING_CLAIMS",
+                "detail": (
+                    "require_phase_ledger=True requires a non-empty "
+                    "--claimed-phases list; got "
+                    f"{claimed_phases!r}"
+                ),
+            })
+            phase_ledger_blocked = True
         else:
             _vresult = _validate_phase_ledger(_ledger_path, claimed_phases=_claim_list)
             phase_ledger_state["hold_state"] = _vresult["hold_state"]

@@ -209,10 +209,20 @@ def _check_line_consistency(
 def _check_claim_evidence(
     claimed: list[str],
     entries: list[dict[str, Any]],
+    expected_run_id: Optional[str] = None,
+    warnings: Optional[list[str]] = None,
 ) -> list[dict[str, str]]:
     """
     For each claimed phase_id, check whether at least one canonical
     (script|phase_exec, PASS) ledger line exists.
+
+    When expected_run_id is provided, candidates are additionally filtered
+    by entry.run_id == expected_run_id. Entries with matching phase_id but
+    a non-matching run_id are recorded in `warnings` (if a warnings list
+    is passed) and are NOT counted as evidence — preventing stale evidence
+    from an earlier run from satisfying a later run's claim. This is the
+    P1 fix: previously a canonical PASS from run A could satisfy the same
+    phase claim for run B.
 
     Returns a list of error dicts.
     """
@@ -225,8 +235,8 @@ def _check_claim_evidence(
             by_phase.setdefault(pid, []).append((idx, e))
 
     for claim in claimed:
-        candidates = by_phase.get(claim, [])
-        if not candidates:
+        all_candidates = by_phase.get(claim, [])
+        if not all_candidates:
             errors.append({
                 "phase_id": claim,
                 "line": 0,
@@ -236,22 +246,83 @@ def _check_claim_evidence(
                 ),
             })
             continue
-        # At least one canonical PASS entry required
-        if not any(is_canonical_evidence(e) for _, e in candidates):
-            # Find a representative line to describe the failure
-            rep_line, rep_entry = candidates[0]
-            writer = rep_entry.get("writer")
-            errors.append({
-                "phase_id": claim,
-                "line": rep_line,
-                "kind": "UNCLAIMED_PHASE",
-                "detail": (
-                    f"claimed phase {claim!r} has {len(candidates)} ledger "
-                    f"line(s) but none are canonical PASS evidence "
-                    f"(writer={writer!r}); writer=agent never satisfies "
-                    f"proof for claimed PASS"
-                ),
-            })
+
+        if expected_run_id is not None:
+            # Filter to entries whose run_id matches the expected run_id
+            matching = [
+                (ln, e) for ln, e in all_candidates
+                if e.get("run_id") == expected_run_id
+            ]
+            # Collect the non-matching run_ids for the warning/detail
+            non_matching_run_ids_set: set[str] = set()
+            for _, e in all_candidates:
+                rid = e.get("run_id")
+                if isinstance(rid, str) and rid != expected_run_id:
+                    non_matching_run_ids_set.add(rid)
+            non_matching_run_ids = sorted(non_matching_run_ids_set)
+            if non_matching_run_ids and warnings is not None:
+                warnings.append(
+                    f"phase {claim!r} has {len(non_matching_run_ids)} stale "
+                    f"ledger line(s) from other run_id(s) "
+                    f"({non_matching_run_ids!r}) that do NOT match the "
+                    f"expected run_id {expected_run_id!r}; these are not "
+                    f"counted as evidence for the current claim"
+                )
+
+            if not matching:
+                # No canonical evidence for the expected run_id
+                # (stale evidence from other run(s) does not satisfy
+                # the current claim)
+                rep_line, rep_entry = all_candidates[0]
+                other_rids = [
+                    e.get("run_id") for _, e in all_candidates
+                ]
+                errors.append({
+                    "phase_id": claim,
+                    "line": rep_line,
+                    "kind": "UNCLAIMED_PHASE",
+                    "detail": (
+                        f"claimed phase {claim!r} has {len(all_candidates)} "
+                        f"ledger line(s) for run_id(s) {other_rids!r} "
+                        f"but NONE for the expected run_id "
+                        f"{expected_run_id!r}; stale evidence from other "
+                        f"run(s) does not satisfy the current claim"
+                    ),
+                })
+                continue
+
+            # At least one canonical PASS entry required (filtered set)
+            if not any(is_canonical_evidence(e) for _, e in matching):
+                rep_line, rep_entry = matching[0]
+                writer = rep_entry.get("writer")
+                errors.append({
+                    "phase_id": claim,
+                    "line": rep_line,
+                    "kind": "UNCLAIMED_PHASE",
+                    "detail": (
+                        f"claimed phase {claim!r} has {len(matching)} "
+                        f"matching-run_id ledger line(s) for run_id="
+                        f"{expected_run_id!r} but none are canonical PASS "
+                        f"evidence (writer={writer!r}); writer=agent never "
+                        f"satisfies proof for claimed PASS"
+                    ),
+                })
+        else:
+            # No run_id filter — original behavior (match by phase_id only)
+            if not any(is_canonical_evidence(e) for _, e in all_candidates):
+                rep_line, rep_entry = all_candidates[0]
+                writer = rep_entry.get("writer")
+                errors.append({
+                    "phase_id": claim,
+                    "line": rep_line,
+                    "kind": "UNCLAIMED_PHASE",
+                    "detail": (
+                        f"claimed phase {claim!r} has {len(all_candidates)} ledger "
+                        f"line(s) but none are canonical PASS evidence "
+                        f"(writer={writer!r}); writer=agent never satisfies "
+                        f"proof for claimed PASS"
+                    ),
+                })
     return errors
 
 
@@ -280,12 +351,18 @@ def _find_duplicate_phase_ids(
 def validate(
     ledger_path: Path,
     claimed_phases: Optional[list[str]] = None,
+    expected_run_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """
     Validate a phase ledger and (optionally) a claim set.
 
     Returns a dict with: valid, hold_state, errors, warnings, exit_code,
-    ledger_path, line_count, claimed_count.
+    ledger_path, line_count, claimed_count, expected_run_id.
+
+    expected_run_id (optional): when set, canonical evidence must match
+    both phase_id AND run_id == expected_run_id. Stale evidence from
+    other run_ids is recorded as a warning and does NOT satisfy the
+    claim. When omitted, behavior is unchanged (match by phase_id only).
     """
     result: dict[str, Any] = {
         "valid": True,
@@ -296,6 +373,7 @@ def validate(
         "ledger_path": str(ledger_path),
         "line_count": 0,
         "claimed_count": 0,
+        "expected_run_id": expected_run_id,
     }
 
     # Read entries
@@ -374,7 +452,12 @@ def validate(
 
     # Claim-evidence checks
     if claimed_phases:
-        claim_errors = _check_claim_evidence(claimed_phases, entries)
+        claim_errors = _check_claim_evidence(
+            claimed_phases,
+            entries,
+            expected_run_id=expected_run_id,
+            warnings=result["warnings"],
+        )
         result["errors"].extend(claim_errors)
 
     # Determine hold state by precedence
@@ -429,6 +512,17 @@ def _build_argparser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--expected-run-id",
+        default=None,
+        help=(
+            "Optional: when set, canonical evidence must match this "
+            "run_id to satisfy a claimed phase. Stops stale evidence "
+            "from a previous run from satisfying a later run's claim. "
+            "When omitted, behavior is unchanged (match by phase_id "
+            "only)."
+        ),
+    )
+    p.add_argument(
         "--output-json",
         help="Optional path to write a JSON validation report",
     )
@@ -451,7 +545,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.claimed_phases:
         claimed = [p.strip() for p in args.claimed_phases.split(",") if p.strip()]
 
-    result = validate(ledger_path, claimed_phases=claimed)
+    result = validate(
+        ledger_path,
+        claimed_phases=claimed,
+        expected_run_id=args.expected_run_id,
+    )
 
     if args.output_json:
         out_path = Path(args.output_json)
@@ -465,6 +563,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "line_count": result["line_count"],
         "claimed_count": result["claimed_count"],
         "malformed_count": result.get("malformed_count", 0),
+        "expected_run_id": result.get("expected_run_id"),
         "error_count": len(result["errors"]),
         "warning_count": len(result["warnings"]),
     }))

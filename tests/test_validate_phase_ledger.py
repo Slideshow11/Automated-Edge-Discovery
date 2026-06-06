@@ -671,3 +671,126 @@ def test_trailing_whitespace_only_is_accepted(tmp_path):
     assert result["valid"] is True
     assert result["hold_state"] == HOLD_VALID
     assert result["malformed_count"] == 0
+
+
+# -----------------------------------------------------------------------------
+# 14. Claimed evidence is bound to expected_run_id (P1 fix from PR #390 round 4)
+# -----------------------------------------------------------------------------
+
+
+def test_claimed_phase_requires_matching_run_id_when_expected_run_id_set(tmp_path):
+    """When expected_run_id is set, stale evidence from another run is rejected.
+
+    Regression guard for the Codex P1 finding: previously the validator
+    selected claim candidates only by phase_id, so a canonical PASS from
+    run_old could satisfy the same phase claim for run_new. The fix:
+    when expected_run_id is set, candidates are filtered by
+    entry.run_id == expected_run_id; non-matching run_ids are recorded
+    as a warning and do NOT satisfy the claim.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # Build a canonical PASS line for run_old only
+    entry = _canonical_pass_line(tmp_path, run_id="run_old", phase_id="PHASE_1")
+    append_entry(entry, ledger)
+
+    # Claim PHASE_1 for run_new — the run_old evidence must NOT satisfy
+    result = validate(
+        ledger,
+        claimed_phases=["PHASE_1"],
+        expected_run_id="run_new",
+    )
+
+    assert result["valid"] is False
+    assert result["hold_state"] != HOLD_VALID
+    # Per spec: either HOLD_UNEVIDENCED_PASS or HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] in (HOLD_UNEVIDENCED_PASS, HOLD_PHASE_EVIDENCE_CORRUPTED)
+    # Error detail must mention stale/nonmatching run_id
+    unclaim_errors = [
+        e for e in result["errors"]
+        if e["kind"] == "UNCLAIMED_PHASE"
+    ]
+    assert len(unclaim_errors) >= 1
+    assert "run_new" in unclaim_errors[0]["detail"]
+    assert "run_old" in unclaim_errors[0]["detail"]
+    # A warning should mention the stale run_id
+    stale_warnings = [w for w in result["warnings"] if "stale" in w and "run_old" in w]
+    assert len(stale_warnings) >= 1
+
+
+def test_claimed_phase_valid_when_run_id_matches_expected_run_id(tmp_path):
+    """When expected_run_id matches, the canonical PASS line is accepted.
+
+    Locks in the happy path: a canonical PASS line for PHASE_1 with
+    run_id=run_new validates as HOLD_VALID when expected_run_id=run_new
+    is set.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        _canonical_pass_line(tmp_path, run_id="run_new", phase_id="PHASE_1"),
+        ledger,
+    )
+    result = validate(
+        ledger,
+        claimed_phases=["PHASE_1"],
+        expected_run_id="run_new",
+    )
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    assert result["errors"] == []
+
+
+def test_no_expected_run_id_preserves_phase_only_matching(tmp_path):
+    """When expected_run_id is omitted, behavior is unchanged.
+
+    Backward-compat: a canonical PASS for PHASE_1 still satisfies the
+    claim regardless of which run_id produced it. This is the existing
+    behavior from the original PR — the new run_id filter is purely
+    additive and must not regress.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(
+        _canonical_pass_line(tmp_path, run_id="some_run", phase_id="PHASE_1"),
+        ledger,
+    )
+    # No expected_run_id
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    assert result["errors"] == []
+    assert result.get("expected_run_id") is None
+
+
+def test_expected_run_id_with_matching_and_stale_mixed_evidence(tmp_path):
+    """When expected_run_id is set and stale evidence is present, the
+    matching canonical line satisfies the claim and the stale line is
+    reported as a warning.
+
+    This locks in that the warning system does not pollute the error
+    stream with stale-evidence issues when matching evidence is present.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # run_old has its own canonical PASS
+    append_entry(
+        _canonical_pass_line(tmp_path, run_id="run_old", phase_id="PHASE_1"),
+        ledger,
+    )
+    # run_new has its own canonical PASS
+    append_entry(
+        _canonical_pass_line(tmp_path, run_id="run_new", phase_id="PHASE_1"),
+        ledger,
+    )
+    result = validate(
+        ledger,
+        claimed_phases=["PHASE_1"],
+        expected_run_id="run_new",
+    )
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    # No UNCLAIMED_PHASE errors — the run_new canonical PASS satisfies it
+    unclaim_errors = [
+        e for e in result["errors"] if e["kind"] == "UNCLAIMED_PHASE"
+    ]
+    assert unclaim_errors == []
+    # Stale-evidence warning is present
+    stale_warnings = [w for w in result["warnings"] if "stale" in w and "run_old" in w]
+    assert len(stale_warnings) >= 1
