@@ -334,12 +334,30 @@ def read_entries_with_errors(
         if not stripped:
             continue  # blank lines are not an error
         try:
-            obj, _end = decoder.raw_decode(stripped)
+            obj, end = decoder.raw_decode(stripped)
         except json.JSONDecodeError as e:
             parse_errors.append({
                 "line": line_no,
                 "raw": stripped,
                 "error": f"json.JSONDecodeError: {e.msg} (line {e.lineno}, col {e.colno})",
+            })
+            continue
+        # Reject trailing data after the decoded JSON object. raw_decode
+        # returns successfully if the leading substring is a complete
+        # JSON object, even when there is non-whitespace garbage after
+        # it. For the corruption/tamper guard this ledger is meant to
+        # enforce, any non-whitespace after the decoded object must be
+        # surfaced as a parse error (HOLD_PHASE_EVIDENCE_CORRUPTED),
+        # not silently accepted.
+        trailing = stripped[end:].strip()
+        if trailing:
+            parse_errors.append({
+                "line": line_no,
+                "raw": stripped,
+                "error": (
+                    f"trailing data after JSON object at position {end} of "
+                    f"{len(stripped)}: {trailing!r}"
+                ),
             })
             continue
         if not isinstance(obj, dict):

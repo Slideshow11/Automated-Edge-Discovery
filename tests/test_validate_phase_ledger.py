@@ -491,3 +491,183 @@ def test_malformed_line_preserves_valid_evidence_count(tmp_path):
     assert result["line_count"] == 3
     assert result["malformed_count"] == 1
     assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+
+
+# -----------------------------------------------------------------------------
+# 12. Required-field / schema validation for canonical evidence
+#     (Codex P1 finding on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def test_required_fields_missing_returns_evidence_corrupted(tmp_path):
+    """A canonical-looking entry missing required v1 fields fails validation.
+
+    Regression guard for the Codex P1 finding: previously the validator
+    relied only on is_canonical_evidence() (which checks writer/status/
+    argv/paths/observed_summary) but never enforced the v1 schema
+    (audit_log_version, ledger_kind, run_id, phase_id, writer, exit_code,
+    status, timestamp). A hand-written entry that looked like evidence
+    but lacked the version/kind/run_id/timestamp fields could pass
+    is_canonical_evidence() and validate as HOLD_VALID. The fix: the
+    validator now calls validate_entry_shape() per parsed entry and
+    surfaces missing/invalid required fields as EVIDENCE_CORRUPTED.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # Hand-write a line that is "canonical-looking" (writer=script,
+    # status=PASS, exit_code=0, argv, absolute stdout/stderr paths,
+    # observed_summary) but is MISSING the v1 schema-required fields:
+    # audit_log_version, ledger_kind, run_id, timestamp.
+    out, err = _write_artifact_pair(tmp_path, "r1", "PHASE_1")
+    bare_entry = {
+        # REQUIRED v1 fields deliberately omitted:
+        # "audit_log_version": 1,
+        # "ledger_kind": "phase_execution_v1",
+        # "run_id": "r1",
+        # "timestamp": "2026-06-06T00:00:00Z",
+        "phase_id": "PHASE_1",
+        "writer": "script",
+        "argv": ["--do", "thing"],
+        "exit_code": 0,
+        "stdout_path": str(out),
+        "stderr_path": str(err),
+        "observed_summary": "looks like evidence",
+        "status": "PASS",
+    }
+    ledger.write_text(json.dumps(bare_entry) + "\n")
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+
+    assert result["valid"] is False
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] != HOLD_VALID
+    # At least one EVIDENCE_CORRUPTED error must mention a missing
+    # required field
+    schema_failures = [
+        e for e in result["errors"]
+        if e["kind"] == "EVIDENCE_CORRUPTED"
+        and "required-field/schema failure" in e["detail"]
+    ]
+    assert len(schema_failures) >= 1
+    # The detail should mention at least one of the missing field names
+    detail_blob = " ".join(e["detail"] for e in schema_failures)
+    assert any(
+        field in detail_blob
+        for field in ("audit_log_version", "ledger_kind", "run_id", "timestamp")
+    )
+
+
+def test_canonical_entry_with_all_required_fields_passes_schema_check(tmp_path):
+    """A canonical entry with all v1 required fields passes the schema check.
+
+    Locks in that the new schema check does not regress the happy path:
+    a properly built entry (writer=script, status=PASS, full v1 fields,
+    absolute paths, non-empty summary) must still validate as HOLD_VALID.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    # No schema failures recorded for a well-formed entry
+    schema_failures = [
+        e for e in result["errors"]
+        if "required-field/schema failure" in e["detail"]
+    ]
+    assert schema_failures == []
+
+
+# -----------------------------------------------------------------------------
+# 13. Trailing data after a JSONL object is rejected as corruption
+#     (Codex P2 finding on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def test_trailing_data_after_jsonl_object_returns_evidence_corrupted(tmp_path):
+    """A JSONL line with trailing garbage after a valid object is corruption.
+
+    Regression guard for the Codex P2 finding: json.JSONDecoder.raw_decode
+    returns successfully if the leading substring is a complete JSON object,
+    even when there is non-whitespace garbage after it. Previously the
+    strict reader ignored `_end` and would silently accept the trailing
+    garbage; the validator then returned HOLD_VALID with malformed_count=0.
+    The fix: the strict reader now checks stripped[end:].strip() and
+    records a parse error if any non-whitespace data follows the object.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # One line: a valid canonical JSONL object followed by trailing
+    # garbage on the same physical line. The raw_decode call succeeds
+    # for the leading substring, so the strict reader must explicitly
+    # detect the trailing "GARBAGE" and treat it as corruption.
+    ledger.write_text(
+        '{"audit_log_version": 1, "ledger_kind": "phase_execution_v1", '
+        '"run_id": "r1", "phase_id": "PHASE_1", "writer": "script", '
+        '"exit_code": 0, "status": "PASS", "timestamp": "2026-06-06T00:00:00Z"} '
+        'GARBAGE\n'
+    )
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+
+    assert result["valid"] is False
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] != HOLD_VALID
+    assert result["malformed_count"] == 1
+    # Error detail must reference trailing data
+    trailing_errors = [
+        e for e in result["errors"]
+        if e["kind"] == "EVIDENCE_CORRUPTED"
+        and "malformed JSONL" in e["detail"]
+        and "trailing data" in e["detail"]
+    ]
+    assert len(trailing_errors) == 1
+    assert trailing_errors[0]["line"] == 1
+
+
+def test_valid_claimed_pass_plus_trailing_garbage_extra_line_returns_evidence_corrupted(tmp_path):
+    """A valid claimed PASS plus a trailing-garbage extra line must NOT return HOLD_VALID.
+
+    This is the canonical-corruption scenario: a single well-formed PASS
+    line is enough to satisfy a claim, but a second physical line with a
+    valid object followed by trailing garbage must force
+    HOLD_PHASE_EVIDENCE_CORRUPTED (not HOLD_VALID). Without this, a
+    tampered/partial-write ledger could pass validation.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # Valid canonical PASS line on line 1 — alone, this would be HOLD_VALID
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    # Line 2: a valid JSON object followed by trailing garbage
+    with ledger.open("a") as f:
+        f.write(
+            '{"audit_log_version": 1, "ledger_kind": "phase_execution_v1", '
+            '"run_id": "r1", "phase_id": "PHASE_2", "writer": "script", '
+            '"exit_code": 0, "status": "PASS", "timestamp": "2026-06-06T00:00:01Z"} '
+            'tail-of-line-2\n'
+        )
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+
+    assert result["valid"] is False
+    assert result["hold_state"] == HOLD_PHASE_EVIDENCE_CORRUPTED
+    assert result["hold_state"] != HOLD_VALID
+    assert result["malformed_count"] == 1
+
+
+def test_trailing_whitespace_only_is_accepted(tmp_path):
+    """Whitespace-only trailing data after a JSON object is NOT corruption.
+
+    This locks in the trailing-data fix's convention: only non-whitespace
+    trailing data forces EVIDENCE_CORRUPTED. Pure trailing whitespace
+    (spaces, tabs) is benign and must not be treated as evidence
+    corruption — that matches the JSON spec and avoids false positives
+    on hand-formatted ledgers.
+    """
+    ledger = tmp_path / "phase_ledger.jsonl"
+    append_entry(_canonical_pass_line(tmp_path, phase_id="PHASE_1"), ledger)
+    # Trailing whitespace-only on the canonical line is fine: append
+    # a wholly-whitespace line to be sure.
+    with ledger.open("a") as f:
+        f.write("   \t   \n")
+
+    result = validate(ledger, claimed_phases=["PHASE_1"])
+    assert result["valid"] is True
+    assert result["hold_state"] == HOLD_VALID
+    assert result["malformed_count"] == 0

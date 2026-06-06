@@ -52,6 +52,7 @@ from phase_ledger import (
     CANONICAL_WRITERS,
     is_canonical_evidence,
     read_entries_with_errors,
+    validate_entry_shape,
 )
 
 
@@ -340,6 +341,29 @@ def validate(
     for idx, e in enumerate(entries, start=1):
         consistency_errors.extend(_check_line_consistency(idx, e))
     result["errors"].extend(consistency_errors)
+
+    # Per-line schema/provenance checks (always). Calls validate_entry_shape
+    # from phase_ledger.py, which enforces REQUIRED_FIELDS
+    # (audit_log_version, ledger_kind, run_id, phase_id, writer, exit_code,
+    # status, timestamp) and the v1 schema values. A hand-written entry
+    # with enough fields to look like canonical evidence but missing the
+    # version/kind/run_id/timestamp would otherwise slip past
+    # is_canonical_evidence() and validate as HOLD_VALID — closing that
+    # gap is the P1 fix.
+    schema_errors: list[dict[str, str]] = []
+    for idx, e in enumerate(entries, start=1):
+        field_errors = validate_entry_shape(e)
+        for fe in field_errors:
+            schema_errors.append({
+                "phase_id": str(e.get("phase_id", f"<line_{idx}>")),
+                "line": idx,
+                "kind": "EVIDENCE_CORRUPTED",
+                "detail": (
+                    f"required-field/schema failure on line {idx} "
+                    f"(phase_id={e.get('phase_id')!r}): {fe}"
+                ),
+            })
+    result["errors"].extend(schema_errors)
 
     # Duplicate phase_id warnings
     dupes = _find_duplicate_phase_ids(entries)
