@@ -70,6 +70,33 @@ def _unique_artifact_suffix() -> str:
     return f"{microstamp}-{nonce}"
 
 
+def _synthesize_observed_summary(cmd: list[str], exit_code: int) -> str:
+    """Build a deterministic, non-empty observed_summary for a PASS entry.
+
+    Round-5 P2 fix (Codex review on PR #390, thread PRRT_kwDOSHFpYM6HnuOi):
+    validate_phase_ledger treats ``status=PASS`` with an empty
+    observed_summary as ``HOLD_PHASE_RESULT_INCONSISTENT``. Previously,
+    when the caller omitted ``--observed-summary`` for a successful
+    command, phase_exec still wrote a PASS line with an empty summary,
+    so the wrapper's default successful path produced evidence that the
+    validator would reject.
+
+    This helper synthesizes a concise, deterministic summary from the
+    command and exit code alone. It deliberately does not include any
+    captured stdout/stderr content, so secrets printed by the wrapped
+    command are not propagated into the ledger.
+
+    The summary includes a short, bounded preview of the command (the
+    first 120 characters) so that downstream validators and human
+    reviewers can still tell which command was actually run.
+    """
+    # Bound the command preview to keep summaries concise and bounded.
+    cmd_preview = " ".join(cmd)
+    if len(cmd_preview) > 120:
+        cmd_preview = cmd_preview[:117] + "..."
+    return f"phase_exec command completed with exit_code={exit_code}: {cmd_preview}"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -188,6 +215,16 @@ def main(argv: list[str] | None = None) -> int:
     else:
         status = "FAIL"
 
+    # If the caller did not supply --observed-summary and the wrapped
+    # command succeeded, synthesize a deterministic non-empty summary
+    # so the round-5 validator's "PASS without summary" guard does not
+    # reject the wrapper's default successful path. See thread
+    # PRRT_kwDOSHFpYM6HnuOi on PR #390.
+    if not args.observed_summary.strip() and status == "PASS":
+        observed_summary = _synthesize_observed_summary(cmd, exit_code)
+    else:
+        observed_summary = args.observed_summary
+
     # Build and append the canonical ledger entry
     entry = build_entry(
         run_id=args.run_id,
@@ -201,7 +238,7 @@ def main(argv: list[str] | None = None) -> int:
         stderr_path=str(stderr_path),
         stdout_size_bytes=stdout_bytes,
         stderr_size_bytes=stderr_bytes,
-        observed_summary=args.observed_summary,
+        observed_summary=observed_summary,
         status=status,
         timestamp=_default_timestamp(),
         source_task_id=args.source_task_id,

@@ -677,6 +677,161 @@ def test_phase_exec_rapid_duplicate_phase_does_not_overwrite_stdout_stderr(tmp_p
 
 
 # -----------------------------------------------------------------------------
+# 12c. phase_exec.py observed_summary synthesis on PASS
+#      (Codex P2 finding on PR #390, thread PRRT_kwDOSHFpYM6HnuOi)
+# -----------------------------------------------------------------------------
+
+
+def test_phase_exec_synthesizes_observed_summary_when_omitted(tmp_path):
+    """phase_exec.py must never write a PASS ledger entry with an empty observed_summary.
+
+    Regression guard: previously, when --observed-summary was omitted and
+    the wrapped command exited 0, phase_exec still wrote status=PASS with
+    observed_summary="". The round-5 validator rejects that combination
+    as HOLD_PHASE_RESULT_INCONSISTENT, so the wrapper's default
+    successful path produced evidence that the validator would not
+    accept. The fix synthesizes a deterministic, non-empty summary from
+    the command and exit code.
+    """
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    # Use a temp helper script whose argv (a single file path) is
+    # completely disjoint from the marker it prints. The synthesized
+    # summary includes the command's argv (so reviewers can tell what
+    # was run) but MUST NOT include captured stdout (to avoid leaking
+    # secrets printed by the wrapped command).
+    helper = tmp_path / "print_marker.sh"
+    helper.write_text("#!/bin/sh\necho STDOUT_MARKER\n")
+    helper.chmod(0o755)
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "summary-synth-1",
+            "--phase-id", "PHASE_SYNTH",
+            "--phase-index", "1",
+            "--source-task-id", "aed.phase-ledger.v0",
+            "--task-packet-id", "phase-ledger-pr1",
+            # No --observed-summary flag at all.
+            "--", str(helper),
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["status"] == "PASS"
+    assert obj["exit_code"] == 0
+    # The synthesized summary must be a non-empty string.
+    assert isinstance(obj["observed_summary"], str)
+    assert obj["observed_summary"] != ""
+    # It must be deterministic: same shape every time for the same input.
+    assert "exit_code=0" in obj["observed_summary"]
+    # It must reference the actual command argv that was run (the path
+    # of the helper script).
+    assert "print_marker.sh" in obj["observed_summary"]
+    # It must NOT include captured stdout content (no secret leak).
+    # STDOUT_MARKER is a string printed by the wrapped command to its
+    # own stdout; it never appears in argv. If the summary did include
+    # stdout, the marker would be present.
+    assert "STDOUT_MARKER" not in obj["observed_summary"], (
+        f"synthesized summary leaked stdout content: {obj['observed_summary']!r}"
+    )
+
+
+def test_phase_exec_preserves_explicit_observed_summary(tmp_path):
+    """An explicit --observed-summary value must be recorded verbatim.
+
+    The fix only synthesizes a summary when the user did not pass one
+    (or passed an empty string). A non-empty --observed-summary must
+    be preserved exactly.
+    """
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "summary-explicit-1",
+            "--phase-id", "PHASE_EXPLICIT",
+            "--phase-index", "1",
+            "--observed-summary", "custom operator-supplied summary",
+            "--", "echo", "hello",
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["status"] == "PASS"
+    assert obj["exit_code"] == 0
+    assert obj["observed_summary"] == "custom operator-supplied summary"
+
+
+def test_phase_exec_synthesized_summary_validates_cleanly(tmp_path):
+    """A PASS entry produced by phase_exec without --observed-summary must validate.
+
+    Drives the actual validate_phase_ledger.validate() against a ledger
+    written by phase_exec with the default-successful path. The
+    claimed phase must validate as valid (i.e. NOT
+    HOLD_PHASE_RESULT_INCONSISTENT due to an empty summary). This is
+    the end-to-end regression guard for thread PRRT_kwDOSHFpYM6HnuOi.
+    """
+    import subprocess
+    import sys as _sys
+
+    from validate_phase_ledger import (
+        HOLD_VALID,
+        HOLD_PHASE_RESULT_INCONSISTENT,
+        validate,
+    )
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    helper = tmp_path / "print_marker.sh"
+    helper.write_text("#!/bin/sh\necho STDOUT_MARKER\n")
+    helper.chmod(0o755)
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "validate-cleanly-1",
+            "--phase-id", "PHASE_VALIDATE_CLEAN",
+            "--phase-index", "1",
+            # No --observed-summary flag.
+            "--", str(helper),
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+
+    result = validate(
+        ledger_path=ledger,
+        claimed_phases=["PHASE_VALIDATE_CLEAN"],
+        expected_run_id="validate-cleanly-1",
+    )
+
+    # The validator must NOT reject the synthesized summary as
+    # RESULT_INCONSISTENT (the round-5 bug).
+    for err in result["errors"]:
+        assert err.get("kind") != "RESULT_INCONSISTENT", (
+            f"validator rejected synthesized summary: {err}"
+        )
+    # And the phase claim must validate cleanly.
+    assert result["hold_state"] == HOLD_VALID, (
+        f"expected HOLD_VALID, got {result['hold_state']!r} "
+        f"with errors={result['errors']!r}"
+    )
+    assert result["valid"] is True
+
+
+# -----------------------------------------------------------------------------
 # 13. aed_final_gate.py integration tests
 # -----------------------------------------------------------------------------
 
