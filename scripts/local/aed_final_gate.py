@@ -456,6 +456,7 @@ def run_final_gate(
     phase_ledger_path: Optional[str] = None,
     claimed_phases: Optional[list[str]] = None,
     require_phase_ledger: bool = False,
+    phase_ledger_expected_run_id: Optional[str] = None,
 ) -> dict:
     # Detect repo from git
     repo_result = subprocess.run(
@@ -618,6 +619,7 @@ def run_final_gate(
         "ledger_path": str(phase_ledger_path) if phase_ledger_path else None,
         "claimed_phases": list(claimed_phases) if claimed_phases else [],
         "claimed_count": len(claimed_phases) if claimed_phases else 0,
+        "expected_run_id": phase_ledger_expected_run_id,
         "hold_state": "not_required",
         "valid": True,
         "line_count": 0,
@@ -671,8 +673,37 @@ def run_final_gate(
                 ),
             })
             phase_ledger_blocked = True
+        elif not phase_ledger_expected_run_id:
+            # P2 fix (Codex round 5): when --require-phase-ledger is set
+            # but --phase-ledger-expected-run-id is missing or empty, the
+            # ledger is validated by phase_id only. With a long-lived
+            # append-only ledger, a stale canonical PASS from a prior
+            # run can satisfy the current claim, defeating the
+            # no-unproven-PASS guard. Fail closed: require the operator
+            # to plumb the current run id through.
+            phase_ledger_state["hold_state"] = "HOLD_UNEVIDENCED_PASS"
+            phase_ledger_state["valid"] = False
+            phase_ledger_state["message"] = (
+                "require-phase-ledger=True requires non-empty "
+                "phase_ledger_expected_run_id"
+            )
+            phase_ledger_state["errors"].append({
+                "phase_id": "<phase_ledger>",
+                "line": 0,
+                "kind": "MISSING_EXPECTED_RUN_ID",
+                "detail": (
+                    "require_phase_ledger=True requires a non-empty "
+                    "--phase-ledger-expected-run-id; got "
+                    f"{phase_ledger_expected_run_id!r}"
+                ),
+            })
+            phase_ledger_blocked = True
         else:
-            _vresult = _validate_phase_ledger(_ledger_path, claimed_phases=_claim_list)
+            _vresult = _validate_phase_ledger(
+                _ledger_path,
+                claimed_phases=_claim_list,
+                expected_run_id=phase_ledger_expected_run_id,
+            )
             phase_ledger_state["hold_state"] = _vresult["hold_state"]
             phase_ledger_state["valid"] = _vresult["valid"]
             phase_ledger_state["line_count"] = _vresult["line_count"]
@@ -948,6 +979,20 @@ def main():
             "adds a layer on top of MERGE_READY."
         ),
     )
+    parser.add_argument(
+        "--phase-ledger-expected-run-id",
+        dest="phase_ledger_expected_run_id",
+        default=None,
+        help=(
+            "Run id used to scope the phase-ledger evidence check. When "
+            "set, the gate validates claimed phases against ledger "
+            "entries whose run_id matches this value, so stale canonical "
+            "PASS lines from earlier runs cannot satisfy a current claim. "
+            "When --require-phase-ledger is on, this argument is required "
+            "(the gate fails closed with HOLD_UNEVIDENCED_PASS if it is "
+            "missing or empty)."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -977,6 +1022,7 @@ def main():
             if args.claimed_phases else None
         ),
         require_phase_ledger=args.require_phase_ledger,
+        phase_ledger_expected_run_id=args.phase_ledger_expected_run_id,
     )
 
     print(json.dumps(gate, indent=2))

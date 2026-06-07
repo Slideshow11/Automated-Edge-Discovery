@@ -799,6 +799,7 @@ def test_aed_final_gate_require_phase_ledger_empty_ledger_returns_hold(tmp_path)
             phase_ledger_path=str(empty_ledger),
             claimed_phases=["PHASE_1", "PHASE_2"],
             require_phase_ledger=True,
+            phase_ledger_expected_run_id="r1",
         )
 
     assert gate["final_recommendation"] == "HOLD_UNEVIDENCED_PASS"
@@ -860,6 +861,7 @@ def test_aed_final_gate_require_phase_ledger_with_valid_evidence_keeps_merge_rea
             phase_ledger_path=str(ledger),
             claimed_phases=["PHASE_1", "PHASE_2"],
             require_phase_ledger=True,
+            phase_ledger_expected_run_id="r1",
         )
 
     assert gate["final_recommendation"] == "MERGE_READY"
