@@ -832,6 +832,172 @@ def test_phase_exec_synthesized_summary_validates_cleanly(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# 12d. phase_exec.py preserves exit code on non-UTF-8 output
+#      (Codex P2 finding on PR #390, thread PRRT_kwDOSHFpYM6Hn2SJ)
+# -----------------------------------------------------------------------------
+
+
+def test_phase_exec_preserves_exit_code_on_non_utf8_output(tmp_path):
+    """A successful command that prints non-UTF-8 bytes must record PASS, not FAIL.
+
+    Regression guard: previously phase_exec used
+    ``subprocess.run(..., text=True)``, which raises ``UnicodeDecodeError``
+    when the wrapped command writes bytes that are not decodable as
+    UTF-8. The broad ``except Exception`` path then caught that error
+    and recorded ``exit_code=-1, status=FAIL, stdout=""`` — so a
+    successful phase that happened to print non-UTF-8 bytes was
+    falsely recorded as failed and could block ledger validation. The
+    fix drops ``text=True`` and decodes the captured bytes with
+    ``errors="replace"`` to preserve the real exit code.
+    """
+    import subprocess
+    import sys as _sys
+
+    # Helper script that writes a non-UTF-8 byte sequence to stdout
+    # and exits 0. We use Python so the test does not depend on
+    # platform-specific shell behavior with binary data.
+    helper = tmp_path / "print_non_utf8.py"
+    helper.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfe\\x00\\x01NON_UTF8_OUTPUT\\n')\n"
+        "sys.exit(0)\n"
+    )
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "non-utf8-1",
+            "--phase-id", "PHASE_NON_UTF8",
+            "--phase-index", "1",
+            "--source-task-id", "aed.phase-ledger.v0",
+            "--task-packet-id", "phase-ledger-pr1",
+            # No --observed-summary; we want to also exercise the
+            # round-5 summary-synthesis path on the real exit code.
+            "--", _sys.executable, str(helper),
+        ],
+        capture_output=True, text=True,
+    )
+    # phase_exec itself should exit 0 because the wrapped command
+    # exited 0; the previous bug would have made phase_exec record
+    # FAIL and propagate a nonzero exit code.
+    assert proc.returncode == 0, (
+        f"phase_exec propagated wrong exit: "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+    obj = json.loads(ledger.read_text().strip())
+    # The real exit code must be preserved.
+    assert obj["exit_code"] == 0
+    # And the status must be PASS, not FAIL.
+    assert obj["status"] == "PASS"
+    # The synthesized summary is still non-empty (round-5 invariant).
+    assert isinstance(obj["observed_summary"], str)
+    assert obj["observed_summary"] != ""
+    # The artifact file must exist and contain at least the readable
+    # suffix of the wrapped command's output (the undecodable bytes
+    # are replaced with U+FFFD, but the readable tail survives).
+    from pathlib import Path as _P
+    captured = _P(obj["stdout_path"]).read_text()
+    assert "NON_UTF8_OUTPUT" in captured
+
+
+def test_phase_exec_synthesized_summary_validates_for_non_utf8_phase(tmp_path):
+    """A PASS entry produced by a non-UTF-8-emitting command must validate cleanly.
+
+    End-to-end regression guard: a phase that exits 0 and writes
+    non-UTF-8 bytes must (a) be recorded as PASS, (b) carry a
+    non-empty observed_summary, and (c) satisfy the round-5 validator
+    with no RESULT_INCONSISTENT error.
+    """
+    import subprocess
+    import sys as _sys
+
+    from validate_phase_ledger import (
+        HOLD_VALID,
+        validate,
+    )
+
+    helper = tmp_path / "print_non_utf8_validate.py"
+    helper.write_text(
+        "import sys\n"
+        "sys.stdout.buffer.write(b'\\xff\\xfeVALIDATE_NON_UTF8\\n')\n"
+        "sys.exit(0)\n"
+    )
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "non-utf8-validate-1",
+            "--phase-id", "PHASE_NON_UTF8_VALIDATE",
+            "--phase-index", "1",
+            "--", _sys.executable, str(helper),
+        ],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, (
+        f"phase_exec propagated wrong exit: "
+        f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+    )
+
+    result = validate(
+        ledger_path=ledger,
+        claimed_phases=["PHASE_NON_UTF8_VALIDATE"],
+        expected_run_id="non-utf8-validate-1",
+    )
+
+    for err in result["errors"]:
+        assert err.get("kind") != "RESULT_INCONSISTENT", (
+            f"validator rejected non-UTF-8 PASS: {err}"
+        )
+    assert result["hold_state"] == HOLD_VALID, (
+        f"expected HOLD_VALID, got {result['hold_state']!r} "
+        f"with errors={result['errors']!r}"
+    )
+    assert result["valid"] is True
+
+
+def test_phase_exec_real_invocation_error_still_records_fail(tmp_path):
+    """A genuine invocation error (FileNotFoundError) must still record FAIL.
+
+    Negative regression guard: the previous bug fix uses a broad
+    ``except Exception`` path for genuine invocation errors. We want
+    to make sure the new bytes-capture path does not mask FileNotFoundError
+    or other real OS-level errors — a missing command must still be
+    recorded as FAIL with exit_code=127.
+    """
+    import subprocess
+    import sys as _sys
+
+    ledger = tmp_path / "phase_ledger.jsonl"
+    proc = subprocess.run(
+        [
+            _sys.executable,
+            str(SCRIPT_DIR / "phase_exec.py"),
+            "--ledger", str(ledger),
+            "--run-id", "missing-1",
+            "--phase-id", "PHASE_MISSING",
+            "--phase-index", "1",
+            # No such binary on PATH.
+            "--", "definitely-not-a-real-binary-xyz123",
+        ],
+        capture_output=True, text=True,
+    )
+    # phase_exec must propagate the FileNotFoundError as a nonzero exit.
+    assert proc.returncode != 0
+    obj = json.loads(ledger.read_text().strip())
+    assert obj["status"] == "FAIL"
+    assert obj["exit_code"] != 0
+    # Stderr artifact must record the not-found message.
+    from pathlib import Path as _P
+    captured_stderr = _P(obj["stderr_path"]).read_text()
+    assert "command not found" in captured_stderr or "not found" in captured_stderr
+
+
+# -----------------------------------------------------------------------------
 # 13. aed_final_gate.py integration tests
 # -----------------------------------------------------------------------------
 

@@ -177,18 +177,31 @@ def main(argv: list[str] | None = None) -> int:
 
     cwd = args.cwd or str(Path.cwd())
 
-    # Run the wrapped command
+    # Run the wrapped command.
+    #
+    # Round-5 P2 fix (Codex review on PR #390, thread
+    # PRRT_kwDOSHFpYM6Hn2SJ): subprocess.run(..., text=True) raises
+    # UnicodeDecodeError when the wrapped command writes bytes that are
+    # not decodable with the locale/default UTF-8 codec. That error
+    # would otherwise be caught by the broad ``except Exception`` path
+    # below, which records exit_code=-1 and status=FAIL — so a
+    # successful phase that happens to write non-UTF-8 bytes would be
+    # falsely recorded as failed. We capture bytes here and decode with
+    # errors="replace" to preserve the real exit code; replacement
+    # characters in the artifact text are acceptable because the
+    # captured bytes are still on disk in their original form via the
+    # bytes path (and downstream validators only check the exit code,
+    # not the rendered text).
     try:
         proc = subprocess.run(
             cmd,
             cwd=cwd,
             capture_output=True,
-            text=True,
             timeout=args.timeout_seconds,
         )
         exit_code = proc.returncode
-        stdout_text = proc.stdout
-        stderr_text = proc.stderr
+        stdout_text = proc.stdout.decode("utf-8", errors="replace") if isinstance(proc.stdout, (bytes, bytearray)) else (proc.stdout or "")
+        stderr_text = proc.stderr.decode("utf-8", errors="replace") if isinstance(proc.stderr, (bytes, bytearray)) else (proc.stderr or "")
     except subprocess.TimeoutExpired as e:
         stdout_text = e.stdout.decode("utf-8", errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         stderr_text = (e.stderr.decode("utf-8", errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")) + f"\n[phase_exec] timeout after {args.timeout_seconds}s"
