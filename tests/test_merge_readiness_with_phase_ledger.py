@@ -128,10 +128,45 @@ def _mock_run_finalize(monkeypatch, return_value: int) -> MagicMock:
 
 
 def _mock_subprocess_run(monkeypatch, returncode: int = 0) -> MagicMock:
-    """Replace ``subprocess.run`` with a MagicMock returning ``returncode``."""
+    """Replace ``subprocess.run`` with a MagicMock returning ``returncode``.
+
+    Used by tests that exercise the default-off path (no
+    subprocess.run for gh pr view) or that only have the phase gate
+    fail (gate returns non-zero so subprocess.run is not called at
+    all). For tests that exercise the opt-in path with a successful
+    phase gate, use ``_mock_subprocess_dual`` instead.
+    """
     mock = MagicMock(return_value=subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout="", stderr="",
     ))
+    monkeypatch.setattr(m.subprocess, "run", mock)
+    return mock
+
+
+def _mock_subprocess_dual(
+    monkeypatch,
+    *,
+    gh_stdout: str = "",
+    gh_rc: int = 0,
+    merge_rc: int = 0,
+) -> MagicMock:
+    """Mock ``subprocess.run`` for the opt-in path with a successful
+    phase gate: first call is the read-only ``gh pr view`` recheck;
+    second call is ``merge_pr_safely.py``.
+
+    Returns a single MagicMock whose ``side_effect`` is a list of two
+    CompletedProcess responses. Tests that exercise this path
+    should use this helper instead of ``_mock_subprocess_run``.
+    """
+    responses = [
+        subprocess.CompletedProcess(
+            args=[], returncode=gh_rc, stdout=gh_stdout, stderr="",
+        ),
+        subprocess.CompletedProcess(
+            args=[], returncode=merge_rc, stdout="", stderr="",
+        ),
+    ]
+    mock = MagicMock(side_effect=responses)
     monkeypatch.setattr(m.subprocess, "run", mock)
     return mock
 
@@ -171,7 +206,14 @@ def test_no_run_summary_skips_phase_ledger_gate(monkeypatch, tmp_path):
 
 def test_run_summary_pass_proceeds_to_merge_pr_safely(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+    # Two-call mock: first (gh pr view) returns the expected SHA
+    # with rc=0; second (merge_pr_safely.py) returns rc=0.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
 
     args = _opt_in_args(
         output_json=str(tmp_path / "out.json"),
@@ -181,7 +223,7 @@ def test_run_summary_pass_proceeds_to_merge_pr_safely(monkeypatch, tmp_path):
 
     # Both called exactly once.
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 1
+    assert mock_sub.call_count == 2
     # Exit code 0.
     assert rc == 0
 
@@ -294,7 +336,14 @@ def test_missing_required_phase_gate_args_exits_2(
 def test_real_expected_head_sha_passed_to_finalize(monkeypatch, tmp_path):
     real_sha = "abcdef1234567890abcdef1234567890abcdef12"
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+    # Two-call mock: gh pr view returns the same real SHA so the
+    # wrapper proceeds to merge_pr_safely.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=real_sha,
+        gh_rc=0,
+        merge_rc=0,
+    )
 
     args = _opt_in_args(
         expected_head_sha=real_sha,
@@ -326,7 +375,14 @@ def test_real_expected_head_sha_passed_to_finalize(monkeypatch, tmp_path):
 
 def test_allowed_files_passed_to_finalize_not_merge_pr_safely(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+    # Two-call mock: gh pr view returns the expected SHA so the
+    # wrapper proceeds to merge_pr_safely.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
 
     args = _opt_in_args(
         allowed_files="scripts/**,tests/**,docs/**",
@@ -340,8 +396,9 @@ def test_allowed_files_passed_to_finalize_not_merge_pr_safely(monkeypatch, tmp_p
     ns = mock_gate.call_args.args[0]
     assert ns.allowed_files == "scripts/**,tests/**,docs/**"
     # The merge_pr_safely subprocess command does NOT contain
-    # --allowed-files (or any wrapper-only arg).
-    cmd = mock_sub.call_args.args[0]
+    # --allowed-files (or any wrapper-only arg). The second
+    # subprocess.run call (index 1) is the merge_pr_safely call.
+    cmd = mock_sub.call_args_list[1].args[0]
     joined = " ".join(cmd)
     assert "--allowed-files" not in joined
     assert "--run-summary" not in joined
@@ -359,7 +416,14 @@ def test_allowed_files_passed_to_finalize_not_merge_pr_safely(monkeypatch, tmp_p
 
 def test_phase_gate_output_paths_passed_to_finalize(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+    # Two-call mock: gh pr view returns the expected SHA so the
+    # wrapper proceeds to merge_pr_safely.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
 
     args = _opt_in_args(
         phase_gate_output_json="/tmp/some/FINAL_GATE.json",
@@ -423,7 +487,14 @@ def test_merge_pr_safely_exit_code_propagates_after_phase_gate_pass(
     monkeypatch, tmp_path
 ):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=1)
+    # Two-call mock: gh pr view returns the expected SHA
+    # (rc=0); merge_pr_safely returns rc=1.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=1,
+    )
 
     args = _opt_in_args(
         output_json=str(tmp_path / "out.json"),
@@ -433,7 +504,7 @@ def test_merge_pr_safely_exit_code_propagates_after_phase_gate_pass(
 
     assert rc == 1
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 1
+    assert mock_sub.call_count == 2
 
 
 # ---------------------------------------------------------------------------
@@ -445,7 +516,14 @@ def test_merge_pr_safely_exit_code_propagates_after_phase_gate_pass(
 
 def test_merge_pr_safely_command_uses_python_and_script_path(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
-    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+    # Two-call mock: gh pr view returns the expected SHA so the
+    # wrapper proceeds to merge_pr_safely.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
 
     args = _opt_in_args(
         output_json=str(tmp_path / "out.json"),
@@ -454,7 +532,9 @@ def test_merge_pr_safely_command_uses_python_and_script_path(monkeypatch, tmp_pa
     rc = m.run_wrapper(args)
 
     assert rc == 0
-    cmd = mock_sub.call_args.args[0]
+    # The merge_pr_safely subprocess command is the SECOND
+    # subprocess.run call (index 1).
+    cmd = mock_sub.call_args_list[1].args[0]
     # First two elements: [python_executable, scripts/local/merge_pr_safely.py]
     assert cmd[0] == sys.executable
     assert cmd[1].endswith("merge_pr_safely.py")
@@ -525,3 +605,274 @@ def test_module_imports_cleanly():
     # already passed at import. Re-invoke it explicitly.
     src = Path(m.__file__).read_text(encoding="utf-8")
     assert m._forbidden_self_check(src) == []
+
+
+# ---------------------------------------------------------------------------
+# P1 REGRESSION GUARDS (PR #393 — Codex inline comment id 3370199372):
+# The wrapper must re-fetch the live PR head after a successful phase
+# gate, and must NOT call merge_pr_safely.py if the live head differs
+# from args.expected_head_sha, or if the recheck itself fails.
+# ---------------------------------------------------------------------------
+
+
+def test_head_match_proceeds_to_merge_pr_safely_after_phase_gate(
+    monkeypatch, tmp_path
+):
+    """After a successful phase gate, when the live PR head matches
+    args.expected_head_sha, the wrapper proceeds to invoke
+    merge_pr_safely.py with rc=0 → wrapper exit code 0.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    # Phase gate called once; two subprocess calls (gh pr view + merge_pr_safely).
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 2
+
+
+def test_hold_head_changed_blocks_merge_pr_safely(monkeypatch, tmp_path):
+    """If gh pr view returns a head different from args.expected_head_sha
+    AFTER the phase gate has passed, the wrapper must NOT invoke
+    merge_pr_safely.py. It must print HOLD_HEAD_CHANGED to stderr
+    and exit 1.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Two-call mock: gh pr view returns a DIFFERENT SHA
+    # (rc=0); merge_pr_safely should never be called.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="1111111111111111111111111111111111111111",  # different from expected
+        gh_rc=0,
+        merge_rc=0,  # would be ignored; merge_pr_safely is not called
+    )
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 1
+    # Phase gate called once; only the gh pr view subprocess ran
+    # (merge_pr_safely was NOT called).
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 1  # only the gh call
+    err = captured_err.getvalue()
+    assert "HOLD_HEAD_CHANGED" in err
+    assert "7f7cb30a636036158ceaae32e30bb492bc221ebf" in err
+    assert "1111111111111111111111111111111111111111" in err
+    assert "merge_pr_safely not invoked" in err
+
+
+def test_head_recheck_failure_exits_2_and_blocks_merge_pr_safely(
+    monkeypatch, tmp_path
+):
+    """If gh pr view fails (non-zero exit or empty stdout), the
+    wrapper must treat it as a hard error: exit 2 and do NOT
+    invoke merge_pr_safely.py.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Two-call mock: gh pr view fails (rc=1); merge_pr_safely
+    # would be ignored but the wrapper must not reach it.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="",
+        gh_rc=1,
+        merge_rc=0,
+    )
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 1  # only the failed gh call
+    err = captured_err.getvalue()
+    assert "unable to recheck PR head" in err
+    assert "merge_pr_safely not invoked" in err
+
+
+def test_head_recheck_failure_with_empty_stdout_exits_2(
+    monkeypatch, tmp_path
+):
+    """If gh pr view returns rc=0 but with empty stdout (a partial
+    failure mode), the wrapper must still treat it as a failure
+    and exit 2.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="",  # empty
+        gh_rc=0,        # rc=0 (deceptive — empty output is a failure)
+        merge_rc=0,
+    )
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 2
+    assert mock_sub.call_count == 1
+
+
+def test_head_recheck_failure_with_malformed_sha_exits_2(
+    monkeypatch, tmp_path
+):
+    """If gh pr view returns a non-SHA value (e.g. an error message
+    that happened to be on stdout with rc=0), the wrapper must
+    reject it and exit 2.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="not a sha",  # malformed
+        gh_rc=0,
+        merge_rc=0,
+    )
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 2
+    assert mock_sub.call_count == 1
+
+
+def test_no_run_summary_does_not_fetch_head(monkeypatch, tmp_path):
+    """In the default-off path (no --run-summary), the wrapper must
+    NOT make a gh pr view call. It only delegates directly to
+    merge_pr_safely.py.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+
+    args = _base_args(
+        run_summary=None,
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    # No phase gate, no gh pr view — just one merge_pr_safely call.
+    assert mock_gate.call_count == 0
+    assert mock_sub.call_count == 1
+    # Confirm the single subprocess call is merge_pr_safely, not gh.
+    cmd = mock_sub.call_args.args[0]
+    assert "gh" not in cmd or "merge_pr_safely.py" in str(cmd)
+
+
+def test_head_recheck_uses_read_only_gh_pr_view(monkeypatch, tmp_path):
+    """The head-recheck subprocess command must be a read-only
+    ``gh pr view --json headRefOid --jq .headRefOid`` invocation.
+    It must NOT include any mutating gh subcommand, --admin, or
+    --auto.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+    )
+
+    args = _opt_in_args(
+        repo="Slideshow11/Automated-Edge-Discovery",
+        pr_number=393,
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    # The FIRST subprocess.run call (index 0) is the gh pr view.
+    cmd = mock_sub.call_args_list[0].args[0]
+    assert "gh" in cmd
+    assert "pr" in cmd
+    assert "view" in cmd
+    assert "393" in cmd
+    assert "--repo" in cmd
+    assert "Slideshow11/Automated-Edge-Discovery" in cmd
+    assert "--json" in cmd
+    assert "headRefOid" in cmd
+    assert "--jq" in cmd
+    assert ".headRefOid" in cmd
+    # Negative assertions: no mutating flags, no admin/auto.
+    joined = " ".join(cmd)
+    assert "merge" not in joined  # no "gh pr merge"
+    assert "create" not in joined  # no "gh pr create"
+    assert "edit" not in joined   # no "gh pr edit"
+    assert "delete" not in joined  # no "gh pr delete" / branch delete
+    assert "--admin" not in joined
+    assert "--auto" not in joined
+
+
+def test_expected_head_sha_used_for_comparison_after_gate(
+    monkeypatch, tmp_path
+):
+    """Two scenarios in one test: (a) when gh returns the same
+    SHA, merge_pr_safely proceeds; (b) when gh returns a
+    different SHA, merge_pr_safely is blocked.
+    """
+    expected_sha = "abcdef1234567890abcdef1234567890abcdef12"
+
+    # ---- Sub-scenario (a): head matches ----
+    mock_gate_a = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub_a = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected_sha,  # matches
+        gh_rc=0,
+        merge_rc=0,
+    )
+    args_a = _opt_in_args(
+        expected_head_sha=expected_sha,
+        output_json=str(tmp_path / "a.json"),
+        output_md=str(tmp_path / "a.md"),
+    )
+    rc_a = m.run_wrapper(args_a)
+    assert rc_a == 0
+    assert mock_sub_a.call_count == 2  # gh + merge_pr_safely
+
+    # ---- Sub-scenario (b): head differs ----
+    # Re-mock for the second sub-scenario.
+    mock_gate_b = _mock_run_finalize(monkeypatch, return_value=0)
+    mock_sub_b = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="ffffffffffffffffffffffffffffffffffffffff",  # different
+        gh_rc=0,
+        merge_rc=0,
+    )
+    args_b = _opt_in_args(
+        expected_head_sha=expected_sha,
+        output_json=str(tmp_path / "b.json"),
+        output_md=str(tmp_path / "b.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc_b = m.run_wrapper(args_b)
+    assert rc_b == 1
+    assert mock_sub_b.call_count == 1  # only gh, no merge_pr_safely
+    assert "HOLD_HEAD_CHANGED" in captured_err.getvalue()

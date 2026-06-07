@@ -283,6 +283,66 @@ def _run_merge_pr_safely(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Live PR head re-fetch (P1 regression guard on PR #393)
+# ---------------------------------------------------------------------------
+
+
+def _build_fetch_live_head_cmd(repo: str, pr_number: int) -> list:
+    """Build the read-only ``gh pr view`` argv used to recheck the live
+    PR head after the phase-ledger gate has passed.
+
+    This closes the Codex P1 finding on PR #393 (inline comment id
+    3370199372): the phase-gate validates ``args.expected_head_sha``,
+    but ``merge_pr_safely.py`` re-fetches the live head itself. If
+    the branch receives a new commit between the gate and the
+    subprocess invocation, ``merge_pr_safely.py`` would otherwise
+    build readiness/merge-command output for code that the
+    runner-produced ledger never covered. This recheck catches
+    that window.
+    """
+    return [
+        "gh", "pr", "view", str(pr_number),
+        "--repo", repo,
+        "--json", "headRefOid",
+        "--jq", ".headRefOid",
+    ]
+
+
+def _fetch_live_pr_head(repo: str, pr_number: int) -> "tuple[bool, Optional[str]]":
+    """Read-only ``gh pr view`` call to re-fetch the live PR head.
+
+    Returns ``(True, head_sha)`` on success where ``head_sha`` is
+    a 40-char hex string with surrounding whitespace stripped.
+    Returns ``(False, None)`` on any failure: subprocess non-zero
+    exit, empty stdout, malformed JSON, or a non-SHA stdout.
+
+    This is intentionally read-only: it never invokes
+    ``gh pr merge``, ``gh pr create``, ``gh pr edit``, or any
+    state-mutating endpoint. The command is a single
+    ``gh pr view --json headRefOid --jq .headRefOid`` call.
+    """
+    cmd = _build_fetch_live_head_cmd(repo, pr_number)
+    completed = subprocess.run(
+        cmd,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        return False, None
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return False, None
+    # Sanity: must look like a 40-char hex SHA. If it doesn't,
+    # treat as a failure (defensive — protects against a future
+    # ``gh`` version that returns a different shape).
+    import re as _re
+    if not _re.fullmatch(r"[0-9a-f]{40}", raw):
+        return False, None
+    return True, raw
+
+
+# ---------------------------------------------------------------------------
 # Phase-gate required-arg validation
 # ---------------------------------------------------------------------------
 
@@ -323,6 +383,9 @@ def run_wrapper(args: argparse.Namespace) -> int:
       1. _reject_admin (defense in depth).
       2. If args.run_summary is None:
            - default-off: skip the phase-gate adapter.
+           - skip the live-head recheck (only the opt-in path
+             needs it; the default-off path delegates to
+             merge_pr_safely which fetches its own head).
            - invoke merge_pr_safely.py directly.
            - return merge_pr_safely's exit code.
       3. If args.run_summary is provided:
@@ -331,8 +394,13 @@ def run_wrapper(args: argparse.Namespace) -> int:
            - invoke the phase-gate adapter.
              If the adapter returns non-zero, exit with the
              adapter's code and do NOT invoke merge_pr_safely.
-           - If the adapter returns 0, invoke merge_pr_safely
-             and return its exit code.
+           - If the adapter returns 0, RE-CHECK the live PR head
+             against args.expected_head_sha (closes the Codex P1
+             finding on PR #393 — see inline comment id
+             3370199372). On any discrepancy (head differs OR
+             fetch fails), exit non-zero and do NOT invoke
+             merge_pr_safely. Only when the live head matches do
+             we proceed to merge_pr_safely.
     """
     _reject_admin(args)
 
@@ -371,7 +439,36 @@ def run_wrapper(args: argparse.Namespace) -> int:
         )
         return gate_rc
 
-    # Gate returned 0 (MERGE_READY). Proceed to merge_pr_safely.
+    # Gate returned 0 (MERGE_READY). BEFORE invoking
+    # merge_pr_safely, re-fetch the live PR head and compare it
+    # to args.expected_head_sha. If the branch received a new
+    # commit between the gate and now, merge_pr_safely would
+    # otherwise build readiness output for code the ledger never
+    # covered. This is the P1 fix for inline comment 3370199372.
+    ok, live_head = _fetch_live_pr_head(args.repo, args.pr_number)
+    if not ok:
+        # Read-only gh pr view failed (subprocess non-zero, empty
+        # stdout, or non-SHA result). Treat as a hard error: do
+        # NOT delegate to merge_pr_safely.
+        print(
+            "merge_readiness_with_phase_ledger: unable to recheck PR head "
+            "after phase-ledger gate; merge_pr_safely not invoked",
+            file=sys.stderr,
+        )
+        return 2
+    if live_head != args.expected_head_sha:
+        # Head changed between the gate and the subprocess. The
+        # ledger evidence no longer covers the live head. Block
+        # the delegation.
+        print(
+            f"HOLD_HEAD_CHANGED: phase-ledger gate validated "
+            f"{args.expected_head_sha} but PR head is now {live_head}; "
+            "merge_pr_safely not invoked",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Live head matches the validated head. Proceed to merge_pr_safely.
     return _run_merge_pr_safely(args)
 
 
