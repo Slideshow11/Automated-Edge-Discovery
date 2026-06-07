@@ -53,6 +53,15 @@ FORBIDDEN_EXECUTION_MODES = frozenset(["claude", "live", "real"])
 # Subprocess timeout for each stage (seconds)
 STAGE_TIMEOUT = 600
 
+# When wrapping a stage with phase_exec.py (opt-in phase-ledger mode), the
+# wrapper process needs a small grace period AFTER its inner --timeout-seconds
+# fires so it can catch the child's TimeoutExpired, append the FAIL ledger
+# line, and exit cleanly. The controller's outer run_stage timeout is bumped
+# by this many seconds; the inner --timeout-seconds passed to phase_exec.py
+# stays at STAGE_TIMEOUT so the user-facing timeout semantics are unchanged.
+# Addresses Codex P1 on PR #391, inline comment id 3369426185.
+PHASE_EXEC_OUTER_TIMEOUT_CUSHION_SECONDS = 30
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -657,12 +666,14 @@ def _run_stage_with_evidence(
     ``run_stage``. When set, the wrapped command is ``phase_exec.py ... -- <argv>``
     so that one canonical ledger line is appended per stage.
 
-    When wrapping, the same ``timeout`` (default ``STAGE_TIMEOUT``) is
-    passed to ``phase_exec.py`` via ``--timeout-seconds`` AND used for
-    the outer ``run_stage`` call. This guarantees the wrapper and the
-    wrapped stage share one timeout — preventing orphan stage processes
-    when the outer timeout fires before phase_exec.py can enforce it
-    on its child (Codex P1 on PR #391, comment id 3368989413).
+    When wrapping, ``--timeout-seconds <timeout>`` is passed to
+    ``phase_exec.py`` (the inner timeout — the one that fires on the
+    stage itself) and the outer ``run_stage`` call is given
+    ``timeout + PHASE_EXEC_OUTER_TIMEOUT_CUSHION_SECONDS`` so the wrapper
+    outlives its child long enough to catch the child's
+    ``TimeoutExpired`` and append a canonical FAIL ledger entry
+    before the controller kills it. The disabled path keeps
+    ``run_stage(..., timeout=timeout)`` exactly as before.
 
     The function returns ``(returncode, stdout, stderr)`` of the *outer*
     phase_exec.py invocation when ledger is enabled (so existing
@@ -674,6 +685,8 @@ def _run_stage_with_evidence(
 
     phase_exec_script = SCRIPT_DIR / "phase_exec.py"
     observed_summary = f"single-task stage ran phase_exec phase_id={phase_id}"
+    inner_timeout = timeout
+    outer_timeout = timeout + PHASE_EXEC_OUTER_TIMEOUT_CUSHION_SECONDS
     wrapped_argv = [
         "python3",
         str(phase_exec_script),
@@ -682,11 +695,11 @@ def _run_stage_with_evidence(
         "--phase-id", phase_id,
         "--observed-summary", observed_summary,
         "--cwd", str(cwd),
-        "--timeout-seconds", str(timeout),
+        "--timeout-seconds", str(inner_timeout),
         "--",
         *stage_argv,
     ]
-    return run_stage(wrapped_argv, cwd, timeout=timeout)
+    return run_stage(wrapped_argv, cwd, timeout=outer_timeout)
 
 
 def load_stage_json(path: Path) -> Optional[dict]:
