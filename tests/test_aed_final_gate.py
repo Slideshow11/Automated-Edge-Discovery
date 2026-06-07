@@ -1814,3 +1814,364 @@ _MOCK_PR_HEAD_RESPONSE = {
         }
     }
 }
+
+
+# -----------------------------------------------------------------------------
+# require_phase_ledger fail-closed tests (Codex round 4 P2 fix on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def _make_phase_ledger_gate_mocks(sha="46f3bf2b4fc490f3991409c33448c678c2f6ea10"):
+    """Build minimal mocks for tests that exercise require_phase_ledger."""
+    from unittest.mock import MagicMock
+
+    def fake_subprocess_run(*args, **kwargs):
+        cmd = args[0] if args else kwargs.get("args", [])
+        if isinstance(cmd, list):
+            if cmd[0] == "git" and len(cmd) >= 4 and cmd[2] == "get-url" and cmd[3] == "origin":
+                return MagicMock(
+                    stdout="https://github.com/Slideshow11/Automated-Edge-Discovery.git",
+                    returncode=0,
+                )
+            if cmd[0] == "gh" and "api" in cmd:
+                return MagicMock(stdout="{}", returncode=0)
+        return MagicMock(stdout="{}", returncode=0)
+
+    def fake_gh_pr_info(pr_number, repo):
+        return {
+            "number": 389,
+            "state": "open",
+            "mergeable": "MERGEABLE",
+            "head": {"sha": sha},
+            "headRefOid": sha,
+            "changed_files": [
+                "scripts/local/run_autocoder_single_task.py",
+            ],
+            "base": {"sha": "a844c1a1a95e584220bd16b33a58da549e62e228"},
+        }
+
+    def fake_gh_runs_for_sha(s, repo):
+        return [{"head_sha": sha, "name": "CI", "conclusion": "success"}]
+
+    def fake_gh(query, *args):
+        # Return a minimal file list for the changed-files query
+        return _MOCK_PR_FILES_RESPONSE
+
+    return fake_subprocess_run, fake_gh_pr_info, fake_gh_runs_for_sha, fake_gh
+
+
+def _build_standard_gate_inputs(tmp_path, sha="46f3bf2b4fc490f3991409c33448c678c2f6ea10"):
+    """Build the standard validation/codex files used by phase-ledger tests."""
+    validation_file = tmp_path / "validation.json"
+    validation_file.write_text(json.dumps({
+        "tests_collected": 153, "passed": 153, "exit_code": 0,
+    }))
+    codex_file = tmp_path / "codex.md"
+    codex_file.write_text(f"Codex review of commit {sha}\nCLEAN — no issues.\n")
+    return validation_file, codex_file
+
+
+def test_aed_final_gate_require_phase_ledger_without_claims_fails_closed(tmp_path):
+    """With --require-phase-ledger but no --claimed-phases, the gate fails closed.
+
+    Regression guard for the Codex P2 finding: previously when
+    require_phase_ledger=True but claimed_phases was None, the validator
+    degraded to internal-consistency-only and could return HOLD_VALID for
+    an empty ledger, leaving final_recommendation as MERGE_READY. The
+    fix: the gate now forces HOLD_UNEVIDENCED_PASS when require_phase_ledger
+    is set but claimed_phases is missing.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file, codex_file = _build_standard_gate_inputs(tmp_path, sha)
+    # An existing (empty) ledger — without the fix this would pass
+    # internal-consistency checks and yield HOLD_VALID
+    empty_ledger = tmp_path / "empty_phase_ledger.jsonl"
+    empty_ledger.write_text("")
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_phase_ledger_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(empty_ledger),
+            claimed_phases=None,  # missing
+            require_phase_ledger=True,
+        )
+
+    # The gate must NOT recommend MERGE_READY when claims are missing
+    assert gate["final_recommendation"] != "MERGE_READY"
+    pl = gate["phase_ledger"]
+    # hold_state must be a failing state
+    assert pl["hold_state"] in ("HOLD_UNEVIDENCED_PASS", "HOLD_PHASE_EVIDENCE_CORRUPTED")
+    # An error should mention require_phase_ledger and claimed_phases
+    detail_blob = " ".join(
+        e.get("detail", "") for e in pl.get("errors", [])
+    )
+    assert "require_phase_ledger" in detail_blob or "require-phase-ledger" in detail_blob
+    assert "claimed_phases" in detail_blob or "claimed-phases" in detail_blob
+    # final_recommendation should be the hold state
+    assert gate["final_recommendation"] == pl["hold_state"]
+
+
+def test_aed_final_gate_require_phase_ledger_with_empty_claims_fails_closed(tmp_path):
+    """With --require-phase-ledger and an explicit empty --claimed-phases list, the gate fails closed.
+
+    Same as above but with claimed_phases=[] (empty list, not None).
+    Both code paths must fail closed.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file, codex_file = _build_standard_gate_inputs(tmp_path, sha)
+    empty_ledger = tmp_path / "empty_phase_ledger.jsonl"
+    empty_ledger.write_text("")
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_phase_ledger_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(empty_ledger),
+            claimed_phases=[],  # explicit empty
+            require_phase_ledger=True,
+        )
+
+    assert gate["final_recommendation"] != "MERGE_READY"
+    pl = gate["phase_ledger"]
+    assert pl["hold_state"] in ("HOLD_UNEVIDENCED_PASS", "HOLD_PHASE_EVIDENCE_CORRUPTED")
+    detail_blob = " ".join(
+        e.get("detail", "") for e in pl.get("errors", [])
+    )
+    assert "require_phase_ledger" in detail_blob or "require-phase-ledger" in detail_blob
+    assert "claimed_phases" in detail_blob or "claimed-phases" in detail_blob
+    assert gate["final_recommendation"] == pl["hold_state"]
+
+
+# -----------------------------------------------------------------------------
+# require_phase_ledger + expected_run_id plumbing (Codex round 5 P2 fix on PR #390)
+# -----------------------------------------------------------------------------
+
+
+def _build_canonical_ledger_line(
+    out_dir, run_id, phase_id, observed="ok"
+):
+    """Build a canonical (writer=script) PASS entry pointing at real
+    on-disk stdout/stderr artifacts. Returns the entry dict.
+    """
+    out = out_dir / f"{run_id}_{phase_id}_stdout.txt"
+    err = out_dir / f"{run_id}_{phase_id}_stderr.txt"
+    out.write_text(observed + "\n")
+    err.write_text("")
+    # Build via the canonical entry builder to ensure schema compliance
+    from phase_ledger import build_entry
+    return build_entry(
+        run_id=run_id,
+        phase_id=phase_id,
+        phase_index=1,
+        writer="script",
+        script="scripts/local/some_script.py",
+        argv=["--do", "thing"],
+        exit_code=0,
+        stdout_path=str(out),
+        stderr_path=str(err),
+        observed_summary=observed,
+        status="PASS",
+        timestamp="2026-06-06T00:00:00Z",
+    )
+
+
+def test_aed_final_gate_require_phase_ledger_without_expected_run_id_fails_closed(tmp_path):
+    """With --require-phase-ledger but no --phase-ledger-expected-run-id, the gate fails closed.
+
+    Regression guard for the Codex round 5 P2 finding: previously the
+    gate called _validate_phase_ledger(claimed_phases=...) without
+    passing expected_run_id. With a long-lived append-only ledger,
+    stale canonical PASS from prior runs would satisfy the current
+    claim. The fix: when require_phase_ledger is on, the gate requires
+    a non-empty phase_ledger_expected_run_id; otherwise it forces
+    HOLD_UNEVIDENCED_PASS.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file, codex_file = _build_standard_gate_inputs(tmp_path, sha)
+    # Build a real ledger with canonical evidence for PHASE_1
+    ledger = tmp_path / "phase_ledger.jsonl"
+    from phase_ledger import append_entry
+    append_entry(
+        _build_canonical_ledger_line(tmp_path, "run_new", "PHASE_1"),
+        ledger,
+    )
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_phase_ledger_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(ledger),
+            claimed_phases=["PHASE_1"],
+            require_phase_ledger=True,
+            phase_ledger_expected_run_id=None,  # missing
+        )
+
+    assert gate["final_recommendation"] != "MERGE_READY"
+    pl = gate["phase_ledger"]
+    assert pl["hold_state"] in ("HOLD_UNEVIDENCED_PASS", "HOLD_PHASE_EVIDENCE_CORRUPTED")
+    detail_blob = " ".join(
+        e.get("detail", "") for e in pl.get("errors", [])
+    )
+    # Reason should mention expected_run_id
+    assert "expected_run_id" in detail_blob or "expected-run-id" in detail_blob
+    assert gate["final_recommendation"] == pl["hold_state"]
+
+
+def test_aed_final_gate_passes_expected_run_id_to_validator(tmp_path):
+    """When stale run evidence exists and expected_run_id is set, the gate does not merge-ready.
+
+    Locks in the run_id plumbing: with require_phase_ledger=True and
+    phase_ledger_expected_run_id=run_new, the gate must NOT validate
+    evidence from a different run_id (run_old). This is the primary
+    Codex round 5 P2 regression guard — stale canonical PASS must not
+    satisfy a current claim.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file, codex_file = _build_standard_gate_inputs(tmp_path, sha)
+    # Build a ledger with canonical PASS for run_old only
+    ledger = tmp_path / "phase_ledger.jsonl"
+    from phase_ledger import append_entry
+    append_entry(
+        _build_canonical_ledger_line(tmp_path, "run_old", "PHASE_1"),
+        ledger,
+    )
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_phase_ledger_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(ledger),
+            claimed_phases=["PHASE_1"],
+            require_phase_ledger=True,
+            phase_ledger_expected_run_id="run_new",
+        )
+
+    # Stale run_old evidence must NOT satisfy a run_new claim
+    assert gate["final_recommendation"] != "MERGE_READY"
+    pl = gate["phase_ledger"]
+    # Either the validator reports unevidenced (HOLD_UNEVIDENCED_PASS) or
+    # the gate flags the missing expected_run_id evidence.
+    assert pl["hold_state"] in (
+        "HOLD_UNEVIDENCED_PASS",
+        "HOLD_PHASE_EVIDENCE_CORRUPTED",
+    )
+    detail_blob = " ".join(
+        e.get("detail", "") for e in pl.get("errors", [])
+    )
+    # Must mention the stale run_id or the missing evidence for run_new
+    assert (
+        "run_old" in detail_blob
+        or "run_new" in detail_blob
+        or "expected_run_id" in detail_blob
+    )
+
+
+def test_aed_final_gate_accepts_matching_expected_run_id(tmp_path):
+    """When expected_run_id matches a canonical PASS in the ledger, the gate accepts the evidence.
+
+    Locks in the happy path: with require_phase_ledger=True and
+    phase_ledger_expected_run_id=run_new, a canonical PASS for run_new
+    satisfies the claim and the gate does not block on the phase-ledger
+    check.
+    """
+    from unittest.mock import patch as _patch
+
+    sha = "46f3bf2b4fc490f3991409c33448c678c2f6ea10"
+    validation_file, codex_file = _build_standard_gate_inputs(tmp_path, sha)
+    # Build a ledger with canonical PASS for run_new
+    ledger = tmp_path / "phase_ledger.jsonl"
+    from phase_ledger import append_entry
+    append_entry(
+        _build_canonical_ledger_line(tmp_path, "run_new", "PHASE_1"),
+        ledger,
+    )
+
+    fake_run, fake_pr, fake_runs, fake_gh = _make_phase_ledger_gate_mocks(sha=sha)
+
+    with _patch("subprocess.run", side_effect=fake_run), \
+         _patch("aed_final_gate.gh_pr_info", side_effect=fake_pr), \
+         _patch("aed_final_gate.gh_runs_for_sha", side_effect=fake_runs), \
+         _patch("aed_final_gate.gh", side_effect=fake_gh):
+        from aed_final_gate import run_final_gate
+        gate = run_final_gate(
+            pr_number=389,
+            expected_head_sha=sha,
+            allowed_files=["scripts/**", "tests/**"],
+            local_validation_path=str(validation_file),
+            codex_artifact_path=str(codex_file),
+            output_json_path=str(tmp_path / "FINAL_GATE.json"),
+            output_md_path=str(tmp_path / "FINAL_GATE.md"),
+            allow_admin=False,
+            phase_ledger_path=str(ledger),
+            claimed_phases=["PHASE_1"],
+            require_phase_ledger=True,
+            phase_ledger_expected_run_id="run_new",
+        )
+
+    pl = gate["phase_ledger"]
+    # Phase-ledger check itself must be valid
+    assert pl["required"] is True
+    assert pl["valid"] is True
+    assert pl["hold_state"] == "HOLD_VALID"
+    assert pl["line_count"] >= 1
+    # The phase-ledger check must NOT be the reason the gate is held
+    # (final_recommendation may still be MERGE_READY or BLOCK for other
+    # reasons, but the phase_ledger.hold_state must be HOLD_VALID)
+    assert pl["hold_state"] != "HOLD_UNEVIDENCED_PASS"
