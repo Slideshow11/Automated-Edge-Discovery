@@ -155,10 +155,23 @@ def _build_run_summary(
     output_json_path: Path,
     output_md_path: Optional[Path],
     task_packet: Optional[dict],
+    phase_ledger_path: Optional[Path] = None,
 ) -> dict:
-    """Build aed.run_summary.v0 payload from the controller result.
+    """
+    Build aed.run_summary.v0 payload from the controller result.
 
-    Pure function — no IO. Tolerates partial / fatal-result dicts.
+    Pure function - no IO. Tolerates partial / fatal-result dicts.
+
+    When ``phase_ledger_path`` is provided (i.e. phase-ledger support was
+    enabled for this run), three additional fields are included in the
+    summary:
+        - ``phase_ledger_path`` (absolute path to the JSONL ledger)
+        - ``phase_ledger_claimed_phases`` (the 5 stage phase IDs)
+        - ``phase_ledger_expected_run_id`` (the task_id used as run_id)
+
+    When ``phase_ledger_path`` is None, these fields are OMITTED (not
+    set to null) so that consumers do not see a shape change for the
+    pre-existing default behavior.
     """
     pkt = task_packet if isinstance(task_packet, dict) else {}
     res = result if isinstance(result, dict) else {}
@@ -220,7 +233,7 @@ def _build_run_summary(
     artifacts["final_status_json"] = str(output_json_path)
     artifacts["final_status_md"] = str(output_md_path) if output_md_path is not None else None
 
-    return {
+    summary = {
         "run_summary_version": RUN_SUMMARY_VERSION,
         "controller": RUN_SUMMARY_CONTROLLER,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -240,7 +253,14 @@ def _build_run_summary(
         "output_json": str(output_json_path),
         "output_md": str(output_md_path) if output_md_path is not None else None,
     }
-
+    # Phase-ledger fields: included only when ledger was actually written.
+    # Spec: omit (not null) when disabled, so consumers that strictly
+    # validate the field set see no change for the default-off path.
+    if phase_ledger_path is not None:
+        summary["phase_ledger_path"] = str(phase_ledger_path)
+        summary["phase_ledger_claimed_phases"] = list(PHASE_LEDGER_CLAIMED_PHASES)
+        summary["phase_ledger_expected_run_id"] = pkt.get("task_id") or res.get("task_id")
+    return summary
 
 def _write_run_summary(
     *,
@@ -248,15 +268,23 @@ def _write_run_summary(
     output_json_path: Path,
     output_md_path: Optional[Path],
     task_packet: Optional[dict],
+    phase_ledger_path: Optional[Path] = None,
 ) -> Optional[Path]:
-    """Best-effort write of run_summary.json beside output_json_path.
+    """
+    Best-effort write of run_summary.json beside output_json_path.
 
     Never raises. Returns the summary path on success, None on failure.
     A failure here MUST NOT change the controller's final_status.json
     outcome or exit code.
     """
     try:
-        summary = _build_run_summary(result, output_json_path, output_md_path, task_packet)
+        summary = _build_run_summary(
+            result=result,
+            output_json_path=output_json_path,
+            output_md_path=output_md_path,
+            task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
+        )
         summary_path = output_json_path.with_name("run_summary.json")
         _write_json(summary_path, summary)
         return summary_path
@@ -579,6 +607,79 @@ def run_stage(
         return -1, "", str(e)
 
 
+# ---------------------------------------------------------------------------
+# Phase ledger support (PR #391, opt-in)
+# ---------------------------------------------------------------------------
+#
+# When the task packet includes ``phase_ledger.enabled == True``, the runner
+# wraps each subprocess-driven stage with ``scripts/local/phase_exec.py`` so
+# that one canonical (writer=phase_exec) ledger line is appended per stage.
+# Stage 1 is in-process packet construction and is intentionally NOT wrapped.
+#
+# When the field is absent or False, behavior is identical to the pre-PR #391
+# runner: no phase_exec.py invocation, no ledger file written, no extra
+# fields on run_summary.json.
+
+# 5 subprocess-driven stages in pipeline order. Stage 1 is in-process and
+# skipped; Stage 7 (PR preview) is intentionally out of v1 scope.
+PHASE_LEDGER_PHASE_ID_BY_STAGE = {
+    2: "stage_2_temp_worktree_exec",
+    3: "stage_3_apply_readiness",
+    4: "stage_4_apply_preview",
+    5: "stage_5_apply_to_branch",
+    6: "stage_6_applied_branch_verify",
+}
+PHASE_LEDGER_CLAIMED_PHASES = list(PHASE_LEDGER_PHASE_ID_BY_STAGE.values())
+
+
+def _phase_ledger_enabled(task_packet: Optional[dict]) -> bool:
+    """Return True iff the task packet opts into phase-ledger production."""
+    if not isinstance(task_packet, dict):
+        return False
+    cfg = task_packet.get("phase_ledger")
+    if not isinstance(cfg, dict):
+        return False
+    return bool(cfg.get("enabled", False))
+
+
+def _run_stage_with_evidence(
+    stage_argv: list,
+    cwd: Path,
+    phase_id: Optional[str],
+    run_id: Optional[str],
+    ledger_path: Optional[Path],
+) -> tuple[int, str, str]:
+    """
+    Run a stage subprocess, optionally wrapping it with phase_exec.py.
+
+    When ``ledger_path`` is None (the default) this is identical to
+    ``run_stage``. When set, the wrapped command is ``phase_exec.py ... -- <argv>``
+    so that one canonical ledger line is appended per stage.
+
+    The function returns ``(returncode, stdout, stderr)`` of the *outer*
+    phase_exec.py invocation when ledger is enabled (so existing
+    returncode-handling code paths downstream continue to work — the
+    phase_exec.py wrapper propagates the wrapped command's exit code).
+    """
+    if not ledger_path or not phase_id or not run_id:
+        return run_stage(stage_argv, cwd)
+
+    phase_exec_script = SCRIPT_DIR / "phase_exec.py"
+    observed_summary = f"single-task stage ran phase_exec phase_id={phase_id}"
+    wrapped_argv = [
+        "python3",
+        str(phase_exec_script),
+        "--ledger", str(ledger_path),
+        "--run-id", run_id,
+        "--phase-id", phase_id,
+        "--observed-summary", observed_summary,
+        "--cwd", str(cwd),
+        "--",
+        *stage_argv,
+    ]
+    return run_stage(wrapped_argv, cwd)
+
+
 def load_stage_json(path: Path) -> Optional[dict]:
     """Load stage output JSON, return None on error."""
     return _load_json(path)
@@ -614,6 +715,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=None,
+            phase_ledger_path=None,
         )
         return result
 
@@ -633,6 +735,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=None,
         )
         return result
 
@@ -641,6 +744,16 @@ def run_autocoder_single_task(
     output_root = Path(output_root_str).resolve()
     task_id = task_packet["task_id"]
     branch_name = task_packet["branch_name"]
+
+    # Phase-ledger opt-in (PR #391). When the task packet includes
+    # ``phase_ledger.enabled == True`` we resolve a ledger path here and
+    # pass it down to every stage wrapper and to _write_run_summary.
+    # When disabled (the default), the value is None and downstream code
+    # takes the pre-PR-#391 path with no behavior change.
+    if _phase_ledger_enabled(task_packet):
+        phase_ledger_path = output_root / "phase_ledger.jsonl"
+    else:
+        phase_ledger_path = None
 
     # Output sub-paths
     execution_packet_path = output_root / "execution_packet.json"
@@ -690,7 +803,13 @@ def run_autocoder_single_task(
         "--output-md", str(result_md_path),
         "--repo-root", str(effective_repo_root),
     ]
-    rc2, stdout2, stderr2 = run_stage(stage2_argv, effective_repo_root)
+    rc2, stdout2, stderr2 = _run_stage_with_evidence(
+        stage_argv=stage2_argv,
+        cwd=effective_repo_root,
+        phase_id=PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+        run_id=task_id,
+        ledger_path=phase_ledger_path,
+    )
     del stage2_argv
 
     # Load result
@@ -715,6 +834,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -739,7 +859,13 @@ def run_autocoder_single_task(
         "--require-pmg-clean",
         "--execution-mode", exec_mode,
     ]
-    rc3, stdout3, stderr3 = run_stage(stage3_argv, effective_repo_root)
+    rc3, stdout3, stderr3 = _run_stage_with_evidence(
+        stage_argv=stage3_argv,
+        cwd=effective_repo_root,
+        phase_id=PHASE_LEDGER_PHASE_ID_BY_STAGE[3],
+        run_id=task_id,
+        ledger_path=phase_ledger_path,
+    )
     del stage3_argv
 
     stage3_data = load_stage_json(apply_readiness_json_path)
@@ -762,6 +888,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -780,7 +907,13 @@ def run_autocoder_single_task(
         "--output-md", str(apply_preview_md_path),
         "--execution-mode", exec_mode,
     ]
-    rc4, stdout4, stderr4 = run_stage(stage4_argv, effective_repo_root)
+    rc4, stdout4, stderr4 = _run_stage_with_evidence(
+        stage_argv=stage4_argv,
+        cwd=effective_repo_root,
+        phase_id=PHASE_LEDGER_PHASE_ID_BY_STAGE[4],
+        run_id=task_id,
+        ledger_path=phase_ledger_path,
+    )
     del stage4_argv
 
     stage4_data = load_stage_json(apply_preview_json_path)
@@ -803,6 +936,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -837,7 +971,13 @@ def run_autocoder_single_task(
         "--allow-real-apply",
         "--execution-mode", exec_mode,
     ]
-    rc5, stdout5, stderr5 = run_stage(stage5_argv, effective_repo_root)
+    rc5, stdout5, stderr5 = _run_stage_with_evidence(
+        stage_argv=stage5_argv,
+        cwd=effective_repo_root,
+        phase_id=PHASE_LEDGER_PHASE_ID_BY_STAGE[5],
+        run_id=task_id,
+        ledger_path=phase_ledger_path,
+    )
     del stage5_argv
 
     stage5_data = load_stage_json(apply_to_branch_json_path)
@@ -863,6 +1003,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -881,7 +1022,13 @@ def run_autocoder_single_task(
         "--output-json", str(applied_branch_verification_json_path),
         "--output-md", str(applied_branch_verification_md_path),
     ]
-    rc6, stdout6, stderr6 = run_stage(stage6_argv, effective_repo_root)
+    rc6, stdout6, stderr6 = _run_stage_with_evidence(
+        stage_argv=stage6_argv,
+        cwd=effective_repo_root,
+        phase_id=PHASE_LEDGER_PHASE_ID_BY_STAGE[6],
+        run_id=task_id,
+        ledger_path=phase_ledger_path,
+    )
     del stage6_argv
 
     stage6_data = load_stage_json(applied_branch_verification_json_path)
@@ -907,6 +1054,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -952,6 +1100,7 @@ def run_autocoder_single_task(
             output_json_path=output_json_path,
             output_md_path=output_md_path,
             task_packet=task_packet,
+            phase_ledger_path=phase_ledger_path,
         )
         return result
 
@@ -1068,6 +1217,7 @@ def run_autocoder_single_task(
         output_json_path=output_json_path,
         output_md_path=output_md_path,
         task_packet=task_packet,
+        phase_ledger_path=phase_ledger_path,
     )
 
     # Write markdown summary
