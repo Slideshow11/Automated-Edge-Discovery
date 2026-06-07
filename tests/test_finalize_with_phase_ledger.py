@@ -43,7 +43,7 @@ def _base_args(
     run_summary: str = "/tmp/run_summary.json",
     pr_number: int = 392,
     expected_head_sha: str = "bf4420084c1c2f1f0e7ff078bcac14c01f8f109a",
-    allowed_files: str = "scripts/**,tests/**",
+    allowed_files=None,  # str | list[str] | None; run_finalize normalizes
     local_validation_path: str = "/tmp/validation.json",
     codex_artifact_path: str = "/tmp/codex.md",
     output_json: str = "/tmp/FINAL_GATE.json",
@@ -543,3 +543,113 @@ def test_adapter_does_not_modify_output_paths(tmp_path, monkeypatch):
     call_kwargs = mock_run.call_args.kwargs
     assert call_kwargs["output_json_path"] == out_json
     assert call_kwargs["output_md_path"] == out_md
+
+
+# ---------------------------------------------------------------------------
+# 13. Codex P2 regression guard (PR #392 inline thread id
+#     PRRT_kwDOSHFpYM6Hrh_M, inline comment id 3369907492):
+#     When run_finalize() is called directly with a hand-built
+#     Namespace(allowed_files="scripts/**,tests/**"), the gate must
+#     receive a clean list[str], not the raw string. Previously this
+#     was a bypass that could let single-character glob patterns
+#     match every changed file (out-of-scope files incorrectly
+#     accepted).
+# ---------------------------------------------------------------------------
+
+
+def test_run_finalize_parses_comma_separated_allowed_files_directly(
+    tmp_path, monkeypatch
+):
+    summary_path = tmp_path / "run_summary.json"
+    _write_run_summary(summary_path)  # default-off ledger
+    mock_run = _mock_run_final_gate(monkeypatch, _MERGE_READY_GATE)
+
+    # Build a hand-built Namespace as a direct (non-CLI) caller
+    # would. The default in _base_args is the comma-separated
+    # string; the adapter MUST parse it before forwarding.
+    args = _base_args(
+        run_summary=str(summary_path),
+        allowed_files="scripts/**,tests/**",
+    )
+    rc = fwpl.run_finalize(args)
+
+    assert rc == 0
+    assert mock_run.call_count == 1
+    call_kwargs = mock_run.call_args.kwargs
+    # The gate receives a list[str], not the raw string.
+    assert call_kwargs["allowed_files"] == ["scripts/**", "tests/**"]
+    assert isinstance(call_kwargs["allowed_files"], list)
+    # Sanity: the rest of the kwargs are still correct.
+    assert call_kwargs["allow_admin"] is False
+    assert call_kwargs["require_phase_ledger"] is False
+
+
+def test_run_finalize_passes_list_allowed_files_through_unchanged(
+    tmp_path, monkeypatch
+):
+    """A direct caller that already pre-built a list[str] sees it
+    forwarded byte-for-byte — the helper is idempotent.
+    """
+    summary_path = tmp_path / "run_summary.json"
+    _write_run_summary(summary_path)
+    mock_run = _mock_run_final_gate(monkeypatch, _MERGE_READY_GATE)
+
+    pre_built = ["docs/**/*.md", "scripts/local/aed_final_gate.py"]
+    args = _base_args(
+        run_summary=str(summary_path),
+        allowed_files=pre_built,
+    )
+    fwpl.run_finalize(args)
+
+    call_kwargs = mock_run.call_args.kwargs
+    # Identity-preserving pass-through — no re-splitting, no strip.
+    assert call_kwargs["allowed_files"] == pre_built
+    assert call_kwargs["allowed_files"] is pre_built
+
+
+def test_run_finalize_passes_none_allowed_files_through(tmp_path, monkeypatch):
+    """A direct caller that sets allowed_files=None gets None at the gate.
+    The gate's signature is ``Optional[list[str]]`` and treats None
+    as "no scope constraint" (per the existing test_aed_final_gate.py
+    contract).
+    """
+    summary_path = tmp_path / "run_summary.json"
+    _write_run_summary(summary_path)
+    mock_run = _mock_run_final_gate(monkeypatch, _MERGE_READY_GATE)
+
+    args = _base_args(run_summary=str(summary_path), allowed_files=None)
+    fwpl.run_finalize(args)
+
+    call_kwargs = mock_run.call_args.kwargs
+    assert call_kwargs["allowed_files"] is None
+
+
+def test_parse_allowed_files_helper_unit():
+    """Unit tests for the normalization helper itself (no gate call)."""
+    assert fwpl._parse_allowed_files(None) is None
+    assert fwpl._parse_allowed_files("") == []
+    assert fwpl._parse_allowed_files("scripts/**") == ["scripts/**"]
+    assert fwpl._parse_allowed_files("scripts/**,tests/**") == [
+        "scripts/**",
+        "tests/**",
+    ]
+    # Trailing comma is dropped (prior behavior).
+    assert fwpl._parse_allowed_files("scripts/**,tests/**,") == [
+        "scripts/**",
+        "tests/**",
+    ]
+    # Whitespace around segments is trimmed.
+    assert fwpl._parse_allowed_files("  scripts/** , tests/**  ") == [
+        "scripts/**",
+        "tests/**",
+    ]
+    # List passes through unchanged (idempotent).
+    lst = ["a", "b", "c"]
+    out = fwpl._parse_allowed_files(lst)
+    assert out == lst
+    assert out is lst
+    # Type errors are loud, not silent.
+    with pytest.raises(TypeError):
+        fwpl._parse_allowed_files(42)
+    with pytest.raises(TypeError):
+        fwpl._parse_allowed_files({"a": 1})

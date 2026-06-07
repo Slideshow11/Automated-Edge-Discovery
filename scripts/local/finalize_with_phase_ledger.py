@@ -265,10 +265,19 @@ def run_finalize(args: argparse.Namespace) -> int:
 
     ledger = _extract_ledger_args(summary)
 
+    # Normalize --allowed_files here (single source of truth) so the
+    # gate always receives a clean ``list[str]`` (or None), whether
+    # the caller came in via the CLI (raw comma-separated string)
+    # or via a hand-built ``Namespace`` (already a list, None, or
+    # raw string). This is the Codex P2 fix on PR #392: previously
+    # only the CLI path parsed, so a direct caller could hand a raw
+    # string to the gate and out-of-scope files would be accepted.
+    allowed_files = _parse_allowed_files(getattr(args, "allowed_files", None))
+
     gate: dict = aed_final_gate.run_final_gate(
         pr_number=args.pr_number,
         expected_head_sha=args.expected_head_sha,
-        allowed_files=args.allowed_files,
+        allowed_files=allowed_files,
         local_validation_path=args.local_validation_path,
         codex_artifact_path=args.codex_artifact_path,
         output_json_path=args.output_json,
@@ -388,23 +397,61 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _parse_allowed_files(raw: str) -> list[str]:
-    """Split a comma-separated ``--allowed-files`` string into a list.
+def _parse_allowed_files(raw: Any) -> Optional[list[str]]:
+    """Normalize the ``--allowed-files`` arg into a clean ``list[str]`` (or None).
 
-    Empty entries (e.g. trailing comma) are dropped so the gate sees
-    a clean list. The final gate accepts a list of globs and treats
-    ``[]`` as "no scope constraint" — we preserve that behavior by
-    forwarding whatever the operator supplied.
+    The argument is a comma-separated string on the CLI path
+    (e.g. ``"scripts/**,tests/**"``). When ``run_finalize`` is called
+    directly with a hand-built ``Namespace`` the value may already be
+    a ``list[str]`` or ``None``. This helper is the single source of
+    truth for normalizing all three shapes:
+
+    * ``None``  → ``None`` (the gate treats ``None`` as "no scope
+      constraint" via its ``Optional[list[str]]`` parameter type).
+    * ``list[str]`` → returned unchanged (idempotent pass-through;
+      double-parsing a list would break).
+    * ``str``    → split on ``,``, strip whitespace from each
+      segment, drop empty segments, return as ``list[str]``. This
+      preserves the prior CLI-path behavior of dropping trailing
+      commas and other empty entries.
+    * anything else → ``TypeError`` (loud failure for caller bugs;
+      a direct ``Namespace(allowed_files=42)`` should not silently
+      degrade).
+
+    Centralizing the normalization here means ``run_finalize`` is
+    correct whether invoked via ``main()`` (CLI path) or directly
+    (test/programmatic path). This is the Codex P2 fix on PR #392:
+    previously the CLI path parsed and the direct-call path did not,
+    so a direct caller passing a comma-separated string would have
+    the gate iterate the string character-by-character, making
+    single-character glob patterns like ``"*"`` match every changed
+    file (out-of-scope files incorrectly accepted).
     """
-    return [s.strip() for s in raw.split(",") if s.strip()]
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        # Idempotent: a list is already the canonical shape. We do
+        # not re-parse the elements (no comma-split, no strip) so the
+        # caller's intended globs are forwarded byte-for-byte.
+        return raw
+    if isinstance(raw, str):
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    raise TypeError(
+        f"finalize_with_phase_ledger: --allowed-files must be a "
+        f"comma-separated string, a list[str], or None; got "
+        f"{type(raw).__name__}: {raw!r}"
+    )
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
-    # Coerce allowed_files from a comma-separated string to a list of
-    # globs. The final gate accepts ``list[str] | None`` for this arg.
-    args.allowed_files = _parse_allowed_files(args.allowed_files)
+    # Note: ``args.allowed_files`` is intentionally NOT pre-parsed
+    # here. Parsing happens inside ``run_finalize`` via
+    # ``_parse_allowed_files``, which is the single source of truth
+    # for all callers (CLI path AND direct-call path). This avoids
+    # the previous P2 finding where a hand-built ``Namespace`` with
+    # a raw comma-separated string could bypass normalization.
     return run_finalize(args)
 
 
