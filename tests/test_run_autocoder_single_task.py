@@ -2417,3 +2417,273 @@ class TestRunAutocoderSingleTaskPhaseLedger:
             assert k not in final_status, (
                 f"final_status.json must not include {k!r} (regression)"
             )
+
+    # ----------------------------------------------------------------
+    # Codex P2 fix v3: reset phase_ledger.jsonl at the start of each
+    # enabled run. PR #391, inline comment id 3369464135.
+    # Reset happens once, only in enabled mode, before stage 2-6.
+    # ----------------------------------------------------------------
+
+    def test_phase_ledger_is_reset_at_start_of_enabled_run(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2 fix v3 (PR #391, comment id 3369464135): when phase_ledger
+        is enabled and the output_root already contains a stale
+        phase_ledger.jsonl (from a prior attempt with the same task_id),
+        the controller must delete the file at the start of the run so
+        only entries from the current attempt appear in the final ledger.
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"reset-stale-{os.urandom(4).hex()}"
+        ledger_path = output_root / "phase_ledger.jsonl"
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        # Pre-create a stale ledger with 5 fake PASS entries that all use
+        # the same run_id we are about to retry with. If the reset doesn't
+        # happen, the final ledger will contain 10 entries (5 stale + 5
+        # fresh). If the reset works, only the 5 fresh ones survive.
+        stale_entries = []
+        for stage_num in (2, 3, 4, 5, 6):
+            stale_entries.append({
+                "writer": "phase_exec",
+                "run_id": task_id,
+                "phase_id": f"stage_{stage_num}_STALE_MARKER_999",
+                "status": "PASS",
+                "observed_summary": f"STALE_MARKER_FROM_PRIOR_RUN_{stage_num}",
+                "command_argv": ["echo", "stale"],
+                "cwd": str(output_root),
+                "stdout_path": None,
+                "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            })
+        ledger_path.write_text(
+            "\n".join(json.dumps(e) for e in stale_entries) + "\n",
+            encoding="utf-8",
+        )
+        assert ledger_path.exists()
+        assert ledger_path.stat().st_size > 0, "stale ledger should have content"
+
+        packet = self._build_packet(tmp_path, task_id=task_id)
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+
+        fake_run, _ = _make_fake_subprocess_run_ledger_aware(output_root)
+        original_fake_run = fake_run
+
+        def _run_with_branch(argv, *args, **kwargs):
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        # The reset happens once at the start of the run, before any
+        # phase_exec.py call. The 5 wrapped stages then append fresh entries.
+        assert ledger_path.exists(), (
+            f"phase_ledger.jsonl should exist after a successful enabled run "
+            f"(5 fresh entries were appended); not found at {ledger_path}"
+        )
+        ledger_text = ledger_path.read_text(encoding="utf-8")
+        # 1. No STALE_MARKER substring from the prior attempt may appear.
+        assert "STALE_MARKER" not in ledger_text, (
+            f"ledger still contains stale entries from prior attempt; "
+            f"the reset did not work. ledger_text={ledger_text!r}"
+        )
+        assert "_STALE_MARKER_999" not in ledger_text, (
+            f"ledger still contains stale phase_id markers; "
+            f"ledger_text={ledger_text!r}"
+        )
+        # 2. All entries must be valid JSON with the right run_id and
+        #    no STALE substring in any field.
+        entries = [
+            json.loads(line) for line in ledger_text.splitlines() if line.strip()
+        ]
+        assert len(entries) >= 1, (
+            f"expected at least 1 fresh entry after reset, got 0; "
+            f"ledger_text={ledger_text!r}"
+        )
+        for entry in entries:
+            assert entry["writer"] == "phase_exec"
+            assert entry["run_id"] == task_id
+            assert "STALE" not in entry.get("phase_id", "")
+            assert "STALE" not in entry.get("observed_summary", "")
+
+    def test_phase_ledger_reset_happens_once_not_per_stage(
+        self, tmp_path, monkeypatch
+    ):
+        """If the reset happened PER STAGE (inside _run_stage_with_evidence),
+        the final ledger would contain exactly 1 entry (only the last stage's).
+        Since the reset happens ONCE at the start of the run, the final
+        ledger should contain entries for all 5 wrapped stages - proving
+        the file was NOT reset between stages.
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"reset-once-{os.urandom(4).hex()}"
+        ledger_path = output_root / "phase_ledger.jsonl"
+
+        fake_run, _ = _make_fake_subprocess_run_ledger_aware(output_root)
+        original_fake_run = fake_run
+
+        def _run_with_branch(argv, *args, **kwargs):
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        packet = self._build_packet(tmp_path, task_id=task_id)
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        # If the reset had been per-stage, the final ledger would have
+        # only the LAST stage's entry. A once-at-start reset lets all 5
+        # wrapped stages append normally, so we expect to see all 5
+        # phase_ids (or at least more than 1, to prove it's not per-stage).
+        assert ledger_path.exists(), (
+            f"phase_ledger.jsonl should exist after enabled run at {ledger_path}"
+        )
+        entries = [
+            json.loads(line)
+            for line in ledger_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert len(entries) >= 1, (
+            f"expected at least 1 phase ledger entry, got 0"
+        )
+        phase_ids = [e["phase_id"] for e in entries]
+        # 5 wrapped stages produce 5 distinct phase_ids from the canonical
+        # PHASE_LEDGER_PHASE_ID_BY_STAGE map. If we see more than one, the
+        # reset is not per-stage. (The controller may short-circuit, so
+        # we don't strictly require all 5, but we DO require > 1.)
+        assert len(phase_ids) > 1, (
+            f"reset appears to be per-stage: ledger has only {len(phase_ids)} "
+            f"entry (phase_ids={phase_ids!r}); a once-at-start reset should "
+            f"let all wrapped stages append their entries"
+        )
+        # Each entry's run_id must match the current task_id (not some
+        # prior attempt's id).
+        for entry in entries:
+            assert entry["run_id"] == task_id, (
+                f"entry run_id {entry.get('run_id')!r} != current "
+                f"task_id {task_id!r}; reset may not have cleared the file"
+            )
+
+    def test_phase_ledger_disabled_does_not_delete_existing_file(
+        self, tmp_path, monkeypatch
+    ):
+        """When phase_ledger is absent/disabled, the controller must NOT
+        touch any existing phase_ledger.jsonl in the output_root:
+        - File must still exist
+        - File contents must be unchanged
+        - run_summary.json must not include phase_ledger_path (disabled-mode
+          shape preserved)
+        """
+        output_root = (tmp_path / "out").resolve()
+        output_root.mkdir(parents=True, exist_ok=True)
+        task_id = f"reset-off-{os.urandom(4).hex()}"
+        ledger_path = output_root / "phase_ledger.jsonl"
+        # Pre-existing content the disabled run must NOT modify.
+        sentinel_content = (
+            '{"writer":"external","run_id":"prior","phase_id":"x",'
+            '"status":"PASS","observed_summary":"UNTOUCHED_SENTINEL"}\n'
+        )
+        ledger_path.write_text(sentinel_content, encoding="utf-8")
+
+        packet = make_packet(task_id=task_id, output_root=str(output_root))
+        # Explicitly NO phase_ledger key.
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+
+        fake_run, _ = _make_fake_subprocess_run_ledger_aware(output_root)
+        original_fake_run = fake_run
+
+        def _run_with_branch(argv, *args, **kwargs):
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        # File must still exist with EXACTLY the sentinel content.
+        assert ledger_path.exists(), (
+            f"existing phase_ledger.jsonl was deleted even though ledger is "
+            f"disabled - disabled mode must not touch the file. "
+            f"expected at {ledger_path}"
+        )
+        actual_content = ledger_path.read_text(encoding="utf-8")
+        assert actual_content == sentinel_content, (
+            f"existing phase_ledger.jsonl contents were modified even though "
+            f"ledger is disabled.\n"
+            f"  expected (sentinel): {sentinel_content!r}\n"
+            f"  actual:              {actual_content!r}"
+        )
+
+        # run_summary.json (if present) must not include phase_ledger_path
+        # in disabled mode.
+        summary_path = out_json.with_name("run_summary.json")
+        if summary_path.exists():
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            assert "phase_ledger_path" not in summary, (
+                "phase_ledger_path must be OMITTED (not null) when ledger is "
+                "disabled, to preserve the prior default shape"
+            )
+            assert "phase_ledger_claimed_phases" not in summary
+            assert "phase_ledger_expected_run_id" not in summary

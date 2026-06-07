@@ -777,6 +777,18 @@ def run_autocoder_single_task(
     else:
         phase_ledger_path = None
 
+    # PR #391 v3 (Codex P2, comment id 3369464135): when phase-ledger mode is
+    # enabled, reset the ledger file ONCE at the start of this run so stale
+    # PASS entries from a prior attempt (same task_id, same output_root)
+    # cannot satisfy validation for phases that did not actually pass in
+    # the current attempt. Disabled mode is unaffected: if phase_ledger_path
+    # is None, nothing here runs and any existing ledger file in the
+    # output_root is left untouched.
+    if phase_ledger_path is not None:
+        phase_ledger_path.parent.mkdir(parents=True, exist_ok=True)
+        if phase_ledger_path.exists():
+            phase_ledger_path.unlink()
+
     # Output sub-paths
     execution_packet_path = output_root / "execution_packet.json"
     result_json_path = output_root / "result.json"
