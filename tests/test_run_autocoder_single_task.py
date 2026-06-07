@@ -2687,3 +2687,353 @@ class TestRunAutocoderSingleTaskPhaseLedger:
             )
             assert "phase_ledger_claimed_phases" not in summary
             assert "phase_ledger_expected_run_id" not in summary
+
+    # ----------------------------------------------------------------
+    # Codex P2 fix v4: derive phase_ledger_claimed_phases from actual
+    # ledger PASS entries (not a static 5-phase list).
+    # PR #391, inline comment id 3369510471.
+    # The new code: _derive_claimed_phases_from_ledger() reads the
+    # ledger, filters by run_id + status=PASS + canonical phase_id,
+    # and returns the canonical-order list. _build_run_summary() then
+    # uses that list (or omits the field if empty).
+    # ----------------------------------------------------------------
+
+    def test_run_summary_claims_only_passed_ledger_phases(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P2 fix v4 (PR #391, comment id 3369510471): when phase_ledger
+        is enabled and the controller runs through all 5 wrapped stages
+        with PASS evidence, run_summary.json must claim exactly those 5
+        phase_ids in canonical stage order, and the resulting summary
+        must validate as HOLD_VALID against the ledger.
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"dyn-pass-{os.urandom(4).hex()}"
+        packet = self._build_packet(tmp_path, task_id=task_id)
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+
+        fake_run, _ = _make_fake_subprocess_run_ledger_aware(output_root)
+        original_fake_run = fake_run
+
+        def _run_with_branch(argv, *args, **kwargs):
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        summary_path = out_json.with_name("run_summary.json")
+        assert summary_path.exists()
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        # All 5 wrapped stages wrote PASS entries. The dynamic derivation
+        # must return the full 5-phase canonical list.
+        expected_canonical = list(
+            _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE.values()
+        )
+        assert summary.get("phase_ledger_claimed_phases") == expected_canonical, (
+            f"phase_ledger_claimed_phases mismatch: "
+            f"got {summary.get('phase_ledger_claimed_phases')!r}, "
+            f"expected canonical 5-stage list {expected_canonical!r}"
+        )
+        # The validator must accept this summary.
+        from validate_phase_ledger import validate, HOLD_VALID
+        ledger_path = output_root / "phase_ledger.jsonl"
+        if ledger_path.exists():
+            result = validate(
+                ledger_path,
+                claimed_phases=summary["phase_ledger_claimed_phases"],
+                expected_run_id=task_id,
+            )
+            assert result["valid"] is True, (
+                f"validator rejected the dynamic-claim summary: {result!r}"
+            )
+            assert result["hold_state"] == HOLD_VALID
+
+    def test_run_summary_claims_only_reached_pass_phases_on_early_hold(
+        self, tmp_path
+    ):
+        """Direct unit test of the helper: when the ledger contains only
+        the reached-stage PASS entries (mimicking an early-HOLD run
+        after stage 2 or 3), the helper must return ONLY those phase_ids
+        and never claim later stages that never ran.
+        """
+        from pathlib import Path
+        ledger_path = tmp_path / "phase_ledger.jsonl"
+        task_id = f"dyn-early-{os.urandom(4).hex()}"
+        # Only stage 2 and 3 wrote PASS entries (early-HOLD scenario).
+        for stage_num in (2, 3):
+            phase_id = _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[stage_num]
+            entry = {
+                "writer": "phase_exec",
+                "run_id": task_id,
+                "phase_id": phase_id,
+                "status": "PASS",
+                "observed_summary": f"early stage {stage_num}",
+                "command_argv": ["echo", str(stage_num)],
+                "cwd": str(tmp_path),
+                "stdout_path": None,
+                "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            }
+            with open(ledger_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            ledger_path, task_id
+        )
+        expected = [
+            _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+            _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[3],
+        ]
+        assert claimed == expected, (
+            f"early-HOLD claim list mismatch: "
+            f"got {claimed!r}, expected {expected!r}"
+        )
+        # Explicitly assert that stages 4, 5, 6 are NOT claimed.
+        for stage_num in (4, 5, 6):
+            not_expected = _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[stage_num]
+            assert not_expected not in claimed, (
+                f"phase {not_expected!r} (stage {stage_num}) was claimed but "
+                f"should not be — its stage was never reached in this "
+                f"early-HOLD run"
+            )
+
+    def test_run_summary_omits_claimed_phases_when_no_pass_evidence(
+        self, tmp_path
+    ):
+        """When the ledger is empty (or missing) the helper must return
+        an empty list, and _build_run_summary must OMIT
+        phase_ledger_claimed_phases (not set it to null or []).
+        """
+        from pathlib import Path
+        # Case A: ledger file does not exist at all.
+        missing_ledger = tmp_path / "does_not_exist.jsonl"
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            missing_ledger, "any-task-id"
+        )
+        assert claimed == [], (
+            f"helper returned {claimed!r} for a missing ledger; expected []"
+        )
+        # Case B: ledger exists but is empty.
+        empty_ledger = tmp_path / "empty.jsonl"
+        empty_ledger.write_text("", encoding="utf-8")
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            empty_ledger, "any-task-id"
+        )
+        assert claimed == [], (
+            f"helper returned {claimed!r} for an empty ledger; expected []"
+        )
+        # Case C: ledger exists with entries but ALL for a different run_id.
+        other_run_ledger = tmp_path / "other_run.jsonl"
+        entry = {
+            "writer": "phase_exec",
+            "run_id": "some_other_run",
+            "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+            "status": "PASS",
+            "observed_summary": "not for us",
+            "command_argv": ["echo", "other"],
+            "cwd": str(tmp_path),
+            "stdout_path": None,
+            "stderr_path": None,
+            "exit_code": 0,
+            "started_at": "2026-06-07T00:00:00Z",
+            "finished_at": "2026-06-07T00:00:01Z",
+        }
+        other_run_ledger.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            other_run_ledger, "our_task_id"
+        )
+        assert claimed == [], (
+            f"helper returned {claimed!r} for a ledger with only other-run "
+            f"entries; expected []"
+        )
+
+        # Integration: _build_run_summary must OMIT the field entirely.
+        result = {"status": "HOLD_TEST", "stage": "validate", "task_id": "x"}
+        summary = _rac_module._build_run_summary(
+            result=result,
+            output_json_path=tmp_path / "out.json",
+            output_md_path=tmp_path / "out.md",
+            task_packet={"task_id": "our_task_id"},
+            phase_ledger_path=empty_ledger,
+        )
+        assert "phase_ledger_claimed_phases" not in summary, (
+            f"phase_ledger_claimed_phases must be OMITTED when no PASS "
+            f"evidence exists; got {summary.get('phase_ledger_claimed_phases')!r}"
+        )
+        # But the other two phase_ledger_* fields must still be present.
+        assert "phase_ledger_path" in summary
+        assert "phase_ledger_expected_run_id" in summary
+        assert summary["phase_ledger_expected_run_id"] == "our_task_id"
+
+    def test_run_summary_ignores_stale_prior_run_pass_entries(
+        self, tmp_path
+    ):
+        """Stale PASS entries from a DIFFERENT run_id (e.g. left over
+        from a prior attempt — though the reset block should normally
+        prevent this) must NOT be claimed. Defense-in-depth: the helper
+        filters by run_id, so even if a stale entry sneaks in, it is
+        ignored.
+        """
+        from pathlib import Path
+        ledger_path = tmp_path / "phase_ledger.jsonl"
+        our_task_id = f"dyn-ours-{os.urandom(4).hex()}"
+        other_task_id = f"dyn-other-{os.urandom(4).hex()}"
+        # 3 entries: 1 for our run (stage 2), 2 for the other run.
+        entries = [
+            {
+                "writer": "phase_exec",
+                "run_id": other_task_id,
+                "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+                "status": "PASS",
+                "observed_summary": "stale from other run",
+                "command_argv": ["echo", "other-2"],
+                "cwd": str(tmp_path),
+                "stdout_path": None, "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            },
+            {
+                "writer": "phase_exec",
+                "run_id": our_task_id,
+                "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+                "status": "PASS",
+                "observed_summary": "our stage 2",
+                "command_argv": ["echo", "our-2"],
+                "cwd": str(tmp_path),
+                "stdout_path": None, "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            },
+            {
+                "writer": "phase_exec",
+                "run_id": other_task_id,
+                "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[3],
+                "status": "PASS",
+                "observed_summary": "stale from other run",
+                "command_argv": ["echo", "other-3"],
+                "cwd": str(tmp_path),
+                "stdout_path": None, "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            },
+        ]
+        ledger_path.write_text(
+            "\n".join(json.dumps(e) for e in entries) + "\n",
+            encoding="utf-8",
+        )
+
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            ledger_path, our_task_id
+        )
+        # Only our stage 2 should be claimed; other-run stages 2 and 3
+        # must be ignored.
+        expected = [_rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2]]
+        assert claimed == expected, (
+            f"stale prior-run claim list mismatch: "
+            f"got {claimed!r}, expected {expected!r}"
+        )
+        # Integration: the summary must not include the stale phase_ids.
+        result = {"status": "HOLD_TEST", "stage": "validate", "task_id": our_task_id}
+        summary = _rac_module._build_run_summary(
+            result=result,
+            output_json_path=tmp_path / "out.json",
+            output_md_path=tmp_path / "out.md",
+            task_packet={"task_id": our_task_id},
+            phase_ledger_path=ledger_path,
+        )
+        assert summary.get("phase_ledger_claimed_phases") == expected
+        # The other run's stage 3 phase_id must NOT appear in the claim list.
+        other_stage_3 = _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[3]
+        assert other_stage_3 not in summary.get("phase_ledger_claimed_phases", []), (
+            f"stale prior-run stage 3 {other_stage_3!r} leaked into the claim list"
+        )
+
+    def test_run_summary_does_not_claim_fail_entries(
+        self, tmp_path
+    ):
+        """FAIL entries (status != "PASS") must NEVER be claimed, even
+        for the current run. Only PASS evidence counts toward the claim
+        list — Codex's stated semantics: claimed phases are required PASS
+        evidence.
+        """
+        from pathlib import Path
+        ledger_path = tmp_path / "phase_ledger.jsonl"
+        task_id = f"dyn-fail-{os.urandom(4).hex()}"
+        # Stage 2 PASSED, stage 3 FAILED (cushion timeout scenario),
+        # stage 4 wrote no entry at all (controller stopped at stage 3).
+        entries = [
+            {
+                "writer": "phase_exec",
+                "run_id": task_id,
+                "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2],
+                "status": "PASS",
+                "observed_summary": "stage 2 passed",
+                "command_argv": ["echo", "2"],
+                "cwd": str(tmp_path),
+                "stdout_path": None, "stderr_path": None,
+                "exit_code": 0,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:01Z",
+            },
+            {
+                "writer": "phase_exec",
+                "run_id": task_id,
+                "phase_id": _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[3],
+                "status": "FAIL",
+                "observed_summary": "stage 3 timed out and cushion wrote FAIL",
+                "command_argv": ["echo", "3"],
+                "cwd": str(tmp_path),
+                "stdout_path": None, "stderr_path": None,
+                "exit_code": -1,
+                "started_at": "2026-06-07T00:00:00Z",
+                "finished_at": "2026-06-07T00:00:30Z",
+            },
+        ]
+        ledger_path.write_text(
+            "\n".join(json.dumps(e) for e in entries) + "\n",
+            encoding="utf-8",
+        )
+
+        claimed = _rac_module._derive_claimed_phases_from_ledger(
+            ledger_path, task_id
+        )
+        # Only stage 2 (PASS) should be claimed; stage 3 (FAIL) is excluded.
+        expected = [_rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[2]]
+        assert claimed == expected, (
+            f"FAIL-aware claim list mismatch: "
+            f"got {claimed!r}, expected {expected!r} "
+            f"(stage 3 FAILED and must not be claimed)"
+        )
+        # The FAIL phase_id must explicitly NOT be in the list.
+        failed_phase = _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[3]
+        assert failed_phase not in claimed, (
+            f"FAIL phase {failed_phase!r} (stage 3) was claimed but "
+            f"FAIL entries must not be claimed"
+        )

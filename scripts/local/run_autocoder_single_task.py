@@ -172,11 +172,21 @@ def _build_run_summary(
     Pure function - no IO. Tolerates partial / fatal-result dicts.
 
     When ``phase_ledger_path`` is provided (i.e. phase-ledger support was
-    enabled for this run), three additional fields are included in the
-    summary:
+    enabled for this run), the following fields are included in the
+    summary (subject to dynamic derivation, see below):
         - ``phase_ledger_path`` (absolute path to the JSONL ledger)
-        - ``phase_ledger_claimed_phases`` (the 5 stage phase IDs)
+        - ``phase_ledger_claimed_phases`` (the phase_ids with PASS evidence
+          in the current ledger, in canonical stage order; OMITTED when no
+          phase actually passed — e.g. an early-HOLD run, or a stage that
+          wrote a FAIL entry)
         - ``phase_ledger_expected_run_id`` (the task_id used as run_id)
+
+    ``phase_ledger_claimed_phases`` is dynamically derived from the
+    ledger file by ``_derive_claimed_phases_from_ledger`` (not a static
+    5-phase list) so consumers that validate the summary against the
+    ledger never see a false ``UNCLAIMED_PHASE`` for stages that were
+    never reached in the current run. See Codex P2 on PR #391, inline
+    comment id 3369510471.
 
     When ``phase_ledger_path`` is None, these fields are OMITTED (not
     set to null) so that consumers do not see a shape change for the
@@ -267,8 +277,18 @@ def _build_run_summary(
     # validate the field set see no change for the default-off path.
     if phase_ledger_path is not None:
         summary["phase_ledger_path"] = str(phase_ledger_path)
-        summary["phase_ledger_claimed_phases"] = list(PHASE_LEDGER_CLAIMED_PHASES)
         summary["phase_ledger_expected_run_id"] = pkt.get("task_id") or res.get("task_id")
+        # Derive claimed phases dynamically from actual ledger PASS
+        # entries (not a static 5-phase list). Codex P2 on PR #391,
+        # inline comment id 3369510471.
+        claimed = _derive_claimed_phases_from_ledger(
+            phase_ledger_path,
+            summary["phase_ledger_expected_run_id"],
+        )
+        if claimed:
+            summary["phase_ledger_claimed_phases"] = claimed
+        # else: omit the field entirely (do not set to null or []) so
+        # the shape matches the no-claim case exactly.
     return summary
 
 def _write_run_summary(
@@ -649,6 +669,67 @@ def _phase_ledger_enabled(task_packet: Optional[dict]) -> bool:
     if not isinstance(cfg, dict):
         return False
     return bool(cfg.get("enabled", False))
+
+
+def _derive_claimed_phases_from_ledger(
+    ledger_path: Optional[Path],
+    expected_run_id: Optional[str],
+) -> list:
+    """
+    Read ``phase_ledger.jsonl`` and return the ordered, deduplicated list
+    of phase_ids that have canonical PASS evidence for this run.
+
+    A phase_id is claimed when ALL of the following hold:
+    - The ledger file exists and is readable.
+    - The entry parses as a JSON object.
+    - ``entry["run_id"]`` equals ``expected_run_id`` (so stale PASS lines
+      from prior runs are NOT claimed).
+    - ``entry["status"]`` equals ``"PASS"`` (FAIL lines are NOT claimed).
+    - ``entry["phase_id"]`` is one of the canonical 5 stage phase_ids
+      (anything else — e.g. a typo, a test marker, or an unknown future
+      stage — is NOT claimed).
+
+    Returned order matches the canonical stage order from
+    ``PHASE_LEDGER_PHASE_ID_BY_STAGE`` (stage 2 → 3 → 4 → 5 → 6) so the
+    claimed list reads as a chronological slice of the run.
+
+    Returns ``[]`` (an empty list) on any error or no match: missing file,
+    unreadable file, malformed JSONL line, or no entries that satisfy
+    the filter. The caller (``_build_run_summary``) is responsible for
+    OMITTING the ``phase_ledger_claimed_phases`` field from the run
+    summary when this helper returns ``[]``.
+    """
+    if ledger_path is None or expected_run_id is None:
+        return []
+    if not ledger_path.exists():
+        return []
+    canonical_order = list(PHASE_LEDGER_PHASE_ID_BY_STAGE.values())
+    canonical_set = set(canonical_order)
+    matched = set()
+    try:
+        text = ledger_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            entry = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("run_id") != expected_run_id:
+            continue
+        if entry.get("status") != "PASS":
+            continue
+        phase_id = entry.get("phase_id")
+        if not isinstance(phase_id, str) or phase_id not in canonical_set:
+            continue
+        matched.add(phase_id)
+    # Re-order to canonical stage order, preserving dedup.
+    return [p for p in canonical_order if p in matched]
 
 
 def _run_stage_with_evidence(
