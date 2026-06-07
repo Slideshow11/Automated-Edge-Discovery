@@ -1890,3 +1890,254 @@ class TestRunAutocoderSingleTaskPhaseLedger:
         assert len(set(phase_ids)) == len(phase_ids), (
             f"phase_ids must be distinct; got {phase_ids!r}"
         )
+
+    # ----------------------------------------------------------------
+    # Codex P1 fix: timeout propagation through phase_exec.py wrapper
+    # PR #391, comment id 3368989413
+    # ----------------------------------------------------------------
+
+    def _capture_all_argvs(self):
+        """Return a list that, when used as a closure cell, captures every
+        subprocess.run argv that flows through the controller. Tests should
+        monkeypatch ``_rac_module.subprocess.run`` with a function that
+        appends ``list(argv)`` to this list before delegating."""
+        return []
+
+    def test_phase_exec_wrapper_receives_stage_timeout(
+        self, tmp_path, monkeypatch
+    ):
+        """Codex P1 fix (PR #391, comment id 3368989413): when phase_ledger
+        is enabled, every phase_exec.py wrapper invocation must receive
+        --timeout-seconds with the runner's stage timeout value (STAGE_TIMEOUT).
+
+        This is a direct unit test of ``_run_stage_with_evidence`` for all 5
+        wrapped stages so we can deterministically assert every invocation
+        carries the timeout — independent of controller short-circuit behavior.
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"timeout-fix-{os.urandom(4).hex()}"
+        ledger_path = output_root / "phase_ledger.jsonl"
+        ledger_path.parent.mkdir(parents=True, exist_ok=True)
+
+        all_argvs: list = []
+
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+
+        def _fake_run(argv, *args, **kwargs):
+            all_argvs.append(list(argv))
+            return _R()
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _fake_run)
+
+        cwd = REPO_ROOT
+        stage_argv = ["echo", "fake-stage-cmd"]
+        # Call the wrapper directly once per wrapped stage (2-6) with
+        # distinct phase_ids, mirroring the 5 controller call sites.
+        for stage_num in (2, 3, 4, 5, 6):
+            phase_id = _rac_module.PHASE_LEDGER_PHASE_ID_BY_STAGE[stage_num]
+            rc, _, _ = _rac_module._run_stage_with_evidence(
+                stage_argv=stage_argv,
+                cwd=cwd,
+                phase_id=phase_id,
+                run_id=task_id,
+                ledger_path=ledger_path,
+            )
+            assert rc == 0
+
+        # Filter to only the phase_exec.py wrapper argvs.
+        phase_exec_argvs = [
+            a for a in all_argvs
+            if len(a) >= 2
+            and a[0] == "python3"
+            and str(a[1]).endswith("phase_exec.py")
+        ]
+        assert len(phase_exec_argvs) == 5, (
+            f"expected exactly 5 phase_exec.py invocations (stages 2-6), "
+            f"got {len(phase_exec_argvs)}; argvs={all_argvs!r}"
+        )
+        expected_timeout = str(_rac_module.STAGE_TIMEOUT)
+        for i, argv in enumerate(phase_exec_argvs, start=1):
+            # Find the index of --timeout-seconds.
+            if "--timeout-seconds" not in argv:
+                raise AssertionError(
+                    f"phase_exec invocation #{i} missing --timeout-seconds: "
+                    f"{argv!r}"
+                )
+            idx = argv.index("--timeout-seconds")
+            assert idx + 1 < len(argv), (
+                f"phase_exec invocation #{i} has --timeout-seconds as last "
+                f"arg (no value): {argv!r}"
+            )
+            assert argv[idx + 1] == expected_timeout, (
+                f"phase_exec invocation #{i} timeout value {argv[idx + 1]!r} "
+                f"!= STAGE_TIMEOUT={expected_timeout!r}; argv={argv!r}"
+            )
+            # --timeout-seconds must appear BEFORE the -- separator, so
+            # phase_exec.py itself reads it (not the wrapped stage).
+            assert "--" in argv, (
+                f"phase_exec invocation #{i} missing -- separator: {argv!r}"
+            )
+            sep_idx = argv.index("--")
+            assert idx < sep_idx, (
+                f"phase_exec invocation #{i}: --timeout-seconds must come "
+                f"BEFORE the -- separator (so phase_exec.py sees it, not the "
+                f"wrapped stage); argv={argv!r}"
+            )
+
+    def test_phase_exec_timeout_arg_not_used_when_ledger_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        """When phase_ledger is absent/disabled:
+        - phase_exec.py must NOT be invoked at all (no wrapper at all).
+        - By code inspection, the --timeout-seconds arg is only ever
+          constructed inside the ``wrapped_argv`` list, which is only
+          reachable when ``ledger_path`` is truthy. So no stage subprocess
+          argv can contain ``--timeout-seconds`` in the disabled path.
+        This test verifies the first property via the captured argvs and
+        asserts the second property holds across every captured argv.
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"timeout-off-{os.urandom(4).hex()}"
+        packet = make_packet(task_id=task_id, output_root=str(output_root))
+        # No phase_ledger key at all.
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+
+        all_argvs: list = []
+
+        original_fake_run, phase_exec_argvs = _make_fake_subprocess_run_ledger_aware(
+            output_root
+        )
+
+        def _run_with_branch(argv, *args, **kwargs):
+            all_argvs.append(list(argv))
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        # 1. No phase_exec.py wrapper invocation.
+        assert phase_exec_argvs == [], (
+            f"phase_exec.py must not be invoked when ledger is disabled, "
+            f"but saw {len(phase_exec_argvs)} invocations: {phase_exec_argvs!r}"
+        )
+        # 2. No captured argv (stage or otherwise) may contain
+        # --timeout-seconds — that flag is only ever added inside the
+        # wrapper construction, which is unreachable in the disabled path.
+        offenders = [a for a in all_argvs if "--timeout-seconds" in a]
+        assert offenders == [], (
+            f"--timeout-seconds appeared in a stage subprocess argv with "
+            f"ledger disabled (it must only appear inside the phase_exec "
+            f"wrapper): {offenders!r}"
+        )
+
+    def test_phase_ledger_timeout_fix_preserves_existing_enabled_behavior(
+        self, tmp_path, monkeypatch
+    ):
+        """Adding --timeout-seconds to the wrapper must NOT regress the
+        existing 4 enabled-mode behaviors:
+        1. phase_ledger.jsonl is still written
+        2. run_summary.json still includes phase_ledger_path
+        3. run_summary.json still includes phase_ledger_claimed_phases
+        4. run_summary.json still includes phase_ledger_expected_run_id
+        5. final_status.json shape is unchanged (no phase_ledger_* keys)
+        """
+        output_root = (tmp_path / "out").resolve()
+        task_id = f"timeout-regress-{os.urandom(4).hex()}"
+        packet = self._build_packet(tmp_path, task_id=task_id)
+        packet["branch_name"] = f"autocoder-test-{task_id}"
+
+        fake_run, _ = _make_fake_subprocess_run_ledger_aware(output_root)
+        original_fake_run = fake_run
+
+        def _run_with_branch(argv, *args, **kwargs):
+            if (
+                len(argv) >= 1
+                and argv[0] == "git"
+                and "rev-parse" in argv
+                and "--verify" in argv
+            ):
+                class _R:
+                    returncode = 1
+                    stdout = ""
+                    stderr = ""
+                return _R()
+            return original_fake_run(argv, *args, **kwargs)
+
+        monkeypatch.setattr(_rac_module.subprocess, "run", _run_with_branch)
+        monkeypatch.setattr(_rac_module, "effective_repo_root", REPO_ROOT)
+
+        out_json = tmp_path / "final_status.json"
+        out_md = tmp_path / "final_status.md"
+        packet_path = tmp_path / "packet.json"
+        packet_path.write_text(json.dumps(packet), encoding="utf-8")
+        _rac_module.run_autocoder_single_task(
+            task_packet_path=packet_path,
+            output_json_path=out_json,
+            output_md_path=out_md,
+        )
+
+        # 1. Ledger file written.
+        ledger_path = output_root / "phase_ledger.jsonl"
+        assert ledger_path.exists(), (
+            f"phase_ledger.jsonl not written at {ledger_path} "
+            f"(regression in enabled mode after timeout fix)"
+        )
+
+        # 2-4. run_summary.json shape.
+        summary_path = out_json.with_name("run_summary.json")
+        assert summary_path.exists(), (
+            "run_summary.json not written (regression in enabled mode "
+            "after timeout fix)"
+        )
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+        assert "phase_ledger_path" in summary, (
+            "phase_ledger_path missing from run_summary.json (regression)"
+        )
+        assert summary["phase_ledger_path"] == str(ledger_path)
+        assert "phase_ledger_claimed_phases" in summary, (
+            "phase_ledger_claimed_phases missing from run_summary.json "
+            "(regression)"
+        )
+        assert set(summary["phase_ledger_claimed_phases"]) == set(
+            _rac_module.PHASE_LEDGER_CLAIMED_PHASES
+        )
+        assert "phase_ledger_expected_run_id" in summary, (
+            "phase_ledger_expected_run_id missing from run_summary.json "
+            "(regression)"
+        )
+        assert summary["phase_ledger_expected_run_id"] == task_id
+
+        # 5. final_status.json shape unchanged.
+        final_status = json.loads(out_json.read_text(encoding="utf-8"))
+        for k in (
+            "phase_ledger_path",
+            "phase_ledger_claimed_phases",
+            "phase_ledger_expected_run_id",
+        ):
+            assert k not in final_status, (
+                f"final_status.json must not include {k!r} (regression)"
+            )

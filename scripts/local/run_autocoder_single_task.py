@@ -648,6 +648,7 @@ def _run_stage_with_evidence(
     phase_id: Optional[str],
     run_id: Optional[str],
     ledger_path: Optional[Path],
+    timeout: int = STAGE_TIMEOUT,
 ) -> tuple[int, str, str]:
     """
     Run a stage subprocess, optionally wrapping it with phase_exec.py.
@@ -656,13 +657,20 @@ def _run_stage_with_evidence(
     ``run_stage``. When set, the wrapped command is ``phase_exec.py ... -- <argv>``
     so that one canonical ledger line is appended per stage.
 
+    When wrapping, the same ``timeout`` (default ``STAGE_TIMEOUT``) is
+    passed to ``phase_exec.py`` via ``--timeout-seconds`` AND used for
+    the outer ``run_stage`` call. This guarantees the wrapper and the
+    wrapped stage share one timeout — preventing orphan stage processes
+    when the outer timeout fires before phase_exec.py can enforce it
+    on its child (Codex P1 on PR #391, comment id 3368989413).
+
     The function returns ``(returncode, stdout, stderr)`` of the *outer*
     phase_exec.py invocation when ledger is enabled (so existing
     returncode-handling code paths downstream continue to work — the
     phase_exec.py wrapper propagates the wrapped command's exit code).
     """
     if not ledger_path or not phase_id or not run_id:
-        return run_stage(stage_argv, cwd)
+        return run_stage(stage_argv, cwd, timeout=timeout)
 
     phase_exec_script = SCRIPT_DIR / "phase_exec.py"
     observed_summary = f"single-task stage ran phase_exec phase_id={phase_id}"
@@ -674,10 +682,11 @@ def _run_stage_with_evidence(
         "--phase-id", phase_id,
         "--observed-summary", observed_summary,
         "--cwd", str(cwd),
+        "--timeout-seconds", str(timeout),
         "--",
         *stage_argv,
     ]
-    return run_stage(wrapped_argv, cwd)
+    return run_stage(wrapped_argv, cwd, timeout=timeout)
 
 
 def load_stage_json(path: Path) -> Optional[dict]:
