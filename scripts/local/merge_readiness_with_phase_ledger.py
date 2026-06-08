@@ -555,6 +555,200 @@ def _missing_required_phase_gate_args(args: argparse.Namespace) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
+# Repository consistency check (P2 regression guard on PR #393,
+# thread PRRT_kwDOSHFpYM6Hs9BB, comment PRRC_kwDOSHFpYM7I5CY5):
+# aed_final_gate.run_final_gate derives its repo from the script
+# repo's ``git remote get-url origin``. If the operator passes a
+# ``--repo`` that doesn't match the script repo's remote origin,
+# the ledger would validate a different PR than the one this
+# wrapper re-fetches and delegates to merge_pr_safely. This
+# section normalizes the two forms and rejects mismatches before
+# the phase-gate adapter is called.
+# ---------------------------------------------------------------------------
+
+
+# Bounded timeout (seconds) for the read-only
+# ``git remote get-url origin`` call. 10s is more than enough for
+# a local filesystem ``git`` invocation; the bound exists so a
+# wedged ``git`` on a slow filesystem cannot stall the wrapper
+# indefinitely.
+_GIT_REMOTE_GET_URL_TIMEOUT_SECONDS = 10
+
+
+def _normalize_repo_slug(value) -> Optional[str]:
+    """Normalize a GitHub repo reference to ``"owner/repo"`` lowercase.
+
+    Accepts all of the common forms the operator or ``git remote
+    get-url`` may produce:
+
+      * ``Slideshow11/Automated-Edge-Discovery``
+      * ``https://github.com/Slideshow11/Automated-Edge-Discovery``
+      * ``https://github.com/Slideshow11/Automated-Edge-Discovery.git``
+      * ``git@github.com:Slideshow11/Automated-Edge-Discovery.git``
+      * ``ssh://git@github.com/Slideshow11/Automated-Edge-Discovery.git``
+
+    Returns ``"owner/repo"`` in lowercase with any trailing
+    ``.git`` stripped. Returns ``None`` for any value that cannot
+    be parsed as an ``owner/repo`` pair (missing slash, empty
+    owner, empty repo, etc.). The case-fold makes the comparison
+    case-insensitive.
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    # Strip trailing ``.git`` if present (after whitespace).
+    if s.endswith(".git"):
+        s = s[: -len(".git")].rstrip()
+    # SSH form: ``git@github.com:owner/repo`` → ``github.com/owner/repo``
+    if s.startswith("git@") and ":" in s:
+        s = s.split(":", 1)[1]
+    # Strip scheme/host for URL forms.
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    # Now we should have either ``host/owner/repo`` or
+    # ``owner/repo``. Drop the host segment if present.
+    parts = [p for p in s.split("/") if p]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[-2], parts[-1]
+    if not owner or not repo:
+        return None
+    # Reject anything that doesn't look like a plausible GitHub
+    # owner/repo. (We deliberately do not enforce strict
+    # character classes here; the goal is just to filter the
+    # empty / pathological cases that would otherwise produce
+    # false-positive matches.)
+    if "/" in owner or "/" in repo:
+        return None
+    return f"{owner.lower()}/{repo.lower()}"
+
+
+def _fetch_repo_root_origin(repo_root: str) -> "tuple[bool, Optional[str]]":
+    """Read ``git -C <repo_root> remote get-url origin``.
+
+    Returns ``(True, origin_url)`` only on a non-empty rc=0
+    stdout (whitespace stripped). Returns ``(False, None)`` on
+    any failure: non-zero exit, empty stdout, missing
+    ``origin`` remote, ``subprocess.TimeoutExpired``, or
+    ``OSError`` (missing ``git`` binary, missing repo path).
+
+    The call is bounded by
+    ``_GIT_REMOTE_GET_URL_TIMEOUT_SECONDS``. This is
+    intentionally read-only: it never invokes ``git push``,
+    ``git remote set-url``, or any state-mutating command.
+    """
+    if not repo_root or not isinstance(repo_root, str):
+        return False, None
+    cmd = ["git", "-C", repo_root, "remote", "get-url", "origin"]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_GIT_REMOTE_GET_URL_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False, None
+    if completed.returncode != 0:
+        return False, None
+    raw = (completed.stdout or "").strip()
+    if not raw:
+        return False, None
+    return True, raw
+
+
+def _validate_repo_matches_repo_root(args) -> Optional[str]:
+    """Return a clear error string if ``args.repo`` does not
+    match the script repo's ``git remote get-url origin``.
+
+    The phase-ledger gate (``aed_final_gate.run_final_gate``)
+    derives its target repo from the script's own ``git
+    remote get-url origin``. If the operator passes a
+    ``--repo`` that resolves to a different GitHub repo than
+    what the gate validates, the ledger can cover code in repo
+    A while the wrapper's downstream ``gh pr view`` and
+    ``merge_pr_safely`` operate on repo B. This is a
+    cross-script consistency violation; we fail closed.
+
+    The check is OPT-IN ONLY: this function is only called
+    when ``args.run_summary`` is provided (see
+    ``run_wrapper``). The default-off path delegates directly
+    to ``merge_pr_safely.py`` and does not run the gate, so
+    there is no consistency surface to enforce.
+
+    Failure modes (all return an error string; the caller
+    prints it to stderr and exits 2):
+
+      * ``args.repo`` is empty/missing/non-string → unable to
+        determine; refuse to proceed.
+      * ``args.repo_root`` is empty/missing/non-string →
+        unable to determine; refuse to proceed.
+      * ``git remote get-url origin`` fails (non-zero exit,
+        empty stdout, TimeoutExpired, OSError) → unable to
+        determine; refuse to proceed (fail closed).
+      * Either side normalizes to ``None`` (unparseable) →
+        unable to determine; refuse to proceed.
+      * Normalized values differ → explicit REPO_MISMATCH.
+
+    On a successful match, returns ``None`` and the caller
+    proceeds to the phase-gate adapter.
+    """
+    expected_raw = getattr(args, "repo", None)
+    repo_root = getattr(args, "repo_root", None)
+
+    if not expected_raw or not isinstance(expected_raw, str):
+        return (
+            "merge_readiness_with_phase_ledger: --repo is missing or empty; "
+            "unable to verify repo/root consistency; refusing to run "
+            "phase-ledger gate"
+        )
+    if not repo_root or not isinstance(repo_root, str):
+        return (
+            "merge_readiness_with_phase_ledger: --repo-root is missing or "
+            "empty; unable to verify repo/root consistency; refusing to "
+            "run phase-ledger gate"
+        )
+
+    expected_norm = _normalize_repo_slug(expected_raw)
+    if expected_norm is None:
+        return (
+            f"merge_readiness_with_phase_ledger: --repo {expected_raw!r} "
+            "is not a parseable owner/repo; refusing to run phase-ledger "
+            "gate"
+        )
+
+    ok, origin_raw = _fetch_repo_root_origin(repo_root)
+    if not ok:
+        return (
+            f"merge_readiness_with_phase_ledger: unable to read "
+            f"git remote get-url origin for --repo-root {repo_root!r}; "
+            "refusing to run phase-ledger gate against an unverified repo"
+        )
+
+    origin_norm = _normalize_repo_slug(origin_raw)
+    if origin_norm is None:
+        return (
+            f"merge_readiness_with_phase_ledger: git remote origin "
+            f"{origin_raw!r} for --repo-root {repo_root!r} is not a "
+            "parseable owner/repo; refusing to run phase-ledger gate"
+        )
+
+    if expected_norm != origin_norm:
+        return (
+            f"REPO_MISMATCH: --repo {expected_raw} does not match git "
+            f"remote origin for --repo-root {repo_root} ({origin_raw}); "
+            "refusing to run phase-ledger gate against a different "
+            "repository than merge readiness"
+        )
+
+    # Match. Proceed.
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Main wrapper entry point
 # ---------------------------------------------------------------------------
 
@@ -616,6 +810,17 @@ def run_wrapper(args: argparse.Namespace) -> int:
             + ". Refusing to proceed.",
             file=sys.stderr,
         )
+        return 2
+
+    # Cross-script consistency check: ensure the operator-supplied
+    # ``--repo`` matches the script repo's ``git remote get-url
+    # origin`` (which is what ``aed_final_gate.run_final_gate`` uses
+    # to determine the target repo for the phase-ledger gate).
+    # Closes the Codex P2 follow-up on PR #393 — inline comment
+    # PRRC_kwDOSHFpYM7I5CY5, thread PRRT_kwDOSHFpYM6Hs9BB.
+    repo_err = _validate_repo_matches_repo_root(args)
+    if repo_err is not None:
+        print(repo_err, file=sys.stderr)
         return 2
 
     gate_rc = _run_phase_gate(args)
