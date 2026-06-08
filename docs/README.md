@@ -35,6 +35,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 - PR gate controller live-smoke harness complete (PR #201): read-only smoke verifying full chain via 4 synthetic scenarios; prepares future auto-dispatch wiring
 - CI workflow trigger invariant checker complete (PR #204): read-only local checker that validates GitHub Actions CI workflow trigger invariants; detects workflow-level paths filters; YAML 1.1 boolean-`on` quirk handled; 17 invariants
 - CI now cancels stale PR workflow runs (PR #210): GitHub Actions workflow-level concurrency added to ci.yml; stale in-progress runs on PR branches are cancelled to save Actions minutes; main branch runs are never cancelled; 6 new concurrency invariants in validate_ci_workflow_invariants.py; 9 new tests; PR scope: ci.yml, validate_ci_workflow_invariants.py, test_validate_ci_workflow_invariants.py, docs
+- Phase-ledger merge-readiness stack complete (PRs #390, #391, #392, #393): runner now emits `run_summary.json` with phase-ledger fields (PR #391), a leaf adapter consumes the runner's phase ledger (PR #392), and an opt-in wrapper (`scripts/local/merge_readiness_with_phase_ledger.py`) composes the phase-gate adapter with `merge_pr_safely.py` (PR #393). Default-off; never merges; human merge authorization remains required. Operator guide: `docs/phase_ledger_merge_readiness_wrapper.md`. PR scope: `scripts/local/phase_ledger.py`, `scripts/local/phase_exec.py`, `scripts/local/run_autocoder_single_task.py`, `scripts/local/finalize_with_phase_ledger.py`, `scripts/local/merge_readiness_with_phase_ledger.py`, `tests/test_*`, docs
 
 ## Document groups
 
@@ -48,6 +49,7 @@ AED currently uses a governance-first research workflow. The document map helps 
 | docs/edge_hypothesis_card_v1.md | IntakeLayer | Defines the manual hypothesis intake card and required fields before testing. | Active |
 | docs/edge_hypothesis_registry_v1.md | RegistryLayer | Defines the manual edge hypothesis registry v1 and lifecycle constraints. | Active |
 | docs/edge_hypothesis_registry.csv | RegistryLayer | Manual v1 registry CSV using the canonical hypothesis registry columns. | Manual v1 |
+| docs/phase_ledger_merge_readiness_wrapper.md | MergeReadinessLayer | Operator guide for the PR #393 opt-in wrapper `scripts/local/merge_readiness_with_phase_ledger.py`: stack summary (PRs #390–#393), default-off vs opt-in flow, required flags, copyable example, failure modes, guardrails, when-not-to-use. | Active v1 |
 | docs/post_governance_implementation_roadmap.md | RoadmapLayer | Locks the post-governance pivot toward enforcement, schema-backed artifacts, and trial accounting. | Active |
 | docs/domain_neutral_aed_architecture.md | ArchitectureLayer | Defines AED core as domain-neutral: generalized abstractions, domain modules, agent tooling, and stop rules. | Active |
 | docs/domain_neutral_modularity_audit.md | ArchitectureLayer | Audit of existing codebase for pre-earnings/event/options coupling. Identifies governance layer as clean; engine/ as expected domain coupling. | Active |
