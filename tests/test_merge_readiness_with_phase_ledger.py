@@ -193,10 +193,23 @@ def _mock_subprocess_dual(
     merge_rc: int = 0,
     report_path: Optional[str] = None,
     report_head_sha: Optional[str] = None,
+    final_gh_stdout: Optional[str] = None,
+    final_gh_rc: Optional[int] = None,
 ) -> MagicMock:
     """Mock ``subprocess.run`` for the opt-in path with a successful
-    phase gate: first call is the read-only ``gh pr view`` recheck;
-    second call is ``merge_pr_safely.py``.
+    phase gate.
+
+    The opt-in path now invokes ``subprocess.run`` THREE times:
+      1. Pre-delegation live-head recheck (``gh pr view``).
+      2. ``merge_pr_safely.py`` (writes the report file).
+      3. Post-merge-readiness live-head recheck
+         (PR #393 — thread PRRT_kwDOSHFpYM6HtFpG).
+
+    The pre-delegation recheck returns ``gh_stdout``/``gh_rc`` and
+    the post-merge-readiness recheck returns ``final_gh_stdout``/
+    ``final_gh_rc`` (both defaulting to the same values as the
+    pre-delegation recheck — meaning tests that don't care about
+    the post-merge recheck get the expected SHA on both calls).
 
     If ``report_path`` and ``report_head_sha`` are both provided AND
     ``merge_rc == 0``, the helper writes a minimal but well-formed
@@ -213,10 +226,15 @@ def _mock_subprocess_dual(
     unchanged without invoking the head-binding check.
 
     Returns a single MagicMock whose ``side_effect`` is a list of
-    two CompletedProcess responses. Tests that exercise this path
+    three CompletedProcess responses. Tests that exercise this path
     should use this helper instead of ``_mock_subprocess_run``.
     """
     import json
+
+    if final_gh_stdout is None:
+        final_gh_stdout = gh_stdout
+    if final_gh_rc is None:
+        final_gh_rc = gh_rc
 
     def _maybe_write_report():
         if merge_rc != 0:
@@ -248,13 +266,23 @@ def _mock_subprocess_dual(
                 args=call_args[0] if call_args else [],
                 returncode=gh_rc, stdout=gh_stdout, stderr="",
             )
-        # Second call: merge_pr_safely.py. Write the report file
-        # BEFORE returning the CompletedProcess so the wrapper's
-        # post-success head-binding check sees it on disk.
-        _maybe_write_report()
+        if call_state["n"] == 2:
+            # Second call: merge_pr_safely.py. Write the report file
+            # BEFORE returning the CompletedProcess so the wrapper's
+            # post-success head-binding check sees it on disk.
+            _maybe_write_report()
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=merge_rc, stdout="", stderr="",
+            )
+        # 3rd call: post-merge-readiness live-head recheck
+        # (PR #393 — thread PRRT_kwDOSHFpYM6HtFpG). By default
+        # reuses the pre-delegation recheck response, but tests
+        # that need to simulate a head change can pass
+        # ``final_gh_stdout`` / ``final_gh_rc``.
         return subprocess.CompletedProcess(
             args=call_args[0] if call_args else [],
-            returncode=merge_rc, stdout="", stderr="",
+            returncode=final_gh_rc, stdout=final_gh_stdout, stderr="",
         )
 
     mock = MagicMock(side_effect=_side_effect)
@@ -326,7 +354,7 @@ def test_run_summary_pass_proceeds_to_merge_pr_safely(monkeypatch, tmp_path):
 
     # Both called exactly once.
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 2
+    assert mock_sub.call_count == 3
     # Exit code 0.
     assert rc == 0
 
@@ -775,9 +803,11 @@ def test_head_match_proceeds_to_merge_pr_safely_after_phase_gate(
     rc = m.run_wrapper(args)
 
     assert rc == 0
-    # Phase gate called once; two subprocess calls (gh pr view + merge_pr_safely).
+    # Phase gate called once; three subprocess calls
+    # (gh pr view + merge_pr_safely + post-merge-readiness
+    # gh pr view recheck).
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 2
+    assert mock_sub.call_count == 3
 
 
 def test_hold_head_changed_blocks_merge_pr_safely(monkeypatch, tmp_path):
@@ -1010,7 +1040,7 @@ def test_expected_head_sha_used_for_comparison_after_gate(
     )
     rc_a = m.run_wrapper(args_a)
     assert rc_a == 0
-    assert mock_sub_a.call_count == 2  # gh + merge_pr_safely
+    assert mock_sub_a.call_count == 3  # gh + merge_pr_safely + post-merge recheck
 
     # ---- Sub-scenario (b): head differs ----
     # Re-mock for the second sub-scenario.
@@ -1072,7 +1102,7 @@ def test_report_head_matches_expected_propagates_success(
 
     assert rc == 0
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 2
+    assert mock_sub.call_count == 3
 
 
 def test_report_head_mismatch_exits_1(monkeypatch, tmp_path):
@@ -1325,11 +1355,21 @@ def test_match_head_commit_extracted_from_merge_command_if_needed(
                 args=call_args[0] if call_args else [],
                 returncode=0, stdout=expected, stderr="",
             )
-        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(report_path).write_text(report_content, encoding="utf-8")
+        if call_state["n"] == 2:
+            # Second call: write the report file with the SHA
+            # embedded in the safe_merge_command_text field only.
+            Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+            Path(report_path).write_text(report_content, encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0, stdout="", stderr="",
+            )
+        # 3rd call: post-merge-readiness live-head recheck
+        # (PR #393 — thread PRRT_kwDOSHFpYM6HtFpG). Return the
+        # same expected SHA so the post-merge recheck passes.
         return subprocess.CompletedProcess(
             args=call_args[0] if call_args else [],
-            returncode=0, stdout="", stderr="",
+            returncode=0, stdout=expected, stderr="",
         )
 
     mock_sub = MagicMock(side_effect=_side_effect)
@@ -1345,7 +1385,7 @@ def test_match_head_commit_extracted_from_merge_command_if_needed(
 
     # SHA extracted from the merge command and matched expected.
     assert rc == 0
-    assert mock_sub.call_count == 2
+    assert mock_sub.call_count == 3
 
 
 def test_report_head_binding_uses_expected_head_sha_not_live_recheck_sha(
@@ -1541,6 +1581,213 @@ def test_head_recheck_uses_bounded_timeout(monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# POST-MERGE-READINESS LIVE-HEAD RECHECK (PR #393 — Codex inline
+# comment PRRC_kwDOSHFpYM7I5OCA, thread PRRT_kwDOSHFpYM6HtFpG):
+# After merge_pr_safely returns 0 AND the report head matches
+# args.expected_head_sha, the wrapper performs a final live-head
+# recheck using the same bounded _fetch_live_pr_head helper.
+# This closes the residual microsecond-scale TOCTOU window
+# between the report file being written and the wrapper
+# actually returning success.
+# ---------------------------------------------------------------------------
+
+
+def test_post_delegation_head_recheck_blocks_when_head_changed(
+    monkeypatch, tmp_path
+):
+    """When the post-merge-readiness live-head recheck returns a
+    SHA different from args.expected_head_sha, the wrapper exits
+    1 with HOLD_HEAD_CHANGED_AFTER_MERGE_READINESS stderr and
+    does NOT return success.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    _mock_repo_origin(monkeypatch)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    # A new commit lands after merge_pr_safely's internal fetch.
+    new_head = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        # Pre-delegation recheck returns the expected SHA
+        # (matches), so the wrapper proceeds to merge_pr_safely.
+        gh_stdout=expected,
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=expected,
+        # Post-merge-readiness recheck returns a DIFFERENT SHA
+        # (simulating a commit that landed between merge_pr_safely's
+        # internal fetch and the wrapper's return).
+        final_gh_stdout=new_head,
+        final_gh_rc=0,
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 1
+    err = captured_err.getvalue()
+    assert "HOLD_HEAD_CHANGED_AFTER_MERGE_READINESS" in err
+    assert expected in err
+    assert new_head in err
+    assert mock_gate.call_count == 1
+    # All three subprocess calls happened (pre-gh + merge + post-gh).
+    assert mock_sub.call_count == 3
+
+
+def test_post_delegation_head_recheck_failure_exits_2(
+    monkeypatch, tmp_path
+):
+    """When the post-merge-readiness live-head recheck fails
+    (non-zero exit, empty stdout, or non-SHA result), the wrapper
+    exits 2 with 'unable to recheck PR head after merge readiness'
+    stderr and does NOT return success.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    _mock_repo_origin(monkeypatch)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,  # pre-delegation matches
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=expected,
+        # Post-merge-readiness recheck fails (empty stdout).
+        final_gh_stdout="",
+        final_gh_rc=0,
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    err = captured_err.getvalue()
+    assert "unable to recheck PR head after merge readiness" in err
+    assert "not returning success" in err
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 3
+
+
+def test_post_delegation_recheck_uses_read_only_gh_pr_view(
+    monkeypatch, tmp_path
+):
+    """The 3rd subprocess.run call (the post-merge-readiness
+    recheck) must be a read-only ``gh pr view --json headRefOid
+    --jq .headRefOid`` invocation. It must NOT include any
+    mutating gh subcommand, --admin, or --auto.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    _mock_repo_origin(monkeypatch)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=expected,
+    )
+
+    args = _opt_in_args(
+        repo="Slideshow11/Automated-Edge-Discovery",
+        pr_number=393,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    # 3 subprocess calls; the 3rd is the post-merge-readiness
+    # live-head recheck.
+    assert mock_sub.call_count == 3
+    cmd = mock_sub.call_args_list[2].args[0]
+    # Same shape as the pre-delegation recheck: read-only
+    # ``gh pr view --json headRefOid --jq .headRefOid``.
+    assert "gh" in cmd
+    assert "pr" in cmd
+    assert "view" in cmd
+    assert "393" in cmd
+    assert "--repo" in cmd
+    assert "Slideshow11/Automated-Edge-Discovery" in cmd
+    assert "--json" in cmd
+    assert "headRefOid" in cmd
+    assert "--jq" in cmd
+    assert ".headRefOid" in cmd
+    # Negative assertions: no mutating flags, no admin/auto.
+    joined = " ".join(cmd)
+    assert "merge" not in joined
+    assert "create" not in joined
+    assert "edit" not in joined
+    assert "delete" not in joined
+    assert "--admin" not in joined
+    assert "--auto" not in joined
+
+
+def test_post_delegation_recheck_skipped_when_verify_fails(
+    monkeypatch, tmp_path
+):
+    """If the report-head verification returns non-zero, the
+    wrapper propagates that code unchanged and does NOT proceed
+    to the post-merge-readiness recheck. The 3rd subprocess
+    call must NOT happen in that case.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    _mock_repo_origin(monkeypatch)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    # Report has a DIFFERENT head from expected (HEAD_MISMATCH
+    # path) — wrapper returns 1 from _verify_merge_readiness_head
+    # before reaching the post-merge recheck.
+    different_report_head = "beadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=different_report_head,
+        # The post-merge recheck would return the new SHA, but
+        # the wrapper should never get there.
+        final_gh_stdout="ffffffffffffffffffffffffffffffffffffffff",
+        final_gh_rc=0,
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 1
+    err = captured_err.getvalue()
+    # HEAD_MISMATCH from the report check, not the post-merge
+    # recheck.
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" in err
+    assert "HOLD_HEAD_CHANGED_AFTER_MERGE_READINESS" not in err
+    # Only 2 subprocess calls happened (pre-gh + merge).
+    # The post-merge recheck was NOT performed.
+    assert mock_sub.call_count == 2
+
+
+# ---------------------------------------------------------------------------
 # P2 REGRESSION GUARDS (PR #393 — inline comment PRRC_kwDOSHFpYM7I5CY5,
 # thread PRRT_kwDOSHFpYM6Hs9BB):
 # The phase-ledger gate (aed_final_gate.run_final_gate) derives its
@@ -1584,9 +1831,10 @@ def test_repo_matches_script_origin_proceeds_normally(monkeypatch, tmp_path):
     # Origin was fetched (we patched the helper, so the test
     # confirms it was called).
     assert mock_origin.call_count == 1
-    # Phase gate called; subprocess run for gh + merge_pr_safely.
+    # Phase gate called; three subprocess.run calls (gh pr view +
+    # merge_pr_safely + post-merge-readiness gh pr view recheck).
     assert mock_gate.call_count == 1
-    assert mock_sub.call_count == 2
+    assert mock_sub.call_count == 3
 
 
 def test_repo_mismatch_with_script_origin_exits_2_before_phase_gate(

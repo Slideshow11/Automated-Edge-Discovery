@@ -879,7 +879,61 @@ def run_wrapper(args: argparse.Namespace) -> int:
     # between merge_pr_safely's internal ``gh pr view`` fetch
     # and the wrapper returning — the P1 follow-up to inline
     # comment 3370258789, thread PRRT_kwDOSHFpYM6HskHa).
-    return _verify_merge_readiness_head(args)
+    verify_rc = _verify_merge_readiness_head(args)
+    if verify_rc != 0:
+        # The post-success report-head check failed (mismatch,
+        # missing report, unparseable, etc.). Propagate its
+        # exit code unchanged. Do NOT proceed to the final
+        # live-head recheck — the report binding already failed
+        # and a successful wrapper return would be unsound.
+        return verify_rc
+
+    # Final live-head recheck AFTER merge readiness completes.
+    # The pre-delegation recheck (above) closes the window
+    # between the phase-gate adapter and merge_pr_safely.py.
+    # The post-success report check (just above) closes the
+    # window between merge_pr_safely's internal ``gh pr view``
+    # and the report file being written. This final recheck
+    # closes the residual window between the report file
+    # being written and the wrapper actually returning — a
+    # new commit landing in that microsecond-scale interval
+    # would otherwise let the wrapper return success for a
+    # head the phase ledger never covered. Closes the Codex
+    # P1 follow-up on PR #393 — inline comment
+    # PRRC_kwDOSHFpYM7I5OCA, thread PRRT_kwDOSHFpYM6HtFpG.
+    # Reuses the existing bounded ``_fetch_live_pr_head``
+    # helper (timeout = GH_PR_VIEW_TIMEOUT_SECONDS = 30s).
+    ok_final, live_head_final = _fetch_live_pr_head(
+        args.repo, args.pr_number,
+    )
+    if not ok_final:
+        # Read-only ``gh pr view`` failed at the very end
+        # (subprocess non-zero, empty stdout, malformed
+        # SHA, or ``subprocess.TimeoutExpired``). Treat as
+        # a hard error: do NOT return success.
+        print(
+            "merge_readiness_with_phase_ledger: unable to recheck "
+            "PR head after merge readiness; not returning success",
+            file=sys.stderr,
+        )
+        return 2
+    if live_head_final != args.expected_head_sha:
+        # Head changed in the residual window between
+        # merge_pr_safely's report write and the wrapper
+        # return. The ledger evidence no longer covers
+        # the live head. Block the return.
+        print(
+            f"HOLD_HEAD_CHANGED_AFTER_MERGE_READINESS: "
+            f"ledger-validated head was {args.expected_head_sha} "
+            f"but PR head is now {live_head_final}; not returning "
+            "success",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Final live head matches the validated head. Safe to
+    # return success.
+    return 0
 
 
 # ---------------------------------------------------------------------------
