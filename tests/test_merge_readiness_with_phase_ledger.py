@@ -1359,3 +1359,106 @@ def test_report_head_mismatch_with_match_in_live_recheck_exits_1(
     assert different_report_head in err
     # Both subprocess calls happened (gh pr view + merge_pr_safely).
     assert mock_sub.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# P2 REGRESSION GUARDS (PR #393 — Codex inline comment PRRC_kwDOSHFpYM7I44yF,
+# thread PRRT_kwDOSHFpYM6Hs2BD):
+# The wrapper's read-only ``gh pr view`` recheck must have a bounded
+# timeout. If ``gh`` stalls (auth prompt, network I/O), ``subprocess.run``
+# raises ``subprocess.TimeoutExpired``; the wrapper must catch it and
+# take the existing "unable to recheck PR head" path (exit 2, do not
+# invoke ``merge_pr_safely``).
+# ---------------------------------------------------------------------------
+
+
+def test_head_recheck_timeout_exits_2_and_blocks_merge_pr_safely(
+    monkeypatch, tmp_path
+):
+    """If the ``gh pr view`` recheck raises ``subprocess.TimeoutExpired``,
+    the wrapper must treat it as a failed recheck: exit 2, print the
+    existing "unable to recheck PR head" stderr message, and do NOT
+    invoke ``merge_pr_safely.py``.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+
+    def _raise_timeout(*call_args, **call_kwargs):
+        raise subprocess.TimeoutExpired(
+            cmd=call_args[0] if call_args else [],
+            timeout=30,
+        )
+
+    mock_sub = MagicMock(side_effect=_raise_timeout)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    # Phase gate called once; only the timed-out gh call ran
+    # (merge_pr_safely was NOT called).
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 1
+    err = captured_err.getvalue()
+    assert "unable to recheck PR head" in err
+    assert "merge_pr_safely not invoked" in err
+
+
+def test_head_recheck_uses_bounded_timeout(monkeypatch, tmp_path):
+    """The ``subprocess.run`` call for the read-only ``gh pr view``
+    recheck must pass a finite ``timeout`` kwarg. The value must be
+    a positive number (we check it is in the reasonable range 1-600s).
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Return a successful CompletedProcess for the gh call so the
+    # wrapper proceeds; we do not care about the rest of the flow
+    # here — we only need to capture the kwarg passed to subprocess.run.
+    expected_sha = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected_sha,
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=expected_sha,
+    )
+
+    args = _opt_in_args(
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    # The FIRST subprocess.run call (index 0) is the gh pr view.
+    gh_call = mock_sub.call_args_list[0]
+    # The timeout may be passed as a positional arg or as a kwarg
+    # depending on the Python version. Accept either form.
+    passed_timeout = None
+    if "timeout" in gh_call.kwargs:
+        passed_timeout = gh_call.kwargs["timeout"]
+    else:
+        # subprocess.run(cmd, ..., timeout=N) — timeout is the
+        # 6th positional arg after check, capture_output, text,
+        # input, encoding (varies by version). Inspect all
+        # positional args for a number.
+        for a in gh_call.args[1:]:
+            if isinstance(a, (int, float)) and 1 <= a <= 600:
+                passed_timeout = a
+                break
+    assert passed_timeout is not None, (
+        f"subprocess.run for gh pr view did not receive a timeout kwarg: "
+        f"args={gh_call.args}, kwargs={gh_call.kwargs}"
+    )
+    assert 1 <= passed_timeout <= 600, (
+        f"timeout value {passed_timeout} out of reasonable range"
+    )
+    # And specifically: the module-level constant must be 30.
+    assert m.GH_PR_VIEW_TIMEOUT_SECONDS == 30
+    assert passed_timeout == m.GH_PR_VIEW_TIMEOUT_SECONDS

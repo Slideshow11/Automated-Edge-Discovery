@@ -288,6 +288,15 @@ def _run_merge_pr_safely(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+# Bounded timeout (seconds) for the read-only ``gh pr view`` recheck.
+# Mirrors the timeout used by ``merge_pr_safely.fetch_pr_head_sha()`` so
+# the wrapper's pre-delegation recheck and ``merge_pr_safely``'s
+# internal fetch fail at the same rate on a stalled ``gh``. Closes
+# the Codex P2 follow-up finding on PR #393 — inline comment
+# PRRC_kwDOSHFpYM7I44yF, thread PRRT_kwDOSHFpYM6Hs2BD.
+GH_PR_VIEW_TIMEOUT_SECONDS = 30
+
+
 def _build_fetch_live_head_cmd(repo: str, pr_number: int) -> list:
     """Build the read-only ``gh pr view`` argv used to recheck the live
     PR head after the phase-ledger gate has passed.
@@ -315,7 +324,17 @@ def _fetch_live_pr_head(repo: str, pr_number: int) -> "tuple[bool, Optional[str]
     Returns ``(True, head_sha)`` on success where ``head_sha`` is
     a 40-char hex string with surrounding whitespace stripped.
     Returns ``(False, None)`` on any failure: subprocess non-zero
-    exit, empty stdout, malformed JSON, or a non-SHA stdout.
+    exit, ``subprocess.TimeoutExpired`` (gh stalled on auth or
+    network I/O), empty stdout, malformed JSON, or a non-SHA
+    stdout.
+
+    The call is bounded by ``GH_PR_VIEW_TIMEOUT_SECONDS`` (see
+    P2 fix on PR #393 — inline comment PRRC_kwDOSHFpYM7I44yF,
+    thread PRRT_kwDOSHFpYM6Hs2BD). If ``gh`` hangs past the
+    timeout, ``subprocess.TimeoutExpired`` is raised by
+    ``subprocess.run``; we catch it and return ``(False, None)``
+    so the wrapper takes the existing "unable to recheck PR head"
+    path (exit 2, do not invoke ``merge_pr_safely``).
 
     This is intentionally read-only: it never invokes
     ``gh pr merge``, ``gh pr create``, ``gh pr edit``, or any
@@ -323,12 +342,20 @@ def _fetch_live_pr_head(repo: str, pr_number: int) -> "tuple[bool, Optional[str]
     ``gh pr view --json headRefOid --jq .headRefOid`` call.
     """
     cmd = _build_fetch_live_head_cmd(repo, pr_number)
-    completed = subprocess.run(
-        cmd,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=GH_PR_VIEW_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        # ``gh`` did not return within the bounded window. Treat
+        # as a failed recheck — the existing path in ``run_wrapper``
+        # prints "unable to recheck PR head" and exits 2 without
+        # invoking ``merge_pr_safely``.
+        return False, None
     if completed.returncode != 0:
         return False, None
     raw = (completed.stdout or "").strip()
