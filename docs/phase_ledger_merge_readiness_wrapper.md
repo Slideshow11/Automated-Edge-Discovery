@@ -80,12 +80,24 @@ inside `run_wrapper(args)`:
    `--codex-artifact-path`, `--phase-gate-output-json`,
    `--phase-gate-output-md`. If any are missing, print a clear
    "Refusing to proceed" message and exit `2`.
-3. **Cross-script consistency check** — read `git remote get-url origin`
-   for `--repo-root` and compare its normalized owner/repo slug to the
-   normalized `--repo` slug. This prevents the phase gate (which derives
-   its target repo from the script repo's `git remote get-url origin`)
-   from validating a different PR than the one the wrapper will delegate
-   to. On mismatch, print a `REPO_MISMATCH:` message and exit `2`.
+3. **Cross-script consistency check** — read `git -C <repo_root>
+   remote get-url origin` (i.e. the origin of the directory the
+   operator passed as `--repo-root`, **not** the origin of the
+   AED script's own checkout) and compare its normalized
+   owner/repo slug to the normalized `--repo` slug. On mismatch,
+   print a `REPO_MISMATCH:` message and exit `2`.
+
+   The phase-gate adapter (`aed_final_gate.run_final_gate`)
+   separately derives its target repo from `git remote get-url
+   origin` run with `cwd=Path(__file__).parent.parent` — i.e.
+   from the AED checkout the wrapper itself is being executed
+   out of, which may be a different physical directory than
+   `--repo-root`. The wrapper does **not** verify that the
+   script-checkout origin and the `--repo-root` origin agree;
+   the operator is responsible for invoking the wrapper from
+   the same AED checkout as `--repo-root` (or, equivalently,
+   for ensuring the two are the same repo). See
+   §Cross-checkout pitfall below.
 4. **Run the phase-gate adapter** — invoke
    `finalize_with_phase_ledger.run_finalize(...)` with the runner's
    `run_summary.json` and the six phase-gate args. If the adapter
@@ -144,7 +156,7 @@ And the always-required identity args:
 
 | Flag | Purpose |
 |------|---------|
-| `--repo <owner/name>` | The GitHub repository the wrapper is gating on. Must match the script repo's `git remote get-url origin`. |
+| `--repo <owner/name>` | The GitHub repository the wrapper is gating on. Must match the origin of `--repo-root` (the directory the operator passes), not the origin of the AED script's own checkout — see §Cross-checkout pitfall. |
 | `--repo-root <path>` | The AED repository root. Used for the repo-consistency check and forwarded to `merge_pr_safely.py`. |
 | `--pr-number <int>` | The GitHub PR number being gated. |
 
@@ -222,6 +234,58 @@ be subverted:
   immediate `Refusing to proceed` exit `2` before any subprocess is
   invoked.
 
+## Cross-checkout pitfall
+
+The wrapper's repo-consistency check (`REPO_MISMATCH:`) compares the
+operator's `--repo` against the `origin` remote of the directory
+passed as `--repo-root`. It does **not** also check that the
+AED script's own checkout (the directory the wrapper is being
+executed from) has an origin that agrees with `--repo-root`. The
+phase-gate adapter, by contrast, derives its target repo from
+`git remote get-url origin` with `cwd=Path(__file__).parent.parent`
+— i.e. from the AED script's own checkout, **not** from
+`--repo-root`. This means the following cross-checkout invocation
+is a **forbidden mode** that defeats the consistency check:
+
+```
+WRONG — do NOT do this:
+  # The wrapper is being invoked from AED checkout A...
+  cd /path/to/aed-checkout-A
+  python3 scripts/local/merge_readiness_with_phase_ledger.py \
+    --repo <owner/repo> \
+    --repo-root /path/to/aed-checkout-B \   # ← different AED checkout
+    ...
+```
+
+In this pattern, the wrapper's `REPO_MISMATCH:` check is comparing
+`--repo` against the origin of checkout B, while the phase-gate
+adapter (`aed_final_gate.run_final_gate`) will validate against
+the origin of checkout A. If the two checkouts are different repos
+(or different forks, or different remotes pointing at the same repo
+under different names), the wrapper's check can pass while the
+phase gate validates a different PR than the operator intended.
+
+The safe pattern is to invoke the wrapper from the same AED
+checkout as `--repo-root`:
+
+```
+RIGHT:
+  cd /path/to/aed-checkout
+  python3 scripts/local/merge_readiness_with_phase_ledger.py \
+    --repo <owner/repo> \
+    --repo-root $(pwd) \
+    ...
+```
+
+Or, equivalently, set `--repo-root` to the absolute path of the
+AED checkout the operator is invoking the wrapper from. The
+wrapper does not detect the cross-checkout pitfall; it is the
+operator's responsibility to avoid it. (A future PR may add an
+explicit script-checkout ↔ `--repo-root` comparison to
+`_validate_repo_matches_repo_root`; until that lands, this
+document is the only safety surface for the cross-checkout
+mode.)
+
 ## When **not** to use the wrapper
 
 The wrapper is the right tool only when **all** of the following hold:
@@ -236,9 +300,13 @@ The wrapper is the right tool only when **all** of the following hold:
    the wrapper. If a new commit landed after the runner finished, the
    runner's evidence does not cover the live head; abort and re-run the
    runner before invoking the wrapper.
-3. The script's `git remote get-url origin` matches `--repo` (the
-   wrapper enforces this; a mismatch exits `2` before any subprocess is
-   invoked).
+3. `--repo` matches the `git remote get-url origin` of the
+   directory passed as `--repo-root` (the wrapper enforces
+   this; a mismatch exits `2` with `REPO_MISMATCH:` before any
+   subprocess is invoked). The wrapper does **not** check
+   that the script's own AED-checkout origin matches
+   `--repo`; see §Cross-checkout pitfall for the forbidden
+   cross-checkout invocation mode.
 4. The operator is not trying to merge directly. The wrapper is not a
    substitute for `gh pr merge` or the standard AED merge authorization
    flow. The wrapper only emits or refuses merge-readiness; the human
@@ -285,13 +353,22 @@ PR is being phase-gated at all:
     validate without a runner-produced summary; producing one is
     a prerequisite, not an optional add-on.
   - **Repo/root mismatch** (`REPO_MISMATCH:` or `unable to read
-    git remote get-url origin` exit `2`): the wrapper is gating
-    on a different repository than the script's `origin` remote,
-    or `--repo-root` is checked out against the wrong repo. Fix
-    the invocation (correct `--repo`) or fix the checkout
-    (correct `--repo-root`, or `git remote set-url origin ...`)
-    and re-invoke the wrapper. The mismatch is a binding error,
-    not a suggestion to bypass.
+    git remote get-url origin` exit `2`): the normalized
+    `--repo` does not match the `origin` remote of the
+    directory the operator passed as `--repo-root`. The
+    wrapper's consistency check is between `--repo` and
+    `--repo-root`'s origin — it does **not** also check the
+    AED script's own checkout origin. Fix the invocation
+    (correct `--repo`) or fix `--repo-root` (point it at the
+    AED checkout the wrapper is being executed from, or run
+    `git remote set-url origin ...` inside `--repo-root`)
+    and re-invoke the wrapper. The mismatch is a binding
+    error, not a suggestion to bypass. If `--repo` and
+    `--repo-root`'s origin both pass the wrapper's check but
+    the phase gate still appears to validate the wrong PR,
+    see §Cross-checkout pitfall — the operator has likely
+    invoked the wrapper from one AED checkout while passing
+    `--repo-root` for a different AED checkout.
   - **Phase gate HOLD/ERROR** (exit `1` or `2` from the
     final-gate adapter, e.g.
     `phase-ledger final gate blocked merge-readiness (gate exit
