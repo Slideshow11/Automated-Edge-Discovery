@@ -244,8 +244,69 @@ The wrapper is the right tool only when **all** of the following hold:
    flow. The wrapper only emits or refuses merge-readiness; the human
    must still authorize the actual merge.
 
-If any of the above does not hold, fall back to the default
-`merge_pr_safely.py` invocation (no `--run-summary`).
+**Invariant.** For a PR intended to be phase-gated,
+`merge_readiness_with_phase_ledger.py` is the safety boundary.
+Bypassing it after a failed prerequisite defeats exact-head
+phase-ledger evidence: the wrapper is the only place where the
+runner-produced ledger is bound to the live PR head, and skipping
+it for the same PR re-merges on stale evidence.
+
+The right response to a failed prerequisite depends on whether the
+PR is being phase-gated at all:
+
+- **PR is not phase-gated.** If the PR is not being phase-gated
+  (no runner-produced `run_summary.json` for the live head, and
+  the operator never intended to invoke the wrapper for it),
+  running `merge_pr_safely.py` directly is fine. The wrapper is
+  opt-in; invoking it without `--run-summary` is the correct way
+  to opt out, and bypassing it is unnecessary.
+
+- **PR is intended to be phase-gated.** If the operator started
+  the phase-gating flow for this PR — i.e. a runner-produced
+  `run_summary.json` exists for it — do **not** fall back to
+  `merge_pr_safely.py` for that same PR after a prerequisite
+  fails. Instead, address the specific failure:
+
+  - **Stale head** (`HOLD_HEAD_CHANGED:` exit `1`, or a runner
+    run whose `expected_head_sha` is older than
+    `git rev-parse origin/<pr-branch>`): the live PR head has
+    advanced past the evidence the runner covered. Re-run the
+    runner against the **current** head to produce a fresh
+    `run_summary.json`, then re-invoke the wrapper with the new
+    `--expected-head-sha`. Do not re-invoke the wrapper with the
+    stale summary, and do not fall back to `merge_pr_safely.py`
+    to "get the merge in" against an un-evaluated head.
+  - **Missing evidence** (`Refusing to proceed` exit `2` for a
+    missing/empty required phase-gate arg, or a
+    `run_summary.json` that is absent, malformed, or lacks
+    `phase_ledger_path` / `phase_ledger_expected_run_id` /
+    `phase_ledger_claimed_phases`): regenerate or provide the
+    evidence. The phase-ledger final-gate adapter has nothing to
+    validate without a runner-produced summary; producing one is
+    a prerequisite, not an optional add-on.
+  - **Repo/root mismatch** (`REPO_MISMATCH:` or `unable to read
+    git remote get-url origin` exit `2`): the wrapper is gating
+    on a different repository than the script's `origin` remote,
+    or `--repo-root` is checked out against the wrong repo. Fix
+    the invocation (correct `--repo`) or fix the checkout
+    (correct `--repo-root`, or `git remote set-url origin ...`)
+    and re-invoke the wrapper. The mismatch is a binding error,
+    not a suggestion to bypass.
+  - **Phase gate HOLD/ERROR** (exit `1` or `2` from the
+    final-gate adapter, e.g.
+    `phase-ledger final gate blocked merge-readiness (gate exit
+    code N)`): treat it as a blocker. The phase-ledger evidence
+    does not agree with the live PR state, and
+    `merge_pr_safely.py` was **not** invoked. Inspect the gate
+    output at `--phase-gate-output-json` /
+    `--phase-gate-output-md` and resolve the underlying
+    disagreement (stale head, missing claimed phase, unblessed
+    files, etc.) before retrying. The gate is the safety
+    boundary; bypassing it defeats exact-head phase-ledger
+    evidence.
+
+A failed prerequisite is information the operator acts on, not
+authorization to skip the safety boundary.
 
 ## Related files
 
