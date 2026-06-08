@@ -350,11 +350,18 @@ def _fetch_live_pr_head(repo: str, pr_number: int) -> "tuple[bool, Optional[str]
             text=True,
             timeout=GH_PR_VIEW_TIMEOUT_SECONDS,
         )
-    except subprocess.TimeoutExpired:
-        # ``gh`` did not return within the bounded window. Treat
-        # as a failed recheck — the existing path in ``run_wrapper``
-        # prints "unable to recheck PR head" and exits 2 without
-        # invoking ``merge_pr_safely``.
+    except (subprocess.TimeoutExpired, OSError):
+        # ``gh`` did not return within the bounded window, or the
+        # binary is missing from ``PATH`` (e.g. on a host without
+        # the GitHub CLI installed). ``FileNotFoundError`` is a
+        # subclass of ``OSError`` and surfaces from
+        # ``subprocess.run`` when the executable cannot be
+        # resolved. Treat both as a failed recheck — the existing
+        # path in ``run_wrapper`` prints "unable to recheck PR
+        # head" and exits 2 without invoking ``merge_pr_safely``.
+        # Closes the Codex P2 follow-up finding on PR #393 —
+        # inline comment PRRC_kwDOSHFpYM7I5bo2, thread
+        # PRRT_kwDOSHFpYM6HtPvH.
         return False, None
     if completed.returncode != 0:
         return False, None

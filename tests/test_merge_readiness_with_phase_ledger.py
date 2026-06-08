@@ -30,7 +30,9 @@ by ``test_finalize_with_phase_ledger.py`` and
 """
 
 import argparse
+import errno as errnos
 import io
+import os
 import subprocess
 import sys
 from contextlib import redirect_stderr
@@ -2076,3 +2078,164 @@ def test_repo_consistency_check_uses_bounded_git_timeout(monkeypatch, tmp_path):
         # Module-level constant.
         assert m._GIT_REMOTE_GET_URL_TIMEOUT_SECONDS == 10
         assert passed_timeout == m._GIT_REMOTE_GET_URL_TIMEOUT_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# MISSING-GH HANDLING FOR HEAD RECHECKS
+# (PR #393 — Codex inline comment PRRC_kwDOSHFpYM7I5bo2, thread
+# PRRT_kwDOSHFpYM6HtPvH):
+# When the host has no ``gh`` binary on ``PATH`` (or it cannot be
+# resolved for any other reason), ``subprocess.run([...])`` raises
+# ``FileNotFoundError`` (a subclass of ``OSError``). The wrapper
+# must treat this the same as a timeout/failed-recheck: exit 2 with
+# the documented "unable to recheck PR head" stderr message and do
+# NOT invoke ``merge_pr_safely.py`` (pre-delegation) or return
+# success (post-merge-readiness).
+# ---------------------------------------------------------------------------
+
+
+def test_head_recheck_handles_missing_gh_binary(monkeypatch, tmp_path):
+    """If the pre-delegation ``gh pr view`` recheck raises
+    ``FileNotFoundError`` (i.e. ``gh`` is not on ``PATH``), the
+    wrapper must fail closed: exit 2, print "unable to recheck PR
+    head" to stderr, and must NOT invoke ``merge_pr_safely.py``.
+    Closes PR #393 — Codex inline comment PRRC_kwDOSHFpYM7I5bo2,
+    thread PRRT_kwDOSHFpYM6HtPvH.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+
+    def _raise_missing_binary(*call_args, **call_kwargs):
+        # ``subprocess.run([...])`` raises ``FileNotFoundError``
+        # (an ``OSError`` subclass) when the executable cannot be
+        # resolved. This mirrors a host without the GitHub CLI
+        # installed.
+        raise FileNotFoundError(
+            errnos.ENOENT, os.strerror(errnos.ENOENT),
+            "gh",
+        )
+
+    mock_sub = MagicMock(side_effect=_raise_missing_binary)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+    _mock_repo_origin(monkeypatch)
+
+    args = _opt_in_args(
+        output_json=str(tmp_path / "out.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    # Phase gate was called exactly once (it runs before the
+    # pre-delegation recheck). The pre-delegation recheck itself
+    # raised before producing a CompletedProcess, so subprocess.run
+    # was called exactly once.
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 1
+    err = captured_err.getvalue()
+    assert "unable to recheck PR head" in err
+    # merge_pr_safely.py was NOT invoked (the wrapper must not
+    # delegate when the pre-delegation recheck failed).
+    assert "merge_pr_safely not invoked" in err
+
+
+def test_post_delegation_recheck_handles_missing_gh_binary(
+    monkeypatch, tmp_path
+):
+    """If the post-merge-readiness ``gh pr view`` recheck raises
+    ``FileNotFoundError`` (i.e. ``gh`` disappeared from ``PATH``
+    after the pre-delegation recheck), the wrapper must fail
+    closed: exit 2 with the post-merge-readiness stderr message
+    and must NOT return success. The phase gate and the merge
+    subprocess were both called; only the final recheck raised.
+    Closes PR #393 — Codex inline comment PRRC_kwDOSHFpYM7I5bo2,
+    thread PRRT_kwDOSHFpYM6HtPvH.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    _mock_repo_origin(monkeypatch)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+
+    call_state = {"n": 0}
+
+    def _side_effect(*call_args, **call_kwargs):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            # Pre-delegation recheck: success, returns the
+            # expected SHA.
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0, stdout=expected, stderr="",
+            )
+        if call_state["n"] == 2:
+            # merge_pr_safely.py: write the report and return 0.
+            import json as _json
+            report = {
+                "head_sha": expected,
+                "safe_merge_command_text": "",
+                "safe_merge_command_list": [],
+            }
+            rp = Path(report_path)
+            if rp.parent and str(rp.parent) not in ("", "."):
+                rp.parent.mkdir(parents=True, exist_ok=True)
+            rp.write_text(_json.dumps(report), encoding="utf-8")
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0, stdout="", stderr="",
+            )
+        # 3rd call: post-merge-readiness recheck — ``gh`` is now
+        # missing. The wrapper must catch the OSError and exit 2.
+        raise FileNotFoundError(
+            errnos.ENOENT, os.strerror(errnos.ENOENT),
+            "gh",
+        )
+
+    mock_sub = MagicMock(side_effect=_side_effect)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    err = captured_err.getvalue()
+    assert "unable to recheck PR head after merge readiness" in err
+    assert "not returning success" in err
+    # Phase gate, merge_pr_safely, and post-merge-readiness recheck
+    # were all attempted.
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 3
+
+
+def test_fetch_live_pr_head_treats_oserror_as_failed_recheck(monkeypatch):
+    """Direct unit test of ``_fetch_live_pr_head`` for the
+    missing-gh path: when ``subprocess.run`` raises
+    ``FileNotFoundError`` (an ``OSError`` subclass), the helper
+    must return ``(False, None)`` rather than letting the
+    exception propagate. This is the building block both the
+    pre- and post-delegation recheck paths rely on.
+    Closes PR #393 — Codex inline comment PRRC_kwDOSHFpYM7I5bo2,
+    thread PRRT_kwDOSHFpYM6HtPvH.
+    """
+    def _raise_oserror(*call_args, **call_kwargs):
+        # Use a generic ``OSError`` rather than the
+        # ``FileNotFoundError`` subclass to verify the catch is
+        # truly on the ``OSError`` base, not just on
+        # ``FileNotFoundError``.
+        raise OSError(errnos.ENOENT, "simulated missing gh")
+
+    mock_sub = MagicMock(side_effect=_raise_oserror)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    ok, head = m._fetch_live_pr_head(
+        "Slideshow11/Automated-Edge-Discovery", 393,
+    )
+
+    assert ok is False
+    assert head is None
