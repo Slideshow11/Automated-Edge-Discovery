@@ -58,6 +58,7 @@ Scope (leaf wrapper):
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -343,6 +344,161 @@ def _fetch_live_pr_head(repo: str, pr_number: int) -> "tuple[bool, Optional[str]
 
 
 # ---------------------------------------------------------------------------
+# Merge-readiness report head-binding (P1 regression guard on PR #393,
+# follow-up to inline comment id 3370199372 → 3370258789)
+# ---------------------------------------------------------------------------
+
+
+_SHA40_RE = re.compile(r"[0-9a-f]{40}")
+
+
+def _load_merge_readiness_report(path) -> "tuple[bool, Optional[dict]]":
+    """Read and JSON-parse the merge-readiness report written by
+    ``merge_pr_safely.py`` at ``path``.
+
+    Returns ``(True, report_dict)`` on success where ``report_dict``
+    is the parsed JSON object. Returns ``(False, None)`` on any
+    failure: missing/empty path, file not found, permission
+    error, or malformed JSON.
+
+    This is purely a read; the wrapper never mutates the report.
+    """
+    if not path:
+        return False, None
+    try:
+        p = Path(path)
+    except TypeError:
+        return False, None
+    try:
+        text = p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False, None
+    if not text.strip():
+        return False, None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return False, None
+    if not isinstance(data, dict):
+        return False, None
+    return True, data
+
+
+def _extract_report_head_sha(report: dict) -> Optional[str]:
+    """Extract the head SHA recorded in a ``merge_pr_safely.py`` report.
+
+    Discovery order (PR #393 Codex P1 fix — see
+    ``scripts/local/merge_pr_safely.py`` lines 489, 520, 558, 583
+    and ``tests/test_merge_pr_safely.py`` line 290):
+
+      1. The ``head_sha`` field — the canonical, explicit
+         field. ``merge_pr_safely.py`` always writes it when
+         the ``gh pr view`` fetch inside that script succeeds.
+      2. The ``safe_merge_command_text`` field — a textual
+         ``gh pr merge ... --match-head-commit <sha> ...`` command.
+         Used as a defensive fallback in case the explicit
+         field is absent in a future revision.
+      3. The ``safe_merge_command_list`` field — the same
+         command as a list of tokens. Same defensive purpose.
+
+    Each candidate value is validated against the 40-char
+    lowercase-hex SHA pattern. The first validated value
+    wins. Returns ``None`` if no usable SHA is found.
+    """
+    # 1) Explicit field.
+    candidate = report.get("head_sha")
+    if isinstance(candidate, str):
+        c = candidate.strip()
+        if _SHA40_RE.fullmatch(c):
+            return c
+
+    # 2) Defensive fallback: --match-head-commit <sha> inside the
+    # textual command. ``re.search`` (not ``fullmatch``) because
+    # the SHA is embedded in a larger command string.
+    for key in ("safe_merge_command_text", "safe_merge_command_list"):
+        value = report.get(key)
+        if isinstance(value, str):
+            m = re.search(r"--match-head-commit\s+([0-9a-f]{40})", value)
+            if m:
+                return m.group(1)
+        elif isinstance(value, list):
+            joined = " ".join(str(x) for x in value)
+            m = re.search(r"--match-head-commit\s+([0-9a-f]{40})", joined)
+            if m:
+                return m.group(1)
+
+    return None
+
+
+def _verify_merge_readiness_head(args) -> int:
+    """Verify the report written by ``merge_pr_safely.py`` records the
+    same head SHA that the phase-ledger gate validated.
+
+    This is the second half of the P1 fix on PR #393 (inline
+    comment id 3370258789, thread PRRT_kwDOSHFpYM6HskHa). The
+    pre-delegation live-head recheck (in ``run_wrapper``) catches
+    commits that land BEFORE the subprocess starts; this
+    post-delegation report check catches commits that land
+    AFTER the subprocess's internal ``gh pr view`` fetch
+    (line 442 of ``merge_pr_safely.py``) and BEFORE the wrapper
+    returns. Together they ensure the wrapper can only report
+    success for a head the runner-produced ledger actually
+    covered.
+
+    Return codes:
+      0 — report's recorded head equals ``args.expected_head_sha``.
+      1 — report's recorded head differs from
+          ``args.expected_head_sha`` (``HEAD_MISMATCH_AFTER_MERGE_READINESS``).
+      2 — report missing, unparseable, or no usable head SHA
+          recorded. Treated as a hard error so the wrapper
+          never returns success without a verifiable bind.
+    """
+    expected = getattr(args, "expected_head_sha", None) or ""
+    report_path = getattr(args, "output_json", None)
+
+    ok, report = _load_merge_readiness_report(report_path)
+    if not ok:
+        print(
+            "merge_readiness_with_phase_ledger: unable to verify "
+            "merge-readiness report head; not returning success",
+            file=sys.stderr,
+        )
+        return 2
+
+    # ``_load_merge_readiness_report`` guarantees ``isinstance(report, dict)``
+    # when ``ok`` is True; narrow explicitly for the type checker.
+    if not isinstance(report, dict):
+        print(
+            "merge_readiness_with_phase_ledger: unable to verify "
+            "merge-readiness report head; not returning success",
+            file=sys.stderr,
+        )
+        return 2
+
+    report_head = _extract_report_head_sha(report)
+    if report_head is None:
+        print(
+            "merge_readiness_with_phase_ledger: unable to verify "
+            "merge-readiness report head; not returning success",
+            file=sys.stderr,
+        )
+        return 2
+
+    if report_head != expected:
+        print(
+            "HEAD_MISMATCH_AFTER_MERGE_READINESS: ledger-validated head "
+            f"was {expected} but merge_pr_safely report shows "
+            f"{report_head}; not returning success",
+            file=sys.stderr,
+        )
+        return 1
+
+    # Report's recorded head matches the ledger-validated head.
+    # Safe to return success.
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Phase-gate required-arg validation
 # ---------------------------------------------------------------------------
 
@@ -401,6 +557,14 @@ def run_wrapper(args: argparse.Namespace) -> int:
              fetch fails), exit non-zero and do NOT invoke
              merge_pr_safely. Only when the live head matches do
              we proceed to merge_pr_safely.
+           - If merge_pr_safely returns 0, VERIFY that the
+             report it wrote to args.output_json records the
+             same head SHA the gate validated (closes the
+             Codex follow-up P1 — inline comment id 3370258789,
+             thread PRRT_kwDOSHFpYM6HskHa). On a head mismatch,
+             missing report, or unparseable report, exit
+             non-zero. Only when the report's recorded head
+             matches do we return 0.
     """
     _reject_admin(args)
 
@@ -469,7 +633,21 @@ def run_wrapper(args: argparse.Namespace) -> int:
         return 1
 
     # Live head matches the validated head. Proceed to merge_pr_safely.
-    return _run_merge_pr_safely(args)
+    merge_rc = _run_merge_pr_safely(args)
+    if merge_rc != 0:
+        # Preserve existing behavior: propagate merge_pr_safely's exit
+        # code unchanged. Do not run the post-success head-binding
+        # verification on a failed run — the report may be missing
+        # or partial in that case, and the failure mode is already
+        # surfaced by merge_pr_safely's own non-zero exit.
+        return merge_rc
+    # merge_pr_safely returned 0. The report should be at
+    # args.output_json. Verify its recorded head still equals
+    # args.expected_head_sha (closes the residual TOCTOU window
+    # between merge_pr_safely's internal ``gh pr view`` fetch
+    # and the wrapper returning — the P1 follow-up to inline
+    # comment 3370258789, thread PRRT_kwDOSHFpYM6HskHa).
+    return _verify_merge_readiness_head(args)
 
 
 # ---------------------------------------------------------------------------

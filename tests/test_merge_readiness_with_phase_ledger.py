@@ -35,6 +35,7 @@ import subprocess
 import sys
 from contextlib import redirect_stderr
 from pathlib import Path
+from typing import Optional
 from unittest.mock import MagicMock
 
 import pytest
@@ -149,24 +150,73 @@ def _mock_subprocess_dual(
     gh_stdout: str = "",
     gh_rc: int = 0,
     merge_rc: int = 0,
+    report_path: Optional[str] = None,
+    report_head_sha: Optional[str] = None,
 ) -> MagicMock:
     """Mock ``subprocess.run`` for the opt-in path with a successful
     phase gate: first call is the read-only ``gh pr view`` recheck;
     second call is ``merge_pr_safely.py``.
 
-    Returns a single MagicMock whose ``side_effect`` is a list of two
-    CompletedProcess responses. Tests that exercise this path
+    If ``report_path`` and ``report_head_sha`` are both provided AND
+    ``merge_rc == 0``, the helper writes a minimal but well-formed
+    merge-readiness JSON report at ``report_path`` with
+    ``head_sha == report_head_sha`` before returning the second
+    CompletedProcess. This simulates the file that a real
+    ``merge_pr_safely.py`` run would produce, and lets the
+    wrapper's post-success head-binding check pass.
+
+    If ``merge_rc != 0`` the helper deliberately does NOT write a
+    report — that mirrors the real behavior where a failed
+    ``merge_pr_safely`` may not write a complete report, and the
+    wrapper's contract is to propagate the non-zero exit code
+    unchanged without invoking the head-binding check.
+
+    Returns a single MagicMock whose ``side_effect`` is a list of
+    two CompletedProcess responses. Tests that exercise this path
     should use this helper instead of ``_mock_subprocess_run``.
     """
-    responses = [
-        subprocess.CompletedProcess(
-            args=[], returncode=gh_rc, stdout=gh_stdout, stderr="",
-        ),
-        subprocess.CompletedProcess(
-            args=[], returncode=merge_rc, stdout="", stderr="",
-        ),
-    ]
-    mock = MagicMock(side_effect=responses)
+    import json
+
+    def _maybe_write_report():
+        if merge_rc != 0:
+            return
+        if not report_path or report_head_sha is None:
+            return
+        # Minimal report shape that satisfies ``_extract_report_head_sha``
+        # via the explicit ``head_sha`` field. ``safe_merge_command_text``
+        # is included as a defensive fallback in case a future revision
+        # of the wrapper prefers the embedded SHA over the explicit field.
+        report = {
+            "head_sha": report_head_sha,
+            "safe_merge_command_text": "",
+            "safe_merge_command_list": [],
+        }
+        rp = Path(report_path)
+        if rp.parent and str(rp.parent) not in ("", "."):
+            rp.parent.mkdir(parents=True, exist_ok=True)
+        rp.write_text(json.dumps(report), encoding="utf-8")
+
+    # Use a callable side_effect so we can run the report-write
+    # side effect at the moment the second subprocess call returns.
+    call_state = {"n": 0}
+
+    def _side_effect(*call_args, **call_kwargs):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=gh_rc, stdout=gh_stdout, stderr="",
+            )
+        # Second call: merge_pr_safely.py. Write the report file
+        # BEFORE returning the CompletedProcess so the wrapper's
+        # post-success head-binding check sees it on disk.
+        _maybe_write_report()
+        return subprocess.CompletedProcess(
+            args=call_args[0] if call_args else [],
+            returncode=merge_rc, stdout="", stderr="",
+        )
+
+    mock = MagicMock(side_effect=_side_effect)
     monkeypatch.setattr(m.subprocess, "run", mock)
     return mock
 
@@ -207,16 +257,22 @@ def test_no_run_summary_skips_phase_ledger_gate(monkeypatch, tmp_path):
 def test_run_summary_pass_proceeds_to_merge_pr_safely(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
     # Two-call mock: first (gh pr view) returns the expected SHA
-    # with rc=0; second (merge_pr_safely.py) returns rc=0.
+    # with rc=0; second (merge_pr_safely.py) returns rc=0. The
+    # helper also writes a valid report file at ``report_path``
+    # so the wrapper's post-success head-binding check sees a
+    # matching head SHA.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -337,17 +393,22 @@ def test_real_expected_head_sha_passed_to_finalize(monkeypatch, tmp_path):
     real_sha = "abcdef1234567890abcdef1234567890abcdef12"
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
     # Two-call mock: gh pr view returns the same real SHA so the
-    # wrapper proceeds to merge_pr_safely.
+    # wrapper proceeds to merge_pr_safely. The helper also writes
+    # a valid report file with head_sha == real_sha so the
+    # post-success head-binding check passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout=real_sha,
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha=real_sha,
     )
 
     args = _opt_in_args(
         expected_head_sha=real_sha,
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -376,17 +437,22 @@ def test_real_expected_head_sha_passed_to_finalize(monkeypatch, tmp_path):
 def test_allowed_files_passed_to_finalize_not_merge_pr_safely(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
     # Two-call mock: gh pr view returns the expected SHA so the
-    # wrapper proceeds to merge_pr_safely.
+    # wrapper proceeds to merge_pr_safely. The helper also writes
+    # a valid report file so the post-success head-binding check
+    # passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
         allowed_files="scripts/**,tests/**,docs/**",
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -417,18 +483,23 @@ def test_allowed_files_passed_to_finalize_not_merge_pr_safely(monkeypatch, tmp_p
 def test_phase_gate_output_paths_passed_to_finalize(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
     # Two-call mock: gh pr view returns the expected SHA so the
-    # wrapper proceeds to merge_pr_safely.
+    # wrapper proceeds to merge_pr_safely. The helper also writes
+    # a valid report file so the post-success head-binding check
+    # passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
         phase_gate_output_json="/tmp/some/FINAL_GATE.json",
         phase_gate_output_md="/tmp/some/FINAL_GATE.md",
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -517,16 +588,21 @@ def test_merge_pr_safely_exit_code_propagates_after_phase_gate_pass(
 def test_merge_pr_safely_command_uses_python_and_script_path(monkeypatch, tmp_path):
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
     # Two-call mock: gh pr view returns the expected SHA so the
-    # wrapper proceeds to merge_pr_safely.
+    # wrapper proceeds to merge_pr_safely. The helper also writes
+    # a valid report file so the post-success head-binding check
+    # passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -623,15 +699,22 @@ def test_head_match_proceeds_to_merge_pr_safely_after_phase_gate(
     merge_pr_safely.py with rc=0 → wrapper exit code 0.
     """
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Two-call mock: gh pr view returns the expected SHA
+    # with rc=0; merge_pr_safely.py returns rc=0. The helper
+    # also writes a valid report file so the post-success
+    # head-binding check passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -792,17 +875,24 @@ def test_head_recheck_uses_read_only_gh_pr_view(monkeypatch, tmp_path):
     --auto.
     """
     mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Two-call mock: gh pr view returns the expected SHA so the
+    # wrapper proceeds to merge_pr_safely. The helper also writes
+    # a valid report file so the post-success head-binding check
+    # passes.
+    report_path = str(tmp_path / "out.json")
     mock_sub = _mock_subprocess_dual(
         monkeypatch,
         gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
     )
 
     args = _opt_in_args(
         repo="Slideshow11/Automated-Edge-Discovery",
         pr_number=393,
-        output_json=str(tmp_path / "out.json"),
+        output_json=report_path,
         output_md=str(tmp_path / "out.md"),
     )
     rc = m.run_wrapper(args)
@@ -840,16 +930,20 @@ def test_expected_head_sha_used_for_comparison_after_gate(
     expected_sha = "abcdef1234567890abcdef1234567890abcdef12"
 
     # ---- Sub-scenario (a): head matches ----
+    expected_sha_a = expected_sha
+    report_path_a = str(tmp_path / "a.json")
     mock_gate_a = _mock_run_finalize(monkeypatch, return_value=0)
     mock_sub_a = _mock_subprocess_dual(
         monkeypatch,
-        gh_stdout=expected_sha,  # matches
+        gh_stdout=expected_sha_a,  # matches
         gh_rc=0,
         merge_rc=0,
+        report_path=report_path_a,
+        report_head_sha=expected_sha_a,
     )
     args_a = _opt_in_args(
-        expected_head_sha=expected_sha,
-        output_json=str(tmp_path / "a.json"),
+        expected_head_sha=expected_sha_a,
+        output_json=report_path_a,
         output_md=str(tmp_path / "a.md"),
     )
     rc_a = m.run_wrapper(args_a)
@@ -876,3 +970,392 @@ def test_expected_head_sha_used_for_comparison_after_gate(
     assert rc_b == 1
     assert mock_sub_b.call_count == 1  # only gh, no merge_pr_safely
     assert "HOLD_HEAD_CHANGED" in captured_err.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# POST-SUCCESS HEAD-BINDING (PR #393 — Codex follow-up inline comment
+# id 3370258789, thread PRRT_kwDOSHFpYM6HskHa):
+# After a successful merge_pr_safely run, the wrapper must verify that
+# the report written to args.output_json records the same head SHA the
+# phase-ledger gate validated. This closes the residual TOCTOU window
+# between merge_pr_safely's internal gh pr view fetch and the wrapper
+# returning.
+# ---------------------------------------------------------------------------
+
+
+def test_report_head_matches_expected_propagates_success(
+    monkeypatch, tmp_path
+):
+    """When merge_pr_safely writes a report whose recorded head SHA
+    equals args.expected_head_sha, the wrapper returns 0.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha="7f7cb30a636036158ceaae32e30bb492bc221ebf",
+    )
+
+    args = _opt_in_args(
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    assert rc == 0
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 2
+
+
+def test_report_head_mismatch_exits_1(monkeypatch, tmp_path):
+    """When merge_pr_safely writes a report with a head SHA different
+    from args.expected_head_sha, the wrapper returns 1 and prints
+    HEAD_MISMATCH_AFTER_MERGE_READINESS to stderr.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Pre-delegation recheck passes (head matches), but the report
+    # written by merge_pr_safely shows a different SHA — simulating
+    # a commit landing between merge_pr_safely's internal fetch and
+    # the wrapper's post-success verification.
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,  # pre-recheck passes
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha="deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",  # different
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 1
+    err = captured_err.getvalue()
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" in err
+    assert expected in err
+    assert "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" in err
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 2
+
+
+def test_report_missing_head_exits_2(monkeypatch, tmp_path):
+    """When merge_pr_safely returns 0 but the report lacks any usable
+    head SHA, the wrapper returns 2 and prints the unable-to-verify
+    error to stderr.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Build a custom side_effect so the second call writes a
+    # report with NO head_sha field and NO --match-head-commit.
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    import json as _json
+
+    call_state = {"n": 0}
+
+    def _side_effect(*call_args, **call_kwargs):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0,
+                stdout=expected,
+                stderr="",
+            )
+        # Second call: write a report with no usable head SHA.
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(
+            _json.dumps({"some_other_field": "irrelevant"}),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            args=call_args[0] if call_args else [],
+            returncode=0, stdout="", stderr="",
+        )
+
+    mock_sub = MagicMock(side_effect=_side_effect)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    err = captured_err.getvalue()
+    assert "unable to verify" in err
+    assert "merge-readiness report head" in err
+    assert mock_gate.call_count == 1
+    assert mock_sub.call_count == 2
+
+
+def test_report_malformed_json_exits_2(monkeypatch, tmp_path):
+    """When merge_pr_safely returns 0 but the report file is invalid
+    JSON, the wrapper returns 2 and the merge_pr_safely subprocess
+    was indeed called (this is a post-success failure mode).
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+
+    call_state = {"n": 0}
+
+    def _side_effect(*call_args, **call_kwargs):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0,
+                stdout=expected,
+                stderr="",
+            )
+        # Second call: write malformed JSON to the report.
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text("this is not { valid json", encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=call_args[0] if call_args else [],
+            returncode=0, stdout="", stderr="",
+        )
+
+    mock_sub = MagicMock(side_effect=_side_effect)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 2
+    err = captured_err.getvalue()
+    assert "unable to verify" in err
+    # merge_pr_safely was indeed called.
+    assert mock_sub.call_count == 2
+    # No HEAD_MISMATCH_AFTER_MERGE_READINESS — this is a different
+    # failure mode (parse failure, not head mismatch).
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" not in err
+
+
+def test_report_head_not_checked_when_merge_pr_safely_fails(
+    monkeypatch, tmp_path
+):
+    """When merge_pr_safely returns non-zero, the wrapper must
+    propagate that exit code unchanged. The post-success
+    head-binding check must NOT run (the report may be missing
+    or partial in that case).
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    # merge_pr_safely returns 1; helper does NOT write a report.
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,
+        gh_rc=0,
+        merge_rc=1,
+        report_path=report_path,
+        report_head_sha=expected,  # ignored because merge_rc != 0
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    # Wrapper returns merge_pr_safely's exit code unchanged.
+    assert rc == 1
+    # No post-success report-head verification error.
+    err = captured_err.getvalue()
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" not in err
+    assert "unable to verify" not in err
+
+
+def test_no_run_summary_does_not_verify_merge_report_head(
+    monkeypatch, tmp_path
+):
+    """In the default-off path (no --run-summary), the wrapper must
+    NOT verify the merge-readiness report head. It only delegates
+    to merge_pr_safely.py. Any report state (missing, malformed,
+    head-mismatched) is irrelevant.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    # Only one subprocess.run call (merge_pr_safely), returning 0.
+    # The "report" path is intentionally never created.
+    mock_sub = _mock_subprocess_run(monkeypatch, returncode=0)
+
+    args = _base_args(
+        run_summary=None,
+        output_json=str(tmp_path / "never_written.json"),
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    # Default-off: no phase gate, no head check, no report check.
+    assert rc == 0
+    assert mock_gate.call_count == 0
+    assert mock_sub.call_count == 1
+    err = captured_err.getvalue()
+    assert "unable to verify" not in err
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" not in err
+
+
+def test_match_head_commit_extracted_from_merge_command_if_needed(
+    monkeypatch, tmp_path
+):
+    """When the report has no explicit ``head_sha`` field but does
+    contain a ``safe_merge_command_text`` with ``--match-head-commit
+    <sha>``, the wrapper must extract the SHA from the command and
+    use it for binding. This is the defensive fallback path.
+    """
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    expected = "7f7cb30a636036158ceaae32e30bb492bc221ebf"
+    report_path = str(tmp_path / "out.json")
+    # Build a report that omits the explicit ``head_sha`` field
+    # but embeds the expected SHA inside safe_merge_command_text.
+    report_content = (
+        "{\n"
+        '  "safe_merge_command_text": "gh pr merge 393 '
+        '--repo Slideshow11/Automated-Edge-Discovery --squash '
+        f'--delete-branch --match-head-commit {expected}",\n'
+        '  "safe_merge_command_list": []\n'
+        "}\n"
+    )
+
+    call_state = {"n": 0}
+
+    def _side_effect(*call_args, **call_kwargs):
+        call_state["n"] += 1
+        if call_state["n"] == 1:
+            return subprocess.CompletedProcess(
+                args=call_args[0] if call_args else [],
+                returncode=0, stdout=expected, stderr="",
+            )
+        Path(report_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(report_path).write_text(report_content, encoding="utf-8")
+        return subprocess.CompletedProcess(
+            args=call_args[0] if call_args else [],
+            returncode=0, stdout="", stderr="",
+        )
+
+    mock_sub = MagicMock(side_effect=_side_effect)
+    monkeypatch.setattr(m.subprocess, "run", mock_sub)
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    rc = m.run_wrapper(args)
+
+    # SHA extracted from the merge command and matched expected.
+    assert rc == 0
+    assert mock_sub.call_count == 2
+
+
+def test_report_head_binding_uses_expected_head_sha_not_live_recheck_sha(
+    monkeypatch, tmp_path
+):
+    """The post-success head-binding check uses args.expected_head_sha
+    (the operator-supplied, ledger-validated value), NOT the
+    pre-delegation live recheck SHA. If the report's recorded head
+    matches the live recheck SHA but NOT expected_head_sha, the
+    wrapper must still block based on the expected vs. report
+    comparison.
+    """
+    expected = "1111111111111111111111111111111111111111"
+    live_recheck = "2222222222222222222222222222222222222222"
+    report_head = "3333333333333333333333333333333333333333"  # matches neither
+
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=live_recheck,  # live recheck differs from expected
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=report_head,
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    # Pre-delegation recheck catches the live vs. expected mismatch
+    # first — the wrapper returns 1 with HOLD_HEAD_CHANGED before
+    # it ever invokes merge_pr_safely or verifies the report.
+    assert rc == 1
+    err = captured_err.getvalue()
+    assert "HOLD_HEAD_CHANGED" in err
+    # No post-success head binding was attempted (merge_pr_safely
+    # was not even called).
+    assert mock_sub.call_count == 1
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" not in err
+
+
+def test_report_head_mismatch_with_match_in_live_recheck_exits_1(
+    monkeypatch, tmp_path
+):
+    """Companion to the previous test: the pre-delegation recheck
+    passes (live == expected), but the report's head differs.
+    Wrapper returns 1 with HEAD_MISMATCH_AFTER_MERGE_READINESS.
+    """
+    expected = "1111111111111111111111111111111111111111"
+    different_report_head = "2222222222222222222222222222222222222222"
+
+    mock_gate = _mock_run_finalize(monkeypatch, return_value=0)
+    report_path = str(tmp_path / "out.json")
+    mock_sub = _mock_subprocess_dual(
+        monkeypatch,
+        gh_stdout=expected,  # pre-recheck passes
+        gh_rc=0,
+        merge_rc=0,
+        report_path=report_path,
+        report_head_sha=different_report_head,  # different from expected
+    )
+
+    args = _opt_in_args(
+        expected_head_sha=expected,
+        output_json=report_path,
+        output_md=str(tmp_path / "out.md"),
+    )
+    captured_err = io.StringIO()
+    with redirect_stderr(captured_err):
+        rc = m.run_wrapper(args)
+
+    assert rc == 1
+    err = captured_err.getvalue()
+    assert "HEAD_MISMATCH_AFTER_MERGE_READINESS" in err
+    assert expected in err
+    assert different_report_head in err
+    # Both subprocess calls happened (gh pr view + merge_pr_safely).
+    assert mock_sub.call_count == 2
