@@ -286,14 +286,109 @@ explicit script-checkout ↔ `--repo-root` comparison to
 document is the only safety surface for the cross-checkout
 mode.)
 
+## Run-summary ledger field set semantics
+
+The phase-gate adapter
+(`scripts/local/finalize_with_phase_ledger.py`) inspects the
+`run_summary.json` produced by the runner and decides whether
+to call `aed_final_gate.run_final_gate(...)` with
+`require_phase_ledger=True` or `require_phase_ledger=False`.
+The decision is **not** symmetric across the three possible
+field-presence states, and operators must understand which
+state applies to their run before treating wrapper success
+as phase-ledger evidence.
+
+The three modes are distinguished by `LEDGER_KEYS` in
+`finalize_with_phase_ledger.py`:
+
+```
+LEDGER_KEYS = (
+    "phase_ledger_path",
+    "phase_ledger_claimed_phases",
+    "phase_ledger_expected_run_id",
+)
+```
+
+`_extract_ledger_args(summary)` then applies the following
+rule (paraphrased from the source):
+
+- **Mode 1 — All three `phase_ledger_*` fields absent:**
+  returns `{"enabled": False, "phase_ledger_path": None,
+  "claimed_phases": None, "expected_run_id": None}`. The
+  adapter calls
+  `aed_final_gate.run_final_gate(..., require_phase_ledger=False,
+  phase_ledger_path=None, claimed_phases=None,
+  phase_ledger_expected_run_id=None)`. In this path the
+  final gate does **not** require a phase ledger, and a
+  return of `MERGE_READY` from the gate (and therefore a
+  return of `0` from the wrapper) is **not** proof that
+  any phase-ledger evidence was validated. This is the
+  default-off compatibility path for older or unledgered
+  run summaries — i.e. runs produced by a runner invocation
+  that did not enable phase-ledger support, or by an
+  earlier runner version that did not emit
+  `phase_ledger_*` fields at all.
+
+- **Mode 2 — At least one `phase_ledger_*` field present
+  (any one of the three):** returns
+  `{"enabled": True, "phase_ledger_path": summary.get(...),
+  "claimed_phases": summary.get(...),
+  "expected_run_id": summary.get(...)}`. The adapter calls
+  `aed_final_gate.run_final_gate(...,
+  require_phase_ledger=True, ...)` and forwards whatever
+  values it found for the other two keys (which may be
+  `None`, an empty list, a missing path, a stale run id,
+  etc.). **This is the phase-ledger evidence boundary.**
+  When the gate finds the evidence missing, empty, stale,
+  or malformed, it enforces fail-closed
+  (`HOLD_UNEVIDENCED_PASS`,
+  `HOLD_PHASE_EVIDENCE_CORRUPTED`, or
+  `HOLD_PHASE_RESULT_INCONSISTENT`) and returns non-zero
+  from the wrapper. A return of `MERGE_READY` from the
+  gate in this mode means the gate validated a real phase
+  ledger; a HOLD/ERROR means it did not.
+
+- **Mode 3 — All three fields present and valid:** a
+  specialization of Mode 2. Same fail-closed semantics;
+  no additional behavior.
+
+**Operator rule of thumb:** for a PR intended to be
+phase-gated, the `run_summary.json` **must** be in Mode 2
+or Mode 3 — i.e. it must contain at least one
+`phase_ledger_*` field, and the values for all three fields
+must be valid (existing path, non-empty claimed phases,
+non-stale expected run id). If the run summary is in Mode
+1 (all-fields-absent), do not interpret wrapper success as
+phase-ledger evidence. Regenerate the run summary from a
+ledger-enabled runner, or treat the evidence as not
+available, before relying on the wrapper as an evidence
+boundary for that PR.
+
+**Why the asymmetry exists:** Mode 1 is the
+default-off compatibility path. A wrapper invocation
+with `--run-summary <path>` against a run summary that
+predates phase-ledger support, or that was produced by a
+ledger-disabled runner, must not fail-closed; that would
+break every pre-existing PR that did not opt into phase
+ledgers. The trade-off is that operators who *did* intend
+phase-gating must verify Mode 2/3 themselves (or trust
+their runner to be in Mode 2/3 when it should be).
+
 ## When **not** to use the wrapper
 
 The wrapper is the right tool only when **all** of the following hold:
 
-1. The PR has a runner-produced `run_summary.json` that names
-   `phase_ledger_path`, `phase_ledger_expected_run_id`, and
-   `phase_ledger_claimed_phases`. Without that artifact, the
-   final-gate adapter has no evidence to validate.
+1. The PR has a runner-produced `run_summary.json` that
+   contains the **complete** `phase_ledger_*` field set —
+   i.e. **all three** of `phase_ledger_path`,
+   `phase_ledger_expected_run_id`, and
+   `phase_ledger_claimed_phases` are present. See
+   §Run-summary ledger field set semantics for the three
+   modes the adapter distinguishes. The wrapper is the
+   phase-ledger evidence boundary only when the complete
+   field set is present and valid; otherwise the wrapper
+   is in default-off / compatibility mode and is **not**
+   a phase-ledger evidence boundary for that PR.
 2. The runner actually ran to completion for the live PR head — i.e.
    the `expected_head_sha` in the run summary is the same as
    `git rev-parse origin/<pr-branch>` at the time the operator invokes
@@ -344,14 +439,60 @@ PR is being phase-gated at all:
     `--expected-head-sha`. Do not re-invoke the wrapper with the
     stale summary, and do not fall back to `merge_pr_safely.py`
     to "get the merge in" against an un-evaluated head.
-  - **Missing evidence** (`Refusing to proceed` exit `2` for a
-    missing/empty required phase-gate arg, or a
-    `run_summary.json` that is absent, malformed, or lacks
-    `phase_ledger_path` / `phase_ledger_expected_run_id` /
-    `phase_ledger_claimed_phases`): regenerate or provide the
-    evidence. The phase-ledger final-gate adapter has nothing to
-    validate without a runner-produced summary; producing one is
-    a prerequisite, not an optional add-on.
+  - **Missing evidence** has two distinct shapes; the
+    wrapper handles them very differently. Operators
+    must know which one applies to their run:
+
+    1. **`Refusing to proceed` exit `2` from the
+       wrapper** for a missing/empty required phase-gate
+       arg (e.g. `--run-summary`, `--expected-head-sha`,
+       `--allowed-files`, `--local-validation-path`,
+       `--codex-artifact-path`, `--phase-gate-output-json`,
+       `--phase-gate-output-md`): the wrapper is refusing
+       to invoke the phase-gate adapter at all because a
+       required flag is empty. Fix the invocation.
+
+    2. **`run_summary.json` is absent, malformed, or
+       lacks one or more of the `phase_ledger_*` fields:**
+       the adapter then distinguishes:
+
+       - **All three `phase_ledger_*` fields absent:**
+         `finalize_with_phase_ledger._extract_ledger_args`
+         returns `{"enabled": False, ...}`. The adapter
+         then calls `aed_final_gate.run_final_gate(...,
+         require_phase_ledger=False)`. In this path the
+         gate can return `MERGE_READY` without validating
+         any phase ledger. This is **compatibility
+         behavior for older or unledgered run summaries,
+         not a phase-ledger evidence boundary.** Do not
+         interpret wrapper success in this path as proof
+         of phase-ledger validation.
+
+       - **Any one of the three `phase_ledger_*` fields
+         present (but possibly with missing/empty/stale
+         values for the other two):**
+         `_extract_ledger_args` returns `{"enabled":
+         True, ...}`. The adapter then calls
+         `aed_final_gate.run_final_gate(...,
+         require_phase_ledger=True)`. This path
+         **is** the phase-ledger evidence boundary; the
+         gate enforces fail-closed
+         (`HOLD_UNEVIDENCED_PASS`,
+         `HOLD_PHASE_EVIDENCE_CORRUPTED`, or
+         `HOLD_PHASE_RESULT_INCONSISTENT`) when the
+         evidence is missing, empty, stale, or malformed.
+
+       See §Run-summary ledger field set semantics for
+       the full contract and the source files
+       involved.
+
+       **For a PR intended to be phase-gated**, an
+       all-fields-absent `run_summary.json` is
+       insufficient: regenerate the run summary from a
+       ledger-enabled runner, or treat the evidence as
+       not available. Do not interpret wrapper success
+       in the all-fields-absent path as
+       `phase_ledger`-validated merge-readiness.
   - **Repo/root mismatch** (`REPO_MISMATCH:` or `unable to read
     git remote get-url origin` exit `2`): the normalized
     `--repo` does not match the `origin` remote of the
@@ -372,15 +513,30 @@ PR is being phase-gated at all:
   - **Phase gate HOLD/ERROR** (exit `1` or `2` from the
     final-gate adapter, e.g.
     `phase-ledger final gate blocked merge-readiness (gate exit
-    code N)`): treat it as a blocker. The phase-ledger evidence
-    does not agree with the live PR state, and
-    `merge_pr_safely.py` was **not** invoked. Inspect the gate
-    output at `--phase-gate-output-json` /
-    `--phase-gate-output-md` and resolve the underlying
-    disagreement (stale head, missing claimed phase, unblessed
-    files, etc.) before retrying. The gate is the safety
-    boundary; bypassing it defeats exact-head phase-ledger
+    code N)`): treat it as a blocker. **This exit
+    only fires when the adapter called the gate with
+    `require_phase_ledger=True`** — i.e. when at
+    least one `phase_ledger_*` field was present in
+    `run_summary.json` and the gate found the
+    evidence missing, empty, stale, or malformed. The
+    phase-ledger evidence does not agree with the live
+    PR state, and `merge_pr_safely.py` was **not**
+    invoked. Inspect the gate output at
+    `--phase-gate-output-json` /
+    `--phase-gate-output-md` and resolve the
+    underlying disagreement (stale head, missing
+    claimed phase, unblessed files, etc.) before
+    retrying. The gate is the safety boundary;
+    bypassing it defeats exact-head phase-ledger
     evidence.
+
+    **If the all-fields-absent path was taken**
+    (see §Run-summary ledger field set semantics),
+    the gate will *not* emit a HOLD/ERROR on the
+    basis of missing phase-ledger evidence; it will
+    only emit HOLD/ERROR on the other (non-ledger)
+    failure modes. A successful run in that path is
+    **not** phase-ledger evidence.
 
 A failed prerequisite is information the operator acts on, not
 authorization to skip the safety boundary.
