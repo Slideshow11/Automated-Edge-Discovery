@@ -11,9 +11,18 @@ scripts/local/merge_readiness_with_phase_ledger.py
 
 The wrapper composes the phase-ledger final-gate adapter
 (`scripts/local/finalize_with_phase_ledger.py`, PR #392) with the existing
-merge-readiness orchestrator (`scripts/local/merge_pr_safely.py`) so that
-merge-readiness output is only emitted when the runner-produced phase ledger
-covers the live PR head. The wrapper never merges. A human must run
+merge-readiness orchestrator (`scripts/local/merge_pr_safely.py`). In the
+phase-ledger evidence path — i.e. when the operator's
+`run_summary.json` contains at least one of the three `phase_ledger_*`
+fields and the wrapper therefore runs the gate with
+`require_phase_ledger=True` (see §Run-summary ledger field set
+semantics) — the wrapper emits merge-readiness output only when the
+runner-produced phase ledger covers the live PR head. When the supplied
+`run_summary.json` has **all** three `phase_ledger_*` fields absent
+(Mode 1 in §Run-summary ledger field set semantics), the wrapper is
+in default-off / compatibility mode and is **not** a phase-ledger
+evidence boundary for that invocation; see that section for the full
+contract. The wrapper never merges. A human must run
 `gh pr merge` (or use the standard AED merge authorization flow) to actually
 land a PR.
 
@@ -42,9 +51,19 @@ Five invariants govern the operator model:
    no-op pass-through to `merge_pr_safely.py`.
 2. The wrapper never merges. It only produces or refuses merge-readiness
    output. Human merge authorization remains required.
-3. The wrapper fail-closes on every check. It does not return success
-   unless every binding step agrees that the live PR head is the same
-   SHA the runner-produced phase ledger covered.
+3. **In the phase-ledger evidence path** (Mode 2 or Mode 3 in
+   §Run-summary ledger field set semantics — i.e. the operator's
+   `run_summary.json` contains at least one `phase_ledger_*`
+   field, so the adapter runs the gate with
+   `require_phase_ledger=True`), the wrapper fail-closes
+   on every binding step. It does not return success
+   unless every binding step agrees that the live PR head
+   is the same SHA the runner-produced phase ledger
+   covered. **In Mode 1 (all three `phase_ledger_*` fields
+   absent)**, the wrapper is in default-off /
+   compatibility mode; success in that mode is **not**
+   proof of phase-ledger coverage. See §Run-summary
+   ledger field set semantics for the full contract.
 4. The wrapper never invokes `gh pr merge`, `gh pr create`, or
    `gh pr edit`. The only `gh` command it issues is a read-only
    `gh pr view --json headRefOid --jq .headRefOid`, bounded by a 30-second
@@ -204,8 +223,14 @@ The wrapper is exhaustive about failure paths. The exit-code contract is:
 | `HOLD_HEAD_CHANGED_AFTER_MERGE_READINESS: ledger-validated head was <expected> but PR head is now <live>` | `1` | A new commit landed in the residual window after the report was written. |
 
 Any non-zero exit is a refused merge readiness and **must not** be
-treated as authorization to merge. The wrapper never returns success for
-a head the runner-produced phase ledger did not cover.
+treated as authorization to merge. **In the phase-ledger
+evidence path** (Mode 2 or Mode 3 in §Run-summary ledger
+field set semantics), the wrapper never returns success
+for a head the runner-produced phase ledger did not cover.
+**In Mode 1 (all `phase_ledger_*` fields absent)**, a
+zero exit is a default-off / compatibility outcome, not
+proof of phase-ledger coverage — see §Run-summary ledger
+field set semantics.
 
 ## Guardrails
 
