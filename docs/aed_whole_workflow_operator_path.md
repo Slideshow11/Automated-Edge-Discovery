@@ -68,7 +68,7 @@ The 13 stages below are the canonical AED operator path. The
 | 8 | Review-thread state | Codex + reviewer + human comments | Resolved / unresolved / outdated thread map | `docs/stale_review_thread_auto_resolution_policy.md`, `docs/pr_review_comment_gate.md` §13 | Do **not** auto-resolve; the policy gates this | `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED` while human thread handling is in progress |
 | 9 | Human merge authorization | `MERGE_READY` packet + live head SHA + clean Codex | Exact authorization phrase | `scripts/local/build_merge_ready_packet.py`, `scripts/local/check_merge_authorization.py`, `docs/merge_authorization_guard.md` | Issue the exact `I confirm merge PR #N at <sha>` phrase with the live 40-char SHA | `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` until the phrase is provided |
 | 10 | Guarded merge | Authorization phrase + live head | Merged PR | `gh pr merge` invoked manually with `--match-head-commit` | Verify merge succeeded; capture merge SHA | `PR_MERGED_PENDING_CLOSEOUT` |
-| 11 | Post-merge CI | Merge commit on `main` | Green required CI jobs on the merge commit | `gh pr checks <PR>` (bounded polling, no `--watch`) | Wait for green; investigate any failure | `HOLD_POST_MERGE_CI_PENDING` while pending; `HOLD_POST_MERGE_CI_FAILED` on any required job failure; `HOLD_POST_MERGE_CI_NOT_OBSERVED` if checks never completed in the polling window |
+| 11 | Post-merge CI | Merge commit on `main` (the SHA returned by `mergeCommit.oid`, **not** the PR head SHA) | Green required workflow runs on `main` for the exact merge commit | `scripts/local/audit_main_ci_for_head.py --branch main --head-sha <merge_commit_sha> --required-workflow <name>` (bounded polling) — pre-merge CI uses `gh pr checks <PR>`; post-merge CI verifies main-branch workflow runs against the merge commit because, after a squash merge and branch deletion, the PR's check view is no longer the authoritative main-side evidence | Wait for green; investigate any failure | `HOLD_POST_MERGE_CI_PENDING` while pending; `HOLD_POST_MERGE_CI_FAILED` on any required workflow failure; `HOLD_POST_MERGE_CI_NOT_OBSERVED` if checks never completed in the polling window |
 | 12 | Audit log | All earlier stages | Append-only JSONL row in `~/.hermes/aed/audit/log.jsonl` | `scripts/local/append_merge_action_audit.py`, `docs/trace_policy_v1.md` | Verify the row is present and well-formed | `PR_MERGED_AND_CLOSED_OUT` once the audit row is present and validated |
 | 13 | Worktree cleanup | Merged PR + audit row | Temp worktree removed; branch deleted | `git worktree remove --force`, `git push origin --delete <branch>` | Keep the primary worktree intentionally stale; do not reset it | `PR_MERGED_AND_CLOSED_OUT` (terminal) |
 
@@ -121,7 +121,7 @@ means a task whose scope contract lists the action as in-scope.
 | Codex review ping (`@codex review`) | Allowed only when the PR is open at the expected head, CI is green, the patch is in scope, and the comment body is gate-safe (see §7). One ping per head. |
 | Thread resolution | Explicit human authorization required. The policy in `docs/stale_review_thread_auto_resolution_policy.md` defines the one allowed case and its 14 preconditions; it does not grant blanket agent authority. |
 | Merge (`gh pr merge`, including `--merge`, `--squash`, `--rebase`) | Explicit human authorization via the `I confirm merge PR #N at <sha>` phrase. The exact 40-character SHA is mandatory; see `docs/merge_authorization_guard.md` §Authorization phrase. |
-| `--admin` flag on `gh pr merge` | Separate explicit human authorization required, and only for cases where a non-admin merge is technically blocked. The AED merge-readiness wrapper hard-rejects `--admin` at argparse time; see `docs/phase_ledger_merge_readiness_wrapper.md` §Guardrails. |
+| `--admin` flag (admin bypass on the merge command) | **Forbidden** at every layer of the existing merge stack. `merge_pr_safely.py` refuses the admin flag always (argparse and defense-in-depth `reject_admin()`); the phase-ledger wrapper (`merge_readiness_with_phase_ledger.py`) hard-rejects the admin flag and never exposes it. No operator phrase, prior token, or one-off authorization in this governance path can grant the admin bypass. A future exception, if any, would require a separate operator policy PR (not a one-off phrase) and its own change to the merge stack; this guide treats the admin bypass as permanently outside the operator path. See `docs/phase_ledger_merge_readiness_wrapper.md` §Guardrails and `scripts/local/merge_pr_safely.py` `reject_admin`. |
 | `--auto` flag on `gh pr merge` | Forbidden. No documented exception; a future policy may revisit this and would require its own operator doc and PR. |
 | Primary worktree update, reset, or pull | Explicit human authorization required. The primary worktree is intentionally left stale at the post-closeout head of the last merged PR (for example, `0a8cee5d2406c970e02e9e217c7f25b0767459e0` after PR #394); agents must not touch it. |
 | PR #384 and PR #386 | Read-only verification only, unless a separate scoped task explicitly authorizes interaction. |
@@ -178,18 +178,42 @@ gh pr merge <PR> \
 
 ### 6.3 Post-merge verification shape
 
+The two SHAs have distinct meanings. Operators must keep them separate
+throughout the post-merge path:
+
+- **PR head SHA** — the reviewed branch commit passed to
+  `--match-head-commit` at authorization time. Used **only** as the
+  pre-merge protection; not the SHA of the merge result.
+- **Merge commit SHA** — the commit created on `main` by the squash
+  merge, returned by `gh pr view --json mergeCommit`. After a squash
+  merge this is a brand-new commit on `main` and is **not** equal to
+  the PR head SHA. Recorded separately in the audit row as `merge_sha`,
+  with the pre-merge PR head recorded as `head_sha` (see
+  `docs/merge_action_audit_log.md` §`pr_merge`).
+
+Read both SHAs, then verify the main-side result:
+
 ```
 gh pr view <PR> --repo <owner/name> \
   --json state,mergedAt,mergeCommit
-git -C <repo-root> log -1 --format=%H
+git -C <repo-root> fetch origin main
+git -C <repo-root> rev-parse origin/main
 ```
 
-- The merge commit SHA returned by `gh pr view` must equal the
-  `--match-head-commit` argument used at authorization.
-- The branch must be deleted by `gh pr merge --delete-branch`; if it is
-  not, the agent must not declare closed out.
+- `mergeCommit.oid` (from `gh pr view`) is the new squash commit on
+  `main`. The audit row records this as `merge_sha`.
+- The pre-merge `--match-head-commit <PR_HEAD_SHA>` value is recorded
+  as `head_sha` in the audit row. It is **not** required to equal
+  `merge_sha` after a squash merge.
+- `origin/main` (after `git fetch origin main`) **must** equal
+  `mergeCommit.oid`. If it does not, the merge did not land where the
+  audit row claims and the agent must not declare closed out.
+- The branch must be deleted by `gh pr merge --delete-branch`; if it
+  is not, the agent must not declare closed out.
 - See `docs/trace_policy_v1.md` §2.1 (raw trace retention) for what the
-  audit row must capture.
+  audit row must capture, and `docs/merge_authorization_guard.md`
+  §Authorization phrase for the PR #207 failure mode that the
+  `--match-head-commit` binding prevents.
 
 ### 6.4 Audit append shape
 
