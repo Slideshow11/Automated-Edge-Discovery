@@ -227,55 +227,178 @@ Classify the result:
 
 ## 7. Review-thread inspection cookbook
 
-Inspect review threads and their state via GraphQL:
+A review-thread inspection is **complete** only when **every page
+of review threads** for the PR has been enumerated. A short or
+single-page query is **diagnostic only** and **must not** be used
+as the pre-merge evidence for the §8 guarded-merge precondition
+that "all current-head threads are resolved or outdated."
+
+This is a hard requirement, not a recommendation. GitHub's PR
+review-thread connection paginates by default; a fixed-window
+`first:N` or `last:N` query silently drops older threads beyond
+the window, and any current-head blocker hidden in that dropped
+range would be missed. Codex findings on prior PRs have
+demonstrated this gap concretely: when the cookbook presented a
+non-paginated query as sufficient, current-head P1 blockers on
+PRs with more than the window size of review threads could be
+omitted from the evidence used to justify a guarded merge.
+
+### 7.1 Preferred path: repository-standard helpers
+
+Inspect the full review-thread set using repository-standard
+helpers that already implement pagination and fail-closed
+behavior. Two helpers are relevant; both are preferred over raw
+GraphQL.
+
+**`scripts/local/wait_for_pr_ready.py`** is the primary helper.
+It issues a paginated query (`reviewThreads(first:100)` plus a
+`pageInfo { hasNextPage }` check). If `hasNextPage` is true on
+any page, the helper returns
+`HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED` and does not
+proceed, which is the correct fail-closed behavior. Treat the
+helper's exit code and status as the authoritative read for the
+"all current-head threads are resolved or outdated" precondition.
+
+**`scripts/local/check_pr_review_comments.py`** is the
+review-comment gate. It already covers inline review comments,
+issue comments, top-level reviews, and per-review comments, and
+it fails closed (`REVIEW_COMMENTS_INCONCLUSIVE`, exit 2) on any
+endpoint error or thread-metadata ambiguity. Its thread fetch
+uses `reviewThreads(first:100)` for thread-resolution context
+only; the helper treats thread metadata as a secondary signal
+backing the four comment endpoints. The gate does **not** by
+itself enforce pagination, so on its own it is not a complete
+thread inventory — but combined with the waiter's
+`hasNextPage` check, the two together cover the full thread
+set with fail-closed semantics on both metadata and
+pagination errors.
+
+**`scripts/local/guarded_pr_closeout_waiter.py`** is the
+closeout-time helper that classifies threads into
+`current_head_unresolved` and `outdated_unresolved` and treats
+any current-head unresolved thread as a blocker. Its thread
+fetch is `reviewThreads(first: 100)` with **no** `pageInfo`
+check, so on a PR with more than 100 review threads it can
+also miss current-head blockers. It must not be relied on as a
+standalone thread inventory for the §8 guarded-merge
+precondition; treat it as one signal among several.
+
+The recommended pre-merge sequence is:
+
+- run `wait_for_pr_ready.py` for the PR; record its
+  `unresolved_thread_count` and verify it is zero (a
+  non-zero count, or a
+  `HOLD_CONVERSATION_CHECK_PAGINATION_REQUIRED` return, blocks
+  the pre-merge path)
+- run `check_pr_review_comments.py` with the live
+  `--reported-head-sha`; verify exit 0
+- cross-check `guarded_pr_closeout_waiter.py`'s
+  `current_head_unresolved_count`; verify it is zero
+- only then proceed toward the §8 guarded merge
+
+All three signals must agree. A single helper is not
+sufficient on its own; the waiter's pagination check, the
+gate's fail-closed endpoint coverage, and the closeout
+waiter's current-head classification are complementary.
+
+### 7.2 Raw GraphQL (advanced fallback)
+
+If the repository-standard helpers are unavailable or the operator
+needs a direct read for a documented reason, a raw GraphQL
+inspection is acceptable **only** if it is fully paginated and
+treated as a stand-in for the helpers' combined output. The
+following shape is the minimum acceptable advanced fallback. It
+is **not** interchangeable with the non-paginated examples that
+appear in older drafts of this section.
+
+A complete advanced-fallback inspection must:
+
+- start with `reviewThreads(first:100)` and include the
+  `pageInfo { hasNextPage endCursor }` block
+- repeat the query with `after: "<endCursor>"` until
+  `hasNextPage` is false
+- on every page, record `id`, `isResolved`, `isOutdated`,
+  `path`, `line` (or `originalLine` if present), and
+  `commit { oid }` on the first comment, then check
+  `originalCommit { oid }` if present
+- treat the inspection as incomplete if any page fails to
+  return, if `hasNextPage` is true but the follow-up page was
+  not requested, if the GraphQL response contains an `errors`
+  block, or if the live `headRefOid` differs from the head used
+  in the earlier pre-merge verification
+- count **all** unresolved active threads across **all** pages
+  before declaring the inspection complete
+- never present a one-page slice as complete evidence
+
+The minimum acceptable advanced-fallback query shape is:
 
 ```
 gh api graphql -f query='
-  query($owner:String!,$name:String!,$number:Int!){
+  query($owner:String!,$name:String!,$number:Int!,$after:String){
     repository(owner:$owner,name:$name){
       pullRequest(number:$number){
         headRefOid
-        reviewThreads(last:20){
+        reviewThreads(first:100, after:$after){
+          pageInfo{ hasNextPage endCursor }
           totalCount
           nodes{
             id isResolved isOutdated
-            comments(last:1){
-              nodes{ id body author{login} commit{oid} path line }
+            path line originalLine
+            comments(first:1){
+              nodes{ id body author{login} commit{oid} originalCommit{oid} path line }
             }
           }
         }
       }
     }
-  }' -F owner=<owner> -F name=<repo> -F number=<PR>
+  }' -F owner=<owner> -F name=<repo> -F number=<PR> -F after=<cursor-or-empty>
 ```
 
-How to interpret a thread:
+Run the query with `after=""` first; if the response's
+`pageInfo.hasNextPage` is true, re-run with
+`after="<endCursor>"`. Repeat until `hasNextPage` is false.
+Only then enumerate unresolved active threads.
+
+A non-paginated or single-page query is **not acceptable** as
+the pre-merge thread inventory and must not be used as
+justification to proceed to §8.
+
+### 7.3 How to interpret a thread
+
+The interpretation rules are unchanged from prior versions and
+apply per thread, after the full inventory is built:
 
 - `isResolved: true` → the thread is closed; not a blocker.
-- `isOutdated: true` → the thread is anchored to a different commit
-  than the current head; not a blocker on the current head, but the
-  agent must not assume the underlying issue is gone.
-- `commit.oid` on the thread's first comment equals the current
-  `headRefOid` AND `isResolved: false` AND `isOutdated: false` →
-  current-head active blocker. Do not merge.
+- `isOutdated: true` → the thread is anchored to a different
+  commit than the current head; not a blocker on the current
+  head, but the agent must not assume the underlying issue is
+  gone.
+- `commit.oid` (or `originalCommit.oid` when present) on the
+  thread's first comment equals the current `headRefOid` AND
+  `isResolved: false` AND `isOutdated: false` → current-head
+  active blocker. Do not merge.
+- Thread metadata retrieval errors, missing `isResolved` /
+  `isOutdated` fields, GraphQL `errors` blocks, or `hasNextPage`
+  not exhausted → treat as a blocker. Do not merge.
 
-Resolve-only preconditions (per `docs/stale_review_thread_auto_resolution_policy.md`):
-14 preconditions must all be true before resolving a single stale
-thread. The agent does not gain blanket authority. The policy
-defines the one allowed case.
+### 7.4 Resolve-only preconditions
 
-The resolve mutation shape is a placeholder; do not issue it
-without an explicit human authorization in a later turn:
+Resolve-only preconditions (per
+`docs/stale_review_thread_auto_resolution_policy.md`) — 14
+preconditions must all be true before resolving a single stale
+thread — apply to any individual resolution action. A complete
+thread inventory (§7.1 or §7.2) is a **prerequisite** for any
+resolve-only decision, not a substitute for the 14 preconditions.
+The agent does not gain blanket authority from the inventory.
 
-```
-# PLACEHOLDER — only with explicit human authorization
-gh api graphql -f query='
-  mutation {
-    resolveReviewThread(input: {threadId: "<THREAD_ID>"}) {
-      thread { id isResolved isOutdated }
-    }
-  }'
-```
+The resolve mutation shape is **not** reproduced in this
+cookbook. It is a separate concern documented in
+`docs/stale_review_thread_auto_resolution_policy.md`, and it
+must never be issued without an explicit human authorization
+in a later turn and verification of all 14 preconditions from
+that policy. A complete thread inventory (§7.1 or §7.2) is a
+prerequisite for the resolve-only authorization prompt but is
+not a substitute for those 14 preconditions.
 
 Never:
 
@@ -283,6 +406,9 @@ Never:
   head. The underlying issue may still be present in the diff.
 - Dismiss a review (no `dismissReview` or equivalent).
 - Resolve multiple unrelated threads in one pass.
+- Use a one-page or non-paginated query as the basis for a
+  resolve-only authorization prompt. The inventory must be
+  complete first.
 
 ## 8. Guarded merge cookbook
 
@@ -535,7 +661,7 @@ A compact map from lifecycle state to the next safe command.
 | `HOLD_PR_CI_FAILED` | Read failing job log; push a fix; close. Do not merge. |
 | `HOLD_CODEX_RESPONSE_PENDING` | §6.5 bounded Codex poll. |
 | `HOLD_NEW_CODEX_THREAD` | Patch or hold. Do not resolve; do not merge. |
-| `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED` | §7 inspect threads; resolve-only authorization prompt to human. |
+| `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED` | §7 build a **complete** thread inventory (full pagination or the repository-standard helpers); then resolve-only authorization prompt to human. A non-paginated or one-page query is **not** an acceptable inventory. |
 | `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` | §4 final pre-merge; §8 guarded merge with human authorization phrase. |
 | `PR_MERGED_PENDING_CLOSEOUT` | §9 post-merge verification; §10 main CI audit; §11 audit append; §12 worktree cleanup. |
 | `PR_MERGED_AND_CLOSED_OUT` | Terminal. |
@@ -560,7 +686,13 @@ cookbook are:
   `docs/stale_review_thread_auto_resolution_policy.md` and produces
   the required audit record. The helper must remain read-only at
   the API level; thread resolution must still be a separate human
-  action.
+  action. The helper's thread inventory must use full pagination
+  (exhausting `pageInfo.hasNextPage`) or one of the
+  repository-standard paginated helpers (`wait_for_pr_ready.py`'s
+  `hasNextPage` check, or `check_pr_review_comments.py` combined
+  with the waiter); a non-paginated `first:N` or `last:N` query is
+  **not** an acceptable thread inventory for the helper to base
+  resolve decisions on.
 - A forbidden-command scanner that runs over a planned command
   surface and rejects any pattern from §13 before it can be
   executed. This cookbook's §13 prose list is the reference
