@@ -311,12 +311,23 @@ following shape is the minimum acceptable advanced fallback. It
 is **not** interchangeable with the non-paginated examples that
 appear in older drafts of this section.
 
+**The recommended raw GraphQL approach is `--paginate`.** The
+`gh api graphql --paginate` flag tells `gh` to walk the
+connection itself, supplying `endCursor` from
+`pageInfo.endCursor` on each subsequent request. The operator
+does not pass a cursor variable; `gh` handles it. The query
+must still declare a nullable `$endCursor` variable for
+compatibility with the first page (where no cursor exists yet).
+
 A complete advanced-fallback inspection must:
 
-- start with `reviewThreads(first:100)` and include the
+- use `gh api graphql --paginate` so `gh` walks every page
+  automatically; do not implement an unbounded loop in shell,
+  Python, or any other host language
+- declare a nullable `$endCursor: String` variable (no `!`)
+  inside the query
+- select `reviewThreads(first:100)` and include the
   `pageInfo { hasNextPage endCursor }` block
-- repeat the query with `after: "<endCursor>"` until
-  `hasNextPage` is false
 - on every page, record `id`, `isResolved`, `isOutdated`,
   `path`, `line` (or `originalLine` if present), and
   `commit { oid }` on the first comment, then check
@@ -324,21 +335,28 @@ A complete advanced-fallback inspection must:
 - treat the inspection as incomplete if any page fails to
   return, if `hasNextPage` is true but the follow-up page was
   not requested, if the GraphQL response contains an `errors`
-  block, or if the live `headRefOid` differs from the head used
-  in the earlier pre-merge verification
+  block, if `endCursor` cannot be parsed, or if the live
+  `headRefOid` differs from the head used in the earlier
+  pre-merge verification
 - count **all** unresolved active threads across **all** pages
   before declaring the inspection complete
 - never present a one-page slice as complete evidence
+- never pass an empty string (`""`) as a cursor; `gh api -F`
+  passes `""` through as a literal empty-string cursor, which
+  is not a valid GitHub GraphQL cursor. The first request must
+  use `after: null` (literal `null`, which `gh -F` converts to
+  JSON `null`) or omit `after` entirely; subsequent requests
+  use the `endCursor` from the previous page's `pageInfo`
 
 The minimum acceptable advanced-fallback query shape is:
 
 ```
-gh api graphql -f query='
-  query($owner:String!,$name:String!,$number:Int!,$after:String){
+gh api graphql --paginate -f query='
+  query($owner:String!,$name:String!,$number:Int!,$endCursor:String){
     repository(owner:$owner,name:$name){
       pullRequest(number:$number){
         headRefOid
-        reviewThreads(first:100, after:$after){
+        reviewThreads(first:100, after:$endCursor){
           pageInfo{ hasNextPage endCursor }
           totalCount
           nodes{
@@ -351,17 +369,33 @@ gh api graphql -f query='
         }
       }
     }
-  }' -F owner=<owner> -F name=<repo> -F number=<PR> -F after=<cursor-or-empty>
+  }' -F owner=<owner> -F name=<repo> -F number=<PR>
 ```
 
-Run the query with `after=""` first; if the response's
-`pageInfo.hasNextPage` is true, re-run with
-`after="<endCursor>"`. Repeat until `hasNextPage` is false.
-Only then enumerate unresolved active threads.
+`gh api graphql --paginate` returns one JSON object per page on
+stdout, separated by newlines; the operator must inspect every
+page, not only the first. Aggregate the results across pages
+before counting unresolved active threads.
 
-A non-paginated or single-page query is **not acceptable** as
-the pre-merge thread inventory and must not be used as
-justification to proceed to §8.
+If `--paginate` cannot be used (for example, a custom host
+blocks the flag, or a wrapper requires explicit cursor
+handling), an acceptable manual two-shape pattern is:
+
+- first request: `gh api graphql -f query='...reviewThreads(first:100){...}' ...`
+  with no `after` variable, or with `after: null` passed via
+  `-F endCursor=null`
+- follow-up requests: re-issue the same query, this time with
+  `-F endCursor="<returned endCursor from pageInfo>"`, until
+  the response's `pageInfo.hasNextPage` is `false`
+- an unbounded `while true` loop around these requests is
+  **forbidden**; if a fixed maximum of follow-up requests is
+  used, the maximum must be documented and respected, and any
+  truncation of pagination is a fail-closed block
+
+Either pattern must inspect every page. A non-paginated or
+single-page query is **not acceptable** as the pre-merge thread
+inventory and must not be used as justification to proceed to
+§8.
 
 ### 7.3 How to interpret a thread
 
@@ -378,8 +412,10 @@ apply per thread, after the full inventory is built:
   `isResolved: false` AND `isOutdated: false` → current-head
   active blocker. Do not merge.
 - Thread metadata retrieval errors, missing `isResolved` /
-  `isOutdated` fields, GraphQL `errors` blocks, or `hasNextPage`
-  not exhausted → treat as a blocker. Do not merge.
+  `isOutdated` fields, GraphQL `errors` blocks, `hasNextPage`
+  not exhausted, `endCursor` parse failures, or `after`
+  cursors that the server rejects as malformed → treat as a
+  blocker. Do not merge.
 
 ### 7.4 Resolve-only preconditions
 
