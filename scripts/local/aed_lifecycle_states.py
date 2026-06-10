@@ -91,11 +91,48 @@ def load_registry(path: Path) -> dict[str, Any]:
     return data
 
 
+def _coerce_list_field(
+    entry: dict[str, Any], state_name: str, field_name: str, errors: list[str]
+) -> list[Any]:
+    """Return a list-typed value for ``field_name`` from ``entry``.
+
+    Defensive type check: the registry is a hand-edited JSON file, and
+    malformed list-valued fields (truthy non-iterables such as the integer
+    ``1``; falsy non-lists such as the empty string ``""`` or empty object
+    ``{}``) must be reported as a validation error and treated as an empty
+    list for downstream checks. The previous implementation used
+    ``entry.get(field, []) or []``, which would either raise a Python
+    traceback on iteration of a truthy non-iterable or silently accept a
+    falsy non-list (e.g. ``""`` -> ``[]``) and miss the malformed field.
+    """
+    if field_name not in entry:
+        return []
+    value = entry[field_name]
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        errors.append(
+            f"state '{state_name}' {field_name} must be a list, "
+            f"got {type(value).__name__}"
+        )
+        return []
+    return value
+
+
 def _check_no_conflicting_mutations(entry: dict[str, Any], state_name: str) -> list[str]:
     """Return a list of mutation tokens that appear in both allowed and forbidden."""
-    allowed = set(entry.get("allowed_mutations", []) or [])
-    forbidden = set(entry.get("forbidden_mutations", []) or [])
-    return sorted(allowed & forbidden)
+    errors: list[str] = []
+    allowed = _coerce_list_field(
+        entry, state_name, "allowed_mutations", errors
+    )
+    forbidden = _coerce_list_field(
+        entry, state_name, "forbidden_mutations", errors
+    )
+    if errors:
+        # Type errors are reported by the caller via the validator loop.
+        # Do not attempt to compute overlap on malformed inputs.
+        return []
+    return sorted(set(allowed) & set(forbidden))
 
 
 def _check_merge_allowed_only_for_authorized(
@@ -153,7 +190,10 @@ def _check_merge_states_require_human_authorization(
     require human authorization.
     """
     permits_merge = entry.get("merge_allowed", False)
-    permits_resolve_only = "thread_resolve" in (entry.get("allowed_mutations") or [])
+    allowed_muts = entry.get("allowed_mutations")
+    permits_resolve_only = (
+        isinstance(allowed_muts, list) and "thread_resolve" in allowed_muts
+    )
     if (permits_merge or permits_resolve_only) and not entry.get(
         "human_authorization_required", False
     ):
@@ -226,24 +266,25 @@ def validate_registry(registry: dict[str, Any]) -> list[str]:
             errors.append(
                 f"state '{name}' category '{category}' is not in registry.categories"
             )
-        for mut in entry.get("allowed_mutations", []) or []:
+        for mut in _coerce_list_field(
+            entry, name, "allowed_mutations", errors
+        ):
             if mut not in VALID_MUTATIONS:
                 errors.append(
                     f"state '{name}' allowed_mutations contains unknown mutation '{mut}'"
                 )
-        for mut in entry.get("forbidden_mutations", []) or []:
+        for mut in _coerce_list_field(
+            entry, name, "forbidden_mutations", errors
+        ):
             if mut not in VALID_MUTATIONS:
                 errors.append(
                     f"state '{name}' forbidden_mutations contains unknown mutation '{mut}'"
                 )
-        if not isinstance(entry.get("evidence_required", None), list):
-            errors.append(
-                f"state '{name}' evidence_required must be a list"
-            )
-        if not isinstance(entry.get("allowed_next_states", None), list):
-            errors.append(
-                f"state '{name}' allowed_next_states must be a list"
-            )
+        # The helper records a "must be a list" error if the field is
+        # present but not a list. It also returns [] for missing or None
+        # values, which is the documented default.
+        _coerce_list_field(entry, name, "evidence_required", errors)
+        _coerce_list_field(entry, name, "allowed_next_states", errors)
         if not isinstance(entry.get("description", None), str):
             errors.append(
                 f"state '{name}' description must be a string"
@@ -270,7 +311,13 @@ def validate_registry(registry: dict[str, Any]) -> list[str]:
     for name, entry in states.items():
         if not isinstance(entry, dict):
             continue
-        for nxt in entry.get("allowed_next_states", []) or []:
+        # Coerce safely: the type-error case for allowed_next_states has
+        # already been recorded by the validator loop above, so here we
+        # only need to avoid raising on malformed input.
+        nxt_list = entry.get("allowed_next_states", [])
+        if not isinstance(nxt_list, list):
+            nxt_list = []
+        for nxt in nxt_list:
             if nxt not in known_names:
                 errors.append(
                     f"state '{name}' allowed_next_states references unknown state '{nxt}'"

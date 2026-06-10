@@ -208,5 +208,155 @@ class RegistryCategoryCoverageTests(unittest.TestCase):
         self.assertEqual(missing, [], f"categories with no state: {missing}")
 
 
+class RegistryMalformedListFieldTests(unittest.TestCase):
+    """The validator must reject malformed list-valued fields gracefully.
+
+    These regression tests cover the two Codex P2 findings raised against
+    commit 92582a41c7:
+      - Finding 1: truthy non-iterables (e.g. integer 1) in a list-valued
+        field must not raise a Python traceback; they must be reported as
+        a validation error and treated as an empty list for downstream
+        checks.
+      - Finding 2: falsy non-list values (e.g. empty string, empty object)
+        in a list-valued field must not be silently treated as the empty
+        list and pass validation; they must be reported as a validation
+        error and treated as an empty list for downstream checks.
+
+    Each test writes a malformed registry to a tmp_path and runs the CLI
+    as a subprocess with --validate, then asserts the returned errors.
+    """
+
+    def setUp(self) -> None:
+        # Load the shipped registry as a base; mutate one field per test.
+        with REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            self.base = json.load(f)
+
+    def _write_and_validate(
+        self, tmp: Path, suffix: str
+    ) -> subprocess.CompletedProcess:
+        out_path = tmp / f"registry_{suffix}.json"
+        with out_path.open("w", encoding="utf-8") as f:
+            json.dump(self.base, f)
+        return subprocess.run(
+            [
+                sys.executable,
+                str(CLI_PATH),
+                "--registry",
+                str(out_path),
+                "--validate",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    def test_truthy_non_iterable_allowed_mutations_is_rejected(self) -> None:
+        """Finding 1: integer 1 in allowed_mutations must not traceback."""
+        import tempfile
+        # Pick a non-terminal state so allowed_mutations iteration runs.
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["allowed_mutations"] = 1
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "int_allowed")
+        self.assertNotEqual(
+            result.returncode, 0, msg=f"stderr: {result.stderr}\nstdout: {result.stdout}"
+        )
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("allowed_mutations", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+        self.assertIn(target, result.stdout + result.stderr)
+
+    def test_truthy_non_iterable_forbidden_mutations_is_rejected(self) -> None:
+        """Finding 1: same pattern in forbidden_mutations."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["forbidden_mutations"] = 1
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "int_forbidden")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("forbidden_mutations", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+        self.assertIn(target, result.stdout + result.stderr)
+
+    def test_falsy_empty_string_allowed_mutations_is_rejected(self) -> None:
+        """Finding 2: empty string must be rejected, not silently accepted."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["allowed_mutations"] = ""
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "str_allowed")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("allowed_mutations", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+        self.assertIn(target, result.stdout + result.stderr)
+
+    def test_falsy_empty_object_forbidden_mutations_is_rejected(self) -> None:
+        """Finding 2: empty object must be rejected, not silently accepted."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["forbidden_mutations"] = {}
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "dict_forbidden")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("forbidden_mutations", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+        self.assertIn(target, result.stdout + result.stderr)
+
+    def test_malformed_field_error_message_mentions_field_name(self) -> None:
+        """The error must include both the field name and the type found."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["allowed_mutations"] = 1
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "msg")
+        combined = result.stdout + result.stderr
+        self.assertIn("allowed_mutations", combined)
+        # The validator reports the runtime type of the malformed value.
+        self.assertIn("int", combined)
+
+    def test_shipped_registry_still_validates_after_hardening(self) -> None:
+        """Regression guard: hardening must not weaken the shipped registry."""
+        result = _run_cli("--validate")
+        self.assertEqual(
+            result.returncode, 0,
+            msg=f"stderr: {result.stderr}\nstdout: {result.stdout}",
+        )
+        self.assertIn("PASSED", result.stdout)
+
+    def test_evidence_required_non_list_is_rejected(self) -> None:
+        """Same hardening pattern applied to evidence_required."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["evidence_required"] = "not a list"
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "str_evidence")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("evidence_required", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+
+    def test_allowed_next_states_non_list_is_rejected(self) -> None:
+        """Same hardening pattern applied to allowed_next_states."""
+        import tempfile
+        target = "HOLD_PR_CI_PENDING"
+        self.base["states"][target]["allowed_next_states"] = 42
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            result = self._write_and_validate(tmp, "int_next")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Traceback", result.stdout + result.stderr)
+        self.assertIn("allowed_next_states", result.stdout + result.stderr)
+        self.assertIn("must be a list", result.stdout + result.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()
