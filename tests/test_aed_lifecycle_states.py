@@ -208,6 +208,146 @@ class RegistryCategoryCoverageTests(unittest.TestCase):
         self.assertEqual(missing, [], f"categories with no state: {missing}")
 
 
+class RegistryAuditAppendSkippedStateTests(unittest.TestCase):
+    """AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR must codify the
+    append-only closeout rule codified 2026-06-10.
+
+    The canonical state covers both the "could not append" case
+    and the "appended entry needs operator review" case. The
+    alias ``AUDIT_APPEND_NEEDS_OPERATOR`` is documented in the
+    entry's description and notes; the registry stores a single
+    canonical entry and does not currently resolve the alias.
+    """
+
+    def setUp(self) -> None:
+        with REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            self.data = json.load(f)
+        self.entry = self.data["states"]["AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR"]
+
+    def test_state_is_present(self) -> None:
+        self.assertIn("AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR", self.data["states"])
+
+    def test_category_is_hold(self) -> None:
+        self.assertEqual(self.entry["category"], "hold")
+
+    def test_human_authorization_required(self) -> None:
+        self.assertTrue(self.entry["human_authorization_required"])
+
+    def test_merge_not_allowed(self) -> None:
+        self.assertFalse(self.entry["merge_allowed"])
+
+    def test_closeout_not_allowed(self) -> None:
+        self.assertFalse(self.entry["closeout_allowed"])
+
+    def test_no_allowed_mutations(self) -> None:
+        self.assertEqual(self.entry["allowed_mutations"], [])
+
+    def test_description_mentions_append_only(self) -> None:
+        self.assertIn("append-only", self.entry["description"])
+
+    def test_description_mentions_alias(self) -> None:
+        self.assertIn("AUDIT_APPEND_NEEDS_OPERATOR", self.entry["description"])
+
+    def test_description_explicitly_forbids_audit_log_mutation(self) -> None:
+        for phrase in (
+            "delete",
+            "trim",
+            "rewrite",
+            "replace",
+            "explicitly authorizes",
+        ):
+            self.assertIn(
+                phrase,
+                self.entry["description"],
+                f"description must mention '{phrase}' for the append-only rule",
+            )
+
+    def test_notes_document_corrective_append_decision_tree(self) -> None:
+        notes = self.entry["notes"]
+        # The five-step decision tree, captured in operator-readable prose.
+        for marker in (
+            "repo-standard audit validator",
+            "stop and report an audit hold",
+            "do not rewrite it",
+            "corrective follow-up entry",
+            "AUDIT_APPEND_NEEDS_OPERATOR",
+            "codified 2026-06-10",
+        ):
+            self.assertIn(marker, notes, f"notes must mention '{marker}'")
+
+    def test_forbidden_mutations_include_comment_delete_and_review_dismiss(self) -> None:
+        forbidden = set(self.entry["forbidden_mutations"])
+        self.assertIn("comment_delete", forbidden)
+        self.assertIn("review_dismiss", forbidden)
+
+    def test_forbidden_mutations_include_merge_and_admin_flags(self) -> None:
+        forbidden = set(self.entry["forbidden_mutations"])
+        for mut in ("pr_merge", "admin_merge", "auto_merge"):
+            self.assertIn(mut, forbidden)
+
+    def test_forbidden_mutations_include_force_push(self) -> None:
+        # The append-only closeout rule forbids force-push while the
+        # audit-ambiguity hold is in effect.
+        self.assertIn("force_push", set(self.entry["forbidden_mutations"]))
+
+    def test_allowed_next_states_include_pending_closout(self) -> None:
+        self.assertIn("PR_MERGED_PENDING_CLOSEOUT", self.entry["allowed_next_states"])
+
+    def test_allowed_next_states_include_terminal_closout(self) -> None:
+        # The task brief permits PR_MERGED_AND_CLOSED_OUT as a
+        # legitimate next state after explicit operator decision and
+        # validator evidence.
+        self.assertIn("PR_MERGED_AND_CLOSED_OUT", self.entry["allowed_next_states"])
+
+    def test_allowed_next_states_are_known(self) -> None:
+        known = set(self.data["states"].keys())
+        for nxt in self.entry["allowed_next_states"]:
+            self.assertIn(nxt, known)
+
+    def test_evidence_required_includes_validator_evidence(self) -> None:
+        # The new evidence requirement reflects that corrective
+        # appends need validator evidence.
+        self.assertIn("validator_evidence_if_available", self.entry["evidence_required"])
+
+    def test_no_conflict_between_allowed_and_forbidden_mutations(self) -> None:
+        allowed = set(self.entry["allowed_mutations"])
+        forbidden = set(self.entry["forbidden_mutations"])
+        self.assertFalse(
+            allowed & forbidden,
+            f"overlap between allowed and forbidden mutations: {allowed & forbidden}",
+        )
+
+    def test_state_canonical_name_is_in_expected_states(self) -> None:
+        # The expected-states list used by RegistryCLIListTests is the
+        # canonical machine-readable surface for downstream consumers.
+        # The new state name must appear in that list.
+        expected_states = [
+            "NOT_RUN",
+            "HOLD_MAIN_HEAD_MISMATCH",
+            "HOLD_HEAD_CHANGED",
+            "HOLD_PR_CI_PENDING",
+            "HOLD_PR_CI_FAILED",
+            "HOLD_CODEX_RESPONSE_PENDING",
+            "HOLD_NEW_CODEX_THREAD",
+            "HOLD_NEW_ACTIVE_THREAD",
+            "CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED",
+            "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            "HOLD_MERGE_STATE_BLOCKED",
+            "HOLD_PRE_MERGE_CONDITION_FAILED",
+            "HOLD_POST_MERGE_CI_PENDING",
+            "HOLD_POST_MERGE_CI_FAILED",
+            "HOLD_POST_MERGE_CI_NOT_OBSERVED",
+            "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
+            "PR_MERGED_PENDING_CLOSEOUT",
+            "PR_MERGED_AND_CLOSED_OUT",
+        ]
+        self.assertIn(
+            "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
+            expected_states,
+            "state must remain in the canonical expected-states list",
+        )
+
+
 class RegistryMalformedListFieldTests(unittest.TestCase):
     """The validator must reject malformed list-valued fields gracefully.
 

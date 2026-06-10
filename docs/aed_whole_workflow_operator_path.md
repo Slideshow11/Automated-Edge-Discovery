@@ -69,7 +69,7 @@ The 13 stages below are the canonical AED operator path. The
 | 9 | Human merge authorization | `MERGE_READY` packet + live head SHA + clean Codex | Exact authorization phrase | `scripts/local/build_merge_ready_packet.py`, `scripts/local/check_merge_authorization.py`, `docs/merge_authorization_guard.md` | Issue the exact `I confirm merge PR #N at <sha>` phrase with the live 40-char SHA | `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` until the phrase is provided |
 | 10 | Guarded merge | Authorization phrase + live head | Merged PR | `gh pr merge` invoked manually with `--match-head-commit` | Verify merge succeeded; capture merge SHA | `PR_MERGED_PENDING_CLOSEOUT` |
 | 11 | Post-merge CI | Merge commit on `main` (the SHA returned by `mergeCommit.oid`, **not** the PR head SHA) | Green required workflow runs on `main` for the exact merge commit | `scripts/local/audit_main_ci_for_head.py --branch main --head-sha <merge_commit_sha> --required-workflow <name>` (bounded polling) — pre-merge CI uses `gh pr checks <PR>`; post-merge CI verifies main-branch workflow runs against the merge commit because, after a squash merge and branch deletion, the PR's check view is no longer the authoritative main-side evidence | Wait for green; investigate any failure | `HOLD_POST_MERGE_CI_PENDING` while pending; `HOLD_POST_MERGE_CI_FAILED` on any required workflow failure; `HOLD_POST_MERGE_CI_NOT_OBSERVED` if checks never completed in the polling window |
-| 12 | Audit log | All earlier stages | Append-only JSONL row in `~/.hermes/aed/audit/log.jsonl` | `scripts/local/append_merge_action_audit.py`, `docs/trace_policy_v1.md` | Verify the row is present and well-formed | `PR_MERGED_AND_CLOSED_OUT` once the audit row is present and validated |
+| 12 | Audit log | All earlier stages | Append-only JSONL row in `~/.hermes/aed/audit/log.jsonl` | `scripts/local/append_merge_action_audit.py`, `docs/trace_policy_v1.md` | Verify the row is present and well-formed; do not rewrite any already-appended row | `PR_MERGED_AND_CLOSED_OUT` once the audit row is present and validated |
 | 13 | Worktree cleanup | Merged PR + audit row | Temp worktree removed; branch deleted | `git worktree remove --force`, `git push origin --delete <branch>` | Keep the primary worktree intentionally stale; do not reset it | `PR_MERGED_AND_CLOSED_OUT` (terminal) |
 
 The terminal state is `PR_MERGED_AND_CLOSED_OUT`. Every other state is
@@ -97,6 +97,7 @@ where a PR is in the pipeline.
 | `HOLD_POST_MERGE_CI_PENDING` | Merge succeeded; post-merge CI still running. | Bounded-poll; do not declare closed out. |
 | `HOLD_POST_MERGE_CI_FAILED` | Merge succeeded; a required post-merge CI job failed. | Investigate; consider a revert PR; do not declare closed out. |
 | `HOLD_POST_MERGE_CI_NOT_OBSERVED` | Merge succeeded; post-merge CI was not observed within the bounded polling window. | Re-check with a fresh bounded poll before declaring closed out. |
+| `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` (alias: `AUDIT_APPEND_NEEDS_OPERATOR`) | Audit append/validation could not be completed safely without human operator decision. The audit log is append-only; once an entry is appended, do not delete, trim, rewrite, or replace it unless the human explicitly authorizes that exact audit-log mutation. | Follow the operator decision tree in `docs/aed_lifecycle_state_registry.md` §10. |
 
 **Reporting rule.** When in doubt, the conservative state wins: prefer
 any `HOLD_*` over `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`, and prefer
@@ -118,7 +119,7 @@ means a task whose scope contract lists the action as in-scope.
 | Docs patch (this document and any other `docs/*.md`) | Allowed only in a docs-scoped task. |
 | Code patch (any `scripts/**`, `tests/**`, `engine/**`, `schemas/**`, `.github/**`) | Allowed only in a code-scoped task; separate PR; this guide does not authorize it. |
 | Branch push to a task branch | Allowed only to the task branch; never to `main` from a worktree. |
-| Codex review ping (`@codex review`) | Allowed only when the PR is open at the expected head, CI is green, the patch is in scope, and the comment body is gate-safe (see §7). One ping per head. |
+| Codex review ping (`@codex review`) | Allowed only when the PR is open at the expected head, CI is green, the patch is in scope, and the comment body is gate-safe (see §8). One ping per head. |
 | Thread resolution | Explicit human authorization required. The policy in `docs/stale_review_thread_auto_resolution_policy.md` defines the one allowed case and its 14 preconditions; it does not grant blanket agent authority. |
 | Merge (`gh pr merge`, including `--merge`, `--squash`, `--rebase`) | Explicit human authorization via the `I confirm merge PR #N at <sha>` phrase. The exact 40-character SHA is mandatory; see `docs/merge_authorization_guard.md` §Authorization phrase. |
 | `--admin` flag (admin bypass on the merge command) | **Forbidden** at every layer of the existing merge stack. `merge_pr_safely.py` refuses the admin flag always (argparse and defense-in-depth `reject_admin()`); the phase-ledger wrapper (`merge_readiness_with_phase_ledger.py`) hard-rejects the admin flag and never exposes it. No operator phrase, prior token, or one-off authorization in this governance path can grant the admin bypass. A future exception, if any, would require a separate operator policy PR (not a one-off phrase) and its own change to the merge stack; this guide treats the admin bypass as permanently outside the operator path. See `docs/phase_ledger_merge_readiness_wrapper.md` §Guardrails and `scripts/local/merge_pr_safely.py` `reject_admin`. |
@@ -130,6 +131,7 @@ means a task whose scope contract lists the action as in-scope.
 | Force-push (`git push --force`, `--force-with-lease`) | Forbidden. |
 | Memory or `fact_store` writes during a PR run | Forbidden. The PR is closed out using the audit log only. |
 | Skill creation or update during a PR run | Forbidden. New skills are saved in dedicated sessions, not as a side-effect of a PR run. |
+| Audit-log row mutation after append (delete, trim, rewrite, replace) | Forbidden. The audit log is append-only. The only allowed action is to append a corrective follow-up entry if the repo audit policy explicitly supports corrective entries; otherwise stop and report `AUDIT_APPEND_NEEDS_OPERATOR` (alias of `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR`). See `docs/aed_lifecycle_state_registry.md` §10 for the full operator decision tree. Explicit human authorization is required for any audit-log mutation, and the authorization must name the exact audit-log mutation being performed. |
 
 ## 6. Safe command references
 
@@ -234,10 +236,89 @@ in a future PR:
 - Per-wrapper invocation templates with placeholder fill-in
 - Per-gate failure-mode recipes
 - Per-stage rerun-and-resume patterns
-- Codex-ping body templates (gate-safe, see §7)
+- Codex-ping body templates (gate-safe, see §8)
 - Worktree-cleanup one-liners
 
-## 7. Lessons from PR #394
+## 7. Audit log append-only closeout rule (codified 2026-06-10)
+
+The AED merge-action audit log is append-only. The rule is stated
+here in the operator-path vocabulary and is cross-referenced from
+`docs/aed_lifecycle_state_registry.md` §10 (the canonical policy
+surface) and `docs/aed_known_safe_command_cookbook.md` §11
+(known-safe command shape).
+
+**Statement.** Once an audit entry is appended to
+`~/.hermes/aed/audit/log.jsonl`, do not delete, trim, rewrite, or
+replace it unless the human operator **explicitly** authorizes that
+exact audit-log mutation. There is no blanket agent authority to
+rewrite audit history. "Looks wrong" is not authorization. This is
+true during the closeout of any AED PR, including the audit append
+step itself: a malformed, non-canonical, incomplete, or suboptimal
+entry stays in the log until a human explicitly authorizes an
+amendment, and the standing policy prefers a corrective follow-up
+append over a rewrite.
+
+**Operator decision tree.** When an audit entry is suspected to
+be malformed, non-canonical, incomplete, or suboptimal after
+append, the operator must:
+
+1. **First** run the repo-standard audit validator
+   (`scripts/local/validate_merge_action_audit_log.py`). The
+   non-strict mode (with `--allow-legacy`) records warnings; the
+   strict mode is the gating signal.
+2. **If validation fails**, stop and report an audit hold. Do
+   not amend the entry. Do not "fix and retry" the closeout.
+3. **If validation passes but the entry is non-canonical**, do
+   not rewrite it. A non-canonical but valid entry stays in the
+   log.
+4. **Append a corrective follow-up entry** *only* if the repo
+   audit policy explicitly supports corrective entries. The
+   current trace policy
+   (`docs/trace_policy_v1.md` §6 Trace Completeness Rule)
+   requires every entry to be complete at emit time, so a
+   corrective append is permitted only when the policy
+   explicitly authorizes it for the specific defect.
+5. **Otherwise** stop and report `AUDIT_APPEND_NEEDS_OPERATOR`
+   (alias of the canonical
+   `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` state). Human operator
+   decision is required.
+
+**While an audit-ambiguity hold is in effect, the following
+repository-side actions are also forbidden**, in addition to
+`pr_merge`, `admin_merge`, and `auto_merge`:
+
+- `comment_delete` — comments may not be deleted to suppress
+  evidence of the ambiguity.
+- `review_dismiss` — reviews may not be dismissed for the same
+  reason.
+- `force_push` — history may not be rewritten on any branch
+  involved in the closeout.
+
+These are encoded in the canonical state's `forbidden_mutations`
+list. The audit-log-mutation prohibition itself (audit delete,
+audit rewrite, audit trim, audit replace) is encoded in the
+state's `description` and `notes` because the validator's
+`VALID_MUTATIONS` set is a vocabulary of allowed repository-side
+actions, not a vocabulary of audit-log row operations; the policy
+text is the authoritative surface for the audit-log-mutation
+rule.
+
+**Why this rule exists.** PR #397 (`tooling(governance): add
+lifecycle state registry`) merged successfully, but its closeout
+included an audit-log rewrite/trim after a malformed entry had
+already validated. PR #397 is accepted and closed; the rule is
+codified so that this pattern does not repeat. The
+`AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` state is the canonical
+hold; the alias `AUDIT_APPEND_NEEDS_OPERATOR` is a reporting
+label for the same condition.
+
+**Reference.** `docs/merge_action_audit_log.md` §Append-only,
+`docs/trace_policy_v1.md` §6, and
+`docs/aed_lifecycle_state_registry.md` §10.
+
+---
+
+## 8. Lessons from PR #394
 
 The full closeout of PR #394 surfaced a small number of operational
 lessons that the operator path should keep in view. Each lesson is
@@ -281,7 +362,7 @@ the relevant lower-level doc.
   on the exact body is mandatory. If the scan fails, do not post; do
   not "fix and retry" silently — report and request a human rephrase.
 
-## 8. Where next work belongs
+## 9. Where next work belongs
 
 The following items are explicitly out of scope for this document and
 should be tracked as separate future PRs. They are listed in

@@ -628,6 +628,40 @@ the log plus the PR just appended. If the script is unavailable or
 its schema is ambiguous, do not invent arguments; report
 `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` and stop.
 
+### 11.1 Append-only constraint (codified 2026-06-10)
+
+The audit log at `~/.hermes/aed/audit/log.jsonl` is append-only. The
+constraint is the policy surface for the registry's
+`AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` state.
+
+- **Do not delete, trim, rewrite, or replace** any audit row that
+  has already been appended, even if the row is malformed,
+  non-canonical, incomplete, or suboptimal. "Looks wrong" is not
+  authorization.
+- **If a previously-appended row is found to be malformed,
+  non-canonical, incomplete, or suboptimal**, the operator must
+  follow the decision tree in
+  `docs/aed_lifecycle_state_registry.md` §10:
+  1. Run the audit validator first.
+  2. If validation fails, stop and report an audit hold.
+  3. If validation passes but the row is non-canonical, do not
+     rewrite it.
+  4. Append a corrective follow-up row only if the repo audit
+     policy explicitly supports corrective entries.
+  5. Otherwise stop and report `AUDIT_APPEND_NEEDS_OPERATOR`
+     (alias of the canonical
+     `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR`).
+- **Do not delete comments or dismiss reviews** to suppress
+  evidence of an audit-ambiguity hold. While the hold is in
+  effect, `comment_delete` and `review_dismiss` are forbidden
+  repository-side actions.
+- **Do not force-push** any branch involved in the closeout
+  while the hold is in effect.
+
+The alias name `AUDIT_APPEND_NEEDS_OPERATOR` is a reporting
+label for the same canonical state. Use either name in operator
+prompts; the registry stores a single canonical entry.
+
 ## 12. Worktree cleanup cookbook
 
 Before removing the temp worktree, verify it is clean:
@@ -705,7 +739,7 @@ A compact map from lifecycle state to the next safe command.
 | `HOLD_POST_MERGE_CI_FAILED` | Investigate; consider revert; do not declare closeout. |
 | `HOLD_POST_MERGE_CI_NOT_OBSERVED` | Re-check with a fresh bounded poll. |
 | `HOLD_MAIN_HEAD_MISMATCH` | Stop. origin/main does not match the expected SHA. |
-| `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` | Stop. Audit script or schema usage was ambiguous. |
+| `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` (alias: `AUDIT_APPEND_NEEDS_OPERATOR`) | Stop. Audit script or schema usage was ambiguous, or a previously appended audit row is malformed / non-canonical / incomplete / suboptimal. Follow the append-only constraint in §11.1 and the operator decision tree in `docs/aed_lifecycle_state_registry.md` §10. |
 
 ## 15. Relationship to future tools
 

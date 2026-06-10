@@ -186,15 +186,15 @@
     },
     "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR": {
       "category": "hold",
-      "description": "The audit append step could not be performed safely because the helper or schema was ambiguous. Operator must run the audit step explicitly.",
-      "evidence_required": ["pr_number", "merge_sha", "ambiguity_reason"],
-      "allowed_next_states": ["PR_MERGED_PENDING_CLOSEOUT"],
+      "description": "The audit append step could not be performed safely because the helper or schema was ambiguous, or a previously appended audit entry was found to be malformed, non-canonical, incomplete, or suboptimal. The audit log is append-only; once an entry is appended, do not delete, trim, rewrite, or replace it unless the human operator explicitly authorizes that exact audit-log mutation. Operator must resolve the ambiguity without rewriting audit history. (Alias: AUDIT_APPEND_NEEDS_OPERATOR.)",
+      "evidence_required": ["pr_number", "merge_sha", "ambiguity_reason", "validator_evidence_if_available"],
+      "allowed_next_states": ["PR_MERGED_PENDING_CLOSEOUT", "PR_MERGED_AND_CLOSED_OUT"],
       "allowed_mutations": [],
-      "forbidden_mutations": ["pr_merge", "admin_merge", "auto_merge"],
+      "forbidden_mutations": ["pr_merge", "admin_merge", "auto_merge", "comment_delete", "review_dismiss", "force_push"],
       "human_authorization_required": true,
       "merge_allowed": false,
       "closeout_allowed": false,
-      "notes": "Operator must run scripts/local/append_merge_action_audit.py with verified args. Do not invent arguments."
+      "notes": "Append-only closeout rule (codified 2026-06-10). If the audit validator or schema usage is ambiguous, the operator must (1) first run the repo-standard audit validator, (2) if validation fails, stop and report an audit hold, (3) if validation passes but the existing entry is non-canonical, do not rewrite it, (4) append a corrective follow-up entry only if the repo audit policy explicitly supports corrective entries, and (5) otherwise stop and report AUDIT_APPEND_NEEDS_OPERATOR (an alias of this state). Operator must run scripts/local/append_merge_action_audit.py with verified args. Do not invent arguments. Do not rewrite, trim, replace, or delete any already-appended audit row. Reference: docs/merge_action_audit_log.md §Append-only, docs/trace_policy_v1.md §6 Trace Completeness Rule. The alias name AUDIT_APPEND_NEEDS_OPERATOR is a reporting alias; this state is the single canonical entry."
     },
     "PR_MERGED_PENDING_CLOSEOUT": {
       "category": "mutation_pending",

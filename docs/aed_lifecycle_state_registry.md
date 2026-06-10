@@ -252,7 +252,92 @@ canonical.
 
 ---
 
-## 10. How future helpers should consume the registry
+## 10. Append-only closeout rule (v1, codified 2026-06-10)
+
+The AED merge-action audit log is append-only. The rule is stated
+here once in the registry vocabulary so that every consumer of the
+lifecycle states — the operator path, the command cookbook, the
+audit appender, the audit validator, and the closeout pipeline —
+points to the same canonical policy.
+
+**The rule.** Once an audit entry is appended to the audit log at
+`~/.hermes/aed/audit/log.jsonl`, do not delete, trim, rewrite, or
+replace it unless the human operator **explicitly** authorizes that
+exact audit-log mutation. There is no blanket agent authority to
+rewrite audit history. "Looks wrong" is not authorization.
+
+**Alias.** The reporting vocabulary includes an alias,
+`AUDIT_APPEND_NEEDS_OPERATOR`, for the situation where a
+previously-appended audit entry is found to be malformed,
+non-canonical, incomplete, or suboptimal. The alias is a synonym
+for `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` — the registry stores a
+single canonical state and treats the alias as a reporting label.
+The validator does not currently resolve the alias because aliases
+are a reporting convenience, not a structural feature of the
+registry.
+
+**Operator decision tree.** When an audit entry is suspected to be
+malformed, non-canonical, incomplete, or suboptimal after append,
+the operator must follow this decision tree in order:
+
+1. **First** run the repo-standard audit validator
+   (`scripts/local/validate_merge_action_audit_log.py`). The
+   validator's non-strict mode (with `--allow-legacy`) records
+   warnings; strict mode is the gating signal.
+2. **If validation fails**, stop and report an audit hold. Do
+   not amend the entry. Do not "fix and retry" the closeout.
+3. **If validation passes but the entry is non-canonical**, do
+   not rewrite it. A non-canonical but valid entry stays in
+   the log.
+4. **Append a corrective follow-up entry** *only* if the repo
+   audit policy explicitly supports corrective entries. The
+   current trace policy (see `docs/trace_policy_v1.md` §6 Trace
+   Completeness Rule) requires every entry to be complete at
+   emit time, so a corrective append is permitted only when the
+   policy explicitly authorizes it for the specific defect.
+5. **Otherwise** stop and report `AUDIT_APPEND_NEEDS_OPERATOR`
+   (alias of `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR`). Human
+   operator decision is required.
+
+**Forbidden mutations while in this state.** The state
+`AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` already forbids
+`pr_merge`, `admin_merge`, and `auto_merge`. The append-only
+closeout rule additionally forbids, while an audit-ambiguity
+hold is in effect:
+
+- `comment_delete` — comments may not be deleted to suppress
+  evidence of the ambiguity.
+- `review_dismiss` — reviews may not be dismissed for the same
+  reason.
+- `force_push` — history may not be rewritten on any branch
+  involved in the closeout.
+
+These are encoded in the registry entry's `forbidden_mutations`
+list. The audit-log-mutation prohibition itself
+(`audit_delete`, `audit_rewrite`, `audit_trim`, `audit_replace`)
+is encoded in the entry's `description` and `notes` because the
+validator's `VALID_MUTATIONS` set is a vocabulary of allowed
+repository-side actions, not a vocabulary of audit-log row
+operations; the policy text is the authoritative surface for the
+audit-log-mutation rule.
+
+**Reference.** `docs/merge_action_audit_log.md` §Append-only
+("Do NOT edit or delete existing audit rows. The append-only
+nature of the log is what makes it auditable."), and
+`docs/trace_policy_v1.md` §6 Trace Completeness Rule.
+
+**Why this state, not a new one.** A separate
+`AUDIT_APPEND_NEEDS_OPERATOR` state would duplicate the
+canonical entry and introduce a stale reporting alias with no
+structural support. The single canonical state
+`AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` covers both the "could not
+append" case and the "appended entry needs operator review"
+case, and the alias is documented in the entry's description and
+notes for consumers that prefer the shorter name.
+
+---
+
+## 11. How future helpers should consume the registry
 
 Future helpers and tools that need to look up a state should:
 
