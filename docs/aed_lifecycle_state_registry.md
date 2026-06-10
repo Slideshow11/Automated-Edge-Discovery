@@ -160,6 +160,7 @@ HOLD_POST_MERGE_CI_NOT_OBSERVED
 AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR
 PR_MERGED_PENDING_CLOSEOUT
 PR_MERGED_AND_CLOSED_OUT
+HOLD_RESUME_CHECKPOINT_NEEDED
 ```
 
 ---
@@ -337,7 +338,114 @@ notes for consumers that prefer the shorter name.
 
 ---
 
-## 11. How future helpers should consume the registry
+## 11. Resume checkpoint rule (v1, codified 2026-06-10)
+
+The AED operator path is multi-turn. A continuation turn (a
+later turn that picks up an in-progress PR) must resume from the
+**latest verified lifecycle state** and must not restart broad
+planning, repeat completed phases, or repeat already-authorized
+mutations. This rule is stated here once in the registry
+vocabulary so that every consumer — the operator path, the
+command cookbook, the closeout pipeline, and future agents —
+points to the same canonical policy.
+
+**The rule.** Before taking any mutation, the operator must
+verify, using read-only checks only:
+
+1. Current PR number and URL.
+2. Current head SHA (the live PR head, not a stale value).
+3. Current lifecycle state (the last verified state from a
+   durable source, not from memory).
+4. Completed phases (which gates have already been passed and
+   which are still in progress).
+5. Remaining permitted mutations (which actions are still
+   authorized for the current state).
+6. Already-performed mutations (which actions have already
+   happened in this PR run, so they are not repeated).
+7. Protected PR/worktree state (the primary worktree, the
+   guarded PRs, and the temp worktree are all as expected).
+8. Whether the next requested action is a **continuation** of
+   the verified state, not a restart of an already-completed
+   phase.
+
+**Stop condition.** If the current state cannot be reconstructed
+from durable evidence, stop and report a resume checkpoint
+hold (`HOLD_RESUME_CHECKPOINT_NEEDED`). Do not infer readiness
+from memory alone. Do not rerun broad workflows when a narrow
+continuation action is sufficient.
+
+**Canonical state.** The `HOLD_RESUME_CHECKPOINT_NEEDED` state
+is the canonical entry for this condition. It is a hold state
+with `merge_allowed: false` and `closeout_allowed: false`, and
+it requires human authorization to leave. Its `allowed_next_states`
+list is the full set of non-terminal and terminal canonical
+states because the operator may reconstruct any of them as the
+prior verified state. After the operator reconstructs the prior
+verified state, the next state is that prior non-terminal state;
+if merge is already verified complete, the next state is
+`PR_MERGED_PENDING_CLOSEOUT`; if closeout is already verified
+complete, the next state is `PR_MERGED_AND_CLOSED_OUT`.
+
+**Forbidden mutations while in this state.** The state forbids
+the canonical mutation tokens `pr_merge`, `thread_resolve`,
+`comment_delete`, `review_dismiss`, and `force_push` because
+all of those are continuations from a verified prior state and
+must wait until reconstruction is complete. The entry's `notes`
+field additionally documents three **policy-level prohibitions**
+that are not in the canonical mutation vocabulary:
+
+- Do not perform a duplicate Codex ping (the same head must
+  not be re-pinged if a ping already exists for it).
+- Do not rewrite any already-appended audit row (the
+  append-only closeout rule from §10 governs).
+- Do not repeat an already-completed mutation (continuation
+  rule examples below).
+
+**Continuation rule examples.** The following examples are
+stated once here in the registry vocabulary; cross-references
+to the operator path (§8) and the command cookbook (§11.2)
+are kept in sync.
+
+- If the previous state was `HOLD_PR_CI_PENDING`, only recheck
+  CI and continue to the Codex phase if CI is green. Do not
+  re-enter earlier gates (scope, scope guard, final gate).
+- If the previous state was `HOLD_CODEX_RESPONSE_PENDING`, do
+  not post another Codex ping unless the current-head ping is
+  missing or the current head has changed. Use bounded polling
+  on the existing ping.
+- If the previous state was
+  `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`, verify the target
+  threads (already-resolved, outdated, or still active)
+  before resolving; do not merge in the same turn unless
+  explicit human authorization is present.
+- If the previous state was
+  `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`, do not repeat
+  thread resolution; perform final pre-merge verification and
+  guarded merge only if exact human authorization is present.
+  Thread resolution is not part of the merge phase.
+- If the previous state was `PR_MERGED_PENDING_CLOSEOUT`, do
+  not merge again; verify the merge commit, main CI, audit
+  append, and temp-worktree cleanup. Each of those is its
+  own sub-step.
+- If the previous state was `PR_MERGED_AND_CLOSED_OUT`, do
+  not reopen or mutate; report terminal closeout. The PR is
+  done.
+
+**Why a new state, not just a note in another state.** The
+operator path and the command cookbook each document the
+continuation rule, but the lifecycle vocabulary needs a single
+canonical entry that says "I do not have enough durable
+evidence to know what to do next." A future consumer that
+inspects the registry for the operator's current hold will
+find exactly one entry that matches that condition.
+
+**Reference.** `docs/aed_whole_workflow_operator_path.md` §8
+(new), `docs/aed_known_safe_command_cookbook.md` §11.2 (new),
+and the cross-references in those documents.
+
+---
+
+## 12. How future helpers should consume the registry
 
 Future helpers and tools that need to look up a state should:
 

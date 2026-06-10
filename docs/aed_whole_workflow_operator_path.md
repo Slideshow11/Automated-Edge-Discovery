@@ -44,7 +44,7 @@ This document is operator guidance only. It explicitly does **not**:
 - Change any script behavior, command shape, gate contract, or audit
   schema. All of those are owned by their own docs and PRs.
 - Provide a complete command cookbook. A separate cookbook is listed in
-  §9 as future work. This document gives only the safe command
+  §10 as future work. This document gives only the safe command
   *shapes* an operator needs to recognize.
 
 If anything in this document appears to conflict with a lower-level
@@ -98,6 +98,7 @@ where a PR is in the pipeline.
 | `HOLD_POST_MERGE_CI_FAILED` | Merge succeeded; a required post-merge CI job failed. | Investigate; consider a revert PR; do not declare closed out. |
 | `HOLD_POST_MERGE_CI_NOT_OBSERVED` | Merge succeeded; post-merge CI was not observed within the bounded polling window. | Re-check with a fresh bounded poll before declaring closed out. |
 | `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` (alias: `AUDIT_APPEND_NEEDS_OPERATOR`) | Audit append/validation could not be completed safely without human operator decision. The audit log is append-only; once an entry is appended, do not delete, trim, rewrite, or replace it unless the human explicitly authorizes that exact audit-log mutation. | Follow the operator decision tree in `docs/aed_lifecycle_state_registry.md` §10. |
+| `HOLD_RESUME_CHECKPOINT_NEEDED` | Continuation cannot safely determine the latest verified lifecycle state or the remaining permitted mutations from durable evidence. The previous turn(s) may have been interrupted or out-of-band; the operator must reconstruct state from read-only evidence before any mutation. | Reconstruct the prior verified state using read-only checks (PR number and URL, current head SHA, current lifecycle state, completed phases, remaining permitted mutations, already-performed mutations, protected PR/worktree state). Do not infer readiness from memory. Do not rerun broad workflows when a narrow continuation action is sufficient. See `docs/aed_lifecycle_state_registry.md` §11. |
 
 **Reporting rule.** When in doubt, the conservative state wins: prefer
 any `HOLD_*` over `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`, and prefer
@@ -119,7 +120,7 @@ means a task whose scope contract lists the action as in-scope.
 | Docs patch (this document and any other `docs/*.md`) | Allowed only in a docs-scoped task. |
 | Code patch (any `scripts/**`, `tests/**`, `engine/**`, `schemas/**`, `.github/**`) | Allowed only in a code-scoped task; separate PR; this guide does not authorize it. |
 | Branch push to a task branch | Allowed only to the task branch; never to `main` from a worktree. |
-| Codex review ping (`@codex review`) | Allowed only when the PR is open at the expected head, CI is green, the patch is in scope, and the comment body is gate-safe (see §8). One ping per head. |
+| Codex review ping (`@codex review`) | Allowed only when the PR is open at the expected head, CI is green, the patch is in scope, and the comment body is gate-safe (see §9). One ping per head. |
 | Thread resolution | Explicit human authorization required. The policy in `docs/stale_review_thread_auto_resolution_policy.md` defines the one allowed case and its 14 preconditions; it does not grant blanket agent authority. |
 | Merge (`gh pr merge`, including `--merge`, `--squash`, `--rebase`) | Explicit human authorization via the `I confirm merge PR #N at <sha>` phrase. The exact 40-character SHA is mandatory; see `docs/merge_authorization_guard.md` §Authorization phrase. |
 | `--admin` flag (admin bypass on the merge command) | **Forbidden** at every layer of the existing merge stack. `merge_pr_safely.py` refuses the admin flag always (argparse and defense-in-depth `reject_admin()`); the phase-ledger wrapper (`merge_readiness_with_phase_ledger.py`) hard-rejects the admin flag and never exposes it. No operator phrase, prior token, or one-off authorization in this governance path can grant the admin bypass. A future exception, if any, would require a separate operator policy PR (not a one-off phrase) and its own change to the merge stack; this guide treats the admin bypass as permanently outside the operator path. See `docs/phase_ledger_merge_readiness_wrapper.md` §Guardrails and `scripts/local/merge_pr_safely.py` `reject_admin`. |
@@ -132,13 +133,14 @@ means a task whose scope contract lists the action as in-scope.
 | Memory or `fact_store` writes during a PR run | Forbidden. The PR is closed out using the audit log only. |
 | Skill creation or update during a PR run | Forbidden. New skills are saved in dedicated sessions, not as a side-effect of a PR run. |
 | Audit-log row mutation after append (delete, trim, rewrite, replace) | Forbidden. The audit log is append-only. The only allowed action is to append a corrective follow-up entry if the repo audit policy explicitly supports corrective entries; otherwise stop and report `AUDIT_APPEND_NEEDS_OPERATOR` (alias of `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR`). See `docs/aed_lifecycle_state_registry.md` §10 for the full operator decision tree. Explicit human authorization is required for any audit-log mutation, and the authorization must name the exact audit-log mutation being performed. |
+| Continuation turn without durable state evidence | Forbidden. A continuation turn must resume from the latest verified lifecycle state. Before any mutation, the operator must verify current PR number and URL, current head SHA, current lifecycle state, completed phases, remaining permitted mutations, already-performed mutations, and protected PR/worktree state. If the state cannot be reconstructed from durable evidence, stop and report `HOLD_RESUME_CHECKPOINT_NEEDED` (see `docs/aed_lifecycle_state_registry.md` §11). Do not restart broad planning. Do not repeat completed phases. Do not repeat already-authorized mutations. Do not post a duplicate Codex ping for the same head. |
 
 ## 6. Safe command references
 
 This section gives only the safe command *shapes* an operator needs to
 recognize in this path. A full command cookbook — including ready-to-run
 incantations for every gate, every stage, and every known failure mode —
-is listed in §9 as future work. Until that cookbook lands, operators
+is listed in §10 as future work. Until that cookbook lands, operators
 should consult the per-stage doc referenced in §3 and copy the example
 command from that doc, replacing placeholders.
 
@@ -236,7 +238,7 @@ in a future PR:
 - Per-wrapper invocation templates with placeholder fill-in
 - Per-gate failure-mode recipes
 - Per-stage rerun-and-resume patterns
-- Codex-ping body templates (gate-safe, see §8)
+- Codex-ping body templates (gate-safe, see §9)
 - Worktree-cleanup one-liners
 
 ## 7. Audit log append-only closeout rule (codified 2026-06-10)
@@ -318,7 +320,90 @@ label for the same condition.
 
 ---
 
-## 8. Lessons from PR #394
+## 8. Resume checkpoint rule (codified 2026-06-10)
+
+The AED operator path is multi-turn. A continuation turn (a
+later turn that picks up an in-progress PR) must resume from the
+**latest verified lifecycle state** and must not restart broad
+planning, repeat completed phases, or repeat already-authorized
+mutations. PR #397 and PR #398 both reached valid intermediate
+states, but continuation turns repeated work or re-entered
+earlier phases; PR #398 also repeated the already-completed
+thread-resolution phase before the merge phase. Both PRs are
+accepted and closed. This rule is codified so future
+continuation prompts resume from the latest verified lifecycle
+state.
+
+**Statement.** Before taking any mutation in a continuation
+turn, the operator must verify, using read-only checks only:
+
+1. Current PR number and URL.
+2. Current head SHA (the live PR head, not a stale value).
+3. Current lifecycle state (the last verified state from a
+   durable source, not from memory).
+4. Completed phases (which gates have already been passed and
+   which are still in progress).
+5. Remaining permitted mutations (which actions are still
+   authorized for the current state).
+6. Already-performed mutations (which actions have already
+   happened in this PR run, so they are not repeated).
+7. Protected PR/worktree state (the primary worktree, the
+   guarded PRs, and the temp worktree are all as expected).
+8. Whether the next requested action is a **continuation** of
+   the verified state, not a restart of an already-completed
+   phase.
+
+**Stop condition.** If the current state cannot be reconstructed
+from durable evidence, stop and report a resume checkpoint
+hold (`HOLD_RESUME_CHECKPOINT_NEEDED`). Do not infer readiness
+from memory alone. Do not rerun broad workflows when a narrow
+continuation action is sufficient.
+
+**Continuation rule examples.** These examples are stated once
+in `docs/aed_lifecycle_state_registry.md` §11; the cross-
+reference is kept in sync.
+
+- If the previous state was `HOLD_PR_CI_PENDING`, only recheck
+  CI and continue to the Codex phase if CI is green. Do not
+  re-enter earlier gates (scope, scope guard, final gate).
+- If the previous state was `HOLD_CODEX_RESPONSE_PENDING`, do
+  not post another Codex ping unless the current-head ping is
+  missing or the current head has changed. Use bounded polling
+  on the existing ping.
+- If the previous state was
+  `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`, verify the target
+  threads (already-resolved, outdated, or still active)
+  before resolving; do not merge in the same turn unless
+  explicit human authorization is present.
+- If the previous state was
+  `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`, do not repeat
+  thread resolution; perform final pre-merge verification and
+  guarded merge only if exact human authorization is present.
+  Thread resolution is not part of the merge phase.
+- If the previous state was `PR_MERGED_PENDING_CLOSEOUT`, do
+  not merge again; verify the merge commit, main CI, audit
+  append, and temp-worktree cleanup. Each of those is its
+  own sub-step.
+- If the previous state was `PR_MERGED_AND_CLOSED_OUT`, do
+  not reopen or mutate; report terminal closeout. The PR is
+  done.
+
+**Why this rule exists.** PR #397 and PR #398 both reached
+valid intermediate states, but continuation turns repeated
+work or re-entered earlier phases. PR #398 also repeated the
+already-completed thread-resolution phase before the merge
+phase. Treating those PRs as accepted and closed, the rule is
+codified so this pattern does not repeat.
+
+**Reference.** `docs/aed_lifecycle_state_registry.md` §11
+(the canonical policy surface and the new
+`HOLD_RESUME_CHECKPOINT_NEEDED` state) and
+`docs/aed_known_safe_command_cookbook.md` §11.2 (the
+constraint summary in the cookbook).
+
+---
+
+## 9. Lessons from PR #394
 
 The full closeout of PR #394 surfaced a small number of operational
 lessons that the operator path should keep in view. Each lesson is
@@ -362,7 +447,7 @@ the relevant lower-level doc.
   on the exact body is mandatory. If the scan fails, do not post; do
   not "fix and retry" silently — report and request a human rephrase.
 
-## 9. Where next work belongs
+## 10. Where next work belongs
 
 The following items are explicitly out of scope for this document and
 should be tracked as separate future PRs. They are listed in

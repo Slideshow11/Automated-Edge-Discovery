@@ -219,6 +219,52 @@
       "merge_allowed": false,
       "closeout_allowed": false,
       "notes": "Terminal state. The PR-specific final-report label (e.g. PR_395_MERGED, PR_396_MERGED) is derived from this state plus the PR number, and is a report label rather than a canonical state in its own right."
+    },
+    "HOLD_RESUME_CHECKPOINT_NEEDED": {
+      "category": "hold",
+      "description": "Continuation cannot safely determine the latest verified lifecycle state or the remaining permitted mutations from durable evidence. The operator must reconstruct state using read-only checks (current PR number and URL, current head SHA, current lifecycle state, completed phases, remaining permitted mutations, already-performed mutations, protected PR/worktree state) before any mutation is performed. Do not infer readiness from memory alone. Do not rerun broad workflows when a narrow continuation action is sufficient.",
+      "evidence_required": [
+        "pr_number_and_url",
+        "current_head_sha",
+        "current_lifecycle_state",
+        "completed_phase_summary",
+        "remaining_permitted_mutation_summary",
+        "already_performed_mutation_summary",
+        "protected_pr_and_worktree_verification"
+      ],
+      "allowed_next_states": [
+        "HOLD_RESUME_CHECKPOINT_NEEDED",
+        "NOT_RUN",
+        "HOLD_MAIN_HEAD_MISMATCH",
+        "HOLD_HEAD_CHANGED",
+        "HOLD_PR_CI_PENDING",
+        "HOLD_PR_CI_FAILED",
+        "HOLD_CODEX_RESPONSE_PENDING",
+        "HOLD_NEW_CODEX_THREAD",
+        "HOLD_NEW_ACTIVE_THREAD",
+        "CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED",
+        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        "HOLD_MERGE_STATE_BLOCKED",
+        "HOLD_PRE_MERGE_CONDITION_FAILED",
+        "HOLD_POST_MERGE_CI_PENDING",
+        "HOLD_POST_MERGE_CI_FAILED",
+        "HOLD_POST_MERGE_CI_NOT_OBSERVED",
+        "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
+        "PR_MERGED_PENDING_CLOSEOUT",
+        "PR_MERGED_AND_CLOSED_OUT"
+      ],
+      "allowed_mutations": [],
+      "forbidden_mutations": [
+        "pr_merge",
+        "thread_resolve",
+        "comment_delete",
+        "review_dismiss",
+        "force_push"
+      ],
+      "human_authorization_required": true,
+      "merge_allowed": false,
+      "closeout_allowed": false,
+      "notes": "Resume checkpoint rule (codified 2026-06-10). Use this state when a continuation prompt lacks enough durable evidence to determine whether the next action is CI polling, Codex polling, thread resolution, merge, audit append, or cleanup. The operator must reconstruct state using read-only checks before proceeding. Policy-level prohibitions while in this state (encoded here as prose because they are not in the validator's canonical mutation vocabulary): do not perform a duplicate Codex ping, do not rewrite any already-appended audit row, and do not repeat an already-completed mutation. After the operator reconstructs the prior verified state, the next state is that prior non-terminal state; if merge is already verified complete, the next state is PR_MERGED_PENDING_CLOSEOUT; if closeout is already verified complete, the next state is PR_MERGED_AND_CLOSED_OUT. The canonical mutation vocabulary covers pr_merge, thread_resolve, comment_delete, review_dismiss, and force_push; the policy-level prohibitions (duplicate Codex ping, audit rewrite, repeated already-completed mutation) are documented here for the operator's reference. The validator will reject any token outside the canonical mutation vocabulary, so this entry uses the canonical tokens for the five audit-trail-prohibitions and the prose notes for the three policy-level prohibitions."
     }
   }
 }

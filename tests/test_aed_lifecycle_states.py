@@ -82,6 +82,7 @@ class RegistryCLIListTests(unittest.TestCase):
         "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
         "PR_MERGED_PENDING_CLOSEOUT",
         "PR_MERGED_AND_CLOSED_OUT",
+        "HOLD_RESUME_CHECKPOINT_NEEDED",
     ]
 
     def test_list_contains_all_required_canonical_states(self) -> None:
@@ -340,44 +341,238 @@ class RegistryAuditAppendSkippedStateTests(unittest.TestCase):
             "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
             "PR_MERGED_PENDING_CLOSEOUT",
             "PR_MERGED_AND_CLOSED_OUT",
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
         ]
         self.assertIn(
             "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
             expected_states,
             "state must remain in the canonical expected-states list",
         )
+        self.assertIn(
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
+            expected_states,
+            "HOLD_RESUME_CHECKPOINT_NEEDED must be in the canonical expected-states list",
+        )
 
     def test_operator_path_doc_section_numbers_are_consistent(self) -> None:
-        """Cross-reference regression guard (PR #398 P3 finding).
+        """Cross-reference regression guard (PR #398 and PR #399 renumberings).
 
-        The previous version of this PR renumbered the operator-path
-        doc from 13 sections to 14 sections (added §7 for the
-        append-only rule, shifted "Lessons" to §8 and "Where next
-        work belongs" to §9) but missed two cross-references in
-        §2 and §6.5 that still pointed to the old §8 ("Where next
-        work belongs"). The §2 and §6.5 references must now point
-        to §9. The §5 authority table and the §6.5 cookbook
-        "Future cookbook (deferred)" entry point to §8, which is
-        the new "Lessons from PR #394" section — that pointer is
-        correct and must stay.
+        The PR #398 commit renumbered the operator-path doc from 13
+        sections to 14 sections (added §7 for the append-only rule,
+        shifted "Lessons" to §8 and "Where next work belongs" to §9).
+        The PR #399 commit renumbers the doc again: it adds a new §8
+        for the resume checkpoint rule, shifts "Lessons from PR #394"
+        to §9, and shifts "Where next work belongs" to §10.
+
+        The §2 and §6.5 "future work" pointers must now reference §10
+        (the new "Where next work belongs" section). The §5 authority
+        table and §6.5 future-cookbook "Codex-ping body templates"
+        pointers must now reference §9 (the new "Lessons from PR #394"
+        section). The "see §8" pointer pattern in those same
+        cross-references must now point to §9, not §8 (the resume
+        checkpoint rule does not have a "see" reference).
         """
         doc_path = REPO_ROOT / "docs" / "aed_whole_workflow_operator_path.md"
         with doc_path.open("r", encoding="utf-8") as f:
             text = f.read()
-        # §2 and §6.5 must point to §9 for the "future work" pointer.
+        # §2 and §6.5 must point to §10 for the "future work" pointer.
         self.assertIn(
-            "§9 as future work",
+            "§10 as future work",
             text,
-            "operator path §2/§6.5 'future work' pointer must reference §9 "
-            "after the PR #398 renumbering",
+            "operator path §2/§6.5 'future work' pointer must reference §10 "
+            "after the PR #399 renumbering",
         )
-        # The "see §8" pointers in the §5 authority table and the
-        # §6.5 future-cookbook list must point to §8 (Lessons from
-        # PR #394), not §9.
+        # The "see §9" pointers in the §5 authority table and the
+        # §6.5 future-cookbook list must point to §9 (Lessons from
+        # PR #394), not §10.
         self.assertIn(
-            "(see §8)",
+            "(see §9)",
             text,
-            "operator path §5/§6.5 'see §8' pointer must still reference §8",
+            "operator path §5/§6.5 'see §9' pointer must still reference §9",
+        )
+
+
+class RegistryResumeCheckpointStateTests(unittest.TestCase):
+    """HOLD_RESUME_CHECKPOINT_NEEDED must codify the resume checkpoint
+    continuation rule codified 2026-06-10.
+
+    The canonical state is the operator's "I do not have enough
+    durable evidence to know what to do next" state. It is a hold
+    state whose allowed_next_states list spans the full set of
+    non-terminal and terminal canonical states because the
+    operator may reconstruct any of them as the prior verified
+    state. Its forbidden_mutations list uses the canonical mutation
+    vocabulary tokens; the three policy-level prohibitions
+    (duplicate Codex ping, audit rewrite, repeated already-
+    completed mutation) are documented in the entry's notes.
+    """
+
+    def setUp(self) -> None:
+        with REGISTRY_PATH.open("r", encoding="utf-8") as f:
+            self.data = json.load(f)
+        self.entry = self.data["states"]["HOLD_RESUME_CHECKPOINT_NEEDED"]
+        self.all_state_names = set(self.data["states"].keys())
+
+    def test_state_is_present(self) -> None:
+        self.assertIn("HOLD_RESUME_CHECKPOINT_NEEDED", self.data["states"])
+
+    def test_category_is_hold(self) -> None:
+        self.assertEqual(self.entry["category"], "hold")
+
+    def test_human_authorization_required(self) -> None:
+        self.assertTrue(self.entry["human_authorization_required"])
+
+    def test_merge_not_allowed(self) -> None:
+        self.assertFalse(self.entry["merge_allowed"])
+
+    def test_closeout_not_allowed(self) -> None:
+        self.assertFalse(self.entry["closeout_allowed"])
+
+    def test_no_allowed_mutations(self) -> None:
+        self.assertEqual(self.entry["allowed_mutations"], [])
+
+    def test_description_explains_continuation_failure(self) -> None:
+        for marker in (
+            "Continuation",
+            "durable evidence",
+            "reconstruct",
+            "read-only",
+            "Do not infer readiness from memory",
+        ):
+            self.assertIn(
+                marker,
+                self.entry["description"],
+                f"description must mention '{marker}'",
+            )
+
+    def test_description_enumerates_eight_verification_steps(self) -> None:
+        for marker in (
+            "PR number and URL",
+            "head SHA",
+            "lifecycle state",
+            "completed phases",
+            "remaining permitted mutations",
+            "already-performed mutations",
+            "protected PR/worktree state",
+            "continuation",
+        ):
+            self.assertIn(
+                marker,
+                self.entry["description"],
+                f"description must mention verification step '{marker}'",
+            )
+
+    def test_evidence_required_lists_seven_items(self) -> None:
+        # The task spec lists six evidence items; the eight
+        # verification steps in the description are operator-readable
+        # guidance, not a one-to-one mapping of evidence_required
+        # tokens. The Codex P2 review found that
+        # `already_performed_mutation_summary` was missing from the
+        # evidence list and required it for the machine-readable
+        # surface to match the prose; that brings the count to
+        # seven. The eight-step operator checklist in the description
+        # remains a prose summary, not a literal one-to-one.
+        self.assertEqual(len(self.entry["evidence_required"]), 7)
+        for marker in (
+            "pr_number_and_url",
+            "current_head_sha",
+            "current_lifecycle_state",
+            "completed_phase_summary",
+            "remaining_permitted_mutation_summary",
+            "already_performed_mutation_summary",
+            "protected_pr_and_worktree_verification",
+        ):
+            self.assertIn(
+                marker,
+                self.entry["evidence_required"],
+                f"evidence_required must include '{marker}'",
+            )
+
+    def test_forbidden_mutations_use_canonical_vocabulary(self) -> None:
+        forbidden = set(self.entry["forbidden_mutations"])
+        for token in (
+            "pr_merge",
+            "thread_resolve",
+            "comment_delete",
+            "review_dismiss",
+            "force_push",
+        ):
+            self.assertIn(
+                token,
+                forbidden,
+                f"forbidden_mutations must include canonical token '{token}'",
+            )
+
+    def test_no_policy_only_tokens_in_forbidden_mutations(self) -> None:
+        # The three policy-level prohibitions (duplicate Codex ping,
+        # audit rewrite, repeated already-completed mutation) are NOT
+        # in the canonical mutation vocabulary and must not appear
+        # here as forbidden_mutations tokens; the validator would
+        # reject them.
+        forbidden = set(self.entry["forbidden_mutations"])
+        for token in (
+            "duplicate_codex_ping",
+            "audit_rewrite",
+            "repeated_already_completed_mutation",
+        ):
+            self.assertNotIn(
+                token,
+                forbidden,
+                f"forbidden_mutations must not include non-canonical token '{token}'; "
+                "document policy-level prohibitions in notes instead",
+            )
+
+    def test_notes_document_three_policy_level_prohibitions(self) -> None:
+        notes = self.entry["notes"]
+        for marker in (
+            "duplicate Codex ping",
+            "rewrite",
+            "audit row",
+            "already-completed mutation",
+            "codified 2026-06-10",
+        ):
+            self.assertIn(marker, notes, f"notes must mention '{marker}'")
+
+    def test_allowed_next_states_span_full_lifecycle(self) -> None:
+        # The operator may reconstruct any prior verified state, so
+        # the allowed_next_states list must span the full set of
+        # canonical states. Terminal and informational states are
+        # included. The Codex P2 review required the state itself
+        # to be in its own allowed_next_states (self-loop) so the
+        # operator can remain in HOLD_RESUME_CHECKPOINT_NEEDED
+        # when reconstruction still cannot determine the prior
+        # state.
+        for name in (
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
+            "NOT_RUN",
+            "HOLD_PR_CI_PENDING",
+            "HOLD_CODEX_RESPONSE_PENDING",
+            "CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED",
+            "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            "PR_MERGED_PENDING_CLOSEOUT",
+            "PR_MERGED_AND_CLOSED_OUT",
+            "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
+        ):
+            self.assertIn(
+                name,
+                self.entry["allowed_next_states"],
+                f"allowed_next_states must include '{name}' for reconstruction",
+            )
+
+    def test_allowed_next_states_are_known(self) -> None:
+        for nxt in self.entry["allowed_next_states"]:
+            self.assertIn(
+                nxt,
+                self.all_state_names,
+                f"allowed_next_states references unknown state '{nxt}'",
+            )
+
+    def test_no_conflict_between_allowed_and_forbidden_mutations(self) -> None:
+        allowed = set(self.entry["allowed_mutations"])
+        forbidden = set(self.entry["forbidden_mutations"])
+        self.assertFalse(
+            allowed & forbidden,
+            f"overlap between allowed and forbidden mutations: {allowed & forbidden}",
         )
 
 

@@ -662,6 +662,65 @@ The alias name `AUDIT_APPEND_NEEDS_OPERATOR` is a reporting
 label for the same canonical state. Use either name in operator
 prompts; the registry stores a single canonical entry.
 
+### 11.2 Resume checkpoint constraint (codified 2026-06-10)
+
+A continuation turn (a later turn that picks up an in-progress
+PR) must resume from the latest verified lifecycle state and
+must not restart broad planning, repeat completed phases, or
+repeat already-authorized mutations. The full rule is the
+canonical policy in `docs/aed_lifecycle_state_registry.md` §11.
+
+**Pre-mutation read-only verification.** Before any mutation in
+a continuation turn, the operator must verify:
+
+1. Current PR number and URL.
+2. Current head SHA (live, not stale).
+3. Current lifecycle state (durable, not from memory).
+4. Completed phases.
+5. Remaining permitted mutations.
+6. Already-performed mutations.
+7. Protected PR/worktree state.
+8. Whether the next action is a continuation, not a restart.
+
+**Stop condition.** If the state cannot be reconstructed from
+durable evidence, stop and report `HOLD_RESUME_CHECKPOINT_NEEDED`.
+Do not infer readiness from memory. Do not rerun broad
+workflows when a narrow continuation action is sufficient.
+
+**Continuation rule examples.** The full list of examples is in
+`docs/aed_lifecycle_state_registry.md` §11. The cookbook
+captures the most common ones:
+
+- `HOLD_PR_CI_PENDING` -> recheck CI only; do not re-enter
+  earlier gates.
+- `HOLD_CODEX_RESPONSE_PENDING` -> bounded poll the existing
+  ping; do not post a duplicate.
+- `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED` -> verify target
+  threads; do not merge in the same turn without explicit
+  human authorization.
+- `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` -> do not repeat
+  thread resolution; perform final pre-merge verification and
+  guarded merge only with exact human authorization.
+- `PR_MERGED_PENDING_CLOSEOUT` -> do not merge again; verify
+  merge commit, main CI, audit append, and temp-worktree
+  cleanup.
+- `PR_MERGED_AND_CLOSED_OUT` -> do not reopen or mutate;
+  report terminal closeout.
+
+**While in `HOLD_RESUME_CHECKPOINT_NEEDED`, the following are
+forbidden in addition to the canonical mutation prohibitions
+already encoded in the registry state:**
+
+- Post a duplicate Codex ping for the same head.
+- Rewrite any already-appended audit row (append-only closeout
+  rule from §11.1 governs).
+- Repeat an already-completed mutation.
+
+The canonical mutation vocabulary covers `pr_merge`,
+`thread_resolve`, `comment_delete`, `review_dismiss`, and
+`force_push`; the three policy-level prohibitions above are
+documented here for the operator's reference.
+
 ## 12. Worktree cleanup cookbook
 
 Before removing the temp worktree, verify it is clean:
@@ -740,6 +799,7 @@ A compact map from lifecycle state to the next safe command.
 | `HOLD_POST_MERGE_CI_NOT_OBSERVED` | Re-check with a fresh bounded poll. |
 | `HOLD_MAIN_HEAD_MISMATCH` | Stop. origin/main does not match the expected SHA. |
 | `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` (alias: `AUDIT_APPEND_NEEDS_OPERATOR`) | Stop. Audit script or schema usage was ambiguous, or a previously appended audit row is malformed / non-canonical / incomplete / suboptimal. Follow the append-only constraint in §11.1 and the operator decision tree in `docs/aed_lifecycle_state_registry.md` §10. |
+| `HOLD_RESUME_CHECKPOINT_NEEDED` | Stop. Continuation lacks enough durable evidence to determine the next action. Reconstruct state using read-only checks (PR number and URL, current head SHA, current lifecycle state, completed phases, remaining permitted mutations, already-performed mutations, protected PR/worktree state). Follow the resume checkpoint constraint in §11.2 and the canonical policy in `docs/aed_lifecycle_state_registry.md` §11. |
 
 ## 15. Relationship to future tools
 
