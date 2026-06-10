@@ -229,9 +229,11 @@
         "current_lifecycle_state",
         "completed_phase_summary",
         "remaining_permitted_mutation_summary",
+        "already_performed_mutation_summary",
         "protected_pr_and_worktree_verification"
       ],
       "allowed_next_states": [
+        "HOLD_RESUME_CHECKPOINT_NEEDED",
         "NOT_RUN",
         "HOLD_MAIN_HEAD_MISMATCH",
         "HOLD_HEAD_CHANGED",

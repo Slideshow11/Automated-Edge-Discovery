@@ -462,18 +462,24 @@ class RegistryResumeCheckpointStateTests(unittest.TestCase):
                 f"description must mention verification step '{marker}'",
             )
 
-    def test_evidence_required_lists_six_items(self) -> None:
+    def test_evidence_required_lists_seven_items(self) -> None:
         # The task spec lists six evidence items; the eight
         # verification steps in the description are operator-readable
         # guidance, not a one-to-one mapping of evidence_required
-        # tokens.
-        self.assertEqual(len(self.entry["evidence_required"]), 6)
+        # tokens. The Codex P2 review found that
+        # `already_performed_mutation_summary` was missing from the
+        # evidence list and required it for the machine-readable
+        # surface to match the prose; that brings the count to
+        # seven. The eight-step operator checklist in the description
+        # remains a prose summary, not a literal one-to-one.
+        self.assertEqual(len(self.entry["evidence_required"]), 7)
         for marker in (
             "pr_number_and_url",
             "current_head_sha",
             "current_lifecycle_state",
             "completed_phase_summary",
             "remaining_permitted_mutation_summary",
+            "already_performed_mutation_summary",
             "protected_pr_and_worktree_verification",
         ):
             self.assertIn(
@@ -531,8 +537,13 @@ class RegistryResumeCheckpointStateTests(unittest.TestCase):
         # The operator may reconstruct any prior verified state, so
         # the allowed_next_states list must span the full set of
         # canonical states. Terminal and informational states are
-        # included.
+        # included. The Codex P2 review required the state itself
+        # to be in its own allowed_next_states (self-loop) so the
+        # operator can remain in HOLD_RESUME_CHECKPOINT_NEEDED
+        # when reconstruction still cannot determine the prior
+        # state.
         for name in (
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
             "NOT_RUN",
             "HOLD_PR_CI_PENDING",
             "HOLD_CODEX_RESPONSE_PENDING",
