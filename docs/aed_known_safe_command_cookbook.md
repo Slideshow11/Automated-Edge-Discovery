@@ -756,10 +756,7 @@ Requirements:
 - `branch --show-current` is `main`.
 
 If any check fails, the run enters
-`HOLD_PROTECTED_STATE_CHANGED` (or, by policy, the analogous
-hold state in the operator-path vocabulary; for the v1
-operator-path vocabulary this corresponds to
-`HOLD_MAIN_HEAD_MISMATCH`) and stops. The operator must
+`HOLD_MAIN_HEAD_MISMATCH` and stops. The operator must
 reconcile the primary before continuing. Do not push, merge,
 or post a Codex ping in this state.
 

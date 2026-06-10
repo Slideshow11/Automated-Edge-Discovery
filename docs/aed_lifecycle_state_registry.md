@@ -485,7 +485,7 @@ authorization.
   every governance PR run, the operator must verify (read-only)
   that the primary worktree is clean, on the `main` branch, and
   at the expected post-closeout head. If the primary has changed
-  unexpectedly, that is a `HOLD_PROTECTED_STATE_CHANGED` signal
+  unexpectedly, that is a `HOLD_MAIN_HEAD_MISMATCH` signal
   and the run must stop.
 
 **Where governance work happens.** Every governance PR run is
@@ -563,10 +563,7 @@ Requirements:
 - `branch --show-current` is `main`.
 
 If any check fails, the run enters
-`HOLD_PROTECTED_STATE_CHANGED` (or, by policy, the analogous
-hold state in the operator path vocabulary; for the v1
-operator-path vocabulary this corresponds to
-`HOLD_MAIN_HEAD_MISMATCH`) and stops. The operator must
+`HOLD_MAIN_HEAD_MISMATCH` and stops. The operator must
 reconcile the primary before continuing. Do not push, merge,
 or post a Codex ping in this state.
 
