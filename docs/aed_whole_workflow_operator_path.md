@@ -44,7 +44,7 @@ This document is operator guidance only. It explicitly does **not**:
 - Change any script behavior, command shape, gate contract, or audit
   schema. All of those are owned by their own docs and PRs.
 - Provide a complete command cookbook. A separate cookbook is listed in
-  §8 as future work. This document gives only the safe command
+  §9 as future work. This document gives only the safe command
   *shapes* an operator needs to recognize.
 
 If anything in this document appears to conflict with a lower-level
@@ -138,7 +138,7 @@ means a task whose scope contract lists the action as in-scope.
 This section gives only the safe command *shapes* an operator needs to
 recognize in this path. A full command cookbook — including ready-to-run
 incantations for every gate, every stage, and every known failure mode —
-is listed in §8 as future work. Until that cookbook lands, operators
+is listed in §9 as future work. Until that cookbook lands, operators
 should consult the per-stage doc referenced in §3 and copy the example
 command from that doc, replacing placeholders.
 

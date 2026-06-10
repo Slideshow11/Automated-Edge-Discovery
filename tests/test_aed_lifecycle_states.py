@@ -347,6 +347,39 @@ class RegistryAuditAppendSkippedStateTests(unittest.TestCase):
             "state must remain in the canonical expected-states list",
         )
 
+    def test_operator_path_doc_section_numbers_are_consistent(self) -> None:
+        """Cross-reference regression guard (PR #398 P3 finding).
+
+        The previous version of this PR renumbered the operator-path
+        doc from 13 sections to 14 sections (added §7 for the
+        append-only rule, shifted "Lessons" to §8 and "Where next
+        work belongs" to §9) but missed two cross-references in
+        §2 and §6.5 that still pointed to the old §8 ("Where next
+        work belongs"). The §2 and §6.5 references must now point
+        to §9. The §5 authority table and the §6.5 cookbook
+        "Future cookbook (deferred)" entry point to §8, which is
+        the new "Lessons from PR #394" section — that pointer is
+        correct and must stay.
+        """
+        doc_path = REPO_ROOT / "docs" / "aed_whole_workflow_operator_path.md"
+        with doc_path.open("r", encoding="utf-8") as f:
+            text = f.read()
+        # §2 and §6.5 must point to §9 for the "future work" pointer.
+        self.assertIn(
+            "§9 as future work",
+            text,
+            "operator path §2/§6.5 'future work' pointer must reference §9 "
+            "after the PR #398 renumbering",
+        )
+        # The "see §8" pointers in the §5 authority table and the
+        # §6.5 future-cookbook list must point to §8 (Lessons from
+        # PR #394), not §9.
+        self.assertIn(
+            "(see §8)",
+            text,
+            "operator path §5/§6.5 'see §8' pointer must still reference §8",
+        )
+
 
 class RegistryMalformedListFieldTests(unittest.TestCase):
     """The validator must reject malformed list-valued fields gracefully.
