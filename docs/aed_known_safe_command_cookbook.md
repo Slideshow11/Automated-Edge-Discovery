@@ -721,6 +721,92 @@ The canonical mutation vocabulary covers `pr_merge`,
 `force_push`; the three policy-level prohibitions above are
 documented here for the operator's reference.
 
+### 11.3 Primary worktree sync constraint (codified 2026-06-10)
+
+The primary worktree at `/home/max/Automated-Edge-Discovery`
+is the source of truth for the expected protected state of
+the repo between governance PR runs. It is **not** a mirror
+of `origin/main` and is **not** updated as a side effect of
+any governance PR. The constraint is the policy surface for
+the canonical `HOLD_MAIN_HEAD_MISMATCH` state's
+`worktree_update` prohibition and is the canonical reference
+for the read-only verification pattern at PHASE 1 of every
+governance PR run.
+
+**Verification pattern (PHASE 1 of every governance PR run).**
+Before any other action in a governance PR run, the operator
+must perform the following read-only checks against the
+primary worktree and stop on any mismatch:
+
+```
+git -C /home/max/Automated-Edge-Discovery status --porcelain
+git -C /home/max/Automated-Edge-Discovery rev-parse HEAD
+git -C /home/max/Automated-Edge-Discovery branch --show-current
+```
+
+Requirements:
+
+- `status --porcelain` is empty.
+- `HEAD` equals the expected post-closeout head of the last
+  merged PR (for the run that begins after PR #399, the
+  expected primary HEAD is
+  `0a8cee5d2406c970e02e9e217c7f25b0767459e0`, which is the
+  post-closeout head of PR #394; this value is recomputed at
+  the start of every run).
+- `branch --show-current` is `main`.
+
+If any check fails, the run enters
+`HOLD_PROTECTED_STATE_CHANGED` (or, by policy, the analogous
+hold state in the operator-path vocabulary; for the v1
+operator-path vocabulary this corresponds to
+`HOLD_MAIN_HEAD_MISMATCH`) and stops. The operator must
+reconcile the primary before continuing. Do not push, merge,
+or post a Codex ping in this state.
+
+**Forbidden commands in the primary worktree during a
+governance PR run.** The following commands are forbidden in
+the primary worktree `/home/max/Automated-Edge-Discovery`
+during a governance PR run:
+
+- `git -C /home/max/Automated-Edge-Discovery pull`
+- `git -C /home/max/Automated-Edge-Discovery fetch`
+  followed by any `checkout`, `reset`, or `merge`
+- `git -C /home/max/Automated-Edge-Discovery reset`
+  (any mode)
+- `git -C /home/max/Automated-Edge-Discovery checkout`
+  to a new ref
+- `git -C /home/max/Automated-Edge-Discovery switch`
+  (any branch switch)
+- Any other write to the primary worktree's working tree or
+  index that is not a documented, scoped, human-authorized
+  action.
+
+These are encoded in the canonical
+`HOLD_MAIN_HEAD_MISMATCH` state's `forbidden_mutations` list
+as the canonical `worktree_update` token, and are restated in
+prose in this section and in `docs/aed_whole_workflow_operator_path.md`
+§9 and `docs/aed_lifecycle_state_registry.md` §13. The
+primary-worktree-update prohibition is a policy-level
+constraint, not a governance PR mutation; the canonical
+validator's `VALID_MUTATIONS` set is a vocabulary of allowed
+repository-side actions, and a primary-worktree update is
+intentionally not in that set.
+
+**When the primary may be synced.** Only with explicit human
+operator authorization delivered out-of-band from any
+governance PR run. The authorization phrase must name the
+exact target ref and the reason. A future agent must not
+infer "sync the primary" from a generic "make sure things
+are up to date" instruction.
+
+**Where governance work happens.** Every governance PR run
+is performed in a dedicated temp worktree at
+`/tmp/aed_runs/worktrees/<task-name>`, branched from
+`origin/main` at the current head. The temp worktree is the
+**mutation surface**; the primary worktree is **never** the
+mutation surface. The temp worktree is removed in the
+closeout phase; the primary is not.
+
 ## 12. Worktree cleanup cookbook
 
 Before removing the temp worktree, verify it is clean:
@@ -771,7 +857,10 @@ governance path.
 - Update, reset, and pull of the primary worktree
   (`/home/max/Automated-Edge-Discovery`) are forbidden in this
   governance path. They require separate explicit human
-  authorization.
+  authorization. The canonical `HOLD_MAIN_HEAD_MISMATCH`
+  state's `forbidden_mutations` list already includes
+  `worktree_update`; the full list of forbidden primary-
+  worktree commands is in §11.3 and the operator path §9.
 - Comment deletion is forbidden.
 - Review dismissal (`dismissReview` or equivalent) is forbidden.
 - Thread resolution without explicit human authorization in a
@@ -797,7 +886,7 @@ A compact map from lifecycle state to the next safe command.
 | `HOLD_POST_MERGE_CI_PENDING` | Re-check audit with a fresh bounded poll. |
 | `HOLD_POST_MERGE_CI_FAILED` | Investigate; consider revert; do not declare closeout. |
 | `HOLD_POST_MERGE_CI_NOT_OBSERVED` | Re-check with a fresh bounded poll. |
-| `HOLD_MAIN_HEAD_MISMATCH` | Stop. origin/main does not match the expected SHA. |
+| `HOLD_MAIN_HEAD_MISMATCH` | Stop. `origin/main` does not match the expected SHA, or the primary worktree has changed unexpectedly. Run the read-only verification pattern in §11.3 and the operator path §9; reconcile the primary before continuing. Do not push, merge, or post a Codex ping in this state. |
 | `AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR` (alias: `AUDIT_APPEND_NEEDS_OPERATOR`) | Stop. Audit script or schema usage was ambiguous, or a previously appended audit row is malformed / non-canonical / incomplete / suboptimal. Follow the append-only constraint in §11.1 and the operator decision tree in `docs/aed_lifecycle_state_registry.md` §10. |
 | `HOLD_RESUME_CHECKPOINT_NEEDED` | Stop. Continuation lacks enough durable evidence to determine the next action. Reconstruct state using read-only checks (PR number and URL, current head SHA, current lifecycle state, completed phases, remaining permitted mutations, already-performed mutations, protected PR/worktree state). Follow the resume checkpoint constraint in §11.2 and the canonical policy in `docs/aed_lifecycle_state_registry.md` §11. |
 
