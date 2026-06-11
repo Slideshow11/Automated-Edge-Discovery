@@ -466,6 +466,172 @@ Future helpers and tools that need to look up a state should:
 
 ---
 
+## 13. Primary worktree sync policy (v1, codified 2026-06-10)
+
+The AED governance workflow depends on a stable **primary worktree**
+at `/home/max/Automated-Edge-Discovery` that is intentionally left
+stale at the post-closeout head of the last merged PR. Every
+governance PR run is built in a separate, short-lived temp worktree
+based on `origin/main`; the primary worktree is read-only with
+respect to the governance path. The rule is stated here once in
+the registry vocabulary so that every consumer — the operator
+path, the command cookbook, the closeout pipeline, the protected-
+state verification pattern, and future agents — points to the same
+canonical policy.
+
+**The rule.** The primary worktree is the source of truth for the
+expected protected state of the repo between governance PR runs.
+It is **not** a mirror of `origin/main` and is **not** updated as
+a side effect of any governance PR. Updating the primary worktree
+to a new commit (via `git pull`, `git fetch && git checkout`,
+`git reset`, `git merge`, or any equivalent) requires **explicit
+human operator authorization** that names the exact target ref and
+is delivered out-of-band from the governance PR run. "Falls
+behind", "out of date", or "would be nice to align" are not
+authorization.
+
+**Why the primary is left stale.** The primary worktree is the
+"ground truth" reference that:
+
+- Holds the post-closeout head of the last merged governance PR
+  (for example, `0a8cee5d2406c970e02e9e217c7f25b0767459e0` after
+  PR #394; `91557d573d5497c64e26106f47c726e8923e0910` is the
+  post-closeout head of the most recent PR #399 merge into
+  `origin/main`, **not** the primary worktree's HEAD).
+- Holds the protected PRs (`#384`, `#386`, `#397`, `#398`, and
+  future guards) in their verified states. The closeout of a new
+  PR verifies that the guarded PRs are byte-identical to their
+  pre-run state.
+- Anchors the protected-state check pattern: at the start of
+  every governance PR run, the operator must verify (read-only)
+  that the primary worktree is clean, on the `main` branch, and
+  at the expected post-closeout head. If the primary has changed
+  unexpectedly, that is a `HOLD_MAIN_HEAD_MISMATCH` signal
+  and the run must stop.
+
+**Where governance work happens.** Every governance PR run is
+performed in a dedicated temp worktree at
+`/tmp/aed_runs/worktrees/<task-name>`, branched from `origin/main`
+at the current head. The temp worktree is the **mutation surface**.
+The primary worktree is **never** the mutation surface. The temp
+worktree is removed in the closeout phase; the primary is not.
+
+**Forbidden actions in the primary worktree during a governance
+PR run** (encoded in the canonical
+`HOLD_MAIN_HEAD_MISMATCH` state's `forbidden_mutations` list and
+restated in the operator path §5 authority table):
+
+- `git pull` in the primary worktree.
+- `git fetch` in the primary worktree followed by any checkout,
+  reset, or fast-forward.
+- `git reset` in the primary worktree (any mode: `--hard`,
+  `--soft`, `--mixed`).
+- `git checkout` to a new ref in the primary worktree.
+- Any branch switch in the primary worktree.
+- Removing, renaming, or recreating the primary worktree.
+- Any write to the primary worktree's working tree or index that
+  is not a documented, scoped, human-authorized action.
+
+The `HOLD_MAIN_HEAD_MISMATCH` state's `forbidden_mutations` list
+already includes the canonical `worktree_update` token for this
+purpose. The validator's `VALID_MUTATIONS` set is a vocabulary of
+allowed repository-side actions; the primary-worktree-update
+prohibition is encoded in prose in the operator path §5 and in
+this section because a primary-worktree update is not a
+governance PR mutation but a meta-decision about the protected
+state surface.
+
+**When the primary may be synced.** Only the following conditions
+permit a primary-worktree update, and each requires explicit
+human operator authorization delivered out-of-band from any
+governance PR run:
+
+- The operator has accepted the closeout of the most recent
+  governance PR and decides that the primary's post-closeout
+  head should be advanced to a new baseline.
+- The primary worktree is being re-anchored to a specific
+  `origin/main` SHA as part of a deliberate re-baseline
+  operation; the operator names the exact target SHA in the
+  authorization phrase.
+- The primary worktree is being retired or replaced; this is
+  not a sync but a deletion-with-replacement and is out of
+  scope for this section.
+
+In every case, the operator's authorization phrase must name
+the exact target ref and the reason. A future agent must not
+infer "sync the primary" from a generic "make sure things
+are up to date" instruction.
+
+**Verification pattern.** At the start of every governance PR
+run, the operator performs the following read-only checks against
+the primary worktree and stops on any mismatch:
+
+```
+git -C /home/max/Automated-Edge-Discovery status --porcelain
+git -C /home/max/Automated-Edge-Discovery rev-parse HEAD
+git -C /home/max/Automated-Edge-Discovery branch --show-current
+```
+
+Requirements:
+
+- `status --porcelain` is empty (no uncommitted or untracked
+  changes).
+- `HEAD` equals the expected post-closeout head of the last
+  merged PR (for the run that begins after PR #399, the
+  expected primary HEAD is `0a8cee5d2406c970e02e9e217c7f25b0767459e0`,
+  which is the post-closeout head of PR #394; this value is
+  recomputed at the start of every run).
+- `branch --show-current` is `main`.
+
+If any check fails, the run enters
+`HOLD_MAIN_HEAD_MISMATCH` and stops. The operator must
+reconcile the primary before continuing. Do not push, merge,
+or post a Codex ping in this state.
+
+**Evidence for the `HOLD_MAIN_HEAD_MISMATCH` state.** The
+machine-readable evidence contract for this state in
+`schemas/aed_lifecycle_states_v1.json` covers both surfaces
+listed above (an `origin/main` HEAD mismatch and a primary
+worktree mismatch). The full evidence list is:
+
+- `expected_head_sha` — the expected `origin/main` head for
+  the current PR run.
+- `observed_origin_main_sha` — the observed `origin/main` head
+  (read with `git -C /home/max/Automated-Edge-Discovery rev-parse origin/main`).
+- `primary_worktree_path` — the absolute path of the primary
+  worktree (`/home/max/Automated-Edge-Discovery`).
+- `primary_status_porcelain` — the output of `git -C <path>
+  status --porcelain`; must be empty.
+- `primary_branch` — the output of `git -C <path> branch
+  --show-current`; must be `main`.
+- `primary_expected_head_sha` — the expected post-closeout
+  head of the last merged PR.
+- `primary_observed_head_sha` — the output of `git -C <path>
+  rev-parse HEAD`; must equal `primary_expected_head_sha`.
+
+Helpers that follow the registry JSON must collect all of the
+above before reporting `HOLD_MAIN_HEAD_MISMATCH`, so a downstream
+consumer can distinguish an `origin/main` mismatch from a
+primary-worktree mismatch and reconcile the right surface.
+
+**Why this rule exists.** The primary-worktree-as-anchor pattern
+is what makes the protected-state check possible. If the
+primary is allowed to drift freely, the protected-state check
+loses its meaning and a misaligned primary could be silently
+treated as "the expected state" while the repo is actually in
+a different configuration. Treating the primary as a stable,
+read-only anchor between runs preserves the invariant that
+"the primary holds what the last closeout produced."
+
+**Cross-references.** The operator path §5 authority table
+restates this rule in the action/authority format; the
+command cookbook §11.3 restates the rule in command-shape
+form; the protected-state check pattern is documented in the
+PHASE 1 verification step of every governance PR task
+specification.
+
+---
+
 *This document is the v1 of the lifecycle state registry. Revisions
 should be additive where possible, with deprecation notes appended
 in the registry's `notes` field for any state that is no longer
