@@ -583,12 +583,19 @@ semantics for exact head SHA matching:
 - Runs are grouped by `workflowName` (case-sensitive exact match).
 - Within each workflow group, runs are sorted newest-first by
   `createdAt` (with `updatedAt` / `databaseId` as tiebreakers).
-- The **newest terminal** run for that workflow on the exact head is
-  the authoritative verdict.
-- Older cancelled or skipped runs for the same workflow and head are
-  not classified as failures. They appear in
-  `superseded_cancelled_runs` as audit history when a later
-  authoritative run exists.
+- The **newest run overall** for that workflow on the exact head is
+  inspected first. If that newest run is still in flight (queued,
+  in_progress, requested, waiting), the workflow is **PENDING** — an
+  older completed success on the same workflow/head must NOT shadow
+  the newer in-flight attempt. The in-flight rerun is the authoritative
+  attempt and the audit must wait for it to finish. Older terminal and
+  in-flight runs are listed in `superseded_cancelled_runs` as audit
+  history.
+- If the newest run is terminal, its conclusion becomes the
+  authoritative verdict for that workflow. Older cancelled/skipped
+  runs for the same workflow and head are not classified as failures.
+  They appear in `superseded_cancelled_runs` as audit history when a
+  later authoritative success exists.
 - A cancelled or skipped run is only a failure if it is the newest
   terminal run for that workflow and head (no later success exists).
 - A `failure`, `timed_out`, `action_required`, or `startup_failure`

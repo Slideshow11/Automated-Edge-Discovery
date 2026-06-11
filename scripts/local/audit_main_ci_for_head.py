@@ -298,48 +298,60 @@ def _run_sort_key(run: Dict[str, Any]) -> str:
 def classify_runs_for_workflows(
     target_runs: List[Dict[str, Any]],
 ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Classify target runs using newest-authoritative-per-workflow semantics.
+    """Classify target runs using newest-authoritative-per-workflow semantics
+    with **in-flight precedence**.
 
     For each workflow name in the input, the runs are sorted newest-first
-    (by createdAt, with updatedAt/databaseId as tiebreakers). The newest
-    terminal run for that workflow on the exact head is the authoritative
-    verdict. Older runs for the same workflow and head are reported as
-    superseded history when the newest terminal run is success.
+    (by createdAt, with updatedAt/databaseId as tiebreakers). The newest run
+    overall for that workflow on the exact head is inspected FIRST:
+
+    - If the newest run is in flight (queued / pending / in_progress /
+      requested / waiting), the workflow is **PENDING**. An older completed
+      success on the same workflow and head must NOT shadow the newer
+      in-flight attempt — the in-flight rerun is the authoritative attempt
+      and its outcome is not yet known.
+    - Only if the newest run is terminal is its conclusion used as the
+      authoritative verdict. Older runs (cancelled / skipped / failure /
+      success / in-flight) are then classified as superseded history when
+      the newest terminal run is success.
 
     Returns
     -------
     (status, pending_runs, failed_runs, successful_runs, superseded_cancelled_runs)
 
-    - ``successful_runs``: the newest terminal success per workflow, plus any
-      non-superseded success in the list. Older cancelled runs for the same
-      workflow and head are **not** counted as failed.
+    - ``successful_runs``: the newest terminal success per workflow, when
+      the newest run is terminal and concluded success. Older cancelled
+      runs for the same workflow and head are **not** counted as failed.
     - ``failed_runs``: terminal-failure conclusions (failure / timed_out /
       action_required / startup_failure / stale) for the newest run of a
       workflow, OR a cancelled/skipped run that is the newest terminal run
       (no later success exists).
-    - ``pending_runs``: the newest run is still in flight (queued /
-      in_progress / requested / waiting) and no later success exists.
-    - ``superseded_cancelled_runs``: older cancelled runs whose authoritative
-      verdict is a later success on the same workflow and exact head.
+    - ``pending_runs``: the newest run for a workflow is still in flight
+      (queued / in_progress / requested / waiting), regardless of whether
+      an older terminal run exists. The audit must wait for the in-flight
+      attempt to finish before declaring the workflow GREEN.
+    - ``superseded_cancelled_runs``: older runs (cancelled / skipped /
+      failure / success / in-flight) that are history relative to the
+      authoritative verdict for the same workflow and exact head.
 
     Decision rules
     --------------
     1. Group runs by ``workflowName`` (case-sensitive exact match).
     2. Within each workflow group, sort newest-first by createdAt (with
        updatedAt/databaseId tiebreakers).
-    3. Find the newest **terminal** run (status=completed) for that workflow;
-       if none, find the newest in-flight run.
-    4. Authoritative verdict = newest terminal run's conclusion.
-       - ``success`` → workflow is GREEN; older cancelled runs for that
-         workflow become ``superseded_cancelled_runs``.
-       - failure-class conclusions (failure / timed_out / action_required /
-         startup_failure / stale) → workflow is FAILED.
-       - ``cancelled`` / ``skipped`` → workflow is FAILED **only if** no
-         newer success exists for the same workflow and exact head.
-       - in-flight (queued / in_progress / requested / waiting) → workflow
-         is PENDING unless a newer success exists, in which case the
-         in-flight run is superseded by the success.
-    5. Across all required workflows: any FAILED → overall FAILED; any
+    3. Inspect ``runs_sorted[0]`` (the newest run overall) FIRST.
+       - If its status is in-flight → workflow is PENDING. Older terminal
+         runs (success / failure / cancelled / skipped) and older
+         in-flight runs are reported as superseded history. The audit
+         must NOT go green based on an older success.
+       - If its status is terminal → use its conclusion as authoritative:
+         - ``success`` → workflow is GREEN; older runs become superseded.
+         - failure-class conclusions (failure / timed_out / action_required /
+           startup_failure / stale) → workflow is FAILED.
+         - ``cancelled`` / ``skipped`` → workflow is FAILED (no later
+           terminal run exists; this is the newest terminal verdict).
+         - unknown terminal conclusion → treat as failure conservatively.
+    4. Across all required workflows: any FAILED → overall FAILED; any
        PENDING and none FAILED → overall PENDING; all GREEN → overall GREEN.
     """
     pending: List[Dict[str, Any]] = []
@@ -363,73 +375,100 @@ def classify_runs_for_workflows(
         # Sort newest-first.
         runs_sorted = sorted(runs, key=_run_sort_key, reverse=True)
 
-        # Find the newest terminal run (status=completed).
-        newest_terminal = next(
-            (r for r in runs_sorted if (r.get("status") or "").lower() == "completed"),
-            None,
-        )
+        # Inspect the NEWEST run overall (runs_sorted[0]) BEFORE accepting
+        # an older terminal verdict. This is the in-flight-precedence rule:
+        # a newer in-flight rerun is the authoritative attempt for this
+        # workflow/head, and an older completed success must NOT shadow it.
+        # Without this check, a workflow with a newer in_progress run and
+        # an older completed success would incorrectly return GREEN based
+        # on the older success while the authoritative attempt is still
+        # running. See audit_main_ci_for_head / Codex P2 finding on
+        # classify_runs_for_workflows().
+        newest = runs_sorted[0]
+        newest_status = (newest.get("status") or "").lower()
 
-        if newest_terminal is not None:
-            conclusion = (newest_terminal.get("conclusion") or "").lower()
-            if conclusion == "success":
-                # Workflow is GREEN. All older terminal runs for this workflow
-                # are reported as superseded history: cancelled/skipped and
-                # failure-class conclusions are all moved to the superseded
-                # bucket. They do not flip the verdict because the newest
-                # terminal run for the same workflow is success.
-                successful.append(newest_terminal)
-                for older in runs_sorted[1:]:
-                    older_status = (older.get("status") or "").lower()
-                    if older_status == "completed":
-                        older_conclusion = (older.get("conclusion") or "").lower()
-                        if older_conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
-                            superseded_cancelled.append(older)
-                        elif older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
-                            # Older failure-class runs are also superseded by
-                            # the newer success on the same workflow/head.
-                            # They are reported in superseded_cancelled_runs
-                            # for full audit history, but they do not block
-                            # the verdict.
-                            superseded_cancelled.append(older)
-                        # Older success: drop (newest success is authoritative)
-                # In-flight older runs are also superseded by success.
-                for older in runs_sorted[1:]:
-                    older_status = (older.get("status") or "").lower()
-                    if older_status in PENDING_STATUSES:
+        if newest_status in PENDING_STATUSES:
+            # Newest run is in flight. Classify the workflow as PENDING
+            # regardless of whether an older terminal run exists. The older
+            # runs (terminal or in-flight) are reported as superseded
+            # history so the audit reader can see what happened, but they
+            # do NOT count as authoritative.
+            pending.append(newest)
+            overall_has_pending = True
+            for older in runs_sorted[1:]:
+                older_status = (older.get("status") or "").lower()
+                if older_status == "completed":
+                    older_conclusion = (older.get("conclusion") or "").lower()
+                    if older_conclusion == "success":
+                        # Older success is superseded by the newer in-flight
+                        # attempt. Listed as history, NOT authoritative —
+                        # the audit must wait for the in-flight run to
+                        # finish before going GREEN.
                         superseded_cancelled.append(older)
-            elif conclusion in TERMINAL_FAILURE_CONCLUSIONS:
-                # Newest terminal is a real failure. Workflow is FAILED.
-                failed.append(newest_terminal)
-                overall_has_failure = True
-                # Older runs are not classified as superseded; report as history.
-                for older in runs_sorted[1:]:
-                    older_status = (older.get("status") or "").lower()
-                    if older_status == "completed":
-                        older_conclusion = (older.get("conclusion") or "").lower()
-                        if older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
-                            failed.append(older)
-            elif conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
-                # Newest terminal is cancelled/skipped. No later success exists
-                # (by construction: this is the newest terminal run). Workflow
-                # is FAILED.
-                failed.append(newest_terminal)
-                overall_has_failure = True
-            else:
-                # Unknown terminal conclusion → treat as failure conservatively.
-                failed.append(newest_terminal)
-                overall_has_failure = True
+                    elif older_conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
+                        superseded_cancelled.append(older)
+                    elif older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                        # Older failure is also superseded by the newer
+                        # in-flight attempt. Listed as history.
+                        superseded_cancelled.append(older)
+                    # Older terminal with unknown conclusion: drop (no
+                    # signal — nothing to record as superseded).
+                elif older_status in PENDING_STATUSES:
+                    # Older in-flight runs are also reported as history
+                    # when the newest run is the authoritative in-flight.
+                    superseded_cancelled.append(older)
+            # Do NOT use an older terminal run as authoritative — continue
+            # to the next workflow with overall_has_pending already set.
+            continue
+
+        # Newest run is terminal. Use its conclusion as the authoritative
+        # verdict for this workflow.
+        conclusion = (newest.get("conclusion") or "").lower()
+        if conclusion == "success":
+            # Workflow is GREEN. All older terminal runs for this workflow
+            # are reported as superseded history: cancelled/skipped and
+            # failure-class conclusions are all moved to the superseded
+            # bucket. They do not flip the verdict because the newest
+            # terminal run for the same workflow is success.
+            successful.append(newest)
+            for older in runs_sorted[1:]:
+                older_status = (older.get("status") or "").lower()
+                if older_status == "completed":
+                    older_conclusion = (older.get("conclusion") or "").lower()
+                    if older_conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
+                        superseded_cancelled.append(older)
+                    elif older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                        # Older failure-class runs are also superseded by
+                        # the newer success on the same workflow/head.
+                        # They are reported in superseded_cancelled_runs
+                        # for full audit history, but they do not block
+                        # the verdict.
+                        superseded_cancelled.append(older)
+                    # Older success: drop (newest success is authoritative)
+                elif older_status in PENDING_STATUSES:
+                    # In-flight older runs are also superseded by success.
+                    superseded_cancelled.append(older)
+        elif conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+            # Newest terminal is a real failure. Workflow is FAILED.
+            failed.append(newest)
+            overall_has_failure = True
+            # Older runs are not classified as superseded; report as history.
+            for older in runs_sorted[1:]:
+                older_status = (older.get("status") or "").lower()
+                if older_status == "completed":
+                    older_conclusion = (older.get("conclusion") or "").lower()
+                    if older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                        failed.append(older)
+        elif conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
+            # Newest terminal is cancelled/skipped. No later success exists
+            # (by construction: this is the newest terminal run). Workflow
+            # is FAILED.
+            failed.append(newest)
+            overall_has_failure = True
         else:
-            # No terminal run for this workflow. The newest run is in flight.
-            newest_in_flight = runs_sorted[0]
-            newest_in_flight_status = (newest_in_flight.get("status") or "").lower()
-            if newest_in_flight_status in PENDING_STATUSES:
-                pending.append(newest_in_flight)
-                overall_has_pending = True
-                # Older in-flight runs: not separately classified.
-            else:
-                # Unknown status: treat as pending conservatively.
-                pending.append(newest_in_flight)
-                overall_has_pending = True
+            # Unknown terminal conclusion → treat as failure conservatively.
+            failed.append(newest)
+            overall_has_failure = True
 
     if overall_has_failure:
         return STATUS_HOLD_FAILED, pending, failed, successful, superseded_cancelled
