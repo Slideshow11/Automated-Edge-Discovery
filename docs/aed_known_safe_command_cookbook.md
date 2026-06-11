@@ -760,34 +760,40 @@ If any check fails, the run enters
 reconcile the primary before continuing. Do not push, merge,
 or post a Codex ping in this state.
 
-**Forbidden commands in the primary worktree during a
-governance PR run.** The following commands are forbidden in
-the primary worktree `/home/max/Automated-Edge-Discovery`
-during a governance PR run:
+**Forbidden primary-worktree operations during a governance PR
+run.** In keeping with §2, this section does **not** list any
+copy-pasteable forbidden command lines. The following
+categories of primary-worktree operation are forbidden during a
+governance PR run, unless exact primary-sync authorization
+exists:
 
-- `git -C /home/max/Automated-Edge-Discovery pull`
-- `git -C /home/max/Automated-Edge-Discovery fetch`
-  followed by any `checkout`, `reset`, or `merge`
-- `git -C /home/max/Automated-Edge-Discovery reset`
-  (any mode)
-- `git -C /home/max/Automated-Edge-Discovery checkout`
-  to a new ref
-- `git -C /home/max/Automated-Edge-Discovery switch`
-  (any branch switch)
+- Pulling from a remote in the primary worktree is forbidden
+  unless exact primary-sync authorization exists.
+- Fetching followed by any checkout, reset, or merge in the
+  primary worktree is forbidden unless exact primary-sync
+  authorization exists.
+- Resetting the primary worktree (in any mode) is forbidden
+  unless exact primary-sync authorization exists.
+- Checking out a new ref in the primary worktree is forbidden
+  unless exact primary-sync authorization exists.
+- Switching branches in the primary worktree is forbidden
+  unless exact primary-sync authorization exists.
 - Any other write to the primary worktree's working tree or
   index that is not a documented, scoped, human-authorized
-  action.
+  action is forbidden.
 
-These are encoded in the canonical
+These prohibitions are encoded in the canonical
 `HOLD_MAIN_HEAD_MISMATCH` state's `forbidden_mutations` list
 as the canonical `worktree_update` token, and are restated in
-prose in this section and in `docs/aed_whole_workflow_operator_path.md`
-§9 and `docs/aed_lifecycle_state_registry.md` §13. The
-primary-worktree-update prohibition is a policy-level
-constraint, not a governance PR mutation; the canonical
-validator's `VALID_MUTATIONS` set is a vocabulary of allowed
-repository-side actions, and a primary-worktree update is
-intentionally not in that set.
+prose in this section, in `docs/aed_whole_workflow_operator_path.md`
+§9, and in `docs/aed_lifecycle_state_registry.md` §13. The
+full prose-only forbidden-pattern list for the governance path
+is in §13 of this cookbook; the canonical `worktree_update`
+token references that list. The primary-worktree-update
+prohibition is a policy-level constraint, not a governance PR
+mutation; the canonical validator's `VALID_MUTATIONS` set is a
+vocabulary of allowed repository-side actions, and a
+primary-worktree update is intentionally not in that set.
 
 **When the primary may be synced.** Only with explicit human
 operator authorization delivered out-of-band from any
