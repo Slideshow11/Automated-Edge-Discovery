@@ -41,9 +41,13 @@ HEAD = "deadbeef" * 5  # 40 chars: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 HEAD_OTHER = "abcd1234" * 5  # 40 chars different
 
 
-def make_run(workflow: str, status: str, conclusion: str, head_sha: str = HEAD) -> Dict[str, Any]:
+def make_run(workflow: str, status: str, conclusion: str, head_sha: str = HEAD,
+             created_at: str = "2026-06-01T22:00:00Z",
+             updated_at: str = "2026-06-01T22:05:00Z",
+             database_id: int | None = None) -> Dict[str, Any]:
+    dbid = database_id if database_id is not None else (1000000 + hash(workflow) % 1000000)
     return {
-        "databaseId": 1000000 + hash(workflow) % 1000000,
+        "databaseId": dbid,
         "name": workflow,
         "workflowName": workflow,
         "status": status,
@@ -51,9 +55,9 @@ def make_run(workflow: str, status: str, conclusion: str, head_sha: str = HEAD) 
         "headSha": head_sha,
         "headBranch": "main",
         "event": "push",
-        "createdAt": "2026-06-01T22:00:00Z",
-        "updatedAt": "2026-06-01T22:05:00Z",
-        "url": f"https://github.com/{REPO}/actions/runs/{hash(workflow) % 1000000}",
+        "createdAt": created_at,
+        "updatedAt": updated_at,
+        "url": f"https://github.com/{REPO}/actions/runs/{dbid}",
         "displayTitle": f"push to main: {workflow}",
     }
 
@@ -782,3 +786,1065 @@ def test_render_markdown_includes_status():
     assert "MAIN_CI_AUDIT_GREEN" in md
     assert "Commands run" in md
     assert HEAD in md
+
+
+# ---------------------------------------------------------------------------
+# Superseded / cancelled run handling (newest-authoritative-per-workflow)
+# ---------------------------------------------------------------------------
+
+
+def test_classify_runs_for_workflows_older_cancelled_then_newer_success(tmp_path, monkeypatch):
+    """Newest-authoritative semantics: a workflow with an older cancelled run
+    and a newer success on the same exact head must be GREEN; the older
+    cancelled run must appear in superseded_cancelled_runs (not failed_runs).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    # CI: older cancelled, newer success.
+    runs = [
+        make_run("CI", "completed", "cancelled", created_at="2026-06-01T22:00:00Z",
+                 database_id=1001),
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=1002),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2001),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_GREEN
+    # The newer success per workflow shows up in successful_runs.
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert successful_dbs == [1002, 2001]
+    # The older cancelled run for CI shows up in superseded_cancelled_runs.
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert superseded_dbs == [1001]
+    # The cancelled run is NOT in failed_runs.
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert failed_dbs == []
+    # Summary count for superseded_cancelled is 1.
+    assert packet["summary"]["superseded_cancelled"] == 1
+    # The markdown report contains a "Superseded cancelled runs" section.
+    md = Path(md_out).read_text()
+    assert "## Superseded cancelled runs" in md
+    assert "1001" in md
+
+
+def test_classify_runs_for_workflows_older_failure_then_newer_success(tmp_path, monkeypatch):
+    """An older failure followed by a newer success on the same workflow
+    and head is GREEN at the workflow level (newest success is authoritative).
+    The older failure is reported as superseded history (not in failed_runs).
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        make_run("CI", "completed", "failure", created_at="2026-06-01T22:00:00Z",
+                 database_id=1101),
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=1102),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2101),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # Newest success wins → GREEN overall.
+    assert packet["status"] == mod.STATUS_GREEN
+    # Successful_runs: newest success per workflow.
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert successful_dbs == [1102, 2101]
+    # failed_runs is empty: the older failure is superseded by the newer
+    # success on the same workflow/head and is reported as history only.
+    assert packet["failed_runs"] == []
+    # The older failure appears in superseded_cancelled_runs.
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert superseded_dbs == [1101]
+
+
+def test_classify_runs_for_workflows_newest_cancelled_no_later_success(tmp_path, monkeypatch):
+    """If the newest terminal run is cancelled and no later success exists for
+    the same workflow and head, the workflow is FAILED (and overall is FAILED).
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # CI: only a cancelled run exists (the newest is cancelled).
+        make_run("CI", "completed", "cancelled", created_at="2026-06-01T22:10:00Z",
+                 database_id=1201),
+        # Edge Discovery: success.
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2201),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_HOLD_FAILED
+    # The newest terminal run for CI is cancelled → it is in failed_runs
+    # (not in superseded_cancelled).
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert 1201 in failed_dbs
+    # No superseded runs (no success exists for CI to supersede the cancelled).
+    assert packet["superseded_cancelled_runs"] == []
+
+
+def test_classify_runs_for_workflows_newest_in_progress_no_terminal_success(tmp_path, monkeypatch):
+    """If the newest run is in_progress and no later success exists for the
+    same workflow and head, the workflow is PENDING.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        make_run("CI", "in_progress", "", created_at="2026-06-01T22:10:00Z",
+                 database_id=1301),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2301),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # CI is in-flight, Edge Discovery is success → overall PENDING.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 1301 in pending_dbs
+
+
+def test_classify_runs_for_workflows_older_in_progress_then_newer_success(tmp_path, monkeypatch):
+    """An older in_progress run that gets superseded by a newer success for
+    the same workflow and head must not be in pending_runs; the success wins.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        make_run("CI", "in_progress", "", created_at="2026-06-01T22:00:00Z",
+                 database_id=1401),
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=1402),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2401),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_GREEN
+    # pending_runs is empty (the in_progress was superseded by the success).
+    assert packet["pending_runs"] == []
+    # The older in_progress run is reported in superseded_cancelled_runs
+    # (it is now history relative to the success).
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 1401 in superseded_dbs
+    # The newer success is in successful_runs.
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 1402 in successful_dbs
+
+
+def test_classify_runs_for_workflows_wrong_head_success_does_not_satisfy(tmp_path, monkeypatch):
+    """Runs for a different head SHA must not satisfy the exact-head audit.
+    The filter_runs_for_head step in audit() already enforces this; here we
+    verify the classifier alone does the right thing if a wrong-head run
+    is mistakenly passed in (it should be classified on its own head, not
+    mixed with right-head runs in a way that flips verdicts).
+
+    For this test we exercise the public `audit()` end-to-end with mixed
+    head SHAs and assert the right-head runs are the only ones considered.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # Wrong head: success should be ignored.
+        make_run("CI", "completed", "success", head_sha=HEAD_OTHER,
+                 created_at="2026-06-01T22:10:00Z", database_id=1501),
+        # Right head: cancelled CI + success for the other workflow.
+        make_run("CI", "completed", "cancelled",
+                 created_at="2026-06-01T22:00:00Z", database_id=1502),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2501),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The wrong-head success (1501) is filtered out; only right-head runs
+    # (1502 cancelled, 2501 success) are considered.
+    all_dbs = sorted(r["databaseId"] for r in packet["runs_for_head"])
+    assert 1501 not in all_dbs
+    assert 1502 in all_dbs
+    assert 2501 in all_dbs
+    # The only success on the right head is Edge Discovery. CI on the right
+    # head is cancelled with no later success → CI is failed, overall is
+    # HOLD_FAILED.
+    assert packet["status"] == mod.STATUS_HOLD_FAILED
+
+
+def test_classify_runs_for_workflows_multiple_workflows_all_need_success(tmp_path, monkeypatch):
+    """Multiple workflows: every required workflow must have an authoritative
+    success for the overall verdict to be GREEN.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # CI: success.
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=1601),
+        # Edge Discovery: success.
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2601),
+        # WFA: success.
+        make_run("WFA", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=3601),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--required-workflow", "Edge Discovery audit tests",
+            "--required-workflow", "WFA",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_GREEN
+    assert packet["missing_required_workflows"] == []
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert successful_dbs == [1601, 2601, 3601]
+
+
+def test_classify_runs_for_workflows_mixed_cancelled_and_skipped_in_history(tmp_path, monkeypatch):
+    """Older cancelled AND skipped runs for the same workflow are both
+    captured in superseded_cancelled_runs when a newer success exists.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        make_run("CI", "completed", "cancelled", created_at="2026-06-01T22:00:00Z",
+                 database_id=1701),
+        make_run("CI", "completed", "skipped", created_at="2026-06-01T22:05:00Z",
+                 database_id=1702),
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:10:00Z",
+                 database_id=1703),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2701),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_GREEN
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    # Both older cancelled (1701) and older skipped (1702) are superseded
+    # by the newer success (1703).
+    assert superseded_dbs == [1701, 1702]
+    # Successful_runs: only the newer success per workflow.
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert successful_dbs == [1703, 2701]
+
+
+# ---------------------------------------------------------------------------
+# In-flight precedence: newer in-flight run must NOT be shadowed by an
+# older completed success on the same workflow/head.
+# ---------------------------------------------------------------------------
+
+
+def test_classify_runs_for_workflows_newer_in_progress_older_success_is_pending(tmp_path, monkeypatch):
+    """The exact Codex regression: a workflow with a newer in_progress run
+    and an older completed success on the same exact head must be PENDING,
+    not GREEN. The older success must be reported in superseded_cancelled
+    so the audit reader can see what happened, but it must NOT count as
+    authoritative while the in-flight attempt is still running.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+
+    runs = [
+        # CI: older completed success, then a newer in_progress rerun
+        # (e.g., a re-trigger created after the original successful run).
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:00:00Z",
+                 database_id=1801),
+        make_run("CI", "in_progress", "", created_at="2026-06-01T22:10:00Z",
+                 database_id=1802),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=2801),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The newer in_progress run makes the audit PENDING — NOT GREEN.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    # The CI in-flight run is in pending_runs.
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 1802 in pending_dbs
+    # The CI older success is in superseded_cancelled_runs, NOT successful_runs.
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 1801 in superseded_dbs
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 1801 not in successful_dbs
+    # The Edge Discovery success is the only authoritative success.
+    assert successful_dbs == [2801]
+    # Polling should have been used (PENDING keeps the audit polling until
+    # exhaustion); the in-flight CI run is still pending at the final poll.
+    assert packet["polls_used"] == 3
+    # The markdown report makes the supersession visible.
+    md = Path(md_out).read_text()
+    assert "## Superseded cancelled runs" in md
+    assert "1801" in md
+
+
+def test_classify_runs_for_workflows_newer_queued_older_success_is_pending(tmp_path, monkeypatch):
+    """In-flight precedence also covers the other in-flight statuses:
+    queued, requested, waiting. An older completed success must NOT shadow
+    a newer queued rerun on the same workflow/head.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    for in_flight_status in ("queued", "requested", "waiting"):
+        runs = [
+            make_run("CI", "completed", "success",
+                     created_at="2026-06-01T22:00:00Z", database_id=1901),
+            make_run("CI", in_flight_status, "",
+                     created_at="2026-06-01T22:10:00Z", database_id=1902),
+            make_run("Edge Discovery audit tests", "completed", "success",
+                     created_at="2026-06-01T22:10:00Z", database_id=2901),
+        ]
+
+        def make_mock(_runs):
+            def _mock(_args):
+                return _runs
+            return _mock
+
+        # Use a per-status fresh tmp dir; the function is called via main().
+        from pathlib import Path as _P
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            json_out = str(_P(td) / "audit.json")
+            md_out = str(_P(td) / "audit.md")
+            monkeypatch.setattr(mod, "run_gh_run_list", make_mock(runs))
+            rc = mod.main(
+                [
+                    "--repo", REPO,
+                    "--head-sha", HEAD,
+                    "--branch", "main",
+                    "--max-polls", "1",
+                    "--poll-seconds", "5",
+                    "--output-json", json_out,
+                    "--output-md", md_out,
+                ]
+            )
+            assert rc == 0, f"main() returned {rc} for in_flight_status={in_flight_status}"
+            packet = json.loads(Path(json_out).read_text())
+            assert packet["status"] == mod.STATUS_HOLD_PENDING, (
+                f"newer {in_flight_status!r} run + older success must be PENDING, "
+                f"got {packet['status']!r}"
+            )
+            pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+            assert 1902 in pending_dbs, (
+                f"newer {in_flight_status!r} run must be in pending_runs"
+            )
+            successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+            assert 1901 not in successful_dbs, (
+                f"older success must NOT be in successful_runs when newer "
+                f"{in_flight_status!r} run exists on the same workflow/head"
+            )
+
+
+def test_classify_runs_for_workflows_newest_failure_older_success_is_failed(tmp_path, monkeypatch):
+    """When the newest terminal run for a workflow is a failure and an
+    older success exists on the same workflow/head, the verdict is
+    FAILED. The newer failure is the authoritative verdict — the older
+    success is dropped from the report (it is history, but the newest
+    failure is what blocks the workflow).
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # CI: older success, then a newer failure.
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:00:00Z",
+                 database_id=2001),
+        make_run("CI", "completed", "failure", created_at="2026-06-01T22:10:00Z",
+                 database_id=2002),
+        # Edge Discovery: success.
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=3001),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The newest CI terminal is failure → overall FAILED.
+    assert packet["status"] == mod.STATUS_HOLD_FAILED
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert 2002 in failed_dbs
+    # The older success is NOT in successful_runs (newest failure is
+    # authoritative, not the older success).
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 2001 not in successful_dbs
+    # Only Edge Discovery is in successful_runs.
+    assert successful_dbs == [3001]
+
+
+def test_classify_runs_for_workflows_one_workflow_pending_keeps_overall_pending(tmp_path, monkeypatch):
+    """Multiple workflows: if one workflow has a newer in-flight run and
+    an older completed success, the in-flight precedence rule applies to
+    THAT workflow and the overall audit must remain PENDING — even if
+    every other workflow has an authoritative success. The green workflows
+    do not pull the audit out of PENDING.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # CI: older completed success, then a newer in_progress rerun
+        # (the in-flight precedence trigger).
+        make_run("CI", "completed", "success", created_at="2026-06-01T22:00:00Z",
+                 database_id=2101),
+        make_run("CI", "in_progress", "", created_at="2026-06-01T22:10:00Z",
+                 database_id=2102),
+        # Edge Discovery: success (would be GREEN on its own).
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=3101),
+        # WFA: success (would be GREEN on its own).
+        make_run("WFA", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=4101),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--required-workflow", "CI",
+            "--required-workflow", "Edge Discovery audit tests",
+            "--required-workflow", "WFA",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # CI's in-flight precedence keeps the whole audit PENDING.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    # CI in-flight is in pending_runs.
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 2102 in pending_dbs
+    # The CI older success is in superseded_cancelled (history only).
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2101 in superseded_dbs
+    # Edge Discovery and WFA are still in successful_runs — they are green
+    # at the workflow level, but the overall audit is held on CI's in-flight.
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 3101 in successful_dbs
+    assert 4101 in successful_dbs
+    # No failure introduced.
+    assert packet["failed_runs"] == []
+
+
+def test_classify_runs_for_workflows_newer_in_progress_older_failure_is_pending(tmp_path, monkeypatch):
+    """When a workflow has a newer in-flight run and an older completed
+    failure (not success), the verdict is still PENDING — the in-flight
+    attempt is the authoritative rerun and may turn the workflow green.
+    The older failure is reported as superseded history, not as a
+    blocking failure.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    runs = [
+        # CI: older failure, then a newer in_progress rerun.
+        make_run("CI", "completed", "failure", created_at="2026-06-01T22:00:00Z",
+                 database_id=2201),
+        make_run("CI", "in_progress", "", created_at="2026-06-01T22:10:00Z",
+                 database_id=2202),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=3201),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The newer in-flight run is the authoritative attempt → PENDING.
+    # The older failure is NOT a blocking failure while the rerun is
+    # still running.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 2202 in pending_dbs
+    # The older failure is reported as superseded history, NOT failed_runs.
+    assert packet["failed_runs"] == []
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2201 in superseded_dbs
+
+
+# ---------------------------------------------------------------------------
+# Run-sort tie-breakers: createdAt ties must be broken by updatedAt, then
+# databaseId, so same-second GitHub Actions attempts are classified
+# deterministically.
+# ---------------------------------------------------------------------------
+
+
+def test_run_sort_key_returns_full_tuple():
+    """_run_sort_key must return a 3-tuple of (createdAt, updatedAt, dbid)
+    so sorted() with reverse=True applies all documented tie-breakers.
+    The old implementation returned only the first non-empty field as a
+    string, which short-circuited the tie-breakers.
+    """
+    run_a = make_run(
+        "CI", "in_progress", "",
+        created_at="2026-06-01T22:00:00Z",
+        updated_at="2026-06-01T22:00:30Z",
+        database_id=1001,
+    )
+    run_b = make_run(
+        "CI", "completed", "success",
+        created_at="2026-06-01T22:00:00Z",  # SAME createdAt as run_a
+        updated_at="2026-06-01T22:00:30Z",  # SAME updatedAt as run_a
+        database_id=1002,
+    )
+    key_a = mod._run_sort_key(run_a)
+    key_b = mod._run_sort_key(run_b)
+    # Both keys must be 3-tuples, not strings.
+    assert isinstance(key_a, tuple)
+    assert isinstance(key_b, tuple)
+    assert len(key_a) == 3
+    assert len(key_b) == 3
+    # With all three tie-breakers applied, run_b (higher dbid) sorts as
+    # newer under reverse=True.
+    assert key_b > key_a
+
+
+def test_run_sort_key_updatedAt_tiebreak_when_createdAt_equal(tmp_path, monkeypatch):
+    """Codex P2 (thread PRRT_kwDOSHFpYM6IsHw6, dbid 3393198896): two
+    attempts with the SAME createdAt but different updatedAt must sort
+    with the more-recently-updated attempt first. Without updatedAt as a
+    tie-breaker, the sort falls back to whatever order gh run list
+    returned, and an older cancelled/failure attempt can be selected as
+    authoritative ahead of a later successful attempt on the same exact
+    head.
+
+    Setup: two CI runs with the SAME createdAt.
+      - older: cancelled, older updatedAt, lower databaseId
+      - newer: success,   newer updatedAt, higher databaseId
+    Expected: GREEN. The newer success wins on updatedAt (and databaseId).
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    same_created = "2026-06-01T22:00:00Z"
+    runs = [
+        # Older attempt: cancelled, with an older updatedAt.
+        make_run(
+            "CI", "completed", "cancelled",
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:10Z",
+            database_id=2001,
+        ),
+        # Newer attempt: success, with a more recent updatedAt.
+        make_run(
+            "CI", "completed", "success",
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:50Z",
+            database_id=2002,
+        ),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=3001),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The newer success wins on updatedAt tie-breaker → GREEN, NOT FAILED.
+    assert packet["status"] == mod.STATUS_GREEN, (
+        f"newer success with later updatedAt must beat older cancelled "
+        f"on the same createdAt — got {packet['status']!r}"
+    )
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 2002 in successful_dbs
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert 2001 not in failed_dbs
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2001 in superseded_dbs
+
+
+def test_run_sort_key_updatedAt_tiebreak_pending_over_older_success(tmp_path, monkeypatch):
+    """Codex P2 (thread PRRT_kwDOSHFpYM6IyZiR, dbid 3395447760): an
+    older completed success on the same createdAt must NOT shadow a
+    newer in-flight rerun that has a later updatedAt. The in-flight
+    rerun is the authoritative attempt and the audit must be PENDING.
+
+    Setup: two CI runs with the SAME createdAt.
+      - older: completed success, older updatedAt, lower databaseId
+      - newer: in_progress,     newer updatedAt, higher databaseId
+    Expected: HOLD_MAIN_CI_PENDING. The older success is superseded
+    history and must NOT be authoritative.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    same_created = "2026-06-01T22:00:00Z"
+    runs = [
+        # Older attempt: completed success with an older updatedAt.
+        make_run(
+            "CI", "completed", "success",
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:10Z",
+            database_id=2101,
+        ),
+        # Newer attempt: in-flight with a more recent updatedAt.
+        make_run(
+            "CI", "in_progress", "",
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:50Z",
+            database_id=2102,
+        ),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=3101),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The newer in-flight attempt with later updatedAt wins → PENDING,
+    # NOT GREEN. The older success is superseded history only.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING, (
+        f"newer in-flight rerun with later updatedAt must beat older "
+        f"completed success on the same createdAt — got {packet['status']!r}"
+    )
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 2102 in pending_dbs
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 2101 not in successful_dbs
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2101 in superseded_dbs
+
+
+def test_run_sort_key_databaseId_tiebreak_when_timestamps_equal(tmp_path, monkeypatch):
+    """When both createdAt and updatedAt tie, the higher databaseId must
+    win as the final tie-breaker. This is the case GitHub's same-second
+    re-trigger produces: the rerun is the same workflow, started and
+    updated in the same second, but the new run has a higher databaseId.
+
+    Setup: two CI runs with the SAME createdAt AND SAME updatedAt.
+      - older: completed failure, lower databaseId
+      - newer: completed success, higher databaseId
+    Expected: GREEN. The higher databaseId wins.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    same_created = "2026-06-01T22:00:00Z"
+    same_updated = "2026-06-01T22:00:30Z"
+    runs = [
+        # Older attempt: failure with the lower databaseId.
+        make_run(
+            "CI", "completed", "failure",
+            created_at=same_created,
+            updated_at=same_updated,
+            database_id=2201,
+        ),
+        # Newer attempt: success with the higher databaseId.
+        make_run(
+            "CI", "completed", "success",
+            created_at=same_created,
+            updated_at=same_updated,
+            database_id=2202,
+        ),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=3201),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The higher databaseId wins on the final tie-breaker → GREEN.
+    assert packet["status"] == mod.STATUS_GREEN, (
+        f"higher databaseId success must beat lower databaseId failure "
+        f"on the same timestamps — got {packet['status']!r}"
+    )
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 2202 in successful_dbs
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert 2201 not in failed_dbs
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2201 in superseded_dbs
+
+
+def test_run_sort_key_databaseId_tiebreak_pending_over_older_success(tmp_path, monkeypatch):
+    """When both createdAt and updatedAt tie, the higher databaseId still
+    wins even when the older run is a completed success. A higher-id
+    in-flight rerun is the authoritative attempt and the audit must be
+    PENDING — the older completed success must NOT shadow it.
+
+    Setup: two CI runs with the SAME createdAt AND SAME updatedAt.
+      - older: completed success, lower databaseId
+      - newer: in_progress,     higher databaseId
+    Expected: HOLD_MAIN_CI_PENDING. The older success is superseded
+    history only.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    same_created = "2026-06-01T22:00:00Z"
+    same_updated = "2026-06-01T22:00:30Z"
+    runs = [
+        # Older attempt: completed success with the lower databaseId.
+        make_run(
+            "CI", "completed", "success",
+            created_at=same_created,
+            updated_at=same_updated,
+            database_id=2301,
+        ),
+        # Newer attempt: in-flight with the higher databaseId.
+        make_run(
+            "CI", "in_progress", "",
+            created_at=same_created,
+            updated_at=same_updated,
+            database_id=2302,
+        ),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=3301),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The higher databaseId wins on the final tie-breaker → PENDING,
+    # NOT GREEN. The older success is superseded history only.
+    assert packet["status"] == mod.STATUS_HOLD_PENDING, (
+        f"higher databaseId in-flight rerun must beat lower databaseId "
+        f"completed success on the same timestamps — got {packet['status']!r}"
+    )
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 2302 in pending_dbs
+    successful_dbs = sorted(r["databaseId"] for r in packet["successful_runs"])
+    assert 2301 not in successful_dbs
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2301 in superseded_dbs
+
+
+def test_run_sort_key_does_not_rely_on_gh_returned_order():
+    """The classifier must produce the same result regardless of the
+    input list order from gh run list. The OLD _run_sort_key returned
+    identical strings for same-createdAt runs, so sorted() preserved
+    the input order — meaning whichever row gh run list returned first
+    became runs_sorted[0]. The NEW tuple key makes the sort order a
+    pure function of (createdAt, updatedAt, dbid), not input order.
+    """
+    same_created = "2026-06-01T22:00:00Z"
+    older_attempt = make_run(
+        "CI", "completed", "cancelled",
+        created_at=same_created,
+        updated_at="2026-06-01T22:00:10Z",
+        database_id=2401,
+    )
+    newer_attempt = make_run(
+        "CI", "completed", "success",
+        created_at=same_created,
+        updated_at="2026-06-01T22:00:50Z",
+        database_id=2402,
+    )
+    # Build two orderings: the GH list might return them in either order.
+    runs_a = [older_attempt, newer_attempt]
+    runs_b = [newer_attempt, older_attempt]
+    sorted_a = sorted(runs_a, key=mod._run_sort_key, reverse=True)
+    sorted_b = sorted(runs_b, key=mod._run_sort_key, reverse=True)
+    # In both orderings, runs_sorted[0] must be the newer attempt
+    # (the success), because updatedAt breaks the createdAt tie.
+    assert sorted_a[0]["databaseId"] == 2402
+    assert sorted_b[0]["databaseId"] == 2402
+    # And runs_sorted[1] must be the older attempt.
+    assert sorted_a[1]["databaseId"] == 2401
+    assert sorted_b[1]["databaseId"] == 2401
+
+
+def test_run_sort_key_existing_in_flight_precedence_test_still_passes(tmp_path, monkeypatch):
+    """The existing newer-in-flight precedence test (added in the prior
+    turn) must still pass with the new tuple-based sort key. This is a
+    regression-on-regression guard: the new sort key must not break the
+    already-fixed in-flight precedence behavior.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    # Use DIFFERENT createdAt values so the createdAt primary key decides
+    # the order (updatedAt tie-breaker is not exercised here).
+    runs = [
+        make_run("CI", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=2501),
+        make_run("CI", "in_progress", "",
+                 created_at="2026-06-01T22:10:00Z", database_id=2502),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:10:00Z", database_id=3501),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    assert packet["status"] == mod.STATUS_HOLD_PENDING
+    pending_dbs = sorted(r["databaseId"] for r in packet["pending_runs"])
+    assert 2502 in pending_dbs
+    superseded_dbs = sorted(r["databaseId"] for r in packet["superseded_cancelled_runs"])
+    assert 2501 in superseded_dbs
+
+
+def test_run_sort_key_different_head_does_not_satisfy_audit(tmp_path, monkeypatch):
+    """Even with the new tuple-based sort key, runs for a different head
+    SHA must not satisfy the exact-head audit. The classifier groups by
+    workflow name, but the upstream filter_runs_for_head() in audit()
+    already filters to the exact head. This test exercises the public
+    audit() flow end-to-end with a wrong-head rerun that has a higher
+    databaseId and a later updatedAt, and confirms it is filtered out.
+    """
+    monkeypatch.setattr("time.sleep", FakeSleep())
+
+    same_created = "2026-06-01T22:00:00Z"
+    runs = [
+        # Wrong head: success with a later updatedAt and higher databaseId.
+        # If this were not filtered, the classifier would prefer it.
+        make_run(
+            "CI", "completed", "success",
+            head_sha=HEAD_OTHER,
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:50Z",
+            database_id=2601,
+        ),
+        # Right head: cancelled.
+        make_run(
+            "CI", "completed", "cancelled",
+            created_at=same_created,
+            updated_at="2026-06-01T22:00:10Z",
+            database_id=2602,
+        ),
+        make_run("Edge Discovery audit tests", "completed", "success",
+                 created_at="2026-06-01T22:00:00Z", database_id=3601),
+    ]
+    monkeypatch.setattr(mod, "run_gh_run_list", lambda args: runs)
+
+    json_out = str(tmp_path / "audit.json")
+    md_out = str(tmp_path / "audit.md")
+    rc = mod.main(
+        [
+            "--repo", REPO,
+            "--head-sha", HEAD,
+            "--branch", "main",
+            "--max-polls", "3",
+            "--poll-seconds", "5",
+            "--output-json", json_out,
+            "--output-md", md_out,
+        ]
+    )
+    assert rc == 0
+    packet = json.loads(Path(json_out).read_text())
+    # The wrong-head success (2601) is filtered out by filter_runs_for_head.
+    runs_for_head_dbs = sorted(r["databaseId"] for r in packet["runs_for_head"])
+    assert 2601 not in runs_for_head_dbs
+    assert 2602 in runs_for_head_dbs
+    # On the right head, CI is the newest terminal and is cancelled → FAILED.
+    assert packet["status"] == mod.STATUS_HOLD_FAILED
+    failed_dbs = sorted(r["databaseId"] for r in packet["failed_runs"])
+    assert 2602 in failed_dbs

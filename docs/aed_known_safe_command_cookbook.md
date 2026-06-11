@@ -571,6 +571,45 @@ Map to operator-path lifecycle states (per
 - `HOLD_MAIN_CI_MISSING_REQUIRED_WORKFLOW` and
   `HOLD_MAIN_CI_NO_RUNS_FOR_HEAD` → `HOLD_POST_MERGE_CI_NOT_OBSERVED`.
 
+### 10.1 Superseded and cancelled runs policy
+
+GitHub Actions re-triggers a workflow when its source files change
+after a push, or when an upstream event re-fires. Each re-trigger
+produces a new workflow run; the prior run is marked
+`cancelled` (or `skipped`) but its databaseId remains visible for the
+same head SHA. The audit tool uses **newest-authoritative-per-workflow**
+semantics for exact head SHA matching:
+
+- Runs are grouped by `workflowName` (case-sensitive exact match).
+- Within each workflow group, runs are sorted newest-first by
+  `createdAt` (with `updatedAt` / `databaseId` as tiebreakers).
+- The **newest run overall** for that workflow on the exact head is
+  inspected first. If that newest run is still in flight (queued,
+  in_progress, requested, waiting), the workflow is **PENDING** — an
+  older completed success on the same workflow/head must NOT shadow
+  the newer in-flight attempt. The in-flight rerun is the authoritative
+  attempt and the audit must wait for it to finish. Older terminal and
+  in-flight runs are listed in `superseded_cancelled_runs` as audit
+  history.
+- If the newest run is terminal, its conclusion becomes the
+  authoritative verdict for that workflow. Older cancelled/skipped
+  runs for the same workflow and head are not classified as failures.
+  They appear in `superseded_cancelled_runs` as audit history when a
+  later authoritative success exists.
+- A cancelled or skipped run is only a failure if it is the newest
+  terminal run for that workflow and head (no later success exists).
+- A `failure`, `timed_out`, `action_required`, or `startup_failure`
+  conclusion is always a failure when it is the newest terminal
+  verdict for a workflow, even if an older success exists.
+
+This policy means a re-triggered workflow that produced
+`conclusion=cancelled` for the first attempt and `conclusion=success`
+for the re-trigger on the same exact head is reported as GREEN; the
+older cancelled run is listed in `superseded_cancelled_runs` and
+appears in the markdown report under the "Superseded cancelled
+runs" section. Inspect that section to confirm the supersession
+chain if the audit report is unexpected.
+
 ## 11. Audit append cookbook
 
 The repo-standard audit appender is
