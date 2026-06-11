@@ -439,7 +439,7 @@ evidence to know what to do next." A future consumer that
 inspects the registry for the operator's current hold will
 find exactly one entry that matches that condition.
 
-**Reference.** `docs/aed_lifecycle_state_registry.md` §8
+**Reference.** `docs/aed_whole_workflow_operator_path.md` §8
 (new), `docs/aed_known_safe_command_cookbook.md` §11.2 (new),
 and the cross-references in those documents.
 
