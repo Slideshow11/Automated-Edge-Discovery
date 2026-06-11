@@ -53,6 +53,15 @@ STATUS_HOLD_NO_RUNS = "HOLD_MAIN_CI_NO_RUNS_FOR_HEAD"
 STATUS_ERROR_INVALID_ARGS = "ERROR_INVALID_ARGS"
 STATUS_ERROR_TOOL_FAILURE = "ERROR_TOOL_FAILURE"
 
+# Workflow-run conclusions that mean "terminal failure" (not superseded, not pending)
+TERMINAL_FAILURE_CONCLUSIONS = frozenset(
+    {"failure", "timed_out", "action_required", "startup_failure", "stale"}
+)
+
+# Workflow-run conclusions that mean "terminal but non-failure" (cancelled is the
+# only canonical one — superseded-by-success is handled separately).
+TERMINAL_NEUTRAL_CONCLUSIONS = frozenset({"cancelled", "skipped"})
+
 # Statuses that indicate "do not proceed"
 HOLD_STATUSES = frozenset(
     {
@@ -237,11 +246,19 @@ def filter_runs_for_head(
 def classify_runs(
     target_runs: List[Dict[str, Any]],
 ) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Classify target runs.
+    """Classify target runs (legacy single-bucket classification).
 
     Returns (status, pending_runs, failed_runs, successful_runs).
     Priority: if any failed -> FAILED; else if all completed success -> GREEN;
     else -> PENDING (any still in flight).
+
+    .. deprecated::
+        This function does not handle workflow-keyed supersession of cancelled
+        runs. New code should call :func:`classify_runs_for_workflows` instead.
+        It is kept for backward compatibility and for the existing test
+        ``test_green_status_two_runs_completed_success`` and
+        ``test_pending_status_through_max_polls`` / ``test_failed_status_*``,
+        which exercise the single-bucket behavior.
     """
     pending: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
@@ -262,6 +279,163 @@ def classify_runs(
     if pending:
         return STATUS_HOLD_PENDING, pending, failed, successful
     return STATUS_GREEN, pending, failed, successful
+
+
+def _run_sort_key(run: Dict[str, Any]) -> str:
+    """Stable sort key: prefer createdAt, fall back to updatedAt, then databaseId."""
+    created = (run.get("createdAt") or "").strip()
+    if created:
+        return created
+    updated = (run.get("updatedAt") or "").strip()
+    if updated:
+        return updated
+    dbid = run.get("databaseId")
+    if dbid is not None:
+        return f"id:{dbid}"
+    return ""
+
+
+def classify_runs_for_workflows(
+    target_runs: List[Dict[str, Any]],
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Classify target runs using newest-authoritative-per-workflow semantics.
+
+    For each workflow name in the input, the runs are sorted newest-first
+    (by createdAt, with updatedAt/databaseId as tiebreakers). The newest
+    terminal run for that workflow on the exact head is the authoritative
+    verdict. Older runs for the same workflow and head are reported as
+    superseded history when the newest terminal run is success.
+
+    Returns
+    -------
+    (status, pending_runs, failed_runs, successful_runs, superseded_cancelled_runs)
+
+    - ``successful_runs``: the newest terminal success per workflow, plus any
+      non-superseded success in the list. Older cancelled runs for the same
+      workflow and head are **not** counted as failed.
+    - ``failed_runs``: terminal-failure conclusions (failure / timed_out /
+      action_required / startup_failure / stale) for the newest run of a
+      workflow, OR a cancelled/skipped run that is the newest terminal run
+      (no later success exists).
+    - ``pending_runs``: the newest run is still in flight (queued /
+      in_progress / requested / waiting) and no later success exists.
+    - ``superseded_cancelled_runs``: older cancelled runs whose authoritative
+      verdict is a later success on the same workflow and exact head.
+
+    Decision rules
+    --------------
+    1. Group runs by ``workflowName`` (case-sensitive exact match).
+    2. Within each workflow group, sort newest-first by createdAt (with
+       updatedAt/databaseId tiebreakers).
+    3. Find the newest **terminal** run (status=completed) for that workflow;
+       if none, find the newest in-flight run.
+    4. Authoritative verdict = newest terminal run's conclusion.
+       - ``success`` → workflow is GREEN; older cancelled runs for that
+         workflow become ``superseded_cancelled_runs``.
+       - failure-class conclusions (failure / timed_out / action_required /
+         startup_failure / stale) → workflow is FAILED.
+       - ``cancelled`` / ``skipped`` → workflow is FAILED **only if** no
+         newer success exists for the same workflow and exact head.
+       - in-flight (queued / in_progress / requested / waiting) → workflow
+         is PENDING unless a newer success exists, in which case the
+         in-flight run is superseded by the success.
+    5. Across all required workflows: any FAILED → overall FAILED; any
+       PENDING and none FAILED → overall PENDING; all GREEN → overall GREEN.
+    """
+    pending: List[Dict[str, Any]] = []
+    failed: List[Dict[str, Any]] = []
+    successful: List[Dict[str, Any]] = []
+    superseded_cancelled: List[Dict[str, Any]] = []
+
+    if not target_runs:
+        return STATUS_HOLD_NO_RUNS, pending, failed, successful, superseded_cancelled
+
+    # Group by workflow name.
+    by_workflow: Dict[str, List[Dict[str, Any]]] = {}
+    for r in target_runs:
+        wf = str(r.get("workflowName") or "")
+        by_workflow.setdefault(wf, []).append(r)
+
+    overall_has_failure = False
+    overall_has_pending = False
+
+    for wf, runs in by_workflow.items():
+        # Sort newest-first.
+        runs_sorted = sorted(runs, key=_run_sort_key, reverse=True)
+
+        # Find the newest terminal run (status=completed).
+        newest_terminal = next(
+            (r for r in runs_sorted if (r.get("status") or "").lower() == "completed"),
+            None,
+        )
+
+        if newest_terminal is not None:
+            conclusion = (newest_terminal.get("conclusion") or "").lower()
+            if conclusion == "success":
+                # Workflow is GREEN. All older terminal runs for this workflow
+                # are reported as superseded history: cancelled/skipped and
+                # failure-class conclusions are all moved to the superseded
+                # bucket. They do not flip the verdict because the newest
+                # terminal run for the same workflow is success.
+                successful.append(newest_terminal)
+                for older in runs_sorted[1:]:
+                    older_status = (older.get("status") or "").lower()
+                    if older_status == "completed":
+                        older_conclusion = (older.get("conclusion") or "").lower()
+                        if older_conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
+                            superseded_cancelled.append(older)
+                        elif older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                            # Older failure-class runs are also superseded by
+                            # the newer success on the same workflow/head.
+                            # They are reported in superseded_cancelled_runs
+                            # for full audit history, but they do not block
+                            # the verdict.
+                            superseded_cancelled.append(older)
+                        # Older success: drop (newest success is authoritative)
+                # In-flight older runs are also superseded by success.
+                for older in runs_sorted[1:]:
+                    older_status = (older.get("status") or "").lower()
+                    if older_status in PENDING_STATUSES:
+                        superseded_cancelled.append(older)
+            elif conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                # Newest terminal is a real failure. Workflow is FAILED.
+                failed.append(newest_terminal)
+                overall_has_failure = True
+                # Older runs are not classified as superseded; report as history.
+                for older in runs_sorted[1:]:
+                    older_status = (older.get("status") or "").lower()
+                    if older_status == "completed":
+                        older_conclusion = (older.get("conclusion") or "").lower()
+                        if older_conclusion in TERMINAL_FAILURE_CONCLUSIONS:
+                            failed.append(older)
+            elif conclusion in TERMINAL_NEUTRAL_CONCLUSIONS:
+                # Newest terminal is cancelled/skipped. No later success exists
+                # (by construction: this is the newest terminal run). Workflow
+                # is FAILED.
+                failed.append(newest_terminal)
+                overall_has_failure = True
+            else:
+                # Unknown terminal conclusion → treat as failure conservatively.
+                failed.append(newest_terminal)
+                overall_has_failure = True
+        else:
+            # No terminal run for this workflow. The newest run is in flight.
+            newest_in_flight = runs_sorted[0]
+            newest_in_flight_status = (newest_in_flight.get("status") or "").lower()
+            if newest_in_flight_status in PENDING_STATUSES:
+                pending.append(newest_in_flight)
+                overall_has_pending = True
+                # Older in-flight runs: not separately classified.
+            else:
+                # Unknown status: treat as pending conservatively.
+                pending.append(newest_in_flight)
+                overall_has_pending = True
+
+    if overall_has_failure:
+        return STATUS_HOLD_FAILED, pending, failed, successful, superseded_cancelled
+    if overall_has_pending:
+        return STATUS_HOLD_PENDING, pending, failed, successful, superseded_cancelled
+    return STATUS_GREEN, pending, failed, successful, superseded_cancelled
 
 
 def missing_required_workflows(
@@ -291,17 +465,20 @@ def build_packet(
     polls_used: int,
     commands_run: List[List[str]],
     errors: List[str],
+    superseded_cancelled_runs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     target_workflow_names = list(args.required_workflow or [])
     if not target_workflow_names:
         target_workflow_names = sorted(
             {str(r.get("workflowName") or "") for r in runs_for_head if r.get("workflowName")}
         )
+    superseded_cancelled_runs = superseded_cancelled_runs or []
     summary_counts = {
         "runs_for_head_total": len(runs_for_head),
         "pending": len(pending_runs),
         "failed": len(failed_runs),
         "successful": len(successful_runs),
+        "superseded_cancelled": len(superseded_cancelled_runs),
         "missing_required_workflows": len(missing_required),
     }
     return {
@@ -322,6 +499,7 @@ def build_packet(
         "pending_runs": pending_runs,
         "failed_runs": failed_runs,
         "successful_runs": successful_runs,
+        "superseded_cancelled_runs": superseded_cancelled_runs,
         "summary": summary_counts,
         "errors": errors,
         "commands_run": commands_run,
@@ -415,6 +593,17 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     lines.append("## Successful runs")
     lines.extend(_md_run_table(packet.get("successful_runs", [])))
     lines.append("")
+    lines.append("## Superseded cancelled runs")
+    lines.append("")
+    lines.append(
+        "Older cancelled or skipped runs for a required workflow whose "
+        "authoritative verdict is a later successful run on the same exact "
+        "head. These runs are reported as history and do **not** count as "
+        "failures when the newest terminal run for the same workflow is "
+        "`success`."
+    )
+    lines.extend(_md_run_table(packet.get("superseded_cancelled_runs", [])))
+    lines.append("")
     lines.append("## Commands run")
     if packet.get("commands_run"):
         for cmd in packet["commands_run"]:
@@ -495,6 +684,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
     pending: List[Dict[str, Any]] = []
     failed: List[Dict[str, Any]] = []
     successful: List[Dict[str, Any]] = []
+    superseded_cancelled: List[Dict[str, Any]] = []
     missing: List[str] = []
 
     polls_used = 0
@@ -565,12 +755,19 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
         ]
 
         if target_runs:
-            status, pending, failed, successful = classify_runs(target_runs)
+            (
+                status,
+                pending,
+                failed,
+                successful,
+                superseded_cancelled,
+            ) = classify_runs_for_workflows(target_runs)
         else:
             # No target runs in this poll (e.g., all required workflows are
             # still missing). Treat as pending — keep polling.
-            status, pending, failed, successful = (
+            status, pending, failed, successful, superseded_cancelled = (
                 STATUS_HOLD_PENDING,
+                [],
                 [],
                 [],
                 [],
@@ -588,6 +785,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
                 polls_used=polls_used,
                 commands_run=commands_run,
                 errors=errors,
+                superseded_cancelled_runs=list(superseded_cancelled),
             )
 
         # GREEN is only reachable when no required workflow is missing AND
@@ -606,6 +804,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
                 polls_used=polls_used,
                 commands_run=commands_run,
                 errors=errors,
+                superseded_cancelled_runs=list(superseded_cancelled),
             )
 
         # Either some required workflow is still missing, or some target
@@ -627,6 +826,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
             polls_used=polls_used,
             commands_run=commands_run,
             errors=errors,
+            superseded_cancelled_runs=list(superseded_cancelled),
         )
     return build_packet(
         args=args,
@@ -639,6 +839,7 @@ def audit(args: argparse.Namespace) -> Dict[str, Any]:
         polls_used=polls_used,
         commands_run=commands_run,
         errors=errors,
+        superseded_cancelled_runs=list(superseded_cancelled),
     )
 
 
