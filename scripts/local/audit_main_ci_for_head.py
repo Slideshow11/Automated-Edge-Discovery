@@ -281,18 +281,54 @@ def classify_runs(
     return STATUS_GREEN, pending, failed, successful
 
 
-def _run_sort_key(run: Dict[str, Any]) -> str:
-    """Stable sort key: prefer createdAt, fall back to updatedAt, then databaseId."""
+def _run_sort_key(run: Dict[str, Any]) -> Tuple[str, str, int]:
+    """Newest-first sort key with **full tie-breakers**: createdAt, then
+    updatedAt, then databaseId (with id / runId fallback).
+
+    Returns a 3-tuple of comparable values suitable for use with
+    ``sorted(..., key=_run_sort_key, reverse=True)``. The tuple is composed
+    of ``(createdAt_str, updatedAt_str, dbid_int)`` so all three documented
+    tie-breakers are applied — the helper no longer short-circuits to the
+    first non-empty field.
+
+    Sort semantics (``reverse=True`` → newest-first):
+
+    - ``createdAt`` is the primary key. ISO-8601 UTC strings (the format
+      returned by ``gh run list``) sort lexicographically in chronological
+      order, so lexicographic ordering on the raw string is correct.
+    - ``updatedAt`` is the first tie-breaker. When two attempts share the
+      same ``createdAt`` second, the attempt that was updated more
+      recently is the newer authoritative attempt.
+    - ``databaseId`` is the second tie-breaker. When both timestamps tie,
+      the higher ``databaseId`` (or id / runId fallback) wins.
+    - Missing timestamps sort as the empty string. Empty string is
+      lexicographically smaller than any ISO-8601 string, so under
+      ``reverse=True`` missing timestamps land at the **oldest** end of
+      the sort — older than any present timestamp.
+    - Missing ``databaseId`` sorts as 0. Under ``reverse=True`` this lands
+      at the oldest end of the id tie-breaker band.
+
+    Without all three keys in a single tuple, ``sorted`` would fall back
+    to Python's stable-sort order, which preserves whatever order
+    ``gh run list`` happened to return. That is the bug Codex flagged
+    in P2 threads ``PRRT_kwDOSHFpYM6IsHw6`` and ``PRRT_kwDOSHFpYM6IyZiR``:
+    an older same-second run could be selected as authoritative ahead of
+    a newer same-second in-flight rerun.
+    """
     created = (run.get("createdAt") or "").strip()
-    if created:
-        return created
     updated = (run.get("updatedAt") or "").strip()
-    if updated:
-        return updated
+    # Prefer databaseId (the field gh run list emits); fall back to
+    # id / runId if a future schema change drops the databaseId field.
     dbid = run.get("databaseId")
-    if dbid is not None:
-        return f"id:{dbid}"
-    return ""
+    if dbid is None:
+        dbid = run.get("id")
+    if dbid is None:
+        dbid = run.get("runId")
+    try:
+        dbid_int = int(dbid) if dbid is not None else 0
+    except (TypeError, ValueError):
+        dbid_int = 0
+    return (created, updated, dbid_int)
 
 
 def classify_runs_for_workflows(
