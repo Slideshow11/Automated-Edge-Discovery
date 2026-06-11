@@ -631,6 +631,121 @@ class RegistryPrimaryWorktreeSyncPolicyTests(unittest.TestCase):
             "primary-worktree-update prohibition",
         )
 
+    def test_hold_main_head_mismatch_covers_primary_worktree_evidence(self) -> None:
+        """The `HOLD_MAIN_HEAD_MISMATCH` registry entry must cover
+        both the origin/main HEAD mismatch surface and the primary
+        worktree mismatch surface (dirty status, wrong branch,
+        wrong HEAD). The evidence_required list must include the
+        primary-worktree tokens that a downstream consumer needs
+        to distinguish the two surfaces and reconcile the right
+        one.
+        """
+        # Description must mention both surfaces.
+        description = self.hold_main_head["description"]
+        for marker in (
+            "origin/main",
+            "primary worktree",
+            "dirty",
+            "branch",
+            "HEAD",
+        ):
+            self.assertIn(
+                marker,
+                description,
+                f"HOLD_MAIN_HEAD_MISMATCH.description must mention '{marker}'",
+            )
+        # Evidence list must include both origin/main and primary tokens.
+        evidence = set(self.hold_main_head["evidence_required"])
+        for token in (
+            "expected_head_sha",
+            "observed_origin_main_sha",
+            "primary_worktree_path",
+            "primary_status_porcelain",
+            "primary_branch",
+            "primary_expected_head_sha",
+            "primary_observed_head_sha",
+        ):
+            self.assertIn(
+                token,
+                evidence,
+                f"HOLD_MAIN_HEAD_MISMATCH.evidence_required must include '{token}'",
+            )
+        # Notes must mention both reconciliation paths.
+        notes = self.hold_main_head["notes"]
+        for marker in (
+            "reconcile",
+            "worktree_update",
+        ):
+            self.assertIn(
+                marker,
+                notes,
+                f"HOLD_MAIN_HEAD_MISMATCH.notes must mention '{marker}'",
+            )
+
+    def test_registry_doc_documents_evidence_for_hold_main_head_mismatch(self) -> None:
+        """The registry doc §13 must restate the full evidence list
+        for `HOLD_MAIN_HEAD_MISMATCH`, so a downstream consumer
+        reading the prose gets the same contract as a consumer
+        reading the JSON.
+        """
+        with self.registry_doc_path.open("r", encoding="utf-8") as f:
+            text = f.read()
+        section_start = text.find("## 13. Primary worktree sync policy")
+        self.assertNotEqual(section_start, -1, "registry doc must have §13")
+        section_end = text.find("\n## ", section_start + 1)
+        if section_end == -1:
+            section_body = text[section_start:]
+        else:
+            section_body = text[section_start:section_end]
+        joined = " ".join(section_body.split())
+        for token in (
+            "expected_head_sha",
+            "observed_origin_main_sha",
+            "primary_worktree_path",
+            "primary_status_porcelain",
+            "primary_branch",
+            "primary_expected_head_sha",
+            "primary_observed_head_sha",
+        ):
+            self.assertIn(
+                token,
+                joined,
+                f"registry §13 must document evidence token '{token}'",
+            )
+
+    def test_operator_path_row_documents_evidence_for_hold_main_head_mismatch(self) -> None:
+        """The operator path doc's `HOLD_MAIN_HEAD_MISMATCH` row
+        must list the required evidence tokens, so the row is the
+        canonical prose surface for the registry entry's evidence
+        contract.
+        """
+        with self.operator_path_doc_path.open("r", encoding="utf-8") as f:
+            lines = f.readlines()
+        # Find the row that begins with `| `HOLD_MAIN_HEAD_MISMATCH` |`.
+        matching = [
+            line for line in lines if line.lstrip().startswith("| `HOLD_MAIN_HEAD_MISMATCH` |")
+        ]
+        self.assertEqual(
+            len(matching),
+            1,
+            "operator path must have exactly one HOLD_MAIN_HEAD_MISMATCH row",
+        )
+        row = matching[0]
+        for token in (
+            "expected_head_sha",
+            "observed_origin_main_sha",
+            "primary_worktree_path",
+            "primary_status_porcelain",
+            "primary_branch",
+            "primary_expected_head_sha",
+            "primary_observed_head_sha",
+        ):
+            self.assertIn(
+                token,
+                row,
+                f"operator path HOLD_MAIN_HEAD_MISMATCH row must list evidence '{token}'",
+            )
+
     def test_registry_doc_has_primary_worktree_sync_section(self) -> None:
         """The lifecycle state registry doc must contain §13, the
         primary worktree sync policy section, codified 2026-06-10.

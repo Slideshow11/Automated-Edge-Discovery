@@ -588,6 +588,32 @@ If any check fails, the run enters
 reconcile the primary before continuing. Do not push, merge,
 or post a Codex ping in this state.
 
+**Evidence for the `HOLD_MAIN_HEAD_MISMATCH` state.** The
+machine-readable evidence contract for this state in
+`schemas/aed_lifecycle_states_v1.json` covers both surfaces
+listed above (an `origin/main` HEAD mismatch and a primary
+worktree mismatch). The full evidence list is:
+
+- `expected_head_sha` — the expected `origin/main` head for
+  the current PR run.
+- `observed_origin_main_sha` — the observed `origin/main` head
+  (read with `git -C /home/max/Automated-Edge-Discovery rev-parse origin/main`).
+- `primary_worktree_path` — the absolute path of the primary
+  worktree (`/home/max/Automated-Edge-Discovery`).
+- `primary_status_porcelain` — the output of `git -C <path>
+  status --porcelain`; must be empty.
+- `primary_branch` — the output of `git -C <path> branch
+  --show-current`; must be `main`.
+- `primary_expected_head_sha` — the expected post-closeout
+  head of the last merged PR.
+- `primary_observed_head_sha` — the output of `git -C <path>
+  rev-parse HEAD`; must equal `primary_expected_head_sha`.
+
+Helpers that follow the registry JSON must collect all of the
+above before reporting `HOLD_MAIN_HEAD_MISMATCH`, so a downstream
+consumer can distinguish an `origin/main` mismatch from a
+primary-worktree mismatch and reconcile the right surface.
+
 **Why this rule exists.** The primary-worktree-as-anchor pattern
 is what makes the protected-state check possible. If the
 primary is allowed to drift freely, the protected-state check

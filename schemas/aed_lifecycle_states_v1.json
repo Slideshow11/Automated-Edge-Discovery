@@ -18,15 +18,15 @@
     },
     "HOLD_MAIN_HEAD_MISMATCH": {
       "category": "hold",
-      "description": "Stop. The observed origin/main HEAD does not match the expected head SHA for this PR run.",
-      "evidence_required": ["expected_head_sha", "observed_origin_main_sha"],
+      "description": "Stop. This state covers both (a) an origin/main HEAD mismatch and (b) a primary worktree mismatch (dirty status, wrong branch, or wrong HEAD). The canonical scenario in a governance PR run is the primary-worktree-state-mismatch surface, which is checked at PHASE 1; an origin/main HEAD mismatch is the same family of failures and uses the same hold.",
+      "evidence_required": ["expected_head_sha", "observed_origin_main_sha", "primary_worktree_path", "primary_status_porcelain", "primary_branch", "primary_expected_head_sha", "primary_observed_head_sha"],
       "allowed_next_states": ["NOT_RUN"],
       "allowed_mutations": [],
       "forbidden_mutations": ["pr_merge", "thread_resolve", "pr_close", "worktree_update"],
       "human_authorization_required": false,
       "merge_allowed": false,
       "closeout_allowed": false,
-      "notes": "Operator must reconcile origin/main before continuing. Do not push or merge."
+      "notes": "Operator must reconcile the failing surface before continuing. On an origin/main HEAD mismatch, reconcile origin/main to the expected head. On a primary worktree mismatch, do not update the primary without explicit human authorization (the primary-worktree-update prohibition is encoded in `worktree_update`); investigate the cause and reconcile only with explicit operator authorization. Do not push, merge, or post a Codex ping in this state."
     },
     "HOLD_HEAD_CHANGED": {
       "category": "hold",
