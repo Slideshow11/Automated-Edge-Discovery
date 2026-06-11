@@ -439,9 +439,30 @@ evidence to know what to do next." A future consumer that
 inspects the registry for the operator's current hold will
 find exactly one entry that matches that condition.
 
-**Reference.** `docs/aed_whole_workflow_operator_path.md` §8
+**Reference.** `docs/aed_lifecycle_state_registry.md` §8
 (new), `docs/aed_known_safe_command_cookbook.md` §11.2 (new),
 and the cross-references in those documents.
+
+---
+
+## 12. How future helpers should consume the registry
+
+Future helpers and tools that need to look up a state should:
+
+1. Load the registry from
+   `schemas/aed_lifecycle_states_v1.json`. The CLI's `--state <NAME>`
+   shape is a useful reference for what a lookup returns.
+2. Treat the registry as a source of vocabulary and policy
+   expectations, not a runtime state machine.
+3. Never depend on the registry to authorize a mutation. The
+   merge authorization guard, the resolve-only policy, and the
+   audit append helper each have their own authorization rules.
+4. When introducing a new state, add it to the registry in the same
+   PR that introduces the script or doc that uses it. Update the
+   operator path and command cookbook cross-references in the same
+   change set.
+5. Run `python3 scripts/local/aed_lifecycle_states.py --validate`
+   as part of CI for any PR that touches the registry.
 
 ---
 
@@ -538,8 +559,8 @@ governance PR run:
 
 In every case, the operator's authorization phrase must name
 the exact target ref and the reason. A future agent must not
-infer "sync the primary" from a generic "make sure things are
-up to date" instruction.
+infer "sync the primary" from a generic "make sure things
+are up to date" instruction.
 
 **Verification pattern.** At the start of every governance PR
 run, the operator performs the following read-only checks against
@@ -582,27 +603,6 @@ command cookbook §11.3 restates the rule in command-shape
 form; the protected-state check pattern is documented in the
 PHASE 1 verification step of every governance PR task
 specification.
-
----
-
-## 12. How future helpers should consume the registry
-
-Future helpers and tools that need to look up a state should:
-
-1. Load the registry from
-   `schemas/aed_lifecycle_states_v1.json`. The CLI's `--state <NAME>`
-   shape is a useful reference for what a lookup returns.
-2. Treat the registry as a source of vocabulary and policy
-   expectations, not a runtime state machine.
-3. Never depend on the registry to authorize a mutation. The
-   merge authorization guard, the resolve-only policy, and the
-   audit append helper each have their own authorization rules.
-4. When introducing a new state, add it to the registry in the same
-   PR that introduces the script or doc that uses it. Update the
-   operator path and command cookbook cross-references in the same
-   change set.
-5. Run `python3 scripts/local/aed_lifecycle_states.py --validate`
-   as part of CI for any PR that touches the registry.
 
 ---
 

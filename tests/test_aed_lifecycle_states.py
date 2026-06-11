@@ -806,21 +806,52 @@ class RegistryPrimaryWorktreeSyncPolicyTests(unittest.TestCase):
         `HOLD_MAIN_HEAD_MISMATCH` must now reference §11.3 (the
         primary worktree sync constraint) and the operator
         path §9.
+
+        The test extracts the exact table row containing
+        `| `HOLD_MAIN_HEAD_MISMATCH` |` from the cookbook and
+        asserts on that extracted row, not on the whole
+        cookbook text. The whole-text check would silently
+        pass if the row regressed, because the cookbook now
+        contains `§11.3` in multiple prose references
+        (the new §11.3 heading, §13 forbidden patterns,
+        and the §14 row itself). Scoping the assertion to
+        the row ensures the row is the one that carries
+        the reference.
         """
         with self.cookbook_doc_path.open("r", encoding="utf-8") as f:
             text = f.read()
-        # Find the §14 row for HOLD_MAIN_HEAD_MISMATCH.
-        self.assertIn(
-            "| `HOLD_MAIN_HEAD_MISMATCH` |",
-            text,
-            "cookbook §14 must have a row for HOLD_MAIN_HEAD_MISMATCH",
+        # Extract the exact table row for HOLD_MAIN_HEAD_MISMATCH
+        # from the §14 state-to-command index. The row starts with
+        # the table-cell delimiter and runs to the end of the line.
+        row_prefix = "| `HOLD_MAIN_HEAD_MISMATCH` |"
+        matching_rows = [
+            line
+            for line in text.splitlines()
+            if line.startswith(row_prefix)
+        ]
+        self.assertEqual(
+            len(matching_rows),
+            1,
+            "cookbook §14 must have exactly one row for "
+            "HOLD_MAIN_HEAD_MISMATCH "
+            f"(found {len(matching_rows)})",
         )
-        # The row content must reference §11.3 and the operator
-        # path §9.
+        row = matching_rows[0]
+        # The row must reference §11.3 (the primary worktree
+        # sync constraint) and §9 (the operator-path section
+        # that codifies the policy).
         self.assertIn(
             "§11.3",
-            text,
-            "cookbook §14 HOLD_MAIN_HEAD_MISMATCH row must reference §11.3",
+            row,
+            "cookbook §14 HOLD_MAIN_HEAD_MISMATCH row must "
+            "reference §11.3 (scoped to the row, not the file)",
+        )
+        self.assertIn(
+            "§9",
+            row,
+            "cookbook §14 HOLD_MAIN_HEAD_MISMATCH row must "
+            "reference §9 (the operator-path section, scoped "
+            "to the row)",
         )
 
     def test_cookbook_forbidden_commands_section_references_policy(self) -> None:
