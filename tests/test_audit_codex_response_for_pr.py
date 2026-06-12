@@ -1308,3 +1308,470 @@ def test_source_has_no_forbidden_diff_patterns():
                     f"audit_codex_response_for_pr.py at line {line}"
                 )
             idx = pos + len(needle)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for current-head Codex findings on PR #402
+# ---------------------------------------------------------------------------
+
+
+def test_rest_mergeable_state_clean_yields_merge_ready(monkeypatch, tmp_path):
+    """P1: REST mergeable_state=clean + clean pass + no unresolved threads
+    must yield MERGE_READY_AWAITING_HUMAN_AUTHORIZATION (not
+    HOLD_MERGE_STATE_BLOCKED, which the old code returned when
+    merge_state_status was null in REST responses)."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = {
+        "sha": EXPECTED_HEAD,
+        "state": "open",
+        "mergeStateStatus": None,  # not present in REST
+        "mergeableState": "clean",  # REST field, lowercase
+        "mergeable": True,
+        "reviewDecision": "",
+        "baseRefName": "main",
+        "headRefName": "tooling/codex-response-classifier-v1",
+        "url": f"https://github.com/{REPO}/pull/402",
+    }
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99100,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["merge_state_status"] == "CLEAN"
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_rest_mergeable_state_blocked_yields_hold_merge_blocked(monkeypatch, tmp_path):
+    """P1: REST mergeable_state=blocked + clean pass + no unresolved
+    threads must yield HOLD_MERGE_STATE_BLOCKED."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = {
+        "sha": EXPECTED_HEAD,
+        "state": "open",
+        "mergeStateStatus": None,
+        "mergeableState": "blocked",
+        "mergeable": False,
+        "reviewDecision": "",
+        "baseRefName": "main",
+        "headRefName": "tooling/codex-response-classifier-v1",
+        "url": f"https://github.com/{REPO}/pull/402",
+    }
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99101,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_MERGE_STATE_BLOCKED
+    assert pkt["merge_state_status"] == "BLOCKED"
+
+
+def test_graphql_merge_state_status_clean_still_works(monkeypatch, tmp_path):
+    """The classifier must continue to honor GraphQL-style
+    mergeStateStatus=CLEAN when present (fixture/test compatibility)."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = {
+        "sha": EXPECTED_HEAD,
+        "state": "open",
+        "mergeStateStatus": "CLEAN",
+        "mergeableState": None,
+        "mergeable": True,
+        "reviewDecision": "APPROVED",
+        "baseRefName": "main",
+        "headRefName": "tooling/codex-response-classifier-v1",
+        "url": f"https://github.com/{REPO}/pull/402",
+    }
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99102,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["merge_state_status"] == "CLEAN"
+
+
+def test_paginated_issue_comments_page2_clean_pass_detected(monkeypatch, tmp_path):
+    """P2: When gh api --paginate --slurp returns [[page1], [page2]],
+    the page-2 Codex clean-pass must be detected after flatten."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    # Slurped output: two pages, the clean pass is on page 2
+    page1 = [make_issue_comment(
+        author="some-user", body="unrelated",
+        created_at="2026-06-10T12:00:00Z", comment_id=1001,
+    )]
+    page2 = [make_issue_comment(
+        author=CODEX_LOGIN,
+        body=codex_clean_pass_body(),
+        created_at="2026-06-11T18:00:00Z",
+        comment_id=99103,
+    )]
+    slurped = json.dumps([page1, page2])
+    runner = make_gh_runner_raw(pr_view, slurped, "[]", {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_comment_id"] == 99103
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_paginated_reviews_page2_review_detected(monkeypatch, tmp_path):
+    """P2: Slurped paginated reviews must include page-2 review entries."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    page1 = []
+    page2 = [make_review(
+        author=CODEX_LOGIN,
+        state="APPROVED",
+        body=codex_clean_pass_body(),
+        submitted_at="2026-06-11T18:00:00Z",
+        review_id=99104,
+    )]
+    slurped_reviews = json.dumps([page1, page2])
+    runner = make_gh_runner_raw(
+        pr_view, "[]", slurped_reviews, {
+            "data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}
+        }
+    )
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_rest_created_at_after_ping_detected(monkeypatch, tmp_path):
+    """P2: Issue comment with REST created_at (snake_case) timestamp
+    after --ping-created-at must be detected as a clean pass (not
+    silently dropped because the GraphQL key was empty)."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    # Use REST snake_case instead of GraphQL camelCase. The fixture
+    # mimics the live --slurp output shape: a JSON array of pages,
+    # where each page is a JSON array of items.
+    issue_page = [{
+        "id": 99105,
+        "databaseId": 99105,
+        "user": {"login": CODEX_LOGIN},
+        "body": codex_clean_pass_body(),
+        "created_at": "2026-06-11T18:00:00Z",  # REST, not createdAt
+    }]
+    slurped = json.dumps([issue_page])
+    runner = make_gh_runner_raw(pr_view, slurped, "[]", {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] != mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_rest_submitted_at_after_ping_detected(monkeypatch, tmp_path):
+    """P2: Formal review with REST submitted_at (snake_case) after
+    --ping-created-at must be detected."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    # Use REST snake_case submitted_at inside a slurped page.
+    review_page = [{
+        "id": 99106,
+        "user": {"login": CODEX_LOGIN},
+        "state": "APPROVED",
+        "body": codex_clean_pass_body(),
+        "submitted_at": "2026-06-11T18:00:00Z",  # REST, not submittedAt
+        "commit_id": EXPECTED_HEAD,
+        "commit": {"oid": EXPECTED_HEAD},
+    }]
+    slurped = json.dumps([review_page])
+    runner = make_gh_runner_raw(pr_view, "[]", slurped, {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] != mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+
+
+def test_rest_created_at_pre_ping_ignored(monkeypatch, tmp_path):
+    """REST created_at pre-ping clean passes must still be ignored."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    issue_page = [{
+        "id": 99107,
+        "databaseId": 99107,
+        "user": {"login": CODEX_LOGIN},
+        "body": codex_clean_pass_body(),
+        "created_at": "2026-06-10T12:00:00Z",  # before ping
+    }]
+    slurped = json.dumps([issue_page])
+    runner = make_gh_runner_raw(pr_view, slurped, "[]", {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "1",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+
+
+def test_pr401_regression_still_passes(monkeypatch, tmp_path):
+    """The PR #401 regression fixture (using GraphQL camelCase shapes)
+    must continue to return CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view(merge_state="CLEAN")
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:05:00Z",
+            comment_id=4677095399,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_stale_1",
+                        "isResolved": False,
+                        "isOutdated": True,
+                        "comments": {"nodes": [{
+                            "databaseId": 3393166147,
+                            "url": "https://example/3393166147",
+                            "body": "old finding",
+                            "path": "scripts/local/audit_main_ci_for_head.py",
+                            "line": 369,
+                            "author": {"login": CODEX_LOGIN},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["unresolved_thread_count"] == 1
+
+
+# Helper that returns raw stdout strings (for the slurped-output cases
+# that need to bypass the make_gh_runner default list-only path).
+def make_gh_runner_raw(pr_view, issues_raw, reviews_raw, threads_payload):
+    def _runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = issues_raw
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = reviews_raw
+            return m
+        m.stdout = "[]"
+        return m
+    return _runner
+
+
+# ---------------------------------------------------------------------------
+# normalize_merge_state unit tests
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_merge_state_handles_all_known_shapes():
+    """Direct unit tests for the normalize_merge_state helper."""
+    # GraphQL uppercase
+    assert mod.normalize_merge_state("CLEAN") == "CLEAN"
+    assert mod.normalize_merge_state("BLOCKED") == "BLOCKED"
+    assert mod.normalize_merge_state("DIRTY") == "DIRTY"
+    assert mod.normalize_merge_state("UNSTABLE") == "UNSTABLE"
+    # REST lowercase
+    assert mod.normalize_merge_state("clean") == "CLEAN"
+    assert mod.normalize_merge_state("blocked") == "BLOCKED"
+    # GraphQL snake_case jq path
+    assert mod.normalize_merge_state("dirty") == "DIRTY"
+    # boolean
+    assert mod.normalize_merge_state(True) == "CLEAN"
+    assert mod.normalize_merge_state(False) == "BLOCKED"
+    # None / empty / garbage
+    assert mod.normalize_merge_state(None) is None
+    assert mod.normalize_merge_state("") is None
+    assert mod.normalize_merge_state("wat") is None
+
+
+def test_timestamp_field_handles_camel_and_snake_case():
+    """Direct unit tests for the timestamp_field helper."""
+    # GraphQL camelCase
+    assert mod.timestamp_field({"createdAt": "2026-01-01T00:00:00Z"}, "createdAt", "created_at") == "2026-01-01T00:00:00Z"
+    assert mod.timestamp_field({"submittedAt": "2026-01-02T00:00:00Z"}, "submittedAt", "submitted_at") == "2026-01-02T00:00:00Z"
+    # REST snake_case
+    assert mod.timestamp_field({"created_at": "2026-01-01T00:00:00Z"}, "createdAt", "created_at") == "2026-01-01T00:00:00Z"
+    assert mod.timestamp_field({"submitted_at": "2026-01-02T00:00:00Z"}, "submittedAt", "submitted_at", "createdAt", "created_at") == "2026-01-02T00:00:00Z"
+    # Prefer GraphQL when both present
+    assert mod.timestamp_field(
+        {"createdAt": "2026-01-01T00:00:00Z", "created_at": "2025-01-01T00:00:00Z"},
+        "createdAt", "created_at",
+    ) == "2026-01-01T00:00:00Z"
+    # Empty / missing
+    assert mod.timestamp_field({}, "createdAt", "created_at") == ""
+    assert mod.timestamp_field({"createdAt": ""}, "createdAt", "created_at") == ""
+
+
+def test_flatten_paginated_items_handles_shapes():
+    """Direct unit tests for the flatten_paginated_items helper."""
+    # Already-flat list
+    items, ok = mod.flatten_paginated_items([{"a": 1}, {"b": 2}])
+    assert ok is True
+    assert items == [{"a": 1}, {"b": 2}]
+    # List of pages
+    items, ok = mod.flatten_paginated_items([[{"a": 1}], [{"b": 2}]])
+    assert ok is True
+    assert items == [{"a": 1}, {"b": 2}]
+    # List of wrappers
+    items, ok = mod.flatten_paginated_items([{"items": [{"a": 1}]}, {"items": [{"b": 2}]}])
+    assert ok is True
+    assert items == [{"a": 1}, {"b": 2}]
+    # Empty
+    items, ok = mod.flatten_paginated_items([])
+    assert ok is True
+    assert items == []
+    # None
+    items, ok = mod.flatten_paginated_items(None)
+    assert ok is False
+    assert items == []
+    # Top-level dict
+    items, ok = mod.flatten_paginated_items({"items": [{"a": 1}]})
+    assert ok is False
+    assert items == []

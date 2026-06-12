@@ -151,8 +151,18 @@ def gh_api_paginated(repo: str, endpoint: str, timeout: int = 30) -> Tuple[bool,
     """
     Call `gh api` for the given endpoint (no leading slash) with --paginate.
     Returns (success, data_list, error_msg).
+
+    gh api --paginate prints each page as a separate JSON document; if the
+    caller does not pass --slurp, the concatenated stdout is NOT valid JSON
+    for multi-page responses. We always pass --slurp so the output is a
+    single JSON array of arrays (one entry per page) that we then flatten
+    in flatten_paginated_items().
+
+    This fixes the live Codex finding that gh api --paginate on issue
+    comments and review submissions can return multiple top-level JSON
+    documents which would otherwise break json.loads().
     """
-    cmd = ["gh", "api", f"repos/{repo}/{endpoint}", "--paginate"]
+    cmd = ["gh", "api", f"repos/{repo}/{endpoint}", "--paginate", "--slurp"]
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False,
@@ -165,11 +175,55 @@ def gh_api_paginated(repo: str, endpoint: str, timeout: int = 30) -> Tuple[bool,
         return True, [], ""
     try:
         data = json.loads(result.stdout)
-        if isinstance(data, list):
-            return True, data, ""
-        return True, [data], ""
     except json.JSONDecodeError as exc:
         return False, [], f"invalid JSON from gh api: {exc}"
+    flat, ok_pages = flatten_paginated_items(data)
+    if not ok_pages:
+        return False, [], f"unexpected gh api --paginate payload shape: {type(data).__name__}"
+    return True, flat, ""
+
+
+def flatten_paginated_items(payload: Any) -> Tuple[List[Dict[str, Any]], bool]:
+    """
+    Flatten a gh api --paginate --slurp payload into a single list of items.
+
+    The slurped output is a JSON array where each element is one page. Each
+    page is itself a JSON array of items. Older REST endpoints sometimes
+    wrap items in an object ({"items": [...]}); we unwrap that case too.
+    For fixtures or partial responses we accept:
+      - already-flat list of items -> returned as-is
+      - list of pages [[...], [...]] -> flattened
+      - list of wrappers [{items: [...]}, ...] -> flattened and joined
+
+    Returns (flat_list, shape_ok). shape_ok is False if the payload is
+    structurally invalid (e.g. None, dict at top level).
+    """
+    if payload is None:
+        return [], False
+    if isinstance(payload, dict):
+        return [], False
+    if not isinstance(payload, list):
+        return [], False
+    flat: List[Dict[str, Any]] = []
+    for page in payload:
+        if page is None:
+            continue
+        if isinstance(page, list):
+            for item in page:
+                if isinstance(item, dict):
+                    flat.append(item)
+        elif isinstance(page, dict):
+            # Could be {items: [...]} or a single-item object
+            if "items" in page and isinstance(page["items"], list):
+                for item in page["items"]:
+                    if isinstance(item, dict):
+                        flat.append(item)
+            else:
+                flat.append(page)
+        else:
+            # Unexpected scalar; skip
+            continue
+    return flat, True
 
 
 def gh_pr_view_min(repo: str, pr_number: int) -> Tuple[bool, Dict[str, Any], str]:
@@ -177,10 +231,19 @@ def gh_pr_view_min(repo: str, pr_number: int) -> Tuple[bool, Dict[str, Any], str
     Fetch PR metadata needed for head/mergeState/reviewDecision checks.
     Uses REST `repos/.../pulls/{n}` (does not require git repo cwd).
     """
+    # REST `repos/.../pulls/{n}` does NOT expose GraphQL-style
+    # `mergeStateStatus`; it exposes `mergeable_state` (clean/blocked/
+    # dirty/unstable) instead. The classifier normalizes both shapes via
+    # normalize_merge_state() below. `reviewDecision` is GraphQL-only and
+    # is left as null on the REST path. `mergeable` is a boolean/string
+    # from REST indicating whether the PR is currently mergeable.
     cmd = [
         "gh", "api", f"repos/{repo}/pulls/{pr_number}",
-        "--jq", "{sha:.head.sha, state:.state, mergeStateStatus:.merge_state_status, "
-                "mergeable:.mergeable, reviewDecision:.review_decision, baseRefName:.base.ref, "
+        "--jq", "{sha:.head.sha, state:.state, "
+                "mergeStateStatus:.merge_state_status, "
+                "mergeableState:.mergeable_state, "
+                "mergeable:.mergeable, reviewDecision:.review_decision, "
+                "baseRefName:.base.ref, "
                 "headRefName:.head.ref, url:.html_url}",
     ]
     try:
@@ -298,6 +361,61 @@ def is_codex_clean_pass_comment(body: str) -> bool:
     return any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES)
 
 
+def normalize_merge_state(value: Any) -> Optional[str]:
+    """
+    Normalize a merge-state field from any of the supported GitHub API
+    shapes into the canonical uppercase form used in the classifier
+    packet.
+
+    Recognized input forms:
+      - GraphQL PullRequest.mergeStateStatus: CLEAN | BLOCKED | DIRTY |
+        UNSTABLE | BEHIND | DRAFT | UNKNOWN
+      - REST Pulls.mergeable_state (lowercase): clean | blocked | dirty |
+        unstable | behind | draft | null (unset while computing)
+      - REST Pulls.mergeable (boolean-as-string): "true" | "false"
+      - GraphQL-style snake_case key from JSON jq filter: merge_state_status
+
+    Returns the canonical uppercase form (e.g. "CLEAN", "BLOCKED",
+    "DIRTY", "UNSTABLE", "BEHIND", "DRAFT", "UNKNOWN") or None when the
+    value is missing/empty/unrecognized.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return "CLEAN" if value else "BLOCKED"
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    upper = s.upper()
+    if upper in ("CLEAN", "BLOCKED", "DIRTY", "UNSTABLE", "BEHIND", "DRAFT", "UNKNOWN"):
+        return upper
+    # Lowercase or title-case from REST
+    if s.lower() in ("clean", "blocked", "dirty", "unstable", "behind", "draft"):
+        return s.upper()
+    return None
+
+
+def timestamp_field(item: Dict[str, Any], *candidates: str) -> str:
+    """
+    Return the first non-empty timestamp from a dict under any of the
+    candidate keys. Supports BOTH GraphQL camelCase (createdAt,
+    submittedAt) and REST snake_case (created_at, submitted_at) shapes.
+
+    Returns "" if none of the candidates are present or all are empty.
+    Used for comparing --ping-created-at against issue-comment /
+    formal-review timestamps from either API surface.
+    """
+    if not isinstance(item, dict):
+        return ""
+    for key in candidates:
+        v = item.get(key)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
 def extract_review_commit_oid(review: Dict[str, Any]) -> str:
     """Extract the commit OID from a review submission dict."""
     return (
@@ -402,9 +520,30 @@ def classify(
         pr_base_ref = pr_data.get("baseRefName", "") or ""
         pr_head_ref = pr_data.get("headRefName", "") or ""
         observed_head_sha = pr_data.get("sha", "") or ""
-        merge_state_status = pr_data.get("mergeStateStatus")
-        mergeable = pr_data.get("mergeable")
-        review_decision = pr_data.get("reviewDecision")
+        # Normalize merge state across GraphQL and REST shapes.
+        # Prefer mergeStateStatus / merge_state_status (GraphQL-style),
+        # then mergeableState (REST lowercase), then mergeable (boolean).
+        # All three forms flow through normalize_merge_state() so the
+        # downstream decision logic can compare against canonical
+        # uppercase values (CLEAN / BLOCKED / DIRTY / UNSTABLE / etc.).
+        merge_state_status = normalize_merge_state(
+            pr_data.get("mergeStateStatus")
+            or pr_data.get("merge_state_status")
+            or pr_data.get("mergeableState")
+            or pr_data.get("mergeable_state")
+            or pr_data.get("mergeable")
+        )
+        # REST does not expose reviewDecision; leave it None unless
+        # the field is present (e.g. from a GraphQL fixture or jq shim).
+        rd_value = pr_data.get("reviewDecision")
+        if rd_value is None or rd_value == "":
+            rd_value = pr_data.get("review_decision")
+        review_decision = rd_value if rd_value not in (None, "") else None
+        # Preserve the raw mergeable value for the packet; this is
+        # REST's boolean-as-string indicator of whether the PR is
+        # currently mergeable (separate from the canonical merge state).
+        mergeable_raw = pr_data.get("mergeable")
+        mergeable = mergeable_raw
         head_matches_expected = bool(
             expected_head_sha and observed_head_sha
             and observed_head_sha == expected_head_sha
@@ -478,22 +617,27 @@ def classify(
             if author in CODEX_BOT_LOGINS:
                 codex_review_submissions.append(r)
 
-        # Determine latest response (newest by createdAt/submittedAt)
+        # Determine latest response (newest by created/submitted timestamp).
+        # Timestamps are read via timestamp_field() which supports BOTH
+        # GraphQL camelCase (createdAt, submittedAt) AND REST snake_case
+        # (created_at, submitted_at) shapes. Without this normalization,
+        # a live REST response with created_at would have an empty
+        # timestamp and would be silently skipped during ping filtering.
         def _iso(s: str) -> str:
             return s or ""
 
         latest_issue = None
         for c in codex_issue_comments:
-            ts = _iso(c.get("createdAt", ""))
+            ts = _iso(timestamp_field(c, "createdAt", "created_at"))
             if ping_dt is not None:
                 c_dt = parse_iso_utc(ts)
                 if c_dt is None or c_dt < ping_dt:
                     continue
-            if latest_issue is None or ts > _iso(latest_issue.get("createdAt", "")):
+            if latest_issue is None or ts > _iso(timestamp_field(latest_issue, "createdAt", "created_at")):
                 latest_issue = c
         latest_review = None
         for r in codex_review_submissions:
-            ts = _iso(r.get("submittedAt", ""))
+            ts = _iso(timestamp_field(r, "submittedAt", "submitted_at", "createdAt", "created_at"))
             if ping_dt is not None:
                 r_dt = parse_iso_utc(ts)
                 if r_dt is None or r_dt < ping_dt:
@@ -508,7 +652,7 @@ def classify(
                     last_seen_codex_review_ts = ts
                     last_seen_codex_review_id = str(r.get("id", ""))
                 continue
-            if latest_review is None or ts > _iso(latest_review.get("submittedAt", "")):
+            if latest_review is None or ts > _iso(timestamp_field(latest_review, "submittedAt", "submitted_at", "createdAt", "created_at")):
                 latest_review = r
             if ts > (last_seen_codex_review_ts or ""):
                 last_seen_codex_review_ts = ts
@@ -516,7 +660,7 @@ def classify(
 
         # Track last-seen Codex activity even if filtered out
         for c in codex_issue_comments:
-            ts = _iso(c.get("createdAt", ""))
+            ts = _iso(timestamp_field(c, "createdAt", "created_at"))
             if ts > (last_seen_codex_comment_ts or ""):
                 last_seen_codex_comment_ts = ts
                 last_seen_codex_comment_id = str(c.get("id", ""))
@@ -525,13 +669,13 @@ def classify(
         candidates = []
         if latest_issue is not None:
             candidates.append((
-                _iso(latest_issue.get("createdAt", "")),
+                _iso(timestamp_field(latest_issue, "createdAt", "created_at")),
                 "issue_comment",
                 str(latest_issue.get("id", "")),
             ))
         if latest_review is not None:
             candidates.append((
-                _iso(latest_review.get("submittedAt", "")),
+                _iso(timestamp_field(latest_review, "submittedAt", "submitted_at", "createdAt", "created_at")),
                 "pull_request_review",
                 str(latest_review.get("id", "")),
             ))
@@ -550,12 +694,17 @@ def classify(
         for c in codex_issue_comments:
             if not is_codex_clean_pass_comment(c.get("body", "")):
                 continue
-            ts = c.get("createdAt", "")
+            # Use timestamp_field() to read BOTH GraphQL camelCase
+            # (createdAt) and REST snake_case (created_at). Without
+            # this, REST responses with created_at would be filtered
+            # out by the ping_dt comparison and the clean pass would
+            # be silently dropped.
+            ts = timestamp_field(c, "createdAt", "created_at")
             if ping_dt is not None:
                 c_dt = parse_iso_utc(ts)
                 if c_dt is None or c_dt < ping_dt:
                     continue
-            if latest_clean_pass is None or ts > latest_clean_pass.get("createdAt", ""):
+            if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c
         if latest_clean_pass is None and latest_review is not None:
             # Treat formal review clean pass as valid only if state is
@@ -566,12 +715,12 @@ def classify(
                 clean_pass_detected = True
                 clean_pass_review_id = latest_review.get("id")
                 clean_pass_source = "pull_request_review"
-                clean_pass_at = latest_review.get("submittedAt")
+                clean_pass_at = timestamp_field(latest_review, "submittedAt", "submitted_at", "createdAt", "created_at")
         if latest_clean_pass is not None:
             clean_pass_detected = True
             clean_pass_comment_id = latest_clean_pass.get("databaseId") or latest_clean_pass.get("id")
             clean_pass_source = "issue_comment"
-            clean_pass_at = latest_clean_pass.get("createdAt")
+            clean_pass_at = timestamp_field(latest_clean_pass, "createdAt", "created_at")
 
         # ---- 7. Inventory threads ----
         # Active = is_resolved=false AND is_outdated=false
@@ -613,7 +762,7 @@ def classify(
         if clean_pass_detected and clean_pass_at:
             cp_dt = parse_iso_utc(clean_pass_at)
             for c in codex_issue_comments:
-                c_dt = parse_iso_utc(c.get("createdAt", ""))
+                c_dt = parse_iso_utc(timestamp_field(c, "createdAt", "created_at"))
                 if c_dt is None or cp_dt is None or c_dt <= cp_dt:
                     continue
                 # Any post-clean-pass Codex issue comment other than
@@ -623,7 +772,7 @@ def classify(
                     break
             if not newer_finding_after_clean_pass:
                 for r in codex_review_submissions:
-                    r_dt = parse_iso_utc(r.get("submittedAt", ""))
+                    r_dt = parse_iso_utc(timestamp_field(r, "submittedAt", "submitted_at", "createdAt", "created_at"))
                     if r_dt is None or cp_dt is None or r_dt <= cp_dt:
                         continue
                     body = r.get("body", "") or ""
