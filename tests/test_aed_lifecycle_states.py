@@ -1016,8 +1016,10 @@ class RegistryPrimaryWorktreeSyncPolicyTests(unittest.TestCase):
         HOLD_POST_MERGE_CI_NOT_OBSERVED,
         AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR,
         PR_MERGED_PENDING_CLOSEOUT, PR_MERGED_AND_CLOSED_OUT,
-        HOLD_RESUME_CHECKPOINT_NEEDED). No state was added in
-        this PR.
+        HOLD_RESUME_CHECKPOINT_NEEDED) plus the two narrow
+        status descriptions added in PR #402 (CODEX_CLEAN_PASS,
+        HOLD_PR_NOT_OPEN) for the audit_codex_response_for_pr.py
+        classifier. No other state was added in this PR.
         """
         expected_states = {
             "NOT_RUN",
@@ -1039,6 +1041,8 @@ class RegistryPrimaryWorktreeSyncPolicyTests(unittest.TestCase):
             "PR_MERGED_PENDING_CLOSEOUT",
             "PR_MERGED_AND_CLOSED_OUT",
             "HOLD_RESUME_CHECKPOINT_NEEDED",
+            "CODEX_CLEAN_PASS",
+            "HOLD_PR_NOT_OPEN",
         }
         actual_states = set(self.data["states"].keys())
         self.assertEqual(

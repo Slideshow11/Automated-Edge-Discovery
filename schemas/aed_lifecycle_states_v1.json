@@ -265,6 +265,30 @@
       "merge_allowed": false,
       "closeout_allowed": false,
       "notes": "Resume checkpoint rule (codified 2026-06-10). Use this state when a continuation prompt lacks enough durable evidence to determine whether the next action is CI polling, Codex polling, thread resolution, merge, audit append, or cleanup. The operator must reconstruct state using read-only checks before proceeding. Policy-level prohibitions while in this state (encoded here as prose because they are not in the validator's canonical mutation vocabulary): do not perform a duplicate Codex ping, do not rewrite any already-appended audit row, and do not repeat an already-completed mutation. After the operator reconstructs the prior verified state, the next state is that prior non-terminal state; if merge is already verified complete, the next state is PR_MERGED_PENDING_CLOSEOUT; if closeout is already verified complete, the next state is PR_MERGED_AND_CLOSED_OUT. The canonical mutation vocabulary covers pr_merge, thread_resolve, comment_delete, review_dismiss, and force_push; the policy-level prohibitions (duplicate Codex ping, audit rewrite, repeated already-completed mutation) are documented here for the operator's reference. The validator will reject any token outside the canonical mutation vocabulary, so this entry uses the canonical tokens for the five audit-trail-prohibitions and the prose notes for the three policy-level prohibitions."
+    },
+    "CODEX_CLEAN_PASS": {
+      "category": "informational",
+      "description": "Codex clean-passed the current head via a PR-level issue comment or a formal review submission. The classifier that emits this state is scripts/local/audit_codex_response_for_pr.py. This state is returned when a clean-pass comment or review is detected but the classifier has no thread inventory and no mergeStateStatus signal. In normal operation the classifier returns CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED or MERGE_READY_AWAITING_HUMAN_AUTHORIZATION instead. Do not interpret CODEX_CLEAN_PASS as merge-ready by itself; re-run the classifier with mergeStateStatus in scope before authorizing a merge.",
+      "evidence_required": ["pr_number", "head_sha", "clean_pass_comment_id or clean_pass_review_id", "clean_pass_source"],
+      "allowed_next_states": ["CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED", "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION", "HOLD_MERGE_STATE_BLOCKED", "HOLD_NEW_CODEX_THREAD"],
+      "allowed_mutations": [],
+      "forbidden_mutations": ["pr_merge", "thread_resolve", "pr_close", "comment_delete", "review_dismiss", "force_push"],
+      "human_authorization_required": false,
+      "merge_allowed": false,
+      "closeout_allowed": false,
+      "notes": "Added 2026-06-11 with the audit_codex_response_for_pr.py classifier (narrow status description per the PR #402 spec)."
+    },
+    "HOLD_PR_NOT_OPEN": {
+      "category": "hold",
+      "description": "PR is not in OPEN state. Codex response classification is meaningful only on OPEN PRs (or a deliberate post-merge resume). Stop and inspect the PR state before any further mutation. The classifier returns this when the PR is MERGED or CLOSED. If MERGED, the next state is determined by the closeout pipeline (PR_MERGED_PENDING_CLOSEOUT or PR_MERGED_AND_CLOSED_OUT). If CLOSED without merge, the run is abandoned.",
+      "evidence_required": ["pr_number", "head_sha", "pr_state", "observed_state_at_classification"],
+      "allowed_next_states": ["HOLD_CODEX_RESPONSE_PENDING", "PR_MERGED_PENDING_CLOSEOUT", "PR_MERGED_AND_CLOSED_OUT"],
+      "allowed_mutations": [],
+      "forbidden_mutations": ["pr_merge", "thread_resolve", "pr_close", "comment_delete", "review_dismiss", "force_push"],
+      "human_authorization_required": false,
+      "merge_allowed": false,
+      "closeout_allowed": false,
+      "notes": "Added 2026-06-11 with the audit_codex_response_for_pr.py classifier (narrow status description per the PR #402 spec)."
     }
   }
 }

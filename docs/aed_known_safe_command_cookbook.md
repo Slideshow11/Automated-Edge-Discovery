@@ -225,6 +225,98 @@ Classify the result:
   is also `CLEAN`.
 - Codex does not respond within the bounded poll → `HOLD_CODEX_RESPONSE_PENDING`.
 
+### 6.6 Codex response classifier (read-only, source of truth)
+
+`scripts/local/audit_codex_response_for_pr.py` is the canonical
+classifier for the Codex response on a PR. It is the source of truth
+for Codex response classification in future PR lifecycle prompts and
+MUST be used instead of ad-hoc gh queries that watch only formal
+review submissions.
+
+The classifier reads three surfaces together, on every poll:
+
+1. PR-level issue comments (Codex clean passes frequently arrive here
+   as a PR-level comment, not as a formal review submission).
+2. Formal `PullRequestReview` submissions.
+3. Review threads, with `isResolved` and `isOutdated` from GraphQL.
+
+A classifier or operator loop that watches only formal review
+submissions WILL miss Codex clean-pass comments and report
+`HOLD_CODEX_RESPONSE_PENDING` indefinitely. This is the failure mode
+the new classifier exists to prevent.
+
+One-shot read (no polling, just the current state):
+
+```
+python3 scripts/local/audit_codex_response_for_pr.py \
+  --repo Slideshow11/Automated-Edge-Discovery \
+  --pr <PR> \
+  --expected-head <40-char head SHA> \
+  --ping-comment-id <dbid> \
+  --ping-created-at <ISO-8601> \
+  --max-polls 1 \
+  --output-json /tmp/codex_response.json \
+  --output-md /tmp/codex_response.md
+```
+
+Bounded poll (max 10 polls, 30s between, hard cap):
+
+```
+python3 scripts/local/audit_codex_response_for_pr.py \
+  --repo Slideshow11/Automated-Edge-Discovery \
+  --pr <PR> \
+  --expected-head <40-char head SHA> \
+  --ping-comment-id <dbid> \
+  --ping-created-at <ISO-8601> \
+  --max-polls 10 \
+  --poll-seconds 30 \
+  --output-json /tmp/codex_response.json \
+  --output-md /tmp/codex_response.md
+```
+
+Hard polling budget. The classifier never sleeps after the budget is
+exhausted and never runs watch commands. When `max-polls` is reached
+without a clean pass, an active finding, or a head-change, the script
+returns `HOLD_CODEX_RESPONSE_PENDING` with `polls_used` and
+`last_seen_codex_*` populated. The operator must STOP polling and
+report `HOLD_CODEX_RESPONSE_PENDING`; do not continue sleeping, do
+not start a second classifier run, and do not post a duplicate Codex
+ping. If a ping has not yet been posted for this head, the next safe
+action is to post a gate-safe Codex review ping and then re-run the
+classifier with a fresh budget.
+
+Read-only. The classifier performs only read operations against
+GitHub. It does not resolve threads, dismiss reviews, delete
+comments, or merge. Do not modify it to perform mutations.
+
+Output lifecycle states:
+
+- `CODEX_CLEAN_PASS` — a clean-pass comment or review was detected;
+  this is a partial signal returned when there is no thread inventory
+  and no `mergeStateStatus` in scope. Re-run with full info before
+  authorizing a merge.
+- `CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED` — clean pass detected and one
+  or more outdated unresolved threads remain. Request explicit human
+  authorization to resolve ONLY the outdated threads; do not resolve
+  active threads; do not merge yet.
+- `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` — clean pass detected,
+  no unresolved threads, and `mergeStateStatus` is `CLEAN`. Request
+  explicit human authorization to merge with the exact live 40-char
+  head SHA. Use guarded squash merge with `--match-head-commit`. Do
+  not include the admin bypass or the auto-merge enablement flag.
+- `HOLD_NEW_CODEX_THREAD` — Codex raised a current-head active
+  finding OR a finding that arrived after the clean pass. Apply a
+  fix-and-resubmit turn. Do not resolve threads; do not merge.
+- `HOLD_CODEX_RESPONSE_PENDING` — poll budget exhausted with no
+  response. Stop and report; do not continue sleeping.
+- `HOLD_HEAD_CHANGED` — observed PR head does not match the expected
+  head. Re-fetch and re-verify before any further mutation.
+- `HOLD_PR_NOT_OPEN` — PR is `MERGED` or `CLOSED`. Inspect the state
+  before any further mutation.
+- `HOLD_MERGE_STATE_BLOCKED` — clean pass + no unresolved threads but
+  `mergeStateStatus` is not `CLEAN`. Investigate branch protection
+  before retrying; do not bypass.
+
 ## 7. Review-thread inspection cookbook
 
 A review-thread inspection is **complete** only when **every page
