@@ -3399,3 +3399,280 @@ def test_inventory_complete_packet_continues_with_fresh_poll_after_failure(monke
     # api_errors should contain GraphQL errors from at least
     # one poll.
     assert any("GraphQL errors" in e for e in pkt["api_errors"])
+
+
+# ---------------------------------------------------------------------------
+# P2 #3 regression tests: clear stale stop state before retrying
+# ---------------------------------------------------------------------------
+#
+# When the classifier continues after an incomplete inventory
+# that already saw an active Codex finding, the OLD code would
+# leave final_status = HOLD_NEW_CODEX_THREAD and
+# stop_reason = "active_finding_with_incomplete_inventory". If a
+# later poll completes successfully with no active threads and
+# no clean pass, the loop would exhaust while preserving the
+# stale stop_reason, and the post-loop exhaustion fallback
+# (HOLD_CODEX_RESPONSE_PENDING) would be skipped. The per-poll
+# state reset clears the terminal decision state at the start
+# of each poll so a later successful poll can produce a fresh
+# decision.
+
+
+def test_stale_stop_state_cleared_after_poll_2_no_active_no_clean_pass(monkeypatch, tmp_path):
+    """
+    P2 #3: Poll 1 has incomplete inventory + active finding
+    seen (hasNextPage=true with a partial Codex active finding).
+    Poll 2 has complete inventory + no active threads + no
+    clean pass. After max polls exhausted, the final state must
+    be HOLD_CODEX_RESPONSE_PENDING, NOT HOLD_NEW_CODEX_THREAD.
+    The OLD code would preserve the stale stop_reason from
+    poll 1 and skip the exhaustion fallback.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Poll 1: hasNextPage=true with a partial
+                # Codex active finding. The active finding is
+                # visible on this page so the gate sets
+                # final_status=HOLD_NEW_CODEX_THREAD with
+                # stop_reason=active_finding_with_incomplete_inventory.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_2"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_poll1_partial_finding",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99701,
+                                    "url": "https://example/99701",
+                                    "body": "P1 finding on current head",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 1,
+                                    "author": {"login": CODEX_LOGIN},
+                                }]},
+                            },
+                        ],
+                    }
+                }}}})
+            else:
+                # Poll 2: complete inventory, no threads, no
+                # clean pass. The per-poll state reset must
+                # clear poll 1's HOLD_NEW_CODEX_THREAD so
+                # poll 2's exhausted state emits
+                # HOLD_CODEX_RESPONSE_PENDING.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = "[]"
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "3", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The post-loop exhaustion fallback must fire.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
+    # Polling exhausted (loop ran all 3 polls).
+    assert pkt["polls_used"] == 3
+    assert pkt["polling_exhausted"] is True
+
+
+def test_stale_stop_state_cleared_final_stop_reason_is_exhaustion(monkeypatch, tmp_path):
+    """
+    P2 #3: The final stop_reason must describe polling
+    exhaustion, NOT the stale active_finding_with_incomplete_inventory
+    from poll 1. The recommendation must reflect polling
+    exhaustion too.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_2"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_poll1_partial_finding_2",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99801,
+                                    "url": "https://example/99801",
+                                    "body": "P1 finding",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 2,
+                                    "author": {"login": CODEX_LOGIN},
+                                }]},
+                            },
+                        ],
+                    }
+                }}}})
+            else:
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = "[]"
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # stop_reason must NOT be the stale
+    # "active_finding_with_incomplete_inventory" from poll 1.
+    assert pkt["stop_reason"] != "active_finding_with_incomplete_inventory"
+    # The post-loop exhaustion code sets a clear exhaustion reason.
+    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # The recommendation must reflect polling exhaustion (the
+    # canonical HOLD_CODEX_RESPONSE_PENDING message), not
+    # the inventory-incomplete message from poll 1.
+    assert "bounded poll budget" in pkt["recommendation"].lower()
+
+
+def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatch, tmp_path):
+    """
+    P2 #3: Poll 1 has incomplete inventory + active finding
+    seen. Poll 2 has complete inventory + clean pass + zero
+    unresolved threads + mergeable CLEAN. The per-poll state
+    reset must allow poll 2 to override poll 1's stale
+    HOLD_NEW_CODEX_THREAD and emit MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_2"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_poll1_partial_finding_3",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99901,
+                                    "url": "https://example/99901",
+                                    "body": "P1 finding",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 3,
+                                    "author": {"login": CODEX_LOGIN},
+                                }]},
+                            },
+                        ],
+                    }
+                }}}})
+            else:
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            if call_count["n"] == 0:
+                m.stdout = "[]"
+            else:
+                # Post-ping clean pass on poll 2.
+                m.stdout = json.dumps([
+                    make_issue_comment(
+                        author=CODEX_LOGIN,
+                        body=codex_clean_pass_body(),
+                        created_at="2026-06-11T18:00:00Z",
+                        comment_id=99902,
+                    )
+                ])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "3", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Poll 2's clean inventory + clean pass must drive the
+    # final decision, overriding poll 1's stale
+    # HOLD_NEW_CODEX_THREAD.
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["stop_reason"] == "merge_ready"
+    assert pkt["unresolved_thread_count"] == 0
+    assert pkt["active_threads"] == []

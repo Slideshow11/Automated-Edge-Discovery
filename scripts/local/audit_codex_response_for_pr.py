@@ -659,7 +659,7 @@ def classify(
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
 
-        # ---- Per-poll thread inventory reset ----
+        # ---- Per-poll state reset ----
         # The thread lists, inventory completeness flag, and
         # inventory error count must reflect ONLY the current
         # poll's snapshot, not accumulated state from earlier
@@ -671,12 +671,38 @@ def classify(
         # threads. api_errors are accumulated across polls so
         # the operator can see all failures, but the inventory
         # completeness and per-poll thread buckets are reset.
+        #
+        # We ALSO reset the terminal decision state
+        # (final_status, stop_reason, recommendation) and the
+        # clean-pass detection state. This is required so a
+        # later successful poll can produce a fresh decision
+        # instead of inheriting a stale HOLD_NEW_CODEX_THREAD
+        # from an earlier poll that saw an active finding on
+        # partial inventory. Without this reset, if poll 1
+        # emitted final_status=HOLD_NEW_CODEX_THREAD with
+        # stop_reason="active_finding_with_incomplete_inventory"
+        # and poll 2 completed successfully with no active
+        # threads and no clean pass, the loop would exhaust
+        # with stop_reason still set from poll 1 and the
+        # post-loop exhaustion fallback (HOLD_CODEX_RESPONSE_PENDING)
+        # would be skipped.
         active_threads = []
         outdated_threads = []
         resolved_threads = []
         review_thread_inventory_complete = True
         review_thread_inventory_error_count = 0
         review_thread_inventory_last_error = ""
+        # Reset terminal decision state.
+        final_status = STATUS_HOLD_CODEX_PENDING
+        recommendation = RECOMMENDATIONS[STATUS_HOLD_CODEX_PENDING]
+        stop_reason = None
+        # Reset clean-pass detection; the per-poll code in
+        # section 6 will re-detect or leave it as False.
+        clean_pass_detected = False
+        clean_pass_comment_id = None
+        clean_pass_review_id = None
+        clean_pass_source = None
+        clean_pass_at = None
 
         # ---- Pre-poll fail-closed gate: malformed ping timestamp ----
         # When the operator supplied --ping-created-at but it
@@ -1065,11 +1091,20 @@ def classify(
         if poll_idx < max_polls:
             time.sleep(poll_seconds)
 
-    # If we exited the loop without a stop_reason, polling is exhausted
+    # If we exited the loop without a stop_reason, polling is
+    # exhausted without making a classification. This is the
+    # canonical exhaustion fallback. Note that with the
+    # per-poll state reset, this branch is reachable: a prior
+    # poll may have set stop_reason (e.g. via the inventory
+    # gate) but the current poll's reset cleared it; if the
+    # current poll also made no decision, we fall through to
+    # here and emit the correct HOLD_CODEX_RESPONSE_PENDING
+    # exhaustion state.
     if stop_reason is None:
         polling_exhausted = True
         final_status = STATUS_HOLD_CODEX_PENDING
         recommendation = RECOMMENDATIONS[STATUS_HOLD_CODEX_PENDING]
+        stop_reason = "polling_exhausted_no_codex_response"
 
     # Build the JSON packet
     packet: Dict[str, Any] = {
@@ -1118,6 +1153,7 @@ def classify(
         "review_thread_inventory_last_error": review_thread_inventory_last_error,
         "polls_used": polls_used,
         "polling_exhausted": polling_exhausted,
+        "stop_reason": stop_reason,
         "max_polls": max_polls,
         "poll_seconds": poll_seconds,
         "api_errors": api_errors,
@@ -1257,6 +1293,9 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     lines.append(f"- **Polls used:** `{packet.get('polls_used', 0)}` / `{packet.get('max_polls', 0)}`  ")
     lines.append(f"- **Poll seconds:** `{packet.get('poll_seconds', 0)}`  ")
     lines.append(f"- **Polling exhausted:** `{packet.get('polling_exhausted', False)}`  ")
+    stop_reason = packet.get("stop_reason", "")
+    if stop_reason:
+        lines.append(f"- **Stop reason:** `{stop_reason}`  ")
     lines.append(f"- **Last seen Codex comment:** `{packet.get('last_seen_codex_comment_at', '')}` "
                  f"(id=`{packet.get('last_seen_codex_comment_id', '')}`)  ")
     lines.append(f"- **Last seen Codex review:** `{packet.get('last_seen_codex_review_at', '')}` "
