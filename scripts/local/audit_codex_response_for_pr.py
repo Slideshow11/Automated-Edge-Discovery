@@ -628,6 +628,26 @@ def classify(
     review_thread_inventory_error_count: int = 0
     review_thread_inventory_last_error: str = ""
 
+    # Issue-comment inventory completeness. PR-level issue
+    # comments are REQUIRED evidence: a Codex clean pass or
+    # a newer finding may live on a PR-level issue comment
+    # rather than on a formal review submission. If the
+    # /issues/{pr}/comments fetch fails, the classifier MUST
+    # NOT emit merge-ready / clean-pass states on that poll.
+    # See the gate in section 8.
+    issue_comment_inventory_complete: bool = True
+    issue_comment_inventory_error_count: int = 0
+    issue_comment_inventory_last_error: str = ""
+
+    # Review-submission inventory completeness. Formal
+    # PullRequestReview submissions are REQUIRED evidence:
+    # a newer formal Codex review such as CHANGES_REQUESTED
+    # could be missed if the /pulls/{pr}/reviews fetch fails.
+    # See the gate in section 8.
+    review_submission_inventory_complete: bool = True
+    review_submission_inventory_error_count: int = 0
+    review_submission_inventory_last_error: str = ""
+
     # Stop conditions
     stop_reason: Optional[str] = None
 
@@ -713,6 +733,12 @@ def classify(
         review_thread_inventory_complete = True
         review_thread_inventory_error_count = 0
         review_thread_inventory_last_error = ""
+        issue_comment_inventory_complete = True
+        issue_comment_inventory_error_count = 0
+        issue_comment_inventory_last_error = ""
+        review_submission_inventory_complete = True
+        review_submission_inventory_error_count = 0
+        review_submission_inventory_last_error = ""
         # Reset raw poll snapshots. The fetch helpers at
         # section 2 (issue comments), section 3 (reviews),
         # and section 4 (review threads) will repopulate
@@ -826,20 +852,50 @@ def classify(
             break
 
         # ---- 2. PR-level issue comments (Codex clean passes live here) ----
+        # PR-level issue comments are REQUIRED evidence for
+        # merge readiness. A clean pass OR a newer finding may
+        # live on a PR-level issue comment rather than on a
+        # formal review submission. If this fetch fails, the
+        # classifier MUST NOT emit merge-ready / clean-pass
+        # states on this poll; the gate in section 8 enforces
+        # fail-closed behavior. We still record the raw
+        # raw_data=[] (cleared by the per-poll reset) so
+        # upstream code can see the failure cleanly.
         ok_issue, issue_data, err_issue = gh_api_paginated(
             repo, f"issues/{pr_number}/comments", timeout=api_timeout,
         )
         if not ok_issue:
-            api_errors.append(f"issue_comments: {err_issue}")
+            issue_comment_inventory_complete = False
+            issue_comment_inventory_error_count += 1
+            issue_comment_inventory_last_error = err_issue
+            api_errors.append(
+                f"issue_comments: {err_issue}; PR-level issue-comment "
+                "inventory is incomplete; classifier cannot trust a "
+                "clean-pass / merge-ready decision from this poll."
+            )
         else:
             pr_issue_comments = issue_data
 
         # ---- 3. Formal PullRequestReview submissions ----
+        # Formal PullRequestReview submissions are REQUIRED
+        # evidence for merge readiness. A newer formal Codex
+        # review such as CHANGES_REQUESTED could be missed if
+        # this fetch fails. If it fails, the classifier MUST
+        # NOT emit merge-ready / clean-pass states on this
+        # poll; the gate in section 8 enforces fail-closed
+        # behavior.
         ok_rev, review_data, err_rev = gh_api_paginated(
             repo, f"pulls/{pr_number}/reviews", timeout=api_timeout,
         )
         if not ok_rev:
-            api_errors.append(f"reviews: {err_rev}")
+            review_submission_inventory_complete = False
+            review_submission_inventory_error_count += 1
+            review_submission_inventory_last_error = err_rev
+            api_errors.append(
+                f"reviews: {err_rev}; review-submission inventory is "
+                "incomplete; classifier cannot trust a clean-pass / "
+                "merge-ready decision from this poll."
+            )
         else:
             pr_reviews = review_data
 
@@ -1048,8 +1104,11 @@ def classify(
                         break
 
         # ---- Inventory completeness gate (fail closed per poll) ----
-        # If the CURRENT poll's review-thread inventory is
-        # incomplete (GraphQL failed, response had errors,
+        # All three Codex response surfaces are REQUIRED
+        # evidence: PR-level issue comments, formal review
+        # submissions, and review threads. If the CURRENT
+        # poll's inventory for any of them is incomplete
+        # (REST or GraphQL failed, response had errors,
         # shape missing expected data, hasNextPage=true, JSON
         # parse failed, etc.), the classifier MUST NOT emit
         # CODEX_CLEAN_PASS, CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED,
@@ -1061,14 +1120,31 @@ def classify(
         # data). We DO NOT break here: later polls may succeed
         # and yield a clean classification based on their own
         # fresh inventory.
+        #
+        # Determine which surfaces are incomplete on this poll.
+        incomplete_surfaces: List[str] = []
+        if not issue_comment_inventory_complete:
+            incomplete_surfaces.append("issue_comment")
+        if not review_submission_inventory_complete:
+            incomplete_surfaces.append("review_submission")
         if not review_thread_inventory_complete:
+            incomplete_surfaces.append("review_thread")
+        if incomplete_surfaces:
+            # When ANY required surface is incomplete on this
+            # poll, the classifier fails closed. A confirmed
+            # active finding (visible on the partial inventory
+            # we did fetch) still drives HOLD_NEW_CODEX_THREAD;
+            # otherwise the safe per-poll state is
+            # HOLD_CODEX_RESPONSE_PENDING.
             if has_active_blocker or newer_finding_after_clean_pass:
                 final_status = STATUS_HOLD_NEW_THREAD
                 recommendation = (
                     RECOMMENDATIONS[STATUS_HOLD_NEW_THREAD]
-                    + " (Note: review-thread inventory is also "
-                    "incomplete; some findings may not have been "
-                    "seen. Inspect api_errors and re-run.)"
+                    + " (Note: required Codex response-surface "
+                    "inventory is also incomplete: "
+                    + ", ".join(incomplete_surfaces)
+                    + "; some findings may not have been seen. "
+                    "Inspect api_errors and re-run.)"
                 )
                 stop_reason = "active_finding_with_incomplete_inventory"
                 # Continue to next poll instead of breaking, so
@@ -1080,11 +1156,12 @@ def classify(
                 break
             final_status = STATUS_HOLD_CODEX_PENDING
             recommendation = (
-                "Review-thread inventory could not be fully fetched; "
-                "merge readiness cannot be trusted until inventory is "
-                "complete. Re-run later with a fresh budget to retry "
-                "the GraphQL review-thread fetch. See api_errors for "
-                "the underlying failure."
+                "Required Codex response surfaces could not be "
+                "fully fetched: "
+                + ", ".join(incomplete_surfaces)
+                + "; merge readiness cannot be trusted until all "
+                "surfaces are complete. Re-run later with a fresh "
+                "budget. See api_errors for the underlying failures."
             )
             stop_reason = "inventory_incomplete"
             # Continue to next poll instead of breaking, so a
@@ -1185,6 +1262,21 @@ def classify(
         "review_thread_inventory_complete": review_thread_inventory_complete,
         "review_thread_inventory_error_count": review_thread_inventory_error_count,
         "review_thread_inventory_last_error": review_thread_inventory_last_error,
+        # Issue-comment inventory completeness. Required evidence:
+        # PR-level issue comments may carry the Codex clean pass
+        # OR a newer Codex finding. When incomplete the classifier
+        # has already failed closed in section 8.
+        "issue_comment_inventory_complete": issue_comment_inventory_complete,
+        "issue_comment_inventory_error_count": issue_comment_inventory_error_count,
+        "issue_comment_inventory_last_error": issue_comment_inventory_last_error,
+        # Review-submission inventory completeness. Required
+        # evidence: a newer formal Codex review (e.g.
+        # CHANGES_REQUESTED) may live on a formal review
+        # submission. When incomplete the classifier has
+        # already failed closed in section 8.
+        "review_submission_inventory_complete": review_submission_inventory_complete,
+        "review_submission_inventory_error_count": review_submission_inventory_error_count,
+        "review_submission_inventory_last_error": review_submission_inventory_last_error,
         "polls_used": polls_used,
         "polling_exhausted": polling_exhausted,
         "stop_reason": stop_reason,
@@ -1304,7 +1396,52 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     # Surface review-thread inventory completeness. When the
     # GraphQL review-thread fetch is incomplete the classifier has
     # already failed closed and refused to emit merge-ready states.
+    # The same fail-closed rule applies to PR-level issue comments
+    # and to formal review submissions — all three Codex response
+    # surfaces are required evidence. The section header
+    # `## Review-thread inventory` is preserved for downstream
+    # tooling and the existing operator scripts that grep for it;
+    # the new surfaces are listed alongside the review-thread
+    # inventory under the same header so the legacy
+    # `## Review-thread inventory` substring is always present in
+    # the rendered markdown.
     lines.append("## Review-thread inventory\n")
+    issue_complete = packet.get("issue_comment_inventory_complete", True)
+    issue_err_count = packet.get("issue_comment_inventory_error_count", 0) or 0
+    issue_last_err = packet.get("issue_comment_inventory_last_error", "") or ""
+    if issue_complete:
+        lines.append(
+            "- **Issue-comment inventory complete:** ✅ "
+            "(PR-level /issues/{n}/comments fetched and validated)\n"
+        )
+    else:
+        lines.append(
+            "- **Issue-comment inventory complete:** ❌ "
+            "(classifier failed closed; merge readiness cannot be "
+            "trusted)\n"
+        )
+        lines.append(f"  - **Error count:** `{issue_err_count}`")
+        if issue_last_err:
+            lines.append(f"  - **Last error:** `{issue_last_err}`")
+        lines.append("")
+    rev_complete = packet.get("review_submission_inventory_complete", True)
+    rev_err_count = packet.get("review_submission_inventory_error_count", 0) or 0
+    rev_last_err = packet.get("review_submission_inventory_last_error", "") or ""
+    if rev_complete:
+        lines.append(
+            "- **Review-submission inventory complete:** ✅ "
+            "(formal /pulls/{n}/reviews fetched and validated)\n"
+        )
+    else:
+        lines.append(
+            "- **Review-submission inventory complete:** ❌ "
+            "(classifier failed closed; merge readiness cannot be "
+            "trusted)\n"
+        )
+        lines.append(f"  - **Error count:** `{rev_err_count}`")
+        if rev_last_err:
+            lines.append(f"  - **Last error:** `{rev_last_err}`")
+        lines.append("")
     inv_complete = packet.get("review_thread_inventory_complete", True)
     inv_err_count = packet.get("review_thread_inventory_error_count", 0) or 0
     inv_last_err = packet.get("review_thread_inventory_last_error", "") or ""
@@ -1322,6 +1459,13 @@ def render_markdown(packet: Dict[str, Any]) -> str:
             lines.append(f"- **Last inventory error:** `{inv_last_err}`\n")
         else:
             lines.append("")
+    if not (issue_complete and rev_complete and inv_complete):
+        lines.append(
+            "_At least one required Codex response-surface "
+            "inventory is incomplete. See `api_errors` below and "
+            "the `stop_reason` in the Polling summary. Classifier "
+            "is holding at HOLD_CODEX_RESPONSE_PENDING._\n"
+        )
 
     lines.append("## Polling summary\n")
     lines.append(f"- **Polls used:** `{packet.get('polls_used', 0)}` / `{packet.get('max_polls', 0)}`  ")

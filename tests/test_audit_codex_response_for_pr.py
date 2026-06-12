@@ -3126,7 +3126,12 @@ def test_raw_poll_snapshot_reset_comments_fetch_failure(monkeypatch, tmp_path):
     assert pkt["status"] != mod.STATUS_MERGE_READY
     # The post-loop exhaustion fallback must fire.
     assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # The latest poll's issue-comments surface is incomplete
+    # (the inventory gate in section 8 fires and fails
+    # closed); the stop_reason must reflect inventory
+    # incompleteness, NOT the post-loop exhaustion fallback
+    # which is reserved for "no decision at all" cases.
+    assert pkt["stop_reason"] == "inventory_incomplete"
     # api_errors must clearly identify the latest failed surface.
     assert any("issue_comments" in e for e in pkt["api_errors"])
 
@@ -3214,11 +3219,16 @@ def test_raw_poll_snapshot_reset_reviews_fetch_failure(monkeypatch, tmp_path):
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
     # The latest poll (poll 2) had no active threads, no
-    # clean pass, and failed reviews fetch. The
-    # post-loop exhaustion fallback must fire.
+    # clean pass, and failed reviews fetch. The classifier
+    # must hold closed on the latest poll's evidence.
     assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
     assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # The latest poll's reviews surface is incomplete (the
+    # inventory gate in section 8 fires and fails closed);
+    # the stop_reason must reflect inventory
+    # incompleteness, NOT the post-loop exhaustion fallback
+    # which is reserved for "no decision at all" cases.
+    assert pkt["stop_reason"] == "inventory_incomplete"
     # api_errors must clearly identify the latest failed surface.
     assert any("reviews" in e for e in pkt["api_errors"])
 
@@ -4078,3 +4088,944 @@ def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatc
     assert pkt["stop_reason"] == "merge_ready"
     assert pkt["unresolved_thread_count"] == 0
     assert pkt["active_threads"] == []
+
+
+# ---------------------------------------------------------------------------
+# P1 #1: Fail closed when issue comments cannot be read
+# P1 #2: Fail closed when reviews cannot be read
+# ---------------------------------------------------------------------------
+#
+# Both P1s require treating the three Codex response surfaces
+# (issue comments, formal review submissions, review threads) as
+# REQUIRED evidence. If any of them cannot be fetched in the latest
+# poll, the classifier MUST NOT emit merge-ready / clean-pass
+# states and MUST fail closed at HOLD_CODEX_RESPONSE_PENDING
+# (NOT HOLD_NEW_CODEX_THREAD — that's reserved for confirmed
+# active findings; a missing surface is a hold on response, not
+# a hold on a new finding).
+#
+# The packet must expose three independent inventory completeness
+# flags so the operator (and the markdown report) can see WHICH
+# surface failed: issue_comment_inventory_complete,
+# review_submission_inventory_complete, review_thread_inventory_complete.
+
+
+def test_p1_issue_comments_fetch_failure_fails_closed_no_merge_ready(
+    monkeypatch, tmp_path,
+):
+    """
+    P1 #1: formal review clean pass + mergeable CLEAN + zero
+    review threads + issue-comments fetch failure must NOT
+    emit MERGE_READY_AWAITING_HUMAN_AUTHORIZATION. The issue
+    comments surface is required evidence; a fetch failure
+    must fail closed at HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            # Issue-comments fetch FAILS.
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            # Review fetch succeeds with a formal APPROVED clean
+            # pass. The old code would happily emit merge-ready
+            # because the issue-comments fetch failed and the
+            # comment list was empty.
+            m.stdout = json.dumps([
+                make_review(
+                    author=CODEX_LOGIN,
+                    state="APPROVED",
+                    body=codex_clean_pass_body(),
+                    submitted_at="2026-06-11T18:00:00Z",
+                    review_id=99871,
+                ),
+            ])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+
+
+def test_p1_issue_comments_fetch_failure_marks_inventory_incomplete(
+    monkeypatch, tmp_path,
+):
+    """P1 #1: packet must expose issue_comment_inventory_complete=False."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([
+                make_review(
+                    author=CODEX_LOGIN,
+                    state="APPROVED",
+                    body=codex_clean_pass_body(),
+                    submitted_at="2026-06-11T18:00:00Z",
+                    review_id=99872,
+                ),
+            ])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["issue_comment_inventory_complete"] is False
+    assert pkt["issue_comment_inventory_error_count"] > 0
+    # The other two surfaces DID succeed — must stay True.
+    assert pkt["review_submission_inventory_complete"] is True
+    assert pkt["review_thread_inventory_complete"] is True
+
+
+def test_p1_issue_comments_fetch_failure_populates_api_errors(
+    monkeypatch, tmp_path,
+):
+    """P1 #1: api_errors must clearly identify issue-comments as failed."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert any("issue_comments" in e for e in pkt["api_errors"])
+    # The error message must explain the issue-comment inventory
+    # was incomplete, not just be the raw stderr line.
+    assert any(
+        "issue-comment" in e.lower() or "issue comment" in e.lower()
+        for e in pkt["api_errors"]
+    )
+
+
+def test_p1_issue_comments_poll_2_failure_does_not_reuse_poll_1(
+    monkeypatch, tmp_path,
+):
+    """
+    P1 #1: poll 1 has incomplete thread inventory AND a
+    clean pass. The loop continues to poll 2 (via the
+    inventory gate's `continue`). Poll 2 succeeds on
+    threads but its issue-comments fetch fails. The
+    classifier must NOT reuse poll 1's clean pass. The
+    latest poll's issue_comment_inventory_complete must
+    be False and the inventory gate in section 8 must
+    hold at HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["graphql"] = call_count.get("graphql", 0) + 1
+            if call_count["graphql"] == 1:
+                # Poll 1: thread fetch INCOMPLETE (hasNextPage),
+                # with the inventory gate firing and continuing
+                # to poll 2.
+                m.stdout = json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                            "nodes": [],
+                        }
+                    }}},
+                    "errors": [{"message": "hasNextPage=true"}],
+                })
+            else:
+                # Poll 2: thread fetch succeeds (empty).
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Poll 1: clean pass present.
+                m.stdout = json.dumps([
+                    make_issue_comment(
+                        author=CODEX_LOGIN,
+                        body=codex_clean_pass_body(),
+                        created_at="2026-06-11T18:00:00Z",
+                        comment_id=99881,
+                    ),
+                ])
+            else:
+                # Poll 2: fetch FAILS.
+                m.returncode = 22
+                m.stderr = "gh api returned 22: HTTP 500"
+                m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Must NOT be merge-ready from poll 1's stale clean pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    # Polling exhausted -> the latest poll's inventory gate
+    # fails closed (issue_comment_inventory_complete=False).
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert any("issue_comments" in e for e in pkt["api_errors"])
+    # The latest poll's issue_comment_inventory_complete must be False.
+    assert pkt["issue_comment_inventory_complete"] is False
+    # Polls_used should be 2 (both polls ran).
+    assert pkt["polls_used"] == 2
+
+
+def test_p1_reviews_fetch_failure_fails_closed_no_merge_ready(
+    monkeypatch, tmp_path,
+):
+    """
+    P1 #2: issue-comment clean pass + mergeable CLEAN + zero
+    review threads + review fetch failure must NOT emit
+    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION. The formal
+    review submissions surface is required evidence.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99891,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            # Review fetch FAILS.
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+
+
+def test_p1_reviews_fetch_failure_marks_inventory_incomplete(
+    monkeypatch, tmp_path,
+):
+    """P1 #2: packet must expose review_submission_inventory_complete=False."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99892,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["review_submission_inventory_complete"] is False
+    assert pkt["review_submission_inventory_error_count"] > 0
+    assert pkt["issue_comment_inventory_complete"] is True
+    assert pkt["review_thread_inventory_complete"] is True
+
+
+def test_p1_reviews_fetch_failure_populates_api_errors(
+    monkeypatch, tmp_path,
+):
+    """P1 #2: api_errors must clearly identify reviews as failed."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert any("reviews" in e for e in pkt["api_errors"])
+
+
+def test_p1_reviews_poll_2_failure_does_not_reuse_poll_1(
+    monkeypatch, tmp_path,
+):
+    """
+    P1 #2: poll 1 has incomplete thread inventory AND a
+    clean pass. The loop continues to poll 2 (via the
+    inventory gate's `continue`). Poll 2 succeeds on
+    threads but its reviews fetch fails. The classifier
+    must NOT reuse poll 1's clean pass. The latest poll's
+    review-submission inventory must be incomplete and the
+    inventory gate in section 8 must hold at
+    HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"graphql": 0, "reviews": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["graphql"] += 1
+            if call_count["graphql"] == 1:
+                # Poll 1: thread fetch INCOMPLETE (hasNextPage).
+                m.stdout = json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {"hasNextPage": True, "endCursor": "X"},
+                            "nodes": [],
+                        }
+                    }}},
+                    "errors": [{"message": "hasNextPage=true"}],
+                })
+            else:
+                # Poll 2: thread fetch succeeds (empty).
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99898,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            call_count["reviews"] += 1
+            if call_count["reviews"] == 1:
+                # Poll 1: reviews succeed (no findings).
+                m.stdout = json.dumps([])
+            else:
+                # Poll 2: reviews fetch FAILS.
+                m.returncode = 22
+                m.stderr = "gh api returned 22: HTTP 500"
+                m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Must NOT be merge-ready from poll 1's stale clean pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    # The latest poll's inventory gate fails closed
+    # (review_submission_inventory_complete=False).
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert any("reviews" in e for e in pkt["api_errors"])
+    assert pkt["review_submission_inventory_complete"] is False
+    assert pkt["polls_used"] == 2
+
+
+def test_p1_all_three_surfaces_complete_emits_merge_ready(
+    monkeypatch, tmp_path,
+):
+    """
+    All three Codex response surfaces (issue comments,
+    review submissions, review threads) fetched completely +
+    clean pass + zero unresolved threads + mergeable CLEAN
+    must emit MERGE_READY_AWAITING_HUMAN_AUTHORIZATION.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99901,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["issue_comment_inventory_complete"] is True
+    assert pkt["review_submission_inventory_complete"] is True
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_p1_threads_incomplete_alone_fails_closed(
+    monkeypatch, tmp_path,
+):
+    """
+    Issue-comments complete + reviews complete + threads
+    INCOMPLETE must still fail closed at HOLD_CODEX_RESPONSE_PENDING.
+    (Regression — review-thread surface is the originally-required
+    evidence. The new P1s add the other two surfaces; this
+    confirms the new code does not weaken the original gate.)
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": True, "endCursor": "X"}, "nodes": []}
+                }}},
+                "errors": [{"message": "hasNextPage=true"}],
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99911,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["issue_comment_inventory_complete"] is True
+    assert pkt["review_submission_inventory_complete"] is True
+    assert pkt["review_thread_inventory_complete"] is False
+
+
+def test_p1_issue_incomplete_alone_fails_closed(
+    monkeypatch, tmp_path,
+):
+    """
+    Issue-comments INCOMPLETE + reviews complete + threads
+    complete must fail closed at HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["issue_comment_inventory_complete"] is False
+    assert pkt["review_submission_inventory_complete"] is True
+    assert pkt["review_thread_inventory_complete"] is True
+
+
+def test_p1_reviews_incomplete_alone_fails_closed(
+    monkeypatch, tmp_path,
+):
+    """
+    Issue-comments complete + reviews INCOMPLETE + threads
+    complete must fail closed at HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99921,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["issue_comment_inventory_complete"] is True
+    assert pkt["review_submission_inventory_complete"] is False
+    assert pkt["review_thread_inventory_complete"] is True
+
+
+def test_p1_packet_exposes_all_three_inventory_completeness_fields():
+    """
+    The packet must always carry all three inventory completeness
+    booleans + error counts, even when the classifier exits
+    without a polling pass (e.g. invalid args).
+    """
+    # Run with an invalid SHA to hit the degraded packet path,
+    # which still writes a JSON file. But that path is in main(),
+    # not classify(), so we just call classify() directly with
+    # the simplest fixture to get a successful packet.
+    from unittest.mock import patch as mock_patch
+    from scripts.local import audit_codex_response_for_pr as mod2  # noqa
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    with mock_patch.object(mod2.subprocess, "run", runner):
+        pkt = mod2.classify(
+            repo=REPO, pr_number=402,
+            expected_head_sha=EXPECTED_HEAD,
+            ping_comment_id=PING_ID, ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
+    assert "issue_comment_inventory_complete" in pkt
+    assert "issue_comment_inventory_error_count" in pkt
+    assert "review_submission_inventory_complete" in pkt
+    assert "review_submission_inventory_error_count" in pkt
+    assert "review_thread_inventory_complete" in pkt
+    assert "review_thread_inventory_error_count" in pkt
+
+
+def test_p1_markdown_shows_all_three_inventory_completeness(
+    monkeypatch, tmp_path,
+):
+    """
+    The markdown report must surface all three inventory
+    completeness states (issue-comments, review-submission,
+    review-thread). When any required surface is incomplete,
+    the markdown must explain the fail-closed reason.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.returncode = 22
+            m.stderr = "gh api returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    md = (tmp_path / "pkt.md").read_text()
+    # The markdown must mention all three surface names.
+    assert "issue-comment" in md.lower() or "issue_comment" in md.lower()
+    assert "review-submission" in md.lower() or "review_submission" in md.lower()
+    assert "review-thread" in md.lower() or "review_thread" in md.lower()
+    # And at least one must be marked incomplete (❌).
+    assert "❌" in md
+    # The fail-closed reason must be visible (api_errors / inventory).
+    assert "api error" in md.lower() or "inventory" in md.lower()
