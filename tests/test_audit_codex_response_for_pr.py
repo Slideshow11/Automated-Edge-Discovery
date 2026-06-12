@@ -133,6 +133,45 @@ def codex_clean_pass_body() -> str:
     )
 
 
+def make_raw_rest_pr_payload(
+    state: str = "open",
+    sha: str = EXPECTED_HEAD,
+    mergeable_state: str = "clean",
+    mergeable: Any = True,
+    title: str = "Test PR",
+) -> Dict[str, Any]:
+    """
+    Build a raw REST `Get a pull request` payload as it would be
+    returned live by `gh api repos/{owner}/{repo}/pulls/{n}`. Uses
+    real REST field names:
+      - state (lowercase "open" / "closed")
+      - merged (bool)
+      - merged_at (string | null)
+      - head.sha, head.ref
+      - base.ref
+      - draft (bool)
+      - mergeable (bool | null)
+      - mergeable_state (lowercase "clean" | "blocked" | "dirty" | "unstable" | null)
+      - html_url
+      - title
+    REST does NOT expose mergeStateStatus or reviewDecision; this
+    helper omits them on purpose so the test exercises the
+    normalize_rest_pr_payload() path that handles real REST.
+    """
+    return {
+        "state": state,
+        "merged": False,
+        "merged_at": None,
+        "head": {"sha": sha, "ref": "tooling/some-branch"},
+        "base": {"ref": "main"},
+        "draft": False,
+        "mergeable": mergeable,
+        "mergeable_state": mergeable_state,
+        "html_url": f"https://github.com/{REPO}/pull/401",
+        "title": title,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Subprocess runner mock
 # ---------------------------------------------------------------------------
@@ -142,6 +181,12 @@ def make_gh_runner(pr_view, issue_comments, reviews, threads_payload):
     """
     Returns a function suitable for monkeypatch.setattr(mod, "subprocess.run", ...).
     The function dispatches based on the gh command shape.
+
+    The PR view endpoint (`repos/.../pulls/{n}`) is matched by the
+    presence of `/pulls/` in the URL AND the absence of `/reviews` or
+    `/comments` (which are sibling endpoints under the same prefix).
+    The legacy `--jq` shim path is no longer used by the production
+    code; the new code parses raw REST JSON.
     """
 
     def _runner(cmd, *args, **kwargs):
@@ -149,9 +194,14 @@ def make_gh_runner(pr_view, issue_comments, reviews, threads_payload):
         m.returncode = 0
         m.stderr = ""
         cmd_str = " ".join(str(c) for c in cmd)
-        # pr view (REST) -> has --jq with sha/state/mergeStateStatus/...
-        # Use a precise URL match: the jq-pr-view uses pulls/{n} with --jq
-        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+        # PR view (REST) endpoint: repos/.../pulls/{n} (no /reviews or
+        # /comments suffix). The new code path does NOT use --jq.
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
             m.stdout = json.dumps(pr_view)
             return m
         # graphql reviewThreads
@@ -738,7 +788,12 @@ def test_polling_stops_immediately_on_clean_pass(monkeypatch, tmp_path):
         m.returncode = 0
         m.stderr = ""
         cmd_str = " ".join(str(c) for c in cmd)
-        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
             m.stdout = json.dumps(pr_view)
             return m
         if "graphql" in cmd_str:
@@ -798,7 +853,12 @@ def test_polling_stops_immediately_on_active_finding(monkeypatch, tmp_path):
         m.returncode = 0
         m.stderr = ""
         cmd_str = " ".join(str(c) for c in cmd)
-        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
             m.stdout = json.dumps(pr_view)
             return m
         if "graphql" in cmd_str:
@@ -865,7 +925,12 @@ def test_both_surfaces_scanned_every_poll(monkeypatch, tmp_path):
         m.returncode = 0
         m.stderr = ""
         cmd_str = " ".join(str(c) for c in cmd)
-        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
             call_log.append("pr_view")
             m.stdout = json.dumps(pr_view)
             return m
@@ -1681,14 +1746,19 @@ def test_pr401_regression_still_passes(monkeypatch, tmp_path):
 
 
 # Helper that returns raw stdout strings (for the slurped-output cases
-# that need to bypass the make_gh_runner default list-only path).
+# that need to bypass the make_gh_runner default list-only path.)
 def make_gh_runner_raw(pr_view, issues_raw, reviews_raw, threads_payload):
     def _runner(cmd, *args, **kwargs):
         m = MagicMock()
         m.returncode = 0
         m.stderr = ""
         cmd_str = " ".join(str(c) for c in cmd)
-        if "repos/" in cmd_str and "/pulls/" in cmd_str and "--jq" in cmd_str:
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
             m.stdout = json.dumps(pr_view)
             return m
         if "graphql" in cmd_str:
@@ -1775,3 +1845,863 @@ def test_flatten_paginated_items_handles_shapes():
     items, ok = mod.flatten_paginated_items({"items": [{"a": 1}]})
     assert ok is False
     assert items == []
+
+
+# ---------------------------------------------------------------------------
+# P1 #1 regression tests: live REST PR metadata normalization
+# ---------------------------------------------------------------------------
+#
+# These tests use the real REST `Get a pull request` payload shape
+# (with `head` / `base` nested objects, lowercase `mergeable_state`,
+# and no `mergeStateStatus` / `review_decision` GraphQL fields). The
+# classifier MUST normalize raw REST into its canonical packet and
+# must not misclassify clean REST payloads as
+# HOLD_MERGE_STATE_BLOCKED simply because the GraphQL field names are
+# absent.
+
+
+def test_live_rest_mergeable_state_clean_reaches_merge_ready(monkeypatch, tmp_path):
+    """
+    P1 #1: Full live REST pull payload with mergeable_state=clean +
+    Codex clean-pass + zero unresolved threads must yield
+    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION.
+
+    On the OLD code path, the JQ shim could not construct the
+    mergeableState key from real REST (because the JQ filter
+    accidentally aliased the wrong source field in some fixture
+    variants), causing merge_state_status to remain None and the
+    decision to fall through to HOLD_MERGE_STATE_BLOCKED. The new
+    normalize_rest_pr_payload() helper reads the real REST field
+    directly and exposes it on the canonical packet.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99001,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["merge_state_status"] == "CLEAN"
+    assert pkt["mergeable"] is True
+    assert pkt["clean_pass_detected"] is True
+    # reviewDecision and mergeStateStatus are absent in REST;
+    # normalize_rest_pr_payload() exposes them as None.
+    assert pkt["review_decision"] is None
+    # Inventory is complete (no thread fetch errors).
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_inventory_error_count"] == 0
+
+
+def test_live_rest_mergeable_state_blocked_yields_hold_merge_blocked(monkeypatch, tmp_path):
+    """
+    P1 #1: Full live REST pull payload with mergeable_state=blocked +
+    clean pass + zero unresolved threads must yield
+    HOLD_MERGE_STATE_BLOCKED. The classification is driven by the
+    real REST mergeable_state field, not by GraphQL-style field names.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="blocked", mergeable=False)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99002,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_MERGE_STATE_BLOCKED
+    assert pkt["merge_state_status"] == "BLOCKED"
+    assert pkt["mergeable"] is False
+
+
+def test_live_rest_lacking_review_decision_still_classifies(monkeypatch, tmp_path):
+    """
+    P1 #1: Full live REST pull payload has NO review_decision field
+    (REST does not expose it; only GraphQL does). The classifier must
+    not require review_decision to reach MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Sanity check: the live REST payload does NOT contain
+    # review_decision. This is the whole point of the test.
+    assert "review_decision" not in pr_view
+    assert "reviewDecision" not in pr_view
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99003,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["review_decision"] is None
+
+
+def test_live_rest_dirty_mergeable_state_normalizes_to_dirty(monkeypatch, tmp_path):
+    """
+    P1 #1: REST mergeable_state=dirty must normalize to canonical
+    DIRTY (uppercase), even when mergeable is null (the
+    "computing" state). The classification falls through to
+    HOLD_MERGE_STATE_BLOCKED on a clean pass.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="dirty", mergeable=None)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99004,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["merge_state_status"] == "DIRTY"
+    assert pkt["status"] == mod.STATUS_HOLD_MERGE_STATE_BLOCKED
+
+
+def test_live_rest_unstable_mergeable_state_normalizes_to_unstable(monkeypatch, tmp_path):
+    """
+    P1 #1: REST mergeable_state=unstable must normalize to canonical
+    UNSTABLE.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="unstable", mergeable=False)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99005,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["merge_state_status"] == "UNSTABLE"
+    assert pkt["status"] == mod.STATUS_HOLD_MERGE_STATE_BLOCKED
+
+
+def test_graphql_merge_state_status_still_works_with_real_rest_payload(monkeypatch, tmp_path):
+    """
+    P1 #1 regression: GraphQL-style mergeStateStatus=CLEAN fixture
+    must continue to classify correctly. The new code must not have
+    regressed GraphQL/mock compatibility while fixing REST.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    # Canonical packet shape (no nested `head` object). The new
+    # gh_pr_view_min() detects this and passes through unchanged.
+    pr_view = {
+        "sha": EXPECTED_HEAD,
+        "state": "OPEN",
+        "mergeStateStatus": "CLEAN",
+        "mergeableState": None,
+        "mergeable": True,
+        "reviewDecision": "APPROVED",
+        "baseRefName": "main",
+        "headRefName": "tooling/codex-response-classifier-v1",
+        "url": f"https://github.com/{REPO}/pull/402",
+    }
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99006,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["merge_state_status"] == "CLEAN"
+    assert pkt["review_decision"] == "APPROVED"
+
+
+def test_rest_payload_no_merge_state_status_key_still_reaches_merge_ready(monkeypatch, tmp_path):
+    """
+    P1 #1 regression: A live REST payload that LACKS the
+    `merge_state_status` key entirely (which is the default for
+    real REST responses) must still reach MERGE_READY when
+    `mergeable_state` is "clean". The OLD JQ-shim path produced
+    `merge_state_status: null` and the classifier would fall
+    through to HOLD_MERGE_STATE_BLOCKED. The new path normalizes
+    REST's real `mergeable_state` directly.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # The new normalize_rest_pr_payload() produces a packet where
+    # mergeStateStatus and merge_state_status are explicitly None
+    # (REST does not expose them) and mergeable_state is "clean".
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99007,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    })
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # If the OLD code were running, the JQ shim would produce
+    # mergeStateStatus=null (real REST lacks it) and the classifier
+    # would emit HOLD_MERGE_STATE_BLOCKED. The new code reads
+    # mergeable_state from the raw REST payload and normalizes it
+    # to CLEAN, enabling MERGE_READY.
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["merge_state_status"] == "CLEAN"
+
+
+def test_normalize_rest_pr_payload_unit():
+    """
+    Direct unit tests for normalize_rest_pr_payload().
+    """
+    raw = {
+        "state": "open",
+        "merged": False,
+        "merged_at": None,
+        "head": {"sha": EXPECTED_HEAD, "ref": "feat/x"},
+        "base": {"ref": "main"},
+        "draft": True,
+        "mergeable": True,
+        "mergeable_state": "clean",
+        "html_url": "https://example/pr/1",
+        "title": "Demo",
+    }
+    pkt = mod.normalize_rest_pr_payload(raw)
+    assert pkt["sha"] == EXPECTED_HEAD
+    assert pkt["state"] == "open"
+    assert pkt["merged"] is False
+    assert pkt["merged_at"] is None
+    assert pkt["title"] == "Demo"
+    assert pkt["draft"] is True
+    assert pkt["mergeableState"] == "clean"
+    assert pkt["mergeable_state"] == "clean"
+    assert pkt["mergeable"] is True
+    assert pkt["mergeStateStatus"] is None
+    assert pkt["merge_state_status"] is None
+    assert pkt["reviewDecision"] is None
+    assert pkt["review_decision"] is None
+    assert pkt["baseRefName"] == "main"
+    assert pkt["headRefName"] == "feat/x"
+    assert pkt["url"] == "https://example/pr/1"
+
+
+def test_normalize_rest_pr_payload_handles_string_mergeable():
+    """Some GitHub responses serialize `mergeable` as a string. Accept both."""
+    raw = {
+        "state": "open",
+        "head": {"sha": EXPECTED_HEAD, "ref": "feat/x"},
+        "base": {"ref": "main"},
+        "mergeable": "true",  # REST sometimes returns string
+        "mergeable_state": "clean",
+        "html_url": "https://example/pr/1",
+    }
+    pkt = mod.normalize_rest_pr_payload(raw)
+    assert pkt["mergeable"] is True
+
+
+def test_normalize_rest_pr_payload_handles_missing_optional_fields():
+    """The normalizer must be tolerant of missing optional REST fields."""
+    pkt = mod.normalize_rest_pr_payload({})
+    assert pkt["sha"] == ""
+    assert pkt["state"] == ""
+    assert pkt["merged"] is False
+    assert pkt["mergeableState"] is None
+    assert pkt["mergeable_state"] is None
+    assert pkt["mergeable"] is None
+    assert pkt["baseRefName"] == ""
+    assert pkt["headRefName"] == ""
+    assert pkt["url"] == ""
+
+
+# ---------------------------------------------------------------------------
+# P1 #2 regression tests: fail closed on incomplete review-thread inventory
+# ---------------------------------------------------------------------------
+#
+# The review-thread fetch is required evidence. If the GraphQL command
+# fails, the response has errors, JSON is malformed, the response is
+# missing expected reviewThreads data, or hasNextPage=true and the
+# implementation did not paginate, the classifier MUST NOT emit
+# MERGE_READY, CODEX_CLEAN_PASS, or CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED.
+# The allowed safe states are HOLD_NEW_CODEX_THREAD (when an active
+# finding is already confirmed) or HOLD_CODEX_RESPONSE_PENDING (when
+# we cannot trust the data).
+
+
+def _empty_thread_payload() -> Dict[str, Any]:
+    return {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    }
+
+
+def test_fail_closed_on_graphql_command_nonzero_exit(monkeypatch, tmp_path):
+    """
+    P1 #2: If the GraphQL review-thread command returns a nonzero
+    exit code, the classifier must hold safely (HOLD_CODEX_RESPONSE_PENDING)
+    and NOT emit MERGE_READY even if clean pass + CLEAN merge state
+    are otherwise satisfied.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99101,
+        ),
+    ]
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            # Simulate a nonzero exit code (e.g. GitHub API outage
+            # or auth failure) on the review-thread GraphQL call.
+            m.returncode = 22
+            m.stderr = "gh graphql returned 22: HTTP 500"
+            m.stdout = ""
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(issue)
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Must NOT emit MERGE_READY when inventory is incomplete.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    # api_errors must be populated so the operator can see what failed.
+    assert any("review_threads" in e for e in pkt["api_errors"])
+
+
+def test_fail_closed_on_graphql_response_errors(monkeypatch, tmp_path):
+    """
+    P1 #2: A GraphQL response containing a top-level `errors` array
+    (rate limit, partial failure, auth expiry) must be treated as
+    incomplete inventory. Classifier must NOT emit MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99102,
+        ),
+    ]
+    graphql_with_errors = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}},
+        "errors": [{"message": "API rate limit exceeded", "type": "RATE_LIMITED"}],
+    }
+    runner = make_gh_runner(pr_view, issue, [], graphql_with_errors)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    assert any("GraphQL errors" in e for e in pkt["api_errors"])
+
+
+def test_fail_closed_on_malformed_graphql_json(monkeypatch, tmp_path):
+    """
+    P1 #2: A malformed GraphQL response (e.g. truncated JSON from a
+    network blip) must be treated as incomplete inventory.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99103,
+        ),
+    ]
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            # Truncated JSON that will fail json.loads.
+            m.stdout = '{"data": {"repository": {"pullRequest": {"reviewTh'
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(issue)
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    assert any("invalid GraphQL response" in e for e in pkt["api_errors"])
+
+
+def test_fail_closed_on_unhandled_pagination(monkeypatch, tmp_path):
+    """
+    P1 #2: hasNextPage=true on the first page (i.e. >100 review
+    threads) and the implementation did not paginate further is
+    incomplete inventory. Classifier must NOT emit MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99104,
+        ),
+    ]
+    threads_paginated = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_2"},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads_paginated)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    assert any("pagination required" in e for e in pkt["api_errors"])
+
+
+def test_fail_closed_on_missing_review_threads_in_response(monkeypatch, tmp_path):
+    """
+    P1 #2: A GraphQL response missing the `reviewThreads` container
+    (e.g. an unexpected shape, partial failure, or schema drift) must
+    be treated as incomplete inventory.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99105,
+        ),
+    ]
+    threads_no_container = {
+        "data": {"repository": {"pullRequest": {
+            # reviewThreads missing on purpose.
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads_no_container)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    assert any("reviewThreads" in e for e in pkt["api_errors"])
+
+
+def test_fail_closed_emits_hold_new_thread_when_finding_already_confirmed(monkeypatch, tmp_path):
+    """
+    P1 #2: When review-thread inventory is incomplete AND a finding
+    is already confirmed in the partial thread list, emit
+    HOLD_NEW_CODEX_THREAD (not HOLD_CODEX_RESPONSE_PENDING) with a
+    note in the recommendation that inventory is also incomplete.
+    The active finding is the dominant signal even with incomplete
+    inventory.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue: list = []
+    threads_partial_with_finding = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_X"},
+                "nodes": [
+                    {
+                        "id": "PRRT_confirmed_finding",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 99110,
+                            "url": "https://example/confirmed",
+                            "body": "P1 finding on current head",
+                            "path": "scripts/local/foo.py",
+                            "line": 50,
+                            "author": {"login": CODEX_LOGIN},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads_partial_with_finding)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Active finding wins over inventory incompleteness; emit
+    # HOLD_NEW_CODEX_THREAD with an explicit inventory note.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_inventory_error_count"] >= 1
+    # The recommendation should mention inventory incompleteness so
+    # the operator knows more findings may exist.
+    assert "inventory" in pkt["recommendation"].lower()
+
+
+def test_inventory_complete_packet_includes_correct_fields(monkeypatch, tmp_path):
+    """
+    Sanity: when inventory is complete, the JSON packet includes
+    review_thread_inventory_complete=true and
+    review_thread_inventory_error_count=0.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99111,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_inventory_error_count"] == 0
+    assert pkt["review_thread_inventory_last_error"] == ""
+
+
+def test_inventory_incomplete_markdown_surfaces_status(monkeypatch, tmp_path):
+    """
+    P1 #2: The markdown report must clearly surface that review-thread
+    inventory is incomplete so the operator sees it without reading
+    the JSON.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99112,
+        ),
+    ]
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.returncode = 1
+            m.stderr = "transport error"
+            m.stdout = ""
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(issue)
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    md = (tmp_path / "pkt.md").read_text()
+    # The markdown must include the new "Review-thread inventory"
+    # section and explicitly mark it as incomplete.
+    assert "## Review-thread inventory" in md
+    assert "Inventory complete" in md
+    # The ❌ marker signals the failure clearly.
+    assert "❌" in md
+    # Operator must see the underlying error message.
+    assert "transport error" in md
+
+
+def test_markdown_includes_new_inventory_section_when_complete(monkeypatch, tmp_path):
+    """Sanity: the new inventory section is rendered on the success path too."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99113,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    md = (tmp_path / "pkt.md").read_text()
+    assert "## Review-thread inventory" in md
+    assert "✅" in md
+
+
+def test_existing_markdown_sections_still_rendered(monkeypatch, tmp_path):
+    """The new inventory section must not break the existing required sections."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99114,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    md = (tmp_path / "pkt.md").read_text()
+    for section in [
+        "## PR metadata",
+        "## Latest Codex response",
+        "## Clean-pass evidence",
+        "## Active current-head blockers",
+        "## Outdated unresolved threads",
+        "## Resolved threads",
+        "## Review-thread inventory",
+        "## Polling summary",
+        "## Recommendation",
+        "## Next safe action",
+    ]:
+        assert section in md, f"missing markdown section: {section}"

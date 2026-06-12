@@ -226,36 +226,121 @@ def flatten_paginated_items(payload: Any) -> Tuple[List[Dict[str, Any]], bool]:
     return flat, True
 
 
+def normalize_rest_pr_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Build a canonical classifier packet from a raw REST
+    `Get a pull request` payload (the live response from
+    `gh api repos/{owner}/{repo}/pulls/{n}`).
+
+    Real REST fields used (as documented by GitHub):
+      - state (lowercase "open" | "closed"; "MERGED" is detected via merged=true)
+      - merged (bool)
+      - merged_at (string | null)
+      - head.sha, head.ref
+      - base.ref
+      - draft (bool)
+      - mergeable (bool | null; null while GitHub is computing)
+      - mergeable_state (lowercase "clean" | "blocked" | "dirty" | "unstable" | null)
+      - html_url
+      - title
+
+    REST does NOT expose:
+      - mergeStateStatus (GraphQL-only)
+      - reviewDecision (GraphQL-only)
+
+    The returned packet exposes the canonical fields the classifier
+    reads (`state`, `sha`, `url`, `baseRefName`, `headRefName`,
+    `mergeStateStatus`, `merge_state_status`, `mergeableState`,
+    `mergeable_state`, `mergeable`, `reviewDecision`,
+    `review_decision`, `title`, `merged`, `merged_at`, `draft`).
+    `mergeStateStatus` and `reviewDecision` are explicitly set to
+    None because REST never exposes them; downstream code MUST NOT
+    treat REST's absence of these fields as a blocker.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    head_obj = raw.get("head")
+    head: Dict[str, Any] = head_obj if isinstance(head_obj, dict) else {}
+    base_obj = raw.get("base")
+    base: Dict[str, Any] = base_obj if isinstance(base_obj, dict) else {}
+    mergeable_state_raw = raw.get("mergeable_state")
+    mergeable_state_str = (
+        mergeable_state_raw if isinstance(mergeable_state_raw, str) else None
+    )
+    mergeable_raw = raw.get("mergeable")
+    if not isinstance(mergeable_raw, (bool, type(None))):
+        # Some GitHub responses serialize as string "true"/"false".
+        if isinstance(mergeable_raw, str):
+            lowered = mergeable_raw.strip().lower()
+            if lowered == "true":
+                mergeable_raw = True
+            elif lowered == "false":
+                mergeable_raw = False
+            else:
+                mergeable_raw = None
+        else:
+            mergeable_raw = None
+    return {
+        # Canonical scalar fields the classifier reads directly.
+        "sha": (head.get("sha") or "") if head.get("sha") else "",
+        "state": (raw.get("state") or "") if raw.get("state") else "",
+        "merged": bool(raw.get("merged", False)),
+        "merged_at": raw.get("merged_at") if "merged_at" in raw else None,
+        "title": (raw.get("title") or "") if raw.get("title") else "",
+        "draft": bool(raw.get("draft", False)) if isinstance(raw.get("draft"), bool) else False,
+        # Merge readiness. REST exposes `mergeable_state` (lowercase);
+        # we also expose both snake_case and camelCase alias keys so the
+        # existing classifier normalization order works unchanged.
+        "mergeableState": mergeable_state_str,  # camelCase alias for fixtures
+        "mergeable_state": mergeable_state_str,  # canonical snake_case
+        "mergeable": mergeable_raw,
+        # GraphQL-only fields are absent in REST; expose as None so the
+        # classifier cannot accidentally read a stale fixture value.
+        "mergeStateStatus": None,  # GraphQL PullRequest.mergeStateStatus (REST lacks)
+        "merge_state_status": None,  # GraphQL-style jq path (REST lacks)
+        "reviewDecision": None,  # GraphQL PullRequest.reviewDecision (REST lacks)
+        "review_decision": None,  # GraphQL-style jq path (REST lacks)
+        # Refs and URL.
+        "baseRefName": (base.get("ref") or "") if base.get("ref") else "",
+        "headRefName": (head.get("ref") or "") if head.get("ref") else "",
+        "url": (raw.get("html_url") or "") if raw.get("html_url") else "",
+    }
+
+
 def gh_pr_view_min(repo: str, pr_number: int) -> Tuple[bool, Dict[str, Any], str]:
     """
     Fetch PR metadata needed for head/mergeState/reviewDecision checks.
-    Uses REST `repos/.../pulls/{n}` (does not require git repo cwd).
+    Uses the REST `Get a pull request` endpoint
+    (`repos/{owner}/{repo}/pulls/{n}`) and parses the raw JSON in
+    Python. Does NOT use `--jq` field-name translation; that path was
+    fragile because real REST payloads do not expose
+    `merge_state_status` or `review_decision` (both are GraphQL-only).
     """
-    # REST `repos/.../pulls/{n}` does NOT expose GraphQL-style
-    # `mergeStateStatus`; it exposes `mergeable_state` (clean/blocked/
-    # dirty/unstable) instead. The classifier normalizes both shapes via
-    # normalize_merge_state() below. `reviewDecision` is GraphQL-only and
-    # is left as null on the REST path. `mergeable` is a boolean/string
-    # from REST indicating whether the PR is currently mergeable.
-    cmd = [
-        "gh", "api", f"repos/{repo}/pulls/{pr_number}",
-        "--jq", "{sha:.head.sha, state:.state, "
-                "mergeStateStatus:.merge_state_status, "
-                "mergeableState:.mergeable_state, "
-                "mergeable:.mergeable, reviewDecision:.review_decision, "
-                "baseRefName:.base.ref, "
-                "headRefName:.head.ref, url:.html_url}",
-    ]
+    cmd = ["gh", "api", f"repos/{repo}/pulls/{pr_number}"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15, check=False)
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15, check=False,
+        )
     except OSError as exc:
         return False, {}, f"gh api invocation failed: {exc}"
     if result.returncode != 0:
         return False, {}, f"gh api returned {result.returncode}: {result.stderr[:300]}"
+    if not result.stdout.strip():
+        return False, {}, "gh api returned empty stdout"
     try:
-        return True, json.loads(result.stdout), ""
-    except json.JSONDecodeError:
-        return False, {}, "gh api --jq returned non-JSON"
+        raw = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        return False, {}, f"gh api returned invalid JSON: {exc}"
+    if not isinstance(raw, dict):
+        return False, {}, f"gh api returned non-object: {type(raw).__name__}"
+    # Shape detection: raw REST payloads have a `head` dict (and a
+    # `base` dict). Canonical/fixture packets have top-level scalar
+    # fields like `sha`, `state`, `mergeStateStatus` and no nested
+    # `head` object. Normalize raw REST, pass canonical through so
+    # existing GraphQL-style fixtures keep working.
+    if isinstance(raw.get("head"), dict):
+        return True, normalize_rest_pr_payload(raw), ""
+    return True, raw, ""
 
 
 def gh_graphql_review_threads(
@@ -265,6 +350,15 @@ def gh_graphql_review_threads(
     Fetch PR review-thread resolution state via GraphQL with --paginate
     on reviewThreads (100 per page). Each returned entry has:
       {thread_id, is_resolved, is_outdated, comment_database_id, comment_url, author, body, path, line}
+
+    Returns (ok, threads, error_msg). `ok=False` means the inventory
+    is incomplete or unavailable: GraphQL command failed, response
+    had `errors`, the response was missing expected `reviewThreads`
+    data, `hasNextPage=true` and the implementation did not paginate
+    further, JSON parsing failed, or the page node list was not a
+    list. Callers MUST treat `ok=False` as a fail-closed signal: the
+    thread list may be empty, partial, or stale, and merge readiness
+    cannot be trusted until inventory is complete.
     """
     owner, name = repo.split("/", 1)
     query_parts = [
@@ -293,31 +387,54 @@ def gh_graphql_review_threads(
         return False, [], f"gh graphql invocation failed: {exc}"
     if result.returncode != 0:
         return False, [], f"gh graphql returned {result.returncode}: {result.stderr[:500]}"
+    if not result.stdout.strip():
+        return False, [], "gh graphql returned empty stdout"
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         return False, [], f"invalid GraphQL response: {exc}"
+    if not isinstance(data, dict):
+        return False, [], f"GraphQL response is not a JSON object: {type(data).__name__}"
     errors = data.get("errors")
     if errors:
         return False, [], f"GraphQL errors: {errors}"
-    pr_data = (
-        data.get("data", {}).get("repository", {}).get("pullRequest", {})
-    )
-    threads_container = pr_data.get("reviewThreads", {})
-    page_info = threads_container.get("pageInfo", {})
-    if page_info.get("hasNextPage"):
-        # Fail closed: pagination is required to be exhaustive.
+    data_obj = data.get("data")
+    if not isinstance(data_obj, dict):
+        return False, [], "GraphQL response missing data object"
+    repository = data_obj.get("repository")
+    if not isinstance(repository, dict):
+        return False, [], "GraphQL response missing repository"
+    pr_data = repository.get("pullRequest")
+    if not isinstance(pr_data, dict):
+        return False, [], "GraphQL response missing pullRequest"
+    threads_container = pr_data.get("reviewThreads")
+    if not isinstance(threads_container, dict):
+        return False, [], "GraphQL response missing reviewThreads container"
+    page_info = threads_container.get("pageInfo")
+    if not isinstance(page_info, dict):
+        return False, [], "GraphQL reviewThreads.pageInfo is not a dict"
+    nodes = threads_container.get("nodes")
+    if not isinstance(nodes, list):
         return False, [], (
-            "reviewThreads pagination required (hasNextPage=true); "
-            "this classifier does not yet paginate review threads."
+            f"GraphQL reviewThreads.nodes is not a list: "
+            f"{type(nodes).__name__}"
         )
-    nodes = threads_container.get("nodes", [])
+    # Parse all nodes from this page. When the response is
+    # paginated (hasNextPage=true) we still parse the visible
+    # threads so the caller can detect findings already on this
+    # page. The caller MUST treat ok=False as incomplete
+    # inventory and refuse to emit merge-ready states.
     threads: List[Dict[str, Any]] = []
     for node in nodes:
+        if not isinstance(node, dict):
+            continue
         thread_id = node.get("id", "")
         is_resolved = bool(node.get("isResolved", False))
         is_outdated = bool(node.get("isOutdated", False))
-        for comment in (node.get("comments", {}) or {}).get("nodes", []):
+        comments_obj = node.get("comments") or {}
+        for comment in (comments_obj.get("nodes") or []):
+            if not isinstance(comment, dict):
+                continue
             author_login = (
                 (comment.get("author") or {}).get("login", "")
                 if isinstance(comment.get("author"), dict) else ""
@@ -333,6 +450,17 @@ def gh_graphql_review_threads(
                 "path": comment.get("path") or "",
                 "line": comment.get("line"),
             })
+    if page_info.get("hasNextPage"):
+        # Fail closed: pagination is required for exhaustive
+        # inventory. Return the partial list (visible page only)
+        # so the caller can still surface findings already on
+        # this page. The caller MUST treat ok=False as
+        # incomplete inventory and refuse to emit merge-ready
+        # states.
+        return False, threads, (
+            "reviewThreads pagination required (hasNextPage=true); "
+            "this classifier does not yet paginate review threads."
+        )
     return True, threads, ""
 
 
@@ -491,6 +619,15 @@ def classify(
     outdated_threads: List[Dict[str, Any]] = []
     resolved_threads: List[Dict[str, Any]] = []
 
+    # Review-thread inventory completeness. The GraphQL review-thread
+    # fetch is REQUIRED evidence for merge readiness. If the fetch
+    # fails, returns errors, is missing expected data, has unhandled
+    # pagination, or returns malformed JSON, inventory is incomplete
+    # and the classifier must fail closed. See the gate in section 8.
+    review_thread_inventory_complete: bool = True
+    review_thread_inventory_error_count: int = 0
+    review_thread_inventory_last_error: str = ""
+
     # Stop conditions
     stop_reason: Optional[str] = None
 
@@ -594,13 +731,23 @@ def classify(
             pr_reviews = review_data
 
         # ---- 4. Review threads (resolution + outdated state) ----
+        # The thread fetch is REQUIRED evidence. Any failure here is
+        # treated as incomplete inventory: the empty/partial list is
+        # never silently used for merge readiness decisions. The gate
+        # in section 8 enforces fail-closed behavior. We still record
+        # any partial data the function returned (e.g. visible page
+        # on a hasNextPage response) so that confirmed findings on
+        # that page can be surfaced as HOLD_NEW_CODEX_THREAD even
+        # when inventory is incomplete.
         ok_thr, thread_data, err_thr = gh_graphql_review_threads(
             repo, pr_number, timeout=api_timeout,
         )
         if not ok_thr:
             api_errors.append(f"review_threads: {err_thr}")
-        else:
-            review_threads = thread_data
+            review_thread_inventory_complete = False
+            review_thread_inventory_error_count += 1
+            review_thread_inventory_last_error = err_thr
+        review_threads = thread_data
 
         # ---- 5. Identify latest Codex response after ping ----
         codex_issue_comments: List[Dict[str, Any]] = []
@@ -747,6 +894,9 @@ def classify(
 
         # ---- 8. Decide ----
         # Order of precedence:
+        # 0) Review-thread inventory incomplete -> fail closed
+        #    (HOLD_NEW_CODEX_THREAD if a confirmed active finding
+        #    exists, else HOLD_CODEX_RESPONSE_PENDING)
         # 1) Codex raised a current-head active finding (thread) -> HOLD_NEW_CODEX_THREAD
         # 2) Codex clean-pass exists AND a newer Codex finding exists
         #    after it -> HOLD_NEW_CODEX_THREAD
@@ -783,6 +933,37 @@ def classify(
                     if state_v in ("APPROVED", "COMMENTED") and not is_codex_clean_pass_comment(body):
                         newer_finding_after_clean_pass = True
                         break
+
+        # ---- Inventory completeness gate (fail closed) ----
+        # If review-thread inventory is incomplete (GraphQL failed,
+        # response had errors, shape missing expected data,
+        # hasNextPage=true, JSON parse failed, etc.), the classifier
+        # MUST NOT emit CODEX_CLEAN_PASS, CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED,
+        # or MERGE_READY_AWAITING_HUMAN_AUTHORIZATION. The only safe
+        # states are HOLD_NEW_CODEX_THREAD (when an active finding is
+        # already confirmed in the partial inventory) or
+        # HOLD_CODEX_RESPONSE_PENDING (when we cannot trust the data).
+        if not review_thread_inventory_complete:
+            if has_active_blocker or newer_finding_after_clean_pass:
+                final_status = STATUS_HOLD_NEW_THREAD
+                recommendation = (
+                    RECOMMENDATIONS[STATUS_HOLD_NEW_THREAD]
+                    + " (Note: review-thread inventory is also "
+                    "incomplete; some findings may not have been "
+                    "seen. Inspect api_errors and re-run.)"
+                )
+                stop_reason = "active_finding_with_incomplete_inventory"
+                break
+            final_status = STATUS_HOLD_CODEX_PENDING
+            recommendation = (
+                "Review-thread inventory could not be fully fetched; "
+                "merge readiness cannot be trusted until inventory is "
+                "complete. Re-run later with a fresh budget to retry "
+                "the GraphQL review-thread fetch. See api_errors for "
+                "the underlying failure."
+            )
+            stop_reason = "inventory_incomplete"
+            break
 
         if has_active_blocker or newer_finding_after_clean_pass:
             final_status = STATUS_HOLD_NEW_THREAD
@@ -857,6 +1038,12 @@ def classify(
         "merge_state_status": merge_state_status,
         "mergeable": mergeable,
         "review_decision": review_decision,
+        # Review-thread inventory completeness. Required evidence:
+        # when incomplete the classifier has already failed closed in
+        # section 8 and refused to emit merge-ready states.
+        "review_thread_inventory_complete": review_thread_inventory_complete,
+        "review_thread_inventory_error_count": review_thread_inventory_error_count,
+        "review_thread_inventory_last_error": review_thread_inventory_last_error,
         "polls_used": polls_used,
         "polling_exhausted": polling_exhausted,
         "max_polls": max_polls,
@@ -954,6 +1141,28 @@ def render_markdown(packet: Dict[str, Any]) -> str:
                 f"[thread]({t.get('comment_url', '')}) (dbid={t.get('comment_database_id', '')})"
             )
         lines.append("")
+
+    # Surface review-thread inventory completeness. When the
+    # GraphQL review-thread fetch is incomplete the classifier has
+    # already failed closed and refused to emit merge-ready states.
+    lines.append("## Review-thread inventory\n")
+    inv_complete = packet.get("review_thread_inventory_complete", True)
+    inv_err_count = packet.get("review_thread_inventory_error_count", 0) or 0
+    inv_last_err = packet.get("review_thread_inventory_last_error", "") or ""
+    if inv_complete:
+        lines.append(
+            "- **Inventory complete:** ✅ (all review-thread pages fetched and validated)\n"
+        )
+    else:
+        lines.append(
+            "- **Inventory complete:** ❌ (classifier failed closed; "
+            "merge readiness cannot be trusted)\n"
+        )
+        lines.append(f"- **Inventory error count:** `{inv_err_count}`  ")
+        if inv_last_err:
+            lines.append(f"- **Last inventory error:** `{inv_last_err}`\n")
+        else:
+            lines.append("")
 
     lines.append("## Polling summary\n")
     lines.append(f"- **Polls used:** `{packet.get('polls_used', 0)}` / `{packet.get('max_polls', 0)}`  ")
