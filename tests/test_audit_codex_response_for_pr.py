@@ -2934,6 +2934,408 @@ def test_no_ping_timestamp_keeps_prior_behavior(monkeypatch, tmp_path):
     assert pkt["status"] == mod.STATUS_MERGE_READY
 
 
+def test_naive_ping_timestamp_fails_closed_no_typeerror(monkeypatch, tmp_path):
+    """
+    P2 #4: A --ping-created-at value that parses to a naive
+    datetime (no Z, no offset) must be treated as invalid and
+    fail closed at HOLD_CODEX_RESPONSE_PENDING. The classifier
+    MUST NOT crash with TypeError when later comparing the
+    naive ping_dt against aware GitHub timestamps. The OLD
+    code would set ping_dt to a naive datetime, accept the
+    ping, and crash on the first comparison against an aware
+    GitHub createdAt/submittedAt.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Pre-ping Codex clean pass (would be accepted as a
+    # post-ping clean pass under the OLD code if the naive
+    # datetime was silently used).
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99501,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    # NAIVE datetime — no Z, no offset.
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID,
+        "--ping-created-at", "2026-06-11T17:30:00",  # naive
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    # Must NOT crash with TypeError. Must write a packet.
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Fail closed.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["ping_timestamp_valid"] is False
+    assert pkt["ping_timestamp_supplied"] is True
+    # The api_error must mention the missing timezone.
+    assert any("no timezone" in e for e in pkt["api_errors"]), (
+        f"expected 'no timezone' error in api_errors, got: {pkt['api_errors']}"
+    )
+
+
+def test_valid_z_ping_timestamp_detects_post_ping_clean_pass(monkeypatch, tmp_path):
+    """
+    P2 #4 regression: A valid Z-suffixed --ping-created-at
+    must continue to filter post-ping Codex evidence.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",  # after Z ping
+            comment_id=99601,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID,
+        "--ping-created-at", "2026-06-11T17:30:00Z",  # valid Z
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["ping_timestamp_valid"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_valid_offset_ping_timestamp_detects_post_ping_clean_pass(monkeypatch, tmp_path):
+    """
+    P2 #4: A valid --ping-created-at with a numeric offset
+    (instead of Z) must also work. Both should produce
+    timezone-aware datetimes.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",  # after the offset ping
+            comment_id=99701,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID,
+        # Offset timestamp (not Z).
+        "--ping-created-at", "2026-06-11T17:30:00+00:00",
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["ping_timestamp_valid"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+
+
+def test_raw_poll_snapshot_reset_comments_fetch_failure(monkeypatch, tmp_path):
+    """
+    P2 #5: Poll 1 has a clean pass + incomplete thread
+    inventory. Poll 2 fails to fetch issue comments but
+    succeeds on threads. The classifier must NOT reuse
+    poll 1's stale clean-pass comment to emit merge-ready.
+    Final state must be HOLD_CODEX_RESPONSE_PENDING (from
+    the post-loop exhaustion fallback).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Poll 1: thread fetch fails (incomplete).
+                m.stdout = json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                    }}},
+                    "errors": [{"message": "transient outage"}],
+                })
+            else:
+                # Poll 2: thread fetch succeeds (empty).
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            if call_count["n"] == 0:
+                # Poll 1: comments fetch succeeds with clean pass.
+                m.stdout = json.dumps([
+                    make_issue_comment(
+                        author=CODEX_LOGIN,
+                        body=codex_clean_pass_body(),
+                        created_at="2026-06-11T18:00:00Z",
+                        comment_id=99801,
+                    )
+                ])
+            else:
+                # Poll 2: comments fetch FAILS.
+                m.returncode = 22
+                m.stderr = "gh api returned 22: HTTP 500"
+                m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Must NOT be merge-ready from the stale poll-1 clean pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    # The post-loop exhaustion fallback must fire.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # api_errors must clearly identify the latest failed surface.
+    assert any("issue_comments" in e for e in pkt["api_errors"])
+
+
+def test_raw_poll_snapshot_reset_reviews_fetch_failure(monkeypatch, tmp_path):
+    """
+    P2 #5: Poll 1 has a stale state that could be
+    misinterpreted. Poll 2 reviews fetch fails. The
+    classifier must NOT emit HOLD_NEW_CODEX_THREAD from
+    stale state — only from the latest poll's evidence.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Poll 1: thread fetch incomplete (hasNextPage) with
+                # partial Codex active finding visible.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": True, "endCursor": "CURSOR_X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_poll1_partial",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99851,
+                                    "url": "https://example/99851",
+                                    "body": "P1 finding",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 1,
+                                    "author": {"login": CODEX_LOGIN},
+                                }]},
+                            },
+                        ],
+                    }
+                }}}})
+            else:
+                # Poll 2: thread fetch succeeds with empty inventory.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = "[]"
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            if call_count["n"] == 0:
+                # Poll 1: reviews fetch succeeds (no findings).
+                m.stdout = "[]"
+            else:
+                # Poll 2: reviews fetch FAILS.
+                m.returncode = 22
+                m.stderr = "gh api returned 22: HTTP 500"
+                m.stdout = ""
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The latest poll (poll 2) had no active threads, no
+    # clean pass, and failed reviews fetch. The
+    # post-loop exhaustion fallback must fire.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # api_errors must clearly identify the latest failed surface.
+    assert any("reviews" in e for e in pkt["api_errors"])
+
+
+def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch, tmp_path):
+    """
+    P2 #5: Poll 1 has comments/reviews/threads data. Poll 2
+    succeeds with all surfaces returning empty. The final
+    packet's raw snapshots and derived thread buckets must
+    reflect poll 2 (empty), not poll 1.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    call_count = {"n": 0}
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # Poll 1: 1 active + 1 outdated thread.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {
+                                "id": "PRRT_poll1_active",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99891,
+                                    "url": "https://example/99891",
+                                    "body": "poll 1 active",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 1,
+                                    "author": {"login": "human-reviewer"},
+                                }]},
+                            },
+                            {
+                                "id": "PRRT_poll1_outdated",
+                                "isResolved": False,
+                                "isOutdated": True,
+                                "comments": {"nodes": [{
+                                    "databaseId": 99892,
+                                    "url": "https://example/99892",
+                                    "body": "poll 1 outdated",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 2,
+                                    "author": {"login": "human-reviewer"},
+                                }]},
+                            },
+                        ],
+                    }
+                }}}})
+            else:
+                # Poll 2: empty.
+                m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            if call_count["n"] == 0:
+                # Poll 1: pre-ping clean pass.
+                m.stdout = json.dumps([
+                    make_issue_comment(
+                        author=CODEX_LOGIN,
+                        body=codex_clean_pass_body(),
+                        created_at="2026-06-10T12:00:00Z",  # pre-ping
+                        comment_id=99893,
+                    )
+                ])
+            else:
+                # Poll 2: empty.
+                m.stdout = "[]"
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = "[]"
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "2", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The final packet must reflect poll 2 (empty), not poll 1.
+    assert pkt["unresolved_thread_count"] == 0
+    assert pkt["active_threads"] == []
+    assert pkt["outdated_threads"] == []
+    # No clean pass (poll 2 had no issue comments and no
+    # pre-ping clean pass survives).
+    assert pkt["clean_pass_detected"] is False
+    # The post-loop exhaustion fallback fires because poll 2
+    # made no decision.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    assert pkt["polls_used"] == 2
+
+
 # ---------------------------------------------------------------------------
 # P2 #2 regression tests: per-poll thread inventory reset
 # ---------------------------------------------------------------------------

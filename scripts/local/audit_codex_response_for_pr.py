@@ -655,6 +655,27 @@ def classify(
                 "post-ping Codex evidence cannot be trusted. Correct "
                 "the ping timestamp and re-run."
             )
+        elif ping_dt.tzinfo is None or ping_dt.tzinfo.utcoffset(ping_dt) is None:
+            # Naive datetime (no timezone) — reject. The
+            # GitHub API returns all createdAt / submittedAt
+            # timestamps with a trailing 'Z' (UTC), so a naive
+            # ping timestamp would later raise
+            # `TypeError: can't compare offset-naive and
+            # offset-aware datetimes` during the post-ping
+            # filter. The classifier must NOT crash; it must
+            # fail closed at HOLD_CODEX_RESPONSE_PENDING and
+            # refuse to compare against aware GitHub
+            # timestamps. Repo policy: require explicit
+            # timezone on the ping timestamp.
+            ping_dt = None
+            ping_timestamp_valid = False
+            api_errors.append(
+                f"ping_created_at has no timezone: {ping_created_at!r}; "
+                "naive datetimes cannot be safely compared with "
+                "aware GitHub timestamps. Add a Z or numeric "
+                "offset (e.g. '2026-06-11T17:30:00Z' or "
+                "'2026-06-11T17:30:00+00:00') and re-run."
+            )
 
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
@@ -692,6 +713,19 @@ def classify(
         review_thread_inventory_complete = True
         review_thread_inventory_error_count = 0
         review_thread_inventory_last_error = ""
+        # Reset raw poll snapshots. The fetch helpers at
+        # section 2 (issue comments), section 3 (reviews),
+        # and section 4 (review threads) will repopulate
+        # these on success. If a later poll's fetch fails,
+        # the empty reset prevents reusing the previous
+        # poll's stale raw data — which would otherwise
+        # let stale clean-pass comments or stale review
+        # findings drive merge-ready / HOLD_NEW_CODEX_THREAD
+        # decisions from evidence the latest poll did not
+        # actually observe.
+        pr_issue_comments = []
+        pr_reviews = []
+        review_threads = []
         # Reset terminal decision state.
         final_status = STATUS_HOLD_CODEX_PENDING
         recommendation = RECOMMENDATIONS[STATUS_HOLD_CODEX_PENDING]
