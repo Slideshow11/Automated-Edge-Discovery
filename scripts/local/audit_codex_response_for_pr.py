@@ -631,17 +631,70 @@ def classify(
     # Stop conditions
     stop_reason: Optional[str] = None
 
-    # If ping is supplied, parse it for filtering
+    # If ping is supplied, parse it for filtering. A malformed
+    # --ping-created-at is a HARD error: do NOT silently fall back
+    # to "no ping filter" because that would accept pre-ping Codex
+    # clean-pass evidence as authoritative and could drive
+    # MERGE_READY_AWAITING_HUMAN_AUTHORIZATION when the operator's
+    # ping timestamp is broken. We track three states explicitly:
+    #   - ping_timestamp_supplied: True if the operator passed a
+    #     non-empty --ping-created-at on the CLI
+    #   - ping_timestamp_valid: True if the supplied timestamp parsed
+    #     cleanly, OR if no timestamp was supplied (in which case
+    #     no filter is applied by design)
+    #   - ping_dt: the parsed datetime, or None when no filter applies
     ping_dt: Optional[datetime] = None
+    ping_timestamp_supplied: bool = bool(ping_created_at)
+    ping_timestamp_valid: bool = True
     if ping_created_at:
         ping_dt = parse_iso_utc(ping_created_at)
         if ping_dt is None:
+            ping_timestamp_valid = False
             api_errors.append(
-                f"ping_created_at could not be parsed: {ping_created_at!r}"
+                f"ping_created_at could not be parsed: {ping_created_at!r}; "
+                "post-ping Codex evidence cannot be trusted. Correct "
+                "the ping timestamp and re-run."
             )
 
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
+
+        # ---- Per-poll thread inventory reset ----
+        # The thread lists, inventory completeness flag, and
+        # inventory error count must reflect ONLY the current
+        # poll's snapshot, not accumulated state from earlier
+        # polls. Stale entries from an earlier poll (e.g. an
+        # unresolved thread that was resolved between polls)
+        # would otherwise cause CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED
+        # instead of MERGE_READY_AWAITING_HUMAN_AUTHORIZATION on
+        # a fresh poll whose own inventory has zero unresolved
+        # threads. api_errors are accumulated across polls so
+        # the operator can see all failures, but the inventory
+        # completeness and per-poll thread buckets are reset.
+        active_threads = []
+        outdated_threads = []
+        resolved_threads = []
+        review_thread_inventory_complete = True
+        review_thread_inventory_error_count = 0
+        review_thread_inventory_last_error = ""
+
+        # ---- Pre-poll fail-closed gate: malformed ping timestamp ----
+        # When the operator supplied --ping-created-at but it
+        # could not be parsed, refuse to classify on this poll.
+        # The classifier MUST NOT accept pre-ping Codex evidence
+        # as authoritative when the operator's ping boundary is
+        # broken. Break so the operator sees the explicit hold
+        # state in the packet.
+        if not ping_timestamp_valid:
+            final_status = STATUS_HOLD_CODEX_PENDING
+            recommendation = (
+                "Supplied --ping-created-at could not be parsed; "
+                "post-ping Codex evidence cannot be trusted. "
+                "Correct the ping timestamp and re-run. See "
+                "api_errors for the underlying parse failure."
+            )
+            stop_reason = "ping_timestamp_invalid"
+            break
 
         # ---- 1. PR metadata (head alignment + state) ----
         ok_pr, pr_data, err_pr = gh_pr_view_min(repo, pr_number)
@@ -934,15 +987,20 @@ def classify(
                         newer_finding_after_clean_pass = True
                         break
 
-        # ---- Inventory completeness gate (fail closed) ----
-        # If review-thread inventory is incomplete (GraphQL failed,
-        # response had errors, shape missing expected data,
-        # hasNextPage=true, JSON parse failed, etc.), the classifier
-        # MUST NOT emit CODEX_CLEAN_PASS, CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED,
-        # or MERGE_READY_AWAITING_HUMAN_AUTHORIZATION. The only safe
-        # states are HOLD_NEW_CODEX_THREAD (when an active finding is
+        # ---- Inventory completeness gate (fail closed per poll) ----
+        # If the CURRENT poll's review-thread inventory is
+        # incomplete (GraphQL failed, response had errors,
+        # shape missing expected data, hasNextPage=true, JSON
+        # parse failed, etc.), the classifier MUST NOT emit
+        # CODEX_CLEAN_PASS, CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED,
+        # or MERGE_READY_AWAITING_HUMAN_AUTHORIZATION on this
+        # poll. The only safe per-poll states are
+        # HOLD_NEW_CODEX_THREAD (when an active finding is
         # already confirmed in the partial inventory) or
-        # HOLD_CODEX_RESPONSE_PENDING (when we cannot trust the data).
+        # HOLD_CODEX_RESPONSE_PENDING (when we cannot trust the
+        # data). We DO NOT break here: later polls may succeed
+        # and yield a clean classification based on their own
+        # fresh inventory.
         if not review_thread_inventory_complete:
             if has_active_blocker or newer_finding_after_clean_pass:
                 final_status = STATUS_HOLD_NEW_THREAD
@@ -953,6 +1011,12 @@ def classify(
                     "seen. Inspect api_errors and re-run.)"
                 )
                 stop_reason = "active_finding_with_incomplete_inventory"
+                # Continue to next poll instead of breaking, so
+                # a later successful poll can override the
+                # classification with a fresh inventory.
+                if poll_idx < max_polls:
+                    time.sleep(poll_seconds)
+                    continue
                 break
             final_status = STATUS_HOLD_CODEX_PENDING
             recommendation = (
@@ -963,6 +1027,12 @@ def classify(
                 "the underlying failure."
             )
             stop_reason = "inventory_incomplete"
+            # Continue to next poll instead of breaking, so a
+            # later successful poll can override the
+            # classification with a fresh inventory.
+            if poll_idx < max_polls:
+                time.sleep(poll_seconds)
+                continue
             break
 
         if has_active_blocker or newer_finding_after_clean_pass:
@@ -1017,6 +1087,8 @@ def classify(
         "pr_head_ref_name": pr_head_ref,
         "ping_comment_id": ping_comment_id,
         "ping_created_at": ping_created_at,
+        "ping_timestamp_supplied": ping_timestamp_supplied,
+        "ping_timestamp_valid": ping_timestamp_valid,
         "latest_codex_response_type": latest_codex_response_type,
         "latest_codex_response_id": latest_codex_response_id,
         "latest_codex_response_created_at": latest_codex_response_created_at,
@@ -1095,6 +1167,23 @@ def render_markdown(packet: Dict[str, Any]) -> str:
         lines.append(f"- **Type:** `{rt}`  ")
         lines.append(f"- **ID:** `{packet.get('latest_codex_response_id', '')}`  ")
         lines.append(f"- **Created at:** `{packet.get('latest_codex_response_created_at', '')}`\n")
+
+    # Surface ping timestamp status. When the operator supplied
+    # --ping-created-at but it could not be parsed, the
+    # classifier refused to accept any post-ping Codex evidence
+    # and held at HOLD_CODEX_RESPONSE_PENDING.
+    lines.append("## Ping timestamp\n")
+    ping_supplied = packet.get("ping_timestamp_supplied", False)
+    ping_valid = packet.get("ping_timestamp_valid", True)
+    if not ping_supplied:
+        lines.append("- **--ping-created-at:** _(not supplied; no ping filter applied)_\n")
+    elif ping_valid:
+        lines.append(f"- **--ping-created-at:** `{packet.get('ping_created_at', '')}`  ")
+        lines.append("- **Parsed cleanly:** ✅  \n")
+    else:
+        lines.append(f"- **--ping-created-at:** `{packet.get('ping_created_at', '')}`  ")
+        lines.append("- **Parsed cleanly:** ❌ (classifier failed closed; "
+                     "post-ping Codex evidence was NOT trusted)\n")
 
     lines.append("## Clean-pass evidence\n")
     if packet.get("clean_pass_detected"):
