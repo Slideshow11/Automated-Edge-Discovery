@@ -6201,3 +6201,335 @@ def test_p3_packet_field_left_untouched():
     # Call render_markdown — it must not mutate the packet.
     mod.render_markdown(packet)
     assert packet["pr_state"] == "open"
+
+
+# ---------------------------------------------------------------------------
+# P2 #3 regression tests: render the actual hold status for partial visible
+# findings (Codex post-ping finding 3, thread PRRT_kwDOSHFpYM6JVUox).
+# ---------------------------------------------------------------------------
+
+
+def _build_partial_inventory_packet(
+    *,
+    status: str,
+    review_thread_inventory_complete: Optional[bool] = None,
+    review_thread_comment_inventory_complete: bool = False,
+    review_thread_comment_inventory_error_count: int = 1,
+    review_thread_comment_incomplete_thread_ids: Optional[List[str]] = None,
+    active_threads: Optional[List[Dict[str, Any]]] = None,
+    outdated_threads: Optional[List[Dict[str, Any]]] = None,
+    resolved_threads: Optional[List[Dict[str, Any]]] = None,
+    issue_complete: bool = True,
+    rev_complete: bool = True,
+) -> Dict[str, Any]:
+    """
+    Build a minimal packet fixture exercising the
+    "inventory incomplete" markdown note path. The
+    three top-level inventory flags drive whether
+    the note is rendered; the nested-comments
+    inventory flag is independent (it controls
+    whether the note ALSO explains incomplete nested
+    pagination, but does not gate the note's
+    presence).
+
+    The default for `review_thread_inventory_complete`
+    follows the production invariant: when nested
+    review-thread comments are paginated, the
+    underlying `gh_graphql_review_threads` returns
+    `ok=False`, and the call site sets BOTH the
+    TOP-LEVEL `review_thread_inventory_complete` AND
+    the `review_thread_comment_inventory_complete`
+    to False. So `False` is the right default for
+    both flags in partial-inventory fixtures; passing
+    `True` for either only makes sense for the
+    "complete inventory" negative-control test.
+    """
+    if review_thread_inventory_complete is None:
+        review_thread_inventory_complete = (
+            not (not issue_complete or not rev_complete)
+            and review_thread_comment_inventory_complete
+        )
+    return {
+        "packet_kind": mod.PACKET_KIND,
+        "schema_version": mod.SCHEMA_VERSION,
+        "status": status,
+        "repo": REPO,
+        "pr_number": 402,
+        "expected_head_sha": EXPECTED_HEAD,
+        "observed_head_sha": EXPECTED_HEAD,
+        "head_matches_expected": True,
+        "pr_state": "open",
+        "pr_url": f"https://github.com/{REPO}/pull/402",
+        "pr_base_ref_name": "main",
+        "pr_head_ref_name": "tooling/codex-response-classifier-v1",
+        "merge_state_status": "BLOCKED",
+        "mergeable": "MERGEABLE",
+        "review_decision": "REVIEW_REQUIRED",
+        "ping_comment_id": PING_ID,
+        "ping_created_at": PING_CREATED,
+        "ping_timestamp_supplied": True,
+        "ping_timestamp_valid": True,
+        "latest_codex_response_type": "pull_request_review",
+        "latest_codex_response_id": "1",
+        "latest_codex_response_created_at": "2026-06-13T15:00:00Z",
+        "clean_pass_detected": False,
+        "clean_pass_source": None,
+        "clean_pass_comment_id": None,
+        "clean_pass_review_id": None,
+        "clean_pass_at": None,
+        "last_seen_codex_review_id": "1",
+        "last_seen_codex_review_at": "2026-06-13T15:00:00Z",
+        "last_seen_codex_comment_id": None,
+        "last_seen_codex_comment_at": None,
+        "active_threads": active_threads if active_threads is not None else [],
+        "outdated_threads": outdated_threads if outdated_threads is not None else [],
+        "resolved_threads": resolved_threads if resolved_threads is not None else [],
+        "unresolved_thread_count": (
+            len(active_threads or []) + len(outdated_threads or [])
+        ),
+        "current_head_active_blocker_count": len(active_threads or []),
+        "outdated_unresolved_thread_count": len(outdated_threads or []),
+        "review_thread_inventory_complete": review_thread_inventory_complete,
+        "review_thread_inventory_error_count": (
+            0 if review_thread_inventory_complete else 1
+        ),
+        "review_thread_inventory_last_error": "",
+        "review_thread_comment_inventory_complete": (
+            review_thread_comment_inventory_complete
+        ),
+        "review_thread_comment_inventory_error_count": (
+            review_thread_comment_inventory_error_count
+        ),
+        "review_thread_comment_incomplete_thread_ids": (
+            review_thread_comment_incomplete_thread_ids
+            if review_thread_comment_incomplete_thread_ids is not None
+            else ["PRRT_kwDOSHFpYM6JVisibleCodex"]
+        ),
+        "issue_comment_inventory_complete": issue_complete,
+        "issue_comment_inventory_error_count": 0 if issue_complete else 1,
+        "issue_comment_inventory_last_error": "",
+        "review_submission_inventory_complete": rev_complete,
+        "review_submission_inventory_error_count": 0 if rev_complete else 1,
+        "review_submission_inventory_last_error": "",
+        "polls_used": 1,
+        "polling_exhausted": False,
+        "stop_reason": "active_finding_with_incomplete_inventory",
+        "max_polls": 1,
+        "poll_seconds": 0,
+        "api_errors": [
+            "review-thread comments pagination required "
+            "(hasNextPage=true on nested comments for 1 thread).",
+        ],
+        "recommendation": "fix and resubmit",
+        "harvested_at": "2026-06-13T15:00:00Z",
+    }
+
+
+def test_p2_partial_inventory_hold_new_thread_renders_actual_status():
+    """
+    P2 #3: When review-thread comment inventory is
+    incomplete AND the partial inventory has already
+    preserved a visible active Codex finding, the
+    actual status is HOLD_NEW_CODEX_THREAD. The
+    markdown MUST render that exact status — it
+    must NOT say the classifier is "holding at
+    HOLD_CODEX_RESPONSE_PENDING". Pre-fix, the
+    markdown unconditionally emitted the wrong
+    wording under any incomplete-inventory
+    condition.
+    """
+    packet = _build_partial_inventory_packet(
+        status=mod.STATUS_HOLD_NEW_THREAD,
+        # Production invariant: when nested-comments
+        # are paginated, the underlying call returns
+        # ok=False, which sets BOTH top-level
+        # review_thread_inventory_complete AND the
+        # nested-comments flag to False. Mirror that
+        # here so the markdown note is triggered.
+        review_thread_inventory_complete=False,
+        review_thread_comment_inventory_complete=False,
+        review_thread_comment_inventory_error_count=1,
+        review_thread_comment_incomplete_thread_ids=[
+            "PRRT_kwDOSHFpYM6JVisibleCodex"
+        ],
+        active_threads=[
+            {
+                "thread_id": "PRRT_kwDOSHFpYM6JVisibleCodex",
+                "comment_database_id": 999001,
+                "comment_url": "https://example/999001",
+                "author": CODEX_LOGIN,
+                "path": (
+                    "scripts/local/audit_codex_response_for_pr.py"
+                ),
+                "line": 499,
+                "is_resolved": False,
+                "is_outdated": False,
+                "body": "Visible Codex finding on the partial page",
+                "nested_incomplete": True,
+            }
+        ],
+    )
+    md = mod.render_markdown(packet)
+    # The actual lifecycle status is the packet's
+    # `status`, which the markdown must echo back.
+    assert "`HOLD_NEW_CODEX_THREAD`" in md, (
+        "markdown must render the packet's actual "
+        "HOLD_NEW_CODEX_THREAD status when a visible "
+        "active finding is preserved under incomplete "
+        "nested inventory. Got markdown: " + md[:500]
+    )
+    # And it must NOT contradict itself by saying the
+    # classifier is "holding at HOLD_CODEX_RESPONSE_PENDING".
+    assert "holding at HOLD_CODEX_RESPONSE_PENDING" not in md, (
+        "markdown must not say the classifier is holding "
+        "at HOLD_CODEX_RESPONSE_PENDING when the packet "
+        "status is HOLD_NEW_CODEX_THREAD. Got markdown: "
+        + md[:500]
+    )
+    # The fail-closed safety explanation must still be
+    # present: clean-pass / merge-ready decisions are
+    # refused while any required surface is incomplete.
+    assert "Clean-pass / merge-ready decisions are still" in md
+    assert "refused while any required surface is" in md
+    # And the report explains the precedence rule so
+    # operators can see why a visible finding drives
+    # HOLD_NEW_CODEX_THREAD.
+    assert "visible active Codex finding" in md
+    assert "HOLD_NEW_CODEX_THREAD" in md
+    assert "HOLD_CODEX_RESPONSE_PENDING" in md
+
+
+def test_p2_partial_inventory_hold_pending_renders_pending_status():
+    """
+    P2 #3: When review-thread comment inventory is
+    incomplete AND no visible active Codex finding
+    was preserved, the actual status is
+    HOLD_CODEX_RESPONSE_PENDING. The markdown MUST
+    render that exact status. Pre-fix wording also
+    said "HOLD_CODEX_RESPONSE_PENDING" in this case,
+    but the post-fix wording must be packet-driven
+    so it tracks the actual decision (not a hardcoded
+    string).
+    """
+    packet = _build_partial_inventory_packet(
+        status=mod.STATUS_HOLD_CODEX_PENDING,
+        review_thread_inventory_complete=False,
+        review_thread_comment_inventory_complete=False,
+        review_thread_comment_inventory_error_count=1,
+        review_thread_comment_incomplete_thread_ids=[
+            "PRRT_kwDOSHFpYM6JNoVisibleCodex"
+        ],
+        # No visible active finding preserved.
+        active_threads=[],
+    )
+    md = mod.render_markdown(packet)
+    # The actual lifecycle status is HOLD_CODEX_RESPONSE_PENDING.
+    assert "`HOLD_CODEX_RESPONSE_PENDING`" in md
+    # The fail-closed safety explanation must still be present.
+    assert "Clean-pass / merge-ready decisions are still" in md
+    assert "refused while any required surface is" in md
+
+
+def test_p2_partial_inventory_explains_clean_pass_merge_ready_refused():
+    """
+    P2 #3: For ANY incomplete-inventory note (whether
+    HOLD_NEW_CODEX_THREAD or HOLD_CODEX_RESPONSE_PENDING),
+    the report must still explain that clean-pass /
+    merge-ready decisions are refused. The fail-closed
+    safety rule is unchanged by this fix.
+    """
+    for status, has_visible in [
+        (mod.STATUS_HOLD_NEW_THREAD, True),
+        (mod.STATUS_HOLD_CODEX_PENDING, False),
+    ]:
+        packet = _build_partial_inventory_packet(
+            status=status,
+            review_thread_comment_inventory_complete=False,
+            active_threads=(
+                [
+                    {
+                        "thread_id": "PRRT_kwDOSHFpYM6JVisible",
+                        "comment_database_id": 999010,
+                        "comment_url": "https://example/999010",
+                        "author": CODEX_LOGIN,
+                        "path": "scripts/local/foo.py",
+                        "line": 1,
+                        "is_resolved": False,
+                        "is_outdated": False,
+                        "body": "visible finding",
+                        "nested_incomplete": True,
+                    }
+                ]
+                if has_visible
+                else []
+            ),
+        )
+        md = mod.render_markdown(packet)
+        # The exact safety wording must always be present.
+        assert "Clean-pass / merge-ready decisions are still" in md, (
+            f"safety explanation missing for status={status}: "
+            f"{md[:300]}"
+        )
+        assert "refused while any required surface is" in md, (
+            f"safety explanation missing for status={status}: "
+            f"{md[:300]}"
+        )
+
+
+def test_p2_complete_inventory_does_not_emit_partial_inventory_note():
+    """
+    P2 #3: When ALL three required surfaces are
+    complete (issue_comment, review_submission,
+    review_thread), the partial-inventory note must
+    NOT be emitted. The new wording is only
+    triggered by incomplete inventory.
+    """
+    packet = _build_partial_inventory_packet(
+        status=mod.STATUS_MERGE_READY,
+        review_thread_inventory_complete=True,
+        review_thread_comment_inventory_complete=True,
+        # Even if the markdown renderer still
+        # renders the partial-inventory section
+        # header, the per-poll note must NOT appear
+        # because all three required surfaces are
+        # complete.
+        issue_complete=True,
+        rev_complete=True,
+    )
+    md = mod.render_markdown(packet)
+    assert "At least one required Codex response-surface" not in md
+    assert "Clean-pass / merge-ready decisions are still" not in md
+
+
+def test_p2_issue_inventory_alone_triggers_packet_driven_note():
+    """
+    P2 #3: The packet-driven note also fires when
+    only the issue-comment inventory is incomplete
+    (and the visible finding comes from elsewhere).
+    The wording must reflect the packet's actual
+    status, not a hardcoded "pending" string.
+    """
+    packet = _build_partial_inventory_packet(
+        status=mod.STATUS_HOLD_NEW_THREAD,
+        review_thread_inventory_complete=True,
+        review_thread_comment_inventory_complete=True,
+        issue_complete=False,  # only this is incomplete
+        active_threads=[
+            {
+                "thread_id": "PRRT_kwDOSHFpYM6JIssueIncomplete",
+                "comment_database_id": 999020,
+                "comment_url": "https://example/999020",
+                "author": CODEX_LOGIN,
+                "path": "scripts/local/foo.py",
+                "line": 1,
+                "is_resolved": False,
+                "is_outdated": False,
+                "body": "active blocker preserved",
+                "nested_incomplete": False,
+            }
+        ],
+    )
+    md = mod.render_markdown(packet)
+    assert "`HOLD_NEW_CODEX_THREAD`" in md
+    assert "holding at HOLD_CODEX_RESPONSE_PENDING" not in md
+    assert "Clean-pass / merge-ready decisions are still" in md

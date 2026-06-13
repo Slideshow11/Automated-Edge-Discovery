@@ -1677,12 +1677,44 @@ def render_markdown(packet: Dict[str, Any]) -> str:
             lines.append(f"- **Last inventory error:** `{inv_last_err}`\n")
         else:
             lines.append("")
+    # Surface the actual lifecycle status the classifier
+    # emitted on this poll, NOT a hardcoded "pending"
+    # string. After the prior fix the classifier can
+    # legitimately return HOLD_NEW_CODEX_THREAD when a
+    # visible active Codex finding sits on the visible
+    # page of an incomplete-nested-pagination thread —
+    # the markdown must reflect the packet's actual
+    # `status`, not a stale "pending" wording that
+    # contradicts the real lifecycle.
+    #
+    # Decision semantics, kept explicit in the report:
+    # - incomplete inventory alone is NOT enough to
+    #   label the report as "pending"; visible active
+    #   Codex findings preserved in the partial
+    #   inventory take precedence and drive
+    #   HOLD_NEW_CODEX_THREAD.
+    # - clean-pass / merge-ready decisions are STILL
+    #   refused while any required surface is
+    #   incomplete (the fail-closed safety rule is
+    #   unchanged).
     if not (issue_complete and rev_complete and inv_complete):
+        actual_status = packet.get("status", "") or (
+            STATUS_HOLD_CODEX_PENDING
+        )
         lines.append(
             "_At least one required Codex response-surface "
             "inventory is incomplete. See `api_errors` below and "
-            "the `stop_reason` in the Polling summary. Classifier "
-            "is holding at HOLD_CODEX_RESPONSE_PENDING._\n"
+            "the `stop_reason` in the Polling summary. "
+            f"Classifier is holding at `{actual_status}`. "
+            "Clean-pass / merge-ready decisions are still "
+            "refused while any required surface is "
+            "incomplete. When the partial inventory has "
+            "already preserved a visible active Codex "
+            "finding, that visible finding takes "
+            "precedence and the status is "
+            "`HOLD_NEW_CODEX_THREAD`; when no visible "
+            "active finding was found yet, the status is "
+            "`HOLD_CODEX_RESPONSE_PENDING`._\n"
         )
 
     lines.append("## Polling summary\n")
