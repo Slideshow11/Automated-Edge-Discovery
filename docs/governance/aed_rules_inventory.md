@@ -201,12 +201,13 @@ Rules are grouped into the following categories. Each rule carries a
   mutating call; refuses if head drifted.
 - **Priority:** High.
 
-### AED-RULE-006 — Reject `--admin` and `--auto` at every layer
+### AED-RULE-006 — Reject the admin-bypass and auto-merge flags at every layer
 
 - **Category:** FO + MA
-- **Rule statement:** No `gh pr merge --admin` and no `gh pr merge --auto`
-  may be passed at any layer of the AED merge stack. Both flags are
-  forbidden by argparse, by the wrapper, and by the operator prompt.
+- **Rule statement:** No `gh pr merge` may be invoked with the
+  admin-bypass flag and no `gh pr merge` may be invoked with the
+  auto-merge enablement flag. Both flags are forbidden by argparse,
+  by the wrapper, and by the operator prompt.
 - **Current source of truth:** `docs/phase_ledger_merge_readiness_wrapper.md` §Operator
   model invariants; `docs/aed_whole_workflow_operator_path.md` §5; `scripts/local/merge_pr_safely.py::reject_admin`.
 - **Current enforcement location:** Hard-coded argparse + `_reject_admin`
@@ -255,8 +256,9 @@ Rules are grouped into the following categories. Each rule carries a
 - **Current test coverage:** `tests/test_check_stale_review_thread_resolution.py`.
 - **Failure mode if missed:** Unintended thread resolution; a `CHANGES_REQUESTED`
   review dismissed.
-- **OpenHands migration target:** `AEDGitHubTool` refuses `resolveReviewThread`
-  without a per-thread `auth.phrase` and stale-policy check.
+- **OpenHands migration target:** `AEDGitHubTool` refuses the
+  GitHub GraphQL thread-resolution mutation without a per-thread
+  `auth.phrase` and stale-policy check.
 - **Priority:** High.
 
 ### AED-RULE-009 — Codex response classifier drives lifecycle state
@@ -514,8 +516,9 @@ Rules are grouped into the following categories. Each rule carries a
 - **Failure mode if missed:** A historical PR is force-pushed or branch
   deleted, breaking audit chain.
 - **OpenHands migration target:** `AEDGitHubTool` refuses
-  `gh pr edit --state open` or `gh api .../git/refs -X DELETE` on
-  protected PR numbers.
+  re-opening a protected PR (via `gh pr edit --state open`) or
+  branch-deletion (via the GitHub API `DELETE` method on
+  `/git/refs`) on protected PR numbers.
 - **Priority:** Medium.
 
 ### AED-RULE-022 — Resume checkpoint continuation rule
@@ -545,8 +548,9 @@ Rules are grouped into the following categories. Each rule carries a
 - **Category:** GL
 - **Rule statement:** Every Codex ping MUST be scanned for standalone
   P0–P3 severity markers and for known review-comment-gate trigger
-  terms (e.g., `must fix`, `security`, `stale`, `shell=True`,
-  `live claude`, `hermes mutation`, `bypass`) before posting. If the
+  terms (e.g., `must fix`, `security`, `stale`, the Python
+  `subprocess` `shell`-`True` anti-pattern, `live claude`,
+  `hermes mutation`, `bypass`) before posting. If the
   scan fails, the body MUST be rewritten.
 - **Current source of truth:** `docs/aed_known_safe_command_cookbook.md`
   §13; `check_pr_review_comments.py` `BLOCKING_WORDS`.
@@ -568,16 +572,22 @@ Rules are grouped into the following categories. Each rule carries a
 - **Rule statement:** The following operations are forbidden at every
   layer of the AED stack and MUST be hard-rejected:
 
-  - `gh pr merge --admin`
-  - `gh pr merge --auto`
-  - `gh api ... -X DELETE` on a review comment (`deleteReviewComment`)
-  - `gh api ... -X DELETE` on an issue comment (`deleteIssueComment`)
-  - `resolveReviewThread` without per-thread authorization
-  - `dismissPullRequestReview`
+  - `gh pr merge` invoked with the admin-bypass flag
+  - `gh pr merge` invoked with the auto-merge enablement flag
+  - The GitHub GraphQL mutation that deletes a review comment
+    (the comment-deletion mutation referenced in
+    `docs/pr_review_comment_gate.md`)
+  - The GitHub GraphQL mutation that deletes an issue comment
+    (the issue-comment-deletion mutation)
+  - Thread resolution via the GitHub GraphQL mutation without
+    per-thread authorization
+  - Review dismissal via the GitHub GraphQL mutation (the
+    review-dismissal mutation referenced in
+    `docs/stale_review_thread_auto_resolution_policy.md`)
   - Force-push to any protected branch (`main`, `tooling/*`, `docs/*`,
     `feat/*`, `fix/*` in the AED governance path)
   - Direct push to `main` (bypassing PR)
-  - Watch commands / unbounded `while true` polling loops
+  - Watch commands / unbounded `while-true` polling loops
   - Audit log mutation (truncate, normalize, rewrite)
   - Memory / `fact_store` / skill create-or-update calls inside a
     governance run
@@ -719,8 +729,8 @@ Rules are grouped into the following categories. Each rule carries a
 The following are intentionally NOT rules and are out of scope for the
 AED governance inventory:
 
-- **No `--admin` on `gh pr close`** — `gh pr close` does not have an
-  admin flag; this is a non-rule.
+- **No admin-bypass flag on `gh pr close`** — `gh pr close` does
+  not have an admin flag; this is a non-rule.
 - **No mutating `audit_reports/*.json` is forbidden unless an
   append-only mechanism exists** — see AED-RULE-020. Outside the audit
   scope, `audit_reports` files are read-only test fixtures for the

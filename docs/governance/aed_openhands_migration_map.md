@@ -76,7 +76,7 @@ broker is the law.
 │  - AEDFileTool       (read/write under /tmp/aed_runs/...)    │
 │  - AEDTerminalTool   (bounded subshell)                      │
 │  - AEDGitTool        (refuses primary-worktree mutation)     │
-│  - AEDGitHubTool     (refuses --admin, --auto, force-push)   │
+│  - AEDGitHubTool     (refuses admin-bypass and auto-merge flags, and force-push)   │
 │  - AEDCodexPingTool  (pre-post scan + de-dup)                │
 │  - AEDCodexClassifierTool (read-only classifier)             │
 │  - AEDAuditTool      (append-only audit)                     │
@@ -118,7 +118,7 @@ unless otherwise noted.
 | AED-RULE-005 | `AEDGitHubTool` PreToolUse | Re-fetch `gh pr view --json headRefOid` before merge-authorizing calls |
 | AED-RULE-006 | `AEDMergeTool` argparse + `AEDPolicy` forbidden-flag list | Defense in depth |
 | AED-RULE-007 | `AEDPolicy` `auth.phrase` gate | Required field on `AEDMergeTool` |
-| AED-RULE-008 | `AEDGitHubTool` `resolveReviewThread` gate | Per-thread `auth.phrase` + stale-policy check |
+| AED-RULE-008 | `AEDGitHubTool` thread-resolution-mutation gate | Per-thread `auth.phrase` + stale-policy check |
 | AED-RULE-009 | `AEDCodexClassifierTool` | Existing classifier |
 | AED-RULE-010 | `AEDCodexPingTool` de-dup by `(pr, head)` | |
 | AED-RULE-011 | `AEDCodexClassifierTool` | Existing clean-pass logic |
