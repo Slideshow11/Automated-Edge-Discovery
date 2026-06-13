@@ -6832,3 +6832,552 @@ def test_p2_issue_comment_newer_finding_path_unchanged(
     pkt = json.loads((tmp_path / "pkt.json").read_text())
     assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
     assert pkt["clean_pass_detected"] is True
+
+
+# ---------------------------------------------------------------------------
+# P2 #5: formal clean-pass reviews before later non-clean reviews
+# ---------------------------------------------------------------------------
+
+
+def _build_formal_clean_pass_then_later_fixture(
+    *,
+    first_review_state: str,
+    first_review_body: str,
+    first_review_commit_oid: str,
+    first_review_id: int = 7101,
+    first_review_submitted_at: str = "2026-06-11T18:00:00Z",
+    second_review_state: str = "COMMENTED",
+    second_review_body: str = "Actually I missed something: P1 real bug",
+    second_review_commit_oid: str = EXPECTED_HEAD,
+    second_review_id: int = 7102,
+    second_review_submitted_at: str = "2026-06-11T18:30:00Z",
+    second_review_author: str = CODEX_LOGIN,
+) -> Dict[str, Any]:
+    """
+    Build a packet-driving fixture where:
+    - A post-ping Codex formal review exists with the
+      given state/body/commit_oid, and is the EARLIER
+      of two post-ping reviews. This is the candidate
+      clean-pass review.
+    - A LATER post-ping Codex formal review (with the
+      given second_* parameters) exists AFTER the
+      first review.
+
+    The ping filter accepts both reviews (their
+    submittedAt timestamps are > PING_CREATED). The
+    first review's commit_oid determines whether it
+    is accepted as the current-head clean pass; the
+    second review's commit_oid determines whether it
+    is treated as a newer finding.
+
+    No PR-level issue comments are included; the
+    clean pass must come from the formal review
+    submission path.
+    """
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state=first_review_state,
+            body=first_review_body,
+            submitted_at=first_review_submitted_at,
+            review_id=first_review_id,
+            commit_oid=first_review_commit_oid,
+        ),
+        make_review(
+            author=second_review_author,
+            state=second_review_state,
+            body=second_review_body,
+            submitted_at=second_review_submitted_at,
+            review_id=second_review_id,
+            commit_oid=second_review_commit_oid,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    return {
+        "pr_view": _make_clean_pass_pr_view(),
+        "issue": [],
+        "reviews": reviews,
+        "threads": threads,
+    }
+
+
+def test_p2_formal_clean_pass_then_later_commented_non_clean_routes_hold_new(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5: Codex clean-passes via a formal APPROVED
+    review with the canonical clean-pass phrase, then
+    later submits a non-clean COMMENTED review on the
+    SAME expected head. Pre-fix: the formal clean-pass
+    branch only inspected `latest_review` (the later
+    non-clean one), so `clean_pass_detected` stayed
+    False, the `newer_finding_after_clean_pass` scan
+    was skipped, and the classifier returned
+    `HOLD_CODEX_RESPONSE_PENDING` instead of
+    `HOLD_NEW_CODEX_THREAD`. Post-fix: the earlier
+    formal APPROVED clean-pass review is detected,
+    the later COMMENTED review is treated as a newer
+    finding, and the status is
+    `HOLD_NEW_CODEX_THREAD`.
+
+    Regression retention: the formal-review clean
+    pass is the clean-pass reference (not an issue
+    comment), and `clean_pass_source` is
+    `pull_request_review` with `clean_pass_review_id`
+    set to the first (clean-pass) review id.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_formal_clean_pass_then_later_fixture(
+        first_review_state="APPROVED",
+        first_review_body=codex_clean_pass_body(),
+        first_review_commit_oid=EXPECTED_HEAD,
+        second_review_state="COMMENTED",
+        second_review_body="I missed something: P2 real bug on current head",
+        second_review_commit_oid=EXPECTED_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD, (
+        f"formal APPROVED clean pass then later "
+        f"non-clean COMMENTED on same head must route "
+        f"to HOLD_NEW_CODEX_THREAD (newer finding), "
+        f"got status={pkt['status']!r}, "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')}, "
+        f"clean_pass_source={pkt.get('clean_pass_source')}, "
+        f"clean_pass_review_id={pkt.get('clean_pass_review_id')}, "
+        f"latest_codex_response_id={pkt.get('latest_codex_response_id')}"
+    )
+    assert pkt["status"] != mod.STATUS_HOLD_CODEX_PENDING, (
+        "must NOT downgrade to HOLD_CODEX_RESPONSE_PENDING "
+        "when a confirmed current-head clean pass exists "
+        "before a later current-head non-clean formal review"
+    )
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["clean_pass_review_id"] == 7101
+    assert pkt["clean_pass_at"] == "2026-06-11T18:00:00Z"
+
+
+def test_p2_formal_clean_pass_then_later_changes_requested_routes_hold_new(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5: Codex clean-passes via a formal COMMENTED
+    review (with clean-pass phrase), then later
+    submits a CHANGES_REQUESTED review on the same
+    expected head. Pre-fix: clean pass was missed and
+    the classifier returned
+    HOLD_CODEX_RESPONSE_PENDING. Post-fix: the earlier
+    clean pass is detected, the later
+    CHANGES_REQUESTED review is treated as a newer
+    finding, status is HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_formal_clean_pass_then_later_fixture(
+        first_review_state="COMMENTED",
+        first_review_body=codex_clean_pass_body(),
+        first_review_commit_oid=EXPECTED_HEAD,
+        second_review_state="CHANGES_REQUESTED",
+        second_review_body="Changes requested on current head",
+        second_review_commit_oid=EXPECTED_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["status"] != mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["clean_pass_review_id"] == 7101
+
+
+def test_p2_formal_clean_pass_then_later_approved_non_clean_routes_hold_new(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5: Codex clean-passes via a formal APPROVED
+    review, then later submits another APPROVED
+    review (with a non-clean body) on the same
+    expected head. Pre-fix: clean pass was missed and
+    the classifier returned
+    HOLD_CODEX_RESPONSE_PENDING. Post-fix: the earlier
+    APPROVED clean pass is detected, the later
+    non-clean APPROVED review is treated as a newer
+    finding, status is HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_formal_clean_pass_then_later_fixture(
+        first_review_state="APPROVED",
+        first_review_body=codex_clean_pass_body(),
+        first_review_commit_oid=EXPECTED_HEAD,
+        second_review_state="APPROVED",
+        second_review_body="Approved overall but I see a real issue on current head",
+        second_review_commit_oid=EXPECTED_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["status"] != mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["clean_pass_review_id"] == 7101
+
+
+def test_p2_formal_clean_pass_on_other_head_not_accepted(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5: A formal APPROVED clean-pass review
+    anchored to a DIFFERENT commit than
+    expected_head_sha must NOT be accepted as the
+    current-head clean pass. The same expected-head
+    commit-scope filter used by the `latest_review`
+    path and the `newer_finding_after_clean_pass`
+    scan applies here. A review with no commit_oid
+    is treated as authoritative (same convention).
+
+    In this fixture the only clean-pass candidate is
+    anchored to OTHER_HEAD, so clean_pass_detected
+    stays False. There are no other surfaces to
+    trigger a different decision, so the status
+    reaches HOLD_CODEX_RESPONSE_PENDING (or
+    HOLD_NEW_CODEX_THREAD only if an active thread
+    exists — none in this fixture).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_formal_clean_pass_then_later_fixture(
+        first_review_state="APPROVED",
+        first_review_body=codex_clean_pass_body(),
+        first_review_commit_oid=OTHER_HEAD,  # NOT expected head
+        second_review_state="COMMENTED",
+        second_review_body="Random follow-up on current head",
+        second_review_commit_oid=EXPECTED_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False, (
+        f"formal clean pass on OTHER_HEAD must NOT be "
+        f"accepted as the current-head clean pass; "
+        f"got clean_pass_detected={pkt.get('clean_pass_detected')}, "
+        f"clean_pass_source={pkt.get('clean_pass_source')}, "
+        f"clean_pass_review_id={pkt.get('clean_pass_review_id')}"
+    )
+    assert pkt["clean_pass_source"] is None
+    assert pkt["clean_pass_review_id"] is None
+    # No clean pass and no active threads -> pending
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+
+
+def test_p2_multiple_formal_clean_passes_picks_most_recent(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5: When multiple post-ping Codex formal
+    reviews qualify as clean-pass candidates, the
+    most recent qualifying review (by submittedAt)
+    is selected as the clean-pass reference. Earlier
+    clean-pass reviews are ignored.
+
+    In this fixture:
+    - First review (18:00): APPROVED + clean-pass
+      phrase on EXPECTED_HEAD
+    - Second review (18:15): APPROVED + clean-pass
+      phrase on EXPECTED_HEAD  (more recent)
+    - Third review (18:30): non-clean COMMENTED on
+      EXPECTED_HEAD
+
+    Expected: clean_pass_review_id is the SECOND
+    review (7115), clean_pass_at is 18:15:00Z, the
+    later non-clean review is treated as a newer
+    finding, status is HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="APPROVED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7110,
+            commit_oid=EXPECTED_HEAD,
+        ),
+        make_review(
+            author=CODEX_LOGIN,
+            state="APPROVED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T18:15:00Z",
+            review_id=7115,
+            commit_oid=EXPECTED_HEAD,
+        ),
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Actually I see a real issue on current head",
+            submitted_at="2026-06-11T18:30:00Z",
+            review_id=7120,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    runner = make_gh_runner(_make_clean_pass_pr_view(), [], reviews, threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    # Most recent clean-pass review is the second one (18:15)
+    assert pkt["clean_pass_review_id"] == 7115, (
+        f"expected the most recent clean-pass review "
+        f"(7115) to be selected; got "
+        f"clean_pass_review_id={pkt.get('clean_pass_review_id')!r}"
+    )
+    assert pkt["clean_pass_at"] == "2026-06-11T18:15:00Z"
+
+
+def test_p2_issue_comment_clean_pass_plus_later_formal_non_clean_still_hold_new(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5 (regression retention): When the clean
+    pass is a PR-level issue comment AND a later
+    formal non-clean review exists on the expected
+    head, the existing issue-comment newer-finding
+    path must still drive HOLD_NEW_CODEX_THREAD.
+
+    This is essentially the same scenario as
+    test_clean_pass_with_newer_finding_after_returns_hold_new
+    but adds a formal review submission that is
+    also non-clean. The clean pass still comes from
+    the issue comment. Status is HOLD_NEW_CODEX_THREAD
+    (driven by the newer non-clean issue comment, not
+    by the formal review alone).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9700,
+        ),
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body="Actually I missed something: P1 real bug",
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9701,
+        ),
+    ]
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Random follow-up on current head",
+            submitted_at="2026-06-11T18:35:00Z",
+            review_id=7150,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, reviews, threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+    # Clean pass came from the issue comment, not the formal review
+    assert pkt["clean_pass_source"] == "issue_comment"
+    assert pkt["clean_pass_comment_id"] == 9700
+
+
+def test_p2_formal_clean_pass_review_with_no_commit_oid_is_authoritative(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5 (regression retention): A formal review
+    with no commit_oid (legacy / GitHub-emitted
+    without a commit anchor) is kept as
+    authoritative, matching the `latest_review`
+    convention. In this fixture the clean-pass
+    review has commit_oid="" (effectively None),
+    which `extract_review_commit_oid` returns as "".
+    The clean pass must still be detected and
+    drive the same routing as a review with a
+    matching commit_oid.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="APPROVED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7200,
+            commit_oid="",  # no commit anchor -> authoritative
+        ),
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="I see a real issue on current head",
+            submitted_at="2026-06-11T18:30:00Z",
+            review_id=7201,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    runner = make_gh_runner(_make_clean_pass_pr_view(), [], reviews, threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["clean_pass_review_id"] == 7200
+
+
+def test_p2_formal_clean_pass_then_later_review_on_other_head_still_hold_new(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #5 (regression retention): The new
+    formal-review clean-pass branch and the existing
+    `newer_finding_after_clean_pass` commit-scope
+    filter (P2 #4) work together. When the formal
+    clean pass is on EXPECTED_HEAD but the later
+    non-clean review is on OTHER_HEAD, the clean
+    pass is detected, but the stale different-commit
+    review is NOT treated as a newer finding. Result:
+    no newer finding, no active threads, merge
+    state CLEAN -> MERGE_READY_AWAITING_HUMAN_AUTHORIZATION.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_formal_clean_pass_then_later_fixture(
+        first_review_state="APPROVED",
+        first_review_body=codex_clean_pass_body(),
+        first_review_commit_oid=EXPECTED_HEAD,
+        second_review_state="COMMENTED",
+        second_review_body="Stale finding on a prior head",
+        second_review_commit_oid=OTHER_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY, (
+        f"formal clean pass on expected head + stale "
+        f"different-commit review must reach "
+        f"MERGE_READY (not HOLD_NEW_CODEX_THREAD); "
+        f"got status={pkt['status']!r}, "
+        f"clean_pass_review_id={pkt.get('clean_pass_review_id')}"
+    )
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "pull_request_review"
+    assert pkt["clean_pass_review_id"] == 7101

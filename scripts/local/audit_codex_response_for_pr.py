@@ -1180,16 +1180,74 @@ def classify(
                     continue
             if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c
-        if latest_clean_pass is None and latest_review is not None:
-            # Treat formal review clean pass as valid only if state is
-            # APPROVED/COMMENTED and body contains the clean-pass phrase.
-            state_value = (latest_review.get("state") or "").upper()
-            body_value = latest_review.get("body", "") or ""
-            if state_value in ("APPROVED", "COMMENTED") and is_codex_clean_pass_comment(body_value):
+        # If no issue-comment clean pass exists, scan ALL post-ping
+        # Codex formal review submissions for a clean pass. We must
+        # not only check `latest_review`, because Codex may first
+        # clean-pass via a formal review and then submit a later
+        # non-clean review on the same head — in that case
+        # `latest_review` points at the later non-clean one and the
+        # earlier clean pass would be missed, the
+        # `newer_finding_after_clean_pass` scan below would be
+        # skipped, and the classifier would return
+        # `HOLD_CODEX_RESPONSE_PENDING` instead of
+        # `HOLD_NEW_CODEX_THREAD` (Codex finding 5,
+        # PRRT_kwDOSHFpYM6JWe1P, 3408523177).
+        #
+        # Apply the same expected-head commit-scope filter used by
+        # the `latest_review` selection path above: reviews anchored
+        # to a different commit than `expected_head_sha` are stale
+        # Codex surfaces from a prior head and must NOT be accepted
+        # as the current-head clean pass. Reviews with no commit_oid
+        # (legacy / GitHub-emitted without a commit anchor) are kept
+        # as authoritative — same convention as `latest_review`.
+        # State is restricted to APPROVED or COMMENTED; bodies must
+        # contain the canonical clean-pass phrase. Ping-window
+        # filtering is applied so old pre-ping clean passes are not
+        # accepted. The most recent qualifying review is selected as
+        # the clean-pass reference.
+        if latest_clean_pass is None and codex_review_submissions:
+            latest_formal_clean_pass = None
+            latest_formal_clean_pass_ts = ""
+            for r in codex_review_submissions:
+                state_value = (r.get("state") or "").upper()
+                body_value = r.get("body", "") or ""
+                if state_value not in ("APPROVED", "COMMENTED"):
+                    continue
+                if not is_codex_clean_pass_comment(body_value):
+                    continue
+                ts = timestamp_field(
+                    r, "submittedAt", "submitted_at", "createdAt", "created_at"
+                )
+                if ping_dt is not None:
+                    r_dt = parse_iso_utc(ts)
+                    if r_dt is None or r_dt < ping_dt:
+                        continue
+                # Same expected-head commit-scope filter as
+                # `latest_review` and the `newer_finding_after_
+                # clean_pass` scan below. Reviews with no
+                # commit_oid are kept as authoritative (legacy /
+                # GitHub-emitted without a commit anchor).
+                rev_commit = extract_review_commit_oid(r)
+                if (
+                    rev_commit
+                    and expected_head_sha
+                    and rev_commit != expected_head_sha
+                ):
+                    # Stale review anchored to a different commit
+                    # than expected_head_sha. Ignore for
+                    # formal-review clean-pass detection.
+                    continue
+                if (
+                    latest_formal_clean_pass is None
+                    or ts > latest_formal_clean_pass_ts
+                ):
+                    latest_formal_clean_pass = r
+                    latest_formal_clean_pass_ts = ts
+            if latest_formal_clean_pass is not None:
                 clean_pass_detected = True
-                clean_pass_review_id = latest_review.get("id")
+                clean_pass_review_id = latest_formal_clean_pass.get("id")
                 clean_pass_source = "pull_request_review"
-                clean_pass_at = timestamp_field(latest_review, "submittedAt", "submitted_at", "createdAt", "created_at")
+                clean_pass_at = latest_formal_clean_pass_ts
         if latest_clean_pass is not None:
             clean_pass_detected = True
             clean_pass_comment_id = latest_clean_pass.get("databaseId") or latest_clean_pass.get("id")
