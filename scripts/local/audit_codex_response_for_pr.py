@@ -1260,6 +1260,29 @@ def classify(
                     r_dt = parse_iso_utc(timestamp_field(r, "submittedAt", "submitted_at", "createdAt", "created_at"))
                     if r_dt is None or cp_dt is None or r_dt <= cp_dt:
                         continue
+                    # Apply the same expected-head commit-scope
+                    # filter used by the `latest_review`
+                    # selection path above. A formal review
+                    # anchored to a different commit than
+                    # `expected_head_sha` is a stale Codex
+                    # surface from a prior head and must
+                    # NOT downgrade a valid current-head
+                    # clean pass to HOLD_NEW_CODEX_THREAD.
+                    # Reviews with no commit_id (legacy /
+                    # GitHub-emitted without a commit
+                    # anchor) are kept as authoritative —
+                    # same convention as `latest_review`.
+                    rev_commit = extract_review_commit_oid(r)
+                    if (
+                        rev_commit
+                        and expected_head_sha
+                        and rev_commit != expected_head_sha
+                    ):
+                        # Stale review on a different
+                        # commit: ignore for the
+                        # newer-finding scan. Do NOT mark
+                        # `newer_finding_after_clean_pass`.
+                        continue
                     body = r.get("body", "") or ""
                     state_v = (r.get("state") or "").upper()
                     if state_v in ("CHANGES_REQUESTED", "REQUEST_CHANGES"):

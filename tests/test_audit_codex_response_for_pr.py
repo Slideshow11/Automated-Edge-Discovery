@@ -6533,3 +6533,302 @@ def test_p2_issue_inventory_alone_triggers_packet_driven_note():
     assert "`HOLD_NEW_CODEX_THREAD`" in md
     assert "holding at HOLD_CODEX_RESPONSE_PENDING" not in md
     assert "Clean-pass / merge-ready decisions are still" in md
+
+
+# ---------------------------------------------------------------------------
+# P2 #4 regression tests: ignore non-head formal reviews when scanning
+# for newer findings after a current-head clean pass
+# (Codex post-ping finding 4, thread PRRT_kwDOSHFpYM6JWKnq).
+# ---------------------------------------------------------------------------
+
+
+def _make_clean_pass_pr_view() -> Dict[str, Any]:
+    """Build a PR view that reaches the clean-pass decision
+    branch (merge_state_status=CLEAN, mergeable=MERGEABLE)."""
+    return make_pr_view(merge_state="CLEAN")
+
+
+def _build_clean_pass_then_review_fixture(
+    *,
+    review_state: str,
+    review_body: str,
+    review_commit_oid: str,
+    review_id: int = 7001,
+    review_submitted_at: str = "2026-06-11T18:30:00Z",
+) -> Dict[str, Any]:
+    """
+    Build a packet-driving fixture where:
+    - A current-head Codex clean pass exists as a PR-level
+      issue comment AFTER the ping.
+    - A LATER formal Codex review submission (with the
+      given state and body) exists AFTER the clean pass,
+      anchored to `review_commit_oid`.
+
+    The clean pass and the review both come AFTER
+    PING_CREATED (2026-06-11T17:30:00Z), so the ping
+    filter accepts both. The review's commit_oid
+    determines whether the post-fix code should treat
+    it as a newer finding.
+    """
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9400,
+        ),
+    ]
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state=review_state,
+            body=review_body,
+            submitted_at=review_submitted_at,
+            review_id=review_id,
+            commit_oid=review_commit_oid,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    return {
+        "pr_view": _make_clean_pass_pr_view(),
+        "issue": issue,
+        "reviews": reviews,
+        "threads": threads,
+    }
+
+
+def test_p2_stale_review_changes_requested_does_not_downgrade_clean_pass(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4: A current-head clean pass exists. A later
+    formal Codex CHANGES_REQUESTED review exists,
+    anchored to a DIFFERENT commit (not
+    expected_head_sha). The newer-finding loop must
+    ignore this stale review; the classifier must
+    reach MERGE_READY_AWAITING_HUMAN_AUTHORIZATION,
+    NOT HOLD_NEW_CODEX_THREAD. Pre-fix: this scenario
+    incorrectly routed to HOLD_NEW_CODEX_THREAD and
+    blocked a valid current-head clean pass.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_clean_pass_then_review_fixture(
+        review_state="CHANGES_REQUESTED",
+        review_body="Changes requested on a prior head",
+        review_commit_oid=OTHER_HEAD,  # NOT expected_head
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY, (
+        f"stale-review CHANGES_REQUESTED on a different "
+        f"commit must NOT downgrade a current-head clean "
+        f"pass; expected MERGE_READY, got "
+        f"status={pkt['status']!r}, "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')}, "
+        f"latest_codex_response_id={pkt.get('latest_codex_response_id')}"
+    )
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_p2_stale_review_commented_does_not_downgrade_clean_pass(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4: Same scenario but with a stale COMMENTED
+    Codex review (non-clean body) on a different
+    commit. Pre-fix this also downgraded to
+    HOLD_NEW_CODEX_THREAD. Post-fix the stale review
+    is ignored and we reach MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_clean_pass_then_review_fixture(
+        review_state="COMMENTED",
+        review_body="Actually I see an issue on the prior head",
+        review_commit_oid=OTHER_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_p2_stale_review_approved_does_not_downgrade_clean_pass(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4: Same scenario but with a stale APPROVED
+    Codex review (non-clean body) on a different
+    commit. Pre-fix this also downgraded to
+    HOLD_NEW_CODEX_THREAD. Post-fix the stale review
+    is ignored and we reach MERGE_READY.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_clean_pass_then_review_fixture(
+        review_state="APPROVED",
+        review_body="Approved on the prior head, but here is a real concern",
+        review_commit_oid=OTHER_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_p2_current_head_review_changes_requested_preserves_behavior(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4 (regression retention): When the formal
+    CHANGES_REQUESTED review IS anchored to
+    expected_head_sha, the new-found commit-scope
+    filter does NOT change behavior. The newer-finding
+    loop still treats the current-head review as a
+    newer finding and routes to HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_clean_pass_then_review_fixture(
+        review_state="CHANGES_REQUESTED",
+        review_body="Changes requested on current head",
+        review_commit_oid=EXPECTED_HEAD,  # on expected head
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_p2_current_head_review_commented_non_clean_preserves_behavior(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4 (regression retention): When a current-head
+    formal COMMENTED review (with a non-clean body)
+    IS anchored to expected_head_sha, the post-fix
+    code still treats it as a newer finding. The
+    classifier must route to HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    fx = _build_clean_pass_then_review_fixture(
+        review_state="COMMENTED",
+        review_body="I missed something — here is a real bug",
+        review_commit_oid=EXPECTED_HEAD,
+    )
+    runner = make_gh_runner(fx["pr_view"], fx["issue"], fx["reviews"], fx["threads"])
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_p2_issue_comment_newer_finding_path_unchanged(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #4 (regression retention): Top-level PR issue
+    comments are NOT commit-scoped, so the new
+    commit-id filter is intentionally NOT applied to
+    them. A newer Codex issue comment that is NOT a
+    clean pass, posted after the current-head clean
+    pass, must still drive HOLD_NEW_CODEX_THREAD —
+    exactly as the pre-fix behavior already did.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9500,
+        ),
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body="Actually I missed something: P1 real bug",
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9501,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": []
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
