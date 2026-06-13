@@ -488,15 +488,21 @@ def gh_graphql_review_threads(
         nested_incomplete = bool(nested_page_info.get("hasNextPage"))
         if nested_incomplete and thread_id:
             incomplete_nested_threads.append(thread_id)
-        # Only emit comment entries for threads whose nested
-        # comments are NOT incomplete — a thread with
-        # incomplete nested comments would have its findings
-        # silently trimmed, so we deliberately do not surface
-        # any of its comments as authoritative. The caller
-        # will see ok=False and treat inventory as
-        # incomplete, refusing to emit merge-ready states.
-        if nested_incomplete:
-            continue
+        # Visibility rule: a thread with `comments.pageInfo.hasNextPage=true`
+        # is incomplete (a later page may hold additional findings), but
+        # the comments returned on the FIRST page are authoritative
+        # evidence the classifier has already seen. We MUST surface
+        # those visible comments so a confirmed Codex-authored current-head
+        # finding on the visible page can drive
+        # HOLD_NEW_CODEX_THREAD (not HOLD_CODEX_RESPONSE_PENDING). The
+        # thread is flagged with `nested_incomplete=True` so the
+        # markdown report and downstream consumers can see which
+        # findings came from partial nested evidence. The unified
+        # inventory gate in section 8 still treats the overall
+        # thread-inventory as incomplete (the function returns
+        # `ok=False` below) and refuses to emit clean-pass /
+        # merge-ready states — incomplete nested comments are
+        # never trusted as a complete inventory.
         for comment in (comments_obj.get("nodes") or []):
             if not isinstance(comment, dict):
                 continue
@@ -514,6 +520,17 @@ def gh_graphql_review_threads(
                 "body": comment.get("body") or "",
                 "path": comment.get("path") or "",
                 "line": comment.get("line"),
+                # True iff the parent thread's nested
+                # `comments.pageInfo.hasNextPage=true`. The
+                # markdown renderer surfaces this flag so
+                # operators can see which findings came
+                # from partial nested evidence; the
+                # decision logic does NOT use this flag
+                # directly — it relies on the existing
+                # inventory-completeness gate in section 8
+                # to refuse clean-pass / merge-ready
+                # states when any thread is flagged.
+                "nested_incomplete": nested_incomplete,
             })
     # Build the metadata dict for this call.
     metadata: Dict[str, Any] = {
@@ -1194,6 +1211,14 @@ def classify(
                 "is_resolved": bool(t.get("is_resolved", False)),
                 "is_outdated": bool(t.get("is_outdated", False)),
                 "body": (t.get("body", "") or "")[:500],
+                # True iff the parent thread's nested
+                # comments pageInfo hasNextPage=true.
+                # Surfaced in markdown and packet so
+                # operators can tell which findings came
+                # from partial nested evidence.
+                "nested_incomplete": bool(
+                    t.get("nested_incomplete", False)
+                ),
             }
             if entry["is_resolved"]:
                 resolved_threads.append(entry)
@@ -1463,8 +1488,19 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     lines.append(f"**Status:** `{status}`  ")
     lines.append(f"**Harvested at:** {harvested}\n")
 
+    # PR state comparison must be case-insensitive: live REST
+    # returns `state="open"` (lowercase) while GraphQL returns
+    # `state="OPEN"` (uppercase). A case-sensitive equality
+    # check against `"OPEN"` would emit a misleading
+    # "not OPEN" warning on every open PR fetched from
+    # REST. We normalize via `.upper()` so the warning
+    # is reserved for genuinely non-open states (`"CLOSED"`,
+    # `"MERGED"`, etc.). The packet field `pr_state` is
+    # left untouched; this normalization is purely for
+    # markdown rendering.
     pr_state = packet.get("pr_state", "")
-    if pr_state and pr_state != "OPEN":
+    pr_state_normalized = pr_state.upper() if pr_state else ""
+    if pr_state and pr_state_normalized != "OPEN":
         lines.append(f"**⚠️  PR state is `{pr_state}` (not OPEN).**\n")
 
     lines.append("## PR metadata\n")

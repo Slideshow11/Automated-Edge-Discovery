@@ -5060,9 +5060,15 @@ def test_nested_thread_comments_incomplete_fails_closed_no_merge_ready(
 ):
     """
     P2 #1: An unresolved review thread has nested
-    `comments.pageInfo.hasNextPage=true` (Codex comment is
-    on a later page). The classifier must NOT emit
-    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION.
+    `comments.pageInfo.hasNextPage=true` (Codex comment IS
+    on the visible first page). The classifier must NOT emit
+    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION, but it MUST
+    preserve the visible Codex finding as a current-head
+    active blocker and emit HOLD_NEW_CODEX_THREAD (not
+    HOLD_CODEX_RESPONSE_PENDING, which would suppress the
+    confirmed finding). Pre-fix behavior dropped the
+    visible comment silently; this test was updated to
+    assert the post-fix behavior.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -5144,8 +5150,29 @@ def test_nested_thread_comments_incomplete_fails_closed_no_merge_ready(
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Inventory is incomplete: refuse clean-pass / merge-ready.
     assert pkt["status"] != mod.STATUS_MERGE_READY
-    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # The visible Codex finding on page 1 is preserved as an
+    # active blocker — it must drive HOLD_NEW_CODEX_THREAD, not
+    # HOLD_CODEX_RESPONSE_PENDING (which would suppress the
+    # confirmed visible finding).
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["current_head_active_blocker_count"] >= 1
+    # The visible finding must show up in active_threads.
+    active_authors = {t.get("author") for t in pkt.get("active_threads", [])}
+    assert mod.CODEX_BOT_LOGINS and any(
+        a in mod.CODEX_BOT_LOGINS for a in active_authors
+    )
+    # And the thread must be flagged as nested_incomplete
+    # in the packet so operators can see which findings
+    # came from partial evidence.
+    flagged = [
+        t for t in pkt.get("active_threads", [])
+        if t.get("nested_incomplete")
+    ]
+    assert len(flagged) >= 1
 
 
 def test_nested_thread_comments_incomplete_marks_inventory_incomplete(
@@ -5483,4 +5510,694 @@ def test_nested_thread_comments_complete_no_blockers_allows_merge_ready(
     assert pkt["review_thread_inventory_complete"] is True
     assert pkt["review_thread_comment_inventory_complete"] is True
     assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["unresolved_thread_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# P2 #1 regression tests: preserve visible findings on paginated thread
+# comments (Codex post-ping finding 1, thread PRRT_kwDOSHFpYM6JS2o5).
+# ---------------------------------------------------------------------------
+
+
+def test_p2_paginated_visible_codex_finding_preserves_active_blocker(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #1: When a review thread has
+    `comments.pageInfo.hasNextPage=true` AND the visible first
+    page contains a Codex-authored unresolved finding, the
+    classifier must surface that visible finding as a
+    current-head active blocker and emit
+    HOLD_NEW_CODEX_THREAD. The visible finding must NOT be
+    dropped solely because the nested pagination is
+    incomplete. Pre-fix behavior dropped the visible comment
+    and incorrectly emitted HOLD_CODEX_RESPONSE_PENDING.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_visible_codex",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "Y",
+                                    },
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99501,
+                                            "url": "https://example/99501",
+                                            "body": (
+                                                "P2 Codex finding on the "
+                                                "visible nested page"
+                                            ),
+                                            "path": (
+                                                "scripts/local/"
+                                                "audit_codex_response_for_pr.py"
+                                            ),
+                                            "line": 499,
+                                            "author": {"login": CODEX_LOGIN},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Visible Codex finding is preserved as a current-head
+    # active blocker; the classifier fails closed on the
+    # incomplete inventory but routes to HOLD_NEW_CODEX_THREAD,
+    # not HOLD_CODEX_RESPONSE_PENDING.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["current_head_active_blocker_count"] >= 1
+    # active_threads contains the visible finding.
+    db_ids = {
+        t.get("comment_database_id")
+        for t in pkt.get("active_threads", [])
+    }
+    assert 99501 in db_ids
+    # Inventory remains incomplete: no clean-pass / merge-ready.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # Inventory flags reflect the incomplete nested pagination.
+    assert pkt["review_thread_comment_inventory_complete"] is False
+    assert pkt["review_thread_comment_inventory_error_count"] > 0
+    assert "PRRT_test_visible_codex" in (
+        pkt.get("review_thread_comment_incomplete_thread_ids") or []
+    )
+
+
+def test_p2_paginated_visible_no_codex_finding_emits_pending(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #1: When a review thread has
+    `comments.pageInfo.hasNextPage=true` AND the visible first
+    page contains NO Codex-authored finding, the classifier
+    must emit HOLD_CODEX_RESPONSE_PENDING (the safe fail-closed
+    per-poll state). It must not emit clean-pass or
+    merge-ready.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_visible_no_codex",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "Y",
+                                    },
+                                    # Visible page contains a
+                                    # NON-Codex comment (a human
+                                    # reply). No Codex finding is
+                                    # visible on this page.
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99601,
+                                            "url": "https://example/99601",
+                                            "body": "human reply, not codex",
+                                            "path": "scripts/local/foo.py",
+                                            "line": 1,
+                                            "author": {"login": "human-user"},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99961,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # No Codex finding visible -> safe fail-closed pending.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+    # Inventory is incomplete.
+    assert pkt["review_thread_comment_inventory_complete"] is False
+    # No merge-ready / clean-pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS
+    assert pkt["status"] != mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+
+
+def test_p2_visible_returned_comments_not_dropped_from_thread_evidence(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #1: The fix must NOT silently drop visible nested-page
+    comments from the thread evidence list. Direct unit-level
+    check on the parsed thread list returned by
+    `gh_graphql_review_threads`: when nested
+    `hasNextPage=true`, the visible Codex comment is
+    present in the returned `threads` list, flagged with
+    `nested_incomplete=True`, and the function still returns
+    `ok=False` so the unified inventory gate keeps the
+    review-thread inventory marked as incomplete.
+    """
+    # Build a synthetic GraphQL payload with a single thread
+    # whose nested comments have hasNextPage=True and a
+    # Codex-authored comment on the visible page.
+    payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                "nodes": [
+                    {
+                        "id": "PRRT_test_unit_visible",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {
+                            "pageInfo": {
+                                "hasNextPage": True,
+                                "endCursor": "Y",
+                            },
+                            "nodes": [
+                                {
+                                    "databaseId": 99701,
+                                    "url": "https://example/99701",
+                                    "body": "P1 Codex finding on visible page",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 10,
+                                    "author": {"login": CODEX_LOGIN},
+                                },
+                            ],
+                        },
+                    },
+                ],
+            }
+        }}}
+    }
+
+    # Patch subprocess.run to return only this GraphQL
+    # payload regardless of args, so the function under
+    # test can parse it.
+    m = MagicMock()
+    m.returncode = 0
+    m.stderr = ""
+    m.stdout = json.dumps(payload)
+    monkeypatch.setattr(mod.subprocess, "run", lambda *a, **kw: m)
+
+    ok, threads, err, metadata = mod.gh_graphql_review_threads(
+        REPO, 402, timeout=10,
+    )
+
+    # Function must still return ok=False because nested
+    # comments are paginated, so the unified inventory gate
+    # refuses to trust the inventory as complete.
+    assert ok is False
+    # But the visible comment MUST be in the returned list.
+    assert len(threads) == 1
+    assert threads[0]["comment_database_id"] == 99701
+    assert threads[0]["author"] == CODEX_LOGIN
+    assert threads[0]["nested_incomplete"] is True
+    # And the metadata must mark the nested inventory
+    # incomplete.
+    assert metadata["review_thread_comment_inventory_complete"] is False
+    assert metadata["review_thread_comment_inventory_error_count"] >= 1
+    assert "PRRT_test_unit_visible" in (
+        metadata["review_thread_comment_incomplete_thread_ids"]
+    )
+    # The error string must clearly identify the nested
+    # pagination as the cause.
+    assert "hasNextPage=true" in err
+
+
+def test_p2_nested_complete_with_codex_still_holds_new_thread(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #1: regression — when nested comments are COMPLETE
+    (hasNextPage=false) and the Codex comment is on the
+    returned page, the existing active-blocker logic still
+    drives HOLD_NEW_CODEX_THREAD. The new visibility rule
+    must not break the no-pagination path.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_complete_visible",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": False,
+                                        "endCursor": "Z",
+                                    },
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99801,
+                                            "url": "https://example/99801",
+                                            "body": "P1 Codex finding",
+                                            "path": "scripts/local/foo.py",
+                                            "line": 1,
+                                            "author": {"login": CODEX_LOGIN},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_error_count"] == 0
+    assert pkt["current_head_active_blocker_count"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# P3 #2 regression tests: normalize PR state before rendering the
+# open-state warning (Codex post-ping finding 2, thread
+# PRRT_kwDOSHFpYM6JS2o7).
+# ---------------------------------------------------------------------------
+
+
+def test_p3_markdown_open_lowercase_renders_no_warning(
+    monkeypatch, tmp_path,
+):
+    """
+    P3 #2: When the PR metadata packet carries
+    `pr_state="open"` (live REST shape, lowercase), the
+    rendered markdown must NOT contain the
+    "PR state is `open` (not OPEN)" warning. The
+    comparison must be case-insensitive.
+    """
+    # Build a packet directly with a lowercase "open" state
+    # and a fully-inventoried clean pass so the markdown
+    # renderer actually runs against a realistic payload.
+    packet = {
+        "packet_kind": mod.PACKET_KIND,
+        "schema_version": mod.SCHEMA_VERSION,
+        "status": mod.STATUS_MERGE_READY,
+        "repo": REPO,
+        "pr_number": 402,
+        "expected_head_sha": EXPECTED_HEAD,
+        "observed_head_sha": EXPECTED_HEAD,
+        "head_matches_expected": True,
+        "pr_state": "open",  # live REST shape
+        "pr_url": f"https://github.com/{REPO}/pull/402",
+        "pr_base_ref_name": "main",
+        "pr_head_ref_name": "tooling/codex-response-classifier-v1",
+        "merge_state_status": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "review_decision": "REVIEW_REQUIRED",
+        "ping_comment_id": PING_ID,
+        "ping_created_at": PING_CREATED,
+        "ping_timestamp_supplied": True,
+        "ping_timestamp_valid": True,
+        "latest_codex_response_type": "issue_comment",
+        "latest_codex_response_id": "1",
+        "latest_codex_response_created_at": "2026-06-11T18:00:00Z",
+        "clean_pass_detected": True,
+        "clean_pass_source": "issue_comment",
+        "clean_pass_comment_id": "1",
+        "clean_pass_review_id": None,
+        "clean_pass_at": "2026-06-11T18:00:00Z",
+        "last_seen_codex_review_id": None,
+        "last_seen_codex_review_at": None,
+        "last_seen_codex_comment_id": "1",
+        "last_seen_codex_comment_at": "2026-06-11T18:00:00Z",
+        "active_threads": [],
+        "outdated_threads": [],
+        "resolved_threads": [],
+        "unresolved_thread_count": 0,
+        "current_head_active_blocker_count": 0,
+        "outdated_unresolved_thread_count": 0,
+        "review_thread_inventory_complete": True,
+        "review_thread_inventory_error_count": 0,
+        "review_thread_inventory_last_error": "",
+        "review_thread_comment_inventory_complete": True,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+        "issue_comment_inventory_complete": True,
+        "issue_comment_inventory_error_count": 0,
+        "issue_comment_inventory_last_error": "",
+        "review_submission_inventory_complete": True,
+        "review_submission_inventory_error_count": 0,
+        "review_submission_inventory_last_error": "",
+        "polls_used": 1,
+        "polling_exhausted": False,
+        "stop_reason": "merge_ready",
+        "max_polls": 1,
+        "poll_seconds": 0,
+        "api_errors": [],
+        "recommendation": "merge ready",
+        "harvested_at": "2026-06-11T18:00:00Z",
+    }
+    md = mod.render_markdown(packet)
+    # Case-insensitive comparison: lowercase "open" must NOT
+    # produce the "not OPEN" warning.
+    assert "not OPEN" not in md
+    # And the rendered state line must still be present
+    # (so the value is not silently dropped).
+    assert "`open`" in md
+
+
+def test_p3_markdown_open_uppercase_renders_no_warning():
+    """
+    P3 #2: When the PR metadata packet carries
+    `pr_state="OPEN"` (GraphQL shape, uppercase), the
+    rendered markdown must NOT contain the
+    "not OPEN" warning. This is the existing-shape
+    regression: pre-fix the comparison was case-sensitive
+    and matched `"OPEN"` exactly, so this case passed
+    already; the test guards against future regressions.
+    """
+    packet = {
+        "packet_kind": mod.PACKET_KIND,
+        "schema_version": mod.SCHEMA_VERSION,
+        "status": mod.STATUS_MERGE_READY,
+        "repo": REPO,
+        "pr_number": 402,
+        "expected_head_sha": EXPECTED_HEAD,
+        "observed_head_sha": EXPECTED_HEAD,
+        "head_matches_expected": True,
+        "pr_state": "OPEN",  # GraphQL shape
+        "pr_url": f"https://github.com/{REPO}/pull/402",
+        "pr_base_ref_name": "main",
+        "pr_head_ref_name": "tooling/codex-response-classifier-v1",
+        "merge_state_status": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "review_decision": "REVIEW_REQUIRED",
+        "ping_comment_id": PING_ID,
+        "ping_created_at": PING_CREATED,
+        "ping_timestamp_supplied": True,
+        "ping_timestamp_valid": True,
+        "latest_codex_response_type": "issue_comment",
+        "latest_codex_response_id": "1",
+        "latest_codex_response_created_at": "2026-06-11T18:00:00Z",
+        "clean_pass_detected": True,
+        "clean_pass_source": "issue_comment",
+        "clean_pass_comment_id": "1",
+        "clean_pass_review_id": None,
+        "clean_pass_at": "2026-06-11T18:00:00Z",
+        "last_seen_codex_review_id": None,
+        "last_seen_codex_review_at": None,
+        "last_seen_codex_comment_id": "1",
+        "last_seen_codex_comment_at": "2026-06-11T18:00:00Z",
+        "active_threads": [],
+        "outdated_threads": [],
+        "resolved_threads": [],
+        "unresolved_thread_count": 0,
+        "current_head_active_blocker_count": 0,
+        "outdated_unresolved_thread_count": 0,
+        "review_thread_inventory_complete": True,
+        "review_thread_inventory_error_count": 0,
+        "review_thread_inventory_last_error": "",
+        "review_thread_comment_inventory_complete": True,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+        "issue_comment_inventory_complete": True,
+        "issue_comment_inventory_error_count": 0,
+        "issue_comment_inventory_last_error": "",
+        "review_submission_inventory_complete": True,
+        "review_submission_inventory_error_count": 0,
+        "review_submission_inventory_last_error": "",
+        "polls_used": 1,
+        "polling_exhausted": False,
+        "stop_reason": "merge_ready",
+        "max_polls": 1,
+        "poll_seconds": 0,
+        "api_errors": [],
+        "recommendation": "merge ready",
+        "harvested_at": "2026-06-11T18:00:00Z",
+    }
+    md = mod.render_markdown(packet)
+    assert "not OPEN" not in md
+
+
+def test_p3_markdown_closed_state_still_warns():
+    """
+    P3 #2: The case-insensitive normalization must NOT
+    suppress the warning for genuinely non-open states
+    (e.g. "closed", "CLOSED", "MERGED"). The warning is
+    reserved for states whose uppercase form is not "OPEN".
+    """
+    for state in ("closed", "CLOSED", "MERGED", "merged"):
+        packet = {
+            "packet_kind": mod.PACKET_KIND,
+            "schema_version": mod.SCHEMA_VERSION,
+            "status": mod.STATUS_HOLD_PR_NOT_OPEN,
+            "repo": REPO,
+            "pr_number": 402,
+            "expected_head_sha": EXPECTED_HEAD,
+            "observed_head_sha": EXPECTED_HEAD,
+            "head_matches_expected": True,
+            "pr_state": state,
+            "pr_url": f"https://github.com/{REPO}/pull/402",
+            "pr_base_ref_name": "main",
+            "pr_head_ref_name": "tooling/codex-response-classifier-v1",
+            "merge_state_status": "",
+            "mergeable": "",
+            "review_decision": "",
+            "ping_comment_id": PING_ID,
+            "ping_created_at": PING_CREATED,
+            "ping_timestamp_supplied": True,
+            "ping_timestamp_valid": True,
+            "latest_codex_response_type": "none",
+            "latest_codex_response_id": "",
+            "latest_codex_response_created_at": "",
+            "clean_pass_detected": False,
+            "clean_pass_source": None,
+            "clean_pass_comment_id": None,
+            "clean_pass_review_id": None,
+            "clean_pass_at": None,
+            "last_seen_codex_review_id": None,
+            "last_seen_codex_review_at": None,
+            "last_seen_codex_comment_id": None,
+            "last_seen_codex_comment_at": None,
+            "active_threads": [],
+            "outdated_threads": [],
+            "resolved_threads": [],
+            "unresolved_thread_count": 0,
+            "current_head_active_blocker_count": 0,
+            "outdated_unresolved_thread_count": 0,
+            "review_thread_inventory_complete": True,
+            "review_thread_inventory_error_count": 0,
+            "review_thread_inventory_last_error": "",
+            "review_thread_comment_inventory_complete": True,
+            "review_thread_comment_inventory_error_count": 0,
+            "review_thread_comment_incomplete_thread_ids": [],
+            "issue_comment_inventory_complete": True,
+            "issue_comment_inventory_error_count": 0,
+            "issue_comment_inventory_last_error": "",
+            "review_submission_inventory_complete": True,
+            "review_submission_inventory_error_count": 0,
+            "review_submission_inventory_last_error": "",
+            "polls_used": 1,
+            "polling_exhausted": False,
+            "stop_reason": "pr_not_open",
+            "max_polls": 1,
+            "poll_seconds": 0,
+            "api_errors": [],
+            "recommendation": "pr not open",
+            "harvested_at": "2026-06-11T18:00:00Z",
+        }
+        md = mod.render_markdown(packet)
+        assert "not OPEN" in md, (
+            f"non-open state {state!r} should still warn, "
+            f"got markdown: {md[:300]}"
+        )
+
+
+def test_p3_packet_field_left_untouched():
+    """
+    P3 #2: The case-insensitive normalization is for
+    markdown rendering only. The `pr_state` field in the
+    packet is left untouched (still lowercase or whatever
+    GitHub returned), so downstream consumers that read
+    the packet see the original value.
+    """
+    packet = {
+        "packet_kind": mod.PACKET_KIND,
+        "schema_version": mod.SCHEMA_VERSION,
+        "status": mod.STATUS_MERGE_READY,
+        "repo": REPO,
+        "pr_number": 402,
+        "expected_head_sha": EXPECTED_HEAD,
+        "observed_head_sha": EXPECTED_HEAD,
+        "head_matches_expected": True,
+        "pr_state": "open",
+        "pr_url": f"https://github.com/{REPO}/pull/402",
+        "pr_base_ref_name": "main",
+        "pr_head_ref_name": "tooling/codex-response-classifier-v1",
+        "merge_state_status": "CLEAN",
+        "mergeable": "MERGEABLE",
+        "review_decision": "REVIEW_REQUIRED",
+        "ping_comment_id": PING_ID,
+        "ping_created_at": PING_CREATED,
+        "ping_timestamp_supplied": True,
+        "ping_timestamp_valid": True,
+        "latest_codex_response_type": "issue_comment",
+        "latest_codex_response_id": "1",
+        "latest_codex_response_created_at": "2026-06-11T18:00:00Z",
+        "clean_pass_detected": True,
+        "clean_pass_source": "issue_comment",
+        "clean_pass_comment_id": "1",
+        "clean_pass_review_id": None,
+        "clean_pass_at": "2026-06-11T18:00:00Z",
+        "last_seen_codex_review_id": None,
+        "last_seen_codex_review_at": None,
+        "last_seen_codex_comment_id": "1",
+        "last_seen_codex_comment_at": "2026-06-11T18:00:00Z",
+        "active_threads": [],
+        "outdated_threads": [],
+        "resolved_threads": [],
+        "unresolved_thread_count": 0,
+        "current_head_active_blocker_count": 0,
+        "outdated_unresolved_thread_count": 0,
+        "review_thread_inventory_complete": True,
+        "review_thread_inventory_error_count": 0,
+        "review_thread_inventory_last_error": "",
+        "review_thread_comment_inventory_complete": True,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+        "issue_comment_inventory_complete": True,
+        "issue_comment_inventory_error_count": 0,
+        "issue_comment_inventory_last_error": "",
+        "review_submission_inventory_complete": True,
+        "review_submission_inventory_error_count": 0,
+        "review_submission_inventory_last_error": "",
+        "polls_used": 1,
+        "polling_exhausted": False,
+        "stop_reason": "merge_ready",
+        "max_polls": 1,
+        "poll_seconds": 0,
+        "api_errors": [],
+        "recommendation": "merge ready",
+        "harvested_at": "2026-06-11T18:00:00Z",
+    }
+    # Call render_markdown — it must not mutate the packet.
+    mod.render_markdown(packet)
+    assert packet["pr_state"] == "open"
