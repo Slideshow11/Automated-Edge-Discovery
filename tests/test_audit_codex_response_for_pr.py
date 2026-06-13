@@ -5029,3 +5029,458 @@ def test_p1_markdown_shows_all_three_inventory_completeness(
     assert "❌" in md
     # The fail-closed reason must be visible (api_errors / inventory).
     assert "api error" in md.lower() or "inventory" in md.lower()
+
+
+# ---------------------------------------------------------------------------
+# Nested review-thread comment pagination (P2 #1 in current turn)
+# ---------------------------------------------------------------------------
+#
+# The GraphQL query for reviewThreads returns a nested
+# `comments(first:50)` connection on each thread. The original
+# code did NOT check the nested `comments.pageInfo.hasNextPage`
+# flag — only the top-level `reviewThreads.pageInfo.hasNextPage`.
+# That means a thread with more than 50 comments could have
+# its Codex-authored finding hidden behind a later page, while
+# the classifier still treated the inventory as complete and
+# emitted merge-ready on a stale clean pass.
+#
+# The fix: fetch `pageInfo { hasNextPage }` on the nested
+# `comments` connection. If ANY thread's nested comments have
+# `hasNextPage=true`, the inventory is incomplete. Mark
+# `review_thread_inventory_complete=False` and
+# `review_thread_comment_inventory_complete=False`, increment
+# `review_thread_comment_inventory_error_count`, and include
+# a clear api_errors message. The existing unified inventory
+# gate in section 8 then fails closed at
+# HOLD_CODEX_RESPONSE_PENDING.
+
+
+def test_nested_thread_comments_incomplete_fails_closed_no_merge_ready(
+    monkeypatch, tmp_path,
+):
+    """
+    P2 #1: An unresolved review thread has nested
+    `comments.pageInfo.hasNextPage=true` (Codex comment is
+    on a later page). The classifier must NOT emit
+    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            # Top-level reviewThreads.pageInfo.hasNextPage is
+            # False (we got all threads in one page), but the
+            # thread we return has nested
+            # comments.pageInfo.hasNextPage=True (the Codex
+            # finding is on the next page).
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_paginated",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "Y",
+                                    },
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99001,
+                                            "url": "https://example/99001",
+                                            "body": "P1 Codex finding on page 1",
+                                            "path": "scripts/local/foo.py",
+                                            "line": 1,
+                                            "author": {"login": CODEX_LOGIN},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99941,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
+
+
+def test_nested_thread_comments_incomplete_marks_inventory_incomplete(
+    monkeypatch, tmp_path,
+):
+    """P2 #1: packet must expose the nested-comments inventory
+    flags as incomplete."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_paginated2",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "Y",
+                                    },
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99002,
+                                            "url": "https://example/99002",
+                                            "body": "Codex finding on page 1",
+                                            "path": "scripts/local/foo.py",
+                                            "line": 1,
+                                            "author": {"login": CODEX_LOGIN},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99942,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["review_thread_inventory_complete"] is False
+    assert pkt["review_thread_comment_inventory_complete"] is False
+    assert pkt["review_thread_comment_inventory_error_count"] > 0
+
+
+def test_nested_thread_comments_incomplete_populates_api_errors(
+    monkeypatch, tmp_path,
+):
+    """P2 #1: api_errors must clearly identify the nested-comments
+    pagination as the cause."""
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False, "endCursor": "X"},
+                        "nodes": [
+                            {
+                                "id": "PRRT_test_paginated3",
+                                "isResolved": False,
+                                "isOutdated": False,
+                                "comments": {
+                                    "pageInfo": {
+                                        "hasNextPage": True,
+                                        "endCursor": "Y",
+                                    },
+                                    "nodes": [
+                                        {
+                                            "databaseId": 99003,
+                                            "url": "https://example/99003",
+                                            "body": "Codex comment page 1",
+                                            "path": "scripts/local/foo.py",
+                                            "line": 1,
+                                            "author": {"login": CODEX_LOGIN},
+                                        },
+                                    ],
+                                },
+                            },
+                        ],
+                    }
+                }}}
+            })
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99943,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The error must mention nested comments and pagination.
+    assert any("nested" in e.lower() or "thread" in e.lower()
+               for e in pkt["api_errors"])
+    # The recommendation must explain the inventory
+    # is incomplete and reference the surface that failed.
+    rec = pkt["recommendation"].lower()
+    assert "inventory" in rec
+    assert "review_thread" in rec or "review-thread" in rec
+
+
+def test_nested_thread_comments_complete_with_codex_still_blocks(
+    monkeypatch, tmp_path,
+):
+    """
+    Regression: when nested comments pageInfo is complete
+    (hasNextPage=false) and the Codex comment IS on the
+    returned page, the existing active-blocker logic must
+    still drive HOLD_NEW_CODEX_THREAD.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                    {
+                        "id": "PRRT_test_complete_with_codex",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {
+                            "pageInfo": {"hasNextPage": False, "endCursor": "Z"},
+                            "nodes": [
+                                {
+                                    "databaseId": 99011,
+                                    "url": "https://example/99011",
+                                    "body": "P1 Codex finding",
+                                    "path": "scripts/local/foo.py",
+                                    "line": 1,
+                                    "author": {"login": CODEX_LOGIN},
+                                },
+                            ],
+                        },
+                    },
+                ]}
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_error_count"] == 0
+    assert pkt["current_head_active_blocker_count"] >= 1
+
+
+def test_nested_thread_comments_complete_no_blockers_allows_merge_ready(
+    monkeypatch, tmp_path,
+):
+    """
+    Regression: when all nested-comments pageInfo is complete
+    and no unresolved threads exist, with a clean pass and
+    mergeable CLEAN, the classifier must emit
+    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION. The new
+    nested-comments check must not over-fire and prevent
+    merge-ready when the inventory IS actually complete.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps({"data": {"repository": {"pullRequest": {
+                "reviewThreads": {
+                    "pageInfo": {"hasNextPage": False},
+                    "nodes": [
+                        {
+                            "id": "PRRT_test_resolved_clean",
+                            "isResolved": True,
+                            "isOutdated": False,
+                            "comments": {
+                                "pageInfo": {"hasNextPage": False, "endCursor": "Z"},
+                                "nodes": [
+                                    {
+                                        "databaseId": 99021,
+                                        "url": "https://example/99021",
+                                        "body": "resolved finding",
+                                        "path": "scripts/local/foo.py",
+                                        "line": 1,
+                                        "author": {"login": CODEX_LOGIN},
+                                    },
+                                ],
+                            },
+                        },
+                    ],
+                }
+            }}}})
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps([
+                make_issue_comment(
+                    author=CODEX_LOGIN,
+                    body=codex_clean_pass_body(),
+                    created_at="2026-06-11T18:00:00Z",
+                    comment_id=99951,
+                ),
+            ])
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps([])
+            return m
+        m.stdout = "[]"
+        return m
+
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["unresolved_thread_count"] == 0

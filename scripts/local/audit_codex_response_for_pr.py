@@ -345,22 +345,44 @@ def gh_pr_view_min(repo: str, pr_number: int) -> Tuple[bool, Dict[str, Any], str
 
 def gh_graphql_review_threads(
     repo: str, pr_number: int, timeout: int = 30
-) -> Tuple[bool, List[Dict[str, Any]], str]:
+) -> Tuple[bool, List[Dict[str, Any]], str, Dict[str, Any]]:
     """
     Fetch PR review-thread resolution state via GraphQL with --paginate
     on reviewThreads (100 per page). Each returned entry has:
       {thread_id, is_resolved, is_outdated, comment_database_id, comment_url, author, body, path, line}
 
-    Returns (ok, threads, error_msg). `ok=False` means the inventory
-    is incomplete or unavailable: GraphQL command failed, response
-    had `errors`, the response was missing expected `reviewThreads`
-    data, `hasNextPage=true` and the implementation did not paginate
-    further, JSON parsing failed, or the page node list was not a
-    list. Callers MUST treat `ok=False` as a fail-closed signal: the
-    thread list may be empty, partial, or stale, and merge readiness
-    cannot be trusted until inventory is complete.
+    Returns (ok, threads, error_msg, metadata). `ok=False` means the
+    inventory is incomplete or unavailable: GraphQL command failed,
+    response had `errors`, the response was missing expected
+    `reviewThreads` data, top-level `hasNextPage=true` and the
+    implementation did not paginate further, ANY thread's nested
+    `comments.pageInfo.hasNextPage=true` (Codex comment may be
+    on a later page), JSON parsing failed, or the page node list
+    was not a list. Callers MUST treat `ok=False` as a fail-closed
+    signal: the thread list may be empty, partial, or stale, and
+    merge readiness cannot be trusted until inventory is complete.
+
+    The metadata dict exposes the nested-comment inventory state
+    so the caller can surface it in the JSON packet / markdown
+    report:
+      - review_thread_comment_inventory_complete: bool
+      - review_thread_comment_inventory_error_count: int
+      - review_thread_comment_incomplete_thread_ids: list[str]
+        (only populated when inventory is incomplete)
     """
     owner, name = repo.split("/", 1)
+    # Note: the nested `comments(first:50)` connection on each
+    # review thread ALSO has its own `pageInfo { hasNextPage
+    # endCursor }`. We must request it explicitly: a thread
+    # with more than 50 comments could have its Codex-authored
+    # finding on a later page, and treating the inventory as
+    # complete on the strength of only the top-level
+    # `reviewThreads.pageInfo` is unsafe. The query therefore
+    # requests `pageInfo { hasNextPage }` on the nested
+    # connection, and the parser below checks every thread's
+    # nested pageInfo. If ANY thread has incomplete nested
+    # comments, the function returns ok=False and the caller
+    # fails closed.
     query_parts = [
         "query {",
         f'repository(owner:"{owner}", name:"{name}") {{',
@@ -369,8 +391,11 @@ def gh_graphql_review_threads(
         "pageInfo { hasNextPage endCursor }",
         "nodes {",
         "id isResolved isOutdated",
-        "comments(first:50) { nodes { databaseId url body path line "
-        "author { login } } }",
+        "comments(first:50) {",
+        "pageInfo { hasNextPage endCursor }",
+        "nodes { databaseId url body path line "
+        "author { login } }",
+        "}",
         "}",
         "}",
         "}",
@@ -379,52 +404,72 @@ def gh_graphql_review_threads(
     ]
     query_literal = " ".join(query_parts)
     cmd = ["gh", "api", "graphql", "--raw-field", f"query={query_literal}"]
+    # Default empty metadata for early-return failure paths.
+    # These paths do not have a parsed response so the nested
+    # comment inventory state is conservatively marked
+    # incomplete; the per-poll raw reset clears the flag at
+    # the start of the next poll.
+    empty_metadata: Dict[str, Any] = {
+        "review_thread_comment_inventory_complete": False,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+    }
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout, check=False,
         )
     except OSError as exc:
-        return False, [], f"gh graphql invocation failed: {exc}"
+        return False, [], f"gh graphql invocation failed: {exc}", dict(empty_metadata)
     if result.returncode != 0:
-        return False, [], f"gh graphql returned {result.returncode}: {result.stderr[:500]}"
+        return False, [], f"gh graphql returned {result.returncode}: {result.stderr[:500]}", dict(empty_metadata)
     if not result.stdout.strip():
-        return False, [], "gh graphql returned empty stdout"
+        return False, [], "gh graphql returned empty stdout", dict(empty_metadata)
     try:
         data = json.loads(result.stdout)
     except json.JSONDecodeError as exc:
-        return False, [], f"invalid GraphQL response: {exc}"
+        return False, [], f"invalid GraphQL response: {exc}", dict(empty_metadata)
     if not isinstance(data, dict):
-        return False, [], f"GraphQL response is not a JSON object: {type(data).__name__}"
+        return False, [], f"GraphQL response is not a JSON object: {type(data).__name__}", dict(empty_metadata)
     errors = data.get("errors")
     if errors:
-        return False, [], f"GraphQL errors: {errors}"
+        return False, [], f"GraphQL errors: {errors}", dict(empty_metadata)
     data_obj = data.get("data")
     if not isinstance(data_obj, dict):
-        return False, [], "GraphQL response missing data object"
+        return False, [], "GraphQL response missing data object", dict(empty_metadata)
     repository = data_obj.get("repository")
     if not isinstance(repository, dict):
-        return False, [], "GraphQL response missing repository"
+        return False, [], "GraphQL response missing repository", dict(empty_metadata)
     pr_data = repository.get("pullRequest")
     if not isinstance(pr_data, dict):
-        return False, [], "GraphQL response missing pullRequest"
+        return False, [], "GraphQL response missing pullRequest", dict(empty_metadata)
     threads_container = pr_data.get("reviewThreads")
     if not isinstance(threads_container, dict):
-        return False, [], "GraphQL response missing reviewThreads container"
+        return False, [], "GraphQL response missing reviewThreads container", dict(empty_metadata)
     page_info = threads_container.get("pageInfo")
     if not isinstance(page_info, dict):
-        return False, [], "GraphQL reviewThreads.pageInfo is not a dict"
+        return False, [], "GraphQL reviewThreads.pageInfo is not a dict", dict(empty_metadata)
     nodes = threads_container.get("nodes")
     if not isinstance(nodes, list):
         return False, [], (
             f"GraphQL reviewThreads.nodes is not a list: "
             f"{type(nodes).__name__}"
-        )
+        ), dict(empty_metadata)
     # Parse all nodes from this page. When the response is
     # paginated (hasNextPage=true) we still parse the visible
     # threads so the caller can detect findings already on this
     # page. The caller MUST treat ok=False as incomplete
     # inventory and refuse to emit merge-ready states.
+    #
+    # While parsing, also track each thread's nested
+    # `comments.pageInfo.hasNextPage` so we can detect
+    # incomplete nested comment pagination. A thread with
+    # `comments.pageInfo.hasNextPage=true` means a Codex
+    # finding could live on a later comments page; the
+    # inventory for that thread is incomplete and the
+    # classifier must fail closed rather than trust the
+    # first page of comments.
     threads: List[Dict[str, Any]] = []
+    incomplete_nested_threads: List[str] = []
     for node in nodes:
         if not isinstance(node, dict):
             continue
@@ -432,6 +477,26 @@ def gh_graphql_review_threads(
         is_resolved = bool(node.get("isResolved", False))
         is_outdated = bool(node.get("isOutdated", False))
         comments_obj = node.get("comments") or {}
+        # Check the nested comments pageInfo. If the nested
+        # connection is paginated (hasNextPage=true) the
+        # thread's comment inventory is incomplete. Record
+        # the thread id so the caller can surface it in the
+        # api_errors message and the markdown report.
+        nested_page_info = comments_obj.get("pageInfo") or {}
+        if not isinstance(nested_page_info, dict):
+            nested_page_info = {}
+        nested_incomplete = bool(nested_page_info.get("hasNextPage"))
+        if nested_incomplete and thread_id:
+            incomplete_nested_threads.append(thread_id)
+        # Only emit comment entries for threads whose nested
+        # comments are NOT incomplete — a thread with
+        # incomplete nested comments would have its findings
+        # silently trimmed, so we deliberately do not surface
+        # any of its comments as authoritative. The caller
+        # will see ok=False and treat inventory as
+        # incomplete, refusing to emit merge-ready states.
+        if nested_incomplete:
+            continue
         for comment in (comments_obj.get("nodes") or []):
             if not isinstance(comment, dict):
                 continue
@@ -450,18 +515,47 @@ def gh_graphql_review_threads(
                 "path": comment.get("path") or "",
                 "line": comment.get("line"),
             })
+    # Build the metadata dict for this call.
+    metadata: Dict[str, Any] = {
+        "review_thread_comment_inventory_complete": (
+            len(incomplete_nested_threads) == 0
+        ),
+        "review_thread_comment_inventory_error_count": (
+            len(incomplete_nested_threads)
+        ),
+        "review_thread_comment_incomplete_thread_ids": list(
+            incomplete_nested_threads
+        ),
+    }
+    if incomplete_nested_threads:
+        # Fail closed: at least one thread has incomplete
+        # nested comments, so the thread inventory is
+        # incomplete. We return the (possibly empty) threads
+        # list so the caller can still surface any findings
+        # that ARE visible, but ok=False forces the unified
+        # inventory gate in section 8 to refuse to emit
+        # merge-ready / clean-pass states.
+        sample = incomplete_nested_threads[:3]
+        return False, threads, (
+            "review-thread comments pagination required "
+            f"(hasNextPage=true on nested comments for "
+            f"{len(incomplete_nested_threads)} thread(s): "
+            f"{', '.join(sample)}); classifier cannot trust "
+            "a clean-pass / merge-ready decision from partial "
+            "thread-comment evidence."
+        ), metadata
     if page_info.get("hasNextPage"):
-        # Fail closed: pagination is required for exhaustive
-        # inventory. Return the partial list (visible page only)
-        # so the caller can still surface findings already on
-        # this page. The caller MUST treat ok=False as
-        # incomplete inventory and refuse to emit merge-ready
-        # states.
+        # Fail closed: top-level pagination is required for
+        # exhaustive inventory. Return the partial list
+        # (visible page only) so the caller can still
+        # surface findings already on this page. The caller
+        # MUST treat ok=False as incomplete inventory and
+        # refuse to emit merge-ready states.
         return False, threads, (
             "reviewThreads pagination required (hasNextPage=true); "
             "this classifier does not yet paginate review threads."
-        )
-    return True, threads, ""
+        ), metadata
+    return True, threads, "", metadata
 
 
 # ---------------------------------------------------------------------------
@@ -648,6 +742,21 @@ def classify(
     review_submission_inventory_error_count: int = 0
     review_submission_inventory_last_error: str = ""
 
+    # Review-thread comment (nested) inventory completeness.
+    # The GraphQL reviewThreads query returns a nested
+    # `comments(first:50)` connection on each thread. The
+    # connection itself is paginated. If ANY thread's nested
+    # comments connection has `hasNextPage=true`, the
+    # inventory for that thread is incomplete: a Codex finding
+    # may live on a later comments page. The unified
+    # inventory gate in section 8 treats this as incomplete
+    # review-thread inventory and refuses to emit merge-ready
+    # / clean-pass states. The ids of the incomplete threads
+    # are exposed so the markdown report can list them.
+    review_thread_comment_inventory_complete: bool = True
+    review_thread_comment_inventory_error_count: int = 0
+    review_thread_comment_incomplete_thread_ids: List[str] = []
+
     # Stop conditions
     stop_reason: Optional[str] = None
 
@@ -739,6 +848,9 @@ def classify(
         review_submission_inventory_complete = True
         review_submission_inventory_error_count = 0
         review_submission_inventory_last_error = ""
+        review_thread_comment_inventory_complete = True
+        review_thread_comment_inventory_error_count = 0
+        review_thread_comment_incomplete_thread_ids = []
         # Reset raw poll snapshots. The fetch helpers at
         # section 2 (issue comments), section 3 (reviews),
         # and section 4 (review threads) will repopulate
@@ -908,7 +1020,17 @@ def classify(
         # on a hasNextPage response) so that confirmed findings on
         # that page can be surfaced as HOLD_NEW_CODEX_THREAD even
         # when inventory is incomplete.
-        ok_thr, thread_data, err_thr = gh_graphql_review_threads(
+        #
+        # The fetch function returns a 4-tuple (ok, threads, err,
+        # metadata). The metadata carries the nested-comment
+        # pagination state — a thread whose nested `comments`
+        # connection has `hasNextPage=true` exposes
+        # review_thread_comment_inventory_complete=False so the
+        # packet / markdown can show the specific surface that
+        # failed. The unified inventory gate in section 8 treats
+        # this as incomplete review-thread inventory and fails
+        # closed at HOLD_CODEX_RESPONSE_PENDING.
+        ok_thr, thread_data, err_thr, thread_metadata = gh_graphql_review_threads(
             repo, pr_number, timeout=api_timeout,
         )
         if not ok_thr:
@@ -917,6 +1039,25 @@ def classify(
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
         review_threads = thread_data
+        # Propagate the nested-comment inventory state from the
+        # fetch metadata. The metadata flags are reported as-is;
+        # the section 8 inventory gate will refuse merge-ready if
+        # any surface is incomplete.
+        review_thread_comment_inventory_complete = bool(
+            thread_metadata.get(
+                "review_thread_comment_inventory_complete", False
+            )
+        )
+        review_thread_comment_inventory_error_count = int(
+            thread_metadata.get(
+                "review_thread_comment_inventory_error_count", 0
+            ) or 0
+        )
+        review_thread_comment_incomplete_thread_ids = list(
+            thread_metadata.get(
+                "review_thread_comment_incomplete_thread_ids", []
+            ) or []
+        )
 
         # ---- 5. Identify latest Codex response after ping ----
         codex_issue_comments: List[Dict[str, Any]] = []
@@ -1156,12 +1297,13 @@ def classify(
                 break
             final_status = STATUS_HOLD_CODEX_PENDING
             recommendation = (
-                "Required Codex response surfaces could not be "
-                "fully fetched: "
+                "Required Codex response-surface inventory is "
+                "incomplete (surfaces: "
                 + ", ".join(incomplete_surfaces)
-                + "; merge readiness cannot be trusted until all "
-                "surfaces are complete. Re-run later with a fresh "
-                "budget. See api_errors for the underlying failures."
+                + "); merge readiness cannot be trusted until "
+                "all surfaces are complete. Re-run later with a "
+                "fresh budget. See api_errors for the underlying "
+                "failures."
             )
             stop_reason = "inventory_incomplete"
             # Continue to next poll instead of breaking, so a
@@ -1262,6 +1404,19 @@ def classify(
         "review_thread_inventory_complete": review_thread_inventory_complete,
         "review_thread_inventory_error_count": review_thread_inventory_error_count,
         "review_thread_inventory_last_error": review_thread_inventory_last_error,
+        # Nested review-thread comment (pageInfo.hasNextPage
+        # on the per-thread `comments` connection) inventory
+        # completeness. When a thread has more than 50 comments
+        # and the Codex-authored finding is on a later page,
+        # this flag is False and the unified inventory gate in
+        # section 8 forces HOLD_CODEX_RESPONSE_PENDING. The
+        # thread ids whose nested pagination is incomplete are
+        # exposed so the markdown report can list them.
+        "review_thread_comment_inventory_complete": review_thread_comment_inventory_complete,
+        "review_thread_comment_inventory_error_count": review_thread_comment_inventory_error_count,
+        "review_thread_comment_incomplete_thread_ids": list(
+            review_thread_comment_incomplete_thread_ids
+        ),
         # Issue-comment inventory completeness. Required evidence:
         # PR-level issue comments may carry the Codex clean pass
         # OR a newer Codex finding. When incomplete the classifier
@@ -1445,10 +1600,37 @@ def render_markdown(packet: Dict[str, Any]) -> str:
     inv_complete = packet.get("review_thread_inventory_complete", True)
     inv_err_count = packet.get("review_thread_inventory_error_count", 0) or 0
     inv_last_err = packet.get("review_thread_inventory_last_error", "") or ""
+    # Nested review-thread comment (per-thread `comments`
+    # pageInfo.hasNextPage) inventory state. The new
+    # nested-comments check is required evidence: a thread
+    # with more than 50 comments could have a Codex finding
+    # on a later comments page.
+    nested_complete = packet.get(
+        "review_thread_comment_inventory_complete", True
+    )
+    nested_err_count = packet.get(
+        "review_thread_comment_inventory_error_count", 0
+    ) or 0
+    nested_incomplete_ids = packet.get(
+        "review_thread_comment_incomplete_thread_ids", []
+    ) or []
     if inv_complete:
-        lines.append(
-            "- **Inventory complete:** ✅ (all review-thread pages fetched and validated)\n"
-        )
+        if nested_complete:
+            lines.append(
+                "- **Inventory complete:** ✅ (all review-thread pages fetched and validated; all nested review-thread comments fetched and validated)\n"
+            )
+        else:
+            lines.append(
+                "- **Inventory complete:** ❌ (top-level review-thread pages are complete, but "
+                f"{nested_err_count} thread(s) have nested comments with hasNextPage=true; "
+                "the classifier failed closed; merge readiness cannot be trusted)\n"
+            )
+            if nested_incomplete_ids:
+                lines.append(
+                    "  - **Incomplete threads:** "
+                    + ", ".join(str(t) for t in nested_incomplete_ids[:5])
+                    + "\n"
+                )
     else:
         lines.append(
             "- **Inventory complete:** ❌ (classifier failed closed; "
