@@ -80,6 +80,11 @@ def _clean_state(**overrides) -> AEDRunState:
         # ZERO_SHA so the engine treats the clean pass as a
         # current-head clean pass for PR #999.
         codex_clean_pass_head_sha=ZERO_SHA,
+        # AED-RULE-011 strict variant: the harness's derived
+        # current-head indicator must be True for the merge path
+        # to allow. _clean_state sets it to True so the engine
+        # treats the clean pass as a current-head clean pass.
+        codex_clean_pass_for_current_head=True,
         codex_ping_comment_id=None,
         codex_ping_head_sha=None,
         audit_append_available=True,
@@ -845,7 +850,9 @@ class TestIsMergeableHelper(unittest.TestCase):
 
     def test_is_mergeable_string_mergeable_lowercase(self):
         from aed_policy.policy import _is_mergeable
-        self.assertTrue(_is_mergeable("mergeable"))
+        # Strict variant: "mergeable" must deny; only the exact
+        # raw "MERGEABLE" is accepted.
+        self.assertFalse(_is_mergeable("mergeable"))
 
     def test_is_mergeable_string_conflicting(self):
         from aed_policy.policy import _is_mergeable
@@ -980,10 +987,12 @@ class TestMergeableStrictMergeableString(unittest.TestCase):
         self.assertTrue(d.allowed)
 
     def test_merge_allowed_when_mergeable_strict_mergeable_lowercase(self):
+        # Strict variant: "mergeable" must deny; only the exact
+        # raw "MERGEABLE" is accepted.
         d = evaluate_action(
             AEDActionType.GITHUB_MERGE, _clean_state(mergeable="mergeable")
         )
-        self.assertTrue(d.allowed)
+        self.assertFalse(d.allowed)
 
 
 class TestExactMergeAuthorizationPhrase(unittest.TestCase):
@@ -1073,9 +1082,11 @@ class TestExactMergeAuthorizationPhrase(unittest.TestCase):
         self.assertTrue(d.allowed)
         self.assertIn("AED-RULE-007", d.matched_rule_ids)
 
-    def test_merge_allowed_when_phrase_has_normalized_whitespace(self):
-        # Whitespace is normalized before comparison, so a phrase
-        # with extra spaces should still match.
+    def test_merge_denied_when_phrase_has_normalized_whitespace(self):
+        # Strict variant: a phrase with extra spaces must deny;
+        # the operator phrase is compared to the canonical
+        # phrase character-for-character with no whitespace
+        # normalization on either side.
         d = evaluate_action(
             AEDActionType.GITHUB_MERGE,
             _clean_state(
@@ -1085,7 +1096,8 @@ class TestExactMergeAuthorizationPhrase(unittest.TestCase):
                 )
             ),
         )
-        self.assertTrue(d.allowed)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-007", d.matched_rule_ids)
 
 
 class TestTargetThreadValidation(unittest.TestCase):
@@ -1356,6 +1368,472 @@ class TestEvaluateActionTargetThreadParameter(unittest.TestCase):
             target_thread_ids=["PRRT_a"],
         )
         self.assertTrue(d.allowed)
+
+
+# ---------------------------------------------------------------------------
+# Strict head SHA validation (PRRT_kwDOSHFpYM6Ja5A0)
+# ---------------------------------------------------------------------------
+
+
+class TestIsFullShaHelper(unittest.TestCase):
+    """Regression tests for the new ``_is_full_sha`` helper."""
+
+    def test_is_full_sha_true_on_40_char_hex(self):
+        from aed_policy.policy import _is_full_sha
+        self.assertTrue(_is_full_sha("a" * 40))
+        self.assertTrue(_is_full_sha("0123456789abcdef0123456789ABCDEF01234567"))
+        self.assertTrue(_is_full_sha(ZERO_SHA))
+
+    def test_is_full_sha_false_on_abbreviated(self):
+        from aed_policy.policy import _is_full_sha
+        self.assertFalse(_is_full_sha("abc1234"))
+        self.assertFalse(_is_full_sha(""))
+        self.assertFalse(_is_full_sha("1234567"))
+
+    def test_is_full_sha_false_on_non_hex_40_chars(self):
+        from aed_policy.policy import _is_full_sha
+        # 40 characters but contains non-hex chars (e.g. 'z').
+        self.assertFalse(_is_full_sha("z" * 40))
+        self.assertFalse(_is_full_sha("a" * 39 + "z"))
+
+    def test_is_full_sha_false_on_none_and_non_string(self):
+        from aed_policy.policy import _is_full_sha
+        self.assertFalse(_is_full_sha(None))
+        self.assertFalse(_is_full_sha(1234567890))
+        self.assertFalse(_is_full_sha(True))
+
+    def test_is_full_sha_false_on_41_char_string(self):
+        from aed_policy.policy import _is_full_sha
+        self.assertFalse(_is_full_sha("a" * 41))
+
+
+class TestHeadMatchesStrictFullSha(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Ja5A0.
+
+    ``_head_matches`` must reject matching abbreviated SHAs and
+    accept only matching full 40-character hex SHAs.
+    """
+
+    def test_head_matches_false_on_abbreviated_matching(self):
+        from aed_policy.policy import _head_matches
+        s = _clean_state(current_head_sha="abc1234", expected_head_sha="abc1234")
+        self.assertFalse(_head_matches(s))
+
+    def test_head_matches_false_on_non_hex_40_matching(self):
+        from aed_policy.policy import _head_matches
+        bad = "z" * 40
+        s = _clean_state(current_head_sha=bad, expected_head_sha=bad)
+        self.assertFalse(_head_matches(s))
+
+    def test_head_matches_false_on_none(self):
+        from aed_policy.policy import _head_matches
+        s = _clean_state(current_head_sha=None, expected_head_sha=ZERO_SHA)
+        self.assertFalse(_head_matches(s))
+        s = _clean_state(current_head_sha=ZERO_SHA, expected_head_sha=None)
+        self.assertFalse(_head_matches(s))
+
+    def test_head_matches_true_on_full_hex_matching(self):
+        from aed_policy.policy import _head_matches
+        s = _clean_state()
+        self.assertTrue(_head_matches(s))
+
+    def test_head_matches_false_on_full_hex_different(self):
+        from aed_policy.policy import _head_matches
+        s = _clean_state(
+            current_head_sha="a" * 40, expected_head_sha="b" * 40
+        )
+        self.assertFalse(_head_matches(s))
+
+
+class TestCodexPingDeniesAbbreviatedHead(unittest.TestCase):
+    """CODEX_PING must deny on matching abbreviated heads (AED-RULE-004)."""
+
+    def test_codex_ping_denied_on_abbreviated_matching_head(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                current_head_sha="abc1234", expected_head_sha="abc1234"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+
+class TestThreadResolveDeniesAbbreviatedHead(unittest.TestCase):
+    """GITHUB_THREAD_RESOLVE must deny on matching abbreviated heads."""
+
+    def test_thread_resolve_denied_on_abbreviated_matching_head(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(
+                current_head_sha="abc1234",
+                expected_head_sha="abc1234",
+                authorized_thread_ids=["PRRT_a"],
+            ),
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+
+class TestMergeDeniesAbbreviatedHead(unittest.TestCase):
+    """GITHUB_MERGE must deny on matching abbreviated heads."""
+
+    def test_merge_denied_on_abbreviated_matching_head(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(
+                current_head_sha="abc1234", expected_head_sha="abc1234"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Strict raw MERGEABLE string (PRRT_kwDOSHFpYM6Ja5Av)
+# ---------------------------------------------------------------------------
+
+
+class TestIsMergeableStrictRawString(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Ja5Av.
+
+    ``_is_mergeable`` must allow only the exact raw GitHub string
+    ``"MERGEABLE"``. No case folding, no whitespace stripping, no
+    Python True compatibility, no normalization.
+    """
+
+    def test_is_mergeable_allows_only_exact_MERGEABLE(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertTrue(_is_mergeable("MERGEABLE"))
+
+    def test_is_mergeable_denies_lowercase(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("mergeable"))
+
+    def test_is_mergeable_denies_uppercase_mixed(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("Mergeable"))
+        self.assertFalse(_is_mergeable("MERGEABLE "))
+        self.assertFalse(_is_mergeable(" MERGEABLE"))
+
+    def test_is_mergeable_denies_trailing_newline(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("MERGEABLE\n"))
+
+    def test_is_mergeable_denies_python_true(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(True))
+
+    def test_is_mergeable_denies_none(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(None))
+
+    def test_is_mergeable_denies_false(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(False))
+
+    def test_is_mergeable_denies_unknown(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("UNKNOWN"))
+
+    def test_is_mergeable_denies_conflicting(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("CONFLICTING"))
+
+    def test_is_mergeable_denies_unsupported_types(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(42))
+        self.assertFalse(_is_mergeable(["MERGEABLE"]))
+        self.assertFalse(_is_mergeable({"value": "MERGEABLE"}))
+
+
+class TestMergeStrictMergeableString(unittest.TestCase):
+    """GITHUB_MERGE must require the exact raw ``"MERGEABLE"`` string."""
+
+    def test_merge_denied_when_mergeable_lowercase(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable="mergeable")
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_padded(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable=" MERGEABLE ")
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_trailing_newline(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable="MERGEABLE\n")
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Strict exact authorization phrase (PRRT_kwDOSHFpYM6Ja5Ay)
+# ---------------------------------------------------------------------------
+
+
+class TestHasExactMergeAuthorizationStrict(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Ja5Ay.
+
+    ``has_exact_merge_authorization`` must compare the operator
+    phrase to the canonical exact-head phrase character-for-character,
+    with no whitespace stripping, no whitespace collapsing, no
+    embedded-newline tolerance, and no case folding.
+    """
+
+    def test_allows_only_exact_canonical_phrase(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state()
+        self.assertTrue(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_leading_space(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                f" I authorize guarded squash merge of PR #999 at exact head {ZERO_SHA}."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_trailing_space(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                f"I authorize guarded squash merge of PR #999 at exact head {ZERO_SHA}. "
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_double_space(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                f"I authorize  guarded squash merge of PR #999 at exact head {ZERO_SHA}."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_embedded_newline(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                f"I authorize guarded squash merge\nof PR #999 at exact head {ZERO_SHA}."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_wrong_pr_number(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                f"I authorize guarded squash merge of PR #1 at exact head {ZERO_SHA}."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_wrong_head(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                "I authorize guarded squash merge of PR #999 "
+                "at exact head " + "a" * 40 + "."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_abbreviated_head(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                "I authorize guarded squash merge of PR #999 at exact head abc1234."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_none_phrase(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase=None)
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_empty_phrase(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase="")
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_denies_phrase_with_arbitrary_text(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase="ok")
+        s2 = _clean_state(explicit_authorization_phrase="merge")
+        self.assertFalse(has_exact_merge_authorization(s))
+        self.assertFalse(has_exact_merge_authorization(s2))
+
+    def test_merge_denied_when_phrase_does_not_match_exactly(self):
+        # Confirms the strict comparison flows through GITHUB_MERGE.
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(
+                explicit_authorization_phrase=(
+                    f" I authorize guarded squash merge of PR #999 at exact head {ZERO_SHA}."
+                )
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-007", d.matched_rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Codex clean-pass tied to FULL current head (PRRT_kwDOSHFpYM6JaFHu strict)
+# ---------------------------------------------------------------------------
+
+
+class TestCodexCleanPassForCurrentHead(unittest.TestCase):
+    """Regression tests for the strict JaFHu variant.
+
+    A merge must require both:
+    - ``codex_clean_pass_for_current_head=True`` (the harness's
+      derived current-head indicator)
+    - ``codex_clean_pass_head_sha`` is a full 40-character hex
+      SHA equal to ``expected_head_sha``
+    """
+
+    def test_merge_denied_when_for_current_head_is_false(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_for_current_head=False),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_merge_denied_when_clean_pass_head_sha_is_none(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_head_sha=None),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_merge_denied_when_clean_pass_head_sha_is_abbreviated(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_head_sha="abc1234"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_merge_denied_when_clean_pass_head_sha_is_non_hex_40(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_head_sha="z" * 40),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_merge_denied_when_clean_pass_head_sha_differs_from_expected(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_head_sha="a" * 40),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_merge_allowed_when_clean_pass_tied_to_full_current_head(self):
+        d = evaluate_action(AEDActionType.GITHUB_MERGE, _clean_state())
+        self.assertTrue(d.allowed)
+
+
+# ---------------------------------------------------------------------------
+# Strict target thread set (PRRT_kwDOSHFpYM6JateD strict)
+# ---------------------------------------------------------------------------
+
+
+class TestTargetThreadStrict(unittest.TestCase):
+    """Regression tests for the strict JateD variant.
+
+    Every target thread ID must be in the authorized set, and
+    empty target IDs are rejected.
+    """
+
+    def test_thread_resolve_denied_when_target_is_empty(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=[],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_thread_resolve_denied_when_target_id_is_empty_string(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=[""],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_thread_resolve_denied_when_any_target_id_unauthorized(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=["PRRT_a", "PRRT_other"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+        self.assertIn("PRRT_other", d.reason)
+
+    def test_thread_resolve_allowed_when_target_is_strict_subset(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a", "PRRT_b"]),
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertTrue(d.allowed)
+
+    def test_thread_resolve_allowed_when_target_equals_authorized(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a", "PRRT_b"]),
+            target_thread_ids=["PRRT_a", "PRRT_b"],
+        )
+        self.assertTrue(d.allowed)
+
+    def test_thread_resolve_denied_on_head_mismatch_with_authorized_target(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(
+                authorized_thread_ids=["PRRT_a"],
+                current_head_sha="a" * 40,
+            ),
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+    def test_thread_resolve_denied_on_duplicates_treated_as_set(self):
+        # Duplicate target IDs are normalized to a set for
+        # comparison, so a duplicated authorized target is still
+        # allowed (the set is a subset of the authorized set).
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=["PRRT_a", "PRRT_a"],
+        )
+        self.assertTrue(d.allowed)
+
+    def test_thread_resolve_denied_with_duplicate_unauthorized(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=["PRRT_a", "PRRT_other", "PRRT_other"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
 
 
 if __name__ == "__main__":

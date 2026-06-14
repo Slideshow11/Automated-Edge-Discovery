@@ -57,9 +57,39 @@ def _allow(rule_ids: Optional[List[str]] = None) -> AEDDecision:
     )
 
 
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+
+def _is_full_sha(value: object) -> bool:
+    """True iff ``value`` is a 40-character hexadecimal SHA string.
+
+    Abbreviated SHAs (e.g. ``"abc1234"``), non-string values, and
+    40-character strings containing non-hex characters all return
+    False. This is the strict variant required by AED-RULE-004
+    for exact-head guarded actions, and by the AED-RULE-005 / -011
+    / -019 / -008 checks in this skeleton.
+    """
+    if not isinstance(value, str):
+        return False
+    if len(value) != 40:
+        return False
+    return all(c in _HEX_DIGITS for c in value)
+
+
 def _head_matches(state: AEDRunState) -> bool:
-    """True iff both SHAs are present and equal."""
-    if not state.current_head_sha or not state.expected_head_sha:
+    """True iff both SHAs are full 40-character hex strings and equal.
+
+    The strict variant requires exact, full, hex SHAs. Abbreviated
+    SHAs (matching or otherwise) are rejected, because the
+    AED-RULE-004 / -005 exact-head checks operate on full SHAs
+    and abbreviating the head is a common input-validation
+    pitfall: callers could otherwise pass matching abbreviated
+    SHAs and slip past the live-head check on CODEX_PING,
+    GITHUB_THREAD_RESOLVE, and GITHUB_MERGE.
+    """
+    if not _is_full_sha(state.current_head_sha):
+        return False
+    if not _is_full_sha(state.expected_head_sha):
         return False
     return state.current_head_sha == state.expected_head_sha
 
@@ -84,23 +114,16 @@ def _in_isolated_workspace(state: AEDRunState) -> bool:
 
 
 def _is_mergeable(value) -> bool:
-    """Normalize GitHub's ``mergeable`` value to a boolean.
+    """True iff ``value`` is the exact raw GitHub string ``"MERGEABLE"``.
 
-    Accepts the raw GitHub strings (``"MERGEABLE"`` /
-    ``"CONFLICTING"`` / ``"UNKNOWN"``) and ``None`` (when the
-    value has not been computed yet). A Python ``True`` is NOT
-    accepted as a substitute for an explicit GitHub ``"MERGEABLE"``
-    string: the safer skeleton default is to require explicit
-    GitHub evidence, since a weak truthy value would otherwise
-    pass for unverified or synthetic states. Only the literal
-    string ``"MERGEABLE"`` (case-insensitive) is treated as
-    mergeable.
+    The strict AED-RULE-019 variant requires the literal raw
+    GitHub value. No whitespace stripping, no case folding, no
+    Python ``True`` compatibility, no normalization of any
+    kind. ``"mergeable"`` / ``" MERGEABLE "`` / ``"MERGEABLE\n"``
+    are all denied. ``None`` / ``False`` / ``"UNKNOWN"`` /
+    ``"CONFLICTING"`` / unsupported types are all denied.
     """
-    if value is None or value is False:
-        return False
-    if isinstance(value, str):
-        return value.strip().upper() == "MERGEABLE"
-    return False
+    return value == "MERGEABLE"
 
 
 def _normalize_phrase(s: Optional[str]) -> str:
@@ -133,29 +156,29 @@ def expected_merge_authorization_phrase(state: AEDRunState) -> str:
 
 
 def has_exact_merge_authorization(state: AEDRunState) -> bool:
-    """True iff ``state.explicit_authorization_phrase`` matches the canonical phrase.
+    """True iff ``state.explicit_authorization_phrase`` is the exact canonical phrase.
 
-    A phrase that is empty, None, an arbitrary string (``"ok"``,
-    ``"merge"``), missing the PR number, missing the head SHA, or
-    carrying a different head SHA all fail this check. Whitespace
-    is normalized before comparison so a phrase with extra spaces
-    or newlines is rejected only when the normalized form differs.
+    The strict AED-RULE-007 variant compares the operator-supplied
+    phrase to the canonical exact-head phrase character-for-character.
+    No whitespace stripping, no whitespace collapsing, no
+    newline tolerance, no case folding. The expected head SHA
+    must itself be a 40-character hex string; if it is not, the
+    engine cannot construct a valid canonical phrase and so
+    cannot accept any authorization text.
+
+    Acceptance rules:
+    - phrase must be a non-empty string
+    - expected_head_sha must be a full 40-character hex SHA
+    - phrase must equal the canonical phrase exactly, with no
+      leading/trailing whitespace allowed, no double spaces
+      allowed, no embedded newlines allowed
     """
     if not state.explicit_authorization_phrase:
         return False
-    if not state.expected_head_sha:
-        return False
-    # The expected head SHA must be a 40-character hex string. If
-    # it isn't, the engine cannot accept any authorization phrase
-    # because the canonical phrase would itself be malformed.
-    if not (
-        isinstance(state.expected_head_sha, str)
-        and len(state.expected_head_sha) == 40
-        and all(c in "0123456789abcdefABCDEF" for c in state.expected_head_sha)
-    ):
+    if not _is_full_sha(state.expected_head_sha):
         return False
     expected = expected_merge_authorization_phrase(state)
-    return _normalize_phrase(state.explicit_authorization_phrase) == _normalize_phrase(expected)
+    return state.explicit_authorization_phrase == expected
 
 
 # ---------------------------------------------------------------------------
@@ -320,10 +343,32 @@ def evaluate_action(
                 rule_ids=["AED-RULE-011"],
                 required_evidence=["codex_clean_pass_detected=true"],
             )
-        if (
-            state.codex_clean_pass_head_sha is None
-            or state.codex_clean_pass_head_sha != state.expected_head_sha
-        ):
+        # AED-RULE-011: the harness's derived current-head indicator
+        # must also be true. This is the strict variant: even if
+        # ``codex_clean_pass_head_sha`` happens to match
+        # ``expected_head_sha`` by coincidence, the harness must
+        # have affirmatively marked the pass as current-head.
+        if not state.codex_clean_pass_for_current_head:
+            return _deny(
+                AEDDecisionCode.HOLD,
+                f"Merge denied: codex_clean_pass_for_current_head is False; the clean-pass evidence is not affirmatively tied to the current expected head (clean-pass head = {state.codex_clean_pass_head_sha!r}, expected head = {state.expected_head_sha!r}).",
+                rule_ids=["AED-RULE-005", "AED-RULE-011"],
+                required_evidence=["codex_clean_pass_for_current_head=true"],
+            )
+        # AED-RULE-005 / -011: the raw clean-pass head SHA must also
+        # be a full 40-character hex SHA equal to the current
+        # expected head. A None / abbreviated / non-hex value, or a
+        # value pointing at a different head, must deny.
+        if not _is_full_sha(state.codex_clean_pass_head_sha):
+            return _deny(
+                AEDDecisionCode.HOLD,
+                f"Merge denied: Codex clean-pass head SHA {state.codex_clean_pass_head_sha!r} is not a full 40-character hex SHA; a stale clean pass from a prior head does not satisfy AED-RULE-011.",
+                rule_ids=["AED-RULE-005", "AED-RULE-011"],
+                required_evidence=[
+                    "codex_clean_pass_head_sha is a 40-character hex SHA equal to expected_head_sha"
+                ],
+            )
+        if state.codex_clean_pass_head_sha != state.expected_head_sha:
             return _deny(
                 AEDDecisionCode.HOLD,
                 f"Merge denied: Codex clean-pass evidence is not tied to the current expected head (clean-pass head = {state.codex_clean_pass_head_sha!r}, expected head = {state.expected_head_sha!r}); a stale clean pass from a prior head does not satisfy AED-RULE-011.",
@@ -350,11 +395,14 @@ def evaluate_action(
             ]
         )
 
-    # AED-RULE-008: thread resolution requires (a) a live-head check,
-    # (b) an explicit non-empty target thread set carried by the
-    # action, and (c) every target thread ID to be included in the
-    # authorized thread list. AED-RULE-005 applies to thread
-    # resolution as well as merge.
+    # AED-RULE-008: thread resolution requires (a) a live-head check
+    # using the full 40-character SHA, (b) an explicit non-empty
+    # target thread set carried by the action, (c) every target
+    # thread ID to be non-empty, and (d) the target set to be a
+    # subset of the authorized thread list. AED-RULE-005 applies
+    # to thread resolution as well as merge. The action must name
+    # the threads it intends to resolve so the policy engine can
+    # verify the target set is a subset of the authorization.
     if action == AEDActionType.GITHUB_THREAD_RESOLVE:
         # AED-RULE-005: live head must match expected head before resolving threads.
         if not _head_matches(state):
@@ -362,21 +410,31 @@ def evaluate_action(
                 AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION,
                 "Thread resolution denied: current head SHA does not match expected head SHA; re-verify the live PR head before resolving threads (AED-RULE-005 applies to thread resolution as well as merge).",
                 rule_ids=["AED-RULE-005"],
-                required_evidence=["current_head_sha==expected_head_sha"],
+                required_evidence=["current_head_sha==expected_head_sha (full 40-character hex)"],
             )
         # AED-RULE-008: target thread IDs must be supplied by the
         # action. A non-empty ``authorized_thread_ids`` is not by
         # itself authorization to resolve a thread: the action must
         # name the threads it intends to resolve so the policy
         # engine can verify the target set is a subset of the
-        # authorization.
-        target_set = tuple(target_thread_ids or ())
-        if not target_set:
+        # authorization. Duplicate target IDs are normalized to a
+        # set for comparison; empty-string targets are rejected
+        # outright.
+        raw_targets = list(target_thread_ids or ())
+        if not raw_targets:
             return _deny(
                 AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
                 "Thread resolution denied: no target thread ID supplied with the action. Supply ``target_thread_ids`` to the policy engine so the action can be checked against the authorized set.",
                 rule_ids=["AED-RULE-008"],
                 required_evidence=["target_thread_ids (non-empty list)"],
+            )
+        target_set = set(raw_targets)
+        if "" in target_set:
+            return _deny(
+                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+                "Thread resolution denied: an empty target thread ID is not a valid thread reference; the action must name real, non-empty thread IDs.",
+                rule_ids=["AED-RULE-008"],
+                required_evidence=["target_thread_ids (all non-empty strings)"],
             )
         # AED-RULE-008: an authorized thread list is required.
         if not state.authorized_thread_ids:
@@ -390,11 +448,11 @@ def evaluate_action(
         # authorized set. Resolving PRRT_other with authorization
         # for PRRT_target must be denied.
         authorized_set = set(state.authorized_thread_ids)
-        unauthorized_targets = [t for t in target_set if t not in authorized_set]
+        unauthorized_targets = sorted(t for t in target_set if t not in authorized_set)
         if unauthorized_targets:
             return _deny(
                 AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
-                f"Thread resolution denied: target thread ID(s) {sorted(unauthorized_targets)!r} are not in the authorized set {sorted(authorized_set)!r}; the action may only resolve threads explicitly named in the authorization.",
+                f"Thread resolution denied: target thread ID(s) {unauthorized_targets!r} are not in the authorized set {sorted(authorized_set)!r}; the action may only resolve threads explicitly named in the authorization.",
                 rule_ids=["AED-RULE-008"],
                 required_evidence=[
                     f"target_thread_ids is a subset of {sorted(state.authorized_thread_ids)!r}"

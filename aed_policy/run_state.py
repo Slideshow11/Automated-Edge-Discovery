@@ -153,6 +153,18 @@ class AEDRunState:
     # clean pass from a prior head cannot satisfy AED-RULE-011.
     codex_clean_pass_head_sha: Optional[str] = None
 
+    # A derived boolean the harness can populate to record whether
+    # the clean pass evidence is tied to the *current* expected
+    # head. AED-RULE-011 requires that a merge be backed by
+    # current-head clean evidence; the policy engine treats
+    # ``codex_clean_pass_for_current_head`` as the canonical
+    # current-head indicator and rejects any merge for which it
+    # is False. The field is intentionally separate from
+    # ``codex_clean_pass_head_sha`` so the classifier can encode
+    # the comparison as a single boolean while still exposing the
+    # raw head SHA for audit.
+    codex_clean_pass_for_current_head: bool = False
+
     def to_dict(self) -> dict:
         """Serialize to a JSON-friendly dict with a stable shape."""
         return {
@@ -182,6 +194,9 @@ class AEDRunState:
                 self.codex_newer_finding_after_clean_pass
             ),
             "codex_clean_pass_head_sha": self.codex_clean_pass_head_sha,
+            "codex_clean_pass_for_current_head": bool(
+                self.codex_clean_pass_for_current_head
+            ),
             "codex_ping_comment_id": self.codex_ping_comment_id,
             "codex_ping_head_sha": self.codex_ping_head_sha,
             "audit_append_available": bool(self.audit_append_available),
