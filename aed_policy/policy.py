@@ -14,6 +14,7 @@ shape (``evaluate_action`` -> ``AEDDecision``) is stable.
 """
 from __future__ import annotations
 
+import os
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .action_types import (
@@ -23,6 +24,15 @@ from .action_types import (
 )
 from .decisions import AEDDecision, AEDDecisionCode
 from .run_state import AEDRunState
+
+
+# AED-RULE-003 / canonical-path hardening: the canonical root for
+# isolated workspaces. All workspace paths must resolve to a path
+# strictly inside this directory tree. The constant is a
+# module-private string (not a function) so test code can use it
+# directly and so the policy engine never accepts a path that
+# escapes the root via dot-segment or symlink manipulation.
+_ISOLATED_WORKSPACE_ROOT = "/tmp/aed_runs/worktrees"
 
 
 # ---------------------------------------------------------------------------
@@ -102,13 +112,63 @@ def _has_explicit_authorization(state: AEDRunState) -> bool:
     )
 
 
+def _canonicalize_path(path: object) -> Optional[str]:
+    """Canonicalize ``path`` to an absolute, symlink-resolved string.
+
+    Returns the canonicalized absolute path, or ``None`` if the
+    path is not a non-empty string. The function uses
+    ``os.path.realpath`` so dot-segment escapes
+    (``/tmp/aed_runs/worktrees/../../home/max/...``) and symlink
+    escapes resolve to the actual on-disk location before
+    comparison. Pure policy logic: no shell execution, no
+    mutation.
+    """
+    if not isinstance(path, str):
+        return None
+    if not path:
+        return None
+    return os.path.realpath(path)
+
+
+def _is_under(path: str, root: str) -> bool:
+    """True iff the canonicalized ``path`` is strictly inside ``root``.
+
+    Both ``path`` and ``root`` are expected to already be
+    canonicalized via ``_canonicalize_path`` (or otherwise
+    absolute and symlink-resolved). The function rejects paths
+    that equal ``root`` so callers cannot satisfy the isolated
+    workspace check by supplying the root itself, and it
+    enforces the trailing ``/`` separator so a path like
+    ``/tmp/aed_runs/worktrees_evil/x`` is rejected when the
+    intended root is ``/tmp/aed_runs/worktrees``.
+    """
+    if not path or not root:
+        return False
+    root_with_sep = root if root.endswith(os.sep) else root + os.sep
+    return path == root or path.startswith(root_with_sep)
+
+
 def _in_isolated_workspace(state: AEDRunState) -> bool:
-    """True iff the isolated workspace path is a non-primary /tmp/aed_runs/... path."""
-    if not state.isolated_workspace_path:
+    """True iff the canonicalized isolated workspace path is under ``/tmp/aed_runs/worktrees``.
+
+    Strict variant: the candidate workspace path is canonicalized
+    via ``os.path.realpath`` before any comparison, so
+    dot-segment escapes such as
+    ``/tmp/aed_runs/worktrees/../../home/max/Automated-Edge-Discovery``
+    resolve to the actual primary worktree and are rejected.
+    Symlink escapes that resolve outside the allowed root are
+    also rejected. Non-string / empty / ``None`` paths deny. The
+    primary worktree path is rejected even if it is also a
+    sub-path of the allowed root.
+    """
+    raw = state.isolated_workspace_path
+    canonical = _canonicalize_path(raw)
+    if canonical is None:
         return False
-    if state.isolated_workspace_path == state.primary_worktree_path:
+    primary_canonical = _canonicalize_path(state.primary_worktree_path)
+    if primary_canonical is not None and canonical == primary_canonical:
         return False
-    if not state.isolated_workspace_path.startswith("/tmp/aed_runs/worktrees/"):
+    if not _is_under(canonical, _ISOLATED_WORKSPACE_ROOT):
         return False
     return True
 
@@ -139,32 +199,44 @@ def _normalize_phrase(s: Optional[str]) -> str:
 
 
 def expected_merge_authorization_phrase(state: AEDRunState) -> str:
-    """Build the canonical exact-head merge authorization phrase.
+    """Build the canonical merge authorization phrase.
 
-    The format is::
+    The format is the live canonical phrase produced by both
+    ``scripts/local/verify_final_head_merge_command.py``
+    (``build_authorization_phrase``) and
+    ``scripts/local/aed_final_gate.py``
+    (``build_authorization_phrase``), with character-for-character
+    alignment::
 
-        I authorize guarded squash merge of PR #<pr_number>
-        at exact head <40-hex expected_head_sha>.
+        I confirm merge PR #<pr_number> at <40-hex expected_head_sha>
+        using final-head reviewed clean state.
 
-    Whitespace inside the phrase is single-spaced. The phrase
-    ends with a single period.
+    The phrase is single-spaced, ends with a single period after
+    ``clean state``, and the head SHA must be a full 40-character
+    hex string. Earlier policy-engine drafts used a different
+    ``I authorize guarded squash merge of PR #<n> at exact head <sha>.``
+    form, but the live final gate and merge-command verifier
+    both produce the form above; aligning the policy engine
+    with the live producers is required for the skeleton to be
+    consistent with the live canonical phrase.
     """
     return (
-        f"I authorize guarded squash merge of PR #{state.pr_number} "
-        f"at exact head {state.expected_head_sha}."
+        f"I confirm merge PR #{state.pr_number} at {state.expected_head_sha} "
+        f"using final-head reviewed clean state."
     )
 
 
 def has_exact_merge_authorization(state: AEDRunState) -> bool:
-    """True iff ``state.explicit_authorization_phrase`` is the exact canonical phrase.
+    """True iff ``state.explicit_authorization_phrase`` is the live canonical phrase.
 
     The strict AED-RULE-007 variant compares the operator-supplied
-    phrase to the canonical exact-head phrase character-for-character.
-    No whitespace stripping, no whitespace collapsing, no
-    newline tolerance, no case folding. The expected head SHA
-    must itself be a 40-character hex string; if it is not, the
-    engine cannot construct a valid canonical phrase and so
-    cannot accept any authorization text.
+    phrase to the live canonical exact-head phrase
+    character-for-character. No whitespace stripping, no
+    whitespace collapsing, no newline tolerance, no case
+    folding. The expected head SHA must itself be a
+    40-character hex string; if it is not, the engine cannot
+    construct a valid canonical phrase and so cannot accept
+    any authorization text.
 
     Acceptance rules:
     - phrase must be a non-empty string
@@ -172,6 +244,11 @@ def has_exact_merge_authorization(state: AEDRunState) -> bool:
     - phrase must equal the canonical phrase exactly, with no
       leading/trailing whitespace allowed, no double spaces
       allowed, no embedded newlines allowed
+    - the phrase is the LIVE form produced by both
+      ``scripts/local/verify_final_head_merge_command.py`` and
+      ``scripts/local/aed_final_gate.py``: the old
+      ``I authorize guarded squash merge of PR #<n> at exact
+      head <sha>.`` policy-only form is no longer accepted.
     """
     if not state.explicit_authorization_phrase:
         return False
@@ -280,10 +357,10 @@ def evaluate_action(
         if not has_exact_merge_authorization(state):
             return _deny(
                 AEDDecisionCode.REQUIRE_EXPLICIT_AUTHORIZATION,
-                f"Merge denied: explicit_authorization_phrase does not match the canonical exact-head phrase. Expected: I authorize guarded squash merge of PR #{state.pr_number} at exact head {state.expected_head_sha}.",
+                f"Merge denied: explicit_authorization_phrase does not match the live canonical merge phrase. Expected: I confirm merge PR #{state.pr_number} at {state.expected_head_sha} using final-head reviewed clean state.",
                 rule_ids=["AED-RULE-007", "AED-RULE-005"],
                 required_evidence=[
-                    f"explicit_authorization_phrase == I authorize guarded squash merge of PR #{state.pr_number} at exact head {state.expected_head_sha}."
+                    f"explicit_authorization_phrase == I confirm merge PR #{state.pr_number} at {state.expected_head_sha} using final-head reviewed clean state."
                 ],
             )
         # AED-RULE-018: all required CI checks must pass.

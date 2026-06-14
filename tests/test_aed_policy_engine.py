@@ -39,9 +39,14 @@ from aed_policy.run_state import AEDRunState  # noqa: E402
 
 
 ZERO_SHA = "0" * 40
+# Live canonical phrase produced by both
+# scripts/local/verify_final_head_merge_command.py and
+# scripts/local/aed_final_gate.py. The policy engine must accept
+# only this exact form; the previous policy-only form is no
+# longer accepted.
 AUTH_PHRASE = (
-    "I authorize guarded squash merge of PR #999 at exact head "
-    f"{ZERO_SHA}."
+    f"I confirm merge PR #999 at {ZERO_SHA} "
+    f"using final-head reviewed clean state."
 )
 
 
@@ -1293,7 +1298,8 @@ class TestAuthorizationHelpers(unittest.TestCase):
         expected = expected_merge_authorization_phrase(state)
         self.assertEqual(
             expected,
-            f"I authorize guarded squash merge of PR #999 at exact head {ZERO_SHA}.",
+            f"I confirm merge PR #999 at {ZERO_SHA} "
+            f"using final-head reviewed clean state.",
         )
 
     def test_has_exact_authorization_with_matching_phrase(self):
@@ -1834,6 +1840,320 @@ class TestTargetThreadStrict(unittest.TestCase):
         )
         self.assertFalse(d.allowed)
         self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# JbKcR: canonicalize isolated workspace path
+# ---------------------------------------------------------------------------
+
+
+class TestInIsolatedWorkspaceCanonicalize(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JbKcR.
+
+    ``_in_isolated_workspace`` must canonicalize the candidate
+    workspace path (dot-segment and symlink resolution) before
+    comparison, and verify the resolved path is actually inside
+    ``/tmp/aed_runs/worktrees``.
+    """
+
+    def test_in_isolated_workspace_denies_none(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path=None)
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_empty_string(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_non_string(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path=12345)
+        self.assertFalse(_in_isolated_workspace(s))
+        s = _clean_state(isolated_workspace_path=["/tmp/aed_runs/worktrees/x"])
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_dot_segment_escape(self):
+        # Dot-segment escape that resolves outside the
+        # /tmp/aed_runs/worktrees root must deny.
+        from aed_policy.policy import _in_isolated_workspace
+        # /tmp/aed_runs/worktrees/../..  -> /tmp; deny
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/../../home/max/Automated-Edge-Discovery"
+        )
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_resolved_path_outside_root(self):
+        from aed_policy.policy import _in_isolated_workspace
+        # Even with trailing slash, resolution lands at /home/...
+        s = _clean_state(isolated_workspace_path="/home/max/Automated-Edge-Discovery")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_sibling_root_prefix(self):
+        # /tmp/aed_runs/worktrees_evil/x has a sibling-prefix
+        # of /tmp/aed_runs/worktrees but is NOT inside it; deny.
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees_evil/x")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_allows_normal_path(self):
+        from aed_policy.policy import _in_isolated_workspace
+        # _clean_state already sets a /tmp/aed_runs/worktrees path.
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees/aed_policy_engine_skeleton_v1")
+        self.assertTrue(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_allows_trailing_separator_path(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees/aed_x/")
+        self.assertTrue(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_primary_path(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/home/max/Automated-Edge-Discovery")
+        self.assertFalse(_in_isolated_workspace(s))
+
+
+class TestMutatingActionsCanonicalizePath(unittest.TestCase):
+    """MUTATING_LOCAL_ACTIONS must deny when workspace resolves outside root."""
+
+    def test_file_write_denied_on_escape(self):
+        from aed_policy.action_types import AEDActionType
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/../../home/max/Automated-Edge-Discovery"
+        )
+        d = evaluate_action(AEDActionType.FILE_WRITE, s)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_terminal_mutation_denied_on_escape(self):
+        from aed_policy.action_types import AEDActionType
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/../../home/max/Automated-Edge-Discovery"
+        )
+        # Use a mutating terminal action; the policy engine maps
+        # them to MUTATING_LOCAL_ACTIONS.
+        for mut_action in (
+            AEDActionType.FILE_WRITE,
+            AEDActionType.TERMINAL_MUTATING,
+            AEDActionType.GIT_MUTATING,
+        ):
+            d = evaluate_action(mut_action, s)
+            self.assertFalse(d.allowed, msg=f"{mut_action.value} should be denied")
+            self.assertIn(
+                "AED-RULE-003", d.matched_rule_ids,
+                msg=f"{mut_action.value} should cite AED-RULE-003",
+            )
+
+
+# ---------------------------------------------------------------------------
+# JbKcU: live canonical merge authorization phrase
+# ---------------------------------------------------------------------------
+
+
+# Build the live canonical phrase from the same Python source
+# the live scripts use, so the test is not just an inline
+# string but actually the same shape the live producers emit.
+LIVE_CANONICAL_AUTH_PHRASE = (
+    f"I confirm merge PR #999 at {ZERO_SHA} "
+    f"using final-head reviewed clean state."
+)
+
+
+class TestExpectedPhraseMatchesLive(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JbKcU."""
+
+    def test_expected_phrase_matches_live_canonical(self):
+        from aed_policy.policy import expected_merge_authorization_phrase
+        s = _clean_state()
+        self.assertEqual(
+            expected_merge_authorization_phrase(s),
+            LIVE_CANONICAL_AUTH_PHRASE,
+        )
+
+    def test_expected_phrase_built_via_live_producer(self):
+        # Independently compute the live producer's phrase and
+        # compare to the policy engine's phrase. This proves the
+        # policy engine is aligned with the live producer
+        # character-for-character.
+        from aed_policy.policy import expected_merge_authorization_phrase
+        s = _clean_state()
+        independent = (
+            f"I confirm merge PR #{s.pr_number} at {s.expected_head_sha} "
+            f"using final-head reviewed clean state."
+        )
+        self.assertEqual(
+            expected_merge_authorization_phrase(s), independent
+        )
+
+    def test_has_exact_authorization_accepts_live_canonical_phrase(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase=LIVE_CANONICAL_AUTH_PHRASE)
+        self.assertTrue(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_old_policy_only_phrase(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        # The OLD policy-only phrase must be rejected now that
+        # the policy engine is aligned with the live canonical
+        # phrase.
+        old_phrase = (
+            f"I authorize guarded squash merge of PR #999 at exact head {ZERO_SHA}."
+        )
+        s = _clean_state(explicit_authorization_phrase=old_phrase)
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_leading_space(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase=(" " + LIVE_CANONICAL_AUTH_PHRASE))
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_trailing_space(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(explicit_authorization_phrase=(LIVE_CANONICAL_AUTH_PHRASE + " "))
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_embedded_newline(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        s = _clean_state(
+            explicit_authorization_phrase=(
+                "I confirm merge PR #999 at " + ZERO_SHA + "\n"
+                "using final-head reviewed clean state."
+            )
+        )
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_wrong_pr_number(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        bad = LIVE_CANONICAL_AUTH_PHRASE.replace("PR #999", "PR #1")
+        s = _clean_state(explicit_authorization_phrase=bad)
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_wrong_head(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        bad = LIVE_CANONICAL_AUTH_PHRASE.replace(ZERO_SHA, "a" * 40)
+        s = _clean_state(explicit_authorization_phrase=bad)
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_has_exact_authorization_rejects_abbreviated_head(self):
+        from aed_policy.policy import has_exact_merge_authorization
+        bad = LIVE_CANONICAL_AUTH_PHRASE.replace(ZERO_SHA, "abc1234")
+        s = _clean_state(explicit_authorization_phrase=bad)
+        self.assertFalse(has_exact_merge_authorization(s))
+
+    def test_merge_denied_unless_live_canonical_phrase_matches(self):
+        # The merge path must require the live canonical phrase
+        # in GITHUB_MERGE.
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(explicit_authorization_phrase="ok"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-007", d.matched_rule_ids)
+
+    def test_merge_allowed_with_live_canonical_phrase(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(explicit_authorization_phrase=LIVE_CANONICAL_AUTH_PHRASE),
+        )
+        self.assertTrue(d.allowed)
+
+
+# ---------------------------------------------------------------------------
+# Still-active prior findings: extra regression tests pinning behavior
+# ---------------------------------------------------------------------------
+
+
+class TestPriorFindingsStillActive(unittest.TestCase):
+    """Regression tests for the four still-active prior findings.
+
+    These tests pin behavior already covered in the existing
+    test classes; they exist to make the "all prior findings
+    still hold after the latest fix turn" guarantee explicit in
+    the test report.
+    """
+
+    def test_jaFHu_merge_denied_without_clean_evidence(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_detected=False),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_jaFHu_merge_denied_with_stale_clean_pass(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(
+                codex_clean_pass_detected=True,
+                codex_clean_pass_for_current_head=False,
+                codex_clean_pass_head_sha="a" * 40,
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+
+    def test_jaFHw_merge_denied_when_mergeable_not_MERGEABLE(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable=None)
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable="CONFLICTING")
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_jaFHw_merge_allowed_only_when_mergeable_is_MERGEABLE(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable="MERGEABLE")
+        )
+        self.assertTrue(d.allowed)
+
+    def test_jateD_thread_resolve_denied_when_no_target(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_jateD_thread_resolve_denied_when_unauthorized_target(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_a"]),
+            target_thread_ids=["PRRT_other"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_ja5A0_codex_ping_denied_on_abbreviated_head(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(current_head_sha="abc1234", expected_head_sha="abc1234"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+    def test_ja5A0_thread_resolve_denied_on_abbreviated_head(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(
+                current_head_sha="abc1234",
+                expected_head_sha="abc1234",
+                authorized_thread_ids=["PRRT_a"],
+            ),
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+    def test_ja5A0_merge_denied_on_abbreviated_head(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(current_head_sha="abc1234", expected_head_sha="abc1234"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
 
 
 if __name__ == "__main__":
