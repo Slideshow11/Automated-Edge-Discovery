@@ -65,7 +65,14 @@ class AEDRunState:
     ci_status: str
     scope_status: str
     merge_state_status: str
-    mergeable: bool
+    # ``mergeable`` carries GitHub's per-PR mergeability status.
+    # It is one of ``"MERGEABLE"``, ``"CONFLICTING"``, ``"UNKNOWN"``,
+    # or ``None`` (when the value has not been computed yet).
+    # The field is intentionally typed as ``Optional[str]`` so the
+    # harness can pass the raw GitHub value through without losing
+    # the distinction between the three states. The policy engine
+    # uses a helper to normalize this value for allow/deny checks.
+    mergeable: Optional[str]
 
     # --- review-thread inventory ---
     unresolved_thread_count: int
@@ -111,7 +118,7 @@ class AEDRunState:
             "ci_status": self.ci_status,
             "scope_status": self.scope_status,
             "merge_state_status": self.merge_state_status,
-            "mergeable": bool(self.mergeable),
+            "mergeable": self.mergeable,
             "unresolved_thread_count": int(self.unresolved_thread_count),
             "active_thread_count": int(self.active_thread_count),
             "outdated_thread_count": int(self.outdated_thread_count),

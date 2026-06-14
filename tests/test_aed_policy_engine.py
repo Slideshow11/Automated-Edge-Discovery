@@ -69,7 +69,7 @@ def _clean_state(**overrides) -> AEDRunState:
         ci_status="pass",
         scope_status="clean",
         merge_state_status="CLEAN",
-        mergeable=True,
+        mergeable="MERGEABLE",
         unresolved_thread_count=0,
         active_thread_count=0,
         outdated_thread_count=0,
@@ -587,6 +587,257 @@ class TestReportingHelpers(unittest.TestCase):
         s = summarize_denied([d_allowed, d_denied])
         self.assertIn("1 of 2", s)
         self.assertIn("DENY", s)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for Codex findings on PR #404
+# ---------------------------------------------------------------------------
+#
+# These tests pin the fixes for the four Codex findings:
+#   PRRT_kwDOSHFpYM6JaFHu (P1) — Require clean Codex evidence before allowing merges
+#   PRRT_kwDOSHFpYM6JaFHw (P1) — Reject unmergeable PRs before allowing merge
+#   PRRT_kwDOSHFpYM6JaFHx (P2) — Re-verify the live head before Codex pings
+#   PRRT_kwDOSHFpYM6JaFHz (P2) — Re-verify the live head before resolving threads
+#
+# Each test below fails on the pre-patch implementation and passes after
+# the patch.
+
+
+class TestCodexCleanEvidenceBeforeMerge(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JaFHu."""
+
+    def test_merge_denied_when_codex_clean_pass_false(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_clean_pass_detected=False),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.HOLD)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+        self.assertIn(
+            "codex_clean_pass_detected=true", d.required_evidence
+        )
+
+    def test_merge_allowed_when_codex_clean_pass_true_and_no_newer_finding(
+        self,
+    ):
+        d = evaluate_action(AEDActionType.GITHUB_MERGE, _clean_state())
+        self.assertTrue(d.allowed)
+
+    def test_merge_denied_when_codex_newer_finding_true(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(codex_newer_finding_after_clean_pass=True),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.HOLD)
+        self.assertIn("AED-RULE-011", d.matched_rule_ids)
+        self.assertIn("AED-RULE-012", d.matched_rule_ids)
+
+
+class TestUnmergeableMergeDenied(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JaFHw."""
+
+    def test_merge_denied_when_mergeable_false(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable=False)
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE
+        )
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_conflicting(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(mergeable="CONFLICTING"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE
+        )
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_unknown(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(mergeable="UNKNOWN"),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE
+        )
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_none(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable=None)
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE
+        )
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_denied_when_mergeable_non_mergeable_even_if_merge_state_clean(
+        self,
+    ):
+        # merge_state_status is CLEAN (default), but mergeable is False.
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE,
+            _clean_state(
+                mergeable=False, merge_state_status="CLEAN"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-019", d.matched_rule_ids)
+
+    def test_merge_allowed_when_mergeable_mergeable_string(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable="MERGEABLE")
+        )
+        self.assertTrue(d.allowed)
+
+    def test_merge_allowed_when_mergeable_true_bool(self):
+        # Backward compatibility: a Python True is treated as mergeable.
+        d = evaluate_action(
+            AEDActionType.GITHUB_MERGE, _clean_state(mergeable=True)
+        )
+        self.assertTrue(d.allowed)
+
+
+class TestCodexPingLiveHead(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JaFHx."""
+
+    def test_codex_ping_denied_when_head_mismatch(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(current_head_sha="a" * 40),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION
+        )
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+    def test_codex_ping_still_denied_for_duplicate_same_head(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id="12345",
+                codex_ping_head_sha=ZERO_SHA,
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING
+        )
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_allowed_when_head_matches_and_no_duplicate(self):
+        d = evaluate_action(AEDActionType.CODEX_PING, _clean_state())
+        self.assertTrue(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_allowed_when_existing_ping_for_different_head_and_head_matches(
+        self,
+    ):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id="12345",
+                codex_ping_head_sha="a" * 40,
+            ),
+        )
+        self.assertTrue(d.allowed)
+
+
+class TestThreadResolveLiveHead(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JaFHz."""
+
+    def test_thread_resolve_denied_when_head_mismatch(self):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(
+                current_head_sha="a" * 40,
+                authorized_thread_ids=["PRRT_abc"],
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION
+        )
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+
+    def test_thread_resolve_allowed_when_head_matches_and_thread_list_authorized(
+        self,
+    ):
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(authorized_thread_ids=["PRRT_abc"]),
+        )
+        self.assertTrue(d.allowed)
+        self.assertIn("AED-RULE-005", d.matched_rule_ids)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_thread_resolve_head_check_runs_before_thread_list_check(self):
+        # If head is mismatched, the head-check denial must take
+        # precedence over the thread-list check, even when the
+        # thread list is empty.
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            _clean_state(
+                current_head_sha="a" * 40,
+                authorized_thread_ids=[],
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION
+        )
+        # The thread-list code should NOT be the active denial
+        # code; the head-check should run first.
+        self.assertNotEqual(
+            d.code, AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION
+        )
+
+
+class TestIsMergeableHelper(unittest.TestCase):
+    """Direct unit tests for the _is_mergeable helper."""
+
+    def test_is_mergeable_true_bool(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertTrue(_is_mergeable(True))
+
+    def test_is_mergeable_false_bool(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(False))
+
+    def test_is_mergeable_none(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(None))
+
+    def test_is_mergeable_string_mergeable(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertTrue(_is_mergeable("MERGEABLE"))
+
+    def test_is_mergeable_string_mergeable_lowercase(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertTrue(_is_mergeable("mergeable"))
+
+    def test_is_mergeable_string_conflicting(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("CONFLICTING"))
+
+    def test_is_mergeable_string_unknown(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable("UNKNOWN"))
+
+    def test_is_mergeable_unsupported_type(self):
+        from aed_policy.policy import _is_mergeable
+        self.assertFalse(_is_mergeable(42))
 
 
 if __name__ == "__main__":

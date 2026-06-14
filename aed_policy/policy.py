@@ -83,6 +83,24 @@ def _in_isolated_workspace(state: AEDRunState) -> bool:
     return True
 
 
+def _is_mergeable(value) -> bool:
+    """Normalize GitHub's ``mergeable`` value to a boolean.
+
+    Accepts the raw GitHub strings (``"MERGEABLE"`` / ``"CONFLICTING"`` /
+    ``"UNKNOWN"``), a ``bool`` (for tests and synthetic states), and
+    ``None`` (when the value has not been computed yet). Only the
+    literal string ``"MERGEABLE"`` (case-insensitive) or a True
+    bool is treated as mergeable.
+    """
+    if value is True:
+        return True
+    if value is False or value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip().upper() == "MERGEABLE"
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -141,7 +159,7 @@ def evaluate_action(
             )
         return _allow(rule_ids=["AED-RULE-002"])
 
-    # AED-RULE-005, -007, -018, -019, -008, -011, -012, -021: merge rules.
+    # AED-RULE-005, -007, -011, -012, -018, -019, -008, -021: merge rules.
     if action == AEDActionType.GITHUB_MERGE:
         # AED-RULE-021: protected historical PRs are read-only.
         if state.pr_number in state.protected_pr_numbers:
@@ -182,13 +200,24 @@ def evaluate_action(
                 rule_ids=["AED-RULE-019"],
                 required_evidence=["scope_status=clean"],
             )
-        # Merge state must be CLEAN.
+        # AED-RULE-019: merge_state_status must be CLEAN.
         if state.merge_state_status != "CLEAN":
             return _deny(
                 AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE,
                 f"Merge denied: merge state status is '{state.merge_state_status}', expected 'CLEAN'.",
                 rule_ids=["AED-RULE-019"],
                 required_evidence=["merge_state_status=CLEAN"],
+            )
+        # AED-RULE-019: GitHub's mergeable field must indicate MERGEABLE.
+        # The mergeable field is GitHub's per-PR mergeability value; it
+        # can be one of "MERGEABLE" / "CONFLICTING" / "UNKNOWN" or None.
+        # Only "MERGEABLE" (case-insensitive) is acceptable for merge.
+        if not _is_mergeable(state.mergeable):
+            return _deny(
+                AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE,
+                f"Merge denied: GitHub mergeable status is {state.mergeable!r}, expected 'MERGEABLE'.",
+                rule_ids=["AED-RULE-019"],
+                required_evidence=["mergeable in {'MERGEABLE', True}"],
             )
         # AED-RULE-008: no unresolved review threads.
         if state.unresolved_thread_count > 0:
@@ -198,7 +227,15 @@ def evaluate_action(
                 rule_ids=["AED-RULE-008"],
                 required_evidence=["unresolved_thread_count=0"],
             )
-        # AED-RULE-011/-012: no newer finding after a clean pass.
+        # AED-RULE-011: current-head Codex clean-pass evidence required.
+        if not state.codex_clean_pass_detected:
+            return _deny(
+                AEDDecisionCode.HOLD,
+                "Merge denied: no current-head Codex clean-pass evidence; the policy engine does not authorize a merge until the classifier reports a clean pass tied to the current head.",
+                rule_ids=["AED-RULE-011"],
+                required_evidence=["codex_clean_pass_detected=true"],
+            )
+        # AED-RULE-012: no newer non-clean finding after the clean pass.
         if state.codex_newer_finding_after_clean_pass:
             return _deny(
                 AEDDecisionCode.HOLD,
@@ -218,8 +255,17 @@ def evaluate_action(
             ]
         )
 
-    # AED-RULE-008: thread resolution requires an exact authorized thread list.
+    # AED-RULE-008: thread resolution requires an exact authorized thread list
+    # AND (AED-RULE-005) a live-head check.
     if action == AEDActionType.GITHUB_THREAD_RESOLVE:
+        # AED-RULE-005: live head must match expected head before resolving threads.
+        if not _head_matches(state):
+            return _deny(
+                AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION,
+                "Thread resolution denied: current head SHA does not match expected head SHA; re-verify the live PR head before resolving threads (AED-RULE-005 applies to thread resolution as well as merge).",
+                rule_ids=["AED-RULE-005"],
+                required_evidence=["current_head_sha==expected_head_sha"],
+            )
         if not state.authorized_thread_ids:
             return _deny(
                 AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
@@ -227,7 +273,7 @@ def evaluate_action(
                 rule_ids=["AED-RULE-008"],
                 required_evidence=["authorized_thread_ids (non-empty list)"],
             )
-        return _allow(rule_ids=["AED-RULE-008"])
+        return _allow(rule_ids=["AED-RULE-005", "AED-RULE-008"])
 
     # AED-RULE-021: PR reopen is a state mutation; protected PRs are read-only.
     if action == AEDActionType.GITHUB_REOPEN:
@@ -252,8 +298,17 @@ def evaluate_action(
     if action == AEDActionType.GITHUB_COMMENT:
         return _allow(rule_ids=[])
 
-    # AED-RULE-010: exactly one Codex ping per head.
+    # AED-RULE-010: exactly one Codex ping per head. Plus AED-RULE-005:
+    # the live head must be verified before posting a ping.
     if action == AEDActionType.CODEX_PING:
+        # AED-RULE-005: live head must match expected head before posting a ping.
+        if not _head_matches(state):
+            return _deny(
+                AEDDecisionCode.REQUIRE_EXACT_HEAD_AUTHORIZATION,
+                "Codex ping denied: current head SHA does not match expected head SHA; re-verify the live PR head before posting a Codex ping (AED-RULE-005 applies to Codex pings as well as merge).",
+                rule_ids=["AED-RULE-005"],
+                required_evidence=["current_head_sha==expected_head_sha"],
+            )
         if (
             state.codex_ping_comment_id
             and state.codex_ping_head_sha
@@ -265,7 +320,7 @@ def evaluate_action(
                 rule_ids=["AED-RULE-010"],
                 required_evidence=["codex_ping_head_sha != expected_head_sha"],
             )
-        return _allow(rule_ids=["AED-RULE-010"])
+        return _allow(rule_ids=["AED-RULE-005", "AED-RULE-010"])
 
     # AED-RULE-020: audit append requires an append-only mechanism evidence.
     if action == AEDActionType.AUDIT_APPEND:
