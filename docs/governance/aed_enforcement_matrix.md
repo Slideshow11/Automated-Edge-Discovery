@@ -48,7 +48,7 @@ Each row covers one `AED-RULE-NNN` and includes:
 | AED-RULE-007 | Human merge authorization phrase required | `docs/merge_authorization_guard.md`; `schemas/aed_lifecycle_states_v1.json` `human_authorization_required` | doc + schema | Soft | schema-level | no runtime phrase check | `AEDPolicy` auth.phrase gate |
 | AED-RULE-008 | Thread resolution requires explicit human authorization | `docs/stale_review_thread_auto_resolution_policy.md`; `check_stale_review_thread_resolution.py` | hard-coded + prompt | Medium | `tests/test_check_stale_review_thread_resolution.py` | not a hard fail by default; only stale-policy check | `AEDGitHubTool` per-thread auth.phrase |
 | AED-RULE-009 | Codex response classifier drives lifecycle state | `audit_codex_response_for_pr.py`; `docs/aed_lifecycle_state_registry.md` | ci + hard-coded | Hard | `tests/test_audit_codex_response_for_pr.py` (122 tests) | none | `AEDCodexClassifierTool` |
-| AED-RULE-010 | Exactly one Codex ping per head | `audit_codex_response_for_pr.py` ping tracking | hard-coded | Medium | ping-window tests in `tests/test_audit_codex_response_for_pr.py` | not enforced before posting (post-hoc only) | `AEDCodexPingTool` de-dup |
+| AED-RULE-010 | Exactly one Codex ping per head | operator prompt | prompt | Prompt-only | none (classifier only echoes `ping_comment_id`; it does not scan PR comments for prior `@codex review` requests on the same head) | no automated pre-post check; ping-window tests cover filtering evidence, not preventing duplicate pings | `AEDCodexPingTool` de-dup + `AEDGitHubTool` refusal + `AEDPolicy` preflight |
 | AED-RULE-011 | Clean pass must be tied to current head | `audit_codex_response_for_pr.py` `clean_pass_*` | hard-coded | Hard | clean-pass tests in `tests/test_audit_codex_response_for_pr.py` | none | `AEDCodexClassifierTool` |
 | AED-RULE-012 | Formal reviews on non-head commits must not downgrade current-head clean pass | `audit_codex_response_for_pr.py` `extract_review_commit_oid` filter in `newer_finding_after_clean_pass` | hard-coded | Hard | `test_p2_stale_review_*` (3); `test_p2_formal_clean_pass_then_later_review_on_other_head_still_hold_new` | none | `AEDCodexClassifierTool` |
 | AED-RULE-013 | Review-thread inventory must be complete | `audit_codex_response_for_pr.py` `review_thread_inventory_complete` | hard-coded | Hard | `test_p2_partial_inventory_*`; `test_paginated_*` | none | `AEDCodexClassifierTool` |
@@ -56,7 +56,7 @@ Each row covers one `AED-RULE-NNN` and includes:
 | AED-RULE-015 | Review-submission inventory must be complete | `audit_codex_response_for_pr.py` `review_submission_inventory_complete` | hard-coded | Hard | `test_p1_*_fetch_failure_*` | none | `AEDCodexClassifierTool` |
 | AED-RULE-016 | Visible findings from incomplete nested pagination must be preserved | `audit_codex_response_for_pr.py` nested pagination block | hard-coded | Hard | `test_p2_partial_inventory_*` | none | `AEDCodexClassifierTool` |
 | AED-RULE-017 | Timestamps must be timezone-aware ISO 8601 | `audit_codex_response_for_pr.py` `parse_iso_utc` | hard-coded | Hard | `test_p2_partial_inventory_hold_pending_renders_pending_status`; `test_valid_*_ping_timestamp_*` | none | `AEDPolicy` ISO validator |
-| AED-RULE-018 | All 5 required CI checks must pass | `.github/workflows/ci.yml`; `audit_main_ci_for_head.py` | ci + hard-coded | Hard | `tests/test_audit_main_ci_for_head.py` (45 tests); `tests/test_check_pr_review_comments.py` | none | `AEDCI` + `AEDMergeTool` |
+| AED-RULE-018 | All 5 required CI checks must pass | `scripts/local/wait_for_pr_ready.py` `DEFAULT_REQUIRED_CHECKS` is the pre-merge required-check source (this matrix is descriptive only); `.github/workflows/ci.yml`; `audit_main_ci_for_head.py` is a separate post-merge main-branch workflow-run auditor that takes a `--required-workflow` argument (not the per-PR required-check source) | ci + hard-coded | Hard | `tests/test_audit_main_ci_for_head.py` (45 tests); `tests/test_check_pr_review_comments.py` | none | `AEDCI` + `AEDMergeTool` |
 | AED-RULE-019 | Scope guard must report SCOPE_CLEAN | `scripts/local/scope_guard.py` | hard-coded | Hard | `tests/test_scope_guard.py` | not run automatically on every commit; run per-turn | `AEDPolicy` post-diff hook |
 | AED-RULE-020 | Audit log is append-only; external audit is never mutated | `append_merge_action_audit.py`; `validate_merge_action_audit_log.py`; `docs/trace_policy_v1.md`; PR #398 | hard-coded + prompt | Hard + Soft | `tests/test_append_merge_action_audit.py`; `tests/test_validate_merge_action_audit_log.py` | operator-prompt rule for "never normalize" is soft | `AEDAuditTool` append-only |
 | AED-RULE-021 | Protected historical PRs are read-only | `docs/aed_known_safe_command_cookbook.md` §3; closeout entries | prompt | Prompt-only | none | no automated check on PR number list | `AEDGitHubTool` protected-PR list |
@@ -75,9 +75,9 @@ Each row covers one `AED-RULE-NNN` and includes:
 | Strength | Count | Rules |
 |----------|-------|-------|
 | Hard | 16 | AED-RULE-005, -006, -009, -011, -012, -013, -014, -015, -016, -017, -018, -019, -020 (append-only half), -024, -025, -027, -028, -029 |
-| Medium | 5 | AED-RULE-004, -008, -010, -020 (no-normalize half), -022 |
+| Medium | 4 | AED-RULE-004, -008, -020 (no-normalize half), -022 |
 | Soft | 2 | AED-RULE-002, -007 |
-| Prompt-only | 7 | AED-RULE-001, -003, -021, -023 (pre-post half), -026, -030 |
+| Prompt-only | 8 | AED-RULE-001, -003, -010, -021, -023 (pre-post half), -026, -030 |
 | Missing | 0 | — |
 | Ambiguous | 0 | — |
 
@@ -95,15 +95,18 @@ OpenHands migration:
 2. **AED-RULE-002** — No primary sync without explicit authorization
 3. **AED-RULE-003** — Use temp worktrees
 4. **AED-RULE-007** — Human merge authorization phrase required
-5. **AED-RULE-021** — Protected historical PRs are read-only
-6. **AED-RULE-023 (pre-post half)** — Gate-safe comment language for
+5. **AED-RULE-010** — Exactly one Codex ping per head (the classifier
+   only echoes a ping id; there is no automated pre-post duplicate
+   check, so the operator prompt is the only barrier)
+6. **AED-RULE-021** — Protected historical PRs are read-only
+7. **AED-RULE-023 (pre-post half)** — Gate-safe comment language for
    Codex pings (pre-post scan is operator-side)
-7. **AED-RULE-026** — Final report distinguishes post-ping from older
+8. **AED-RULE-026** — Final report distinguishes post-ping from older
    anchored
-8. **AED-RULE-030** — Meta-rule tracking the gap above
+9. **AED-RULE-030** — Meta-rule tracking the gap above
 
-These 8 rules define the OpenHands migration's enforcement-hardening
-scope. A `PreToolUse` hook and a `Stop` hook can promote the first 5
+These 9 rules define the OpenHands migration's enforcement-hardening
+scope. A `PreToolUse` hook and a `Stop` hook can promote the first 6
 to hard rules; a report template can promote AED-RULE-026.
 
 ## 5. Worked examples (from the matrix)

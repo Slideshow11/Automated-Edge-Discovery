@@ -289,17 +289,32 @@ Rules are grouped into the following categories. Each rule carries a
   Codex ping comment authored with `@codex review` in the body. A new
   head MUST have a new ping before any Codex response is interpreted as
   authoritative.
-- **Current source of truth:** `audit_codex_response_for_pr.py` ping
-  tracking + the operator prompt.
-- **Current enforcement location:** Classifier packet tracks
-  `ping_comment_id` and rejects new pings that duplicate the same head.
-- **Current enforcement strength:** Medium.
-- **Current test coverage:** Tests for ping-window filtering in
-  `tests/test_audit_codex_response_for_pr.py`.
+- **Current source of truth:** Operator prompt. The classifier script
+  accepts `--ping-comment-id` and `--ping-created-at` only as a
+  per-invocation filter against the issue-comment / review inventories
+  it already fetched; it does not scan PR comments for multiple
+  `@codex review` requests and does not reject a duplicate ping for
+  the same head. The script's `ping_comment_id` field is echoed in
+  the packet as an artifact, not enforced as a uniqueness check.
+- **Current enforcement location:** Operator prompt / manual discipline
+  only. There is no automated pre-post check that no prior
+  `@codex review` request exists for the same `(pr_number, head_sha)`
+  tuple.
+- **Current enforcement strength:** Prompt-only (operator must
+  consciously check the PR for an existing ping comment before
+  posting a new one).
+- **Current test coverage:** None. The classifier's existing ping-window
+  tests cover filtering evidence by a supplied ping id, not
+  preventing the agent from posting a duplicate ping.
 - **Failure mode if missed:** Codex may re-review an already-reviewed
-  head; agent may post duplicate pings and confuse the classifier.
-- **OpenHands migration target:** `AEDCodexPingTool` de-duplicates pings
-  by `(pr_number, expected_head_sha)`.
+  head; the agent may post duplicate pings and confuse downstream
+  classification; the operator prompt is the only barrier.
+- **OpenHands migration target:** Hardening routes to
+  `AEDCodexPingTool` (de-duplicates pings by
+  `(pr_number, expected_head_sha)` before posting),
+  `AEDGitHubTool` (refuses ping mutations that would duplicate an
+  existing same-head ping comment), and an `AEDPolicy` preflight that
+  scans PR comments for prior `@codex review` requests.
 - **Priority:** High.
 
 ### AED-RULE-011 — Clean pass must be tied to current head
@@ -448,8 +463,21 @@ Rules are grouped into the following categories. Each rule carries a
   `pr-gate-live-smoke`, `review-comment-gate`, `test (3.11)`,
   `validator`. A pending check is not a pass.
 - **Current source of truth:** `docs/aed_whole_workflow_operator_path.md`
-  §5; `.github/workflows/ci.yml`; `docs/audit-edge-discovery.yml`.
-- **Current enforcement location:** CI workflow + `audit_main_ci_for_head.py`.
+  §5; `.github/workflows/ci.yml`. The canonical pre-merge required-check
+  list is the `DEFAULT_REQUIRED_CHECKS` constant in
+  `scripts/local/wait_for_pr_ready.py`; that script is the per-PR
+  readiness checker used to decide whether the five required checks are
+  all green on the current head. `audit_main_ci_for_head.py` is a
+  separate post-merge main-branch workflow-run auditor that takes a
+  `--required-workflow` argument; it is not the source of the pre-merge
+  required-check set. (A file once referenced as
+  `docs/audit-edge-discovery.yml` does not exist; the actual workflow
+  lives under `.github/workflows/`.)
+- **Current enforcement location:** The pre-merge required-check
+  source is `scripts/local/wait_for_pr_ready.py` (`DEFAULT_REQUIRED_CHECKS`).
+  This inventory file is descriptive only — the script is the actual
+  enforcement location used to evaluate PR readiness; the docs file
+  itself does not gate merges.
 - **Current enforcement strength:** Hard.
 - **Current test coverage:** `tests/test_audit_main_ci_for_head.py` (45
   tests) and `tests/test_check_pr_review_comments.py`.
@@ -516,9 +544,13 @@ Rules are grouped into the following categories. Each rule carries a
 - **Failure mode if missed:** A historical PR is force-pushed or branch
   deleted, breaking audit chain.
 - **OpenHands migration target:** `AEDGitHubTool` refuses
-  re-opening a protected PR (via `gh pr edit --state open`) or
-  branch-deletion (via the GitHub API `DELETE` method on
-  `/git/refs`) on protected PR numbers.
+  re-opening a protected PR and refuses branch-deletion on protected
+  PR numbers. The canonical reopen command is `gh pr reopen` (not
+  `gh pr edit --state open`, which is not the documented reopen
+  verb); the migration must guard the actual reopen path users
+  invoke. Reopen is treated as a GitHub PR state mutation that
+  requires explicit operator authorization and lifecycle validation
+  before invocation.
 - **Priority:** Medium.
 
 ### AED-RULE-022 — Resume checkpoint continuation rule
@@ -777,3 +809,4 @@ OpenHands migration proceeds:
 | Date | PR | Author | Change |
 |------|----|--------|--------|
 | 2026-06-13 | (PR #403) | initial | Created `aed_rules_inventory.md` with 30 rules. |
+| 2026-06-14 | (PR #403) | second pass | Addressed three Codex P2 review findings: pointed AED-RULE-018 at the pre-merge `wait_for_pr_ready.py` `DEFAULT_REQUIRED_CHECKS` source (descriptive only); reclassified AED-RULE-010 duplicate-ping avoidance as prompt-only today (the classifier only echoes `ping_comment_id`, it does not scan for duplicate pings) and routed migration hardening to `AEDCodexPingTool` / `AEDGitHubTool` / `AEDPolicy` preflight; corrected the AED-RULE-021 migration target to the canonical `gh pr reopen` command (not `gh pr edit --state open`) and described reopen as a PR state mutation requiring explicit operator authorization and lifecycle validation. |

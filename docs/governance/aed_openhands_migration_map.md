@@ -120,7 +120,7 @@ unless otherwise noted.
 | AED-RULE-007 | `AEDPolicy` `auth.phrase` gate | Required field on `AEDMergeTool` |
 | AED-RULE-008 | `AEDGitHubTool` thread-resolution-mutation gate | Per-thread `auth.phrase` + stale-policy check |
 | AED-RULE-009 | `AEDCodexClassifierTool` | Existing classifier |
-| AED-RULE-010 | `AEDCodexPingTool` de-dup by `(pr, head)` | |
+| AED-RULE-010 | `AEDCodexPingTool` de-dup by `(pr, head)` + `AEDGitHubTool` ping-mutation refusal + `AEDPolicy` preflight | The classifier echoes the ping id but does not scan for duplicate pings; hardening routes to a pre-post guard (de-dup + refusal + preflight scan) so duplicate pings are refused before posting. |
 | AED-RULE-011 | `AEDCodexClassifierTool` | Existing clean-pass logic |
 | AED-RULE-012 | `AEDCodexClassifierTool` | Existing non-head filter |
 | AED-RULE-013 | `AEDCodexClassifierTool` | Existing inventory check |
@@ -131,7 +131,7 @@ unless otherwise noted.
 | AED-RULE-018 | `AEDCI` (post-tool-use CI monitor) | Block merge while non-pass |
 | AED-RULE-019 | `AEDPolicy` post-diff scope-guard invocation | Reuse `scope_guard.py` |
 | AED-RULE-020 | `AEDAuditTool` (append-only) | OS-level append-only file mode |
-| AED-RULE-021 | `AEDGitHubTool` protected-PR list | Read from `schemas/aed_protected_prs.json` (proposed) |
+| AED-RULE-021 | `AEDGitHubTool` protected-PR list | Read from `schemas/aed_protected_prs.json` (proposed). The protected-PR guard must intercept the canonical reopen command (`gh pr reopen`, not `gh pr edit --state open`) and treat reopen as a PR state mutation requiring explicit operator authorization and lifecycle validation. |
 | AED-RULE-022 | `AEDLifecycleStateStore` resume-checkpoint | Reject duplicate mutations |
 | AED-RULE-023 | `AEDCodexPingTool` pre-post scan | Move scan logic to a shared helper |
 | AED-RULE-024 | `AEDPolicy` forbidden-operation list + tool-level rejection | Multi-target |
@@ -291,7 +291,7 @@ PR with its own closeout:
 6. **Full PR lifecycle runner.** End-to-end demo on a small
    docs-only PR with one PR-cycle.
 
-After step 6, soft rules (AED-RULE-001, -002, -003, -007, -021,
+After step 6, soft rules (AED-RULE-001, -002, -003, -007, -010, -021,
 -023 pre-post, -026, -030) should all be hard-enforced.
 
 ## 12. Non-goals for the first OpenHands PR
