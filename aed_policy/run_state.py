@@ -14,6 +14,47 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Set
 
 
+# AED-RULE-021: the canonical set of historical PR numbers that
+# the harness treats as read-only by default. The set deliberately
+# excludes the current PR (e.g. PR #404) so the default does not
+# lock the engine's own PR.
+#
+# The list is the union of:
+#   PR #384 (initial protected historicals list — supersedes
+#            nothing here; listed as a baseline)
+#   PR #386 (tooling/guarded-pr-closeout-waiter)
+#   PR #397 (tooling: add lifecycle state registry)
+#   PR #398 (docs: codify audit append-only closeout rule)
+#   PR #399 (docs: codify resume checkpoint continuation rule)
+#   PR #400 (docs: codify primary worktree sync policy)
+#   PR #401 (tooling: handle superseded main CI audit runs)
+#   PR #402 (tooling: classify Codex responses across comments and reviews)
+#   PR #403 (docs(governance): inventory AED rules and enforcement map)
+#
+# Creating an ``AEDRunState`` without explicitly supplying
+# ``protected_pr_numbers`` will still protect these PRs (AED-RULE-021).
+DEFAULT_PROTECTED_PR_NUMBERS: tuple = (
+    384,
+    386,
+    397,
+    398,
+    399,
+    400,
+    401,
+    402,
+    403,
+)
+
+
+def _default_protected_pr_numbers() -> Set[int]:
+    """Default factory: returns a fresh copy of the protected PR set.
+
+    A fresh copy is returned so callers who mutate the set
+    locally do not affect the canonical constant.
+    """
+    return set(DEFAULT_PROTECTED_PR_NUMBERS)
+
+
 @dataclass
 class AEDRunState:
     """The minimal inputs the policy engine needs to evaluate an action.
@@ -96,7 +137,21 @@ class AEDRunState:
     authorized_thread_ids: List[str] = field(default_factory=list)
 
     # --- Protected PR set ---
-    protected_pr_numbers: Set[int] = field(default_factory=set)
+    # AED-RULE-021: by default, the engine protects the historical
+    # PRs in ``DEFAULT_PROTECTED_PR_NUMBERS``. Explicitly passing an
+    # empty set is allowed (the policy engine treats it as missing
+    # protected-PR evidence and denies).
+    protected_pr_numbers: Set[int] = field(
+        default_factory=_default_protected_pr_numbers
+    )
+
+    # The head SHA that the current Codex clean-pass evidence is
+    # tied to. When ``codex_clean_pass_detected`` is True, this
+    # field carries the head SHA the classifier observed for the
+    # clean pass. The policy engine requires this SHA to equal
+    # ``expected_head_sha`` before allowing a merge, so a stale
+    # clean pass from a prior head cannot satisfy AED-RULE-011.
+    codex_clean_pass_head_sha: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialize to a JSON-friendly dict with a stable shape."""
@@ -126,6 +181,7 @@ class AEDRunState:
             "codex_newer_finding_after_clean_pass": bool(
                 self.codex_newer_finding_after_clean_pass
             ),
+            "codex_clean_pass_head_sha": self.codex_clean_pass_head_sha,
             "codex_ping_comment_id": self.codex_ping_comment_id,
             "codex_ping_head_sha": self.codex_ping_head_sha,
             "audit_append_available": bool(self.audit_append_available),

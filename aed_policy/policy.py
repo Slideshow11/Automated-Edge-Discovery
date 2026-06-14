@@ -14,7 +14,7 @@ shape (``evaluate_action`` -> ``AEDDecision``) is stable.
 """
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from .action_types import (
     AEDActionType,
@@ -86,19 +86,76 @@ def _in_isolated_workspace(state: AEDRunState) -> bool:
 def _is_mergeable(value) -> bool:
     """Normalize GitHub's ``mergeable`` value to a boolean.
 
-    Accepts the raw GitHub strings (``"MERGEABLE"`` / ``"CONFLICTING"`` /
-    ``"UNKNOWN"``), a ``bool`` (for tests and synthetic states), and
-    ``None`` (when the value has not been computed yet). Only the
-    literal string ``"MERGEABLE"`` (case-insensitive) or a True
-    bool is treated as mergeable.
+    Accepts the raw GitHub strings (``"MERGEABLE"`` /
+    ``"CONFLICTING"`` / ``"UNKNOWN"``) and ``None`` (when the
+    value has not been computed yet). A Python ``True`` is NOT
+    accepted as a substitute for an explicit GitHub ``"MERGEABLE"``
+    string: the safer skeleton default is to require explicit
+    GitHub evidence, since a weak truthy value would otherwise
+    pass for unverified or synthetic states. Only the literal
+    string ``"MERGEABLE"`` (case-insensitive) is treated as
+    mergeable.
     """
-    if value is True:
-        return True
-    if value is False or value is None:
+    if value is None or value is False:
         return False
     if isinstance(value, str):
         return value.strip().upper() == "MERGEABLE"
     return False
+
+
+def _normalize_phrase(s: Optional[str]) -> str:
+    """Collapse runs of whitespace to a single space and strip.
+
+    Used to compare the operator-supplied authorization phrase
+    against the expected phrase without allowing trivial
+    whitespace differences to slip through.
+    """
+    if not s:
+        return ""
+    return " ".join(s.split())
+
+
+def expected_merge_authorization_phrase(state: AEDRunState) -> str:
+    """Build the canonical exact-head merge authorization phrase.
+
+    The format is::
+
+        I authorize guarded squash merge of PR #<pr_number>
+        at exact head <40-hex expected_head_sha>.
+
+    Whitespace inside the phrase is single-spaced. The phrase
+    ends with a single period.
+    """
+    return (
+        f"I authorize guarded squash merge of PR #{state.pr_number} "
+        f"at exact head {state.expected_head_sha}."
+    )
+
+
+def has_exact_merge_authorization(state: AEDRunState) -> bool:
+    """True iff ``state.explicit_authorization_phrase`` matches the canonical phrase.
+
+    A phrase that is empty, None, an arbitrary string (``"ok"``,
+    ``"merge"``), missing the PR number, missing the head SHA, or
+    carrying a different head SHA all fail this check. Whitespace
+    is normalized before comparison so a phrase with extra spaces
+    or newlines is rejected only when the normalized form differs.
+    """
+    if not state.explicit_authorization_phrase:
+        return False
+    if not state.expected_head_sha:
+        return False
+    # The expected head SHA must be a 40-character hex string. If
+    # it isn't, the engine cannot accept any authorization phrase
+    # because the canonical phrase would itself be malformed.
+    if not (
+        isinstance(state.expected_head_sha, str)
+        and len(state.expected_head_sha) == 40
+        and all(c in "0123456789abcdefABCDEF" for c in state.expected_head_sha)
+    ):
+        return False
+    expected = expected_merge_authorization_phrase(state)
+    return _normalize_phrase(state.explicit_authorization_phrase) == _normalize_phrase(expected)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +164,10 @@ def _is_mergeable(value) -> bool:
 
 
 def evaluate_action(
-    action: AEDActionType, state: AEDRunState
+    action: AEDActionType,
+    state: AEDRunState,
+    *,
+    target_thread_ids: Sequence[str] = (),
 ) -> AEDDecision:
     """Evaluate a proposed action against the current run state.
 
@@ -116,6 +176,12 @@ def evaluate_action(
     :class:`AEDDecision` describing the verdict, the reason, the
     rule IDs that matched, and (for denials) the evidence the
     caller must supply to flip the decision to allow.
+
+    For ``GITHUB_THREAD_RESOLVE`` actions, ``target_thread_ids``
+    is the list of thread IDs the action is attempting to
+    resolve. The engine requires this to be non-empty and a
+    subset of ``state.authorized_thread_ids``. For all other
+    actions, the parameter is ignored.
     """
     # AED-RULE-024: unknown action is denied by default.
     if action == AEDActionType.UNKNOWN:
@@ -161,7 +227,17 @@ def evaluate_action(
 
     # AED-RULE-005, -007, -011, -012, -018, -019, -008, -021: merge rules.
     if action == AEDActionType.GITHUB_MERGE:
-        # AED-RULE-021: protected historical PRs are read-only.
+        # AED-RULE-021: protected historical PRs are read-only. Fail
+        # closed when ``protected_pr_numbers`` is empty: an empty
+        # set is treated as missing protected-PR evidence, so the
+        # policy engine cannot confirm the current PR is *not*
+        # protected and must deny.
+        if not state.protected_pr_numbers:
+            return _deny(
+                AEDDecisionCode.DENY,
+                "Merge denied: no protected-PR evidence available (AED-RULE-021); ``protected_pr_numbers`` is empty, so the engine cannot evaluate whether the current PR is protected. Supply a non-empty ``protected_pr_numbers`` set (the AED-RULE-021 default is the AED canonical historical PR list).",
+                rule_ids=["AED-RULE-021"],
+            )
         if state.pr_number in state.protected_pr_numbers:
             return _deny(
                 AEDDecisionCode.DENY,
@@ -176,13 +252,16 @@ def evaluate_action(
                 rule_ids=["AED-RULE-005"],
                 required_evidence=["current_head_sha==expected_head_sha"],
             )
-        # AED-RULE-007: human authorization phrase required.
-        if not _has_explicit_authorization(state):
+        # AED-RULE-007: human authorization phrase required, and it
+        # must match the canonical exact-head phrase.
+        if not has_exact_merge_authorization(state):
             return _deny(
                 AEDDecisionCode.REQUIRE_EXPLICIT_AUTHORIZATION,
-                "Merge denied: no explicit human authorization phrase provided.",
-                rule_ids=["AED-RULE-007"],
-                required_evidence=["explicit_authorization_phrase"],
+                f"Merge denied: explicit_authorization_phrase does not match the canonical exact-head phrase. Expected: I authorize guarded squash merge of PR #{state.pr_number} at exact head {state.expected_head_sha}.",
+                rule_ids=["AED-RULE-007", "AED-RULE-005"],
+                required_evidence=[
+                    f"explicit_authorization_phrase == I authorize guarded squash merge of PR #{state.pr_number} at exact head {state.expected_head_sha}."
+                ],
             )
         # AED-RULE-018: all required CI checks must pass.
         if state.ci_status != "pass":
@@ -208,16 +287,19 @@ def evaluate_action(
                 rule_ids=["AED-RULE-019"],
                 required_evidence=["merge_state_status=CLEAN"],
             )
-        # AED-RULE-019: GitHub's mergeable field must indicate MERGEABLE.
-        # The mergeable field is GitHub's per-PR mergeability value; it
-        # can be one of "MERGEABLE" / "CONFLICTING" / "UNKNOWN" or None.
-        # Only "MERGEABLE" (case-insensitive) is acceptable for merge.
+        # AED-RULE-019: GitHub's mergeable field must explicitly
+        # indicate MERGEABLE. The mergeable field is GitHub's per-PR
+        # mergeability value; it can be one of "MERGEABLE" /
+        # "CONFLICTING" / "UNKNOWN" or None. Only the literal string
+        # "MERGEABLE" (case-insensitive) is acceptable for merge.
+        # A Python True is NOT accepted as a substitute for
+        # explicit GitHub evidence.
         if not _is_mergeable(state.mergeable):
             return _deny(
                 AEDDecisionCode.REQUIRE_CLEAN_MERGE_STATE,
                 f"Merge denied: GitHub mergeable status is {state.mergeable!r}, expected 'MERGEABLE'.",
                 rule_ids=["AED-RULE-019"],
-                required_evidence=["mergeable in {'MERGEABLE', True}"],
+                required_evidence=["mergeable == 'MERGEABLE'"],
             )
         # AED-RULE-008: no unresolved review threads.
         if state.unresolved_thread_count > 0:
@@ -227,13 +309,26 @@ def evaluate_action(
                 rule_ids=["AED-RULE-008"],
                 required_evidence=["unresolved_thread_count=0"],
             )
-        # AED-RULE-011: current-head Codex clean-pass evidence required.
+        # AED-RULE-011: current-head Codex clean-pass evidence
+        # required, and the clean pass must be tied to the current
+        # expected head (so a stale clean pass from a prior head
+        # cannot satisfy AED-RULE-011).
         if not state.codex_clean_pass_detected:
             return _deny(
                 AEDDecisionCode.HOLD,
                 "Merge denied: no current-head Codex clean-pass evidence; the policy engine does not authorize a merge until the classifier reports a clean pass tied to the current head.",
                 rule_ids=["AED-RULE-011"],
                 required_evidence=["codex_clean_pass_detected=true"],
+            )
+        if (
+            state.codex_clean_pass_head_sha is None
+            or state.codex_clean_pass_head_sha != state.expected_head_sha
+        ):
+            return _deny(
+                AEDDecisionCode.HOLD,
+                f"Merge denied: Codex clean-pass evidence is not tied to the current expected head (clean-pass head = {state.codex_clean_pass_head_sha!r}, expected head = {state.expected_head_sha!r}); a stale clean pass from a prior head does not satisfy AED-RULE-011.",
+                rule_ids=["AED-RULE-005", "AED-RULE-011"],
+                required_evidence=["codex_clean_pass_head_sha == expected_head_sha"],
             )
         # AED-RULE-012: no newer non-clean finding after the clean pass.
         if state.codex_newer_finding_after_clean_pass:
@@ -255,8 +350,11 @@ def evaluate_action(
             ]
         )
 
-    # AED-RULE-008: thread resolution requires an exact authorized thread list
-    # AND (AED-RULE-005) a live-head check.
+    # AED-RULE-008: thread resolution requires (a) a live-head check,
+    # (b) an explicit non-empty target thread set carried by the
+    # action, and (c) every target thread ID to be included in the
+    # authorized thread list. AED-RULE-005 applies to thread
+    # resolution as well as merge.
     if action == AEDActionType.GITHUB_THREAD_RESOLVE:
         # AED-RULE-005: live head must match expected head before resolving threads.
         if not _head_matches(state):
@@ -266,6 +364,21 @@ def evaluate_action(
                 rule_ids=["AED-RULE-005"],
                 required_evidence=["current_head_sha==expected_head_sha"],
             )
+        # AED-RULE-008: target thread IDs must be supplied by the
+        # action. A non-empty ``authorized_thread_ids`` is not by
+        # itself authorization to resolve a thread: the action must
+        # name the threads it intends to resolve so the policy
+        # engine can verify the target set is a subset of the
+        # authorization.
+        target_set = tuple(target_thread_ids or ())
+        if not target_set:
+            return _deny(
+                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+                "Thread resolution denied: no target thread ID supplied with the action. Supply ``target_thread_ids`` to the policy engine so the action can be checked against the authorized set.",
+                rule_ids=["AED-RULE-008"],
+                required_evidence=["target_thread_ids (non-empty list)"],
+            )
+        # AED-RULE-008: an authorized thread list is required.
         if not state.authorized_thread_ids:
             return _deny(
                 AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
@@ -273,10 +386,32 @@ def evaluate_action(
                 rule_ids=["AED-RULE-008"],
                 required_evidence=["authorized_thread_ids (non-empty list)"],
             )
+        # AED-RULE-008: every target thread ID must be in the
+        # authorized set. Resolving PRRT_other with authorization
+        # for PRRT_target must be denied.
+        authorized_set = set(state.authorized_thread_ids)
+        unauthorized_targets = [t for t in target_set if t not in authorized_set]
+        if unauthorized_targets:
+            return _deny(
+                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+                f"Thread resolution denied: target thread ID(s) {sorted(unauthorized_targets)!r} are not in the authorized set {sorted(authorized_set)!r}; the action may only resolve threads explicitly named in the authorization.",
+                rule_ids=["AED-RULE-008"],
+                required_evidence=[
+                    f"target_thread_ids is a subset of {sorted(state.authorized_thread_ids)!r}"
+                ],
+            )
         return _allow(rule_ids=["AED-RULE-005", "AED-RULE-008"])
 
     # AED-RULE-021: PR reopen is a state mutation; protected PRs are read-only.
+    # Fail closed when ``protected_pr_numbers`` is empty: an empty
+    # set is treated as missing protected-PR evidence.
     if action == AEDActionType.GITHUB_REOPEN:
+        if not state.protected_pr_numbers:
+            return _deny(
+                AEDDecisionCode.DENY,
+                "Reopen denied: no protected-PR evidence available (AED-RULE-021); ``protected_pr_numbers`` is empty, so the engine cannot evaluate whether the current PR is protected. Supply a non-empty ``protected_pr_numbers`` set.",
+                rule_ids=["AED-RULE-021"],
+            )
         if state.pr_number in state.protected_pr_numbers:
             return _deny(
                 AEDDecisionCode.DENY,
