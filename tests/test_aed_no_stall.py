@@ -2912,5 +2912,101 @@ class TerminalStateFinalOutputAssertionTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Section 29: Fix 3415785873 — parked terminal states with non-empty
+#             next_action still require operator intervention
+# ---------------------------------------------------------------------------
+
+
+class ParkedTerminalRequiresOperatorTests(unittest.TestCase):
+    """Codex 3415785873: ``checkpoint_requires_operator``
+    must return True for a recognized but NON-COMPLETED
+    terminal/parked state, even when ``next_action`` is
+    non-empty. A checkpoint like
+    ``terminal_state="HOLD_OPERATOR_REQUIRED"`` with
+    ``next_action="poll CI"`` must require operator
+    intervention — the runner stops on the terminal
+    state, but the operator must acknowledge the hold
+    or authorize the closeout.
+    """
+
+    def _ck(self, terminal_state, next_action=None):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=[],
+            next_phase="PHASE_6",
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=terminal_state,
+            updated_at=None,
+        )
+
+    def test_hold_operator_required_with_next_action_requires_operator(
+        self,
+    ) -> None:
+        # The exact case from Codex 3415785873: a parked
+        # terminal state with a non-empty next_action.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck("HOLD_OPERATOR_REQUIRED", "poll CI")
+            )
+        )
+
+    def test_merge_ready_with_next_action_requires_operator(self) -> None:
+        # Parked, awaiting-human. Not completed. Even with
+        # a non-empty next_action, the operator must
+        # acknowledge the await.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION", "poll CI"
+                )
+            )
+        )
+
+    def test_hold_pr_ci_pending_with_next_action_requires_operator(
+        self,
+    ) -> None:
+        # Hold schema state with a non-empty next_action.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck("HOLD_PR_CI_PENDING", "poll CI")
+            )
+        )
+
+    def test_hold_operator_required_with_no_next_action_requires_operator(
+        self,
+    ) -> None:
+        # Parked terminal state with no next_action: also
+        # requires operator. (Pre-existing behavior.)
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck("HOLD_OPERATOR_REQUIRED", None)
+            )
+        )
+
+    def test_completed_merged_with_next_action_does_not_require_operator(
+        self,
+    ) -> None:
+        # Completed state: even with a stale next_action
+        # left over from a previous phase, the runner
+        # stops on the terminal state and the operator
+        # is NOT required to intervene. The completed
+        # short-circuit fires BEFORE the parked check.
+        self.assertFalse(
+            checkpoint_requires_operator(
+                self._ck("MERGED", "poll CI")
+            )
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

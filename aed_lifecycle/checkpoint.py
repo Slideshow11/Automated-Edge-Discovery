@@ -450,6 +450,13 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
 
     - the checkpoint has a terminal_state the runner does not
       recognize
+    - the checkpoint is parked on a recognized-but-non-completed
+      terminal state (e.g. ``HOLD_OPERATOR_REQUIRED``,
+      ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``, any
+      ``HOLD_*`` schema state) — the runner stops on the
+      terminal state but the operator must acknowledge
+      the hold or authorize the closeout, even when
+      ``next_action`` is non-empty
     - the checkpoint is stale or incomplete (no phase, no
       next_action, no terminal_state)
     - the checkpoint has unresolved threads AND no
@@ -469,23 +476,21 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
       and must require the operator — the runner cannot
       auto-resume a phase that has no executable next step.
 
-    Fix A (Codex 3415657744): a checkpoint that is parked
-    on a RECOGNIZED COMPLETED terminal state
-    (e.g. ``"MERGED"``, ``"FAILED"``,
+    Fix A (Codex 3415657744 + 3415785873): a checkpoint
+    that is parked on a RECOGNIZED COMPLETED terminal
+    state (``"MERGED"``, ``"FAILED"``,
     ``"PR_MERGED_AND_CLOSED_OUT"``) does NOT require
-    operator intervention. The runner stops on the terminal
-    state and the operator has already authorized the
-    close. The check is short-circuited BEFORE the
-    next-action validity check, so a checkpoint with
-    ``terminal_state="MERGED"`` and
-    ``next_action=None`` correctly returns ``False``.
-
-    Parked/hold terminal states (e.g.
-    ``"MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"``,
-    ``"HOLD_OPERATOR_REQUIRED"``, all ``HOLD_*`` schema
-    states) are NOT completed and keep their operator
-    semantics — the runner must surface them to the
-    operator, even when ``next_action`` is None.
+    operator intervention. The runner stops on the
+    terminal state and the operator has already
+    authorized the close. The check is short-circuited
+    BEFORE the parked-terminal check. A checkpoint that
+    is parked on a recognized but NON-COMPLETED terminal
+    state (``"HOLD_OPERATOR_REQUIRED"``,
+    ``"MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"``, any
+    ``HOLD_*`` schema state) DOES require operator
+    intervention, even when ``next_action`` is non-empty,
+    because the operator must acknowledge the hold or
+    authorize the closeout.
     """
     # Unknown terminal state is a hold.
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
@@ -494,17 +499,31 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
         return True
 
     # Fix A (Codex 3415657744): completed terminal
-    # states short-circuit before the next-action
-    # validity check. A checkpoint with a recognized
-    # completed terminal_state is fully done — the
-    # runner stops and the operator is NOT required to
-    # intervene. ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
-    # and ``HOLD_*`` states are NOT completed, so they
-    # fall through to the next-action check and surface
-    # as ``HOLD_OPERATOR_REQUIRED`` (the parked/awaiting
-    # semantics).
+    # states short-circuit to False. The runner stops on
+    # the terminal state and the operator is NOT
+    # required to intervene. Completed states:
+    # ``MERGED``, ``FAILED``, ``PR_MERGED_AND_CLOSED_OUT``.
     if is_completed_terminal_state(state.terminal_state):
         return False
+
+    # Fix A (Codex 3415785873): recognized but
+    # non-completed (parked/hold) terminal states
+    # ALWAYS require operator intervention, even when
+    # ``next_action`` is non-empty. The runner stops on
+    # the terminal state via ``next_action_from_checkpoint``,
+    # but the operator must acknowledge the hold or
+    # authorize the closeout. Parked states:
+    # ``HOLD_OPERATOR_REQUIRED``,
+    # ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``, all
+    # ``HOLD_*`` schema states. This branch fires
+    # AFTER the completed short-circuit and BEFORE
+    # the next-action validity check, so a parked
+    # terminal state with a non-empty next_action
+    # correctly returns True.
+    if state.terminal_state is not None and is_terminal_lifecycle_state(
+        state.terminal_state
+    ):
+        return True
 
     # next_action is required to be present AND valid. The
     # canonical :func:`is_valid_next_action` helper returns
