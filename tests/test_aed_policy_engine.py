@@ -2251,5 +2251,263 @@ class TestMutatingActionsRejectsRoot(unittest.TestCase):
         self.assertIn("AED-RULE-003", d.matched_rule_ids)
 
 
+# ---------------------------------------------------------------------------
+# JcYvO: validate thread IDs before set/sort/comparison
+# ---------------------------------------------------------------------------
+
+
+class TestIsValidThreadIdHelper(unittest.TestCase):
+    """Regression tests for the new ``_is_valid_thread_id`` helper."""
+
+    def test_is_valid_thread_id_true_on_string(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertTrue(_is_valid_thread_id("PRRT_a"))
+        self.assertTrue(_is_valid_thread_id("x"))
+
+    def test_is_valid_thread_id_false_on_none(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertFalse(_is_valid_thread_id(None))
+
+    def test_is_valid_thread_id_false_on_int(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertFalse(_is_valid_thread_id(123))
+
+    def test_is_valid_thread_id_false_on_list(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertFalse(_is_valid_thread_id([]))
+        self.assertFalse(_is_valid_thread_id(["PRRT_a"]))
+
+    def test_is_valid_thread_id_false_on_dict(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertFalse(_is_valid_thread_id({}))
+        self.assertFalse(_is_valid_thread_id({"id": "PRRT_a"}))
+
+    def test_is_valid_thread_id_false_on_empty_string(self):
+        from aed_policy.policy import _is_valid_thread_id
+        self.assertFalse(_is_valid_thread_id(""))
+
+    def test_is_valid_thread_id_false_on_bool(self):
+        from aed_policy.policy import _is_valid_thread_id
+        # bool is a subclass of int; it is not a valid thread ID.
+        self.assertFalse(_is_valid_thread_id(True))
+        self.assertFalse(_is_valid_thread_id(False))
+
+
+class TestValidateThreadIdsHelper(unittest.TestCase):
+    """Regression tests for ``_validate_thread_ids``."""
+
+    def test_validate_thread_ids_returns_none_for_valid(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(["PRRT_a", "PRRT_b"], "target")
+        self.assertIsNone(result)
+
+    def test_validate_thread_ids_denies_non_list(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids("PRRT_a", "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_empty_list(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids([], "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_none_entry(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(["PRRT_a", None], "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_int_entry(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids([42], "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_empty_string_entry(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids([""], "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+
+class TestThreadResolveMalformedTargetIds(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JcYvO (malformed target IDs)."""
+
+    def _assert_denied_no_TypeError(self, d):
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_target_None_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[None],
+        )
+        self._assert_denied_no_TypeError(d)
+
+    def test_target_int_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[123],
+        )
+        self._assert_denied_no_TypeError(d)
+
+    def test_target_list_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[["PRRT_a"]],
+        )
+        self._assert_denied_no_TypeError(d)
+
+    def test_target_dict_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[{"id": "PRRT_a"}],
+        )
+        self._assert_denied_no_TypeError(d)
+
+    def test_target_empty_string_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[""],
+        )
+        self._assert_denied_no_TypeError(d)
+
+    def test_mixed_target_None_and_string(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_target"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=[None, "PRRT_other"],
+        )
+        # No TypeError; denial cites AED-RULE-008.
+        self._assert_denied_no_TypeError(d)
+
+
+class TestThreadResolveMalformedAuthorizedIds(unittest.TestCase):
+    """Regression tests for malformed authorized_thread_ids."""
+
+    def _assert_denied(self, d):
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_authorized_None_denied(self):
+        s = _clean_state(authorized_thread_ids=[None])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_authorized_int_denied(self):
+        s = _clean_state(authorized_thread_ids=[1, 2, 3])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_authorized_list_denied(self):
+        s = _clean_state(authorized_thread_ids=[["PRRT_a"]])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_authorized_dict_denied(self):
+        s = _clean_state(authorized_thread_ids=[{"id": "PRRT_a"}])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_authorized_empty_string_denied(self):
+        s = _clean_state(authorized_thread_ids=[""])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_mixed_authorized_None_and_string(self):
+        s = _clean_state(authorized_thread_ids=[None, "PRRT_target"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_other"],
+        )
+        # No TypeError; denial cites AED-RULE-008.
+        self._assert_denied(d)
+
+
+class TestThreadResolveValidIdsStillWork(unittest.TestCase):
+    """Valid IDs continue to be accepted after the malformed-ID hardening."""
+
+    def test_valid_strict_subset_allowed(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a", "PRRT_b"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertTrue(d.allowed)
+
+    def test_valid_equal_set_allowed(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a", "PRRT_b"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a", "PRRT_b"],
+        )
+        self.assertTrue(d.allowed)
+
+    def test_valid_unauthorized_string_still_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_other"],
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_valid_target_with_authorized_containing_unauthorized_string(self):
+        # When the target list is valid but the authorized list
+        # also contains an unauthorized string, target validation
+        # passes and authorized validation passes (no type
+        # issues), so the resolution decision reduces to subset
+        # checking: PRRT_target is a subset of {PRRT_target}.
+        s = _clean_state(authorized_thread_ids=["PRRT_target", "PRRT_other"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_target"],
+        )
+        self.assertTrue(d.allowed)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -204,6 +204,61 @@ def _normalize_phrase(s: Optional[str]) -> str:
     return " ".join(s.split())
 
 
+def _is_valid_thread_id(value: object) -> bool:
+    """True iff ``value`` is a non-empty string usable as a thread ID.
+
+    The strict variant requires a ``str`` instance of length
+    >= 1. ``None``, ``int``, ``bool``, ``list``, ``dict``,
+    ``tuple``, and any other non-string types are rejected.
+    Empty strings are also rejected because a thread reference
+    with no characters is not a valid thread identity.
+    """
+    if not isinstance(value, str):
+        return False
+    if not value:
+        return False
+    return True
+
+
+def _validate_thread_ids(
+    values: object, label: str
+) -> Optional[AEDDecision]:
+    """Validate that ``values`` is a non-empty list of non-empty string thread IDs.
+
+    Returns ``None`` when all values are valid. Returns an
+    :class:`AEDDecision` denial citing ``AED-RULE-008`` when
+    the values are not a sequence, are empty, or contain any
+    entry that is not a non-empty string. The function never
+    raises: malformed IDs fail closed with a policy denial
+    rather than a Python exception, so the policy engine
+    cannot leak a ``TypeError`` from
+    ``sorted(...)`` / ``set(...)`` / ``in`` checks downstream.
+    """
+    if not isinstance(values, (list, tuple)):
+        return _deny(
+            AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+            f"Thread resolution denied: {label} must be a list of thread ID strings; got {type(values).__name__}.",
+            rule_ids=["AED-RULE-008"],
+            required_evidence=[f"{label} (non-empty list of non-empty strings)"],
+        )
+    if len(values) == 0:
+        return _deny(
+            AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+            f"Thread resolution denied: {label} is empty; supply a non-empty list of thread ID strings.",
+            rule_ids=["AED-RULE-008"],
+            required_evidence=[f"{label} (non-empty list of non-empty strings)"],
+        )
+    for i, v in enumerate(values):
+        if not _is_valid_thread_id(v):
+            return _deny(
+                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
+                f"Thread resolution denied: {label}[{i}]={v!r} is not a non-empty string thread ID; the action must supply a list of non-empty string thread IDs.",
+                rule_ids=["AED-RULE-008"],
+                required_evidence=[f"{label} (all entries are non-empty strings)"],
+            )
+    return None
+
+
 def expected_merge_authorization_phrase(state: AEDRunState) -> str:
     """Build the canonical merge authorization phrase.
 
@@ -273,7 +328,7 @@ def evaluate_action(
     action: AEDActionType,
     state: AEDRunState,
     *,
-    target_thread_ids: Sequence[str] = (),
+    target_thread_ids: Sequence[object] = (),
 ) -> AEDDecision:
     """Evaluate a proposed action against the current run state.
 
@@ -481,11 +536,15 @@ def evaluate_action(
     # AED-RULE-008: thread resolution requires (a) a live-head check
     # using the full 40-character SHA, (b) an explicit non-empty
     # target thread set carried by the action, (c) every target
-    # thread ID to be non-empty, and (d) the target set to be a
-    # subset of the authorized thread list. AED-RULE-005 applies
-    # to thread resolution as well as merge. The action must name
-    # the threads it intends to resolve so the policy engine can
-    # verify the target set is a subset of the authorization.
+    # thread ID to be a non-empty string, (d) every authorized
+    # thread ID to be a non-empty string, and (e) the target set
+    # to be a subset of the authorized thread list. AED-RULE-005
+    # applies to thread resolution as well as merge. The action
+    # must name the threads it intends to resolve so the policy
+    # engine can verify the target set is a subset of the
+    # authorization. All malformed IDs fail closed with a
+    # policy denial citing AED-RULE-008 — the policy engine
+    # never raises TypeError from set/sorted membership checks.
     if action == AEDActionType.GITHUB_THREAD_RESOLVE:
         # AED-RULE-005: live head must match expected head before resolving threads.
         if not _head_matches(state):
@@ -496,42 +555,33 @@ def evaluate_action(
                 required_evidence=["current_head_sha==expected_head_sha (full 40-character hex)"],
             )
         # AED-RULE-008: target thread IDs must be supplied by the
-        # action. A non-empty ``authorized_thread_ids`` is not by
-        # itself authorization to resolve a thread: the action must
-        # name the threads it intends to resolve so the policy
-        # engine can verify the target set is a subset of the
-        # authorization. Duplicate target IDs are normalized to a
-        # set for comparison; empty-string targets are rejected
-        # outright.
-        raw_targets = list(target_thread_ids or ())
-        if not raw_targets:
-            return _deny(
-                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
-                "Thread resolution denied: no target thread ID supplied with the action. Supply ``target_thread_ids`` to the policy engine so the action can be checked against the authorized set.",
-                rule_ids=["AED-RULE-008"],
-                required_evidence=["target_thread_ids (non-empty list)"],
-            )
-        target_set = set(raw_targets)
-        if "" in target_set:
-            return _deny(
-                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
-                "Thread resolution denied: an empty target thread ID is not a valid thread reference; the action must name real, non-empty thread IDs.",
-                rule_ids=["AED-RULE-008"],
-                required_evidence=["target_thread_ids (all non-empty strings)"],
-            )
-        # AED-RULE-008: an authorized thread list is required.
-        if not state.authorized_thread_ids:
-            return _deny(
-                AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
-                "Thread resolution denied: no authorized thread list provided; supply the exact list of thread IDs the operator has approved for resolution.",
-                rule_ids=["AED-RULE-008"],
-                required_evidence=["authorized_thread_ids (non-empty list)"],
-            )
-        # AED-RULE-008: every target thread ID must be in the
-        # authorized set. Resolving PRRT_other with authorization
-        # for PRRT_target must be denied.
+        # action, every entry must be a non-empty string, and
+        # the list must be non-empty. A non-empty
+        # ``authorized_thread_ids`` is not by itself authorization
+        # to resolve a thread: the action must name the threads
+        # it intends to resolve so the policy engine can verify
+        # the target set is a subset of the authorization. All
+        # validation runs through ``_validate_thread_ids`` so a
+        # malformed payload (None / int / list / dict / empty
+        # string) fails closed with a denial rather than
+        # raising a TypeError.
+        target_validation = _validate_thread_ids(
+            target_thread_ids, "target_thread_ids"
+        )
+        if target_validation is not None:
+            return target_validation
+        target_set = set(target_thread_ids)
+        authorized_validation = _validate_thread_ids(
+            state.authorized_thread_ids, "authorized_thread_ids"
+        )
+        if authorized_validation is not None:
+            return authorized_validation
+        # All IDs are validated non-empty strings at this point;
+        # building sets, sorting, and ``in`` checks are safe.
         authorized_set = set(state.authorized_thread_ids)
-        unauthorized_targets = sorted(t for t in target_set if t not in authorized_set)
+        unauthorized_targets = sorted(
+            t for t in target_set if t not in authorized_set
+        )
         if unauthorized_targets:
             return _deny(
                 AEDDecisionCode.REQUIRE_THREAD_LIST_AUTHORIZATION,
