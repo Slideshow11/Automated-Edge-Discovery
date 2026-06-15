@@ -14,6 +14,7 @@ watchdog deterministic and unit-testable.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Optional
 
@@ -102,13 +103,36 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
     is exhausted — that is a known, bounded hold, not an
     unexpected stall. The runner's last known ``next_action``
     is the strongest signal of what is being held.
+
+    The CI and Codex detectors use word-boundary / token
+    patterns rather than substring matches so that words
+    containing the substring "ci" (e.g. "decide", "reconcile",
+    "policy", "lifecycle", "suspicious") or "codex" (e.g.
+    "codex_response_poll" is a true Codex match, but
+    "codexia" would not be) are not misclassified.
     """
     action = (state.next_action or "").lower()
-    if "ci" in action or "ci status" in action or "ci_poll" in action:
+    if _CI_TOKEN_PATTERN.search(action):
         return HOLD_PR_CI_PENDING
-    if "codex" in action or "codex_response" in action:
+    if _CODEX_TOKEN_PATTERN.search(action):
         return HOLD_CODEX_RESPONSE_PENDING
     return HOLD_OPERATOR_REQUIRED
+
+
+# Word-boundary patterns for CI and Codex detection. Built
+# once at module load; the patterns use the ``\b`` anchor so
+# that the substring "ci" inside "decide" / "reconcile" /
+# "policy" / "lifecycle" / "suspicious" does not match.
+_CI_TOKEN_PATTERN=re.compile(
+    r"\bci(?:_status|_poll)?\b"
+    r"|\bgithub actions\b"
+    r"|\bchecks?\b"
+    r"|\btest (?:3\.|run)\b"
+    r"|\bworkflow run\b"
+)
+_CODEX_TOKEN_PATTERN=re.compile(
+    r"\bcodex(?:_response)?\b"
+)
 
 
 def evaluate_watchdog(state: WatchdogState, now: float) -> str:

@@ -204,9 +204,19 @@ class ClassifyHumphryMessageTests(unittest.TestCase):
             STALL_NO_CHECKPOINT,
         )
 
-    def test_terminal_with_checkpoint_buried_is_still_terminal(self) -> None:
-        # A message that contains a terminal token anywhere is terminal.
+    def test_terminal_with_checkpoint_buried_is_not_terminal(self) -> None:
+        # A descriptive mention of a terminal state is NOT an
+        # explicit assertion. The runner must keep going
+        # (or surface a stall) rather than stop on a buried
+        # token.
         text = "I see HOLD_PR_CI_PENDING showing in the harness output."
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_TERMINAL)
+
+    def test_explicit_terminal_assertion_via_prefix_is_terminal(self) -> None:
+        # The new explicit-assertion rule accepts a
+        # "Final lifecycle state: <STATE>" line as terminal.
+        text = "Final lifecycle state: HOLD_PR_CI_PENDING"
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_TERMINAL,
@@ -737,14 +747,32 @@ class ClassifyPhaseHeaderProgressTests(unittest.TestCase):
         )
 
     def test_phase_header_with_terminal_token_still_terminal(self) -> None:
+        # The terminal token is on its own line, prefixed
+        # with the explicit-assertion prefix. The phase
+        # header is on a different line and is therefore
+        # ignored by the terminal-assertion check.
         text = (
-            "Now PHASE 5 — bounded polling reached limit, "
-            "HOLD_PR_CI_PENDING"
+            "Now PHASE 5 — bounded polling reached limit\n"
+            "Final lifecycle state: HOLD_PR_CI_PENDING"
         )
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_TERMINAL,
         )
+
+    def test_phase_header_with_buried_terminal_token_is_not_terminal(
+        self,
+    ) -> None:
+        # A phase header that merely MENTIONS a terminal
+        # token (no explicit assertion) is not an explicit
+        # terminal-state assertion. The runner should not
+        # stop on a buried mention.
+        text = (
+            "Now PHASE 5 — bounded polling reached limit, "
+            "HOLD_PR_CI_PENDING"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_TERMINAL)
 
 
 # ---------------------------------------------------------------------------
@@ -906,25 +934,26 @@ class ClassifyWholeTokenTerminalTests(unittest.TestCase):
         verdict = classify_humphry_message_for_stall(text)
         self.assertNotEqual(verdict, OK_TERMINAL)
 
-    def test_whole_terminal_state_token_matches(self) -> None:
-        # The terminal state appears as a whole token.
-        text = "State is MERGE_READY_AWAITING_HUMAN_AUTHORIZATION."
+    def test_explicit_terminal_assertion_matches(self) -> None:
+        # The terminal state appears via an explicit prefix
+        # on its own line.
+        text = "Final lifecycle state: MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_TERMINAL,
         )
 
-    def test_whole_terminal_state_token_at_string_end(self) -> None:
-        # Trailing word-boundary.
-        text = "now in HOLD_PR_CI_PENDING"
+    def test_terminal_state_at_string_end_via_em_dash(self) -> None:
+        # Trailing em-dash separator: state at start of line.
+        text = "HOLD_PR_CI_PENDING — bounded polling reached limit"
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_TERMINAL,
         )
 
-    def test_whole_terminal_state_token_at_string_start(self) -> None:
-        # Leading word-boundary.
-        text = "MERGED."
+    def test_terminal_state_alone_matches(self) -> None:
+        # The state on its own line.
+        text = "MERGED"
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_TERMINAL,
@@ -1181,6 +1210,452 @@ class ClassifyNextActionEmptyValueTests(unittest.TestCase):
     def test_next_step_with_real_value_is_progress(self) -> None:
         text = "next step: poll CI status"
         self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 14: Explicit terminal-state assertions (Codex 3413417446)
+# ---------------------------------------------------------------------------
+
+
+class ClassifyExplicitTerminalAssertionTests(unittest.TestCase):
+    """The terminal-state classifier must require an explicit
+    assertion. A negated, future, or descriptive mention of
+    a terminal state must NOT be classified as OK_TERMINAL.
+    """
+
+    # --- Should NOT be terminal ---
+
+    def test_negated_terminal_mention_is_not_terminal(self) -> None:
+        text = "Not MERGED yet"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_future_looking_terminal_mention_is_not_terminal(self) -> None:
+        text = "will be MERGED after review"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_negated_hold_mention_is_not_terminal(self) -> None:
+        text = "not HOLD_PR_CI_PENDING"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_uncertain_mention_is_not_terminal(self) -> None:
+        text = "next state might be MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_no_terminal_mention_is_not_terminal(self) -> None:
+        text = "No MERGED state yet"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_negated_with_next_action_is_not_terminal(self) -> None:
+        # The exact example from the Codex finding.
+        text = (
+            "Not MERGED yet; next_action: poll CI status, "
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    # --- Should BE terminal ---
+
+    def test_explicit_final_lifecycle_state_is_terminal(self) -> None:
+        text = "Final lifecycle state: MERGED"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_explicit_terminal_state_prefix_is_terminal(self) -> None:
+        text = "Terminal state: HOLD_NEW_CODEX_THREAD"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_bare_terminal_state_is_terminal(self) -> None:
+        text = "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_explicit_assertion_with_em_dash_explanation_is_terminal(self) -> None:
+        text = "Final lifecycle state: HOLD_PR_CI_PENDING — bounded polling reached limit"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_phase_header_plus_explicit_assertion_is_terminal(self) -> None:
+        # Phase header + explicit assertion: the assertion wins.
+        text = (
+            "Now PHASE 5 — bounded polling reached limit\n"
+            "Final lifecycle state: HOLD_PR_CI_PENDING"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_phase_header_plus_next_action_plus_checkpoint_is_still_progress(
+        self,
+    ) -> None:
+        # A phase-header message with both next_action and
+        # checkpoint evidence (no terminal mention) is
+        # OK_PROGRESS_WITH_NEXT_ACTION. The terminal-assertion
+        # rule must not change this case.
+        text = (
+            "Starting PHASE 2 — next_action: poll CI status, "
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 15: CI token-match watchdog (Codex 3413417456)
+# ---------------------------------------------------------------------------
+
+
+class WatchdogCITokenMatchTests(unittest.TestCase):
+    """The watchdog phase-time-exhaustion hold recommender
+    must use a word-boundary / token pattern for CI detection,
+    not a substring. Words like "decide" or "reconcile" must
+    not be reported as CI pending.
+    """
+
+    def _state(self, next_action: str) -> WatchdogState:
+        # Phase time exhausted: started_at=0, now=10_000,
+        # max_phase=1800. Both fields set, but terminal is None.
+        return WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+
+    def test_poll_ci_status_is_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(self._state("poll CI status"), now=10000.0)
+        self.assertEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_github_actions_is_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(self._state("check github actions"), now=10000.0)
+        self.assertEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_ci_poll_token_is_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(self._state("ci_poll step"), now=10000.0)
+        self.assertEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_decide_whether_to_merge_is_not_ci_pending(self) -> None:
+        # "decide" contains the substring "ci" but is not a CI
+        # action. Must NOT trigger HOLD_PR_CI_PENDING.
+        verdict = evaluate_watchdog(
+            self._state("decide whether to merge"), now=10000.0
+        )
+        self.assertNotEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_reconcile_threads_is_not_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(
+            self._state("reconcile threads"), now=10000.0
+        )
+        self.assertNotEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_policy_review_is_not_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(self._state("policy review"), now=10000.0)
+        self.assertNotEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_lifecycle_audit_is_not_ci_pending(self) -> None:
+        # "lifecycle" alone is in the spec's "should not" list.
+        # "lifecycle audit" has no CI token and no "ci" word.
+        verdict = evaluate_watchdog(
+            self._state("lifecycle audit"), now=10000.0
+        )
+        self.assertNotEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_suspicious_change_is_not_ci_pending(self) -> None:
+        verdict = evaluate_watchdog(
+            self._state("suspicious change review"), now=10000.0
+        )
+        self.assertNotEqual(verdict, "HOLD_PR_CI_PENDING")
+
+    def test_codex_response_is_codex_pending(self) -> None:
+        verdict = evaluate_watchdog(
+            self._state("poll codex response"), now=10000.0
+        )
+        self.assertEqual(verdict, "HOLD_CODEX_RESPONSE_PENDING")
+
+    def test_generic_unknown_action_is_operator_required(self) -> None:
+        # "wait for feedback" has no CI token and no "ci" word.
+        # The spec says a generic non-CI non-Codex action maps
+        # to HOLD_OPERATOR_REQUIRED.
+        verdict = evaluate_watchdog(
+            self._state("wait for feedback"), now=10000.0
+        )
+        self.assertEqual(verdict, "HOLD_OPERATOR_REQUIRED")
+
+
+# ---------------------------------------------------------------------------
+# Section 16: next_action validation in checkpoint (Codex 3413417465)
+# ---------------------------------------------------------------------------
+
+
+class ValidateNextActionTests(unittest.TestCase):
+    """validate_checkpoint must reject non-string, empty,
+    whitespace-only, and placeholder ``next_action`` values.
+    next_action_from_checkpoint must never return a non-string.
+    """
+
+    def _base_checkpoint(self, next_action):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+
+    def test_none_next_action_allowed(self) -> None:
+        # next_action=None is documented as optional.
+        errors = validate_checkpoint(self._base_checkpoint(None))
+        self.assertEqual(errors, [])
+
+    def test_valid_string_next_action_allowed(self) -> None:
+        errors = validate_checkpoint(
+            self._base_checkpoint("poll CI status")
+        )
+        self.assertEqual(errors, [])
+
+    def test_empty_string_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint(""))
+        self.assertTrue(
+            any("next_action" in e and "empty" in e for e in errors),
+            f"empty next_action must fail, got {errors}",
+        )
+
+    def test_whitespace_only_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint("   "))
+        self.assertTrue(
+            any("next_action" in e for e in errors),
+            f"whitespace-only next_action must fail, got {errors}",
+        )
+
+    def test_list_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint(["poll"]))
+        self.assertTrue(
+            any("next_action" in e and "list" in e for e in errors),
+            f"list next_action must fail, got {errors}",
+        )
+
+    def test_dict_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint({"a": 1}))
+        self.assertTrue(
+            any("next_action" in e and "dict" in e for e in errors),
+            f"dict next_action must fail, got {errors}",
+        )
+
+    def test_int_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint(42))
+        self.assertTrue(
+            any("next_action" in e and "int" in e for e in errors),
+            f"int next_action must fail, got {errors}",
+        )
+
+    def test_bool_next_action_rejected(self) -> None:
+        errors = validate_checkpoint(self._base_checkpoint(True))
+        self.assertTrue(
+            any("next_action" in e and "bool" in e for e in errors),
+            f"bool next_action must fail, got {errors}",
+        )
+
+    def test_placeholder_next_action_rejected(self) -> None:
+        for placeholder in ("none", "null", "n/a", "todo", "tbd", "tba"):
+            with self.subTest(placeholder=placeholder):
+                errors = validate_checkpoint(
+                    self._base_checkpoint(placeholder)
+                )
+                self.assertTrue(
+                    any(
+                        "next_action" in e and "placeholder" in e
+                        for e in errors
+                    ),
+                    f"placeholder {placeholder!r} must fail, got {errors}",
+                )
+
+    def test_next_action_from_checkpoint_never_returns_non_string(self) -> None:
+        # Bypass validation: set next_action to a list.
+        ck = self._base_checkpoint(["not a string"])
+        action = next_action_from_checkpoint(ck)
+        # The helper must surface a hold, not the bad value.
+        self.assertTrue(
+            isinstance(action, str),
+            f"next_action_from_checkpoint must return a string, got {type(action).__name__}: {action!r}",
+        )
+        self.assertEqual(action, "HOLD_OPERATOR_REQUIRED")
+
+    def test_next_action_from_checkpoint_rejects_placeholder(self) -> None:
+        ck = self._base_checkpoint("none")
+        action = next_action_from_checkpoint(ck)
+        self.assertEqual(action, "HOLD_OPERATOR_REQUIRED")
+
+
+# ---------------------------------------------------------------------------
+# Section 17: Regression coverage for the 4 reanchored findings (Fix D)
+# ---------------------------------------------------------------------------
+
+
+class ReanchoredFindingsRegressionTests(unittest.TestCase):
+    """The 4 findings that Codex re-anchored to the current head
+    (3412614313, 3412650321, 3413237709, 3413328918) were
+    addressed in earlier rounds. These tests pin that the
+    implementation still satisfies them after the new fix
+    changes.
+    """
+
+    # --- 3412614313: canonical lifecycle registry vocabulary ---
+
+    def test_canonical_registry_coverage_holds(self) -> None:
+        # Read the schema and verify every canonical HOLD
+        # and terminal state is recognized.
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "schemas"
+            / "aed_lifecycle_states_v1.json"
+        )
+        with path.open("r", encoding="utf-8") as f:
+            registry = json.load(f)
+        for state_name, entry in registry["states"].items():
+            if entry.get("category") in ("hold", "terminal"):
+                with self.subTest(state=state_name):
+                    self.assertTrue(
+                        is_terminal_lifecycle_state(state_name),
+                        f"canonical state {state_name!r} must be recognized",
+                    )
+
+    def test_specific_canonical_holds_required_by_pr_spec(self) -> None:
+        # Per the PR #405 spec.
+        for state in [
+            "HOLD_MAIN_HEAD_MISMATCH",
+            "HOLD_MERGE_STATE_BLOCKED",
+            "HOLD_POST_MERGE_CI_PENDING",
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
+        ]:
+            with self.subTest(state=state):
+                self.assertTrue(is_terminal_lifecycle_state(state))
+
+    # --- 3412650321: watchdog requires next_action for OK progress ---
+
+    def test_watchdog_checkpoint_without_next_action_is_stall(self) -> None:
+        st = WatchdogState(
+            phase_name="PHASE_1",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=300.0,
+            max_phase_seconds=1800.0,
+            next_action=None,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+        self.assertEqual(evaluate_watchdog(st, now=10.0), "STALL_RISK")
+
+    def test_watchdog_next_action_without_checkpoint_is_stall(self) -> None:
+        st = WatchdogState(
+            phase_name="PHASE_1",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=300.0,
+            max_phase_seconds=1800.0,
+            next_action="poll Codex",
+            checkpoint_path=None,
+            terminal_state=None,
+        )
+        self.assertEqual(evaluate_watchdog(st, now=10.0), "STALL_RISK")
+
+    def test_watchdog_both_present_is_progress(self) -> None:
+        st = WatchdogState(
+            phase_name="PHASE_1",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=300.0,
+            max_phase_seconds=1800.0,
+            next_action="poll Codex",
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+        self.assertEqual(
+            evaluate_watchdog(st, now=10.0),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    # --- 3413237709: optional checkpoint fields may be None ---
+
+    def test_optional_fields_can_be_none(self) -> None:
+        # Build a checkpoint with optional fields None.
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=None,
+            next_phase=None,
+            next_action=None,
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state="MERGED",
+            updated_at=None,
+        )
+        errors = validate_checkpoint(ck)
+        self.assertEqual(errors, [])
+
+    # --- 3413328918: next_action marker requires value ---
+
+    def test_next_action_marker_with_no_value_is_stall(self) -> None:
+        # The classifier must reject a bare marker.
+        text = "checkpoint: /tmp/ckpt.json\nnext_action:"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_marker_with_placeholder_value_is_stall(self) -> None:
+        text = "next_action: none"
+        self.assertNotEqual(
             classify_humphry_message_for_stall(text),
             OK_PROGRESS_WITH_NEXT_ACTION,
         )

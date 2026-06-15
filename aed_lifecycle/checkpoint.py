@@ -58,7 +58,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-from .no_stall import is_terminal_lifecycle_state
+from .no_stall import (
+    _PLACEHOLDER_NEXT_ACTIONS,
+    is_terminal_lifecycle_state,
+)
 
 
 # Required fields. A checkpoint missing any of these is invalid.
@@ -206,6 +209,26 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
     elif state.pr_number <= 0:
         errors.append("checkpoint pr_number must be a positive int")
 
+    # next_action, if present, must be a non-empty, non-placeholder
+    # string. The runner consumes this value directly; a non-string
+    # would be an unsafe resume path.
+    if state.next_action is not None:
+        if not isinstance(state.next_action, str):
+            errors.append(
+                "checkpoint field 'next_action' must be a string, "
+                f"got {type(state.next_action).__name__}"
+            )
+        elif not state.next_action.strip():
+            errors.append(
+                "checkpoint field 'next_action' is empty or "
+                "whitespace-only"
+            )
+        elif state.next_action.strip().lower() in _PLACEHOLDER_NEXT_ACTIONS:
+            errors.append(
+                f"checkpoint field 'next_action' is a placeholder "
+                f"value: {state.next_action!r}"
+            )
+
     # terminal_state, if set, must be a recognized terminal state
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
         state.terminal_state
@@ -346,6 +369,13 @@ def next_action_from_checkpoint(state: CheckpointState) -> Optional[str]:
         return "HOLD_OPERATOR_REQUIRED"
 
     if state.next_action:
+        # Defensive: a non-string next_action must never be
+        # returned to the runner. If validation was skipped or
+        # bypassed, this is the last-line guard.
+        if not isinstance(state.next_action, str) or not state.next_action.strip():
+            return "HOLD_OPERATOR_REQUIRED"
+        if state.next_action.strip().lower() in _PLACEHOLDER_NEXT_ACTIONS:
+            return "HOLD_OPERATOR_REQUIRED"
         return state.next_action
 
     return "HOLD_OPERATOR_REQUIRED"

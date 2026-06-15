@@ -270,13 +270,15 @@ def _contains_any(text: str, needles: tuple) -> bool:
 
 
 # A whole-token (word-boundary) match pattern built from
-# TERMINAL_LIFECYCLE_STATES. The classifier uses this pattern
-# rather than a substring scan so that a final output containing
-# a longer non-terminal name (e.g. the canonical
-# CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED) is not classified as
-# OK_TERMINAL solely because it contains the shorter registered
-# CODEX_CLEAN_PASS substring. The pattern is built lazily and
-# cached on the module.
+# TERMINAL_LIFECYCLE_STATES. The classifier previously used
+# this as the primary detector, but a sentence that merely
+# *mentions* a terminal state in a negated or future-looking
+# context (e.g. "Not MERGED yet") was still classified as
+# OK_TERMINAL. The classifier now uses
+# ``_has_explicit_terminal_assertion`` instead, which
+# requires an explicit assertion pattern. The pattern is
+# kept for any caller that still needs a fast whole-token
+# scanner; it is not used by the classifier.
 _TERMINAL_TOKEN_PATTERN: "re.Pattern[str] | None" = None
 
 
@@ -284,15 +286,137 @@ def _terminal_token_pattern() -> "re.Pattern[str]":
     """Return the compiled whole-token regex for terminal states.
 
     Built lazily and cached on the module. The pattern is
-    anchored on word boundaries (``\\b``) so the longer
-    ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`` does not match
-    just because it contains ``CODEX_CLEAN_PASS``.
+    anchored on word boundaries (``\\b``).
     """
     global _TERMINAL_TOKEN_PATTERN
     if _TERMINAL_TOKEN_PATTERN is None:
         body = "|".join(re.escape(s) for s in TERMINAL_LIFECYCLE_STATES)
         _TERMINAL_TOKEN_PATTERN = re.compile(r"\b(?:" + body + r")\b")
     return _TERMINAL_TOKEN_PATTERN
+
+
+# Negation / future / uncertainty tokens that, when present
+# in the same line as a terminal state, disqualify the line
+# from being treated as an explicit terminal-state assertion.
+# The runner must not stop on a negated, future, or uncertain
+# mention of a terminal state.
+_DISQUALIFYING_TOKENS = (
+    "not ",
+    "no ",
+    "n't ",
+    "won't ",
+    "will not ",
+    "will be ",
+    "going to be ",
+    "after ",
+    "before ",
+    "might be ",
+    "may be ",
+    "could be ",
+    "would be ",
+    "should be ",
+    "maybe ",
+    "perhaps ",
+    "isn't ",
+    "aren't ",
+    "wasn't ",
+    "weren't ",
+    "doesn't ",
+    "don't ",
+    "didn't ",
+)
+
+
+# Explicit assertion prefixes the runner emits when reporting
+# a terminal state. A line that starts (after stripping
+# leading whitespace) with one of these prefixes and a
+# recognized terminal state is treated as an explicit
+# assertion.
+_ASSERTION_PREFIXES = (
+    "Final lifecycle state:",
+    "Final state:",
+    "Terminal state:",
+    "Lifecycle state:",
+    "State:",
+)
+
+
+# Placeholder next_action values that the validator rejects.
+# Mirrors ``_NEXT_ACTION_EMPTY_VALUES`` in
+# :mod:`aed_lifecycle.no_stall` for cross-module consistency.
+_PLACEHOLDER_NEXT_ACTIONS = frozenset(
+    {"none", "null", "n/a", "todo", "tbd", "tba"}
+)
+
+
+def _line_has_explicit_terminal_assertion(line: str) -> bool:
+    """Return True iff ``line`` is an explicit terminal-state assertion.
+
+    A line is an explicit assertion when one of the following
+    holds AND the line does not contain a disqualifying
+    negation / future / uncertainty token:
+
+    - The line, after stripping leading whitespace, is
+      exactly a terminal state name.
+    - The line starts with one of the ``_ASSERTION_PREFIXES``
+      (e.g. ``"Final lifecycle state:"``, ``"Terminal state:"``)
+      followed by a recognized terminal state. Trailing
+      punctuation and the em-dash-separated explanation
+      (e.g. ``"Final lifecycle state: HOLD_PR_CI_PENDING —
+      bounded polling reached limit"``) are accepted.
+    - The line starts with a terminal state name followed by
+      an em-dash (e.g. ``"HOLD_PR_CI_PENDING — bounded polling
+      reached limit"``).
+    """
+    s = line.strip()
+    if not s:
+        return False
+
+    # Disqualify any line that contains a negation, future,
+    # or uncertainty token. The check is case-insensitive.
+    lower = s.lower()
+    for tok in _DISQUALIFYING_TOKENS:
+        if tok in lower:
+            return False
+
+    # Check 1: line is exactly a terminal state.
+    if is_terminal_lifecycle_state(s):
+        return True
+
+    # Check 2: explicit assertion prefix.
+    for prefix in _ASSERTION_PREFIXES:
+        if s.startswith(prefix):
+            rest = s[len(prefix):].strip()
+            if not rest:
+                continue
+            # First token is the candidate state.
+            first_token = rest.split(None, 1)[0].rstrip(",;:.—")
+            if is_terminal_lifecycle_state(first_token):
+                return True
+
+    # Check 3: state at start of line, followed by an em-dash
+    # separator. This handles lines like
+    # ``"HOLD_PR_CI_PENDING — bounded polling reached limit"``.
+    for state in TERMINAL_LIFECYCLE_STATES:
+        for sep in (" — ", "—"):
+            if s.startswith(state + sep):
+                return True
+
+    return False
+
+
+def _has_explicit_terminal_assertion(text: str) -> bool:
+    """Return True iff any line in ``text`` is an explicit terminal-state assertion.
+
+    The function splits ``text`` into lines and checks each
+    line. A single line is sufficient — the runner can put
+    the assertion on its own line, or include a trailing
+    explanation.
+    """
+    for line in text.splitlines():
+        if _line_has_explicit_terminal_assertion(line):
+            return True
+    return False
 
 
 def classify_humphry_message_for_stall(text: object) -> str:
@@ -330,14 +454,14 @@ def classify_humphry_message_for_stall(text: object) -> str:
     if not isinstance(text, str) or not text:
         return STALL_NO_TERMINAL_STATE
 
-    # 1. Terminal-state detection — whole-token match against
-    # the registry. The check uses a word-boundary regex so
-    # that a longer non-terminal name like
-    # ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`` is not classified
-    # as OK_TERMINAL solely because it contains the shorter
-    # registered ``CODEX_CLEAN_PASS`` substring. This is the
-    # only way a message can become OK_TERMINAL.
-    if _terminal_token_pattern().search(text):
+    # 1. Terminal-state detection — explicit assertion. The
+    # check requires a line that is exactly a terminal state,
+    # or one of the documented assertion prefixes followed by
+    # a terminal state, or a terminal state followed by an
+    # em-dash separator. Negated / future / uncertain
+    # mentions of a terminal state are explicitly rejected.
+    # This is the only way a message can become OK_TERMINAL.
+    if isinstance(text, str) and _has_explicit_terminal_assertion(text):
         return OK_TERMINAL
 
     has_continue_prompt = _contains_any(text, _CONTINUE_PROMPT_TOKENS)
