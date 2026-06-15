@@ -1,0 +1,238 @@
+"""AED no-stall lifecycle helpers (v1).
+
+This module is the regression guard for the phase-header-only
+failure mode that surfaced in PR #404 and prior runs. The
+helpers here are pure functions over a small, stdlib-only
+vocabulary:
+
+- :data:`TERMINAL_LIFECYCLE_STATES` — the canonical set of
+  terminal states a Humphry/Telegram runner can land on.
+- :func:`is_terminal_lifecycle_state` — predicate.
+- :func:`classify_humphry_message_for_stall` — classifies a
+  final-output text into one of six categories that a runner
+  can branch on.
+
+This module does not import any AED-internal policy or
+harness code. It is intentionally a leaf module so the
+runner can call it from any process boundary.
+
+Public API
+----------
+
+- :data:`OK_TERMINAL`
+- :data:`OK_PROGRESS_WITH_NEXT_ACTION`
+- :data:`STALL_PHASE_HEADER_ONLY`
+- :data:`STALL_WAITING_FOR_CONTINUE`
+- :data:`STALL_NO_TERMINAL_STATE`
+- :data:`STALL_NO_CHECKPOINT`
+- :func:`is_terminal_lifecycle_state`
+- :func:`classify_humphry_message_for_stall`
+- :data:`TERMINAL_LIFECYCLE_STATES`
+"""
+from __future__ import annotations
+
+from typing import FrozenSet
+
+
+# ---------------------------------------------------------------------------
+# Public classification constants
+# ---------------------------------------------------------------------------
+
+
+OK_TERMINAL = "OK_TERMINAL"
+"""The final output carries a recognized terminal lifecycle state."""
+
+OK_PROGRESS_WITH_NEXT_ACTION = "OK_PROGRESS_WITH_NEXT_ACTION"
+"""The final output is mid-phase progress, but explicitly carries
+a ``next_action`` (and optionally a checkpoint path) so the runner
+can resume from where it left off."""
+
+STALL_PHASE_HEADER_ONLY = "STALL_PHASE_HEADER_ONLY"
+"""The final output is just a phase header (``Starting PHASE 1 —``
+or ``Now PHASE 8 — ...``) with no checkpoint, no terminal state,
+and no ``next_action``."""
+
+STALL_WAITING_FOR_CONTINUE = "STALL_WAITING_FOR_CONTINUE"
+"""The final output is a prompt-style question asking the
+operator to type ``Continue`` (or ``yes``) before proceeding."""
+
+STALL_NO_TERMINAL_STATE = "STALL_NO_TERMINAL_STATE"
+"""The final output is a generic progress note with no terminal
+state and no ``next_action``. The runner cannot tell whether the
+work is done, paused, or stuck."""
+
+STALL_NO_CHECKPOINT = "STALL_NO_CHECKPOINT"
+"""The final output references a checkpoint but does not name one
+explicitly, has no ``next_action``, and no terminal state."""
+
+
+# ---------------------------------------------------------------------------
+# Terminal lifecycle state registry
+# ---------------------------------------------------------------------------
+
+
+# The canonical set of terminal states a Humphry/Telegram runner
+# can land on. Frozen at runtime; mutating it would defeat the
+# purpose of an explicit registry.
+TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
+    {
+        # Successful close
+        "MERGED",
+        # Awaiting human authorization — runner is done, work is
+        # paused for the operator. A terminal "parked" state.
+        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        # Hard holds
+        "HOLD_NEW_CODEX_THREAD",
+        "HOLD_CODEX_RESPONSE_PENDING",
+        "HOLD_PR_CI_PENDING",
+        "HOLD_PR_CI_FAILED",
+        "HOLD_SCOPE_GUARD_FAILED",
+        "HOLD_UNAUTHORIZED_THREAD_INVENTORY",
+        "HOLD_BRANCH_POLICY_BLOCKED",
+        "HOLD_HEAD_CHANGED",
+        "HOLD_ISOLATED_WORKSPACE_DIRTY",
+        "HOLD_UNEXPECTED_LOCAL_CHANGES",
+        "HOLD_OPERATOR_REQUIRED",
+        # Generic failure close
+        "FAILED",
+    }
+)
+
+
+def is_terminal_lifecycle_state(state: object) -> bool:
+    """Return True iff ``state`` is a recognized terminal lifecycle state.
+
+    The function is strict: anything that is not a non-empty string
+    in :data:`TERMINAL_LIFECYCLE_STATES` returns False. A non-string
+    return value (e.g. ``None``) cannot be a terminal state, and an
+    empty string is not a terminal state. Abbreviated state names
+    (e.g. ``"MERGE_READY"``) are rejected; the runner must use the
+    canonical identifier.
+    """
+    if not isinstance(state, str):
+        return False
+    if not state:
+        return False
+    return state in TERMINAL_LIFECYCLE_STATES
+
+
+# ---------------------------------------------------------------------------
+# classify_humphry_message_for_stall
+# ---------------------------------------------------------------------------
+
+
+# Substrings that mark a phase header. The classifier is conservative:
+# a line that contains a phase header substring is treated as a phase
+# header even if the rest of the line is plausible progress text. This
+# is the bug the PR is meant to detect.
+_PHASE_HEADER_TOKENS = (
+    "Starting PHASE ",
+    "Now PHASE ",
+    "Phase PHASE ",
+    "PHASE_STARTING",
+)
+
+
+# Substrings that mark a yes/no continue prompt.
+_CONTINUE_PROMPT_TOKENS = (
+    "Continue?",
+    "(yes/no)",
+    "(y/n)",
+    "Type continue",
+    "Press enter to continue",
+    "Awaiting confirmation",
+)
+
+
+# Substrings that mark an explicit checkpoint reference.
+_CHECKPOINT_TOKENS = (
+    "checkpoint_path=",
+    "checkpoint: ",
+    "checkpoint_path:",
+    "checkpoint=",
+    "wrote checkpoint to",
+    "saved checkpoint to",
+    "checkpoint file",
+    "checkpoint at",
+)
+
+
+# Substrings that mark an explicit next_action reference.
+_NEXT_ACTION_TOKENS = (
+    "next_action=",
+    "next_action:",
+    "Next action:",
+    "next step:",
+    "next step=",
+)
+
+
+def _contains_any(text: str, needles: tuple) -> bool:
+    return any(n in text for n in needles)
+
+
+def classify_humphry_message_for_stall(text: object) -> str:
+    """Classify a Humphry final-output message into a stall category.
+
+    The classifier is the primary regression guard for the
+    phase-header-only failure mode. The decision tree is:
+
+    1. If the text contains any terminal lifecycle state token
+       (substring match against the registered terminal set) →
+       :data:`OK_TERMINAL`. The check is intentionally a substring
+       match so a sentence like "I see HOLD_PR_CI_PENDING in the
+       harness output" still classifies as terminal.
+
+    2. If the text contains a continue-prompt token →
+       :data:`STALL_WAITING_FOR_CONTINUE`.
+
+    3. If the text contains a phase-header token (and no terminal
+       state, no ``next_action``, and no checkpoint reference) →
+       :data:`STALL_PHASE_HEADER_ONLY`.
+
+    4. If the text contains a ``next_action`` token → either
+       :data:`OK_PROGRESS_WITH_NEXT_ACTION` (when the run is
+       mid-phase) or :data:`OK_TERMINAL` (already handled above).
+
+    5. If the text mentions a checkpoint but no next_action and
+       no terminal state → :data:`STALL_NO_CHECKPOINT`.
+
+    6. Otherwise → :data:`STALL_NO_TERMINAL_STATE`.
+
+    The classifier is pure and deterministic. It does not read
+    from disk, the network, or any global state. Empty / non-string
+    inputs return :data:`STALL_NO_TERMINAL_STATE`.
+    """
+    if not isinstance(text, str) or not text:
+        return STALL_NO_TERMINAL_STATE
+
+    # 1. Terminal-state detection — substring match against the
+    # registry. This is the only way a message can become
+    # OK_TERMINAL.
+    if any(state in text for state in TERMINAL_LIFECYCLE_STATES):
+        return OK_TERMINAL
+
+    has_continue_prompt = _contains_any(text, _CONTINUE_PROMPT_TOKENS)
+    has_phase_header = _contains_any(text, _PHASE_HEADER_TOKENS)
+    has_checkpoint = _contains_any(text, _CHECKPOINT_TOKENS)
+    has_next_action = _contains_any(text, _NEXT_ACTION_TOKENS)
+
+    # 2. Continue-prompt stall — outranks phase-header because the
+    # user explicitly asked to stop.
+    if has_continue_prompt:
+        return STALL_WAITING_FOR_CONTINUE
+
+    # 3. Phase header with nothing else
+    if has_phase_header:
+        return STALL_PHASE_HEADER_ONLY
+
+    # 4. Progress with explicit next_action
+    if has_next_action:
+        return OK_PROGRESS_WITH_NEXT_ACTION
+
+    # 5. Checkpoint mentioned but no next_action and no terminal
+    if has_checkpoint:
+        return STALL_NO_CHECKPOINT
+
+    # 6. Default: generic progress with no terminal
+    return STALL_NO_TERMINAL_STATE
