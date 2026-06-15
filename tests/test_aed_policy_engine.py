@@ -2943,17 +2943,25 @@ class TestCanonicalizePathRejectsRelative(unittest.TestCase):
         # would have pre-patch resolved "." to the cwd and
         # allowed the action. The strict variant must still
         # deny because the policy decision must not depend
-        # on the process's cwd.
+        # on the process's cwd. This test must work in any
+        # sandbox: create the worktree-style cwd directory
+        # if it does not exist so the chdir is portable.
         import os
+        import tempfile
         original_cwd = os.getcwd()
-        try:
-            os.chdir("/tmp/aed_runs/worktrees/aed_policy_engine_skeleton_v1")
-            d = evaluate_action(
-                AEDActionType.FILE_WRITE,
-                _clean_state(isolated_workspace_path="."),
-            )
-        finally:
-            os.chdir(original_cwd)
+        with tempfile.TemporaryDirectory(
+            prefix="aed_runs_worktrees_", dir="/tmp"
+        ) as tmp_root:
+            sim_cwd = os.path.join(tmp_root, "aed_policy_engine_skeleton_v1")
+            os.makedirs(sim_cwd, exist_ok=True)
+            try:
+                os.chdir(sim_cwd)
+                d = evaluate_action(
+                    AEDActionType.FILE_WRITE,
+                    _clean_state(isolated_workspace_path="."),
+                )
+            finally:
+                os.chdir(original_cwd)
         self.assertFalse(d.allowed)
         self.assertIn("AED-RULE-003", d.matched_rule_ids)
 
