@@ -116,8 +116,21 @@ def _canonicalize_path(path: object) -> Optional[str]:
     """Canonicalize ``path`` to an absolute, symlink-resolved string.
 
     Returns the canonicalized absolute path, or ``None`` if the
-    path is not a non-empty string. The function uses
-    ``os.path.realpath`` so dot-segment escapes
+    path is not a non-empty string or is not already an
+    absolute path. The function refuses to resolve a relative
+    path against the process's current working directory:
+    accepting relative input would let the same ``AEDRunState``
+    produce different decisions depending on the policy
+    process's cwd (a caller running the engine from
+    ``/tmp/aed_runs/worktrees/<task>`` would see ``"."`` resolve
+    to that task and pass the workspace check, while a caller
+    running from anywhere else would see ``"."`` resolve to a
+    path that fails the check). The policy decision must be a
+    pure function of the inputs, not of the ambient cwd, so
+    relative paths are denied at the boundary.
+
+    Once the path is confirmed to be absolute, the function
+    uses ``os.path.realpath`` so dot-segment escapes
     (``/tmp/aed_runs/worktrees/../../home/max/...``) and symlink
     escapes resolve to the actual on-disk location before
     comparison. Pure policy logic: no shell execution, no
@@ -126,6 +139,8 @@ def _canonicalize_path(path: object) -> Optional[str]:
     if not isinstance(path, str):
         return None
     if not path:
+        return None
+    if not os.path.isabs(path):
         return None
     return os.path.realpath(path)
 
@@ -218,6 +233,29 @@ def _is_valid_thread_id(value: object) -> bool:
     if not value:
         return False
     return True
+
+
+def _action_name(action: object) -> str:
+    """Return a human-readable, exception-free name for ``action``.
+
+    Used by the catch-all denial branch (AED-RULE-024) so the
+    function never assumes the caller has passed a real
+    :class:`AEDActionType` enum member. Reading ``action.value``
+    directly would raise ``AttributeError`` when ``action`` is
+    a raw string (e.g. ``"NEW_TOOL_ACTION"``), ``None``, an
+    ``int``, a ``dict``, or any arbitrary object. The strict
+    variant uses :func:`getattr` with a default of
+    :func:`repr`, so the catch-all path is the fail-closed
+    path for uncovered actions: it returns a denial with a
+    useful name in the reason text and never throws back to
+    the caller.
+    """
+    if action is None:
+        return "<None>"
+    name = getattr(action, "value", None)
+    if isinstance(name, str) and name:
+        return name
+    return type(action).__name__
 
 
 def _validate_thread_ids(
@@ -350,7 +388,33 @@ def evaluate_action(
     resolve. The engine requires this to be non-empty and a
     subset of ``state.authorized_thread_ids``. For all other
     actions, the parameter is ignored.
+
+    Input robustness: callers that pass a non-``AEDActionType``
+    value (a raw string that happens to match an enum value
+    name, ``None``, an ``int``, a ``dict``, or any other
+    object) are funneled to the AED-RULE-024 catch-all denial
+    *before* any of the per-action ``in`` / ``==`` checks
+    fire, so the function never raises ``TypeError`` from a
+    dict-vs-frozenset membership test or any other unexpected
+    input. A raw string that happens to compare equal to an
+    ``AEDActionType`` enum value name is still treated as
+    "not an enum member" by this guard and denied by default;
+    callers must pass the actual enum, not a string.
     """
+    # AED-RULE-024: type guard. The catch-all denial path
+    # also handles non-enum inputs (via ``_action_name``), but
+    # the per-action ``in`` / ``==`` checks further down rely
+    # on ``action`` being an ``AEDActionType`` enum member
+    # (e.g. ``action in READ_ONLY_ACTIONS`` raises TypeError
+    # for a ``dict``). Funnel non-enum inputs to the catch-all
+    # first so the function never throws.
+    if not isinstance(action, AEDActionType):
+        return _deny(
+            AEDDecisionCode.DENY,
+            f"Action {_action_name(action)} is not covered by the current policy skeleton and is denied by default.",
+            rule_ids=["AED-RULE-024"],
+        )
+
     # AED-RULE-024: unknown action is denied by default.
     if action == AEDActionType.UNKNOWN:
         return _deny(
@@ -642,17 +706,43 @@ def evaluate_action(
                 rule_ids=["AED-RULE-005"],
                 required_evidence=["current_head_sha==expected_head_sha"],
             )
-        if (
-            state.codex_ping_comment_id
-            and state.codex_ping_head_sha
-            and state.codex_ping_head_sha == state.expected_head_sha
-        ):
-            return _deny(
-                AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING,
-                f"Codex ping denied: a ping comment already exists for the current expected head ({state.codex_ping_head_sha}); duplicate pings are refused.",
-                rule_ids=["AED-RULE-010"],
-                required_evidence=["codex_ping_head_sha != expected_head_sha"],
-            )
+        # AED-RULE-010: a same-head ping is duplicate evidence by
+        # itself. The strict variant denies on the head SHA
+        # alone: if ``codex_ping_head_sha`` is a full 40-character
+        # hex SHA equal to ``expected_head_sha`` (or to
+        # ``current_head_sha``), the engine must refuse the new
+        # ping regardless of whether ``codex_ping_comment_id``
+        # is truthy. A partial scan that yields a same-head
+        # SHA with a falsy / empty comment id is still
+        # sufficient evidence that a ping for this head already
+        # exists, and the policy engine must not allow a
+        # second ping for the same head. A malformed
+        # ``codex_ping_head_sha`` (None, abbreviated, non-hex)
+        # also denies rather than falling through to allow,
+        # because AED-RULE-010 forbids the engine from
+        # treating partial evidence as "no prior ping".
+        if state.codex_ping_head_sha is not None:
+            if not _is_full_sha(state.codex_ping_head_sha):
+                return _deny(
+                    AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING,
+                    f"Codex ping denied: a prior ping head SHA is recorded ({state.codex_ping_head_sha!r}) but it is not a full 40-character hex SHA; AED-RULE-010 forbids treating partial evidence as no prior ping.",
+                    rule_ids=["AED-RULE-010", "AED-RULE-005"],
+                    required_evidence=[
+                        "codex_ping_head_sha is a 40-character hex SHA != expected_head_sha"
+                    ],
+                )
+            if (
+                state.codex_ping_head_sha == state.expected_head_sha
+                or state.codex_ping_head_sha == state.current_head_sha
+            ):
+                return _deny(
+                    AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING,
+                    f"Codex ping denied: a ping already exists for the current head ({state.codex_ping_head_sha}); duplicate same-head pings are refused by AED-RULE-010 regardless of comment-id evidence.",
+                    rule_ids=["AED-RULE-010", "AED-RULE-005"],
+                    required_evidence=[
+                        "codex_ping_head_sha is a 40-character hex SHA != expected_head_sha and != current_head_sha"
+                    ],
+                )
         return _allow(rule_ids=["AED-RULE-005", "AED-RULE-010"])
 
     # AED-RULE-020: audit append requires an append-only mechanism evidence.
@@ -683,9 +773,18 @@ def evaluate_action(
             )
         return _allow(rule_ids=["AED-RULE-003"])
 
-    # AED-RULE-024: catch-all deny.
+    # AED-RULE-024: catch-all deny. The catch-all path must
+    # never assume the caller passed a real ``AEDActionType``
+    # enum member: a broker deserializing a JSON action
+    # payload could forward a raw string (e.g.
+    # ``"NEW_TOOL_ACTION"``), ``None``, an ``int``, a
+    # ``dict``, or any other object. Reading ``action.value``
+    # directly would raise ``AttributeError`` and convert the
+    # fail-closed denial path into a Python exception, which
+    # is itself a policy violation. Use ``_action_name`` to
+    # produce a stable, exception-free action label.
     return _deny(
         AEDDecisionCode.DENY,
-        f"Action {action.value} is not covered by the current policy skeleton and is denied by default.",
+        f"Action {_action_name(action)} is not covered by the current policy skeleton and is denied by default.",
         rule_ids=["AED-RULE-024"],
     )

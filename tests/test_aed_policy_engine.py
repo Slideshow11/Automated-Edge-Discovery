@@ -2676,5 +2676,356 @@ class TestThreadResolveListAllowedAfterJcmlxFix(unittest.TestCase):
         self.assertTrue(d.allowed)
 
 
+# ---------------------------------------------------------------------------
+# Jcv5i: CODEX_PING must deny duplicate same-head pings based on head
+# evidence alone, not gated by ``codex_ping_comment_id`` truthiness.
+# ---------------------------------------------------------------------------
+
+
+class TestCodexPingDeniesOnHeadEvidenceAlone(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Jcv5i.
+
+    The pre-patch implementation gated duplicate-same-head
+    denials on ``state.codex_ping_comment_id and
+    state.codex_ping_head_sha and ...``, so a partial scan
+    with a same-head SHA but a falsy comment id slipped
+    through and allowed a second ping. The strict variant
+    must deny on the head SHA alone, and must also deny when
+    a prior head SHA is recorded but is not a full
+    40-character hex value (malformed evidence must not
+    silently satisfy "no prior ping").
+    """
+
+    def test_codex_ping_denied_when_ping_head_matches_expected_and_comment_id_none(
+        self,
+    ):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id=None,
+                codex_ping_head_sha=ZERO_SHA,
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING
+        )
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_denied_when_ping_head_matches_expected_and_comment_id_empty(
+        self,
+    ):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id="",
+                codex_ping_head_sha=ZERO_SHA,
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING
+        )
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_denied_when_ping_head_matches_current_and_expected(
+        self,
+    ):
+        # current_head_sha == expected_head_sha == ZERO_SHA
+        # in _clean_state, so a codex_ping_head_sha == ZERO_SHA
+        # matches BOTH conditions.
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id=None,
+                codex_ping_head_sha=ZERO_SHA,
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_denied_when_ping_head_is_malformed_abbreviated(
+        self,
+    ):
+        # Abbreviated SHA (12 chars) is partial evidence and
+        # must NOT be treated as "no prior ping". AED-RULE-010
+        # forbids falling through to allow on malformed input.
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id=None,
+                codex_ping_head_sha=ZERO_SHA[:12],
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_NO_DUPLICATE_CODEX_PING
+        )
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_allowed_only_when_no_prior_ping_head(self):
+        # _clean_state has codex_ping_head_sha=None; this is
+        # the only allow path for the duplicate check.
+        d = evaluate_action(AEDActionType.CODEX_PING, _clean_state())
+        self.assertTrue(d.allowed)
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_allowed_when_ping_head_is_different_full_sha(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id="12345",
+                codex_ping_head_sha="a" * 40,
+            ),
+        )
+        self.assertTrue(d.allowed)
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+    def test_codex_ping_duplicate_denial_cites_aed_rule_010(self):
+        d = evaluate_action(
+            AEDActionType.CODEX_PING,
+            _clean_state(
+                codex_ping_comment_id=None,
+                codex_ping_head_sha=ZERO_SHA,
+            ),
+        )
+        self.assertIn("AED-RULE-010", d.matched_rule_ids)
+
+
+# ---------------------------------------------------------------------------
+# Jcv5k: catch-all denial must handle raw strings, None, ints, dicts, and
+# arbitrary objects without reading ``action.value`` and without throwing.
+# ---------------------------------------------------------------------------
+
+
+class TestEvaluateActionAcceptsUnknownInputs(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Jcv5k.
+
+    The pre-patch catch-all read ``action.value`` directly,
+    which raises ``AttributeError`` for raw strings,
+    ``None``, ``int``, ``dict``, and arbitrary objects. The
+    strict variant uses ``_action_name`` so the fail-closed
+    denial path never throws. AED-RULE-024 still fires for
+    any input that is not a recognized ``AEDActionType`` enum
+    member.
+    """
+
+    def test_evaluate_action_raw_string_unknown_returns_deny_no_raise(self):
+        try:
+            d = evaluate_action("NEW_TOOL_ACTION", _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_raw_string_known_returns_deny_no_raise(self):
+        # A raw string that happens to match an enum VALUE
+        # name should still be treated as not-an-enum and
+        # fall through to the catch-all (AED-RULE-024). The
+        # function compares against ``AEDActionType`` enum
+        # members, not Python strings, so a raw string
+        # never satisfies the enum checks.
+        try:
+            d = evaluate_action("GITHUB_MERGE", _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_none_returns_deny_no_raise(self):
+        try:
+            d = evaluate_action(None, _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_int_returns_deny_no_raise(self):
+        try:
+            d = evaluate_action(123, _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_dict_returns_deny_no_raise(self):
+        try:
+            d = evaluate_action({"action": "NEW"}, _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_arbitrary_object_returns_deny_no_raise(self):
+        class _Weird:
+            pass
+        try:
+            d = evaluate_action(_Weird(), _clean_state())
+        except AttributeError as e:
+            self.fail(f"evaluate_action raised AttributeError: {e}")
+        self.assertIsNotNone(d)
+        self.assertFalse(d.allowed)
+        self.assertEqual(d.code, AEDDecisionCode.DENY)
+        self.assertIn("AED-RULE-024", d.matched_rule_ids)
+
+    def test_evaluate_action_int_has_useful_reason_text(self):
+        d = evaluate_action(123, _clean_state())
+        # The reason text should mention the action label so
+        # operators can tell what the engine saw. The strict
+        # variant uses _action_name -> type(action).__name__
+        # for an int, which is "int".
+        self.assertIn("int", d.reason)
+
+
+# ---------------------------------------------------------------------------
+# Jcv5l: workspace path canonicalization must reject relative paths so the
+# policy decision never depends on the process's cwd.
+# ---------------------------------------------------------------------------
+
+
+class TestCanonicalizePathRejectsRelative(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Jcv5l.
+
+    The pre-patch ``_canonicalize_path`` called
+    ``os.path.realpath`` on any non-empty string, so a
+    relative path like ``"."`` or
+    ``"./aed_policy_engine_skeleton_v1"`` would resolve
+    against the policy process's cwd. If the process was
+    running from inside
+    ``/tmp/aed_runs/worktrees/<task>``, the resolved path
+    would pass the workspace check; from any other cwd it
+    would fail. The strict variant rejects non-absolute paths
+    at the boundary so the decision is a pure function of
+    the inputs.
+    """
+
+    def test_dot_relative_denied(self):
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(isolated_workspace_path="."),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_dot_slash_task_relative_denied(self):
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(
+                isolated_workspace_path="./aed_policy_engine_skeleton_v1"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_relative_worktrees_subdir_denied(self):
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(
+                isolated_workspace_path="tmp/aed_runs/worktrees/x"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_relative_path_denied_even_if_cwd_would_resolve_under_root(self):
+        # Simulate: a process running the policy engine from
+        # /tmp/aed_runs/worktrees/<task> with isolated_workspace_path="."
+        # would have pre-patch resolved "." to the cwd and
+        # allowed the action. The strict variant must still
+        # deny because the policy decision must not depend
+        # on the process's cwd.
+        import os
+        original_cwd = os.getcwd()
+        try:
+            os.chdir("/tmp/aed_runs/worktrees/aed_policy_engine_skeleton_v1")
+            d = evaluate_action(
+                AEDActionType.FILE_WRITE,
+                _clean_state(isolated_workspace_path="."),
+            )
+        finally:
+            os.chdir(original_cwd)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_file_write_denied_when_isolated_workspace_is_dot(self):
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(isolated_workspace_path="."),
+        )
+        self.assertFalse(d.allowed)
+        self.assertEqual(
+            d.code, AEDDecisionCode.REQUIRE_ISOLATED_WORKSPACE
+        )
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_terminal_mutating_denied_when_isolated_workspace_is_dot(self):
+        d = evaluate_action(
+            AEDActionType.TERMINAL_MUTATING,
+            _clean_state(isolated_workspace_path="."),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_git_mutating_denied_when_isolated_workspace_is_dot(self):
+        d = evaluate_action(
+            AEDActionType.GIT_MUTATING,
+            _clean_state(isolated_workspace_path="."),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_absolute_named_workspace_still_allowed(self):
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(
+                isolated_workspace_path="/tmp/aed_runs/worktrees/some_task"
+            ),
+        )
+        self.assertTrue(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_absolute_worktrees_root_still_denied(self):
+        # /tmp/aed_runs/worktrees (without a task subdir) is
+        # the worktrees root itself; the engine must still
+        # reject it because AED-RULE-003 requires a per-task
+        # isolated workspace strictly under the root.
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(
+                isolated_workspace_path="/tmp/aed_runs/worktrees"
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_absolute_dot_segment_escape_still_denied(self):
+        # Absolute but escapes via dot segments; the engine
+        # must still deny after realpath resolution. The
+        # path is absolute so the new check does not block
+        # it; instead _is_under must reject it because the
+        # canonicalized path is /home/max/... which is not
+        # under /tmp/aed_runs/worktrees.
+        d = evaluate_action(
+            AEDActionType.FILE_WRITE,
+            _clean_state(
+                isolated_workspace_path=(
+                    "/tmp/aed_runs/worktrees/../../home/max/x"
+                )
+            ),
+        )
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+
 if __name__ == "__main__":
     unittest.main()
