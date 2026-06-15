@@ -131,21 +131,27 @@ def _canonicalize_path(path: object) -> Optional[str]:
 
 
 def _is_under(path: str, root: str) -> bool:
-    """True iff the canonicalized ``path`` is strictly inside ``root``.
+    """True iff the canonicalized ``path`` is strictly below ``root``.
 
     Both ``path`` and ``root`` are expected to already be
     canonicalized via ``_canonicalize_path`` (or otherwise
-    absolute and symlink-resolved). The function rejects paths
-    that equal ``root`` so callers cannot satisfy the isolated
-    workspace check by supplying the root itself, and it
-    enforces the trailing ``/`` separator so a path like
-    ``/tmp/aed_runs/worktrees_evil/x`` is rejected when the
-    intended root is ``/tmp/aed_runs/worktrees``.
+    absolute and symlink-resolved). The function requires the
+    path to start with ``root + os.sep`` (with a trailing
+    separator) so a path like
+    ``/tmp/aed_runs/worktrees_evil/x`` is rejected even
+    though it shares a textual prefix with
+    ``/tmp/aed_runs/worktrees``. Equality with ``root`` is
+    explicitly rejected: the policy engine requires a
+    per-task isolated worktree under
+    ``/tmp/aed_runs/worktrees/<task-name>``, never the
+    shared worktree parent itself.
     """
     if not path or not root:
         return False
+    if path == root:
+        return False
     root_with_sep = root if root.endswith(os.sep) else root + os.sep
-    return path == root or path.startswith(root_with_sep)
+    return path.startswith(root_with_sep)
 
 
 def _in_isolated_workspace(state: AEDRunState) -> bool:

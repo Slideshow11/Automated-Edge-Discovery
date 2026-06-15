@@ -2156,5 +2156,100 @@ class TestPriorFindingsStillActive(unittest.TestCase):
         self.assertIn("AED-RULE-005", d.matched_rule_ids)
 
 
+# ---------------------------------------------------------------------------
+# JbcAl: reject /tmp/aed_runs/worktrees root as an isolated workspace
+# ---------------------------------------------------------------------------
+
+
+class TestInIsolatedWorkspaceRejectsRoot(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6JbcAl.
+
+    ``_in_isolated_workspace`` must deny when the canonicalized
+    isolated workspace path is exactly
+    ``/tmp/aed_runs/worktrees``. The policy engine requires a
+    per-task isolated worktree under
+    ``/tmp/aed_runs/worktrees/<task-name>``, never the shared
+    worktree parent itself.
+    """
+
+    def test_in_isolated_workspace_denies_exact_root(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_root_with_trailing_slash(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees/")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_denies_path_canonicalizing_to_root(self):
+        # /tmp/aed_runs/worktrees/. canonicalizes to /tmp/aed_runs/worktrees.
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees/.")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_allows_named_workspace(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/aed_policy_engine_skeleton_v1"
+        )
+        self.assertTrue(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_allows_child_path(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/aed_x/subdir/nested"
+        )
+        self.assertTrue(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_still_denies_sibling_prefix(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees_evil/x")
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_still_denies_dot_segment_escape(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(
+            isolated_workspace_path="/tmp/aed_runs/worktrees/../../home/max/Automated-Edge-Discovery"
+        )
+        self.assertFalse(_in_isolated_workspace(s))
+
+    def test_in_isolated_workspace_still_denies_none_and_empty(self):
+        from aed_policy.policy import _in_isolated_workspace
+        s = _clean_state(isolated_workspace_path=None)
+        self.assertFalse(_in_isolated_workspace(s))
+        s = _clean_state(isolated_workspace_path="")
+        self.assertFalse(_in_isolated_workspace(s))
+
+
+class TestMutatingActionsRejectsRoot(unittest.TestCase):
+    """MUTATING_LOCAL_ACTIONS must deny when the workspace path is the root."""
+
+    def test_file_write_denied_at_root(self):
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees")
+        d = evaluate_action(AEDActionType.FILE_WRITE, s)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_terminal_mutating_denied_at_root(self):
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees")
+        d = evaluate_action(AEDActionType.TERMINAL_MUTATING, s)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_git_mutating_denied_at_root(self):
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees")
+        d = evaluate_action(AEDActionType.GIT_MUTATING, s)
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+    def test_root_denial_includes_AED_RULE_003(self):
+        s = _clean_state(isolated_workspace_path="/tmp/aed_runs/worktrees")
+        d = evaluate_action(AEDActionType.FILE_WRITE, s)
+        # AED-RULE-003 must be cited explicitly so the decision is
+        # auditable end-to-end.
+        self.assertIn("AED-RULE-003", d.matched_rule_ids)
+
+
 if __name__ == "__main__":
     unittest.main()
