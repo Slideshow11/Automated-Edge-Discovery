@@ -74,14 +74,32 @@ explicitly, has no ``next_action``, and no terminal state."""
 # The canonical set of terminal states a Humphry/Telegram runner
 # can land on. Frozen at runtime; mutating it would defeat the
 # purpose of an explicit registry.
+#
+# The set is the union of:
+#   1. The original PR #405 task spec (the HOLD_* names that the
+#      spec asked us to register, plus MERGED, FAILED, and
+#      MERGE_READY_AWAITING_HUMAN_AUTHORIZATION).
+#   2. Every canonical HOLD_* and ``terminal`` lifecycle state
+#      from ``schemas/aed_lifecycle_states_v1.json`` (the
+#      canonical AED lifecycle registry), plus the parked-when-
+#      ready state ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+#      and the two "parked" informational/mutation-pending
+#      states that a runner may legitimately stop on
+#      (``CODEX_CLEAN_PASS`` and ``PR_MERGED_PENDING_CLOSEOUT``).
+#
+# Drift between this set and the canonical registry is caught by
+# ``TestCanonicalRegistryCoverage`` in tests/test_aed_no_stall.py.
+# The test reads the schema and asserts coverage, so a future
+# registry addition fails the suite until the set is updated.
 TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
     {
+        # ---- Original PR #405 task spec ----
         # Successful close
         "MERGED",
         # Awaiting human authorization — runner is done, work is
         # paused for the operator. A terminal "parked" state.
         "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
-        # Hard holds
+        # Hard holds (per the PR #405 task spec)
         "HOLD_NEW_CODEX_THREAD",
         "HOLD_CODEX_RESPONSE_PENDING",
         "HOLD_PR_CI_PENDING",
@@ -95,6 +113,27 @@ TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
         "HOLD_OPERATOR_REQUIRED",
         # Generic failure close
         "FAILED",
+        # ---- Canonical AED lifecycle registry
+        #      (schemas/aed_lifecycle_states_v1.json) ----
+        # category=hold
+        "HOLD_MAIN_HEAD_MISMATCH",
+        "HOLD_NEW_ACTIVE_THREAD",
+        "HOLD_MERGE_STATE_BLOCKED",
+        "HOLD_PRE_MERGE_CONDITION_FAILED",
+        "HOLD_POST_MERGE_CI_PENDING",
+        "HOLD_POST_MERGE_CI_FAILED",
+        "HOLD_POST_MERGE_CI_NOT_OBSERVED",
+        "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
+        "HOLD_RESUME_CHECKPOINT_NEEDED",
+        "HOLD_PR_NOT_OPEN",
+        # category=terminal
+        "PR_MERGED_AND_CLOSED_OUT",
+        # category=ready but parked awaiting human
+        # (already listed above: MERGE_READY_AWAITING_HUMAN_AUTHORIZATION)
+        # category=mutation_pending — parked
+        "PR_MERGED_PENDING_CLOSEOUT",
+        # category=informational — parked on a clean Codex pass
+        "CODEX_CLEAN_PASS",
     }
 )
 
@@ -222,11 +261,27 @@ def classify_humphry_message_for_stall(text: object) -> str:
     if has_continue_prompt:
         return STALL_WAITING_FOR_CONTINUE
 
-    # 3. Phase header with nothing else
+    # 3. Phase-header classification. A phase header is only a
+    # bare STALL_PHASE_HEADER_ONLY when nothing else is in the
+    # message. When next_action and a checkpoint reference are
+    # both present, the message is a resumable progress update
+    # and the runner should treat it as OK_PROGRESS_WITH_NEXT_ACTION.
     if has_phase_header:
+        if has_next_action and has_checkpoint:
+            return OK_PROGRESS_WITH_NEXT_ACTION
+        # Next action but no checkpoint: there is something for
+        # the runner to do, but no resume point — STALL_NO_CHECKPOINT.
+        if has_next_action and not has_checkpoint:
+            return STALL_NO_CHECKPOINT
+        # Checkpoint but no next_action: there is a resume point
+        # but nothing to act on. STALL_NO_TERMINAL_STATE flags the
+        # generic "no next action" case.
+        if has_checkpoint and not has_next_action:
+            return STALL_NO_TERMINAL_STATE
+        # Pure phase header.
         return STALL_PHASE_HEADER_ONLY
 
-    # 4. Progress with explicit next_action
+    # 4. Progress with explicit next_action (no phase header)
     if has_next_action:
         return OK_PROGRESS_WITH_NEXT_ACTION
 

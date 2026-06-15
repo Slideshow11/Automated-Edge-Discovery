@@ -46,6 +46,7 @@ from aed_lifecycle.checkpoint import (  # noqa: E402
     checkpoint_requires_operator,
     next_action_from_checkpoint,
     validate_checkpoint,
+    validate_resume_observations,
 )
 from aed_lifecycle.watchdog import (  # noqa: E402
     STALL_RISK,
@@ -328,7 +329,7 @@ def _make_checkpoint(**overrides: Any) -> CheckpointState:
 
 
 class CheckpointValidationTests(unittest.TestCase):
-    """validate_checkpoint must enforce required fields and head invariants."""
+    """validate_checkpoint is structural only (no head-comparison logic)."""
 
     def test_valid_checkpoint_has_no_errors(self) -> None:
         errors = validate_checkpoint(_make_checkpoint())
@@ -342,43 +343,135 @@ class CheckpointValidationTests(unittest.TestCase):
             f"expected branch error, got {errors}",
         )
 
-    def test_pr_head_changed_is_invalid(self) -> None:
-        # Override last_verified_pr_head to a different SHA,
-        # simulating "the PR head moved between the last
-        # verification and the current observation."
+    # ------------------------------------------------------------------
+    # Fix A — structural validation must NOT compare PR head to
+    # primary head. A normal feature-branch PR has different SHAs
+    # in those two fields by design.
+    # ------------------------------------------------------------------
+
+    def test_structural_validation_passes_when_pr_head_differs_from_primary(
+        self,
+    ) -> None:
+        # PR head "a"*40, primary head "0"*40. A normal feature
+        # branch sits on a different SHA than origin/main.
+        # Structural validation must accept this without error.
         ck = _make_checkpoint(
-            current_head="a" * 40,
-            last_verified_pr_head="a" * 40,  # not changed
-            last_verified_primary_head="a" * 40,
+            last_verified_pr_head="a" * 40,
+            last_verified_primary_head="0" * 40,
         )
-        # Now simulate the head having moved by switching
-        # the two SHA fields. The runner re-fetched the PR
-        # and observed a new SHA.
-        ck.current_head = "b" * 40
         errors = validate_checkpoint(ck)
-        self.assertTrue(
-            any("PR head" in e or "pr_head" in e for e in errors),
-            f"expected pr-head-changed error, got {errors}",
+        self.assertEqual(
+            errors,
+            [],
+            f"structural validation must not flag PR/primary head inequality, got {errors}",
         )
 
-    def test_primary_head_changed_is_invalid(self) -> None:
-        # Override last_verified_primary_head to a different
-        # SHA, simulating "the primary worktree moved between
-        # the last verification and the current observation."
+    def test_pr_head_inequality_with_primary_is_not_a_validation_error(
+        self,
+    ) -> None:
+        # Even when the SHA strings are wildly different and the
+        # checkpoint is otherwise fine, structural validation
+        # must succeed because the inequality is intentional
+        # (PR head != primary head by design).
         ck = _make_checkpoint(
-            last_verified_primary_head="0" * 40,  # primary was here
+            current_head="a" * 40,
             last_verified_pr_head="a" * 40,
-            current_head="a" * 40,  # PR head unchanged
+            last_verified_primary_head="0" * 40,
         )
-        # The runner re-fetched the primary and observed a
-        # new SHA. Update current_head to represent the new
-        # observed primary SHA at resume time.
-        ck.current_head = "1" * 40
         errors = validate_checkpoint(ck)
+        self.assertNotIn(
+            True,
+            [("primary" in e.lower() or "pr head" in e.lower()) for e in errors],
+            f"structural validation must not compare PR head to primary head, got {errors}",
+        )
+
+
+class CheckpointResumeObservationsTests(unittest.TestCase):
+    """validate_resume_observations is the head-drift detector.
+
+    The function compares each recorded head against its own
+    freshly observed SHA. The runner calls it with the SHAs
+    it just fetched from the GitHub API (observed_pr_head) and
+    from the protected primary worktree (observed_primary_head).
+    """
+
+    def test_resume_allowed_when_observations_match(self) -> None:
+        # Default checkpoint: all three SHAs are "a"*40. The
+        # observed PR head and observed primary head both match
+        # the recorded values — no drift.
+        ck = _make_checkpoint()
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="a" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_resume_hold_on_pr_head_drift(self) -> None:
+        ck = _make_checkpoint()
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="b" * 40,  # PR head moved
+            observed_primary_head="a" * 40,
+        )
+        self.assertTrue(
+            any("PR head" in e for e in errors),
+            f"expected PR head drift error, got {errors}",
+        )
+
+    def test_resume_hold_on_primary_head_drift(self) -> None:
+        ck = _make_checkpoint(last_verified_primary_head="0" * 40)
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="1" * 40,  # primary moved
+        )
         self.assertTrue(
             any("primary" in e.lower() for e in errors),
-            f"expected primary-head-changed error, got {errors}",
+            f"expected primary head drift error, got {errors}",
         )
+
+    def test_resume_holds_on_both_drifts(self) -> None:
+        ck = _make_checkpoint(last_verified_primary_head="0" * 40)
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="b" * 40,  # PR head moved
+            observed_primary_head="1" * 40,  # primary moved
+        )
+        self.assertEqual(len(errors), 2, f"expected 2 drift errors, got {errors}")
+
+    def test_resume_allows_when_pr_and_primary_heads_differ(self) -> None:
+        # The critical regression guard: PR head "a"*40, primary
+        # head "0"*40. Both observations match their own
+        # recorded values. validate_resume_observations must
+        # succeed — the two are different SHAs by design.
+        ck = _make_checkpoint(
+            last_verified_pr_head="a" * 40,
+            last_verified_primary_head="0" * 40,
+        )
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_resume_observations_skip_when_observation_is_empty(self) -> None:
+        ck = _make_checkpoint()
+        # None or empty observation is "skip this check" so the
+        # runner can populate only one observation.
+        errors_none = validate_resume_observations(
+            ck,
+            observed_pr_head="",
+            observed_primary_head="a" * 40,
+        )
+        self.assertEqual(errors_none, [])
+        errors_empty = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="",
+        )
+        self.assertEqual(errors_empty, [])
 
 
 class CheckpointResumeTests(unittest.TestCase):
@@ -427,20 +520,20 @@ class CheckpointResumeTests(unittest.TestCase):
         self.assertEqual(action, "poll Codex response")
         self.assertFalse(checkpoint_requires_operator(ck))
 
-    def test_cannot_resume_if_pr_head_changed(self) -> None:
-        # The PR head moved between the last verification
-        # and the current observation. Even if next_action is
-        # set, head change overrides.
-        ck = _make_checkpoint()
-        ck.current_head = "b" * 40  # PR head moved
-        self.assertTrue(checkpoint_requires_operator(ck))
-
-    def test_cannot_resume_if_primary_head_changed(self) -> None:
-        # The primary worktree moved between the last
-        # verification and the current observation.
-        ck = _make_checkpoint(last_verified_primary_head="0" * 40)
-        ck.current_head = "1" * 40  # runner re-fetched primary
-        self.assertTrue(checkpoint_requires_operator(ck))
+    def test_structural_resume_unchanged_by_pr_vs_primary_head_difference(
+        self,
+    ) -> None:
+        # The structural resume helper does not compare heads.
+        # A normal feature-branch PR has different PR head and
+        # primary head; the helper must still return next_action.
+        ck = _make_checkpoint(
+            last_verified_pr_head="a" * 40,
+            last_verified_primary_head="0" * 40,
+            next_action="poll CI status",
+        )
+        action = next_action_from_checkpoint(ck)
+        self.assertEqual(action, "poll CI status")
+        self.assertFalse(checkpoint_requires_operator(ck))
 
     def test_stale_checkpoint_returns_hold(self) -> None:
         ck = _make_checkpoint(phase=None, next_action=None, terminal_state=None)
@@ -590,6 +683,204 @@ def _ck_to_dict(ck: CheckpointState) -> Dict[str, Any]:
     import dataclasses
 
     return dataclasses.asdict(ck)
+
+
+# ---------------------------------------------------------------------------
+# Section 7: Fix B — phase header with next_action + checkpoint
+# ---------------------------------------------------------------------------
+
+
+class ClassifyPhaseHeaderProgressTests(unittest.TestCase):
+    """A phase header is only STALL_PHASE_HEADER_ONLY when nothing
+    else is in the message. When next_action and a checkpoint
+    reference are both present, the message is a resumable
+    progress update.
+    """
+
+    def test_pure_phase_header_still_stall(self) -> None:
+        text = "Starting PHASE 1 — protected-state verification."
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            STALL_PHASE_HEADER_ONLY,
+        )
+
+    def test_phase_header_with_next_action_and_checkpoint_is_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — next_action: poll CI status, "
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_phase_header_with_next_action_only_is_stall_no_checkpoint(
+        self,
+    ) -> None:
+        text = "Now PHASE 5 — next_action: poll Codex response"
+        # Has phase header and next_action but no checkpoint
+        # evidence: there is something for the runner to do,
+        # but no resume point.
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            STALL_NO_CHECKPOINT,
+        )
+
+    def test_phase_header_with_checkpoint_only_is_stall_no_terminal(self) -> None:
+        text = "Starting PHASE 3 — checkpoint: /tmp/ckpt.json"
+        # Has phase header and checkpoint but no next_action.
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            STALL_NO_TERMINAL_STATE,
+        )
+
+    def test_phase_header_with_terminal_token_still_terminal(self) -> None:
+        text = (
+            "Now PHASE 5 — bounded polling reached limit, "
+            "HOLD_PR_CI_PENDING"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 8: Fix C — canonical registry coverage
+# ---------------------------------------------------------------------------
+
+
+class CanonicalRegistryCoverageTests(unittest.TestCase):
+    """is_terminal_lifecycle_state must cover every canonical
+    HOLD/terminal state from the AED lifecycle registry at
+    schemas/aed_lifecycle_states_v1.json.
+
+    This test reads the schema directly and asserts coverage,
+    so a future registry addition fails the suite until
+    TERMINAL_LIFECYCLE_STATES is updated.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        path = (
+            Path(__file__).resolve().parent.parent
+            / "schemas"
+            / "aed_lifecycle_states_v1.json"
+        )
+        with path.open("r", encoding="utf-8") as f:
+            cls.registry = json.load(f)
+        cls.canonical_hold_states = [
+            name
+            for name, entry in cls.registry["states"].items()
+            if entry.get("category") == "hold"
+        ]
+        cls.canonical_terminal_states = [
+            name
+            for name, entry in cls.registry["states"].items()
+            if entry.get("category") == "terminal"
+        ]
+
+    def test_every_canonical_hold_state_is_recognized(self) -> None:
+        for state in self.canonical_hold_states:
+            with self.subTest(state=state):
+                self.assertTrue(
+                    is_terminal_lifecycle_state(state),
+                    f"canonical HOLD state {state!r} is not in "
+                    "TERMINAL_LIFECYCLE_STATES",
+                )
+
+    def test_every_canonical_terminal_state_is_recognized(self) -> None:
+        for state in self.canonical_terminal_states:
+            with self.subTest(state=state):
+                self.assertTrue(
+                    is_terminal_lifecycle_state(state),
+                    f"canonical terminal state {state!r} is not in "
+                    "TERMINAL_LIFECYCLE_STATES",
+                )
+
+    def test_specific_canonical_hold_states_required_by_pr_spec(self) -> None:
+        # Per the PR #405 spec: these specific canonical states
+        # must be recognized as terminal/parked.
+        for state in [
+            "HOLD_MAIN_HEAD_MISMATCH",
+            "HOLD_MERGE_STATE_BLOCKED",
+            "HOLD_POST_MERGE_CI_PENDING",
+            "HOLD_RESUME_CHECKPOINT_NEEDED",
+        ]:
+            with self.subTest(state=state):
+                self.assertTrue(
+                    is_terminal_lifecycle_state(state),
+                    f"PR-spec required canonical state {state!r} "
+                    "is not recognized",
+                )
+
+    def test_merge_ready_awaiting_human_authorization_recognized(self) -> None:
+        self.assertTrue(
+            is_terminal_lifecycle_state("MERGE_READY_AWAITING_HUMAN_AUTHORIZATION")
+        )
+
+    def test_merged_and_failed_still_recognized(self) -> None:
+        self.assertTrue(is_terminal_lifecycle_state("MERGED"))
+        self.assertTrue(is_terminal_lifecycle_state("FAILED"))
+
+
+# ---------------------------------------------------------------------------
+# Section 9: Fix D — watchdog next_action requirement
+# ---------------------------------------------------------------------------
+
+
+class WatchdogNextActionRequirementTests(unittest.TestCase):
+    """OK_PROGRESS_WITH_NEXT_ACTION requires BOTH checkpoint_path
+    AND next_action. If either is missing, the verdict is
+    STALL_RISK (or HOLD_* for budget reasons).
+    """
+
+    def _make_state(self, **overrides: Any) -> WatchdogState:
+        base: Dict[str, Any] = dict(
+            phase_name="PHASE_1",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=300.0,
+            max_phase_seconds=1800.0,
+            next_action=None,
+            checkpoint_path=None,
+            terminal_state=None,
+        )
+        base.update(overrides)
+        return WatchdogState(**base)
+
+    def test_checkpoint_path_present_next_action_missing_is_stall(self) -> None:
+        # Codex finding 3412650321: a checkpoint without a
+        # next_action is the checkpoint-without-continuation
+        # stall case the protocol is trying to catch.
+        st = self._make_state(checkpoint_path="/tmp/ckpt.json")
+        verdict = evaluate_watchdog(st, now=10.0)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_present_checkpoint_path_missing_is_stall(
+        self,
+    ) -> None:
+        st = self._make_state(next_action="poll Codex")
+        verdict = evaluate_watchdog(st, now=10.0)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_both_present_within_bounds_is_progress(self) -> None:
+        st = self._make_state(
+            next_action="poll Codex",
+            checkpoint_path="/tmp/ckpt.json",
+        )
+        verdict = evaluate_watchdog(st, now=10.0)
+        self.assertEqual(verdict, "OK_PROGRESS_WITH_NEXT_ACTION")
+
+    def test_terminal_state_present_is_ok(self) -> None:
+        # Even with no checkpoint_path or next_action, a
+        # terminal state means the run is parked. OK_TERMINAL
+        # wins over the STALL_RISK branch.
+        st = self._make_state(terminal_state="HOLD_PR_CI_PENDING")
+        verdict = evaluate_watchdog(st, now=10.0)
+        self.assertEqual(verdict, "OK_TERMINAL")
 
 
 if __name__ == "__main__":

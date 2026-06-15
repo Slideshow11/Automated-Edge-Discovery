@@ -26,6 +26,7 @@ from .checkpoint import (
     checkpoint_requires_operator,
     next_action_from_checkpoint,
     validate_checkpoint,
+    validate_resume_observations,
 )
 from .no_stall import (
     OK_PROGRESS_WITH_NEXT_ACTION,
@@ -62,6 +63,7 @@ __all__ = [
     "checkpoint_requires_operator",
     "next_action_from_checkpoint",
     "validate_checkpoint",
+    "validate_resume_observations",
     # watchdog
     "STALL_RISK",
     "WATCHDOG_PROGRESS_REQUIRED",

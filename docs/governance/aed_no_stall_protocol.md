@@ -132,18 +132,24 @@ from where it left off. The shape is pinned in
 | `terminal_state`              | `Optional[str]`            | yes (None allowed) | if set, the checkpoint is parked |
 | `updated_at`                  | `Optional[str]`            | yes (None allowed) | ISO-8601 timestamp of the last checkpoint update |
 
-`validate_checkpoint(state)` returns a list of human-readable
-error strings. An empty list means the checkpoint is valid.
+The validation/resume surface is split into three pure helpers:
 
-`next_action_from_checkpoint(state)` returns the string the
-runner should act on, or `None` if the checkpoint says to stop.
+- `validate_checkpoint(state)` — STRUCTURAL only. Verifies that
+  the fields are present, well-formed, and consistent with
+  the documented schema. It does NOT compare the PR head
+  against the primary head — those are intentionally
+  different SHAs in a normal feature-branch PR.
+- `validate_resume_observations(state, observed_pr_head, observed_primary_head)`
+  — head-drift detector. Compares each recorded head
+  against its own observation. Returns a list of error
+  strings (empty = no drift).
+- `next_action_from_checkpoint(state)` — returns the string
+  the runner should act on, or `None` if the checkpoint says
+  to stop. STRUCTURAL / lookups only.
+
 Stale / incomplete checkpoints return `HOLD_OPERATOR_REQUIRED`,
-not a silent continuation.
-
-`checkpoint_requires_operator(state)` returns `True` iff the
-checkpoint cannot be safely auto-resumed. Head changes,
-unknown terminal states, and stale / empty checkpoints all
-require operator intervention.
+not a silent continuation. Head-drift is surfaced separately
+as `HOLD_HEAD_CHANGED` via the resume-observations helper.
 
 ## 6. How a future runner resumes
 
@@ -153,29 +159,47 @@ The runner's resume loop is a pure function over the checkpoint:
 from aed_lifecycle.checkpoint import (
     CheckpointState,
     next_action_from_checkpoint,
-    checkpoint_requires_operator,
     validate_checkpoint,
+    validate_resume_observations,
 )
 
-def resume(state: CheckpointState) -> str | None:
+def resume(
+    state: CheckpointState,
+    observed_pr_head: str,
+    observed_primary_head: str,
+) -> str | None:
+    # 1. Structural validation first. A structurally invalid
+    #    checkpoint cannot be safely resumed.
     errors = validate_checkpoint(state)
     if errors:
         return "HOLD_OPERATOR_REQUIRED"
-    if checkpoint_requires_operator(state):
-        return "HOLD_OPERATOR_REQUIRED"
+
+    # 2. Head-drift detection. The runner has just fetched the
+    #    PR head and the protected primary head from their
+    #    respective sources of truth. If either drifted from
+    #    the recorded value, hold.
+    drift = validate_resume_observations(
+        state, observed_pr_head, observed_primary_head,
+    )
+    if drift:
+        return "HOLD_HEAD_CHANGED"
+
+    # 3. Otherwise, emit the next_action or None.
     return next_action_from_checkpoint(state)
 ```
 
 The runner MUST:
 
-1. **Re-verify the head before resuming.** Fetch the current PR
-   head SHA and the current protected primary SHA from the
-   external source of truth. Update `state.current_head` (and,
-   for the primary, pass it through a separate
-   `verify_primary_head_unchanged` function — see the watchdog
-   expansion in PR #406). If the head moved,
-   `checkpoint_requires_operator` returns `True` and the runner
-   surfaces `HOLD_HEAD_CHANGED` to the operator.
+1. **Re-verify the heads before resuming.** Fetch the current PR
+   head SHA and the current protected primary SHA from their
+   respective sources of truth. Pass both to
+   `validate_resume_observations`. If the PR head drifted, the
+   function returns an error and the runner surfaces
+   `HOLD_HEAD_CHANGED` to the operator. If the primary head
+   drifted, the function also returns an error and the runner
+   surfaces `HOLD_HEAD_CHANGED` (or, when an AED-RULE-XXX
+   canonical "primary drift" state lands in
+   `TERMINAL_LIFECYCLE_STATES`, that more specific state).
 
 2. **Classify the final agent output.** The runner ingests the
    agent's final response text into
@@ -203,8 +227,14 @@ one of four verdicts:
 |----------------------------------|---------|
 | `OK_TERMINAL`                    | The phase has a recognized terminal state. |
 | `WATCHDOG_PROGRESS_REQUIRED`     | Idle time exceeded `max_idle_seconds`. The runner should emit a progress update or a checkpoint. |
-| `STALL_RISK`                     | No terminal_state and no checkpoint_path. The runner is at risk of stalling. |
-| `OK_PROGRESS_WITH_NEXT_ACTION`   | Mid-phase progress with a `next_action` and a `checkpoint_path`. |
+| `STALL_RISK`                     | No terminal_state and no checkpoint_path AND/OR no next_action. The runner is at risk of stalling. |
+| `OK_PROGRESS_WITH_NEXT_ACTION`   | Mid-phase progress with BOTH a `next_action` AND a `checkpoint_path`. The watchdog recommends the runner continue. |
+
+`OK_PROGRESS_WITH_NEXT_ACTION` requires both fields. A
+checkpoint without a next_action is the
+checkpoint-without-continuation stall case the protocol is
+trying to catch, and a next_action without a checkpoint has
+no resume point. Both conditions produce `STALL_RISK`.
 
 When the phase-time budget (`max_phase_seconds`) is exhausted, the
 watchdog recommends a `HOLD_*` state (never a stall):

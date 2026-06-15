@@ -154,9 +154,13 @@ def evaluate_watchdog(state: WatchdogState, now: float) -> str:
     if elapsed_idle > state.max_idle_seconds:
         return WATCHDOG_PROGRESS_REQUIRED
 
-    # 5. No checkpoint_path — runner is at risk of stalling
-    # because there is no resume point.
-    if not state.checkpoint_path:
+    # 5. No checkpoint_path OR no next_action — runner is at risk
+    # of stalling. OK_PROGRESS_WITH_NEXT_ACTION requires BOTH
+    # fields to be present: a checkpoint without a next_action
+    # is the checkpoint-without-continuation stall case the
+    # protocol is trying to catch, and a next_action without
+    # a checkpoint has no resume point.
+    if not state.checkpoint_path or not state.next_action:
         return STALL_RISK
 
     # 6. Mid-progress with a next_action and a checkpoint_path
