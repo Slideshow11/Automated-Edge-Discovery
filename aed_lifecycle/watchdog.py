@@ -52,6 +52,7 @@ stop and report the terminal state."""
 HOLD_HEAD_CHANGED = "HOLD_HEAD_CHANGED"
 HOLD_PR_CI_PENDING = "HOLD_PR_CI_PENDING"
 HOLD_CODEX_RESPONSE_PENDING = "HOLD_CODEX_RESPONSE_PENDING"
+HOLD_POST_MERGE_CI_PENDING = "HOLD_POST_MERGE_CI_PENDING"
 HOLD_OPERATOR_REQUIRED = "HOLD_OPERATOR_REQUIRED"
 
 
@@ -136,11 +137,125 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
     operator fallback).
     """
     action = (state.next_action or "").lower()
+    phase = (state.phase_name or "").lower()
+    # Post-merge / main-CI closeout detection. When the
+    # watchdog is in a post-merge closeout phase, the
+    # correct exhaustion hold is one of the dedicated
+    # post-merge main-CI holds, not the pre-merge PR-CI
+    # pending state. A pre-merge PR-CI pending state would
+    # send the runner down the wrong recovery path.
+    #
+    # Fix D (Codex 3415861213): Exhausted phases whose
+    # next_action or phase_name indicates post-merge / main
+    # CI closeout must report HOLD_POST_MERGE_CI_PENDING
+    # rather than the pre-merge HOLD_PR_CI_PENDING. The
+    # schema has three distinct post-merge closeout holds
+    # (HOLD_POST_MERGE_CI_PENDING,
+    # HOLD_POST_MERGE_CI_FAILED,
+    # HOLD_POST_MERGE_CI_NOT_OBSERVED); pending-timeout maps
+    # to HOLD_POST_MERGE_CI_PENDING. The runner distinguishes
+    # failed vs not-observed at the closeout pipeline layer
+    # using actual main-CI evidence; the watchdog only knows
+    # whether the phase is exhausted.
+    is_post_merge = _is_post_merge_closeout_phase(phase, action)
     if _CI_TOKEN_PATTERN.search(action):
+        if is_post_merge:
+            return HOLD_POST_MERGE_CI_PENDING
         return HOLD_PR_CI_PENDING
     if _CODEX_TOKEN_PATTERN.search(action):
         return HOLD_CODEX_RESPONSE_PENDING
     return HOLD_OPERATOR_REQUIRED
+
+
+# Post-merge / main-CI closeout detection tokens. The
+# watchdog uses these to distinguish a pre-merge PR CI hold
+# from a post-merge main CI closeout hold when CI is the
+# exhausted-next-action signal. The phase_name and
+# next_action fields are both lowercased before matching.
+#
+# Fix D (Codex 3415861213): The post-merge / closeout
+# detector must fire on context words ("post-merge",
+# "closeout", "main CI", "remote main CI", "post merge
+# main") and not on generic CI verbs like "check",
+# "checks", "run checks", "wait for required checks",
+# "reconcile threads", or "decide whether to merge". The
+# detector is checked BEFORE the generic CI detector so
+# that an exhausted phase with the word "ci" in a
+# post-merge context correctly maps to
+# HOLD_POST_MERGE_CI_PENDING.
+#
+# Match the documented canonical state names from
+# schemas/aed_lifecycle_states_v1.json: HOLD_POST_MERGE_CI_PENDING,
+# HOLD_POST_MERGE_CI_FAILED, HOLD_POST_MERGE_CI_NOT_OBSERVED,
+# and PR_MERGED_PENDING_CLOSEOUT.
+_POST_MERGE_PHASE_TOKENS = (
+    "post-merge",
+    "post merge",
+    "postmerge",
+    "closeout",
+    "close-out",
+    "close out",
+    "main ci",
+    "remote main ci",
+    "post-merge main",
+    "post merge main",
+    "postmerge main",
+    "merged pending closeout",
+    "post_merge_ci",
+    "main_ci",
+)
+_POST_MERGE_NEXT_ACTION_TOKENS = (
+    "post-merge ci",
+    "post merge ci",
+    "postmerge ci",
+    "main ci",
+    "remote main ci",
+    "audit post-merge",
+    "audit post merge",
+    "audit main ci",
+    "post-merge main",
+    "post merge main",
+    "postmerge main",
+    "post-merge main ci",
+    "post merge main ci",
+)
+_POST_MERGE_PHASE_PATTERN = re.compile(
+    r"\b("
+    + "|".join(re.escape(t) for t in _POST_MERGE_PHASE_TOKENS)
+    + r")\b"
+)
+_POST_MERGE_NEXT_ACTION_PATTERN = re.compile(
+    r"\b("
+    + "|".join(re.escape(t) for t in _POST_MERGE_NEXT_ACTION_TOKENS)
+    + r")\b"
+)
+
+
+def _is_post_merge_closeout_phase(phase: str, action: str) -> bool:
+    """Return True if the phase or next action clearly
+    indicates a post-merge / main-CI closeout audit.
+
+    The detector scans for the documented post-merge
+    context words in either the phase name or the next
+    action. Generic English verbs like "check", "checks",
+    "run checks", "wait for required checks", "reconcile
+    threads", and "decide whether to merge" are NOT
+    sufficient; the post-merge / closeout detector only
+    fires on explicit post-merge or main-CI context words.
+
+    Fix D (Codex 3415861213): The CI token detector uses
+    \b word boundaries so that "ci" inside "decide" /
+    "reconcile" / "policy" / "lifecycle" / "suspicious"
+    does not match. The post-merge detector also uses
+    \b word boundaries so that a phase like
+    "policy review" or a next action like "check docs"
+    does not falsely match.
+    """
+    if _POST_MERGE_PHASE_PATTERN.search(phase):
+        return True
+    if _POST_MERGE_NEXT_ACTION_PATTERN.search(action):
+        return True
+    return False
 
 
 # Word-boundary patterns for CI and Codex detection. Built

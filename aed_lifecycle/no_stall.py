@@ -428,6 +428,18 @@ def _extract_next_action_value(text: str) -> Optional[str]:
     walked past the newline. The new implementation splits
     on newlines and only inspects the same-line remainder
     after each marker.
+
+    Fix C (Codex 3415861210): The previous implementation
+    returned the first extracted token from the first
+    marker found, even if that token was a placeholder
+    (``"none"``, ``"todo"``, empty). This caused a runner
+    that emitted a placeholder first (``next_action: none``)
+    and a real action later (``next_action: poll CI status``)
+    to be misclassified as having no valid next action. The
+    new implementation scans ALL markers across the text and
+    returns the first marker whose value passes
+    :func:`is_valid_next_action`. Placeholder/empty markers
+    are skipped instead of short-circuiting the search.
     """
     for raw_line in text.splitlines():
         line = raw_line
@@ -453,7 +465,10 @@ def _extract_next_action_value(text: str) -> Optional[str]:
                     token_end = j
                     break
             first_token = stripped[:token_end]
-            return first_token
+            if is_valid_next_action(first_token):
+                return first_token
+            # else: placeholder/empty marker — keep scanning
+            # the rest of the text for a real action.
     return None
 
 

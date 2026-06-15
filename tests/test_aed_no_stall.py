@@ -3008,5 +3008,356 @@ class ParkedTerminalRequiresOperatorTests(unittest.TestCase):
         )
 
 
+class ContinueScanningNextActionTests(unittest.TestCase):
+    """Regression tests for Codex 3415861210.
+
+    The next_action extractor must scan ALL ``next_action:``
+    markers in a message, not just the first one. A runner
+    that emits a placeholder (``next_action: none``) and
+    then a real action (``next_action: poll CI status``)
+    must be recognized as having a valid next action, not
+    rejected because the first marker was a placeholder.
+    """
+
+    @staticmethod
+    def _classify(message: str) -> str:
+        return classify_humphry_message_for_stall(message)
+
+    def test_placeholder_then_real_action_with_checkpoint_is_progress(
+        self,
+    ) -> None:
+        msg = (
+            "next_action: none\n"
+            "next_action: poll CI status\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        # Real action is present, checkpoint is present.
+        # The placeholder must be skipped, not short-circuit.
+        self.assertEqual(self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_todo_placeholder_then_resume_with_checkpoint_is_progress(
+        self,
+    ) -> None:
+        msg = (
+            "next_action: todo\n"
+            "next_action: resume from checkpoint\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_empty_marker_then_poll_codex_with_checkpoint_is_progress(
+        self,
+    ) -> None:
+        msg = (
+            "next_action:\n"
+            "next_action: poll Codex response\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_placeholder_only_with_checkpoint_is_not_valid(self) -> None:
+        msg = (
+            "next_action: none\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        # No real action; the placeholder does not satisfy
+        # the next_action contract.
+        self.assertNotEqual(
+            self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION
+        )
+
+    def test_todo_placeholder_only_with_checkpoint_is_not_valid(self) -> None:
+        msg = (
+            "next_action: todo\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION
+        )
+
+    def test_empty_marker_only_with_checkpoint_is_not_valid(self) -> None:
+        msg = (
+            "next_action:\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            self._classify(msg), OK_PROGRESS_WITH_NEXT_ACTION
+        )
+
+    def test_extractor_returns_real_action_not_checkpoint(self) -> None:
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        msg = (
+            "next_action: none\n"
+            "next_action: poll CI status\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        value = _extract_next_action_value(msg)
+        # The extractor must return the real action, not the
+        # checkpoint field name and not the placeholder.
+        self.assertEqual(value, "poll")
+        # And it must not include the checkpoint text.
+        self.assertNotIn("checkpoint", (value or ""))
+        self.assertNotIn("ckpt.json", (value or ""))
+
+    def test_extractor_returns_first_valid_marker_only(self) -> None:
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        msg = (
+            "next_action: none\n"
+            "next_action: todo\n"
+            "next_action: resume from checkpoint\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        # Should return the first VALID token, which is
+        # "resume". Placeholders "none" and "todo" must be
+        # skipped.
+        self.assertEqual(_extract_next_action_value(msg), "resume")
+
+    def test_extractor_returns_none_when_only_placeholders(self) -> None:
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        msg = (
+            "next_action: none\n"
+            "next_action: todo\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertIsNone(_extract_next_action_value(msg))
+
+
+class PostMergeCIRecommendHoldTests(unittest.TestCase):
+    """Regression tests for Codex 3415861213.
+
+    When the watchdog times out (phase-time exhausted) and
+    the next_action or phase_name clearly indicates a
+    post-merge / main-CI closeout audit, the recommended
+    hold must be ``HOLD_POST_MERGE_CI_PENDING`` (or its
+    failed / not-observed variant) — NOT the pre-merge
+    ``HOLD_PR_CI_PENDING``. The latter is the wrong
+    recovery path for a runner that is auditing post-merge
+    main CI.
+    """
+
+    @staticmethod
+    def _exhausted_state(
+        phase_name: str,
+        next_action: str,
+    ) -> "WatchdogState":
+        from aed_lifecycle.watchdog import WatchdogState
+        return WatchdogState(
+            phase_name=phase_name,
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+        )
+
+    def test_phase_name_post_merge_returns_post_merge_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="post-merge CI",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_next_action_poll_remote_main_ci_returns_post_merge_hold(
+        self,
+    ) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="poll remote main CI",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_next_action_audit_post_merge_main_ci_returns_post_merge_hold(
+        self,
+    ) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="audit post-merge main CI",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_phase_name_closeout_returns_post_merge_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="closeout audit",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_pr_ci_phrase_remains_pre_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_6",
+            next_action="poll PR CI",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_wait_for_required_checks_remains_pre_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_6",
+            next_action="wait for required checks",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_poll_test_3_11_remains_pre_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_6",
+            next_action="poll test (3.11)",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_check_github_actions_for_pr_remains_pre_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_6",
+            next_action="check github actions for PR",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_generic_check_docs_is_not_a_ci_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        # "check docs" has no CI signal — the CI token
+        # pattern (with \b) does not match it. The
+        # post-merge detector also does not match. So the
+        # fallback HOLD_OPERATOR_REQUIRED must be returned.
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="check docs",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+    def test_reconcile_threads_is_not_a_ci_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        # "reconcile threads" must not match the CI token
+        # pattern ("reconcile" contains "ci" but the \b
+        # boundary prevents a match). And there is no
+        # post-merge / main-CI signal. Fallback hold.
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="reconcile threads",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+    def test_decide_whether_to_merge_is_not_a_ci_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        # "decide whether to merge" must not match CI.
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="decide whether to merge",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+    def test_run_checks_is_not_a_ci_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        # "run checks" alone is not CI without a context
+        # word. The CI token pattern requires explicit
+        # CI-context tokens, not bare "checks".
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="run checks",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+    def test_phase_name_post_merge_with_codex_token_returns_codex_hold(
+        self,
+    ) -> None:
+        # When the next action is about Codex (not CI),
+        # the post-merge detector must NOT promote it to a
+        # CI hold. The Codex detector still fires first.
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="post-merge Codex re-review",
+            next_action="poll codex",
+        )
+        # Codex has no CI signal in next_action, so the
+        # Codex detector returns HOLD_CODEX_RESPONSE_PENDING.
+        # The post-merge / main-CI detector is irrelevant
+        # here because no CI token is present.
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
