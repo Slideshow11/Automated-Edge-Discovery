@@ -2203,5 +2203,342 @@ class ReanchoredFindingsExtendedCoverageTests(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Section 22: Fix A — strict hold/terminal registry coverage
+#             (Codex 3415107647)
+# ---------------------------------------------------------------------------
+
+
+class StrictHoldTerminalRegistryCoverageTests(unittest.TestCase):
+    """Fix A: the terminal/parked registry is the union of
+    (a) every ``category=hold`` and ``category=terminal``
+    schema state and (b) the spec-required extras
+    (``MERGED``, ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``,
+    ``FAILED``). States with other categories
+    (``informational``, ``mutation_pending``, ``ready``) are
+    NOT terminal/parked and must NOT be in the registry.
+    """
+
+    def test_every_schema_hold_is_terminal(self) -> None:
+        from aed_lifecycle.no_stall import (
+            TERMINAL_LIFECYCLE_STATES,
+            _schema_terminal_or_parked_states,
+        )
+        schema_terminal = _schema_terminal_or_parked_states()
+        for state in schema_terminal:
+            self.assertIn(
+                state,
+                TERMINAL_LIFECYCLE_STATES,
+                f"schema terminal {state!r} missing from "
+                "TERMINAL_LIFECYCLE_STATES",
+            )
+
+    def test_every_schema_non_terminal_is_not_terminal(self) -> None:
+        from aed_lifecycle.no_stall import (
+            TERMINAL_LIFECYCLE_STATES,
+            _schema_non_terminal_states,
+        )
+        schema_non_terminal = _schema_non_terminal_states()
+        # Spec-required extras are allowed even though they
+        # are not in the schema.
+        spec_extras = {"MERGED", "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+                       "FAILED"}
+        for state in schema_non_terminal:
+            if state in spec_extras:
+                continue
+            self.assertNotIn(
+                state,
+                TERMINAL_LIFECYCLE_STATES,
+                f"schema non-terminal {state!r} is incorrectly in "
+                "TERMINAL_LIFECYCLE_STATES",
+            )
+
+    def test_codex_clean_pass_resolve_only_needed_not_terminal(self) -> None:
+        # If present in the schema, must NOT be terminal.
+        from aed_lifecycle.no_stall import is_terminal_lifecycle_state
+        # This is informational / mutation_pending per the
+        # schema. Even if the agent emits a final report
+        # containing this name, the classifier must NOT treat
+        # it as a terminal/parked state.
+        self.assertFalse(
+            is_terminal_lifecycle_state("CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED")
+        )
+
+    def test_codex_clean_pass_not_terminal(self) -> None:
+        from aed_lifecycle.no_stall import is_terminal_lifecycle_state
+        self.assertFalse(is_terminal_lifecycle_state("CODEX_CLEAN_PASS"))
+
+    def test_pr_merged_pending_closeout_not_terminal(self) -> None:
+        from aed_lifecycle.no_stall import is_terminal_lifecycle_state
+        self.assertFalse(
+            is_terminal_lifecycle_state("PR_MERGED_PENDING_CLOSEOUT")
+        )
+
+    def test_not_run_not_terminal(self) -> None:
+        from aed_lifecycle.no_stall import is_terminal_lifecycle_state
+        self.assertFalse(is_terminal_lifecycle_state("NOT_RUN"))
+
+    def test_classifier_does_not_classify_codex_clean_pass_as_terminal(
+        self,
+    ) -> None:
+        # Even an explicit-prefix assertion on
+        # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED must not
+        # classify as OK_TERMINAL — the state is not in the
+        # registry, so is_terminal_lifecycle_state returns
+        # False, and the explicit-assertion path rejects it.
+        text = (
+            "Final lifecycle state: CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_TERMINAL)
+
+
+# ---------------------------------------------------------------------------
+# Section 23: Fix B — canonical next_action extractor (Codex 3415107653)
+# ---------------------------------------------------------------------------
+
+
+class CanonicalNextActionExtractorTests(unittest.TestCase):
+    """Fix B: the ``next_action`` extractor must not consume
+    past the marker's line boundary. A marker on one line
+    followed by a different field on the next line is
+    EMPTY, even if the next field name is well-formed.
+    """
+
+    def test_next_action_then_checkpoint_field_is_empty(self) -> None:
+        text = "next_action:\ncheckpoint: /tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_none_then_checkpoint_is_empty(self) -> None:
+        text = "next_action: none\ncheckpoint: /tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_todo_then_checkpoint_is_empty(self) -> None:
+        text = "next_action: todo\ncheckpoint: /tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_null_is_empty(self) -> None:
+        text = "next_action: null"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_na_is_empty(self) -> None:
+        text = "next_action: n/a"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_checkpoint_field_collision_is_empty(self) -> None:
+        # "checkpoint: /tmp/ckpt.json" is the value, not a
+        # next_action. A naive extractor would consume the
+        # next line and treat "checkpoint" as the value.
+        text = "next_action: checkpoint: /tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_valid_next_action_with_checkpoint_is_progress(self) -> None:
+        # All three required elements:
+        # phase header + valid next_action + checkpoint
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: continue bounded CI polling\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_valid_next_action_poll_codex_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 5 — Codex review.\n"
+            "next_action: poll Codex response\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_valid_next_action_resume_from_checkpoint_is_progress(self) -> None:
+        text = (
+            "Now PHASE 3 — resume from checkpoint.\n"
+            "next_action: resume from checkpoint\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_extractor_returns_actual_string_value(self) -> None:
+        from aed_lifecycle.no_stall import _extract_next_action_value
+
+        # Marker followed by a real value on the same line.
+        self.assertEqual(
+            _extract_next_action_value("next_action: poll Codex response"),
+            "poll",
+        )
+        # Marker followed by nothing on the same line
+        # (the next line is a different field). The
+        # extractor must NOT walk past the newline.
+        self.assertIsNone(
+            _extract_next_action_value(
+                "next_action:\ncheckpoint: /tmp/ckpt.json"
+            )
+        )
+        # No marker at all.
+        self.assertIsNone(_extract_next_action_value("checkpoint: /tmp/x"))
+
+
+# ---------------------------------------------------------------------------
+# Section 24: Fix C — validate watchdog next_action before OK progress
+#             (Codex 3415107657)
+# ---------------------------------------------------------------------------
+
+
+class WatchdogValidatesNextActionTests(unittest.TestCase):
+    """Fix C: ``evaluate_watchdog`` must use the canonical
+    ``is_valid_next_action`` helper. A placeholder
+    ``next_action`` (``"none"``, ``"todo"``, etc.) with a
+    checkpoint path must produce :data:`STALL_RISK`, not
+    :data:`OK_PROGRESS_WITH_NEXT_ACTION`.
+    """
+
+    def _state(self, next_action):
+        return WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+
+    def test_next_action_none_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state(None), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_empty_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state(""), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_whitespace_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state("   "), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_none_placeholder_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state("none"), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_todo_placeholder_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state("todo"), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_next_action_null_placeholder_is_not_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(self._state("null"), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+    def test_valid_next_action_with_checkpoint_is_ok_progress(self) -> None:
+        verdict = evaluate_watchdog(
+            self._state("poll CI status"), now=100.0
+        )
+        self.assertEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_path_without_valid_next_action_is_not_ok_progress(
+        self,
+    ) -> None:
+        verdict = evaluate_watchdog(self._state(None), now=100.0)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertEqual(verdict, STALL_RISK)
+
+
+# ---------------------------------------------------------------------------
+# Section 25: Fix D — checkpoint_requires_operator for absent next_action
+#             (Codex 3415107663)
+# ---------------------------------------------------------------------------
+
+
+class CheckpointRequiresOperatorAbsentNextActionTests(unittest.TestCase):
+    """Fix D: ``checkpoint_requires_operator`` must return
+    True for ``next_action=None`` with a populated
+    ``phase`` (e.g. ``"PHASE_5_CI_POLL"``), not just when
+    both phase and next_action are absent. Only a valid
+    non-placeholder string next_action AND an otherwise
+    structurally valid checkpoint returns False.
+    """
+
+    def _ck(self, next_action, phase="PHASE_5_CI_POLL"):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=phase,
+            completed_phases=[],
+            next_phase="PHASE_6",
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+
+    def test_none_with_phase_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck(None)))
+
+    def test_none_with_phase_5_ci_poll_requires_operator(self) -> None:
+        # The exact case from Codex 3415107663.
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(None, "PHASE_5_CI_POLL"))
+        )
+
+    def test_empty_string_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("")))
+
+    def test_placeholder_requires_operator(self) -> None:
+        for bad in ["none", "todo", "null", "n/a"]:
+            self.assertTrue(checkpoint_requires_operator(self._ck(bad)))
+
+    def test_valid_string_does_not_require_operator(self) -> None:
+        self.assertFalse(
+            checkpoint_requires_operator(self._ck("poll CI status"))
+        )
+
+    def test_next_action_from_checkpoint_returns_hold_for_none(self) -> None:
+        # next_action_from_checkpoint must return
+        # HOLD_OPERATOR_REQUIRED for None, empty, and
+        # placeholder values.
+        for bad in [None, "", "   ", "none", "todo"]:
+            result = next_action_from_checkpoint(self._ck(bad))
+            self.assertIsInstance(result, str)
+            self.assertEqual(result, "HOLD_OPERATOR_REQUIRED")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -420,9 +420,13 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
       :func:`validate_checkpoint` and
       :func:`next_action_from_checkpoint` is used here so the
       three helpers cannot disagree on what counts as a usable
-      next action. Fix D (Codex 3414948261): this case must
-      trigger ``HOLD_OPERATOR_REQUIRED`` rather than fall
-      through to ``False`` and allow silent auto-resume.
+      next action. Fix D (Codex 3414948261 + 3415107663): this
+      case must trigger ``HOLD_OPERATOR_REQUIRED`` rather than
+      fall through to ``False`` and allow silent auto-resume.
+      ``next_action=None`` with a populated ``phase`` (e.g.
+      ``"PHASE_5_CI_POLL"``) is also an absent-action case
+      and must require the operator — the runner cannot
+      auto-resume a phase that has no executable next step.
     """
     # Unknown terminal state is a hold.
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
@@ -430,12 +434,14 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     ):
         return True
 
-    # next_action, if present, must be a valid executable
-    # action. The runner cannot auto-resume against a
-    # non-string / empty / placeholder next_action.
-    if state.next_action is not None and not is_valid_next_action(
-        state.next_action
-    ):
+    # next_action is required to be present AND valid. The
+    # canonical :func:`is_valid_next_action` helper returns
+    # False for None, non-strings, empty / whitespace strings,
+    # and placeholders. ``is_valid_next_action(None)`` is
+    # False, so a ``next_action=None`` with a populated
+    # ``phase`` requires the operator (Fix D, Codex
+    # 3415107663).
+    if not is_valid_next_action(state.next_action):
         return True
 
     # Stale / empty checkpoint.

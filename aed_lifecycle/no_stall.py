@@ -32,7 +32,7 @@ Public API
 from __future__ import annotations
 
 import re
-from typing import FrozenSet
+from typing import FrozenSet, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -95,10 +95,13 @@ explicitly, has no ``next_action``, and no terminal state."""
 TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
     {
         # ---- Original PR #405 task spec ----
-        # Successful close
+        # Successful close — not in the schema, parked by the
+        # no-stall protocol as the runner-done signal.
         "MERGED",
         # Awaiting human authorization — runner is done, work is
         # paused for the operator. A terminal "parked" state.
+        # The schema marks this as category=ready (not hold or
+        # terminal) so it must be added by the protocol.
         "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
         # Hard holds (per the PR #405 task spec)
         "HOLD_NEW_CODEX_THREAD",
@@ -112,11 +115,11 @@ TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
         "HOLD_ISOLATED_WORKSPACE_DIRTY",
         "HOLD_UNEXPECTED_LOCAL_CHANGES",
         "HOLD_OPERATOR_REQUIRED",
-        # Generic failure close
+        # Generic failure close — not in the schema.
         "FAILED",
         # ---- Canonical AED lifecycle registry
-        #      (schemas/aed_lifecycle_states_v1.json) ----
-        # category=hold
+        #      (schemas/aed_lifecycle_states_v1.json),
+        #      category=hold only ----
         "HOLD_MAIN_HEAD_MISMATCH",
         "HOLD_NEW_ACTIVE_THREAD",
         "HOLD_MERGE_STATE_BLOCKED",
@@ -127,14 +130,26 @@ TERMINAL_LIFECYCLE_STATES: FrozenSet[str] = frozenset(
         "AUDIT_APPEND_SKIPPED_NEEDS_OPERATOR",
         "HOLD_RESUME_CHECKPOINT_NEEDED",
         "HOLD_PR_NOT_OPEN",
-        # category=terminal
+        # ---- Canonical AED lifecycle registry, category=terminal ----
         "PR_MERGED_AND_CLOSED_OUT",
-        # category=ready but parked awaiting human
-        # (already listed above: MERGE_READY_AWAITING_HUMAN_AUTHORIZATION)
-        # category=mutation_pending — parked
-        "PR_MERGED_PENDING_CLOSEOUT",
-        # category=informational — parked on a clean Codex pass
-        "CODEX_CLEAN_PASS",
+        # ---- Intentional exclusions (Fix A, Codex 3415107647) ----
+        # NOT included as terminal/parked:
+        #   "CODEX_CLEAN_PASS" — category=informational; the schema
+        #     notes that re-classification with merge/thread state
+        #     is required before authorizing merge. Including it
+        #     as terminal would let a final message assert it and
+        #     cause the runner to stop while closeout or
+        #     re-classification is still required.
+        #   "CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED" — category=
+        #     mutation_pending; resolve-only authorization /
+        #     follow-up is still required. The runner must NOT
+        #     stop on this state.
+        #   "PR_MERGED_PENDING_CLOSEOUT" — category=
+        #     mutation_pending; audit_append and worktree_remove
+        #     are still allowed. The runner must NOT stop on
+        #     this state.
+        #   "NOT_RUN" — category=informational; the initial
+        #     pre-governance state. Not a parked final state.
     }
 )
 
@@ -148,12 +163,110 @@ def is_terminal_lifecycle_state(state: object) -> bool:
     empty string is not a terminal state. Abbreviated state names
     (e.g. ``"MERGE_READY"``) are rejected; the runner must use the
     canonical identifier.
+
+    Fix A (Codex 3415107647): The strict terminal/parked
+    vocabulary is the union of (a) every canonical
+    ``category=hold`` and ``category=terminal`` state in
+    ``schemas/aed_lifecycle_states_v1.json`` and (b) the
+    spec-required extras that are NOT in the schema
+    (``MERGED``, ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``,
+    ``FAILED``). ``CODEX_CLEAN_PASS`` (informational),
+    ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED``
+    (mutation_pending), ``PR_MERGED_PENDING_CLOSEOUT``
+    (mutation_pending), and ``NOT_RUN`` (informational) are
+    intentionally EXCLUDED: those states are not parked
+    final states, and treating them as terminal would let a
+    final message stop the runner while closeout or
+    re-classification is still required.
     """
     if not isinstance(state, str):
         return False
     if not state:
         return False
     return state in TERMINAL_LIFECYCLE_STATES
+
+
+# Canonical coverage helpers used by the schema-driven tests
+# and the strict registry guard. The terminal/parked
+# vocabulary is the union of (a) every ``category=hold`` and
+# ``category=terminal`` state in the schema and (b) the
+# spec-required extras. The non-terminal vocabulary is the
+# complement — every other schema state, which must NOT
+# classify as terminal.
+_SPEC_REQUIRED_EXTRAS: FrozenSet[str] = frozenset(
+    {
+        # Successful close / failure close / human-authorization
+        # parked. These are runner-done signals, not canonical
+        # schema states.
+        "MERGED",
+        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        "FAILED",
+    }
+)
+
+
+def _load_schema_states() -> dict:
+    """Load the canonical lifecycle registry from the schema.
+
+    Lazy / best-effort: reads
+    ``schemas/aed_lifecycle_states_v1.json`` relative to the
+    repo root. Returns an empty dict if the file is missing
+    or unreadable (the calling test is opt-in). This is the
+    single canonical entry point so all coverage checks read
+    the schema the same way.
+    """
+    import json
+    from pathlib import Path
+
+    try:
+        schema_path = (
+            Path(__file__).resolve().parent.parent
+            / "schemas"
+            / "aed_lifecycle_states_v1.json"
+        )
+        return json.loads(schema_path.read_text()).get("states", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def _schema_terminal_or_parked_states() -> FrozenSet[str]:
+    """Return the schema states that are category=hold or category=terminal.
+
+    The function is the source of truth for what the schema
+    considers a parked / held final state. Used by the
+    coverage test to assert every schema hold/terminal state
+    is in :data:`TERMINAL_LIFECYCLE_STATES`, and to assert
+    every non-hold/non-terminal schema state is NOT in
+    :data:`TERMINAL_LIFECYCLE_STATES`.
+    """
+    states = _load_schema_states()
+    return frozenset(
+        name
+        for name, defn in states.items()
+        if defn.get("category") in {"hold", "terminal"}
+    )
+
+
+def _schema_non_terminal_states() -> FrozenSet[str]:
+    """Return the schema states that are NOT category=hold or category=terminal.
+
+    The function is the source of truth for what the schema
+    considers a non-final, in-progress, or
+    re-classification-required state. Used by the coverage
+    test to assert none of them are in
+    :data:`TERMINAL_LIFECYCLE_STATES`. Includes
+    ``NOT_RUN`` (informational), ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+    (ready), ``PR_MERGED_PENDING_CLOSEOUT`` and
+    ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED``
+    (mutation_pending), and ``CODEX_CLEAN_PASS``
+    (informational).
+    """
+    states = _load_schema_states()
+    return frozenset(
+        name
+        for name, defn in states.items()
+        if defn.get("category") not in {"hold", "terminal"}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -228,41 +341,88 @@ _NEXT_ACTION_EMPTY_VALUES = (
 )
 
 
+def _extract_next_action_value(text: str) -> Optional[str]:
+    """Return the first real ``next_action`` value found in ``text``.
+
+    The function is the canonical extractor for a
+    ``next_action:`` (or similar) marker. It scans ``text``
+    line-by-line and, for each marker that is present, returns
+    the first whitespace-delimited token immediately after the
+    marker on the SAME line. The scan stops at the end of the
+    marker's line — a marker followed by a newline is
+    considered empty, even if the next line is a different
+    field (e.g. ``checkpoint: /tmp/ckpt.json``).
+
+    The return value is the raw string token, with no
+    stripping applied (the caller is expected to call
+    :func:`is_valid_next_action` on it). The token is
+    lowercased only for placeholder comparison; the
+    placeholder check itself is delegated to
+    :func:`is_valid_next_action`. ``None`` is returned iff
+    no marker is found, or every marker is followed by an
+    empty / placeholder / no-value line.
+
+    Fix B (Codex 3415107653): The previous implementation
+    used ``str.lstrip()`` which consumes newlines and
+    treated the next field name as the action value. For
+    example, ``"next_action:\\ncheckpoint: /tmp/ckpt.json"``
+    yielded ``has_next_action=True`` because ``lstrip()``
+    walked past the newline. The new implementation splits
+    on newlines and only inspects the same-line remainder
+    after each marker.
+    """
+    for raw_line in text.splitlines():
+        line = raw_line
+        for marker in _NEXT_ACTION_TOKENS:
+            idx = line.find(marker)
+            if idx < 0:
+                continue
+            after = line[idx + len(marker):]
+            stripped = after.lstrip()
+            if not stripped:
+                # Marker is the last token on the line — empty
+                # value, keep scanning for other markers.
+                continue
+            # Pull the first whitespace-delimited token on
+            # the same line. Stop at any non-identifier
+            # delimiter (whitespace, comma, semicolon, close
+            # brackets, paren, colon) so a value like
+            # ``"checkpoint: /tmp/ckpt.json"`` extracts as
+            # ``"checkpoint"`` rather than the full string.
+            token_end = len(stripped)
+            for j, ch in enumerate(stripped):
+                if ch.isspace() or ch in ",;]})\n:":
+                    token_end = j
+                    break
+            first_token = stripped[:token_end]
+            return first_token
+    return None
+
+
 def _has_next_action_with_value(text: str) -> bool:
     """Return True iff ``text`` contains a ``next_action:`` (or
     similar) marker followed by a non-empty, non-placeholder
     value.
 
-    The check is per-marker: each ``next_action:`` occurrence
-    must be followed by at least one non-whitespace,
-    non-placeholder character. This prevents the
-    no-continuation stall case the classifier is meant to
+    The check is per-marker, per-line: each ``next_action:``
+    occurrence must be followed by at least one non-whitespace,
+    non-placeholder character ON THE SAME LINE. This prevents
+    the no-continuation stall case the classifier is meant to
     reject, where the agent emits ``next_action:`` with no
-    concrete value (e.g. ``next_action:`` or
-    ``next_action: none``).
+    concrete value (e.g. ``next_action:`` or ``next_action:
+    none``), or where a bare ``next_action:`` is followed by a
+    newline and the next field name is the value
+    (``"next_action:\\ncheckpoint: /tmp/ckpt.json"``).
+
+    The actual extraction is delegated to
+    :func:`_extract_next_action_value`, which is the single
+    canonical extractor. The validity check is delegated to
+    :func:`is_valid_next_action`.
     """
-    for marker in _NEXT_ACTION_TOKENS:
-        idx = 0
-        while True:
-            pos = text.find(marker, idx)
-            if pos < 0:
-                break
-            after = text[pos + len(marker):]
-            stripped = after.lstrip()
-            if not stripped:
-                idx = pos + len(marker)
-                continue
-            # Pull the first whitespace-delimited token.
-            token_end = len(stripped)
-            for j, ch in enumerate(stripped):
-                if ch.isspace() or ch in ",;]})\n":
-                    token_end = j
-                    break
-            first_token = stripped[:token_end].lower()
-            if first_token and first_token not in _NEXT_ACTION_EMPTY_VALUES:
-                return True
-            idx = pos + len(marker)
-    return False
+    value = _extract_next_action_value(text)
+    if value is None:
+        return False
+    return is_valid_next_action(value)
 
 
 def _contains_any(text: str, needles: tuple) -> bool:
@@ -352,34 +512,75 @@ _PLACEHOLDER_NEXT_ACTIONS = frozenset(
 def is_valid_next_action(value: object) -> bool:
     """Return True iff ``value`` is a usable ``next_action``.
 
-    Fix D (Codex 3414948261): The single canonical
-    next-action validity check used by every helper that
-    needs to decide whether a ``next_action`` field is safe
-    to act on. A ``next_action`` is valid iff:
+    Fix D (Codex 3414948261) + Fix B (Codex 3415107653): The
+    single canonical next-action validity check used by every
+    helper that needs to decide whether a ``next_action``
+    field is safe to act on. A ``next_action`` is valid iff:
 
     - it is a string (``isinstance(value, str)``)
     - after ``str.strip()`` it is non-empty
     - its lowercased, stripped form is NOT a placeholder
       (``none``, ``null``, ``nil``, ``n/a``, ``na``, ``todo``,
       ``tbd``, ``tba``)
+    - its lowercased, stripped form is NOT itself a field
+      name. The set of rejected field names is the documented
+      no-stall-protocol field set: ``next_action``,
+      ``next_step``, ``checkpoint``, ``phase``, ``terminal``,
+      ``state``, ``lifecycle``, ``next_phase``,
+      ``pending_actions``, ``updated_at``. A value that
+      matches one of these is treated as a field-name
+      collision (``next_action: checkpoint: /tmp/ckpt.json``)
+      and is rejected. This catches the case where the agent
+      misuses a field as a value rather than treating the
+      marker as a no-value placeholder.
 
     Anything else — ``None``, ``""``, ``"   "``, ``"none"``,
-    ``"todo"``, ``123``, ``[]``, ``{}`` — is invalid.
+    ``"todo"``, ``"checkpoint"``, ``123``, ``[]``, ``{}`` —
+    is invalid.
 
     Used by :func:`validate_checkpoint` (in checkpoint.py),
-    :func:`next_action_from_checkpoint`, and
-    :func:`checkpoint_requires_operator` so the three
+    :func:`next_action_from_checkpoint`,
+    :func:`checkpoint_requires_operator`, and
+    :func:`evaluate_watchdog` (in watchdog.py) so the four
     helpers cannot disagree on what counts as a usable
-    next action. Used by the message classifier only as a
-    sanity check, since the classifier is text-shaped and
-    operates on substrings, not on field values.
+    next action. Used by the message classifier as a sanity
+    check via :func:`_has_next_action_with_value`, since the
+    classifier is text-shaped and operates on substrings, not
+    on field values.
     """
     if not isinstance(value, str):
         return False
     stripped = value.strip()
     if not stripped:
         return False
-    return stripped.lower() not in _PLACEHOLDER_NEXT_ACTIONS
+    lower = stripped.lower()
+    if lower in _PLACEHOLDER_NEXT_ACTIONS:
+        return False
+    if lower in _FIELD_NAME_NEXT_ACTIONS:
+        return False
+    return True
+
+
+# Field-name tokens that must not appear as a next_action
+# value. A next_action value that looks like another protocol
+# field name is almost certainly a misuse (``next_action:
+# checkpoint: /tmp/ckpt.json``) and is rejected. This set is
+# the documented no-stall-protocol field vocabulary; new
+# field names added to the protocol should be added here.
+_FIELD_NAME_NEXT_ACTIONS: FrozenSet[str] = frozenset(
+    {
+        "next_action",
+        "next_step",
+        "checkpoint",
+        "phase",
+        "terminal",
+        "state",
+        "lifecycle",
+        "next_phase",
+        "pending_actions",
+        "updated_at",
+    }
+)
 
 
 def _line_has_explicit_terminal_assertion(line: str) -> bool:

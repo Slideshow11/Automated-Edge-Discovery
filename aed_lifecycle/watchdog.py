@@ -18,7 +18,10 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
-from .no_stall import is_terminal_lifecycle_state
+from .no_stall import (
+    is_terminal_lifecycle_state,
+    is_valid_next_action,
+)
 
 
 # Verdict constants
@@ -181,10 +184,22 @@ def evaluate_watchdog(state: WatchdogState, now: float) -> str:
        → :data:`WATCHDOG_PROGRESS_REQUIRED`.
     4. ``terminal_state`` is set but unrecognized → treat as
        a hold. Recommend :data:`HOLD_OPERATOR_REQUIRED`.
-    5. No terminal_state AND no next_action AND no
+    5. No terminal_state AND no valid next_action AND no
        checkpoint_path → :data:`STALL_RISK`.
-    6. Otherwise (next_action + checkpoint_path) →
+    6. Otherwise (valid next_action + checkpoint_path) →
        :data:`OK_PROGRESS_WITH_NEXT_ACTION`.
+
+    Fix C (Codex 3415107657): ``evaluate_watchdog`` must
+    use the canonical :func:`is_valid_next_action` helper
+    instead of a truthiness check. A ``next_action`` of
+    ``""``, ``"   "``, ``"none"``, ``"null"``, ``"todo"``,
+    or any other placeholder is treated as INVALID and
+    produces :data:`STALL_RISK` rather than
+    :data:`OK_PROGRESS_WITH_NEXT_ACTION`. ``None`` and
+    non-string values are also invalid. The watchdog is
+    therefore consistent with ``validate_checkpoint``,
+    ``next_action_from_checkpoint``, and
+    ``checkpoint_requires_operator`.
     """
     # 1. Recognized terminal state
     if state.terminal_state is not None and is_terminal_lifecycle_state(
@@ -211,16 +226,23 @@ def evaluate_watchdog(state: WatchdogState, now: float) -> str:
     if elapsed_idle > state.max_idle_seconds:
         return WATCHDOG_PROGRESS_REQUIRED
 
-    # 5. No checkpoint_path OR no next_action — runner is at risk
-    # of stalling. OK_PROGRESS_WITH_NEXT_ACTION requires BOTH
-    # fields to be present: a checkpoint without a next_action
-    # is the checkpoint-without-continuation stall case the
-    # protocol is trying to catch, and a next_action without
-    # a checkpoint has no resume point.
-    if not state.checkpoint_path or not state.next_action:
+    # 5. No checkpoint_path OR no valid next_action — runner is
+    # at risk of stalling. OK_PROGRESS_WITH_NEXT_ACTION
+    # requires BOTH fields to be present AND the next_action
+    # must be a valid executable action (canonical
+    # is_valid_next_action check). A checkpoint without a
+    # valid next_action is the checkpoint-without-continuation
+    # stall case the protocol is trying to catch, and a
+    # next_action without a checkpoint has no resume point.
+    # A placeholder / empty / whitespace / non-string
+    # next_action is treated the same as a missing one.
+    has_valid_checkpoint = bool(state.checkpoint_path)
+    has_valid_next_action = is_valid_next_action(state.next_action)
+    if not has_valid_checkpoint or not has_valid_next_action:
         return STALL_RISK
 
-    # 6. Mid-progress with a next_action and a checkpoint_path
+    # 6. Mid-progress with a valid next_action and a
+    # checkpoint_path
     return OK_PROGRESS_WITH_NEXT_ACTION
 
 
