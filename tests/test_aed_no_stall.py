@@ -4033,5 +4033,210 @@ class NonEmptyCheckpointValueWatchdogTests(unittest.TestCase):
         self.assertEqual(verdict, OK_TERMINAL)
 
 
+class BareCheckpointMarkerRejectionTests(unittest.TestCase):
+    """Regression tests for Codex 3417105899.
+
+    The value-bearing checkpoint parser must reject bare
+    ``Checkpoint `` / ``checkpoint `` markers (no colon,
+    no equals) because a status phrase like
+    ``Checkpoint pending`` or
+    ``Checkpoint file will be written later`` would
+    otherwise be treated as having a real checkpoint
+    value. The classifier requires an explicit path/value
+    marker (``checkpoint:``, ``checkpoint_path:``,
+    ``checkpoint_path=``, ``checkpoint=``, ``checkpoint =``)
+    for OK_PROGRESS_WITH_NEXT_ACTION. Bare prose
+    references may still count for the broad
+    STALL_NO_CHECKPOINT branch but NOT for the value-bearing
+    OK_PROGRESS branch.
+    """
+
+    def test_checkpoint_pending_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint pending"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_file_will_be_written_later_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint file will be written later"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_missing_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint missing"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_lowercase_checkpoint_pending_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint pending"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_needed_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint still needed"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_todo_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint todo"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_checkpoint_created_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint created"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_status_words_alone_are_not_progress(self) -> None:
+        # The bare status words ``pending``, ``file``,
+        # ``missing``, ``needed``, ``later``, ``written``,
+        # ``created`` are never valid checkpoint paths. The
+        # extractor must not classify them as such.
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for status_word in [
+            "pending",
+            "file",
+            "missing",
+            "needed",
+            "later",
+            "written",
+            "created",
+            "checkpoint",
+        ]:
+            text = (
+                "Starting PHASE 2.\n"
+                "next_action: poll CI\n"
+                f"Checkpoint {status_word}"
+            )
+            # The extractor must not find a real value
+            # when the value is a status word.
+            value = _extract_checkpoint_value(text)
+            self.assertIsNone(
+                value,
+                f"status word {status_word!r} should not "
+                f"extract as a value: got {value!r}",
+            )
+            # And the classifier must not return
+            # OK_PROGRESS_WITH_NEXT_ACTION.
+            verdict = classify_humphry_message_for_stall(text)
+            self.assertNotEqual(
+                verdict,
+                OK_PROGRESS_WITH_NEXT_ACTION,
+                f"status word {status_word!r} should not "
+                f"classify as OK_PROGRESS: got {verdict!r}",
+            )
+
+    def test_checkpoint_colon_value_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "Checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_lowercase_colon_value_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_path_equals_value_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_space_equals_value_is_progress(self) -> None:
+        # The new ``checkpoint =`` (with space before =)
+        # form must be accepted.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint = /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_broad_prose_checkpoint_file_remains_stall(self) -> None:
+        # The STALL_NO_CHECKPOINT branch still treats a
+        # prose mention as a checkpoint reference. A
+        # message like ``Wrote checkpoint file but no
+        # next_action specified.`` continues to classify
+        # as STALL_NO_CHECKPOINT because the runner wrote
+        # a checkpoint but provided no value-bearing
+        # resume point.
+        text = "Wrote checkpoint file but no next_action specified."
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            STALL_NO_CHECKPOINT,
+        )
+
+    def test_parser_does_not_consume_next_action(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        text = (
+            "Checkpoint: /tmp/ckpt.json\n"
+            "next_action: poll CI"
+        )
+        value = _extract_checkpoint_value(text)
+        self.assertEqual(value, "/tmp/ckpt.json")
+        self.assertNotIn("next_action", value or "")
+        self.assertNotIn("poll", value or "")
+
+    def test_parser_does_not_consume_terminal_state(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        text = (
+            "checkpoint: /tmp/ckpt.json\n"
+            "terminal_state: MERGED"
+        )
+        value = _extract_checkpoint_value(text)
+        self.assertEqual(value, "/tmp/ckpt.json")
+        self.assertNotIn("terminal_state", value or "")
+        self.assertNotIn("MERGED", value or "")
+
+
 if __name__ == "__main__":
     unittest.main()

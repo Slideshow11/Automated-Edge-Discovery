@@ -514,7 +514,7 @@ _CHECKPOINT_MARKERS = (
     "checkpoint=",
     "checkpoint:",
     "Checkpoint:",
-    "Checkpoint ",
+    "checkpoint =",
 )
 
 
