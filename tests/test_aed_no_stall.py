@@ -2689,5 +2689,228 @@ class TerminalCheckpointSkipsHeadDriftTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
 
+# ---------------------------------------------------------------------------
+# Section 27: Fix A — completed terminal checkpoints do not require operator
+#             (Codex 3415657744)
+# ---------------------------------------------------------------------------
+
+
+class CompletedTerminalDoesNotRequireOperatorTests(unittest.TestCase):
+    """Codex 3415657744: ``checkpoint_requires_operator``
+    must return False for a recognized COMPLETED terminal
+    state (e.g. ``MERGED``, ``FAILED``,
+    ``PR_MERGED_AND_CLOSED_OUT``) BEFORE the next-action
+    validity check. Parked/hold terminal states
+    (``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``,
+    ``HOLD_OPERATOR_REQUIRED``, all ``HOLD_*`` schema
+    states) still require operator attention.
+    """
+
+    def _ck(self, terminal_state, next_action=None, phase="PHASE_8"):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=phase,
+            completed_phases=[],
+            next_phase=None,
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=terminal_state,
+            updated_at=None,
+        )
+
+    def test_merged_does_not_require_operator(self) -> None:
+        # Spec: completed terminal extras are not in schema
+        # but are still completed.
+        self.assertFalse(
+            checkpoint_requires_operator(self._ck("MERGED"))
+        )
+
+    def test_failed_does_not_require_operator(self) -> None:
+        # Spec: FAILED is a completed extra.
+        self.assertFalse(
+            checkpoint_requires_operator(self._ck("FAILED"))
+        )
+
+    def test_pr_merged_and_closed_out_does_not_require_operator(self) -> None:
+        # Canonical schema category=terminal state.
+        self.assertFalse(
+            checkpoint_requires_operator(self._ck("PR_MERGED_AND_CLOSED_OUT"))
+        )
+
+    def test_hold_operator_required_requires_operator(self) -> None:
+        # Parked/hold state: runner must surface to operator.
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck("HOLD_OPERATOR_REQUIRED"))
+        )
+
+    def test_merge_ready_awaiting_human_authorization_requires_operator(
+        self,
+    ) -> None:
+        # Parked, awaiting-human. NOT a completed state.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck("MERGE_READY_AWAITING_HUMAN_AUTHORIZATION")
+            )
+        )
+
+    def test_unknown_terminal_state_requires_operator(self) -> None:
+        # An unrecognized terminal state is a hold.
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck("NOT_A_REAL_STATE"))
+        )
+
+    def test_non_terminal_with_no_next_action_requires_operator(self) -> None:
+        # Non-terminal with absent next_action: the
+        # runner cannot auto-resume. The original
+        # behavior (Fix D, Codex 3415107663) still
+        # applies for non-terminal checkpoints.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(terminal_state=None, next_action=None)
+            )
+        )
+
+    def test_non_terminal_with_valid_next_action_does_not_require_operator(
+        self,
+    ) -> None:
+        self.assertFalse(
+            checkpoint_requires_operator(
+                self._ck(terminal_state=None, next_action="poll CI")
+            )
+        )
+
+    def test_is_completed_terminal_state_helper(self) -> None:
+        from aed_lifecycle.no_stall import is_completed_terminal_state
+        # Completed
+        self.assertTrue(is_completed_terminal_state("MERGED"))
+        self.assertTrue(is_completed_terminal_state("FAILED"))
+        self.assertTrue(
+            is_completed_terminal_state("PR_MERGED_AND_CLOSED_OUT")
+        )
+        # NOT completed
+        self.assertFalse(
+            is_completed_terminal_state("MERGE_READY_AWAITING_HUMAN_AUTHORIZATION")
+        )
+        self.assertFalse(is_completed_terminal_state("HOLD_OPERATOR_REQUIRED"))
+        self.assertFalse(is_completed_terminal_state("HOLD_PR_CI_PENDING"))
+        # Non-string / empty / None
+        self.assertFalse(is_completed_terminal_state(None))
+        self.assertFalse(is_completed_terminal_state(""))
+        self.assertFalse(is_completed_terminal_state(123))
+
+
+# ---------------------------------------------------------------------------
+# Section 28: Fix B — terminal_state final-output assertions
+#             (Codex 3415657751)
+# ---------------------------------------------------------------------------
+
+
+class TerminalStateFinalOutputAssertionTests(unittest.TestCase):
+    """Codex 3415657751: the classifier must recognize
+    ``terminal_state: <STATE>`` and ``terminal_state=<STATE>``
+    (with optional whitespace around ``=``) as explicit
+    terminal-state assertions, so a real done signal like
+    ``terminal_state: MERGED`` or
+    ``terminal_state=HOLD_PR_CI_PENDING`` classifies as
+    ``OK_TERMINAL`` rather than a ``STALL_*`` result.
+    Placeholder values, missing values, and non-terminal
+    states are still rejected.
+    """
+
+    def test_terminal_state_colon_merged_is_terminal(self) -> None:
+        self.assertEqual(
+            classify_humphry_message_for_stall("terminal_state: MERGED"),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_equals_hold_pr_ci_pending_is_terminal(self) -> None:
+        self.assertEqual(
+            classify_humphry_message_for_stall(
+                "terminal_state=HOLD_PR_CI_PENDING"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_spaced_equals_with_explanation(self) -> None:
+        self.assertEqual(
+            classify_humphry_message_for_stall(
+                "terminal_state = HOLD_NEW_CODEX_THREAD — "
+                "waiting for operator"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_colon_empty_not_terminal(self) -> None:
+        self.assertNotEqual(
+            classify_humphry_message_for_stall("terminal_state:"),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_colon_none_not_terminal(self) -> None:
+        self.assertNotEqual(
+            classify_humphry_message_for_stall("terminal_state: none"),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_colon_todo_not_terminal(self) -> None:
+        self.assertNotEqual(
+            classify_humphry_message_for_stall("terminal_state: todo"),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_equals_codex_clean_pass_not_terminal(self) -> None:
+        # CODEX_CLEAN_PASS is informational / non-terminal.
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(
+                "terminal_state=CODEX_CLEAN_PASS"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_equals_pr_merged_pending_closeout_not_terminal(
+        self,
+    ) -> None:
+        # PR_MERGED_PENDING_CLOSEOUT is mutation_pending /
+        # non-terminal.
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(
+                "terminal_state=PR_MERGED_PENDING_CLOSEOUT"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_existing_final_lifecycle_state_still_works(self) -> None:
+        # Regression: previous prefixes still work.
+        self.assertEqual(
+            classify_humphry_message_for_stall(
+                "Final lifecycle state: HOLD_NEW_CODEX_THREAD"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_existing_terminal_state_colon_still_works(self) -> None:
+        # Regression: the original Terminal state: prefix.
+        self.assertEqual(
+            classify_humphry_message_for_stall(
+                "Terminal state: HOLD_PR_CI_PENDING"
+            ),
+            OK_TERMINAL,
+        )
+
+    def test_exact_state_alone_still_works(self) -> None:
+        # Regression: bare state on a line by itself.
+        self.assertEqual(
+            classify_humphry_message_for_stall("MERGED"),
+            OK_TERMINAL,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

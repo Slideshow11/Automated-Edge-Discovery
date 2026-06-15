@@ -59,6 +59,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .no_stall import (
+    is_completed_terminal_state,
     is_terminal_lifecycle_state,
     is_valid_next_action,
 )
@@ -467,12 +468,43 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
       ``"PHASE_5_CI_POLL"``) is also an absent-action case
       and must require the operator — the runner cannot
       auto-resume a phase that has no executable next step.
+
+    Fix A (Codex 3415657744): a checkpoint that is parked
+    on a RECOGNIZED COMPLETED terminal state
+    (e.g. ``"MERGED"``, ``"FAILED"``,
+    ``"PR_MERGED_AND_CLOSED_OUT"``) does NOT require
+    operator intervention. The runner stops on the terminal
+    state and the operator has already authorized the
+    close. The check is short-circuited BEFORE the
+    next-action validity check, so a checkpoint with
+    ``terminal_state="MERGED"`` and
+    ``next_action=None`` correctly returns ``False``.
+
+    Parked/hold terminal states (e.g.
+    ``"MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"``,
+    ``"HOLD_OPERATOR_REQUIRED"``, all ``HOLD_*`` schema
+    states) are NOT completed and keep their operator
+    semantics — the runner must surface them to the
+    operator, even when ``next_action`` is None.
     """
     # Unknown terminal state is a hold.
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
         state.terminal_state
     ):
         return True
+
+    # Fix A (Codex 3415657744): completed terminal
+    # states short-circuit before the next-action
+    # validity check. A checkpoint with a recognized
+    # completed terminal_state is fully done — the
+    # runner stops and the operator is NOT required to
+    # intervene. ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+    # and ``HOLD_*`` states are NOT completed, so they
+    # fall through to the next-action check and surface
+    # as ``HOLD_OPERATOR_REQUIRED`` (the parked/awaiting
+    # semantics).
+    if is_completed_terminal_state(state.terminal_state):
+        return False
 
     # next_action is required to be present AND valid. The
     # canonical :func:`is_valid_next_action` helper returns

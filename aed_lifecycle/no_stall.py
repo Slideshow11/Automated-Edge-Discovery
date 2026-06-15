@@ -269,6 +269,64 @@ def _schema_non_terminal_states() -> FrozenSet[str]:
     )
 
 
+# Completed / closed terminal states that mark the
+# checkpoint as fully done. The runner stops on these
+# states; the operator is NOT required to intervene (Fix
+# A, Codex 3415657744).
+#
+# The set is the union of:
+#   - every canonical ``category=terminal`` schema state
+#     (``PR_MERGED_AND_CLOSED_OUT``)
+#   - the spec-required completed extras that are NOT in
+#     the schema: ``MERGED`` (successful close) and
+#     ``FAILED`` (generic failure close)
+#
+# Parked/hold terminal states (e.g.
+# ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``,
+# ``HOLD_OPERATOR_REQUIRED``, all ``HOLD_*`` schema
+# states) are EXCLUDED: they still require operator
+# attention. The runner does not auto-resume against a
+# parked/awaiting-human checkpoint, even if
+# ``next_action`` is None.
+_COMPLETED_TERMINAL_STATES: FrozenSet[str] = frozenset(
+    {
+        # Spec-required completed extras (not in schema).
+        "MERGED",
+        "FAILED",
+        # Canonical schema category=terminal state.
+        "PR_MERGED_AND_CLOSED_OUT",
+    }
+)
+
+
+def is_completed_terminal_state(state: object) -> bool:
+    """Return True iff ``state`` is a completed/closed terminal state.
+
+    A completed terminal state marks the checkpoint as
+    fully done — the runner stops and the operator is NOT
+    required to intervene. This is a strict subset of
+    :func:`is_terminal_lifecycle_state`: parked/awaiting
+    terminal states (e.g.
+    ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``,
+    ``HOLD_OPERATOR_REQUIRED``, all ``HOLD_*`` states)
+    are NOT completed terminal states and still require
+    operator attention.
+
+    Fix A (Codex 3415657744): this distinction is what
+    ``checkpoint_requires_operator`` uses to decide
+    whether a terminal-state checkpoint should require
+    operator intervention. ``MERGED`` and
+    ``PR_MERGED_AND_CLOSED_OUT`` are completed.
+    ``HOLD_OPERATOR_REQUIRED`` is parked — the operator
+    must intervene.
+    """
+    if not isinstance(state, str):
+        return False
+    if not state:
+        return False
+    return state in _COMPLETED_TERMINAL_STATES
+
+
 # ---------------------------------------------------------------------------
 # classify_humphry_message_for_stall
 # ---------------------------------------------------------------------------
@@ -492,12 +550,29 @@ _DISQUALIFYING_TOKENS = (
 # leading whitespace) with one of these prefixes and a
 # recognized terminal state is treated as an explicit
 # assertion.
+#
+# Fix B (Codex 3415657751): the documented
+# checkpoint-protocol field prefix ``terminal_state:`` /
+# ``terminal_state=`` is added so a final-output signal
+# like ``terminal_state: MERGED`` or
+# ``terminal_state=HOLD_PR_CI_PENDING`` classifies as
+# ``OK_TERMINAL`` instead of being rejected as a stall.
+# The field-name variants are accepted with or without
+# surrounding whitespace around the ``=`` separator
+# (``terminal_state=MERGED`` and ``terminal_state = MERGED``
+# are both valid).
 _ASSERTION_PREFIXES = (
     "Final lifecycle state:",
     "Final state:",
     "Terminal state:",
     "Lifecycle state:",
     "State:",
+    "terminal_state:",
+    "terminal_state=",
+    "terminal_state =",
+    "Terminal State:",
+    "TERMINAL_STATE:",
+    "TERMINAL_STATE=",
 )
 
 
