@@ -345,8 +345,41 @@ _ASSERTION_PREFIXES = (
 # Mirrors ``_NEXT_ACTION_EMPTY_VALUES`` in
 # :mod:`aed_lifecycle.no_stall` for cross-module consistency.
 _PLACEHOLDER_NEXT_ACTIONS = frozenset(
-    {"none", "null", "n/a", "todo", "tbd", "tba"}
+    {"none", "null", "n/a", "na", "todo", "tbd", "tba", "nil"}
 )
+
+
+def is_valid_next_action(value: object) -> bool:
+    """Return True iff ``value`` is a usable ``next_action``.
+
+    Fix D (Codex 3414948261): The single canonical
+    next-action validity check used by every helper that
+    needs to decide whether a ``next_action`` field is safe
+    to act on. A ``next_action`` is valid iff:
+
+    - it is a string (``isinstance(value, str)``)
+    - after ``str.strip()`` it is non-empty
+    - its lowercased, stripped form is NOT a placeholder
+      (``none``, ``null``, ``nil``, ``n/a``, ``na``, ``todo``,
+      ``tbd``, ``tba``)
+
+    Anything else — ``None``, ``""``, ``"   "``, ``"none"``,
+    ``"todo"``, ``123``, ``[]``, ``{}`` — is invalid.
+
+    Used by :func:`validate_checkpoint` (in checkpoint.py),
+    :func:`next_action_from_checkpoint`, and
+    :func:`checkpoint_requires_operator` so the three
+    helpers cannot disagree on what counts as a usable
+    next action. Used by the message classifier only as a
+    sanity check, since the classifier is text-shaped and
+    operates on substrings, not on field values.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    return stripped.lower() not in _PLACEHOLDER_NEXT_ACTIONS
 
 
 def _line_has_explicit_terminal_assertion(line: str) -> bool:
@@ -354,7 +387,9 @@ def _line_has_explicit_terminal_assertion(line: str) -> bool:
 
     A line is an explicit assertion when one of the following
     holds AND the line does not contain a disqualifying
-    negation / future / uncertainty token:
+    negation / future / uncertainty token in the AMBIGUOUS
+    PART of the line (i.e. before the asserted state, or in
+    a bare-state mention):
 
     - The line, after stripping leading whitespace, is
       exactly a terminal state name.
@@ -367,42 +402,93 @@ def _line_has_explicit_terminal_assertion(line: str) -> bool:
     - The line starts with a terminal state name followed by
       an em-dash (e.g. ``"HOLD_PR_CI_PENDING — bounded polling
       reached limit"``).
+
+    Fix B (Codex 3414948252): The disqualifying-token scan is
+    scoped to the ambiguous portion of the line (the part
+    BEFORE an explicit assertion prefix or em-dash separator),
+    not the entire line. The explanation after a valid
+    assertion is allowed to contain words like ``"no"``,
+    ``"not"``, ``"missing"``, or ``"after"`` without
+    invalidating the assertion. For example::
+
+        "Final lifecycle state: HOLD_RESUME_CHECKPOINT_NEEDED — no next_action/checkpoint"
+        "Terminal state: HOLD_OPERATOR_REQUIRED — missing checkpoint"
+        "Lifecycle state: HOLD_PR_CI_PENDING — no final check result"
+        "MERGED after operator merge"
+
+    are all valid explicit assertions, and the disqualifier
+    must not fire on the explanatory text.
+
+    The disqualifier still applies in full to BARE / AMBIGUOUS
+    mentions like::
+
+        "Not MERGED yet"
+        "No MERGED state yet"
+        "will be MERGED after review"
+        "next state might be HOLD_PR_CI_PENDING"
+
+    where the line is a generic statement about the state of
+    the run rather than a structured assertion.
     """
     s = line.strip()
     if not s:
         return False
 
-    # Disqualify any line that contains a negation, future,
-    # or uncertainty token. The check is case-insensitive.
-    lower = s.lower()
-    for tok in _DISQUALIFYING_TOKENS:
-        if tok in lower:
-            return False
-
-    # Check 1: line is exactly a terminal state.
+    # Check 1: line is exactly a terminal state. A bare state
+    # mention is always ambiguous — any negation/future token
+    # anywhere in the line disqualifies it.
     if is_terminal_lifecycle_state(s):
-        return True
+        return _has_no_disqualifying_tokens(s)
 
-    # Check 2: explicit assertion prefix.
+    # Check 2: explicit assertion prefix. The state token is the
+    # first word after the prefix; the explanation that follows
+    # is allowed to contain disqualifying tokens.
     for prefix in _ASSERTION_PREFIXES:
         if s.startswith(prefix):
             rest = s[len(prefix):].strip()
             if not rest:
                 continue
-            # First token is the candidate state.
+            # First token is the candidate state. Trailing
+            # punctuation (e.g. trailing comma) is stripped.
             first_token = rest.split(None, 1)[0].rstrip(",;:.—")
             if is_terminal_lifecycle_state(first_token):
-                return True
+                # The ambiguous portion is the prefix-and-state
+                # span only; the explanation is ignored.
+                ambiguous = s[: len(prefix) + len(first_token)]
+                return _has_no_disqualifying_tokens(ambiguous)
 
     # Check 3: state at start of line, followed by an em-dash
-    # separator. This handles lines like
-    # ``"HOLD_PR_CI_PENDING — bounded polling reached limit"``.
+    # separator. The em-dash and everything after it is the
+    # explanation; the disqualifier is scoped to the
+    # state-and-anything-before-em-dash span.
     for state in TERMINAL_LIFECYCLE_STATES:
         for sep in (" — ", "—"):
             if s.startswith(state + sep):
-                return True
+                # The ambiguous portion is the state token plus
+                # any leading context BEFORE the state. We
+                # conservatively scope to just the state span
+                # since lines of this form are typically
+                # ``"STATE — explanation"`` with no leading
+                # context.
+                ambiguous = state
+                return _has_no_disqualifying_tokens(ambiguous)
 
     return False
+
+
+def _has_no_disqualifying_tokens(text: str) -> bool:
+    """Return True iff ``text`` contains no negation / future / uncertainty token.
+
+    Used by :func:`_line_has_explicit_terminal_assertion` to
+    scope the disqualifier to the ambiguous portion of a line.
+    The check is case-insensitive and uses substring matching
+    against :data:`_DISQUALIFYING_TOKENS`.
+    """
+    lower = text.lower()
+    for tok in _DISQUALIFYING_TOKENS:
+        if tok in lower:
+            return False
+    return True
 
 
 def _has_explicit_terminal_assertion(text: str) -> bool:

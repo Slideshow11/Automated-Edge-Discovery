@@ -39,6 +39,7 @@ from aed_lifecycle.no_stall import (  # noqa: E402
     OK_TERMINAL,
     classify_humphry_message_for_stall,
     is_terminal_lifecycle_state,
+    is_valid_next_action,
     TERMINAL_LIFECYCLE_STATES,
 )
 from aed_lifecycle.checkpoint import (  # noqa: E402
@@ -1367,7 +1368,11 @@ class WatchdogCITokenMatchTests(unittest.TestCase):
         self.assertEqual(verdict, "HOLD_PR_CI_PENDING")
 
     def test_ci_poll_token_is_ci_pending(self) -> None:
-        verdict = evaluate_watchdog(self._state("ci_poll step"), now=10000.0)
+        # Fix C (Codex 3414948257): a bare "ci" token is a CI
+        # signal. The older `_status|_poll` suffix variants are
+        # NOT in the new pattern — only the noun "ci" / "CI" /
+        # "pr ci" is matched.
+        verdict = evaluate_watchdog(self._state("poll ci"), now=10000.0)
         self.assertEqual(verdict, "HOLD_PR_CI_PENDING")
 
     def test_decide_whether_to_merge_is_not_ci_pending(self) -> None:
@@ -1659,6 +1664,543 @@ class ReanchoredFindingsRegressionTests(unittest.TestCase):
             classify_humphry_message_for_stall(text),
             OK_PROGRESS_WITH_NEXT_ACTION,
         )
+
+
+# ---------------------------------------------------------------------------
+# Section 17: Fix A — reject non-string required checkpoint fields
+#             (Codex 3414948246)
+# ---------------------------------------------------------------------------
+
+
+class RejectNonStringRequiredFieldsTests(unittest.TestCase):
+    """Fix A: required string fields must be actual strings.
+
+    The validator must reject non-string values such as
+    ``int``, ``float``, ``bool``, ``list``, ``dict``, ``tuple``
+    and ``object`` for the required string fields ``repo``,
+    ``branch``, ``current_head``. Optional fields documented
+    as ``Optional[...]`` must still be allowed to be ``None``.
+    """
+
+    def _base_args(self):
+        return dict(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action="poll CI status",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+
+    def _ck(self, **overrides):
+        return CheckpointState(**{**self._base_args(), **overrides})
+
+    def test_repo_int_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(repo=123))
+        self.assertTrue(any("'repo'" in e and "int" in e for e in errors))
+
+    def test_branch_list_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(branch=[]))
+        self.assertTrue(any("'branch'" in e for e in errors))
+
+    def test_current_head_int_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(current_head=42))
+        self.assertTrue(any("'current_head'" in e for e in errors))
+
+    def test_repo_bool_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(repo=True))
+        self.assertTrue(any("'repo'" in e and "bool" in e for e in errors))
+
+    def test_branch_float_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(branch=3.14))
+        self.assertTrue(any("'branch'" in e and "float" in e for e in errors))
+
+    def test_current_head_dict_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(current_head={"a": 1}))
+        self.assertTrue(any("'current_head'" in e for e in errors))
+
+    def test_repo_tuple_rejected(self) -> None:
+        errors = validate_checkpoint(self._ck(repo=("a", "b")))
+        self.assertTrue(any("'repo'" in e and "tuple" in e for e in errors))
+
+    def test_valid_strings_still_accepted(self) -> None:
+        errors = validate_checkpoint(self._ck())
+        self.assertEqual(errors, [])
+
+    def test_optional_fields_still_accepted_as_none(self) -> None:
+        # Documented Optional fields (next_action, terminal_state,
+        # updated_at, etc.) may still be None.
+        errors = validate_checkpoint(
+            self._ck(next_action=None, terminal_state=None, updated_at=None)
+        )
+        self.assertEqual(errors, [])
+
+
+# ---------------------------------------------------------------------------
+# Section 18: Fix B — terminal assertions before disqualifying explanations
+#             (Codex 3414948252)
+# ---------------------------------------------------------------------------
+
+
+class TerminalAssertionDisqualifierScopeTests(unittest.TestCase):
+    """Fix B: the disqualifier must be scoped to the ambiguous
+    portion of an explicit terminal assertion, not the
+    explanation that follows.
+
+    A line that starts with an explicit prefix and a canonical
+    terminal state is an assertion even if the explanation
+    contains ``"no"``, ``"not"``, ``"missing"``, or ``"after"``.
+    Bare / ambiguous mentions still apply the full disqualifier.
+    """
+
+    def test_prefix_with_no_in_explanation(self) -> None:
+        text = (
+            "Final lifecycle state: HOLD_RESUME_CHECKPOINT_NEEDED — "
+            "no next_action/checkpoint"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_prefix_with_not_in_explanation(self) -> None:
+        text = "Terminal state: HOLD_OPERATOR_REQUIRED — not yet resumed"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_prefix_with_missing_in_explanation(self) -> None:
+        text = "Lifecycle state: HOLD_PR_CI_PENDING — missing result"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_prefix_with_after_in_explanation(self) -> None:
+        text = "Final state: MERGED after operator merge"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_em_dash_state_with_no_in_explanation(self) -> None:
+        text = "HOLD_PR_CI_PENDING — no final check result"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_bare_not_merged_yet_not_terminal(self) -> None:
+        text = "Not MERGED yet"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_bare_no_merged_state_not_terminal(self) -> None:
+        text = "No MERGED state yet"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_bare_will_be_merged_not_terminal(self) -> None:
+        text = "will be MERGED after review"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_bare_might_be_hold_not_terminal(self) -> None:
+        text = "next state might be HOLD_PR_CI_PENDING"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text), OK_TERMINAL
+        )
+
+    def test_exact_terminal_state_alone_is_terminal(self) -> None:
+        # Regression: exact terminal state on a line by itself
+        # must still be classified OK_TERMINAL.
+        self.assertEqual(
+            classify_humphry_message_for_stall("MERGED"), OK_TERMINAL
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 19: Fix C — narrow CI matching (Codex 3414948257)
+# ---------------------------------------------------------------------------
+
+
+class NarrowCITokenMatchingTests(unittest.TestCase):
+    """Fix C: generic English verbs (``check``, ``checks``) alone
+    are NOT CI tokens. Only the documented CI-specific phrases
+    are matched. Codex token matching remains token-safe."""
+
+    def _state(self, next_action: str) -> WatchdogState:
+        return WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+
+    # --- Spec positives: these ARE CI ---
+
+    def test_poll_ci_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("poll CI status"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_pr_ci_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("wait for pr ci"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_github_actions_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("check github actions"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_workflow_run_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("wait for workflow run"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_test_3_11_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("poll test (3.11)"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_test_3_11_bare_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("poll test 3.11"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_required_checks_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("required checks pending"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_status_check_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("wait for status check"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    # --- Spec negatives: these are NOT CI ---
+
+    def test_check_docs_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(self._state("check docs"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_check_thread_inventory_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("check thread inventory"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_run_checks_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(self._state("run checks"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_reconcile_threads_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("reconcile threads"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_decide_whether_to_merge_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("decide whether to merge"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_policy_review_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("policy review"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_lifecycle_state_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("lifecycle state review"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_suspicious_activity_is_not_ci_pending(self) -> None:
+        self.assertNotEqual(
+            evaluate_watchdog(
+                self._state("suspicious activity review"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_codex_token_match_remains_token_safe(self) -> None:
+        # codex_response is a true Codex match.
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("poll codex response"), now=10000.0
+            ),
+            "HOLD_CODEX_RESPONSE_PENDING",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 20: Fix D — checkpoint_requires_operator uses canonical
+#             next_action validity check (Codex 3414948261)
+# ---------------------------------------------------------------------------
+
+
+class CheckpointRequiresOperatorInvalidNextActionTests(unittest.TestCase):
+    """Fix D: ``checkpoint_requires_operator`` must share the
+    canonical ``is_valid_next_action`` check used by
+    ``validate_checkpoint`` and ``next_action_from_checkpoint``.
+
+    A checkpoint with a phase but an unusable ``next_action``
+    (``""``, ``"   "``, ``"none"``, ``"todo"``, a list, a dict,
+    an int) must return ``True`` (operator required). Only a
+    valid non-placeholder string next_action returns ``False``.
+    """
+
+    def _ck(self, next_action):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+
+    def test_empty_string_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("")))
+
+    def test_whitespace_string_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("   ")))
+
+    def test_placeholder_none_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("none")))
+
+    def test_placeholder_todo_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("todo")))
+
+    def test_placeholder_null_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck("null")))
+
+    def test_list_next_action_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck([])))
+
+    def test_dict_next_action_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck({})))
+
+    def test_int_next_action_requires_operator(self) -> None:
+        self.assertTrue(checkpoint_requires_operator(self._ck(123)))
+
+    def test_valid_string_does_not_require_operator(self) -> None:
+        self.assertFalse(
+            checkpoint_requires_operator(self._ck("poll CI status"))
+        )
+
+    def test_canonical_helper_is_string_invariant(self) -> None:
+        # is_valid_next_action is the single canonical check.
+        for bad in [None, "", "   ", "none", "todo", "null", "tbd",
+                    123, [], {}, True]:
+            self.assertFalse(is_valid_next_action(bad))
+        for good in ["poll CI", "PHASE_5", "reconcile threads", "wait"]:
+            self.assertTrue(is_valid_next_action(good))
+
+
+class NextActionFromCheckpointNeverReturnsNonStringTests(unittest.TestCase):
+    """Fix D: ``next_action_from_checkpoint`` must never
+    return a non-string. Defensive: even with an invalid
+    next_action, the function returns the literal string
+    ``"HOLD_OPERATOR_REQUIRED"`` rather than passing the
+    invalid value to the runner."""
+
+    def _ck(self, next_action):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action=next_action,
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+
+    def test_invalid_next_action_returns_hold_string(self) -> None:
+        for bad in ["", "   ", "none", "todo", "tbd"]:
+            result = next_action_from_checkpoint(self._ck(bad))
+            self.assertIsInstance(result, str)
+            self.assertEqual(result, "HOLD_OPERATOR_REQUIRED")
+
+    def test_valid_next_action_returned_verbatim(self) -> None:
+        result = next_action_from_checkpoint(self._ck("poll CI status"))
+        self.assertIsInstance(result, str)
+        self.assertEqual(result, "poll CI status")
+
+
+# ---------------------------------------------------------------------------
+# Section 21: Reanchored active findings — pinned regression coverage
+# ---------------------------------------------------------------------------
+
+
+class ReanchoredFindingsExtendedCoverageTests(unittest.TestCase):
+
+    def test_canonical_registry_covers_schema_hold_and_terminal(self) -> None:
+        import json
+        from pathlib import Path
+        schema_path = (
+            Path(__file__).resolve().parent.parent
+            / "schemas"
+            / "aed_lifecycle_states_v1.json"
+        )
+        schema = json.loads(schema_path.read_text())
+        canonical = set(schema.get("states", {}).keys())
+        # Every canonical hold/terminal state must be in the registry.
+        from aed_lifecycle.no_stall import TERMINAL_LIFECYCLE_STATES
+        for state_name, state_def in schema.get("states", {}).items():
+            if state_def.get("category") in {"hold", "terminal"}:
+                self.assertIn(
+                    state_name,
+                    TERMINAL_LIFECYCLE_STATES,
+                    f"{state_name} missing from TERMINAL_LIFECYCLE_STATES",
+                )
+
+    def test_watchdog_requires_both_checkpoint_and_next_action(self) -> None:
+        # With checkpoint_path but no next_action, must be STALL_RISK.
+        state = WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action=None,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+        self.assertEqual(evaluate_watchdog(state, now=100.0), STALL_RISK)
+
+    def test_optional_checkpoint_fields_may_be_none(self) -> None:
+        # Documented Optional fields may be None.
+        ck = CheckpointState(
+            repo="r",
+            pr_number=1,
+            branch="b",
+            current_head="a" * 40,
+            phase=None,
+            completed_phases=[],
+            next_phase=None,
+            next_action=None,
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_checkpoint(ck)
+        # Should not fail on the Optional None fields. (It may
+        # still fail with "stale" or similar — but no field is
+        # rejected for being None.)
+        for e in errors:
+            self.assertNotIn("must not be None", e)
+
+    def test_next_action_marker_without_value_not_progress(self) -> None:
+        text = "checkpoint: /tmp/ckpt.json\nnext_action:"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_ci_matching_token_safe(self) -> None:
+        state = WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action="decide whether to merge",
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+        self.assertNotEqual(
+            evaluate_watchdog(state, now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_next_action_validation_shared_across_helpers(self) -> None:
+        # The same canonical helper must back all three helpers.
+        for bad in ["", "   ", "none", "todo"]:
+            ck = CheckpointState(
+                repo="r",
+                pr_number=1,
+                branch="b",
+                current_head="a" * 40,
+                phase="PHASE_1",
+                completed_phases=[],
+                next_phase="PHASE_2",
+                next_action=bad,
+                pending_actions=[],
+                last_verified_primary_head="0" * 40,
+                last_verified_pr_head="a" * 40,
+                authorized_thread_ids=[],
+                unresolved_thread_ids=[],
+                terminal_state=None,
+                updated_at=None,
+            )
+            # validate_checkpoint flags it
+            self.assertTrue(validate_checkpoint(ck))
+            # checkpoint_requires_operator returns True
+            self.assertTrue(checkpoint_requires_operator(ck))
+            # next_action_from_checkpoint returns the hold string
+            self.assertEqual(
+                next_action_from_checkpoint(ck), "HOLD_OPERATOR_REQUIRED"
+            )
 
 
 if __name__ == "__main__":

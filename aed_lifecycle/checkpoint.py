@@ -59,8 +59,8 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .no_stall import (
-    _PLACEHOLDER_NEXT_ACTIONS,
     is_terminal_lifecycle_state,
+    is_valid_next_action,
 )
 
 
@@ -186,7 +186,18 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
         if val is None:
             errors.append(f"checkpoint field {fname!r} is None")
             continue
-        if isinstance(val, str) and not val.strip():
+        # Fix A (Codex 3414948246): required string fields must be
+        # actual strings. Other types (int, float, bool, list, dict,
+        # tuple) are rejected with a type-mismatch error so a typo
+        # or a non-string serialization cannot silently slip through
+        # and become a non-resumable checkpoint at runtime.
+        if not isinstance(val, str):
+            errors.append(
+                f"checkpoint field {fname!r} must be a string, "
+                f"got {type(val).__name__}"
+            )
+            continue
+        if not val.strip():
             errors.append(f"checkpoint field {fname!r} is empty string")
             continue
 
@@ -211,8 +222,13 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
 
     # next_action, if present, must be a non-empty, non-placeholder
     # string. The runner consumes this value directly; a non-string
-    # would be an unsafe resume path.
-    if state.next_action is not None:
+    # would be an unsafe resume path. The validity check uses the
+    # canonical :func:`is_valid_next_action` helper so this validator
+    # and :func:`next_action_from_checkpoint` and
+    # :func:`checkpoint_requires_operator` all agree.
+    if state.next_action is not None and not is_valid_next_action(
+        state.next_action
+    ):
         if not isinstance(state.next_action, str):
             errors.append(
                 "checkpoint field 'next_action' must be a string, "
@@ -223,7 +239,7 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
                 "checkpoint field 'next_action' is empty or "
                 "whitespace-only"
             )
-        elif state.next_action.strip().lower() in _PLACEHOLDER_NEXT_ACTIONS:
+        else:
             errors.append(
                 f"checkpoint field 'next_action' is a placeholder "
                 f"value: {state.next_action!r}"
@@ -369,12 +385,12 @@ def next_action_from_checkpoint(state: CheckpointState) -> Optional[str]:
         return "HOLD_OPERATOR_REQUIRED"
 
     if state.next_action:
-        # Defensive: a non-string next_action must never be
-        # returned to the runner. If validation was skipped or
-        # bypassed, this is the last-line guard.
-        if not isinstance(state.next_action, str) or not state.next_action.strip():
-            return "HOLD_OPERATOR_REQUIRED"
-        if state.next_action.strip().lower() in _PLACEHOLDER_NEXT_ACTIONS:
+        # Defensive: a non-string / empty / placeholder
+        # next_action must never be returned to the runner. If
+        # validation was skipped or bypassed, this is the
+        # last-line guard. The validity check is delegated to
+        # the canonical :func:`is_valid_next_action` helper.
+        if not is_valid_next_action(state.next_action):
             return "HOLD_OPERATOR_REQUIRED"
         return state.next_action
 
@@ -397,10 +413,28 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
       next_action, no terminal_state)
     - the checkpoint has unresolved threads AND no
       ``next_action`` (the runner cannot auto-resolve threads)
+    - the checkpoint has a ``next_action`` that is present but
+      not a valid executable action (None / non-string / empty
+      / whitespace / placeholder). The same
+      :func:`is_valid_next_action` helper used by
+      :func:`validate_checkpoint` and
+      :func:`next_action_from_checkpoint` is used here so the
+      three helpers cannot disagree on what counts as a usable
+      next action. Fix D (Codex 3414948261): this case must
+      trigger ``HOLD_OPERATOR_REQUIRED`` rather than fall
+      through to ``False`` and allow silent auto-resume.
     """
     # Unknown terminal state is a hold.
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
         state.terminal_state
+    ):
+        return True
+
+    # next_action, if present, must be a valid executable
+    # action. The runner cannot auto-resume against a
+    # non-string / empty / placeholder next_action.
+    if state.next_action is not None and not is_valid_next_action(
+        state.next_action
     ):
         return True
 

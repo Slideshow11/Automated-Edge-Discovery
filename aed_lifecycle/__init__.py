@@ -38,6 +38,7 @@ from .no_stall import (
     TERMINAL_LIFECYCLE_STATES,
     classify_humphry_message_for_stall,
     is_terminal_lifecycle_state,
+    is_valid_next_action,
 )
 from .watchdog import (
     STALL_RISK,
@@ -58,6 +59,7 @@ __all__ = [
     "TERMINAL_LIFECYCLE_STATES",
     "classify_humphry_message_for_stall",
     "is_terminal_lifecycle_state",
+    "is_valid_next_action",
     # checkpoint
     "CheckpointState",
     "checkpoint_requires_operator",

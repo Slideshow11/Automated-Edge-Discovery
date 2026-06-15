@@ -110,6 +110,27 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
     "policy", "lifecycle", "suspicious") or "codex" (e.g.
     "codex_response_poll" is a true Codex match, but
     "codexia" would not be) are not misclassified.
+
+    Fix C (Codex 3414948257): The CI detector requires stronger
+    CI-specific tokens. Generic English verbs like "check" /
+    "checks" alone are NOT classified as CI — they could refer
+    to docs checks, thread-inventory checks, or any other
+    non-CI verification. Only the following tokens are
+    considered CI:
+
+    - ``ci``, ``CI``
+    - ``pr ci``
+    - ``github actions``
+    - ``workflow run``
+    - ``test (3.11)`` / ``test 3.11``
+    - ``status check`` / ``status checks``
+    - ``required check`` / ``required checks``
+
+    Generic phrases like "check docs", "check thread inventory",
+    "run checks", "reconcile threads", "decide whether to merge",
+    "policy review", "lifecycle state", "suspicious activity"
+    are NOT CI and fall through to the Codex detector (or the
+    operator fallback).
     """
     action = (state.next_action or "").lower()
     if _CI_TOKEN_PATTERN.search(action):
@@ -123,12 +144,24 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
 # once at module load; the patterns use the ``\b`` anchor so
 # that the substring "ci" inside "decide" / "reconcile" /
 # "policy" / "lifecycle" / "suspicious" does not match.
-_CI_TOKEN_PATTERN=re.compile(
-    r"\bci(?:_status|_poll)?\b"
-    r"|\bgithub actions\b"
-    r"|\bchecks?\b"
-    r"|\btest (?:3\.|run)\b"
-    r"|\bworkflow run\b"
+#
+# Fix C (Codex 3414948257): ``\bchecks?\b`` was too broad
+# (matched the bare verb "check"). The CI detector now
+# requires explicit CI-context tokens: the noun "ci" / "CI",
+# "pr ci", "github actions", "workflow run", the GitHub-Actions
+# test-3.11 job name, or the noun phrase "status check" /
+# "required check". Generic "check" / "checks" alone is
+# rejected.
+_CI_TOKEN_PATTERN = re.compile(
+    r"\bci\b"
+    r"|\bpr\s+ci\b"
+    r"|\bgithub\s+actions\b"
+    r"|\bworkflow\s+run\b"
+    r"|\btest\s+3\.11\b"
+    r"|\btest\s*\(\s*3\.11\s*\)"
+    r"|\btest\s+run\b"
+    r"|\bstatus\s+checks?\b"
+    r"|\brequired\s+checks?\b"
 )
 _CODEX_TOKEN_PATTERN=re.compile(
     r"\bcodex(?:_response)?\b"
