@@ -157,7 +157,18 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
     # failed vs not-observed at the closeout pipeline layer
     # using actual main-CI evidence; the watchdog only knows
     # whether the phase is exhausted.
+    #
+    # Fix F (Codex 3416424655): The post-merge branch
+    # now also fires when the next_action matches a
+    # post-merge token (``remote_main_ci``, ``main_ci``,
+    # ``post_merge_ci``) even when the regular CI pattern
+    # does not match, so that an exhausted post-merge
+    # phase with action ``poll remote_main_ci`` routes to
+    # HOLD_POST_MERGE_CI_PENDING instead of falling
+    # through to HOLD_OPERATOR_REQUIRED.
     is_post_merge = _is_post_merge_closeout_phase(phase, action)
+    if is_post_merge and _POST_MERGE_CI_ACTION_PATTERN.search(action):
+        return HOLD_POST_MERGE_CI_PENDING
     if _CI_TOKEN_PATTERN.search(action):
         if is_post_merge:
             return HOLD_POST_MERGE_CI_PENDING
@@ -184,11 +195,26 @@ def _recommend_hold_for_phase_exhausted(state: WatchdogState) -> str:
 # post-merge context correctly maps to
 # HOLD_POST_MERGE_CI_PENDING.
 #
+# Fix E (Codex 3416424655): Identifier-style names like
+# ``PHASE_POST_MERGE_CI``, ``post_merge_ci``,
+# ``post_merge_main_ci``, ``post_merge_closeout``,
+# ``remote_main_ci``, ``closeout_ci`` must also match.
+# Python's ``\b`` word boundary treats ``_`` as a word
+# character, so ``\bpost_merge_ci\b`` never matches
+# ``PHASE_POST_MERGE_CI``. The detector now uses explicit
+# identifier-style token-boundary logic that treats
+# underscores, hyphens, and spaces as separators, while
+# still rejecting partial-word matches like
+# ``postpone``, ``mergeable``, ``mainframe``, ``claim_ci``,
+# ``domain_ci`` (the prefix char is a word char so the
+# boundary fails).
+#
 # Match the documented canonical state names from
 # schemas/aed_lifecycle_states_v1.json: HOLD_POST_MERGE_CI_PENDING,
 # HOLD_POST_MERGE_CI_FAILED, HOLD_POST_MERGE_CI_NOT_OBSERVED,
 # and PR_MERGED_PENDING_CLOSEOUT.
 _POST_MERGE_PHASE_TOKENS = (
+    # Prose / multi-word forms.
     "post-merge",
     "post merge",
     "postmerge",
@@ -201,10 +227,19 @@ _POST_MERGE_PHASE_TOKENS = (
     "post merge main",
     "postmerge main",
     "merged pending closeout",
+    # Identifier-style (snake_case) forms. Underscores are
+    # treated as token separators in the boundary class
+    # below, so these are detected in phase names like
+    # ``PHASE_POST_MERGE_CI``.
     "post_merge_ci",
+    "post_merge_main_ci",
+    "post_merge_closeout",
     "main_ci",
+    "remote_main_ci",
+    "closeout_ci",
 )
 _POST_MERGE_NEXT_ACTION_TOKENS = (
+    # Prose / multi-word forms.
     "post-merge ci",
     "post merge ci",
     "postmerge ci",
@@ -218,16 +253,110 @@ _POST_MERGE_NEXT_ACTION_TOKENS = (
     "postmerge main",
     "post-merge main ci",
     "post merge main ci",
+    # Identifier-style (snake_case) forms.
+    "post_merge_ci",
+    "post_merge_main_ci",
+    "remote_main_ci",
+    "audit_post_merge_main_ci",
 )
+# Identifier-aware token boundary. Standard ``\b`` is a
+# transition between ``\w`` (``[A-Za-z0-9_]``) and
+# non-``\w``; that fails when both sides of the match are
+# word characters and one of them is an underscore
+# (e.g. ``\bpost_merge_ci\b`` does not match inside
+# ``phase_post_merge_ci`` because ``_`` is ``\w``). The
+# post-merge detector instead requires the match to be
+# bounded on both sides by any character that is NOT a
+# letter, digit, or underscore. This treats underscores
+# (and hyphens and spaces) as separators while still
+# rejecting partial-word matches against prose words like
+# ``postpone`` (the ``post`` inside ``postpone`` is followed
+# by ``p``, a word char) or ``claim_ci`` (the ``main_ci``
+# token would have to start with a non-word boundary, but
+# the prefix char ``i`` in ``claim_ci`` is a word char).
+#
+# Fix E (Codex 3416424655): The post-merge detector must
+# use this identifier-aware boundary so that
+# ``PHASE_POST_MERGE_CI`` and ``post_merge_ci`` match
+# while ``postpone``, ``mergeable``, ``mainframe``,
+# ``claim_ci``, ``domain_ci`` do not.
+# Identifier-aware token boundary. Standard ``\b`` is a
+# transition between ``\w`` (``[A-Za-z0-9_]``) and
+# non-``\w``; that fails when both sides of the match are
+# word characters and one of them is an underscore
+# (e.g. ``\bpost_merge_ci\b`` does not match inside
+# ``phase_post_merge_ci`` because ``_`` is ``\w``). The
+# post-merge detector instead requires the match to be
+# bounded on both sides by any character that is NOT a
+# letter or digit. This treats underscores (and hyphens
+# and spaces) as separators while still rejecting
+# partial-word matches against prose words like
+# ``postpone`` (the ``post`` inside ``postpone`` is
+# followed by ``p``, a letter) or ``claim_ci`` (the
+# ``main_ci`` token would have to start with a
+# non-alphanumeric boundary, but the prefix char ``i`` in
+# ``claim_ci`` is a letter).
+#
+# The boundary class excludes ONLY ``[A-Za-z0-9]`` (NOT
+# ``_``) so that snake_case identifiers like
+# ``PHASE_POST_MERGE_CI`` and ``phase_post_merge_ci`` are
+# treated as having underscore-separated tokens. A pure
+# ``\b`` boundary treats ``_`` as a word character and
+# would reject these; the identifier-aware boundary
+# accepts them.
+#
+# Fix E (Codex 3416424655): The post-merge detector must
+# use this identifier-aware boundary so that
+# ``PHASE_POST_MERGE_CI`` and ``post_merge_ci`` match
+# while ``postpone``, ``mergeable``, ``mainframe``,
+# ``claim_ci``, ``domain_ci`` do not.
+_NON_WORD_BOUNDARY = r"(?<![A-Za-z0-9])"
+_NON_WORD_BOUNDARY_END = r"(?![A-Za-z0-9])"
 _POST_MERGE_PHASE_PATTERN = re.compile(
-    r"\b("
+    _NON_WORD_BOUNDARY
+    + r"("
     + "|".join(re.escape(t) for t in _POST_MERGE_PHASE_TOKENS)
-    + r")\b"
+    + r")"
+    + _NON_WORD_BOUNDARY_END
 )
 _POST_MERGE_NEXT_ACTION_PATTERN = re.compile(
-    r"\b("
+    _NON_WORD_BOUNDARY
+    + r"("
     + "|".join(re.escape(t) for t in _POST_MERGE_NEXT_ACTION_TOKENS)
-    + r")\b"
+    + r")"
+    + _NON_WORD_BOUNDARY_END
+)
+# Post-merge / main-CI identifier-style CI-action tokens.
+# These are the snake_case closeout tokens that imply a
+# CI action even though the regular ``\bci\b`` pattern
+# does not match (because ``_`` is a word character).
+# The pattern is only consulted in the post-merge branch
+# of the hold selector, so partial-word traps like
+# ``claim_ci`` and ``domain_ci`` are safely rejected by
+# the ``(?<![A-Za-z0-9])`` boundary: the prefix char
+# before any ``main_ci`` substring inside ``claim_ci`` is
+# a letter (``i``) or a letter (``o``), so the boundary
+# fails.
+#
+# Fix F (Codex 3416424655): exhausted phases whose
+# next_action contains ``remote_main_ci``, ``main_ci``,
+# ``post_merge_ci``, etc. now correctly route to
+# HOLD_POST_MERGE_CI_PENDING via the post-merge branch
+# (gated by ``is_post_merge``) rather than falling
+# through to HOLD_OPERATOR_REQUIRED.
+_POST_MERGE_CI_ACTION_TOKENS = (    "post_merge_ci",
+    "post_merge_main_ci",
+    "post_merge_closeout",
+    "main_ci",
+    "remote_main_ci",
+    "closeout_ci",
+)
+_POST_MERGE_CI_ACTION_PATTERN = re.compile(
+    _NON_WORD_BOUNDARY
+    + r"("
+    + "|".join(re.escape(t) for t in _POST_MERGE_CI_ACTION_TOKENS)
+    + r")"
+    + _NON_WORD_BOUNDARY_END
 )
 
 
@@ -270,6 +399,30 @@ def _is_post_merge_closeout_phase(phase: str, action: str) -> bool:
 # test-3.11 job name, or the noun phrase "status check" /
 # "required check". Generic "check" / "checks" alone is
 # rejected.
+# Identifier-aware CI token boundary. Standard ``\b`` is a
+# transition between ``\w`` (``[A-Za-z0-9_]``) and
+# non-``\w``; that fails when both sides of the match are
+# word characters and one of them is an underscore
+# (e.g. ``\bci\b`` does not match inside ``remote_main_ci``
+# because ``_`` is ``\w``). The CI detector uses the same
+# identifier-aware boundary as the post-merge detector for
+# the ``ci`` token only, so that an exhausted next_action
+# like ``poll remote_main_ci`` is recognized as a CI action
+# (and then re-routed to the post-merge hold by the
+# post-merge detector). Other CI context words
+# (``pr ci``, ``github actions``, ``test 3.11``, etc.)
+# still use the original ``\b`` boundaries because they
+# already match at word boundaries in prose.
+#
+# Fix E (Codex 3416424655): ``\bci\b`` must also match
+# ``ci`` in identifier context so that post-merge / main
+# CI closeout actions like ``poll remote_main_ci`` and
+# ``poll main_ci`` route to the post-merge hold, not the
+# operator fallback. The boundary uses
+# ``(?<![A-Za-z0-9_])...(?![A-Za-z0-9_])`` so that
+# ``claim_ci`` and ``domain_ci`` still do not match (the
+# prefix char before the ``ci`` substring is a word char).
+_CI_IDENTIFIER_BOUNDARY = r"(?<![A-Za-z0-9_])ci(?![A-Za-z0-9_])"
 _CI_TOKEN_PATTERN = re.compile(
     r"\bci\b"
     r"|\bpr\s+ci\b"
@@ -280,9 +433,13 @@ _CI_TOKEN_PATTERN = re.compile(
     r"|\btest\s+run\b"
     r"|\bstatus\s+checks?\b"
     r"|\brequired\s+checks?\b"
+    r"|"
+    + _CI_IDENTIFIER_BOUNDARY
 )
-_CODEX_TOKEN_PATTERN=re.compile(
+_CODEX_TOKEN_PATTERN = re.compile(
     r"\bcodex(?:_response)?\b"
+    r"|(?<![A-Za-z0-9_])codex(?:_response)?(?:_(?:poll|pending))?(?![A-Za-z0-9_])"
+    r"|(?<![A-Za-z0-9_])(?:poll|wait_for)_codex(?:_response)?(?![A-Za-z0-9_])"
 )
 
 

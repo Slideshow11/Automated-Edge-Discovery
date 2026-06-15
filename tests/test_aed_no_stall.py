@@ -3359,5 +3359,377 @@ class PostMergeCIRecommendHoldTests(unittest.TestCase):
         )
 
 
+class IdentifierStylePostMergePhaseTests(unittest.TestCase):
+    """Regression tests for Codex 3416424655.
+
+    The post-merge / main-CI closeout detector must recognize
+    identifier-style (snake_case) phase names AND next_action
+    strings, not just prose forms. The detector uses an
+    identifier-aware token boundary class
+    (``(?<![A-Za-z0-9_])...(?![A-Za-z0-9_])``) so that
+    ``PHASE_POST_MERGE_CI`` matches the ``post_merge_ci``
+    token while partial-word matches like ``postpone``,
+    ``mergeable``, ``mainframe``, ``claim_ci``,
+    ``domain_ci`` are still rejected.
+    """
+
+    @staticmethod
+    def _exhausted_state(
+        phase_name: str,
+        next_action: str,
+    ) -> "WatchdogState":
+        from aed_lifecycle.watchdog import WatchdogState
+        return WatchdogState(
+            phase_name=phase_name,
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+        )
+
+    def test_phase_post_merge_ci_identifier_style(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_POST_MERGE_CI",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_phase_post_merge_ci_lowercase(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="post_merge_ci",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_phase_post_merge_main_ci_identifier_style(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="post_merge_main_ci",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_phase_post_merge_closeout_identifier_style(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="post_merge_closeout",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_next_action_poll_remote_main_ci_identifier_style(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="poll remote_main_ci",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+        )
+
+    def test_unrelated_postpone_does_not_match_post_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # "postpone" contains "post" but the next char "p" is
+        # a word char, so the identifier-aware boundary
+        # rejects it as a post-merge token.
+        state = self._exhausted_state(
+            phase_name="phase_postpone",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_unrelated_mergeable_does_not_match_post_merge(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # "mergeable" contains "merge" but the next char
+        # "a" is a word char.
+        state = self._exhausted_state(
+            phase_name="phase_mergeable",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_unrelated_mainframe_does_not_match_main_ci(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # "mainframe" contains "main" but the next char
+        # "f" is a word char.
+        state = self._exhausted_state(
+            phase_name="phase_mainframe",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_unrelated_claim_ci_does_not_match_main_ci(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # "claim_ci" contains the substring "aim_ci" but
+        # not "main_ci" with a non-word-char prefix. The
+        # "m" in "main_ci" is preceded by "i" (a word
+        # char), so the boundary fails.
+        state = self._exhausted_state(
+            phase_name="phase_claim_ci",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+    def test_unrelated_domain_ci_does_not_match_main_ci(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # "domain_ci" contains the substring "main_ci"
+        # starting at position 2. The "m" is preceded by
+        # "o" (a word char), so the boundary fails.
+        state = self._exhausted_state(
+            phase_name="phase_domain_ci",
+            next_action="poll github actions",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_PR_CI_PENDING,
+        )
+
+
+class SuffixCodexResponseActionTests(unittest.TestCase):
+    """Regression tests for Codex 3416424661.
+
+    The Codex action detector must recognize snake_case
+    suffixed next_action strings such as
+    ``codex_response_poll``, ``codex_response_pending``,
+    ``poll_codex_response``, ``wait_for_codex_response``,
+    not just the bare ``codex`` and ``codex response``
+    forms. The detector uses the identifier-aware boundary
+    class so that suffixed variants match while
+    substring traps like ``codexia`` or
+    ``codex_response_pollx`` do not.
+    """
+
+    @staticmethod
+    def _exhausted_state(
+        phase_name: str,
+        next_action: str,
+    ) -> "WatchdogState":
+        from aed_lifecycle.watchdog import WatchdogState
+        return WatchdogState(
+            phase_name=phase_name,
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+        )
+
+    def test_codex_response_poll_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex_response_poll",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_codex_response_pending_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex_response_pending",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_poll_codex_response_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="poll_codex_response",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_wait_for_codex_response_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="wait_for_codex_response",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_poll_codex_response_prose_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        # The original prose form must still work via the
+        # ``\bcodex(?:_response)?\b`` alternative.
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="poll Codex response",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_bare_codex_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_codex_poll_returns_codex_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex_poll",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_CODEX_RESPONSE_PENDING,
+        )
+
+    def test_codex_does_not_return_pr_ci_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_CODEX_RESPONSE_PENDING,
+            HOLD_PR_CI_PENDING,
+            evaluate_watchdog,
+        )
+        # A pure codex action with no CI token must NOT be
+        # misclassified as a PR-CI hold.
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex_response_poll",
+        )
+        verdict = evaluate_watchdog(state, now=1000.0)
+        self.assertEqual(verdict, HOLD_CODEX_RESPONSE_PENDING)
+        self.assertNotEqual(verdict, HOLD_PR_CI_PENDING)
+
+    def test_unrelated_codex_substring_trap_does_not_match(self) -> None:
+        # "codexia" is a substring trap: it contains
+        # "codex" but with a non-word char boundary after.
+        # The original ``\bcodex\b`` already rejected this.
+        # Verify the new alternatives also reject it.
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codexia",
+        )
+        # "codexia" is a single token, no CI signal. The
+        # Codex pattern (with \b or identifier-aware
+        # boundary) must not match because the char after
+        # "codex" is "i" (a word char).
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+    def test_codex_response_pollx_suffix_trap_does_not_match(self) -> None:
+        # "codex_response_pollx" must not match the
+        # ``codex_response_poll`` token because the trailing
+        # "x" is a word char so the identifier-aware
+        # boundary fails.
+        from aed_lifecycle.watchdog import (
+            HOLD_OPERATOR_REQUIRED,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_7",
+            next_action="codex_response_pollx",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_OPERATOR_REQUIRED,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
