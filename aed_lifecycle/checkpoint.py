@@ -248,34 +248,62 @@ def validate_resume_observations(
     "skip this check" so the runner can call this function
     with only one observation populated (e.g. PR head only,
     if the primary worktree is not yet reachable).
+
+    A ``None`` or empty-string RECORDED head (i.e. the
+    checkpoint was persisted without a recorded PR head or
+    primary head) is NOT silently skipped — it is treated as
+    a missing-required-field error. The runner cannot verify
+    head drift against a missing recorded head, so resuming
+    from a checkpoint that lost its recorded heads would be
+    unsafe. The error message is the standard
+    "recorded head missing" form, and the runner is expected
+    to surface it as ``HOLD_OPERATOR_REQUIRED`` (the
+    checkpoint is structurally unfit for resume).
     """
     errors: List[str] = []
 
-    if (
-        isinstance(observed_pr_head, str)
-        and observed_pr_head
-        and isinstance(state.last_verified_pr_head, str)
+    # Recorded PR head must be present and non-empty before
+    # we can compare it against the observation. A missing
+    # recorded head is a hard error, not a silent skip.
+    if not (
+        isinstance(state.last_verified_pr_head, str)
         and state.last_verified_pr_head
     ):
-        if observed_pr_head != state.last_verified_pr_head:
-            errors.append(
-                "PR head changed: "
-                f"last_verified_pr_head={state.last_verified_pr_head[:12]} "
-                f"but observed={observed_pr_head[:12]}"
-            )
+        errors.append(
+            "recorded PR head missing: "
+            "last_verified_pr_head is None or empty"
+        )
+    elif (
+        isinstance(observed_pr_head, str)
+        and observed_pr_head
+        and observed_pr_head != state.last_verified_pr_head
+    ):
+        errors.append(
+            "PR head changed: "
+            f"last_verified_pr_head={state.last_verified_pr_head[:12]} "
+            f"but observed={observed_pr_head[:12]}"
+        )
 
-    if (
-        isinstance(observed_primary_head, str)
-        and observed_primary_head
-        and isinstance(state.last_verified_primary_head, str)
+    # Recorded primary head must be present and non-empty
+    # before we can compare it against the observation.
+    if not (
+        isinstance(state.last_verified_primary_head, str)
         and state.last_verified_primary_head
     ):
-        if observed_primary_head != state.last_verified_primary_head:
-            errors.append(
-                "primary worktree head changed: "
-                f"last_verified_primary_head={state.last_verified_primary_head[:12]} "
-                f"but observed={observed_primary_head[:12]}"
-            )
+        errors.append(
+            "recorded primary head missing: "
+            "last_verified_primary_head is None or empty"
+        )
+    elif (
+        isinstance(observed_primary_head, str)
+        and observed_primary_head
+        and observed_primary_head != state.last_verified_primary_head
+    ):
+        errors.append(
+            "primary worktree head changed: "
+            f"last_verified_primary_head={state.last_verified_primary_head[:12]} "
+            f"but observed={observed_primary_head[:12]}"
+        )
 
     return errors
 

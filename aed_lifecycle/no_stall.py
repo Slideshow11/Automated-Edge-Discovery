@@ -198,6 +198,11 @@ _CHECKPOINT_TOKENS = (
 
 
 # Substrings that mark an explicit next_action reference.
+# Each entry is the literal marker the agent emits. A bare
+# ``next_action:`` with no value is intentionally NOT sufficient
+# on its own — the classifier requires both the marker AND a
+# non-empty, non-placeholder value before classifying as
+# OK_PROGRESS_WITH_NEXT_ACTION.
 _NEXT_ACTION_TOKENS = (
     "next_action=",
     "next_action:",
@@ -205,6 +210,59 @@ _NEXT_ACTION_TOKENS = (
     "next step:",
     "next step=",
 )
+
+
+# Empty-value placeholders that explicitly mean "no action".
+# When a ``next_action:`` marker is followed by one of these
+# tokens, the classifier must NOT classify as
+# OK_PROGRESS_WITH_NEXT_ACTION. The runner cannot execute
+# an empty / "none" / "null" action.
+_NEXT_ACTION_EMPTY_VALUES = (
+    "none",
+    "null",
+    "nil",
+    "n/a",
+    "todo",
+    "tbd",
+    "tba",
+)
+
+
+def _has_next_action_with_value(text: str) -> bool:
+    """Return True iff ``text`` contains a ``next_action:`` (or
+    similar) marker followed by a non-empty, non-placeholder
+    value.
+
+    The check is per-marker: each ``next_action:`` occurrence
+    must be followed by at least one non-whitespace,
+    non-placeholder character. This prevents the
+    no-continuation stall case the classifier is meant to
+    reject, where the agent emits ``next_action:`` with no
+    concrete value (e.g. ``next_action:`` or
+    ``next_action: none``).
+    """
+    for marker in _NEXT_ACTION_TOKENS:
+        idx = 0
+        while True:
+            pos = text.find(marker, idx)
+            if pos < 0:
+                break
+            after = text[pos + len(marker):]
+            stripped = after.lstrip()
+            if not stripped:
+                idx = pos + len(marker)
+                continue
+            # Pull the first whitespace-delimited token.
+            token_end = len(stripped)
+            for j, ch in enumerate(stripped):
+                if ch.isspace() or ch in ",;]})\n":
+                    token_end = j
+                    break
+            first_token = stripped[:token_end].lower()
+            if first_token and first_token not in _NEXT_ACTION_EMPTY_VALUES:
+                return True
+            idx = pos + len(marker)
+    return False
 
 
 def _contains_any(text: str, needles: tuple) -> bool:
@@ -285,7 +343,7 @@ def classify_humphry_message_for_stall(text: object) -> str:
     has_continue_prompt = _contains_any(text, _CONTINUE_PROMPT_TOKENS)
     has_phase_header = _contains_any(text, _PHASE_HEADER_TOKENS)
     has_checkpoint = _contains_any(text, _CHECKPOINT_TOKENS)
-    has_next_action = _contains_any(text, _NEXT_ACTION_TOKENS)
+    has_next_action = _has_next_action_with_value(text)
 
     # 2. Continue-prompt stall — outranks phase-header because the
     # user explicitly asked to stop.

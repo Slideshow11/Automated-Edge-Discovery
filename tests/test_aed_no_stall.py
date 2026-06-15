@@ -1038,5 +1038,153 @@ class CheckpointOptionalFieldsTests(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Section 12: Recorded-head-missing error (Codex 3413328909)
+# ---------------------------------------------------------------------------
+
+
+class CheckpointRecordedHeadMissingTests(unittest.TestCase):
+    """validate_resume_observations must NOT silently skip the
+    head-drift check when the recorded head is None or empty.
+    A checkpoint that lost its recorded heads is structurally
+    unfit for resume and the runner must surface it as a hold.
+    """
+
+    def test_missing_recorded_pr_head_is_error(self) -> None:
+        # A checkpoint with no recorded PR head but a valid
+        # recorded primary head and a non-empty observation.
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action="poll CI",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head=None,  # missing
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertTrue(
+            any("PR head" in e and "missing" in e for e in errors),
+            f"missing recorded PR head must be an error, got {errors}",
+        )
+
+    def test_missing_recorded_primary_head_is_error(self) -> None:
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action="poll CI",
+            pending_actions=[],
+            last_verified_primary_head=None,  # missing
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertTrue(
+            any("primary" in e.lower() and "missing" in e for e in errors),
+            f"missing recorded primary head must be an error, got {errors}",
+        )
+
+    def test_both_recorded_heads_missing_yields_two_errors(self) -> None:
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action="poll CI",
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_resume_observations(
+            ck,
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(
+            len(errors),
+            2,
+            f"both missing recorded heads must produce 2 errors, got {errors}",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 13: next_action must have a non-empty value (Codex 3413328918)
+# ---------------------------------------------------------------------------
+
+
+class ClassifyNextActionEmptyValueTests(unittest.TestCase):
+    """The classifier must require a non-empty, non-placeholder
+    value after a ``next_action:`` marker. A bare marker with
+    no value (or with a placeholder like ``none`` / ``null``)
+    must NOT classify as OK_PROGRESS_WITH_NEXT_ACTION.
+    """
+
+    def test_bare_next_action_marker_is_not_progress(self) -> None:
+        # Newline-separated bare marker with no value.
+        text = "checkpoint: /tmp/ckpt.json\nnext_action:"
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_next_action_none_is_not_progress(self) -> None:
+        text = "next_action: none"
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_next_action_null_is_not_progress(self) -> None:
+        text = "next_action: null"
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_next_action_todo_is_not_progress(self) -> None:
+        text = "next_action: todo"
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_next_action_with_real_value_is_progress(self) -> None:
+        text = "next_action: poll CI status"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_step_with_real_value_is_progress(self) -> None:
+        text = "next step: poll CI status"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
