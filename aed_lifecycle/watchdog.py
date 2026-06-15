@@ -20,6 +20,7 @@ from typing import Optional
 
 from .no_stall import (
     is_terminal_lifecycle_state,
+    is_valid_checkpoint_path,
     is_valid_next_action,
 )
 
@@ -508,7 +509,19 @@ def evaluate_watchdog(state: WatchdogState, now: float) -> str:
     # next_action without a checkpoint has no resume point.
     # A placeholder / empty / whitespace / non-string
     # next_action is treated the same as a missing one.
-    has_valid_checkpoint = bool(state.checkpoint_path)
+    #
+    # Fix H (Codex 3417011624): ``bool(state.checkpoint_path)``
+    # used to mark a whitespace-only path as valid. The
+    # watchdog now uses the canonical
+    # :func:`is_valid_checkpoint_path` helper from
+    # :mod:`aed_lifecycle.no_stall` so that ``None``,
+    # ``""``, ``"   "``, ``"none"``, ``"todo"`` and other
+    # placeholder strings are rejected. A blank checkpoint
+    # path is not a valid resume point and must not satisfy
+    # the OK_PROGRESS_WITH_NEXT_ACTION branch.
+    has_valid_checkpoint = is_valid_checkpoint_path(
+        state.checkpoint_path
+    )
     has_valid_next_action = is_valid_next_action(state.next_action)
     if not has_valid_checkpoint or not has_valid_next_action:
         return STALL_RISK

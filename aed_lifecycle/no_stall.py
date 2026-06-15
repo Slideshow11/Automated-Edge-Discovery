@@ -498,6 +498,136 @@ def _has_next_action_with_value(text: str) -> bool:
     return is_valid_next_action(value)
 
 
+# Substrings that mark an explicit checkpoint marker in a
+# final message. Each entry is the literal marker the agent
+# emits before a checkpoint path value. A bare marker with
+# no value (e.g. ``checkpoint_path=`` followed by a newline,
+# or ``checkpoint:`` with nothing) is NOT sufficient on its
+# own — the classifier now requires both the marker AND a
+# valid path value before treating the message as
+# OK_PROGRESS_WITH_NEXT_ACTION.
+_CHECKPOINT_MARKERS = (
+    "checkpoint_path=",
+    "checkpoint_path:",
+    "Checkpoint path:",
+    "Checkpoint Path:",
+    "checkpoint=",
+    "checkpoint:",
+    "Checkpoint:",
+    "Checkpoint ",
+)
+
+
+def _extract_checkpoint_value(text: str) -> "Optional[str]":
+    """Return the first real ``checkpoint`` value found in ``text``.
+
+    A "real" value is a non-empty, non-placeholder string
+    captured from the same line as one of the
+    :data:`_CHECKPOINT_MARKERS` entries. The extractor
+    walks each line of the message, finds the first
+    marker occurrence, and pulls the first whitespace-
+    delimited token on the same line — bounded so that
+    the value never consumes the next field name (e.g.
+    ``"next_action: poll CI"`` is not consumed when
+    parsing ``"checkpoint_path=/tmp/ckpt.json"``).
+
+    The return value is the raw string token, with no
+    stripping applied (the caller is expected to call
+    :func:`is_valid_checkpoint_path` on it). ``None`` is
+    returned iff no marker is found, every marker is
+    followed by an empty / placeholder / no-value line, or
+    the extracted token fails the canonical
+    :func:`is_valid_checkpoint_path` check.
+
+    Fix G (Codex 3417011620): The previous
+    ``_contains_any(text, _CHECKPOINT_TOKENS)`` check
+    matched any substring like ``"checkpoint_path="``
+    even when no value followed. The new extractor
+    captures the same-line value and validates it via
+    :func:`is_valid_checkpoint_path`, so a marker with
+    no real value (e.g. ``checkpoint_path=`` followed
+    by a newline, or ``checkpoint: none``) does not
+    satisfy the "has a real checkpoint" predicate.
+    """
+    for raw_line in text.splitlines():
+        line = raw_line
+        for marker in _CHECKPOINT_MARKERS:
+            idx = line.find(marker)
+            if idx < 0:
+                continue
+            after = line[idx + len(marker):]
+            stripped = after.lstrip()
+            if not stripped:
+                # Marker is the last token on the line —
+                # empty value, keep scanning.
+                continue
+            # Pull the first whitespace-delimited token on
+            # the same line. Stop at any non-identifier
+            # delimiter (whitespace, comma, semicolon, close
+            # brackets, paren, colon) so a value like
+            # ``"checkpoint: /tmp/ckpt.json, resume: yes"``
+            # extracts as ``"/tmp/ckpt.json,"`` (then we
+            # strip trailing punctuation when validating)
+            # rather than the full string. We also stop at
+            # a comma to prevent the extractor from
+            # consuming the next field when the agent
+            # accidentally lists multiple paths.
+            token_end = len(stripped)
+            for j, ch in enumerate(stripped):
+                if ch.isspace() or ch in ",;]})\n":
+                    token_end = j
+                    break
+                if ch == ":":
+                    # Allow the colon to terminate the
+                    # token so that ``"checkpoint:
+                    # /tmp/ckpt.json: extra"`` extracts
+                    # ``/tmp/ckpt.json`` cleanly.
+                    token_end = j
+                    break
+            first_token = stripped[:token_end]
+            if is_valid_checkpoint_path(first_token):
+                return first_token
+            # else: placeholder/empty marker — keep
+            # scanning the rest of the text for a real
+            # value.
+    return None
+
+
+def _has_checkpoint_with_value(text: str) -> bool:
+    """Return True iff ``text`` contains a ``checkpoint:`` (or
+    similar) marker followed by a valid path value.
+
+    The check is per-marker, per-line: each
+    ``checkpoint_path=`` (or similar) occurrence must be
+    followed by at least one non-whitespace, non-placeholder
+    character ON THE SAME LINE. This prevents the
+    "marker-without-path" stall case the classifier is
+    meant to reject, where the agent emits a bare marker
+    like ``checkpoint_path=`` with no concrete value, or
+    a placeholder like ``checkpoint: none``.
+
+    The actual extraction is delegated to
+    :func:`_extract_checkpoint_value`, which is the single
+    canonical extractor. The validity check is delegated to
+    :func:`is_valid_checkpoint_path`.
+
+    Fix G (Codex 3417011620): The classifier previously
+    checked ``_contains_any(text, _CHECKPOINT_TOKENS)``
+    which matched any substring containing the literal
+    ``"checkpoint_path="`` regardless of what followed. A
+    final message like ``Starting PHASE 2 — next_action:
+    poll CI, checkpoint_path=`` would set both
+    ``has_next_action`` and ``has_checkpoint`` to True and
+    be classified as OK_PROGRESS_WITH_NEXT_ACTION despite
+    having no real checkpoint path. The new
+    ``_has_checkpoint_with_value`` requires a real value.
+    """
+    value = _extract_checkpoint_value(text)
+    if value is None:
+        return False
+    return is_valid_checkpoint_path(value)
+
+
 def _contains_any(text: str, needles: tuple) -> bool:
     return any(n in text for n in needles)
 
@@ -673,6 +803,67 @@ _FIELD_NAME_NEXT_ACTIONS: FrozenSet[str] = frozenset(
 )
 
 
+# Empty-value placeholders for a checkpoint marker value.
+# A checkpoint marker with one of these tokens as the value
+# (``checkpoint_path=`` with nothing, ``checkpoint:``,
+# ``checkpoint: none``, ``checkpoint_path: todo``) is NOT
+# valid evidence of a resume point. The runner cannot
+# resume from a placeholder.
+#
+# Fix G (Codex 3417011620) + Fix H (Codex 3417011624):
+# The classifier and the watchdog evaluator must both use
+# the canonical :func:`is_valid_checkpoint_path` helper so
+# that a placeholder, empty, or whitespace-only value is
+# rejected. ``None``, ``""``, ``"   "``, ``"none"``,
+# ``"todo"``, ``"tbd"``, ``"tba"``, ``"null"``, ``"nil"``,
+# ``"n/a"``, ``"na"`` are all invalid.
+_CHECKPOINT_EMPTY_VALUES: FrozenSet[str] = frozenset(
+    {"none", "null", "nil", "n/a", "na", "todo", "tbd", "tba"}
+)
+
+
+def is_valid_checkpoint_path(value: object) -> bool:
+    """Return True iff ``value`` is a usable checkpoint path.
+
+    A checkpoint path is valid iff:
+
+    - it is a string (``isinstance(value, str)``)
+    - after ``str.strip()`` it is non-empty
+    - its lowercased, stripped form is NOT a placeholder
+      (``none``, ``null``, ``nil``, ``n/a``, ``na``,
+      ``todo``, ``tbd``, ``tba``)
+
+    The single canonical validity check used by every
+    helper that needs to decide whether a checkpoint
+    field is safe to act on — both the message classifier
+    (in :func:`_has_checkpoint_with_value`) and the
+    watchdog evaluator (in :func:`evaluate_watchdog` in
+    :mod:`aed_lifecycle.watchdog`) call this helper so the
+    two cannot disagree on what counts as a usable
+    checkpoint.
+
+    Fix G (Codex 3417011620): A bare ``checkpoint_path=``
+    with no value, or a ``checkpoint: none`` placeholder,
+    used to slip through the classifier because
+    ``_contains_any`` only checked for the substring
+    ``"checkpoint_path="``. The classifier now requires
+    a real value via :func:`_has_checkpoint_with_value`
+    which delegates to this helper.
+
+    Fix H (Codex 3417011624): ``bool(state.checkpoint_path)``
+    used to mark a whitespace-only path as valid. The
+    watchdog now uses this helper instead.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if stripped.lower() in _CHECKPOINT_EMPTY_VALUES:
+        return False
+    return True
+
+
 def _line_has_explicit_terminal_assertion(line: str) -> bool:
     """Return True iff ``line`` is an explicit terminal-state assertion.
 
@@ -843,7 +1034,37 @@ def classify_humphry_message_for_stall(text: object) -> str:
 
     has_continue_prompt = _contains_any(text, _CONTINUE_PROMPT_TOKENS)
     has_phase_header = _contains_any(text, _PHASE_HEADER_TOKENS)
+    # ``has_checkpoint`` is the broad check: the message
+    # references a checkpoint in any form (prose mention
+    # like "wrote checkpoint to" or a value-bearing marker
+    # like "checkpoint: /tmp/ckpt.json"). It is used for
+    # the STALL_* branches that just need to know whether
+    # the runner wrote a checkpoint at all.
     has_checkpoint = _contains_any(text, _CHECKPOINT_TOKENS)
+    # ``has_checkpoint_with_value`` is the strict check:
+    # the message contains a value-bearing checkpoint
+    # marker (e.g. ``checkpoint_path=``, ``checkpoint:``)
+    # followed by a real, non-empty, non-placeholder path
+    # value on the same line. It is required for
+    # OK_PROGRESS_WITH_NEXT_ACTION. A prose-only
+    # checkpoint mention like "wrote checkpoint to"
+    # satisfies ``has_checkpoint`` but NOT
+    # ``has_checkpoint_with_value``, so the message still
+    # falls through to STALL_NO_CHECKPOINT (because the
+    # runner has not given a value-bearing resume point)
+    # rather than misclassifying as OK_PROGRESS_WITH_NEXT_ACTION.
+    #
+    # Fix G (Codex 3417011620): The classifier used to
+    # treat any substring containing ``"checkpoint_path="``
+    # as evidence of a real resume point, even with no
+    # value. A final message like ``Starting PHASE 2 —
+    # next_action: poll CI, checkpoint_path=`` would set
+    # ``has_checkpoint`` to True despite having no real
+    # checkpoint path. The new ``has_checkpoint_with_value``
+    # requires the marker to be followed by a valid path
+    # value on the same line; the broad ``has_checkpoint``
+    # still covers prose mentions for the STALL_* paths.
+    has_checkpoint_with_value = _has_checkpoint_with_value(text)
     has_next_action = _has_next_action_with_value(text)
 
     # 2. Continue-prompt stall — outranks phase-header because the
@@ -853,27 +1074,46 @@ def classify_humphry_message_for_stall(text: object) -> str:
 
     # 3. Phase-header classification. A phase header is only a
     # bare STALL_PHASE_HEADER_ONLY when nothing else is in the
-    # message. When next_action and a checkpoint reference are
-    # both present, the message is a resumable progress update
-    # and the runner should treat it as OK_PROGRESS_WITH_NEXT_ACTION.
+    # message. When next_action and a value-bearing checkpoint
+    # marker are both present, the message is a resumable
+    # progress update and the runner should treat it as
+    # OK_PROGRESS_WITH_NEXT_ACTION.
+    #
+    # Fix G (Codex 3417011620): The OK_PROGRESS branch
+    # requires ``has_checkpoint_with_value`` (strict) rather
+    # than the broad ``has_checkpoint`` so a phase-header
+    # message with ``checkpoint_path=`` (no value) does NOT
+    # count as having a resume point. The broad
+    # ``has_checkpoint`` still drives the STALL_NO_CHECKPOINT
+    # branch below so prose-only checkpoint mentions
+    # continue to flag the runner.
     if has_phase_header:
-        if has_next_action and has_checkpoint:
+        if has_next_action and has_checkpoint_with_value:
             return OK_PROGRESS_WITH_NEXT_ACTION
-        # Next action but no checkpoint: there is something for
-        # the runner to do, but no resume point — STALL_NO_CHECKPOINT.
-        if has_next_action and not has_checkpoint:
+        # Next action but no (value-bearing) checkpoint: there
+        # is something for the runner to do, but no resume
+        # point — STALL_NO_CHECKPOINT.
+        if has_next_action and not has_checkpoint_with_value:
             return STALL_NO_CHECKPOINT
-        # Checkpoint but no next_action: there is a resume point
-        # but nothing to act on. STALL_NO_TERMINAL_STATE flags the
-        # generic "no next action" case.
+        # Checkpoint mentioned (broad) but no next_action:
+        # there is a resume point but nothing to act on.
+        # STALL_NO_TERMINAL_STATE flags the generic
+        # "no next action" case.
         if has_checkpoint and not has_next_action:
             return STALL_NO_TERMINAL_STATE
         # Pure phase header.
         return STALL_PHASE_HEADER_ONLY
 
-    # 4. Progress with explicit next_action (no phase header)
-    if has_next_action:
+    # 4. Progress with explicit next_action (no phase header).
+    # Requires a value-bearing checkpoint marker so a bare
+    # ``checkpoint_path=`` (no value) does not count.
+    if has_next_action and has_checkpoint_with_value:
         return OK_PROGRESS_WITH_NEXT_ACTION
+    if has_next_action and not has_checkpoint_with_value:
+        # The runner named an action but provided no
+        # value-bearing resume point — same stall case as
+        # the phase-header branch above.
+        return STALL_NO_CHECKPOINT
 
     # 5. Checkpoint mentioned but no next_action and no terminal
     if has_checkpoint:

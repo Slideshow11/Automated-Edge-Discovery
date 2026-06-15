@@ -1202,14 +1202,30 @@ class ClassifyNextActionEmptyValueTests(unittest.TestCase):
         self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
 
     def test_next_action_with_real_value_is_progress(self) -> None:
-        text = "next_action: poll CI status"
+        # Fix G (Codex 3417011620): OK_PROGRESS_WITH_NEXT_ACTION
+        # now requires BOTH a valid next_action value AND a
+        # valid value-bearing checkpoint marker. The previous
+        # version accepted a bare next_action without a
+        # checkpoint as OK_PROGRESS_WITH_NEXT_ACTION, but a
+        # runner with no resume point cannot safely continue.
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_PROGRESS_WITH_NEXT_ACTION,
         )
 
     def test_next_step_with_real_value_is_progress(self) -> None:
-        text = "next step: poll CI status"
+        # Fix G (Codex 3417011620): See the matching comment
+        # on ``test_next_action_with_real_value_is_progress``.
+        # OK_PROGRESS_WITH_NEXT_ACTION requires a real
+        # checkpoint value, not just a real next_action.
+        text = (
+            "next step: poll CI status\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
         self.assertEqual(
             classify_humphry_message_for_stall(text),
             OK_PROGRESS_WITH_NEXT_ACTION,
@@ -3729,6 +3745,292 @@ class SuffixCodexResponseActionTests(unittest.TestCase):
             evaluate_watchdog(state, now=1000.0),
             HOLD_OPERATOR_REQUIRED,
         )
+
+
+class NonEmptyCheckpointValueClassifierTests(unittest.TestCase):
+    """Regression tests for Codex 3417011620.
+
+    The classifier must require a value-bearing checkpoint
+    marker (``checkpoint_path=``, ``checkpoint_path:``,
+    ``checkpoint:``, ``Checkpoint:``) followed by a real,
+    non-empty, non-placeholder path value on the same line.
+    A bare marker with no value, or a placeholder value like
+    ``none`` or ``todo``, must NOT count as a valid
+    resume point. The OK_PROGRESS_WITH_NEXT_ACTION branch
+    requires BOTH a valid next_action value AND a valid
+    value-bearing checkpoint marker.
+    """
+
+    def test_phase_header_with_empty_checkpoint_path_equals_not_progress(
+        self,
+    ) -> None:
+        # Bare marker ``checkpoint_path=`` with nothing
+        # after the ``=`` is not a valid resume point.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint_path="
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_phase_header_with_empty_checkpoint_colon_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint:"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_phase_header_with_empty_checkpoint_path_colon_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint_path:"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_phase_header_with_checkpoint_none_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint: none"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_phase_header_with_checkpoint_path_todo_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint_path: todo"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_phase_header_with_valid_checkpoint_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_phase_header_with_checkpoint_path_equals_value_is_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_extractor_does_not_consume_next_action(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        # The extractor must find the real ``/tmp/ckpt.json``
+        # value, not consume the ``next_action`` text that
+        # follows.
+        text = (
+            "checkpoint: /tmp/ckpt.json\n"
+            "next_action: poll CI"
+        )
+        value = _extract_checkpoint_value(text)
+        self.assertIsNotNone(value)
+        self.assertEqual(value, "/tmp/ckpt.json")
+        self.assertNotIn("next_action", value or "")
+        self.assertNotIn("poll", value or "")
+
+    def test_extractor_does_not_consume_following_field(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        # The extractor must stop at a field-boundary
+        # delimiter, not consume the rest of the line.
+        text = "checkpoint_path=/tmp/ckpt.json, resume: yes"
+        value = _extract_checkpoint_value(text)
+        self.assertIsNotNone(value)
+        self.assertEqual(value, "/tmp/ckpt.json")
+        self.assertNotIn("resume", value or "")
+
+    def test_is_valid_checkpoint_path_rejects_empty(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_checkpoint_path
+        self.assertFalse(is_valid_checkpoint_path(""))
+        self.assertFalse(is_valid_checkpoint_path(None))
+        self.assertFalse(is_valid_checkpoint_path("   "))
+        self.assertFalse(is_valid_checkpoint_path("\t\n"))
+
+    def test_is_valid_checkpoint_path_rejects_placeholders(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_checkpoint_path
+        for placeholder in [
+            "none", "None", "NONE", "null", "nil",
+            "n/a", "na", "todo", "tbd", "tba",
+        ]:
+            self.assertFalse(
+                is_valid_checkpoint_path(placeholder),
+                f"placeholder {placeholder!r} should be invalid",
+            )
+
+    def test_is_valid_checkpoint_path_accepts_real_paths(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_checkpoint_path
+        for path in [
+            "/tmp/ckpt.json",
+            "/tmp/aed_no_stall_checkpoint_pr405.json",
+            "./ckpt.json",
+            "../state/ckpt.json",
+        ]:
+            self.assertTrue(
+                is_valid_checkpoint_path(path),
+                f"path {path!r} should be valid",
+            )
+
+
+class NonEmptyCheckpointValueWatchdogTests(unittest.TestCase):
+    """Regression tests for Codex 3417011624.
+
+    The watchdog must use the canonical
+    :func:`is_valid_checkpoint_path` helper (not a truthiness
+    check) so that whitespace, placeholder, and non-string
+    ``checkpoint_path`` values are rejected. A runner that
+    continues past the stall guard without a real resume
+    point is exactly the no-stall protocol's failure mode.
+    """
+
+    @staticmethod
+    def _state(checkpoint_path):
+        from aed_lifecycle.watchdog import WatchdogState
+        return WatchdogState(
+            phase_name="PHASE_8",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action="poll CI",
+            checkpoint_path=checkpoint_path,
+        )
+
+    def test_empty_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_whitespace_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("   ")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_none_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state(None)
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_placeholder_none_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("none")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_placeholder_todo_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("todo")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_placeholder_tbd_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("tbd")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_placeholder_null_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            STALL_RISK,
+            evaluate_watchdog,
+        )
+        state = self._state("null")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, STALL_RISK)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_valid_checkpoint_path_is_progress(self) -> None:
+        from aed_lifecycle.watchdog import (
+            OK_PROGRESS_WITH_NEXT_ACTION,
+            evaluate_watchdog,
+        )
+        state = self._state("/tmp/aed_no_stall_checkpoint_pr405.json")
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+
+    def test_terminal_state_skips_checkpoint_requirement(self) -> None:
+        # The watchdog's branch 1 (terminal_state recognized)
+        # returns OK_TERMINAL without consulting
+        # checkpoint_path at all. A None checkpoint_path must
+        # not block the OK_TERMINAL verdict.
+        from aed_lifecycle.watchdog import (
+            OK_TERMINAL,
+            WatchdogState,
+            evaluate_watchdog,
+        )
+        state = WatchdogState(
+            phase_name="PHASE_8",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action=None,
+            checkpoint_path=None,
+            terminal_state="MERGED",
+        )
+        verdict = evaluate_watchdog(state, now=1.0)
+        self.assertEqual(verdict, OK_TERMINAL)
 
 
 if __name__ == "__main__":
