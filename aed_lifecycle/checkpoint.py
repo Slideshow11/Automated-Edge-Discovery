@@ -290,16 +290,56 @@ def validate_resume_observations(
 
     A ``None`` or empty-string RECORDED head (i.e. the
     checkpoint was persisted without a recorded PR head or
-    primary head) is NOT silently skipped — it is treated as
-    a missing-required-field error. The runner cannot verify
-    head drift against a missing recorded head, so resuming
-    from a checkpoint that lost its recorded heads would be
-    unsafe. The error message is the standard
-    "recorded head missing" form, and the runner is expected
-    to surface it as ``HOLD_OPERATOR_REQUIRED`` (the
-    checkpoint is structurally unfit for resume).
+    primary head) is treated as a missing-recorded-head
+    error, with one exception: a checkpoint that has a
+    RECOGNIZED ``terminal_state`` (e.g. ``"MERGED"``,
+    ``"HOLD_OPERATOR_REQUIRED"``) is parked. The runner
+    cannot continue, and the recorded-head-missing error
+    would force a spurious ``HOLD_HEAD_CHANGED`` instead of
+    the documented terminal-state verdict. The recorded-head
+    requirement is therefore SKIPPED for checkpoints with a
+    recognized terminal state. Fix for Codex 3415335299:
+    a terminal checkpoint persisted without
+    ``last_verified_*_head`` fields must not surface
+    ``HOLD_HEAD_CHANGED``. Resuming a non-terminal
+    checkpoint that lost its recorded heads is still
+    unsafe and is reported as
+    ``"recorded PR head missing"`` /
+    ``"recorded primary head missing"``, which the runner
+    surfaces as ``HOLD_OPERATOR_REQUIRED``.
+
+    Terminal-state check order:
+
+    1. If ``state.terminal_state`` is a recognized
+       terminal lifecycle state, skip the recorded-head
+       checks entirely and return ``[]``. The runner
+       will stop on the terminal state.
+    2. If ``state.terminal_state`` is set but NOT
+       recognized, return ``["unknown terminal state"]``
+       so the runner surfaces ``HOLD_OPERATOR_REQUIRED``.
+    3. Otherwise, run the recorded-head checks as
+       documented.
     """
     errors: List[str] = []
+
+    # Terminal-state short-circuit. A checkpoint parked on
+    # a recognized terminal state (Fix for Codex 3415335299)
+    # is done — the recorded-head-missing check would force a
+    # spurious HOLD_HEAD_CHANGED instead of letting the
+    # terminal state take effect. The runner stops on the
+    # terminal state; no head-drift detection is needed.
+    if state.terminal_state is not None:
+        if is_terminal_lifecycle_state(state.terminal_state):
+            return []
+        # Unknown terminal_state — surface as a hold, do not
+        # fall through to the head-drift checks (the runner
+        # would otherwise report HOLD_HEAD_CHANGED instead of
+        # the unknown-terminal hold).
+        errors.append(
+            f"unknown terminal_state {state.terminal_state!r} "
+            "is not a recognized terminal state"
+        )
+        return errors
 
     # Recorded PR head must be present and non-empty before
     # we can compare it against the observation. A missing

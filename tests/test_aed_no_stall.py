@@ -2540,5 +2540,154 @@ class CheckpointRequiresOperatorAbsentNextActionTests(unittest.TestCase):
             self.assertEqual(result, "HOLD_OPERATOR_REQUIRED")
 
 
+# ---------------------------------------------------------------------------
+# Section 26: Fix 3415335299 — skip head-drift checks for terminal checkpoints
+# ---------------------------------------------------------------------------
+
+
+class TerminalCheckpointSkipsHeadDriftTests(unittest.TestCase):
+    """Codex 3415335299: a terminal checkpoint persisted
+    without ``last_verified_*_head`` fields must NOT
+    surface ``HOLD_HEAD_CHANGED``. The runner stops on
+    the terminal state, and the recorded-head-missing
+    check is skipped for terminal checkpoints.
+    """
+
+    def _terminal_ck(self, terminal_state="MERGED"):
+        return CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_8",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3"],
+            next_phase=None,
+            next_action=None,
+            pending_actions=[],
+            # Optional fields omitted (None) — terminal
+            # checkpoint without recorded heads.
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=terminal_state,
+            updated_at="2026-06-15T17:30:00Z",
+        )
+
+    def test_terminal_merged_skips_head_drift_check(self) -> None:
+        # A terminal checkpoint with no recorded heads
+        # must NOT produce recorded-head-missing errors.
+        errors = validate_resume_observations(
+            self._terminal_ck("MERGED"),
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_terminal_merge_ready_skips_head_drift_check(self) -> None:
+        errors = validate_resume_observations(
+            self._terminal_ck("MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"),
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_terminal_hold_operator_required_skips_head_drift(self) -> None:
+        errors = validate_resume_observations(
+            self._terminal_ck("HOLD_OPERATOR_REQUIRED"),
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_terminal_failed_skips_head_drift(self) -> None:
+        errors = validate_resume_observations(
+            self._terminal_ck("FAILED"),
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_non_terminal_still_flags_missing_recorded_head(self) -> None:
+        # A non-terminal checkpoint with a missing recorded
+        # head must STILL surface the recorded-head-missing
+        # error. The terminal-state short-circuit does not
+        # apply here.
+        ck = CheckpointState(
+            repo="r",
+            pr_number=1,
+            branch="b",
+            current_head="a" * 40,
+            phase="PHASE_5",
+            completed_phases=[],
+            next_phase="PHASE_6",
+            next_action="poll CI",
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_resume_observations(
+            ck, observed_pr_head="a" * 40, observed_primary_head="0" * 40
+        )
+        self.assertTrue(
+            any("recorded PR head missing" in e for e in errors)
+        )
+        self.assertTrue(
+            any("recorded primary head missing" in e for e in errors)
+        )
+
+    def test_unknown_terminal_state_surfaces_hold(self) -> None:
+        # An unrecognized terminal state must surface as
+        # "unknown terminal state" so the runner can report
+        # HOLD_OPERATOR_REQUIRED — NOT a recorded-head error.
+        errors = validate_resume_observations(
+            self._terminal_ck("NOT_A_REAL_STATE"),
+            observed_pr_head="a" * 40,
+            observed_primary_head="0" * 40,
+        )
+        # Should NOT contain recorded-head-missing errors.
+        self.assertFalse(
+            any("recorded PR head missing" in e for e in errors)
+        )
+        self.assertFalse(
+            any("recorded primary head missing" in e for e in errors)
+        )
+        # Should contain the unknown-terminal error.
+        self.assertTrue(
+            any("unknown terminal_state" in e for e in errors)
+        )
+
+    def test_terminal_resume_after_phase_1_succeeds(self) -> None:
+        # The terminal-state short-circuit must apply
+        # regardless of what phase is recorded. A
+        # PHASE_1-completed terminal checkpoint must
+        # resume without head-drift errors.
+        ck = CheckpointState(
+            repo="r",
+            pr_number=1,
+            branch="b",
+            current_head="a" * 40,
+            phase="PHASE_1",
+            completed_phases=[],
+            next_phase="PHASE_2",
+            next_action=None,
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state="MERGED",
+            updated_at=None,
+        )
+        errors = validate_resume_observations(
+            ck, observed_pr_head="a" * 40, observed_primary_head="0" * 40
+        )
+        self.assertEqual(errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()
