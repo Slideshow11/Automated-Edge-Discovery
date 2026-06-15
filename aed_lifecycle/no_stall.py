@@ -31,6 +31,7 @@ Public API
 """
 from __future__ import annotations
 
+import re
 from typing import FrozenSet
 
 
@@ -210,6 +211,32 @@ def _contains_any(text: str, needles: tuple) -> bool:
     return any(n in text for n in needles)
 
 
+# A whole-token (word-boundary) match pattern built from
+# TERMINAL_LIFECYCLE_STATES. The classifier uses this pattern
+# rather than a substring scan so that a final output containing
+# a longer non-terminal name (e.g. the canonical
+# CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED) is not classified as
+# OK_TERMINAL solely because it contains the shorter registered
+# CODEX_CLEAN_PASS substring. The pattern is built lazily and
+# cached on the module.
+_TERMINAL_TOKEN_PATTERN: "re.Pattern[str] | None" = None
+
+
+def _terminal_token_pattern() -> "re.Pattern[str]":
+    """Return the compiled whole-token regex for terminal states.
+
+    Built lazily and cached on the module. The pattern is
+    anchored on word boundaries (``\\b``) so the longer
+    ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`` does not match
+    just because it contains ``CODEX_CLEAN_PASS``.
+    """
+    global _TERMINAL_TOKEN_PATTERN
+    if _TERMINAL_TOKEN_PATTERN is None:
+        body = "|".join(re.escape(s) for s in TERMINAL_LIFECYCLE_STATES)
+        _TERMINAL_TOKEN_PATTERN = re.compile(r"\b(?:" + body + r")\b")
+    return _TERMINAL_TOKEN_PATTERN
+
+
 def classify_humphry_message_for_stall(text: object) -> str:
     """Classify a Humphry final-output message into a stall category.
 
@@ -245,10 +272,14 @@ def classify_humphry_message_for_stall(text: object) -> str:
     if not isinstance(text, str) or not text:
         return STALL_NO_TERMINAL_STATE
 
-    # 1. Terminal-state detection — substring match against the
-    # registry. This is the only way a message can become
-    # OK_TERMINAL.
-    if any(state in text for state in TERMINAL_LIFECYCLE_STATES):
+    # 1. Terminal-state detection — whole-token match against
+    # the registry. The check uses a word-boundary regex so
+    # that a longer non-terminal name like
+    # ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`` is not classified
+    # as OK_TERMINAL solely because it contains the shorter
+    # registered ``CODEX_CLEAN_PASS`` substring. This is the
+    # only way a message can become OK_TERMINAL.
+    if _terminal_token_pattern().search(text):
         return OK_TERMINAL
 
     has_continue_prompt = _contains_any(text, _CONTINUE_PROMPT_TOKENS)

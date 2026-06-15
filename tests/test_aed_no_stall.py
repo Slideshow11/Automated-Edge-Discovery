@@ -883,5 +883,160 @@ class WatchdogNextActionRequirementTests(unittest.TestCase):
         self.assertEqual(verdict, "OK_TERMINAL")
 
 
+# ---------------------------------------------------------------------------
+# Section 10: Whole-token terminal-state matching (Codex 3413237706)
+# ---------------------------------------------------------------------------
+
+
+class ClassifyWholeTokenTerminalTests(unittest.TestCase):
+    """The terminal-state match in the classifier must be
+    whole-token (word-boundary), not substring. A longer
+    non-terminal name containing a shorter registered terminal
+    name (e.g. ``CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED`` contains
+    the substring ``CODEX_CLEAN_PASS``) must NOT trigger
+    OK_TERMINAL.
+    """
+
+    def test_longer_non_terminal_with_substring_is_not_terminal(self) -> None:
+        # CODEX_CLEAN_PASS is in TERMINAL_LIFECYCLE_STATES but
+        # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED is not. Whole-token
+        # matching must reject the longer name even though it
+        # contains the shorter one as a substring.
+        text = "Now in CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED state."
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_TERMINAL)
+
+    def test_whole_terminal_state_token_matches(self) -> None:
+        # The terminal state appears as a whole token.
+        text = "State is MERGE_READY_AWAITING_HUMAN_AUTHORIZATION."
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_whole_terminal_state_token_at_string_end(self) -> None:
+        # Trailing word-boundary.
+        text = "now in HOLD_PR_CI_PENDING"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_whole_terminal_state_token_at_string_start(self) -> None:
+        # Leading word-boundary.
+        text = "MERGED."
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Section 11: Optional checkpoint fields may be None (Codex 3413237709)
+# ---------------------------------------------------------------------------
+
+
+class CheckpointOptionalFieldsTests(unittest.TestCase):
+    """A terminal checkpoint with optional fields set to None
+    (e.g. no phase, no next_phase, no last_verified_*_head)
+    must pass structural validation. The dataclass marks these
+    fields as ``Optional[...]`` with sensible defaults, so
+    None is a valid value.
+    """
+
+    def test_terminal_checkpoint_with_only_required_fields_passes(self) -> None:
+        # Build a checkpoint with the truly required fields
+        # only. Optional fields default to None / empty.
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=None,
+            terminal_state="MERGED",
+        )
+        errors = validate_checkpoint(ck)
+        self.assertEqual(
+            errors,
+            [],
+            f"terminal checkpoint with optional fields None must pass, got {errors}",
+        )
+
+    def test_checkpoint_with_none_for_all_optional_fields_passes(self) -> None:
+        # All optional fields None, only the truly required
+        # ones populated. Validation must succeed.
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=None,
+            next_phase=None,
+            next_action=None,
+            pending_actions=[],
+            last_verified_primary_head=None,
+            last_verified_pr_head=None,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state="HOLD_RESUME_CHECKPOINT_NEEDED",
+            updated_at=None,
+        )
+        errors = validate_checkpoint(ck)
+        self.assertEqual(
+            errors,
+            [],
+            f"checkpoint with all optional fields None must pass, got {errors}",
+        )
+
+    def test_checkpoint_with_optional_lists_empty_passes(self) -> None:
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5",
+            completed_phases=[],
+            pending_actions=[],
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+        )
+        errors = validate_checkpoint(ck)
+        self.assertEqual(
+            errors,
+            [],
+            f"empty required list fields must be allowed, got {errors}",
+        )
+
+    def test_checkpoint_missing_repo_string_fails(self) -> None:
+        # Truly required string fields are still enforced.
+        ck = CheckpointState(
+            repo="",  # empty — should fail
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase=None,
+        )
+        errors = validate_checkpoint(ck)
+        self.assertTrue(
+            any("repo" in e for e in errors),
+            f"empty repo must fail validation, got {errors}",
+        )
+
+    def test_checkpoint_missing_branch_string_fails(self) -> None:
+        ck = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="",
+            current_head="a" * 40,
+            phase=None,
+        )
+        errors = validate_checkpoint(ck)
+        self.assertTrue(
+            any("branch" in e for e in errors),
+            f"empty branch must fail validation, got {errors}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -62,21 +62,21 @@ from .no_stall import is_terminal_lifecycle_state
 
 
 # Required fields. A checkpoint missing any of these is invalid.
-# Optional fields (next_action, terminal_state, updated_at) are
-# allowed to be None — the validator will flag a fully empty
-# checkpoint as operator-required, but does not flag the field
-# itself.
-_REQUIRED_CHECKPOINT_FIELDS: Tuple[str, ...] = (
+# A "required" field is one that the dataclass types as
+# non-Optional and that the protocol needs to make any
+# meaningful use of the checkpoint. Optional fields (those
+# typed ``Optional[...]`` in the dataclass) may be None.
+# The validator emits a structural error only for missing
+# required fields, empty required strings, bad pr_number, or
+# an unrecognized terminal_state.
+_REQUIRED_STRING_FIELDS: Tuple[str, ...] = (
     "repo",
-    "pr_number",
     "branch",
     "current_head",
-    "phase",
+)
+_REQUIRED_LIST_FIELDS: Tuple[str, ...] = (
     "completed_phases",
-    "next_phase",
     "pending_actions",
-    "last_verified_primary_head",
-    "last_verified_pr_head",
     "authorized_thread_ids",
     "unresolved_thread_ids",
 )
@@ -127,7 +127,7 @@ class CheckpointState:
     last_verified_primary_head: Optional[str] = None
     last_verified_pr_head: Optional[str] = None
     authorized_thread_ids: List[str] = field(default_factory=list)
-    unresolved_thread_ids: List[str] = None  # type: ignore[assignment]
+    unresolved_thread_ids: List[str] = field(default_factory=list)
     terminal_state: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -155,18 +155,27 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
 
     A checkpoint is considered structurally invalid when:
 
-    - any required field is missing or None
-    - ``pr_number`` is not a positive int
+    - any required string field (``repo``, ``branch``,
+      ``current_head``) is missing or empty
+    - ``pr_number`` is missing, not an int, or not positive
+    - any required list field is missing or contains
+      non-string items
     - the ``terminal_state`` is set but is not a recognized
       terminal state
 
     The function is lenient: it emits human-readable error
     strings, not exception types, so callers can collect
-    errors and report them in a single message.
+    errors and report them in a single message. Optional
+    fields (``phase``, ``next_phase``, ``next_action``,
+    ``pending_actions``, ``last_verified_primary_head``,
+    ``last_verified_pr_head``, ``authorized_thread_ids``,
+    ``unresolved_thread_ids``, ``terminal_state``,
+    ``updated_at``) may be None — the dataclass marks them
+    as ``Optional[...]`` with sensible defaults.
     """
     errors: List[str] = []
 
-    for fname in _REQUIRED_CHECKPOINT_FIELDS:
+    for fname in _REQUIRED_STRING_FIELDS:
         if not hasattr(state, fname):
             errors.append(f"checkpoint missing required field {fname!r}")
             continue
@@ -177,24 +186,19 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
         if isinstance(val, str) and not val.strip():
             errors.append(f"checkpoint field {fname!r} is empty string")
             continue
-        if isinstance(val, list) and len(val) == 0 and fname in {
-            "completed_phases",
-            "pending_actions",
-        }:
-            # Empty completed_phases is fine (first run); empty
-            # pending_actions is fine (work is done).
+
+    for fname in _REQUIRED_LIST_FIELDS:
+        if not hasattr(state, fname):
+            errors.append(f"checkpoint missing required list field {fname!r}")
             continue
-        if isinstance(val, list) and fname in {
-            "authorized_thread_ids",
-            "unresolved_thread_ids",
-        }:
-            # Empty is fine — the runner still needs to verify
-            # both lists are lists of strings.
-            if not all(isinstance(x, str) for x in val):
-                errors.append(
-                    f"checkpoint field {fname!r} must be list[str]"
-                )
+        val = getattr(state, fname)
+        if not isinstance(val, list):
+            errors.append(f"checkpoint field {fname!r} must be list[str]")
             continue
+        if not all(isinstance(x, str) for x in val):
+            errors.append(
+                f"checkpoint field {fname!r} must be list[str]"
+            )
 
     # pr_number must be a positive int
     if not isinstance(state.pr_number, int) or isinstance(state.pr_number, bool):
