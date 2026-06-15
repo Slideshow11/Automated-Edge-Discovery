@@ -2509,5 +2509,172 @@ class TestThreadResolveValidIdsStillWork(unittest.TestCase):
         self.assertTrue(d.allowed)
 
 
+# ---------------------------------------------------------------------------
+# Jcmlx: reject non-list AED thread containers (tuple / set / str / dict)
+# ---------------------------------------------------------------------------
+
+
+class TestValidateThreadIdsContainerType(unittest.TestCase):
+    """Regression tests for PRRT_kwDOSHFpYM6Jcmlx.
+
+    ``_validate_thread_ids`` must accept only ``list`` as the
+    container type. Tuples, sets, strings, dicts, generators,
+    and ``None`` are denied with a policy decision that cites
+    ``AED-RULE-008`` and never raises.
+    """
+
+    def test_validate_thread_ids_denies_tuple(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(("PRRT_a",), "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_empty_tuple(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(tuple(), "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_set(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids({"PRRT_a"}, "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_frozenset(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(frozenset({"PRRT_a"}), "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_string(self):
+        from aed_policy.policy import _validate_thread_ids
+        # A bare string is iterable char-by-char, but the
+        # contract requires a list, so a string is denied.
+        result = _validate_thread_ids("PRRT_a", "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_dict(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids({"id": "PRRT_a"}, "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_none(self):
+        from aed_policy.policy import _validate_thread_ids
+        result = _validate_thread_ids(None, "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+    def test_validate_thread_ids_denies_generator(self):
+        from aed_policy.policy import _validate_thread_ids
+        def _gen():
+            yield "PRRT_a"
+        result = _validate_thread_ids(_gen(), "target")
+        self.assertIsNotNone(result)
+        self.assertFalse(result.allowed)
+        self.assertIn("AED-RULE-008", result.matched_rule_ids)
+
+
+class TestThreadResolveTupleContainerDenied(unittest.TestCase):
+    """Regression tests: GITHUB_THREAD_RESOLVE denies tuple containers."""
+
+    def _assert_denied(self, d):
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+    def test_target_thread_ids_tuple_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=("PRRT_a",),
+        )
+        self._assert_denied(d)
+
+    def test_authorized_thread_ids_tuple_denied(self):
+        s = _clean_state(authorized_thread_ids=("PRRT_a",))
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_both_target_and_authorized_tuples_denied(self):
+        s = _clean_state(authorized_thread_ids=("PRRT_a",))
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=("PRRT_a",),
+        )
+        self._assert_denied(d)
+
+    def test_target_set_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids={"PRRT_a"},
+        )
+        self._assert_denied(d)
+
+    def test_authorized_set_denied(self):
+        s = _clean_state(authorized_thread_ids={"PRRT_a"})
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self._assert_denied(d)
+
+    def test_target_string_denied(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids="PRRT_a",
+        )
+        self._assert_denied(d)
+
+    def test_tuple_path_no_TypeError(self):
+        # A tuple of authorized thread IDs would have made the
+        # pre-patch implementation allow thread resolution.
+        # After the patch, the tuple container is denied with
+        # AED-RULE-008 and never raises.
+        s = _clean_state(authorized_thread_ids=("PRRT_a", "PRRT_b"))
+        try:
+            d = evaluate_action(
+                AEDActionType.GITHUB_THREAD_RESOLVE,
+                s,
+                target_thread_ids=("PRRT_a",),
+            )
+        except TypeError as e:
+            self.fail(f"evaluate_action raised TypeError: {e}")
+        self.assertFalse(d.allowed)
+        self.assertIn("AED-RULE-008", d.matched_rule_ids)
+
+
+class TestThreadResolveListAllowedAfterJcmlxFix(unittest.TestCase):
+    """Lists of non-empty strings are still allowed after the Jcmlx fix."""
+
+    def test_target_and_authorized_both_lists_allowed(self):
+        s = _clean_state(authorized_thread_ids=["PRRT_a", "PRRT_b"])
+        d = evaluate_action(
+            AEDActionType.GITHUB_THREAD_RESOLVE,
+            s,
+            target_thread_ids=["PRRT_a"],
+        )
+        self.assertTrue(d.allowed)
+
+
 if __name__ == "__main__":
     unittest.main()
