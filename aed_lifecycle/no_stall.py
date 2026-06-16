@@ -44,9 +44,27 @@ OK_TERMINAL = "OK_TERMINAL"
 """The final output carries a recognized terminal lifecycle state."""
 
 OK_PROGRESS_WITH_NEXT_ACTION = "OK_PROGRESS_WITH_NEXT_ACTION"
-"""The final output is mid-phase progress, but explicitly carries
-a ``next_action`` (and optionally a checkpoint path) so the runner
-can resume from where it left off."""
+"""The final output is mid-phase progress and explicitly carries
+BOTH a ``next_action`` AND a value-bearing checkpoint path so the
+runner can resume from where it left off.
+
+The classifier requires both pieces of evidence. A final output
+that has a valid ``next_action`` but no value-bearing checkpoint
+falls through to ``STALL_NO_CHECKPOINT`` (or
+``STALL_NO_TERMINAL_STATE`` when the message has no checkpoint
+mention at all); a final output that has a value-bearing
+checkpoint but no ``next_action`` also falls through to
+``STALL_NO_TERMINAL_STATE`` (the runner has a resume point but
+nothing executable to act on). The strict both-required contract
+is documented here for the AED no-stall protocol. Fix L
+(Codex 3420442393) explicitly aligned this docstring with the
+strict classifier implementation: the previous wording
+(``optionally a checkpoint path``) was misleading because the
+classifier was already requiring both fields, and a
+compliant-looking progress message that omitted the checkpoint
+classified as ``STALL_NO_CHECKPOINT`` instead of the
+``OK_PROGRESS_WITH_NEXT_ACTION`` a future runner would expect.
+"""
 
 STALL_PHASE_HEADER_ONLY = "STALL_PHASE_HEADER_ONLY"
 """The final output is just a phase header (``Starting PHASE 1 —``
@@ -871,6 +889,22 @@ _DISQUALIFYING_TOKENS = (
 # surrounding whitespace around the ``=`` separator
 # (``terminal_state=MERGED`` and ``terminal_state = MERGED``
 # are both valid).
+#
+# Fix K (Codex 3420442396): the prefix-match is
+# case-insensitive AND the prefix set covers every
+# capitalization and spacing variant the runner can
+# pretty-print, including the previously-missing
+# uppercase-with-spaced-equals form ``TERMINAL_STATE =
+# MERGED``. The matching loop in
+# :func:`_line_has_explicit_terminal_assertion`
+# lowercases both the line and the candidate prefix for
+# the ``startswith`` check, so this tuple only needs to
+# hold one canonical case per logical prefix; mixed-case
+# lines (``Terminal_State = MERGED``) are accepted via
+# the lowercased comparison. Underscore and space
+# variants of the field name are both accepted because
+# both forms appear in the AED no-stall protocol and
+# the agent may pretty-print either way.
 _ASSERTION_PREFIXES = (
     "Final lifecycle state:",
     "Final state:",
@@ -883,6 +917,27 @@ _ASSERTION_PREFIXES = (
     "Terminal State:",
     "TERMINAL_STATE:",
     "TERMINAL_STATE=",
+    "TERMINAL_STATE =",
+    "terminal state:",
+    "terminal state=",
+    "terminal state =",
+    "Terminal_State:",
+    "Terminal_State=",
+    "Terminal_State =",
+    "LIFECYCLE_STATE:",
+    "LIFECYCLE_STATE=",
+    "LIFECYCLE_STATE =",
+    "lifecycle_state:",
+    "lifecycle_state=",
+    "lifecycle_state =",
+    "Lifecycle State:",
+    "Lifecycle_State:",
+    "Lifecycle_State=",
+    "Lifecycle_State =",
+    "FINAL LIFECYCLE STATE:",
+    "FINAL STATE:",
+    "FINAL_LIFECYCLE_STATE:",
+    "FINAL_STATE:",
 )
 
 
@@ -1112,6 +1167,16 @@ def _line_has_explicit_terminal_assertion(line: str) -> bool:
     s = line.strip()
     if not s:
         return False
+    # Fix K (Codex 3420442396): the prefix match is
+    # case-insensitive. Both the line and each candidate
+    # prefix are lower-cased for the ``startswith`` check;
+    # the original-case ``s`` is preserved for state-token
+    # extraction so :func:`is_terminal_lifecycle_state`
+    # (which expects canonical case like ``MERGED``) keeps
+    # working unchanged. ASCII case-folding preserves
+    # length so the position used to slice the rest of
+    # the line is the same in ``s`` and ``s_lower``.
+    s_lower = s.lower()
 
     # Check 1: line is exactly a terminal state. A bare state
     # mention is always ambiguous — any negation/future token
@@ -1123,8 +1188,9 @@ def _line_has_explicit_terminal_assertion(line: str) -> bool:
     # first word after the prefix; the explanation that follows
     # is allowed to contain disqualifying tokens.
     for prefix in _ASSERTION_PREFIXES:
-        if s.startswith(prefix):
-            rest = s[len(prefix):].strip()
+        prefix_lower = prefix.lower()
+        if s_lower.startswith(prefix_lower):
+            rest = s[len(prefix_lower):].strip()
             if not rest:
                 continue
             # First token is the candidate state. Trailing
@@ -1133,7 +1199,7 @@ def _line_has_explicit_terminal_assertion(line: str) -> bool:
             if is_terminal_lifecycle_state(first_token):
                 # The ambiguous portion is the prefix-and-state
                 # span only; the explanation is ignored.
-                ambiguous = s[: len(prefix) + len(first_token)]
+                ambiguous = s[: len(prefix_lower) + len(first_token)]
                 return _has_no_disqualifying_tokens(ambiguous)
 
     # Check 3: state at start of line, followed by an em-dash

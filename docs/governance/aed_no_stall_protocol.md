@@ -36,7 +36,7 @@ The classifier emits one of six categories:
 | Constant                    | Meaning                                                                                  |
 |-----------------------------|------------------------------------------------------------------------------------------|
 | `OK_TERMINAL`               | Output carries a recognized terminal lifecycle state — the run is finished (one way or another). |
-| `OK_PROGRESS_WITH_NEXT_ACTION` | Mid-phase progress, but explicitly carries `next_action` (and optionally a checkpoint path) so the runner can resume. |
+| `OK_PROGRESS_WITH_NEXT_ACTION` | Mid-phase progress that explicitly carries BOTH a `next_action` AND a value-bearing checkpoint path. Both fields are required — see Fix L (Codex 3420442393). |
 | `STALL_PHASE_HEADER_ONLY`   | Output is just a phase header (`"Starting PHASE 1 — ..."` or `"Now PHASE 8 — ..."`) with no terminal state, no `next_action`, and no checkpoint. |
 | `STALL_WAITING_FOR_CONTINUE` | Output is a yes/no continue prompt. |
 | `STALL_NO_TERMINAL_STATE`   | Output is a generic progress note with no terminal state and no `next_action`. The runner cannot tell whether the work is done, paused, or stuck. |

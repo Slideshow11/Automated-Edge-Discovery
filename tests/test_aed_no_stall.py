@@ -4822,6 +4822,240 @@ class CapitalizedProseCheckpointPathExtractionTests(unittest.TestCase):
         )
 
 
+class OkProgressRequiresBothFieldsTests(unittest.TestCase):
+    """Regression tests for Codex 3420442393 (Fix L).
+
+    The public contract for ``OK_PROGRESS_WITH_NEXT_ACTION``
+    requires BOTH a valid ``next_action`` AND a value-bearing
+    checkpoint path. A final output that omits either
+    piece of evidence is NOT ``OK_PROGRESS_WITH_NEXT_ACTION``;
+    it falls through to ``STALL_NO_CHECKPOINT`` (next_action
+    without checkpoint) or ``STALL_NO_TERMINAL_STATE``
+    (checkpoint without next_action). Fix L aligned the
+    docstring and the docs protocol with the strict
+    classifier implementation; these tests pin the
+    contract so a future change cannot regress it.
+    """
+
+    def test_next_action_only_is_not_ok_progress(self) -> None:
+        # A final output with a valid ``next_action`` and
+        # no value-bearing checkpoint is NOT
+        # ``OK_PROGRESS_WITH_NEXT_ACTION``. The
+        # classifier falls through to ``STALL_NO_CHECKPOINT``
+        # (or ``STALL_NO_TERMINAL_STATE`` when the message
+        # has no checkpoint mention at all).
+        text = "next_action: poll CI status"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_next_action_only_with_phase_header_is_stall_no_checkpoint(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            STALL_NO_CHECKPOINT,
+        )
+
+    def test_field_style_checkpoint_with_next_action_is_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_prose_checkpoint_with_next_action_is_progress(self) -> None:
+        # Sentence-cased prose form (Fix J territory)
+        # combined with a valid ``next_action`` must
+        # classify as ``OK_PROGRESS_WITH_NEXT_ACTION``.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Wrote checkpoint to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_only_is_not_ok_progress(self) -> None:
+        # A final output with a value-bearing checkpoint
+        # but no ``next_action`` is NOT
+        # ``OK_PROGRESS_WITH_NEXT_ACTION``. The runner
+        # has a resume point but nothing executable to
+        # act on, so the classifier falls through to
+        # ``STALL_NO_TERMINAL_STATE`` (or
+        # ``STALL_NO_CHECKPOINT`` when the message also
+        # has a phase header).
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertNotEqual(verdict, OK_TERMINAL)
+
+    def test_no_next_action_no_checkpoint_is_stall(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification."
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(verdict, OK_PROGRESS_WITH_NEXT_ACTION)
+        self.assertNotEqual(verdict, OK_TERMINAL)
+
+
+class TerminalStateAssertionPrefixNormalizationTests(unittest.TestCase):
+    """Regression tests for Codex 3420442396 (Fix K).
+
+    The terminal_state assertion prefix list accepts
+    uppercase with spaces (``TERMINAL_STATE = MERGED``)
+    and other mixed-case / spaced forms in addition to
+    the previously-recognized uppercase-without-space
+    (``TERMINAL_STATE=``) and lowercase-spaced
+    (``terminal_state =``) forms. The matching is
+    case-insensitive so a sentence-cased or all-caps
+    pretty-printed protocol field still classifies as
+    an explicit terminal-state assertion.
+    """
+
+    def test_terminal_state_uppercase_spaced_equals_merged(self) -> None:
+        # The specific form called out in the Codex
+        # finding: ``TERMINAL_STATE = MERGED``.
+        text = "TERMINAL_STATE = MERGED"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_uppercase_spaced_equals_hold(self) -> None:
+        text = "TERMINAL_STATE = HOLD_PR_CI_PENDING"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_mixed_case_spaced_equals(self) -> None:
+        text = "Terminal_State = HOLD_NEW_CODEX_THREAD"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_uppercase_no_space_equals(self) -> None:
+        # Already-supported form: still works.
+        text = "TERMINAL_STATE=MERGED"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_lowercase_spaced_equals(self) -> None:
+        # Already-supported form: still works.
+        text = "terminal_state = MERGED"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_lowercase_colon(self) -> None:
+        # Already-supported form: still works.
+        text = "terminal_state: MERGED"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_empty_colon_is_not_terminal(self) -> None:
+        text = "terminal_state:"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_uppercase_spaced_equals_empty_is_not_terminal(
+        self,
+    ) -> None:
+        text = "TERMINAL_STATE ="
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_uppercase_spaced_equals_non_terminal_value(
+        self,
+    ) -> None:
+        # CODEX_CLEAN_PASS is informational, not a
+        # parked/terminal state. The strict prefix match
+        # still extracts the value and rejects it.
+        text = "TERMINAL_STATE = CODEX_CLEAN_PASS"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_uppercase_spaced_equals_with_explanation(
+        self,
+    ) -> None:
+        # The em-dash explanation form should still work
+        # for the new uppercase-with-spaced-equals
+        # prefix. Fix B's disqualifier is scoped to the
+        # ambiguous portion, not the explanation.
+        text = "TERMINAL_STATE = HOLD_PR_CI_PENDING — bounded polling reached limit"
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_TERMINAL,
+        )
+
+    def test_terminal_state_assertion_extractor(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _line_has_explicit_terminal_assertion,
+        )
+        # Direct test of the assertion helper on each
+        # canonical form called out in the spec.
+        accepted_forms = [
+            "terminal_state: MERGED",
+            "Terminal State: MERGED",
+            "TERMINAL_STATE: MERGED",
+            "terminal_state=MERGED",
+            "terminal_state = MERGED",
+            "TERMINAL_STATE=MERGED",
+            "TERMINAL_STATE = MERGED",
+            "Terminal_State = MERGED",
+        ]
+        for line in accepted_forms:
+            self.assertTrue(
+                _line_has_explicit_terminal_assertion(line),
+                f"line {line!r} should be an explicit terminal assertion",
+            )
+
+    def test_terminal_state_assertion_rejects_empty(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _line_has_explicit_terminal_assertion,
+        )
+        rejected_forms = [
+            "terminal_state:",
+            "TERMINAL_STATE =",
+            "terminal_state: none",
+            "TERMINAL_STATE = none",
+        ]
+        for line in rejected_forms:
+            self.assertFalse(
+                _line_has_explicit_terminal_assertion(line),
+                f"line {line!r} should NOT be an explicit terminal assertion",
+            )
+
+
 class RejectCheckpointAssignmentAsNextActionTests(unittest.TestCase):
     """Regression tests for Codex finding 3417182526 (Fix H).
 
