@@ -4595,6 +4595,233 @@ class ProseCheckpointPathExtractionTests(unittest.TestCase):
             )
 
 
+class CapitalizedProseCheckpointPathExtractionTests(unittest.TestCase):
+    """Regression tests for Codex 3420268720 (Fix J).
+
+    The value-bearing checkpoint parser must recognize
+    prose-style markers in sentence-cased form
+    (``Wrote checkpoint to`` / ``Saved checkpoint to`` /
+    ``Checkpoint file:`` / ``Checkpoint file`` /
+    ``Checkpoint at`` / ``Checkpoint saved to``) when the
+    marker is followed by a path-shaped value. The previous
+    case-sensitive ``line.find(marker)`` for prose markers
+    let a perfectly valid sentence-cased final output fall
+    through to ``STALL_NO_CHECKPOINT`` even though both a
+    continuation action and a concrete resume path were
+    present.
+
+    The parser must still reject capitalized status forms
+    (e.g. ``Checkpoint pending``, ``Wrote checkpoint to
+    pending``, ``Checkpoint file will be written later``) so
+    the bare-marker bug (Codex 3417105899) remains pinned.
+    Field-style markers (e.g. ``checkpoint:`` /
+    ``checkpoint_path=``) keep their strict
+    case-sensitive behavior; only prose-style markers
+    accept sentence-cased variants.
+    """
+
+    def test_capitalized_wrote_checkpoint_to_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Wrote checkpoint to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_saved_checkpoint_to_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Saved checkpoint to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_checkpoint_file_with_colon_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint file: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_checkpoint_file_without_colon_is_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint file /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_checkpoint_at_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint at /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_checkpoint_saved_to_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint saved to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_prose_extractor_returns_path(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text, expected in [
+            (
+                "Wrote checkpoint to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "Saved checkpoint to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "Checkpoint file: /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "Checkpoint file /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "Checkpoint at /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "Checkpoint saved to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertEqual(
+                value,
+                expected,
+                f"capitalized prose marker text {text!r} should extract {expected!r}, got {value!r}",
+            )
+
+    def test_capitalized_prose_with_status_word_returns_none(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text in [
+            "Wrote checkpoint to pending",
+            "Saved checkpoint to pending",
+            "Saved checkpoint to later",
+            "Wrote checkpoint to later",
+            "Checkpoint at pending",
+            "Checkpoint saved to missing",
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertIsNone(
+                value,
+                f"capitalized prose marker with status-word value {text!r} should extract None, got {value!r}",
+            )
+
+    def test_capitalized_prose_with_home_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Wrote checkpoint to ~/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_prose_with_relative_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Saved checkpoint to ./ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_bare_checkpoint_pending_is_not_progress(
+        self,
+    ) -> None:
+        # The bare-marker bug (Codex 3417105899) must
+        # remain pinned: a sentence-cased bare
+        # ``Checkpoint pending`` is still not a valid
+        # value-bearing checkpoint reference. The
+        # case-insensitive prose-marker search is only
+        # for the explicit prose markers (``Wrote
+        # checkpoint to`` / etc.), not for the bare
+        # ``Checkpoint`` token.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint pending"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_capitalized_checkpoint_file_will_be_written_later_is_not_progress(
+        self,
+    ) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint file will be written later"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_field_style_markers_remain_case_sensitive(self) -> None:
+        # Field-style markers like ``Checkpoint:`` are
+        # case-sensitive. The agent must use exactly the
+        # documented case (``Checkpoint:`` /
+        # ``checkpoint:``). A non-matching case for a
+        # non-explicit field-style marker must NOT
+        # classify as progress.
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        # ``CHECKPOINT:`` is not in the field-style
+        # marker list (which has lowercase
+        # ``checkpoint:`` and the explicit
+        # ``Checkpoint:``). It must not extract.
+        self.assertIsNone(
+            _extract_checkpoint_value("CHECKPOINT: /tmp/ckpt.json"),
+        )
+        # ``Checkpoint:`` (exact case) still works.
+        self.assertEqual(
+            _extract_checkpoint_value("Checkpoint: /tmp/ckpt.json"),
+            "/tmp/ckpt.json",
+        )
+        # ``checkpoint:`` (lowercase) still works.
+        self.assertEqual(
+            _extract_checkpoint_value("checkpoint: /tmp/ckpt.json"),
+            "/tmp/ckpt.json",
+        )
+
+
 class RejectCheckpointAssignmentAsNextActionTests(unittest.TestCase):
     """Regression tests for Codex finding 3417182526 (Fix H).
 

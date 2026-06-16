@@ -562,21 +562,35 @@ def _has_next_action_with_value(text: str) -> bool:
 # valid path value before treating the message as
 # OK_PROGRESS_WITH_NEXT_ACTION.
 #
-# The marker tuple mixes field-style markers (colon/equals
-# delimited) and prose-style markers (space delimited) so
-# that a final output like ``wrote checkpoint to
-# /tmp/ckpt.json`` parses the same way as ``checkpoint:
-# /tmp/ckpt.json``. Prose markers require a path-shaped
-# value (see :func:`is_valid_checkpoint_path`); a marker
-# like ``wrote checkpoint to pending`` is rejected because
+# The marker vocabulary is split into two tuples:
+#
+# - :data:`_CHECKPOINT_FIELD_MARKERS` — field-style markers
+#   (colon / equals delimited). Matching is CASE-SENSITIVE
+#   so the strict field-style behavior is preserved. A few
+#   mixed-case entries (``Checkpoint:``, ``Checkpoint
+#   path:``) are explicit so the agent can use
+#   sentence-cased field names without losing precision.
+# - :data:`_CHECKPOINT_PROSE_MARKERS` — prose-style markers
+#   (space delimited, sometimes colon). Matching is
+#   CASE-INSENSITIVE so a sentence-cased ``Wrote checkpoint
+#   to /tmp/ckpt.json`` parses the same way as the
+#   lowercase form. Fix J (Codex 3420268720): a case-sensitive
+#   prose-marker search let a perfectly valid
+#   sentence-cased final output fall through to
+#   ``STALL_NO_CHECKPOINT`` even though both a continuation
+#   action and a concrete resume path were present.
+#
+# Both marker sets still require a path-shaped value (see
+# :func:`is_valid_checkpoint_path`); a marker like
+# ``wrote checkpoint to pending`` is rejected because
 # ``pending`` is not path-shaped. The previous bare-marker
 # bug (``Checkpoint pending`` slipping through as a real
 # value) is still pinned: bare ``Checkpoint `` /
 # ``checkpoint `` / ``Checkpoint file`` markers without a
-# colon, equals, or trailing-space path-suffix are not
-# in this tuple.
-_CHECKPOINT_MARKERS = (
-    # Field-style markers (colon or equals delimited).
+# colon, equals, or trailing-space path-suffix are not in
+# either tuple, so the strict value-bearing path must still
+# be present after the marker.
+_CHECKPOINT_FIELD_MARKERS = (
     "checkpoint_path=",
     "checkpoint_path:",
     "Checkpoint path:",
@@ -585,13 +599,20 @@ _CHECKPOINT_MARKERS = (
     "checkpoint:",
     "Checkpoint:",
     "checkpoint =",
+)
+
+
+_CHECKPOINT_PROSE_MARKERS = (
     # Prose-style markers (space delimited). Each entry is
     # the literal marker followed by a trailing space so
     # that ``checkpoint file`` does NOT match
     # ``checkpoint file: /tmp/ckpt.json`` (the colon breaks
     # the space-suffix match — the explicit
     # ``checkpoint file: `` entry below handles that
-    # form).
+    # form). Matching is CASE-INSENSITIVE so
+    # ``Wrote checkpoint to /tmp/ckpt.json`` and
+    # ``Checkpoint file: /tmp/ckpt.json`` parse the same
+    # way as the lowercase forms.
     "wrote checkpoint to ",
     "saved checkpoint to ",
     "checkpoint file: ",
@@ -606,13 +627,25 @@ def _extract_checkpoint_value(text: str) -> "Optional[str]":
 
     A "real" value is a non-empty, non-placeholder string
     captured from the same line as one of the
-    :data:`_CHECKPOINT_MARKERS` entries. The extractor
-    walks each line of the message, finds the first
-    marker occurrence, and pulls the first whitespace-
+    :data:`_CHECKPOINT_FIELD_MARKERS` or
+    :data:`_CHECKPOINT_PROSE_MARKERS` entries. The extractor
+    walks each line of the message, finds the first marker
+    occurrence, and pulls the first whitespace-
     delimited token on the same line — bounded so that
     the value never consumes the next field name (e.g.
     ``"next_action: poll CI"`` is not consumed when
     parsing ``"checkpoint_path=/tmp/ckpt.json"``).
+
+    Field-style markers are matched CASE-SENSITIVELY so the
+    strict field-style behavior is preserved. Prose-style
+    markers are matched CASE-INSENSITIVELY so a
+    sentence-cased ``Wrote checkpoint to /tmp/ckpt.json``
+    parses the same way as the lowercase form (Fix J,
+    Codex 3420268720). The case-insensitive search is
+    performed on a lower-cased copy of the line; the
+    original-case `idx` is preserved so the returned
+    value-bearing token still has the same surface form
+    the agent wrote.
 
     The return value is the raw string token, with no
     stripping applied (the caller is expected to call
@@ -631,48 +664,97 @@ def _extract_checkpoint_value(text: str) -> "Optional[str]":
     no real value (e.g. ``checkpoint_path=`` followed
     by a newline, or ``checkpoint: none``) does not
     satisfy the "has a real checkpoint" predicate.
+
+    Fix J (Codex 3420268720): the previous
+    case-sensitive ``line.find(marker)`` for prose
+    markers let a sentence-cased final output like
+    ``Wrote checkpoint to /tmp/ckpt.json`` slip through
+    to ``STALL_NO_CHECKPOINT``. The new extractor
+    case-folds the line and the prose marker for the
+    search, but the original-case ``idx`` is used to
+    slice the value, so the returned token still matches
+    the agent's surface casing.
     """
     for raw_line in text.splitlines():
         line = raw_line
-        for marker in _CHECKPOINT_MARKERS:
+        line_lower = line.lower()
+        # Field-style markers: case-sensitive search so
+        # strict field-style behavior is preserved. The
+        # mixed-case field-style entries (``Checkpoint:``,
+        # ``Checkpoint path:``) are explicit and remain
+        # case-sensitive.
+        for marker in _CHECKPOINT_FIELD_MARKERS:
             idx = line.find(marker)
             if idx < 0:
                 continue
-            after = line[idx + len(marker):]
-            stripped = after.lstrip()
-            if not stripped:
-                # Marker is the last token on the line —
-                # empty value, keep scanning.
+            value = _extract_value_after_marker(line, idx, len(marker))
+            if value is not None:
+                return value
+        # Prose-style markers: case-insensitive search so
+        # a sentence-cased ``Wrote checkpoint to`` parses
+        # the same way as the lowercase form. The
+        # lower-cased marker is searched in the
+        # lower-cased line, but the original-case
+        # ``idx`` is used to slice the value.
+        for marker in _CHECKPOINT_PROSE_MARKERS:
+            marker_lower = marker.lower()
+            idx = line_lower.find(marker_lower)
+            if idx < 0:
                 continue
-            # Pull the first whitespace-delimited token on
-            # the same line. Stop at any non-identifier
-            # delimiter (whitespace, comma, semicolon, close
-            # brackets, paren, colon) so a value like
-            # ``"checkpoint: /tmp/ckpt.json, resume: yes"``
-            # extracts as ``"/tmp/ckpt.json,"`` (then we
-            # strip trailing punctuation when validating)
-            # rather than the full string. We also stop at
-            # a comma to prevent the extractor from
-            # consuming the next field when the agent
-            # accidentally lists multiple paths.
-            token_end = len(stripped)
-            for j, ch in enumerate(stripped):
-                if ch.isspace() or ch in ",;]})\n":
-                    token_end = j
-                    break
-                if ch == ":":
-                    # Allow the colon to terminate the
-                    # token so that ``"checkpoint:
-                    # /tmp/ckpt.json: extra"`` extracts
-                    # ``/tmp/ckpt.json`` cleanly.
-                    token_end = j
-                    break
-            first_token = stripped[:token_end]
-            if is_valid_checkpoint_path(first_token):
-                return first_token
-            # else: placeholder/empty marker — keep
-            # scanning the rest of the text for a real
-            # value.
+            value = _extract_value_after_marker(line, idx, len(marker))
+            if value is not None:
+                return value
+    return None
+
+
+def _extract_value_after_marker(
+    line: str, idx: int, marker_len: int
+) -> "Optional[str]":
+    """Return the first whitespace-delimited token after the
+    marker at ``idx`` in ``line`` if it is a valid
+    checkpoint path; otherwise ``None``.
+
+    Helper extracted from :func:`_extract_checkpoint_value`
+    so the field-style and prose-style marker passes can
+    share the same per-line value-extraction logic. The
+    caller is expected to have already verified that the
+    marker is present at ``idx``.
+    """
+    after = line[idx + marker_len:]
+    stripped = after.lstrip()
+    if not stripped:
+        # Marker is the last token on the line —
+        # empty value, keep scanning.
+        return None
+    # Pull the first whitespace-delimited token on
+    # the same line. Stop at any non-identifier
+    # delimiter (whitespace, comma, semicolon, close
+    # brackets, paren, colon) so a value like
+    # ``"checkpoint: /tmp/ckpt.json, resume: yes"``
+    # extracts as ``"/tmp/ckpt.json,"`` (then we
+    # strip trailing punctuation when validating)
+    # rather than the full string. We also stop at
+    # a comma to prevent the extractor from
+    # consuming the next field when the agent
+    # accidentally lists multiple paths.
+    token_end = len(stripped)
+    for j, ch in enumerate(stripped):
+        if ch.isspace() or ch in ",;]})\n":
+            token_end = j
+            break
+        if ch == ":":
+            # Allow the colon to terminate the
+            # token so that ``"checkpoint:
+            # /tmp/ckpt.json: extra"`` extracts
+            # ``/tmp/ckpt.json`` cleanly.
+            token_end = j
+            break
+    first_token = stripped[:token_end]
+    if is_valid_checkpoint_path(first_token):
+        return first_token
+    # else: placeholder/empty marker — keep
+    # scanning the rest of the text for a real
+    # value.
     return None
 
 
