@@ -561,7 +561,22 @@ def _has_next_action_with_value(text: str) -> bool:
 # own — the classifier now requires both the marker AND a
 # valid path value before treating the message as
 # OK_PROGRESS_WITH_NEXT_ACTION.
+#
+# The marker tuple mixes field-style markers (colon/equals
+# delimited) and prose-style markers (space delimited) so
+# that a final output like ``wrote checkpoint to
+# /tmp/ckpt.json`` parses the same way as ``checkpoint:
+# /tmp/ckpt.json``. Prose markers require a path-shaped
+# value (see :func:`is_valid_checkpoint_path`); a marker
+# like ``wrote checkpoint to pending`` is rejected because
+# ``pending`` is not path-shaped. The previous bare-marker
+# bug (``Checkpoint pending`` slipping through as a real
+# value) is still pinned: bare ``Checkpoint `` /
+# ``checkpoint `` / ``Checkpoint file`` markers without a
+# colon, equals, or trailing-space path-suffix are not
+# in this tuple.
 _CHECKPOINT_MARKERS = (
+    # Field-style markers (colon or equals delimited).
     "checkpoint_path=",
     "checkpoint_path:",
     "Checkpoint path:",
@@ -570,6 +585,19 @@ _CHECKPOINT_MARKERS = (
     "checkpoint:",
     "Checkpoint:",
     "checkpoint =",
+    # Prose-style markers (space delimited). Each entry is
+    # the literal marker followed by a trailing space so
+    # that ``checkpoint file`` does NOT match
+    # ``checkpoint file: /tmp/ckpt.json`` (the colon breaks
+    # the space-suffix match — the explicit
+    # ``checkpoint file: `` entry below handles that
+    # form).
+    "wrote checkpoint to ",
+    "saved checkpoint to ",
+    "checkpoint file: ",
+    "checkpoint file ",
+    "checkpoint at ",
+    "checkpoint saved to ",
 )
 
 
@@ -889,6 +917,11 @@ def is_valid_checkpoint_path(value: object) -> bool:
     - its lowercased, stripped form is NOT a placeholder
       (``none``, ``null``, ``nil``, ``n/a``, ``na``,
       ``todo``, ``tbd``, ``tba``)
+    - its stripped form is path-shaped: it must start with
+      a recognized path prefix
+      (``/`` for absolute Unix paths,
+      ``~/`` for home-relative paths,
+      ``./`` or ``../`` for explicit relative paths).
 
     The single canonical validity check used by every
     helper that needs to decide whether a checkpoint
@@ -910,6 +943,17 @@ def is_valid_checkpoint_path(value: object) -> bool:
     Fix H (Codex 3417011624): ``bool(state.checkpoint_path)``
     used to mark a whitespace-only path as valid. The
     watchdog now uses this helper instead.
+
+    Fix I (Codex 3417849222): a prose marker such as
+    ``wrote checkpoint to pending`` previously slipped
+    through the placeholder-only check because
+    ``pending`` is not in :data:`_CHECKPOINT_EMPTY_VALUES`.
+    The new path-shape check rejects any value that
+    does not start with ``/``, ``~/``, ``./`` or
+    ``../``, so a status word like ``pending``,
+    ``later``, ``missing``, or ``written`` cannot
+    satisfy OK_PROGRESS_WITH_NEXT_ACTION even when
+    emitted after a prose marker.
     """
     if not isinstance(value, str):
         return False
@@ -917,6 +961,20 @@ def is_valid_checkpoint_path(value: object) -> bool:
     if not stripped:
         return False
     if stripped.lower() in _CHECKPOINT_EMPTY_VALUES:
+        return False
+    # Path-shape check: the value must look like an actual
+    # file path. We accept absolute Unix paths (``/``),
+    # home-relative paths (``~/``), and explicit relative
+    # paths (``./`` or ``../``). A bare status word or
+    # placeholder like ``pending`` / ``later`` /
+    # ``written`` does not start with any of these prefixes
+    # and is rejected even when it follows a prose marker.
+    if not (
+        stripped.startswith("/")
+        or stripped.startswith("~/")
+        or stripped.startswith("./")
+        or stripped.startswith("../")
+    ):
         return False
     return True
 

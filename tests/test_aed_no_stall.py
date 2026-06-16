@@ -2569,7 +2569,12 @@ class TerminalCheckpointSkipsHeadDriftTests(unittest.TestCase):
     check is skipped for terminal checkpoints.
     """
 
-    def _terminal_ck(self, terminal_state="MERGED"):
+    def _terminal_ck(
+        self,
+        terminal_state="MERGED",
+        last_verified_pr_head=None,
+        last_verified_primary_head=None,
+    ):
         return CheckpointState(
             repo="Slideshow11/Automated-Edge-Discovery",
             pr_number=405,
@@ -2580,10 +2585,13 @@ class TerminalCheckpointSkipsHeadDriftTests(unittest.TestCase):
             next_phase=None,
             next_action=None,
             pending_actions=[],
-            # Optional fields omitted (None) — terminal
-            # checkpoint without recorded heads.
-            last_verified_primary_head=None,
-            last_verified_pr_head=None,
+            # Optional fields default to None (terminal
+            # checkpoint without recorded heads). Tests that
+            # exercise a parked/hold terminal state's
+            # observed-head check pass matching recorded
+            # heads via the helper.
+            last_verified_primary_head=last_verified_primary_head,
+            last_verified_pr_head=last_verified_pr_head,
             authorized_thread_ids=[],
             unresolved_thread_ids=[],
             terminal_state=terminal_state,
@@ -2601,18 +2609,131 @@ class TerminalCheckpointSkipsHeadDriftTests(unittest.TestCase):
         self.assertEqual(errors, [])
 
     def test_terminal_merge_ready_skips_head_drift_check(self) -> None:
+        # Fix G (Codex 3417849218): parked/hold terminal
+        # states go through observed-head checks. With
+        # recorded heads that match the observations, the
+        # parked terminal state is still ok — no head-drift
+        # errors. The terminal-state verdict remains
+        # authoritative (the operator must acknowledge the
+        # hold or authorize the closeout), but the head
+        # checks produce no error when the heads match.
         errors = validate_resume_observations(
-            self._terminal_ck("MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"),
+            self._terminal_ck(
+                "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
             observed_pr_head="a" * 40,
             observed_primary_head="0" * 40,
         )
         self.assertEqual(errors, [])
 
     def test_terminal_hold_operator_required_skips_head_drift(self) -> None:
+        # Same as above for ``HOLD_OPERATOR_REQUIRED``: the
+        # parked terminal state goes through head checks, and
+        # with matching recorded heads there is no head-drift
+        # error.
         errors = validate_resume_observations(
-            self._terminal_ck("HOLD_OPERATOR_REQUIRED"),
+            self._terminal_ck(
+                "HOLD_OPERATOR_REQUIRED",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
             observed_pr_head="a" * 40,
             observed_primary_head="0" * 40,
+        )
+        self.assertEqual(errors, [])
+
+    def test_parked_terminal_with_moved_pr_head_errors(self) -> None:
+        # Fix G (Codex 3417849218): a parked terminal state
+        # such as ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+        # with a moved observed PR head must surface
+        # ``HOLD_HEAD_CHANGED`` (or the existing head-changed
+        # error path). The runner must not surface a stale
+        # "merge ready / awaiting authorization" verdict
+        # when the PR head has moved.
+        errors = validate_resume_observations(
+            self._terminal_ck(
+                "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
+            observed_pr_head="b" * 40,  # PR head moved
+            observed_primary_head="0" * 40,
+        )
+        self.assertTrue(
+            any("PR head" in e for e in errors),
+            f"expected PR head drift error, got {errors}",
+        )
+
+    def test_parked_terminal_with_moved_primary_head_errors(self) -> None:
+        # Same as above for the primary head.
+        errors = validate_resume_observations(
+            self._terminal_ck(
+                "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
+            observed_pr_head="a" * 40,
+            observed_primary_head="1" * 40,  # primary moved
+        )
+        self.assertTrue(
+            any("primary" in e.lower() for e in errors),
+            f"expected primary head drift error, got {errors}",
+        )
+
+    def test_hold_new_codex_thread_with_moved_pr_head_errors(self) -> None:
+        # ``HOLD_NEW_CODEX_THREAD`` is a parked hold state.
+        # A moved PR head must surface ``HOLD_HEAD_CHANGED``.
+        errors = validate_resume_observations(
+            self._terminal_ck(
+                "HOLD_NEW_CODEX_THREAD",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
+            observed_pr_head="b" * 40,
+            observed_primary_head="0" * 40,
+        )
+        self.assertTrue(
+            any("PR head" in e for e in errors),
+            f"expected PR head drift error, got {errors}",
+        )
+
+    def test_hold_pr_ci_pending_with_moved_primary_head_errors(self) -> None:
+        # ``HOLD_PR_CI_PENDING`` is a parked hold state. A
+        # moved primary head must surface
+        # ``HOLD_HEAD_CHANGED``.
+        errors = validate_resume_observations(
+            self._terminal_ck(
+                "HOLD_PR_CI_PENDING",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
+            observed_pr_head="a" * 40,
+            observed_primary_head="1" * 40,
+        )
+        self.assertTrue(
+            any("primary" in e.lower() for e in errors),
+            f"expected primary head drift error, got {errors}",
+        )
+
+    def test_completed_terminal_skips_head_drift_even_when_heads_moved(
+        self,
+    ) -> None:
+        # Completed terminal states (``MERGED``, ``FAILED``,
+        # ``PR_MERGED_AND_CLOSED_OUT``) skip head-drift
+        # checks. The runner stops on the completed terminal
+        # state and the operator has already authorized the
+        # closeout. A moved head must NOT surface
+        # ``HOLD_HEAD_CHANGED`` for a completed terminal.
+        errors = validate_resume_observations(
+            self._terminal_ck(
+                "MERGED",
+                last_verified_pr_head="a" * 40,
+                last_verified_primary_head="0" * 40,
+            ),
+            observed_pr_head="b" * 40,  # PR head moved
+            observed_primary_head="1" * 40,  # primary moved
         )
         self.assertEqual(errors, [])
 
@@ -4236,6 +4357,242 @@ class BareCheckpointMarkerRejectionTests(unittest.TestCase):
         self.assertEqual(value, "/tmp/ckpt.json")
         self.assertNotIn("terminal_state", value or "")
         self.assertNotIn("MERGED", value or "")
+
+
+class ProseCheckpointPathExtractionTests(unittest.TestCase):
+    """Regression tests for Codex 3417849222 (Fix B).
+
+    The value-bearing checkpoint parser must recognize
+    prose-style markers (``wrote checkpoint to``,
+    ``saved checkpoint to``, ``checkpoint file:`` /
+    ``checkpoint file``, ``checkpoint at``,
+    ``checkpoint saved to``) when the marker is followed
+    by a path-shaped value. The broader classifier
+    vocabulary already treats those phrases as
+    checkpoint references, but the previous extractor
+    only accepted field-style markers, so a valid final
+    output like ``next_action: poll CI status`` plus
+    ``wrote checkpoint to /tmp/ckpt.json`` was misclassified
+    as ``STALL_NO_CHECKPOINT`` even though both a
+    continuation action and a concrete resume path were
+    present.
+
+    The parser must still reject prose/status forms
+    (e.g. ``Checkpoint pending``,
+    ``saved checkpoint to pending``,
+    ``Checkpoint file will be written later``) so the
+    previous bare-marker bug (Codex 3417105899) remains
+    pinned: a status phrase must not satisfy
+    ``OK_PROGRESS_WITH_NEXT_ACTION``.
+    """
+
+    def test_wrote_checkpoint_to_absolute_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "wrote checkpoint to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_saved_checkpoint_to_absolute_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "saved checkpoint to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_file_with_colon_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint file: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_file_without_colon_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint file /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_at_absolute_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint at /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_saved_to_absolute_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint saved to /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_wrote_checkpoint_to_home_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "wrote checkpoint to ~/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_wrote_checkpoint_to_relative_path_is_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "wrote checkpoint to ./ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_file_will_be_written_later_is_not_progress(
+        self,
+    ) -> None:
+        # Status phrase with no path-shaped value. The
+        # prose marker is not enough — the value is a
+        # status word, not a path.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint file will be written later"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_pending_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "Checkpoint pending"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_saved_checkpoint_to_pending_is_not_progress(self) -> None:
+        # A prose marker followed by a non-path value.
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "saved checkpoint to pending"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_wrote_checkpoint_to_later_is_not_progress(self) -> None:
+        text = (
+            "Starting PHASE 2 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "wrote checkpoint to later"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_field_style_checkpoints_still_progress(self) -> None:
+        # Field-style markers must still work alongside
+        # the new prose markers.
+        for marker in [
+            "checkpoint: /tmp/ckpt.json",
+            "checkpoint_path=/tmp/ckpt.json",
+            "checkpoint = /tmp/ckpt.json",
+        ]:
+            text = (
+                "Starting PHASE 2 — protected-state verification.\n"
+                "next_action: poll CI status\n"
+                f"{marker}"
+            )
+            self.assertEqual(
+                classify_humphry_message_for_stall(text),
+                OK_PROGRESS_WITH_NEXT_ACTION,
+                f"field-style marker {marker!r} should classify as progress",
+            )
+
+    def test_prose_checkpoint_extractor_returns_path(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text, expected in [
+            (
+                "wrote checkpoint to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "saved checkpoint to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "checkpoint file: /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "checkpoint file /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "checkpoint at /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+            (
+                "checkpoint saved to /tmp/ckpt.json",
+                "/tmp/ckpt.json",
+            ),
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertEqual(
+                value,
+                expected,
+                f"prose marker text {text!r} should extract {expected!r}, got {value!r}",
+            )
+
+    def test_prose_checkpoint_with_status_word_returns_none(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text in [
+            "wrote checkpoint to pending",
+            "saved checkpoint to pending",
+            "saved checkpoint to later",
+            "wrote checkpoint to later",
+            "checkpoint at pending",
+            "checkpoint saved to missing",
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertIsNone(
+                value,
+                f"prose marker with status-word value {text!r} should extract None, got {value!r}",
+            )
 
 
 class RejectCheckpointAssignmentAsNextActionTests(unittest.TestCase):
