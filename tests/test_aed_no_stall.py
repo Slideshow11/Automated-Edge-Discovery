@@ -4393,5 +4393,323 @@ class RejectCheckpointAssignmentAsNextActionTests(unittest.TestCase):
         self.assertFalse(_is_field_assignment_collision(None))  # type: ignore[arg-type]
 
 
+class StructuralValidityBeforeAutoResumeTests(unittest.TestCase):
+    """Regression tests for Codex finding 3417410596 (Fix I).
+
+    ``checkpoint_requires_operator`` must run
+    ``validate_checkpoint`` (or equivalent structural
+    validation) at the top, before any other branch. A
+    checkpoint with structurally invalid required fields
+    must never auto-resume, regardless of ``next_action``
+    validity or ``terminal_state``. The previous
+    implementation fell through to ``False`` when
+    ``next_action`` was valid even when the structural
+    fields were missing, empty, or wrong-typed — telling
+    the caller that operator intervention was NOT
+    required for a checkpoint the runner could not
+    actually use.
+
+    The structural-validity gate precedes:
+      - the unknown-terminal-state hold
+      - the completed-terminal-state short-circuit
+        (MERGED, FAILED, PR_MERGED_AND_CLOSED_OUT)
+      - the parked-terminal-state branch
+        (HOLD_OPERATOR_REQUIRED, MERGE_READY_*, all HOLD_*)
+      - the valid-next-action fast path
+    """
+
+    def _ck(self, **overrides):
+        base = dict(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="poll CI status",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        base.update(overrides)
+        return CheckpointState(**base)
+
+    # --- Empty required string fields ---
+
+    def test_empty_repo_with_valid_next_action_requires_operator(self) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(repo=""))
+        )
+
+    def test_empty_branch_with_valid_next_action_requires_operator(self) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(branch=""))
+        )
+
+    def test_empty_current_head_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(current_head=""))
+        )
+
+    def test_whitespace_repo_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(repo="   "))
+        )
+
+    def test_none_repo_with_valid_next_action_requires_operator(self) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(repo=None))  # type: ignore[arg-type]
+        )
+
+    # --- Non-string required fields ---
+
+    def test_int_repo_with_valid_next_action_requires_operator(self) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(repo=123))  # type: ignore[arg-type]
+        )
+
+    def test_list_branch_with_valid_next_action_requires_operator(self) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(branch=[]))  # type: ignore[arg-type]
+        )
+
+    def test_dict_current_head_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(current_head={"a": 1})  # type: ignore[arg-type]
+            )
+        )
+
+    # --- Invalid pr_number ---
+
+    def test_none_pr_number_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(pr_number=None)  # type: ignore[arg-type]
+            )
+        )
+
+    def test_zero_pr_number_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(pr_number=0))
+        )
+
+    def test_negative_pr_number_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(pr_number=-1))
+        )
+
+    def test_string_pr_number_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(pr_number="405")  # type: ignore[arg-type]
+            )
+        )
+
+    def test_bool_pr_number_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        # bool is a subclass of int — verify it is rejected.
+        self.assertTrue(
+            checkpoint_requires_operator(self._ck(pr_number=True))
+        )
+
+    # --- Invalid required list fields ---
+
+    def test_string_completed_phases_with_valid_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(completed_phases="not a list")  # type: ignore[arg-type]
+            )
+        )
+
+    def test_list_with_non_string_completed_phases_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(completed_phases=["PHASE_1", 2])  # type: ignore[list-item]
+            )
+        )
+
+    # --- Invalid next_action when present ---
+
+    def test_invalid_next_action_with_valid_structural_requires_operator(
+        self,
+    ) -> None:
+        # Already covered by CheckpointRequiresOperatorInvalidNextActionTests;
+        # included here to verify the structural gate does not
+        # mask invalid next_action — both gates must run.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(next_action="none")
+            )
+        )
+
+    # --- The positive case: structurally valid + valid next_action ---
+
+    def test_structurally_valid_with_valid_next_action_does_not_require_operator(
+        self,
+    ) -> None:
+        self.assertFalse(
+            checkpoint_requires_operator(
+                self._ck(next_action="poll CI status")
+            )
+        )
+
+    def test_structurally_valid_with_no_next_action_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(next_action=None)
+            )
+        )
+
+    # --- Completed terminal still requires operator if structurally broken ---
+
+    def test_merged_terminal_with_empty_repo_requires_operator(self) -> None:
+        # A completed terminal checkpoint with a broken
+        # structural field MUST still surface to the operator.
+        # There is no exception for completed terminal
+        # states when the checkpoint is structurally broken.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    repo="",
+                    terminal_state="MERGED",
+                    next_action=None,
+                )
+            )
+        )
+
+    def test_failed_terminal_with_invalid_pr_number_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    pr_number=0,
+                    terminal_state="FAILED",
+                    next_action=None,
+                )
+            )
+        )
+
+    def test_merged_terminal_with_valid_structure_does_not_require_operator(
+        self,
+    ) -> None:
+        # Pinned: the completed-terminal short-circuit
+        # still works for structurally valid checkpoints.
+        self.assertFalse(
+            checkpoint_requires_operator(
+                self._ck(terminal_state="MERGED", next_action=None)
+            )
+        )
+
+    # --- Parked terminal still requires operator ---
+
+    def test_hold_operator_required_with_valid_structure_requires_operator(
+        self,
+    ) -> None:
+        # Pinned: the parked-terminal branch still works
+        # for structurally valid checkpoints.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    terminal_state="HOLD_OPERATOR_REQUIRED",
+                    next_action="continue polling",
+                )
+            )
+        )
+
+    def test_merge_ready_awaiting_human_with_valid_structure_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+                    next_action="wait for human",
+                )
+            )
+        )
+
+    def test_hold_new_codex_thread_with_valid_structure_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    terminal_state="HOLD_NEW_CODEX_THREAD",
+                    next_action="wait for Codex",
+                )
+            )
+        )
+
+    # --- Combined broken structural + non-empty next_action ---
+
+    def test_empty_repo_AND_valid_next_action_still_requires_operator(
+        self,
+    ) -> None:
+        # The exact bug from Codex 3417410596.
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(repo="", next_action="poll CI status")
+            )
+        )
+
+    def test_invalid_pr_number_AND_terminal_state_requires_operator(
+        self,
+    ) -> None:
+        self.assertTrue(
+            checkpoint_requires_operator(
+                self._ck(
+                    pr_number=-1,
+                    terminal_state="MERGED",
+                    next_action=None,
+                )
+            )
+        )
+
+    # --- Verify validate_checkpoint is called ---
+
+    def test_validate_checkpoint_called_with_same_state(self) -> None:
+        # Direct verification: passing a state with empty
+        # repo returns True even with a fully-valid
+        # next_action and a recognized completed terminal
+        # state. This pins the exact code path of Fix I.
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        state = self._ck(repo="", terminal_state="MERGED", next_action=None)
+        # Sanity: validate_checkpoint reports the structural error.
+        errors = validate_checkpoint(state)
+        self.assertTrue(any("'repo'" in e for e in errors))
+        # The fix: checkpoint_requires_operator must
+        # agree with validate_checkpoint, regardless of
+        # the completed-terminal short-circuit.
+        self.assertTrue(checkpoint_requires_operator(state))
+
+
 if __name__ == "__main__":
     unittest.main()

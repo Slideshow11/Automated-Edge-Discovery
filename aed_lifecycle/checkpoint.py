@@ -446,8 +446,37 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     :func:`validate_resume_observations` first and surface
     ``HOLD_HEAD_CHANGED`` itself.
 
+    Fix I (Codex 3417410596): A checkpoint with structurally
+    invalid required fields (``repo``, ``branch``,
+    ``current_head``, ``pr_number``, list fields) must never
+    auto-resume, regardless of ``next_action`` validity or
+    ``terminal_state``. The previous implementation fell
+    through to ``False`` when ``next_action`` was valid even
+    when the structural fields were missing, empty, or
+    wrong-typed — telling the caller that operator
+    intervention was NOT required for a checkpoint the
+    runner could not actually use. This is dangerous: a
+    runner that trusts ``checkpoint_requires_operator(...) ==
+    False`` would attempt to resume a checkpoint with
+    ``repo=""`` and crash. The new implementation calls
+    :func:`validate_checkpoint` at the top, before any other
+    branch, and returns True on any structural error. This
+    gate precedes the completed-terminal short-circuit, the
+    parked-terminal branch, and the valid-next-action
+    fast path. There is no exception for completed
+    terminal states: a checkpoint with ``terminal_state=
+    "MERGED"`` and ``repo=""`` is still structurally
+    broken, and the operator must acknowledge the broken
+    closeout before the runner can act on the checkpoint.
+
     A checkpoint requires operator intervention when:
 
+    - structural validation fails (any of ``repo``,
+      ``branch``, ``current_head``, ``pr_number``,
+      required list fields, ``next_action`` when present).
+      Fix I (Codex 3417410596). This check runs FIRST so a
+      structurally broken checkpoint never falls through
+      to the no-operator path.
     - the checkpoint has a terminal_state the runner does not
       recognize
     - the checkpoint is parked on a recognized-but-non-completed
@@ -480,9 +509,11 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     that is parked on a RECOGNIZED COMPLETED terminal
     state (``"MERGED"``, ``"FAILED"``,
     ``"PR_MERGED_AND_CLOSED_OUT"``) does NOT require
-    operator intervention. The runner stops on the
+    operator intervention, PROVIDED the checkpoint is
+    structurally valid. The runner stops on the
     terminal state and the operator has already
     authorized the close. The check is short-circuited
+    AFTER the structural-validity gate (Fix I) and
     BEFORE the parked-terminal check. A checkpoint that
     is parked on a recognized but NON-COMPLETED terminal
     state (``"HOLD_OPERATOR_REQUIRED"``,
@@ -492,6 +523,19 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     because the operator must acknowledge the hold or
     authorize the closeout.
     """
+    # Fix I (Codex 3417410596): structural validation is a
+    # hard prerequisite for auto-resume. Run
+    # ``validate_checkpoint`` first; any error means the
+    # checkpoint is unusable and the operator must
+    # acknowledge the broken state before the runner
+    # acts on it. This gate precedes the
+    # completed-terminal short-circuit, the
+    # parked-terminal branch, and the valid-next-action
+    # fast path — no exceptions for completed terminal
+    # states, no exceptions for non-empty next_action.
+    if validate_checkpoint(state):
+        return True
+
     # Unknown terminal state is a hold.
     if state.terminal_state is not None and not is_terminal_lifecycle_state(
         state.terminal_state
@@ -499,10 +543,12 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
         return True
 
     # Fix A (Codex 3415657744): completed terminal
-    # states short-circuit to False. The runner stops on
-    # the terminal state and the operator is NOT
-    # required to intervene. Completed states:
-    # ``MERGED``, ``FAILED``, ``PR_MERGED_AND_CLOSED_OUT``.
+    # states short-circuit to False (provided the
+    # checkpoint is structurally valid — see Fix I
+    # above). The runner stops on the terminal state
+    # and the operator is NOT required to intervene.
+    # Completed states: ``MERGED``, ``FAILED``,
+    # ``PR_MERGED_AND_CLOSED_OUT``.
     if is_completed_terminal_state(state.terminal_state):
         return False
 
