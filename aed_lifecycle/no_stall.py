@@ -399,6 +399,34 @@ _NEXT_ACTION_EMPTY_VALUES = (
 )
 
 
+def _is_field_assignment_collision(token: str) -> bool:
+    """Return True iff ``token`` looks like a field-assignment prefix.
+
+    Fix H (Codex 3417182526): A malformed same-line remainder
+    like ``checkpoint_path=/tmp/ckpt.json`` is a
+    field-name-as-value collision. After the per-token boundary
+    scan in :func:`_extract_next_action_value` has stopped at
+    the ``=`` delimiter, the extracted ``first_token`` is the
+    bare field name (``checkpoint_path``). The runner is
+    misusing a protocol field as an action value, not emitting
+    an executable action. Reject it so the scan continues to
+    the next marker (or returns ``None`` if no real action is
+    present).
+
+    A collision is recognised when ``token.lower()`` is a known
+    protocol field name. The set is the same vocabulary used by
+    :func:`is_valid_next_action` (``_FIELD_NAME_NEXT_ACTIONS``)
+    so the two helpers cannot disagree on which tokens are
+    field names.
+    """
+    if not isinstance(token, str):
+        return False
+    stripped = token.strip()
+    if not stripped:
+        return False
+    return stripped.lower() in _FIELD_NAME_NEXT_ACTIONS
+
+
 def _extract_next_action_value(text: str) -> Optional[str]:
     """Return the first real ``next_action`` value found in ``text``.
 
@@ -440,6 +468,19 @@ def _extract_next_action_value(text: str) -> Optional[str]:
     returns the first marker whose value passes
     :func:`is_valid_next_action`. Placeholder/empty markers
     are skipped instead of short-circuiting the search.
+
+    Fix H (Codex 3417182526): The per-token boundary scan
+    must also stop at ``=`` so a malformed same-line
+    remainder like ``"checkpoint_path=/tmp/ckpt.json"``
+    extracts as ``"checkpoint_path"`` rather than the whole
+    ``"checkpoint_path=/tmp/ckpt.json"`` string. After
+    extraction, if the first token is a known protocol field
+    name (``checkpoint``, ``checkpoint_path``,
+    ``terminal_state``, ``phase``, ``state``, etc.) the
+    marker is treated as a field-assignment collision and
+    is skipped — the runner mis-used a field name as a
+    value, not as an action. The scan continues to the next
+    marker so a real action on a later line is still found.
     """
     for raw_line in text.splitlines():
         line = raw_line
@@ -456,15 +497,29 @@ def _extract_next_action_value(text: str) -> Optional[str]:
             # Pull the first whitespace-delimited token on
             # the same line. Stop at any non-identifier
             # delimiter (whitespace, comma, semicolon, close
-            # brackets, paren, colon) so a value like
-            # ``"checkpoint: /tmp/ckpt.json"`` extracts as
-            # ``"checkpoint"`` rather than the full string.
+            # brackets, paren, colon, EQUALS) so a value like
+            # ``"checkpoint_path=/tmp/ckpt.json"`` extracts
+            # as ``"checkpoint_path"`` rather than the full
+            # string, and so ``"checkpoint: /tmp/ckpt.json"``
+            # extracts as ``"checkpoint"`` rather than the
+            # full string.
             token_end = len(stripped)
             for j, ch in enumerate(stripped):
-                if ch.isspace() or ch in ",;]})\n:":
+                if ch.isspace() or ch in ",;]})\n:=":
                     token_end = j
                     break
             first_token = stripped[:token_end]
+            if not first_token:
+                # Delimiter was the first character; keep
+                # scanning for other markers.
+                continue
+            if _is_field_assignment_collision(first_token):
+                # The remainder is a field=value assignment
+                # (e.g. ``checkpoint_path=/tmp/ckpt.json``).
+                # The agent used a protocol field name as
+                # a value; this is not an executable action.
+                # Skip this marker and keep scanning.
+                continue
             if is_valid_next_action(first_token):
                 return first_token
             # else: placeholder/empty marker — keep scanning
@@ -792,9 +847,11 @@ _FIELD_NAME_NEXT_ACTIONS: FrozenSet[str] = frozenset(
         "next_action",
         "next_step",
         "checkpoint",
+        "checkpoint_path",
         "phase",
-        "terminal",
         "state",
+        "terminal",
+        "terminal_state",
         "lifecycle",
         "next_phase",
         "pending_actions",

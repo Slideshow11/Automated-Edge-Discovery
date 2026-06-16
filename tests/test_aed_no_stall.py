@@ -4238,5 +4238,160 @@ class BareCheckpointMarkerRejectionTests(unittest.TestCase):
         self.assertNotIn("MERGED", value or "")
 
 
+class RejectCheckpointAssignmentAsNextActionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3417182526 (Fix H).
+
+    The next_action extractor must not consume a field=value
+    assignment on the same line. A malformed message like
+    ``next_action: checkpoint_path=/tmp/ckpt.json`` is a
+    field-name-as-value collision: the runner used a protocol
+    field name as a value, not as an executable action. The
+    classifier must NOT classify the message as
+    ``OK_PROGRESS_WITH_NEXT_ACTION``.
+
+    Valid multi-line messages that contain a real action plus a
+    checkpoint/terminal field must still be classified as
+    ``OK_PROGRESS_WITH_NEXT_ACTION`` — the rejection only
+    applies when the only next_action marker is a
+    field-assignment collision.
+    """
+
+    def test_next_action_checkpoint_path_equals_is_not_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = "Starting PHASE 1 — protected-state verification.\nnext_action: checkpoint_path=/tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_next_action_checkpoint_equals_is_not_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = "Starting PHASE 1 — protected-state verification.\nnext_action: checkpoint=/tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_next_action_checkpoint_path_space_equals_is_not_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = "Starting PHASE 1 — protected-state verification.\nnext_action: checkpoint_path = /tmp/ckpt.json"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_next_action_terminal_state_equals_is_not_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = "Starting PHASE 1 — protected-state verification.\nnext_action: terminal_state=MERGED"
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_next_action_empty_value_then_checkpoint_path_is_not_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action:\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_valid_poll_ci_with_checkpoint_equals_is_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: continue bounded CI polling\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_valid_poll_codex_with_checkpoint_colon_is_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: poll Codex response\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_valid_resume_with_checkpoint_space_equals_is_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: resume from checkpoint\n"
+            "checkpoint = /tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_invalid_marker_followed_by_valid_marker_is_progress(self) -> None:
+        """If a runner emits a field-assignment marker first
+        and a real action later, the scan must skip the
+        collision and accept the real action (round-10
+        continue-scanning behavior is preserved).
+        """
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json\n"
+            "next_action: poll CI status"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_extractor_does_not_include_checkpoint_text(self) -> None:
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        text = "next_action: checkpoint_path=/tmp/ckpt.json"
+        value = _extract_next_action_value(text)
+        self.assertNotIn("checkpoint", value or "")
+        self.assertNotIn("=", value or "")
+        self.assertNotIn("/", value or "")
+
+    def test_is_field_assignment_collision_rejects_field_names(self) -> None:
+        from aed_lifecycle.no_stall import _is_field_assignment_collision
+        for tok in (
+            "checkpoint", "checkpoint_path", "terminal_state",
+            "phase", "state", "next_action", "next_step",
+        ):
+            self.assertTrue(
+                _is_field_assignment_collision(tok),
+                f"expected {tok!r} to be a collision",
+            )
+
+    def test_is_field_assignment_collision_accepts_real_actions(self) -> None:
+        from aed_lifecycle.no_stall import _is_field_assignment_collision
+        for tok in ("poll", "continue", "resume", "wait", "proceed"):
+            self.assertFalse(
+                _is_field_assignment_collision(tok),
+                f"expected {tok!r} NOT to be a collision",
+            )
+
+    def test_is_field_assignment_collision_handles_case(self) -> None:
+        from aed_lifecycle.no_stall import _is_field_assignment_collision
+        self.assertTrue(_is_field_assignment_collision("Checkpoint"))
+        self.assertTrue(_is_field_assignment_collision("CHECKPOINT_PATH"))
+        self.assertTrue(_is_field_assignment_collision("Terminal_State"))
+
+    def test_is_field_assignment_collision_handles_garbage(self) -> None:
+        from aed_lifecycle.no_stall import _is_field_assignment_collision
+        self.assertFalse(_is_field_assignment_collision(""))
+        self.assertFalse(_is_field_assignment_collision("   "))
+        self.assertFalse(_is_field_assignment_collision(None))  # type: ignore[arg-type]
+
+
 if __name__ == "__main__":
     unittest.main()
