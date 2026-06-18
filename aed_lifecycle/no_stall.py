@@ -392,11 +392,27 @@ _CHECKPOINT_TOKENS = (
 # on its own — the classifier requires both the marker AND a
 # non-empty, non-placeholder value before classifying as
 # OK_PROGRESS_WITH_NEXT_ACTION.
+#
+# Order matters: the colon-style markers (``next_action:``)
+# are listed BEFORE the equals-style markers (``next_action=``)
+# so the parser prefers the FIRST occurrence of a marker in
+# the line. For an ambiguous line such as
+# ``"next_action: next_action=poll CI"`` the first
+# ``next_action:`` (at position 0) is a real field-assignment
+# collision (``next_action`` is followed by ``=``), so the
+# parser rejects the whole line. Listing ``next_action=``
+# first would have caused the parser to find the sub-marker
+# at position 13 (the ``=`` inside the field-assignment value)
+# and incorrectly accept ``"poll CI"`` as the action. Fix N
+# (Codex 3438828758): the colon-first ordering aligns the
+# parser with the persisted validation, which sees the full
+# ``"next_action=poll CI"`` value and rejects it as a
+# field-assignment collision.
 _NEXT_ACTION_TOKENS = (
-    "next_action=",
     "next_action:",
     "Next action:",
     "next step:",
+    "next_action=",
     "next step=",
 )
 
@@ -635,6 +651,31 @@ def _extract_next_action_value(text: str) -> Optional[str]:
     is skipped — the runner mis-used a field name as a
     value, not as an action. The scan continues to the next
     marker so a real action on a later line is still found.
+
+    Fix N (Codex 3438828758): The field-assignment
+    collision check must use the narrowed semantics shared
+    with :func:`is_valid_next_action` — the
+    :func:`_is_field_assignment_collision_value` helper
+    that rejects a marker only if the first identifier-like
+    token is a known field name AND the first
+    non-whitespace character after that token is ``=`` or
+    ``:``. The previous per-token call
+    :func:`_is_field_assignment_collision` only checked
+    whether the bare first token was a field name, so a
+    legitimate action like
+    ``"next_action: checkpoint current run state"`` was
+    wrongly rejected: the first token ``"checkpoint"`` IS
+    a field name, but the next character is a space (not
+    ``=`` or ``:``), so the value is a real executable
+    action and the marker must be accepted. The narrowed
+    helper is given the FULL ``stripped`` remainder
+    (including the ``=`` / ``:`` delimiter if any) so the
+    check can see the post-token context. ``first_token``
+    is still extracted for the
+    :func:`is_valid_next_action` call that returns the
+    action value to the runner. This keeps final-output
+    parsing and persisted validation aligned: both use
+    the same vocabulary and the same narrowed rule.
     """
     for raw_line in text.splitlines():
         line = raw_line
@@ -667,13 +708,61 @@ def _extract_next_action_value(text: str) -> Optional[str]:
                 # Delimiter was the first character; keep
                 # scanning for other markers.
                 continue
-            if _is_field_assignment_collision(first_token):
-                # The remainder is a field=value assignment
-                # (e.g. ``checkpoint_path=/tmp/ckpt.json``).
-                # The agent used a protocol field name as
-                # a value; this is not an executable action.
-                # Skip this marker and keep scanning.
-                continue
+            if _is_field_assignment_collision_value(stripped):
+                # The remainder is a real field=value /
+                # field: value assignment (e.g.
+                # ``checkpoint_path=/tmp/ckpt.json`` or
+                # ``terminal_state = MERGED`` or
+                # ``state: MERGED`` or
+                # ``next_action=poll CI``). The agent
+                # used a protocol field name as a value
+                # with the assignment delimiter (``=`` or
+                # ``:``) — this is not an executable
+                # action. The structured field-assignment
+                # value ``consumes`` the rest of the line
+                # (it is a deliberate misuse, not an
+                # empty/placeholder marker), so the parser
+                # stops looking for sub-markers in the
+                # same line and advances to the next line.
+                # The across-line ``scan past invalid
+                # markers`` behavior is preserved by the
+                # outer ``for raw_line in
+                # text.splitlines()`` loop. Fix N (Codex
+                # 3438828758): the narrowed helper takes
+                # the FULL ``stripped`` remainder (not
+                # just the bare ``first_token``) so it
+                # can see whether the field-name token is
+                # actually followed by an assignment
+                # delimiter. A legitimate action like
+                # ``"checkpoint current run state"`` is
+                # not a field assignment (the field name
+                # is followed by a space, not ``=`` /
+                # ``:``) and is correctly accepted.
+                break
+            # Fix N (Codex 3438828758): when the first
+            # word is a field name but the value is not a
+            # field assignment (per the narrowed check
+            # above), the value is a real executable
+            # action that starts with a field-name word
+            # (e.g. ``"checkpoint current run state"``).
+            # The extractor must return the FULL value in
+            # this case so the caller's
+            # :func:`is_valid_next_action` can validate
+            # the multi-word action. Returning just the
+            # bare first word would cause
+            # :func:`is_valid_next_action` to reject it
+            # (the bare word is a field name, so the
+            # full-string field-name check would fire).
+            # For single-word values where ``stripped ==
+            # first_token``, we fall through to the
+            # :func:`is_valid_next_action` check below —
+            # a bare field name as the action value is
+            # not a valid action and the scan continues.
+            if (
+                first_token.lower() in _FIELD_NAME_NEXT_ACTIONS
+                and stripped != first_token
+            ):
+                return stripped
             if is_valid_next_action(first_token):
                 return first_token
             # else: placeholder/empty marker — keep scanning

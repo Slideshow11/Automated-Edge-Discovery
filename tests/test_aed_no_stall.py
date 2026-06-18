@@ -6472,5 +6472,296 @@ class StructuralValidityBeforeAutoResumeTests(unittest.TestCase):
         self.assertTrue(checkpoint_requires_operator(state))
 
 
+class FinalOutputFieldAssignmentRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3438828758 (Fix N).
+
+    The narrowed field-assignment collision check used by
+    :func:`is_valid_next_action` must be applied to the
+    final-output extractor
+    :func:`_extract_next_action_value` so the parser and
+    the persisted validator agree on what counts as a
+    field-assignment collision. The previous per-token call
+    :func:`_is_field_assignment_collision` only checked
+    whether the bare first token was a field name, so a
+    legitimate action like
+    ``"next_action: checkpoint current run state"`` was
+    wrongly rejected: the first token ``"checkpoint"`` IS
+    a field name, but the next character is a space (not
+    ``=`` or ``:``), so the value is a real executable
+    action and the marker must be accepted. After Fix N:
+
+    - The extractor uses the canonical
+      :func:`_is_field_assignment_collision_value` helper
+      (taking the full ``stripped`` remainder, not just the
+      bare first token) so it can see the post-token
+      context.
+    - When the first word is a field name but the value is
+      not a field assignment, the extractor returns the
+      FULL value (not just the first word) so the caller's
+      :func:`is_valid_next_action` can validate the
+      multi-word action.
+    - A field-assignment collision ``break``s the inner
+      marker loop on the same line, preventing sub-marker
+      re-parsing of a structured misuse.
+    - The marker order in :data:`_NEXT_ACTION_TOKENS` is
+      ``next_action:`` (colon) before ``next_action=``
+      (equals) so the parser prefers the first occurrence
+      of any marker in the line.
+    """
+
+    # --- Legitimate actions that begin with a field-name word
+    #     are now ACCEPTED in final-output text ---
+
+    def test_final_output_checkpoint_current_run_state_is_progress(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint current run state\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_state_current_pr_status_is_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: state current PR status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_phase_current_retry_window_is_progress(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: phase current retry window\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_next_action_review_codex_response_is_progress(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: next_action review Codex response\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Real field-assignment collisions remain REJECTED ---
+
+    def test_final_output_checkpoint_path_equals_value_rejected(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_terminal_state_equals_value_rejected(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: terminal_state=MERGED"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_state_colon_value_rejected(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: state: MERGED"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_phase_colon_value_rejected(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: phase: PHASE_7"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_final_output_next_action_equals_value_rejected(self) -> None:
+        """The ambiguous ``next_action: next_action=poll CI`` line
+        must be rejected. Before Fix N, the parser found the
+        ``next_action=`` sub-marker at position 13 and returned
+        ``"poll"`` as the action; the message then incorrectly
+        classified as ``OK_PROGRESS_WITH_NEXT_ACTION``. After
+        Fix N, the colon-first marker ordering and the
+        ``break`` after a field-assignment collision prevent
+        sub-marker re-parsing of a structured misuse.
+        """
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: next_action=poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Multi-marker (across lines) behavior pinned ---
+
+    def test_multi_marker_collision_then_real_action_accepted(self) -> None:
+        """The first marker is a field-assignment collision
+        on line 1, the second marker is a real action on
+        line 2, the third is a value-bearing checkpoint on
+        line 3. The parser must skip the line-1 collision
+        and accept the line-2 real action. The
+        across-line ``scan past invalid markers`` behavior
+        is preserved.
+        """
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json\n"
+            "next_action: checkpoint current run state\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Extractor direct tests ---
+
+    def test_extractor_returns_full_value_for_field_name_action(
+        self,
+    ) -> None:
+        """The extractor must return the FULL value (not
+        just the first word) when the first word is a
+        field name and the value is not a field
+        assignment, so the caller's
+        :func:`is_valid_next_action` can validate the
+        multi-word action.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        self.assertEqual(
+            _extract_next_action_value(
+                "next_action: checkpoint current run state"
+            ),
+            "checkpoint current run state",
+        )
+        self.assertEqual(
+            _extract_next_action_value(
+                "next_action: state current PR status"
+            ),
+            "state current PR status",
+        )
+        self.assertEqual(
+            _extract_next_action_value(
+                "next_action: phase current retry window"
+            ),
+            "phase current retry window",
+        )
+
+    def test_extractor_returns_first_word_for_non_field_name_action(
+        self,
+    ) -> None:
+        """Pin the canonical extractor contract: for
+        non-field-name first words, the extractor returns
+        the first word (preserves existing test contracts).
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        self.assertEqual(
+            _extract_next_action_value("next_action: poll CI status"),
+            "poll",
+        )
+        self.assertEqual(
+            _extract_next_action_value("next_action: poll Codex response"),
+            "poll",
+        )
+        self.assertEqual(
+            _extract_next_action_value(
+                "next_action: resume from checkpoint"
+            ),
+            "resume",
+        )
+
+    def test_extractor_returns_none_for_field_assignment_collisions(
+        self,
+    ) -> None:
+        """Pin: real field-assignment collisions in
+        final-output text return ``None`` from the
+        extractor, so the classifier does not see a
+        valid next_action.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        for v in (
+            "next_action: checkpoint_path=/tmp/ckpt.json",
+            "next_action: checkpoint_path = /tmp/ckpt.json",
+            "next_action: checkpoint=/tmp/ckpt.json",
+            "next_action: terminal_state=MERGED",
+            "next_action: terminal_state = MERGED",
+            "next_action: state: MERGED",
+            "next_action: phase: PHASE_7",
+            "next_action: next_action=poll CI",
+        ):
+            with self.subTest(v=v):
+                self.assertIsNone(
+                    _extract_next_action_value(v),
+                    f"expected {v!r} to return None",
+                )
+
+    # --- Persisted validation tests from Fix M still pass
+    #     (sanity: this is a final-output-only fix, the
+    #     persisted validation contract is unchanged) ---
+
+    def test_persisted_validation_unchanged_for_legitimate_action(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("checkpoint current run state")
+        )
+        self.assertTrue(
+            is_valid_next_action("state current PR status")
+        )
+
+    def test_persisted_validation_unchanged_for_field_assignment(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
