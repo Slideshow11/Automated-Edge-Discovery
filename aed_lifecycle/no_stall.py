@@ -417,6 +417,93 @@ _NEXT_ACTION_EMPTY_VALUES = (
 )
 
 
+def _is_field_assignment_collision_value(value: object) -> bool:
+    """Return True iff ``value`` is a real ``field=value`` / ``field: value`` assignment.
+
+    The check combines two conditions:
+
+    1. The first identifier-like token of ``value`` is a
+       known protocol field name (i.e. a member of
+       :data:`_FIELD_NAME_NEXT_ACTIONS`).
+    2. The first non-whitespace character AFTER that token
+       is the assignment delimiter ``=`` or ``:`` (with
+       optional spaces between the token and the delimiter).
+
+    Both conditions must hold. A value that satisfies only
+    (1) — e.g. ``"checkpoint current run state"`` where the
+    first word is the field name ``checkpoint`` but the
+    remainder is plain executable action text — is NOT a
+    field-assignment collision and must be accepted.
+
+    Examples (True = rejected as collision):
+
+    - ``"checkpoint_path=/tmp/ckpt.json"`` → True
+    - ``"checkpoint_path = /tmp/ckpt.json"`` → True
+    - ``"checkpoint=/tmp/ckpt.json"`` → True
+    - ``"terminal_state=MERGED"`` → True
+    - ``"terminal_state = MERGED"`` → True
+    - ``"state: MERGED"`` → True
+    - ``"phase: PHASE_7"`` → True
+    - ``"next_action=poll CI"`` → True
+    - ``"next_step: continue"`` → True
+
+    Examples (False = accepted as a real action):
+
+    - ``"checkpoint current run state"`` → False
+    - ``"state current PR status"`` → False
+    - ``"phase current retry window"`` → False
+    - ``"next_action review Codex response"`` → False
+    - ``"poll CI status"`` → False (first token not a field name)
+    - ``"checkpoint"`` → False (handled by the full-string
+      field-name check in :func:`is_valid_next_action`, not
+      here)
+
+    Fix M (Codex 3438724908): the previous persisted-state
+    check (Fix L, Codex 3422779962) rejected any value
+    whose first identifier-like token was a known protocol
+    field name, even with no assignment delimiter. That was
+    too aggressive — it rejected legitimate executable
+    actions like ``"checkpoint current run state"`` and
+    ``"state current PR status"`` that begin with a
+    field-name word but have no ``=`` or ``:`` syntax. The
+    canonical :func:`_is_field_assignment_collision_value`
+    helper is the single source of truth for persisted
+    field-assignment collision detection: it is called by
+    :func:`is_valid_next_action`, which is in turn called by
+    :func:`validate_checkpoint`,
+    :func:`checkpoint_requires_operator`,
+    :func:`next_action_from_checkpoint`, and
+    :func:`evaluate_watchdog`. Tightening the helper
+    tightens all four callers in one place.
+    """
+    if not isinstance(value, str):
+        return False
+    first_tok = _first_field_name_token(value)
+    if first_tok is None:
+        return False
+    if first_tok.lower() not in _FIELD_NAME_NEXT_ACTIONS:
+        return False
+    # Find the first non-whitespace character after the
+    # token in the original value. The token's start is
+    # after the leading whitespace; we re-strip leading
+    # whitespace and walk to the token's end so the
+    # remainder we examine is the actual post-token span.
+    s = value.lstrip()
+    if not s:
+        return False
+    token_end = len(s)
+    for j, ch in enumerate(s):
+        if ch.isspace() or ch in _FIELD_TOKEN_BOUNDARIES:
+            token_end = j
+            break
+    remainder = s[token_end:]
+    for ch in remainder:
+        if not ch.isspace():
+            return ch in ("=", ":")
+    # Token is at the end of the value with nothing after.
+    return False
+
+
 def _is_field_assignment_collision(token: str) -> bool:
     """Return True iff ``token`` looks like a field-assignment prefix.
 
@@ -1047,23 +1134,23 @@ def is_valid_next_action(value: object) -> bool:
         return False
     if lower in _FIELD_NAME_NEXT_ACTIONS:
         return False
-    # Fix L (Codex 3422779962): reject field=value
-    # assignment collisions that the full-string field-name
-    # check above cannot catch. Persisted checkpoint / watchdog
-    # values can store a full assignment like
-    # ``"checkpoint_path=/tmp/ckpt.json"`` or
-    # ``"terminal_state = MERGED"`` or ``"state: MERGED"``;
-    # the full string is not exactly a field name, but the
-    # first token before the first boundary character IS a
-    # known protocol field name. The runner mis-used a field
-    # name as a value, not as an executable action. The
-    # canonical :func:`_first_field_name_token` helper
-    # extracts the first token using the same boundary
-    # vocabulary as :func:`_extract_next_action_value`, so
-    # persisted-state validation and final-output extraction
-    # agree on what counts as a field-name-as-value collision.
-    first_tok = _first_field_name_token(stripped)
-    if first_tok and first_tok.lower() in _FIELD_NAME_NEXT_ACTIONS:
+    # Fix M (Codex 3438724908): reject only real field
+    # assignments, not legitimate actions that merely begin
+    # with a field-name word. A value like
+    # ``"checkpoint current run state"`` is a valid executable
+    # action that contains the field-name word ``checkpoint``
+    # but has no assignment delimiter (``=`` or ``:``); it
+    # must be accepted. A value like
+    # ``"checkpoint_path=/tmp/ckpt.json"`` is a true
+    # field-assignment collision (the field name is followed
+    # by ``=``) and must be rejected. The canonical
+    # :func:`_is_field_assignment_collision_value` helper is
+    # the single source of truth for persisted
+    # field-assignment collision detection and is consistent
+    # with the final-output extractor
+    # (:func:`_extract_next_action_value`) which uses the
+    # same ``_FIELD_NAME_NEXT_ACTIONS`` vocabulary.
+    if _is_field_assignment_collision_value(stripped):
         return False
     return True
 

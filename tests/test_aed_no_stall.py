@@ -5610,6 +5610,550 @@ class RejectPersistedFieldAssignmentAsNextActionTests(unittest.TestCase):
         )
 
 
+class NarrowFieldAssignmentRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3438724908 (Fix M).
+
+    Tightens the persisted-state ``is_valid_next_action`` check
+    so it rejects ONLY real ``field=value`` / ``field: value``
+    assignments, not legitimate executable actions that merely
+    begin with a field-name word. The previous fix (Fix L,
+    Codex 3422779962) rejected any value whose first word was a
+    protocol field name; that was too aggressive and rejected
+    legitimate actions like ``"checkpoint current run state"``
+    and ``"state current PR status"``.
+
+    The new canonical helper
+    :func:`_is_field_assignment_collision_value` is the single
+    source of truth for persisted field-assignment collision
+    detection. It is called by :func:`is_valid_next_action`,
+    which is in turn called by ``validate_checkpoint``,
+    ``checkpoint_requires_operator``,
+    ``next_action_from_checkpoint``, and ``evaluate_watchdog``.
+    """
+
+    # --- Legitimate actions that begin with a field-name word
+    #     are now ACCEPTED (the previous fix wrongly rejected
+    #     them). ---
+
+    def test_checkpoint_current_run_state_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("checkpoint current run state")
+        )
+
+    def test_state_current_pr_status_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("state current PR status")
+        )
+
+    def test_phase_current_retry_window_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("phase current retry window")
+        )
+
+    def test_next_action_review_codex_response_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("next_action review Codex response")
+        )
+
+    def test_terminal_state_current_view_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("terminal_state current view")
+        )
+
+    def test_lifecycle_current_phase_is_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("lifecycle current phase")
+        )
+
+    def test_all_field_names_accepted_when_followed_by_text(self) -> None:
+        """Every member of ``_FIELD_NAME_NEXT_ACTIONS`` must be
+        accepted when followed by ordinary action text (no
+        ``=`` or ``:`` delimiter). This is the symmetric
+        complement of ``test_all_field_names_rejected_as_field_equals_value``
+        and pins the Fix M contract.
+        """
+        from aed_lifecycle.no_stall import (
+            _FIELD_NAME_NEXT_ACTIONS,
+            is_valid_next_action,
+        )
+        for fname in sorted(_FIELD_NAME_NEXT_ACTIONS):
+            value = f"{fname} ordinary executable action text"
+            with self.subTest(fname=fname):
+                self.assertTrue(
+                    is_valid_next_action(value),
+                    f"expected {value!r} to be accepted",
+                )
+
+    def test_all_field_names_accepted_with_space_equals(self) -> None:
+        """The boundary between "field assignment" and
+        "legitimate action" is the presence of ``=`` or
+        ``:`` after the field name. ``field = poll CI
+        status`` IS a field assignment (the ``=`` is
+        present) and must be rejected — the value side is
+        not the gate. This test pins the rejection
+        contract for ``field = value`` so a future
+        refactor cannot silently accept these.
+        """
+        from aed_lifecycle.no_stall import (
+            _FIELD_NAME_NEXT_ACTIONS,
+            is_valid_next_action,
+        )
+        for fname in sorted(_FIELD_NAME_NEXT_ACTIONS):
+            value = f"{fname} = poll CI status"
+            with self.subTest(fname=fname):
+                self.assertFalse(
+                    is_valid_next_action(value),
+                    f"expected {value!r} to be rejected (field assignment)",
+                )
+
+    # --- Real field-assignment collisions remain REJECTED.
+    #     Pin the symmetric contract so the loosening of
+    #     "any field-name word" does not accidentally relax
+    #     "field=value" / "field: value" rejection. ---
+
+    def test_checkpoint_path_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+
+    def test_checkpoint_path_space_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path = /tmp/ckpt.json")
+        )
+
+    def test_checkpoint_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint=/tmp/ckpt.json")
+        )
+
+    def test_checkpoint_space_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint = /tmp/ckpt.json")
+        )
+
+    def test_terminal_state_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+
+    def test_terminal_state_space_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("terminal_state = MERGED")
+        )
+
+    def test_state_colon_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("state: MERGED"))
+
+    def test_phase_colon_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("phase: PHASE_7"))
+
+    def test_next_action_equals_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("next_action=poll CI"))
+
+    def test_next_step_colon_value_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("next_step: continue"))
+
+    def test_all_field_names_rejected_as_field_equals_value(self) -> None:
+        """Pin the full vocabulary: every member of
+        ``_FIELD_NAME_NEXT_ACTIONS`` must be rejected when
+        followed by ``=`` (with or without surrounding
+        spaces).
+        """
+        from aed_lifecycle.no_stall import (
+            _FIELD_NAME_NEXT_ACTIONS,
+            is_valid_next_action,
+        )
+        for fname in sorted(_FIELD_NAME_NEXT_ACTIONS):
+            for sep in ("=", " = "):
+                value = f"{fname}{sep}somevalue"
+                with self.subTest(fname=fname, sep=sep):
+                    self.assertFalse(
+                        is_valid_next_action(value),
+                        f"expected {value!r} to be rejected",
+                    )
+
+    def test_all_field_names_rejected_as_field_colon_value(self) -> None:
+        """Pin the full vocabulary: every member of
+        ``_FIELD_NAME_NEXT_ACTIONS`` must be rejected when
+        followed by ``:`` (with or without surrounding
+        spaces).
+        """
+        from aed_lifecycle.no_stall import (
+            _FIELD_NAME_NEXT_ACTIONS,
+            is_valid_next_action,
+        )
+        for fname in sorted(_FIELD_NAME_NEXT_ACTIONS):
+            for sep in (":", " : "):
+                value = f"{fname}{sep}somevalue"
+                with self.subTest(fname=fname, sep=sep):
+                    self.assertFalse(
+                        is_valid_next_action(value),
+                        f"expected {value!r} to be rejected",
+                    )
+
+    # --- Helper-specific contract tests ---
+
+    def test_field_assignment_collision_value_rejects_equals(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        for v in (
+            "checkpoint_path=/tmp/ckpt.json",
+            "checkpoint_path = /tmp/ckpt.json",
+            "checkpoint=/tmp/ckpt.json",
+            "checkpoint = /tmp/ckpt.json",
+            "terminal_state=MERGED",
+            "terminal_state = MERGED",
+        ):
+            with self.subTest(v=v):
+                self.assertTrue(
+                    _is_field_assignment_collision_value(v),
+                    f"expected {v!r} to be a collision",
+                )
+
+    def test_field_assignment_collision_value_rejects_colon(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        for v in (
+            "state: MERGED",
+            "phase: PHASE_7",
+            "next_step: continue",
+            "next_action: poll CI",
+        ):
+            with self.subTest(v=v):
+                self.assertTrue(
+                    _is_field_assignment_collision_value(v),
+                    f"expected {v!r} to be a collision",
+                )
+
+    def test_field_assignment_collision_value_accepts_text(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        for v in (
+            "checkpoint current run state",
+            "state current PR status",
+            "phase current retry window",
+            "next_action review Codex response",
+            "terminal_state current view",
+        ):
+            with self.subTest(v=v):
+                self.assertFalse(
+                    _is_field_assignment_collision_value(v),
+                    f"expected {v!r} NOT to be a collision",
+                )
+
+    def test_field_assignment_collision_value_handles_garbage(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        for v in ("", "   ", "=", ":", "= value", ": value",
+                  "poll CI status", None, 123, [], {}):
+            with self.subTest(v=v):
+                self.assertFalse(
+                    _is_field_assignment_collision_value(v),
+                    f"expected {v!r} NOT to be a collision",
+                )
+
+    def test_field_assignment_collision_value_case_insensitive(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        # Capitalized field names still trip the check.
+        self.assertTrue(
+            _is_field_assignment_collision_value("Checkpoint=val")
+        )
+        self.assertTrue(
+            _is_field_assignment_collision_value("TERMINAL_STATE=MERGED")
+        )
+        # Capitalized field names followed by plain text
+        # are accepted (case-insensitive comparison).
+        self.assertFalse(
+            _is_field_assignment_collision_value(
+                "Checkpoint current run state"
+            )
+        )
+
+    def test_field_assignment_collision_value_pads_whitespace(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _is_field_assignment_collision_value,
+        )
+        self.assertTrue(
+            _is_field_assignment_collision_value(
+                "  checkpoint_path  =  /tmp/ckpt.json  "
+            )
+        )
+        self.assertTrue(
+            _is_field_assignment_collision_value(
+                "  state  :  MERGED  "
+            )
+        )
+
+    # --- validate_checkpoint integration ---
+
+    def test_validate_checkpoint_accepts_legitimate_field_name_action(
+        self,
+    ) -> None:
+        """A structurally valid checkpoint with a legitimate
+        next_action that begins with a field-name word but
+        has no assignment delimiter must NOT be flagged by
+        ``validate_checkpoint``.
+        """
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="checkpoint current run state",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        errors = validate_checkpoint(state)
+        self.assertFalse(
+            any("next_action" in e for e in errors),
+            f"unexpected next_action errors: {errors!r}",
+        )
+
+    def test_validate_checkpoint_rejects_field_assignment_value(self) -> None:
+        """Pin: a checkpoint with ``next_action=
+        'checkpoint_path=/tmp/ckpt.json'`` is still flagged.
+        """
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="checkpoint_path=/tmp/ckpt.json",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        errors = validate_checkpoint(state)
+        self.assertTrue(
+            any("next_action" in e for e in errors),
+            f"expected next_action error, got {errors!r}",
+        )
+
+    # --- checkpoint_requires_operator integration ---
+
+    def test_checkpoint_requires_operator_false_for_legitimate_action(
+        self,
+    ) -> None:
+        """Pin: a structurally valid checkpoint with a
+        legitimate ``next_action`` that begins with a
+        field-name word does NOT require operator
+        intervention. The runner may auto-resume.
+        """
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="checkpoint current run state",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        self.assertFalse(checkpoint_requires_operator(state))
+
+    def test_checkpoint_requires_operator_true_for_field_assignment(
+        self,
+    ) -> None:
+        """Pin: a structurally valid checkpoint with a
+        field-assignment ``next_action`` still requires
+        operator intervention.
+        """
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="checkpoint_path=/tmp/ckpt.json",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        self.assertTrue(checkpoint_requires_operator(state))
+
+    # --- next_action_from_checkpoint integration ---
+
+    def test_next_action_from_checkpoint_returns_legitimate_action(
+        self,
+    ) -> None:
+        """Pin: ``next_action_from_checkpoint`` returns the
+        legitimate action verbatim when the value is a real
+        executable action that merely begins with a
+        field-name word.
+        """
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="state current PR status",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        result = next_action_from_checkpoint(state)
+        self.assertEqual(result, "state current PR status")
+
+    def test_next_action_from_checkpoint_holds_for_field_assignment(
+        self,
+    ) -> None:
+        """Pin: ``next_action_from_checkpoint`` returns
+        ``HOLD_OPERATOR_REQUIRED`` for a field-assignment
+        collision.
+        """
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="a" * 40,
+            phase="PHASE_5_CI_POLL",
+            completed_phases=["PHASE_1", "PHASE_2", "PHASE_3", "PHASE_4"],
+            next_phase="PHASE_6_CODEX_RE_REVIEW",
+            next_action="checkpoint_path=/tmp/ckpt.json",
+            pending_actions=[],
+            last_verified_primary_head="0" * 40,
+            last_verified_pr_head="a" * 40,
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at="2026-06-16T00:00:00Z",
+        )
+        result = next_action_from_checkpoint(state)
+        self.assertEqual(result, "HOLD_OPERATOR_REQUIRED")
+
+    # --- evaluate_watchdog integration ---
+
+    def test_evaluate_watchdog_accepts_legitimate_field_name_action(
+        self,
+    ) -> None:
+        """Pin: a structurally valid WatchdogState with a
+        legitimate next_action and a value-bearing checkpoint
+        returns ``OK_PROGRESS_WITH_NEXT_ACTION`` even when the
+        action begins with a field-name word.
+        """
+        state = WatchdogState(
+            phase_name="PHASE_5_CI_POLL",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_phase_seconds=1000.0,
+            max_idle_seconds=1000.0,
+            terminal_state=None,
+            checkpoint_path="/tmp/ckpt.json",
+            next_action="checkpoint current run state",
+        )
+        result = evaluate_watchdog(state, now=10.0)
+        self.assertEqual(result, "OK_PROGRESS_WITH_NEXT_ACTION")
+
+    def test_evaluate_watchdog_rejects_field_assignment_value(self) -> None:
+        """Pin: a structurally valid WatchdogState with a
+        field-assignment ``next_action`` does NOT return
+        ``OK_PROGRESS_WITH_NEXT_ACTION`` — it returns
+        ``STALL_RISK`` because the canonical
+        :func:`is_valid_next_action` helper now treats the
+        value as a field-assignment collision.
+        """
+        from aed_lifecycle.watchdog import STALL_RISK
+        state = WatchdogState(
+            phase_name="PHASE_5_CI_POLL",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_phase_seconds=1000.0,
+            max_idle_seconds=1000.0,
+            terminal_state=None,
+            checkpoint_path="/tmp/ckpt.json",
+            next_action="checkpoint_path=/tmp/ckpt.json",
+        )
+        result = evaluate_watchdog(state, now=10.0)
+        self.assertNotEqual(result, "OK_PROGRESS_WITH_NEXT_ACTION")
+        self.assertEqual(result, STALL_RISK)
+
+    # --- Existing final-output behavior remains pinned ---
+
+    def test_final_output_pinned_collision_still_rejected(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_final_output_pinned_legitimate_action_still_progress(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+
 class StructuralValidityBeforeAutoResumeTests(unittest.TestCase):
     """Regression tests for Codex finding 3417410596 (Fix I).
 
