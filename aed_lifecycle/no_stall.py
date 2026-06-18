@@ -445,6 +445,55 @@ def _is_field_assignment_collision(token: str) -> bool:
     return stripped.lower() in _FIELD_NAME_NEXT_ACTIONS
 
 
+# Boundary characters that separate the first token of a
+# ``next_action`` value from the rest. The set is identical
+# to the boundary scan in :func:`_extract_next_action_value`
+# so persisted-state validation and final-output extraction
+# agree on what counts as the "first field token".
+_FIELD_TOKEN_BOUNDARIES = "=:,;]})\n\"'"
+
+
+def _first_field_name_token(value: str) -> Optional[str]:
+    """Return the first identifier-like token in ``value`` or ``None``.
+
+    The token is the longest run of non-boundary characters at
+    the start of ``value`` (after leading whitespace is
+    stripped). Boundaries are: ``=``, ``:``, ``,``, ``;``,
+    ``]``, ``)``, ``}``, whitespace, newline, and the quote
+    characters ``"`` and ``'``. The token is returned with its
+    original case so the caller can decide whether to
+    lowercase it for comparison.
+
+    ``None`` is returned for non-strings, empty / whitespace
+    inputs, or inputs that start with a boundary character
+    (no first token).
+
+    Fix L (Codex 3422779962): persisted checkpoint /
+    watchdog values can contain a full ``field=value``
+    assignment, e.g. ``"checkpoint_path=/tmp/ckpt.json"`` or
+    ``"terminal_state=MERGED"`` or ``"terminal_state =
+    MERGED"``. A bare full-string membership check against
+    :data:`_FIELD_NAME_NEXT_ACTIONS` misses these because the
+    full string is not exactly a field name. The
+    :func:`is_valid_next_action` helper therefore needs to
+    extract the first field-name token and reject the value
+    when that token is a known protocol field name. This
+    keeps the persisted-state validator and the final-output
+    extractor (:func:`_extract_next_action_value`) consistent
+    — both reject field-name-as-value collisions using the
+    same vocabulary.
+    """
+    if not isinstance(value, str):
+        return None
+    s = value.lstrip()
+    if not s:
+        return None
+    for j, ch in enumerate(s):
+        if ch.isspace() or ch in _FIELD_TOKEN_BOUNDARIES:
+            return s[:j] if j > 0 else None
+    return s
+
+
 def _extract_next_action_value(text: str) -> Optional[str]:
     """Return the first real ``next_action`` value found in ``text``.
 
@@ -997,6 +1046,24 @@ def is_valid_next_action(value: object) -> bool:
     if lower in _PLACEHOLDER_NEXT_ACTIONS:
         return False
     if lower in _FIELD_NAME_NEXT_ACTIONS:
+        return False
+    # Fix L (Codex 3422779962): reject field=value
+    # assignment collisions that the full-string field-name
+    # check above cannot catch. Persisted checkpoint / watchdog
+    # values can store a full assignment like
+    # ``"checkpoint_path=/tmp/ckpt.json"`` or
+    # ``"terminal_state = MERGED"`` or ``"state: MERGED"``;
+    # the full string is not exactly a field name, but the
+    # first token before the first boundary character IS a
+    # known protocol field name. The runner mis-used a field
+    # name as a value, not as an executable action. The
+    # canonical :func:`_first_field_name_token` helper
+    # extracts the first token using the same boundary
+    # vocabulary as :func:`_extract_next_action_value`, so
+    # persisted-state validation and final-output extraction
+    # agree on what counts as a field-name-as-value collision.
+    first_tok = _first_field_name_token(stripped)
+    if first_tok and first_tok.lower() in _FIELD_NAME_NEXT_ACTIONS:
         return False
     return True
 
