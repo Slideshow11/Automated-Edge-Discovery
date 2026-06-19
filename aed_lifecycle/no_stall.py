@@ -412,11 +412,14 @@ _CHECKPOINT_TOKENS = (
     # ``STALL_PHASE_HEADER_ONLY`` even though a real
     # checkpoint path is present (Fix W, Codex 3442251126).
     "Checkpoint_path=",
+    "Checkpoint:",
     "Checkpoint: ",
     "Checkpoint_path:",
     "Checkpoint path=",
     "Checkpoint path:",
+    "Checkpoint Path:",
     "Checkpoint=",
+    "checkpoint =",
     "Wrote checkpoint to",
     "Saved checkpoint to",
     "Checkpoint file",

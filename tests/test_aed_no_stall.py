@@ -9372,3 +9372,126 @@ class MainCiPostMergeTokenRoutingTests(unittest.TestCase):
                 f"action {action!r} should NOT route to HOLD_POST_MERGE_CI_PENDING "
                 f"(it does not contain the standalone 'main_ci' token)",
             )
+
+
+class TitleCaseCheckpointPathBroadCheckTests(unittest.TestCase):
+    """Regression tests for Codex 3442626197 (Fix X).
+
+    The strict value-bearing extractor
+    (``_extract_checkpoint_value``) accepts the title-cased
+    field marker ``Checkpoint Path:`` in
+    ``_CHECKPOINT_FIELD_MARKERS``, but the broad
+    ``_CHECKPOINT_TOKENS`` substring scan previously only
+    included the lowercase-p variant ``Checkpoint path:``.
+    For a final output like::
+
+        Starting PHASE 3 — Checkpoint Path: /tmp/ckpt.json
+
+    with no ``next_action``, ``_has_checkpoint_with_value()``
+    returned True (strict extractor matched) while
+    ``has_checkpoint`` (broad) returned False, so the
+    classifier returned ``STALL_PHASE_HEADER_ONLY`` instead
+    of the intended checkpoint-bearing stall
+    (``STALL_NO_TERMINAL_STATE``). The title-case variant
+    must be added to the broad token list so the broad check
+    stays in sync with the strict extractor.
+
+    Also covers the related ``checkpoint =`` (with space)
+    field-style variant and verifies the strict source-of-truth
+    sync contract: any title-cased field marker accepted by
+    ``_CHECKPOINT_FIELD_MARKERS`` must also be present in the
+    broad ``_CHECKPOINT_TOKENS`` list.
+    """
+
+    def test_phase_header_with_title_case_checkpoint_path_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint Path: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint Path: ' (title-case) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(
+            verdict,
+            STALL_NO_TERMINAL_STATE,
+            f"phase header + title-case field marker (no next_action) should "
+            f"be STALL_NO_TERMINAL_STATE, got {verdict!r}",
+        )
+
+    def test_phase_header_with_lowercase_p_checkpoint_path_is_stall_no_terminal(self) -> None:
+        # Pre-existing lowercase-p variant (Fix W) — pinned
+        # to ensure the Fix W change is preserved.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint path: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint path: ' (lowercase p) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_checkpoint_equals_space_is_stall_no_terminal(self) -> None:
+        # The strict extractor also accepts ``checkpoint =``
+        # (with space, equals delimiter). Verify the broad
+        # scan covers this form too.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "checkpoint = /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'checkpoint = ' (with space) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_title_case_field_markers_in_broad_list_match_strict_list(self) -> None:
+        # Source-of-truth sync contract: every
+        # title-cased / sentence-cased entry in
+        # ``_CHECKPOINT_FIELD_MARKERS`` (the strict
+        # extractor vocabulary) must also be present in
+        # the broad ``_CHECKPOINT_TOKENS`` list. This
+        # prevents the broad check from drifting behind
+        # the strict extractor on a future addition.
+        from aed_lifecycle.no_stall import (
+            _CHECKPOINT_FIELD_MARKERS,
+            _CHECKPOINT_TOKENS,
+        )
+        broad_set = set(_CHECKPOINT_TOKENS)
+        for marker in _CHECKPOINT_FIELD_MARKERS:
+            # Skip lowercase-only field markers — they are
+            # always present in the broad list (lowercase
+            # is the canonical form). Only enforce the
+            # sync for entries that contain an uppercase
+            # letter (i.e. title-cased or sentence-cased
+            # variants).
+            if any(c.isupper() for c in marker):
+                self.assertIn(
+                    marker,
+                    broad_set,
+                    f"title-cased field marker {marker!r} (from "
+                    f"_CHECKPOINT_FIELD_MARKERS) must also be in the "
+                    f"broad _CHECKPOINT_TOKENS list so the broad "
+                    f"phase-header check stays in sync with the strict "
+                    f"extractor (Codex 3442626197 / Fix X)",
+                )
+
+    def test_checkpoint_path_tokens_contain_title_case_variants(self) -> None:
+        # Direct contract check: the broad token list must
+        # include ``Checkpoint Path:`` and ``checkpoint =``
+        # — the two field-style title-case variants the
+        # strict extractor accepts that the broad scan
+        # previously missed.
+        from aed_lifecycle.no_stall import _CHECKPOINT_TOKENS
+        self.assertIn("Checkpoint Path:", _CHECKPOINT_TOKENS)
+        self.assertIn("checkpoint =", _CHECKPOINT_TOKENS)
