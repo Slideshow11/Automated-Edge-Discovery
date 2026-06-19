@@ -9495,3 +9495,119 @@ class TitleCaseCheckpointPathBroadCheckTests(unittest.TestCase):
         from aed_lifecycle.no_stall import _CHECKPOINT_TOKENS
         self.assertIn("Checkpoint Path:", _CHECKPOINT_TOKENS)
         self.assertIn("checkpoint =", _CHECKPOINT_TOKENS)
+
+
+class LowercaseCheckpointColonNoSpaceBroadCheckTests(unittest.TestCase):
+    """Regression tests for Codex 3442962725 (Fix Y).
+
+    The strict value-bearing extractor
+    (``_extract_checkpoint_value``) accepts the lowercase
+    field marker ``checkpoint:`` (no trailing space) in
+    ``_CHECKPOINT_FIELD_MARKERS``, but the broad
+    ``_CHECKPOINT_TOKENS`` substring scan only had
+    ``checkpoint: `` (with trailing space). A phase-header
+    message like::
+
+        Starting PHASE 3
+        checkpoint:/tmp/ckpt.json
+
+    has a real checkpoint value (the strict extractor
+    matches ``checkpoint:`` with no space), but the broad
+    scan misses the form (no trailing space) and the
+    classifier falls through to ``STALL_PHASE_HEADER_ONLY``
+    instead of the intended checkpoint-bearing stall
+    (``STALL_NO_TERMINAL_STATE``).
+
+    The fix adds ``checkpoint:`` (no trailing space) to
+    ``_CHECKPOINT_TOKENS`` so the broad scan matches the
+    strict field marker.
+    """
+
+    def test_phase_header_with_checkpoint_colon_no_space_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "checkpoint:/tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'checkpoint:' (no space) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(
+            verdict,
+            STALL_NO_TERMINAL_STATE,
+            f"phase header + 'checkpoint:' (no space, no next_action) should "
+            f"be STALL_NO_TERMINAL_STATE, got {verdict!r}",
+        )
+
+    def test_phase_header_with_checkpoint_colon_space_still_works(self) -> None:
+        # Pre-existing trailing-space form — pinned to
+        # ensure the Fix W change is preserved.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "checkpoint: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'checkpoint: ' (with space) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_lowercase_field_markers_in_broad_list_match_strict_list(self) -> None:
+        # Source-of-truth sync contract: every entry in
+        # ``_CHECKPOINT_FIELD_MARKERS`` (the strict
+        # extractor vocabulary) must also be present in the
+        # broad ``_CHECKPOINT_TOKENS`` list, either as an
+        # exact entry or as a strict-prefix match (e.g. the
+        # broad scan keeps ``checkpoint: `` with trailing
+        # space to be a strict prefix of any line with a
+        # value after the marker, but for the no-space form
+        # the broad scan needs the exact ``checkpoint:``
+        # entry because the no-space form is also a valid
+        # value-bearing form that ends at the line boundary).
+        from aed_lifecycle.no_stall import (
+            _CHECKPOINT_FIELD_MARKERS,
+            _CHECKPOINT_TOKENS,
+        )
+        broad_set = set(_CHECKPOINT_TOKENS)
+        for marker in _CHECKPOINT_FIELD_MARKERS:
+            # Acceptable broad coverage: exact match, OR
+            # the strict marker is a prefix of a broad
+            # entry (e.g. ``checkpoint:`` is a prefix of
+            # ``checkpoint: ``). This is what the broad
+            # scan's substring containment check actually
+            # uses — a line containing ``checkpoint: /...``
+            # satisfies ``checkpoint: `` containment, and
+            # a line containing ``checkpoint:/...``
+            # satisfies ``checkpoint:`` containment.
+            covered = (
+                marker in broad_set
+                or any(b.startswith(marker) or marker.startswith(b) for b in broad_set)
+            )
+            self.assertTrue(
+                covered,
+                f"strict field marker {marker!r} (from _CHECKPOINT_FIELD_MARKERS) "
+                f"must be covered by the broad _CHECKPOINT_TOKENS list "
+                f"(either as an exact entry or as a prefix-of / prefixed-by "
+                f"relationship). The broad scan uses substring containment, so "
+                f"a line containing the marker plus a value will match if "
+                f"the marker is a prefix of any broad entry OR any broad "
+                f"entry is a prefix of the marker.",
+            )
+
+    def test_checkpoint_tokens_contain_lowercase_colon_no_space(self) -> None:
+        # Direct contract check: ``checkpoint:`` (no
+        # trailing space) must be in the broad token list.
+        from aed_lifecycle.no_stall import _CHECKPOINT_TOKENS
+        self.assertIn(
+            "checkpoint:",
+            _CHECKPOINT_TOKENS,
+            "lowercase field marker 'checkpoint:' (no trailing space) must be "
+            "in _CHECKPOINT_TOKENS so the broad phase-header scan matches "
+            "the strict field-marker form (Codex 3442962725 / Fix Y)",
+        )

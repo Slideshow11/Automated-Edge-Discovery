@@ -395,6 +395,7 @@ _CONTINUE_PROMPT_TOKENS = (
 # the broad check stays in sync with the strict extractor.
 _CHECKPOINT_TOKENS = (
     "checkpoint_path=",
+    "checkpoint:",
     "checkpoint: ",
     "checkpoint_path:",
     "checkpoint=",
