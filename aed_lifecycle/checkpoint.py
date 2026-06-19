@@ -192,8 +192,29 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
     # valid ``next_action`` but no ``phase`` could
     # auto-resume. ``hasattr`` distinguishes the two
     # cases; ``getattr(..., None)`` does not.
+    #
+    # Fix AF (Codex 3443990130): a PRESENT but
+    # non-string ``phase`` (e.g. ``phase=[]`` or
+    # ``phase=123``) is also a structural error. The
+    # presence-only check is necessary but not
+    # sufficient — the documented schema pins ``phase``
+    # as ``Optional[str]`` (i.e. the value must be
+    # either ``None`` or a string). Anything else
+    # (list, int, bool, dict, tuple) means the
+    # checkpoint was deserialized into the wrong shape
+    # and must not auto-resume. This check guards the
+    # same code path as Fix AE and follows the same
+    # pattern as the existing ``_REQUIRED_STRING_FIELDS``
+    # type-mismatch check (Fix A, Codex 3414948246).
     if not hasattr(state, "phase"):
         errors.append("checkpoint missing required field 'phase'")
+    else:
+        phase_val = getattr(state, "phase")
+        if phase_val is not None and not isinstance(phase_val, str):
+            errors.append(
+                "checkpoint field 'phase' must be a string or None, "
+                f"got {type(phase_val).__name__}"
+            )
 
     for fname in _REQUIRED_STRING_FIELDS:
         if not hasattr(state, fname):
