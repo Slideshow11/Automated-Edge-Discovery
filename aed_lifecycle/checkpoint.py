@@ -365,14 +365,33 @@ def validate_resume_observations(
     errors: List[str] = []
 
     # Terminal-state handling.
-    if state.terminal_state is not None:
-        if not is_terminal_lifecycle_state(state.terminal_state):
+    # Fix AD (Codex 3443646997): guard optional
+    # attribute access with ``getattr(..., None)`` so a
+    # partially deserialized checkpoint cannot raise
+    # ``AttributeError`` here. Read each optional field
+    # once at the top and use the local variable
+    # throughout. ``validate_checkpoint`` already ran
+    # before this point and guarantees the required
+    # string fields (``repo``, ``branch``,
+    # ``current_head``) are present; the ``getattr``
+    # guards here are belt-and-braces for
+    # namespace/dict-like objects that bypass the
+    # validator.
+    terminal_state_value = getattr(state, "terminal_state", None)
+    last_verified_pr_head_value = getattr(
+        state, "last_verified_pr_head", None
+    )
+    last_verified_primary_head_value = getattr(
+        state, "last_verified_primary_head", None
+    )
+    if terminal_state_value is not None:
+        if not is_terminal_lifecycle_state(terminal_state_value):
             # Unknown terminal_state — surface as a hold, do
             # not fall through to the head-drift checks (the
             # runner would otherwise report HOLD_HEAD_CHANGED
             # instead of the unknown-terminal hold).
             errors.append(
-                f"unknown terminal_state {state.terminal_state!r} "
+                f"unknown terminal_state {terminal_state_value!r} "
                 "is not a recognized terminal state"
             )
             return errors
@@ -381,7 +400,7 @@ def validate_resume_observations(
         # the terminal state and the operator is not
         # required to intervene. Parked/hold terminal states
         # fall through to the head checks below.
-        if is_completed_terminal_state(state.terminal_state):
+        if is_completed_terminal_state(terminal_state_value):
             return []
         # else: parked/hold terminal state — continue to
         # the recorded-head checks.
@@ -390,8 +409,8 @@ def validate_resume_observations(
     # we can compare it against the observation. A missing
     # recorded head is a hard error, not a silent skip.
     if not (
-        isinstance(state.last_verified_pr_head, str)
-        and state.last_verified_pr_head
+        isinstance(last_verified_pr_head_value, str)
+        and last_verified_pr_head_value
     ):
         errors.append(
             "recorded PR head missing: "
@@ -400,19 +419,19 @@ def validate_resume_observations(
     elif (
         isinstance(observed_pr_head, str)
         and observed_pr_head
-        and observed_pr_head != state.last_verified_pr_head
+        and observed_pr_head != last_verified_pr_head_value
     ):
         errors.append(
             "PR head changed: "
-            f"last_verified_pr_head={state.last_verified_pr_head[:12]} "
+            f"last_verified_pr_head={last_verified_pr_head_value[:12]} "
             f"but observed={observed_pr_head[:12]}"
         )
 
     # Recorded primary head must be present and non-empty
     # before we can compare it against the observation.
     if not (
-        isinstance(state.last_verified_primary_head, str)
-        and state.last_verified_primary_head
+        isinstance(last_verified_primary_head_value, str)
+        and last_verified_primary_head_value
     ):
         errors.append(
             "recorded primary head missing: "
@@ -421,11 +440,11 @@ def validate_resume_observations(
     elif (
         isinstance(observed_primary_head, str)
         and observed_primary_head
-        and observed_primary_head != state.last_verified_primary_head
+        and observed_primary_head != last_verified_primary_head_value
     ):
         errors.append(
             "primary worktree head changed: "
-            f"last_verified_primary_head={state.last_verified_primary_head[:12]} "
+            f"last_verified_primary_head={last_verified_primary_head_value[:12]} "
             f"but observed={observed_primary_head[:12]}"
         )
 
@@ -455,10 +474,32 @@ def next_action_from_checkpoint(state: CheckpointState) -> Optional[str]:
     - If the checkpoint has a ``next_action`` → return
       ``next_action`` verbatim.
     - Otherwise → ``"HOLD_OPERATOR_REQUIRED"``.
+
+    Fix AD (Codex 3443646997): read ``terminal_state`` and
+    ``next_action`` via ``getattr(..., None)`` at the top so
+    a partially deserialized checkpoint object that lacks
+    these attributes (e.g. a decoded namespace/dict-like
+    object rather than a ``CheckpointState`` instance with
+    dataclass defaults) does NOT raise ``AttributeError``.
+    The previous direct ``state.terminal_state`` /
+    ``state.next_action`` accesses would crash before the
+    runner could surface ``HOLD_OPERATOR_REQUIRED`` for a
+    corrupt checkpoint, even though
+    :func:`validate_checkpoint` was already safe (Fix Z +
+    Fix AC). This brings the downstream resume helpers
+    into line with the validator.
     """
+    # Fix AD (Codex 3443646997): guard optional
+    # attribute access with ``getattr(..., None)`` so a
+    # partially deserialized checkpoint cannot raise
+    # ``AttributeError`` here.
+    terminal_state_value = getattr(state, "terminal_state", None)
+    next_action_value = getattr(state, "next_action", None)
+    phase_value = getattr(state, "phase", None)
+
     # Terminal state: runner is done.
-    if state.terminal_state is not None:
-        if is_terminal_lifecycle_state(state.terminal_state):
+    if terminal_state_value is not None:
+        if is_terminal_lifecycle_state(terminal_state_value):
             return None
         # Unknown terminal_state — treat as a hold.
         return "HOLD_OPERATOR_REQUIRED"
@@ -466,18 +507,18 @@ def next_action_from_checkpoint(state: CheckpointState) -> Optional[str]:
     # Stale / empty checkpoint — no phase, no next_action, no
     # terminal_state. The runner must NOT emit a silent
     # continuation; it must surface the hold to the operator.
-    if not state.phase and not state.next_action:
+    if not phase_value and not next_action_value:
         return "HOLD_OPERATOR_REQUIRED"
 
-    if state.next_action:
+    if next_action_value:
         # Defensive: a non-string / empty / placeholder
         # next_action must never be returned to the runner. If
         # validation was skipped or bypassed, this is the
         # last-line guard. The validity check is delegated to
         # the canonical :func:`is_valid_next_action` helper.
-        if not is_valid_next_action(state.next_action):
+        if not is_valid_next_action(next_action_value):
             return "HOLD_OPERATOR_REQUIRED"
-        return state.next_action
+        return next_action_value
 
     return "HOLD_OPERATOR_REQUIRED"
 
@@ -580,9 +621,22 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     if validate_checkpoint(state):
         return True
 
+    # Fix AD (Codex 3443646997): guard optional
+    # attribute access with ``getattr(..., None)`` so a
+    # partially deserialized checkpoint cannot raise
+    # ``AttributeError`` here. Read each optional field
+    # once at the top and use the local variable
+    # throughout.
+    terminal_state_value = getattr(state, "terminal_state", None)
+    next_action_value = getattr(state, "next_action", None)
+    phase_value = getattr(state, "phase", None)
+    unresolved_thread_ids_value = getattr(
+        state, "unresolved_thread_ids", None
+    )
+
     # Unknown terminal state is a hold.
-    if state.terminal_state is not None and not is_terminal_lifecycle_state(
-        state.terminal_state
+    if terminal_state_value is not None and not is_terminal_lifecycle_state(
+        terminal_state_value
     ):
         return True
 
@@ -593,7 +647,7 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     # and the operator is NOT required to intervene.
     # Completed states: ``MERGED``, ``FAILED``,
     # ``PR_MERGED_AND_CLOSED_OUT``.
-    if is_completed_terminal_state(state.terminal_state):
+    if is_completed_terminal_state(terminal_state_value):
         return False
 
     # Fix A (Codex 3415785873): recognized but
@@ -610,8 +664,8 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     # the next-action validity check, so a parked
     # terminal state with a non-empty next_action
     # correctly returns True.
-    if state.terminal_state is not None and is_terminal_lifecycle_state(
-        state.terminal_state
+    if terminal_state_value is not None and is_terminal_lifecycle_state(
+        terminal_state_value
     ):
         return True
 
@@ -622,20 +676,20 @@ def checkpoint_requires_operator(state: CheckpointState) -> bool:
     # False, so a ``next_action=None`` with a populated
     # ``phase`` requires the operator (Fix D, Codex
     # 3415107663).
-    if not is_valid_next_action(state.next_action):
+    if not is_valid_next_action(next_action_value):
         return True
 
     # Stale / empty checkpoint.
     if (
-        state.terminal_state is None
-        and not state.phase
-        and not state.next_action
+        terminal_state_value is None
+        and not phase_value
+        and not next_action_value
     ):
         return True
 
     # Unresolved threads with no next_action: the runner cannot
     # auto-resolve threads; the operator must.
-    if state.unresolved_thread_ids and not state.next_action:
+    if unresolved_thread_ids_value and not next_action_value:
         return True
 
     return False

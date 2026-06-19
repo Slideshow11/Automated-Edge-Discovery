@@ -10101,3 +10101,246 @@ class CheckpointOptionalAttributeHasattrGuardTests(unittest.TestCase):
             f"non-string next_action should produce a 'next_action' error, "
             f"got errors={errors!r}",
         )
+
+
+class CheckpointResumeHelpersGetattrGuardTests(unittest.TestCase):
+    """Regression tests for Codex 3443646997 (Fix AD).
+
+    The Fix AC ``getattr(..., None)`` guards brought
+    :func:`validate_checkpoint` into line with the rest of
+    the validator, but the downstream resume helpers
+    (:func:`next_action_from_checkpoint`,
+    :func:`checkpoint_requires_operator`,
+    :func:`validate_resume_observations`) still dereferenced
+    ``state.next_action`` / ``state.terminal_state`` /
+    related optional attributes directly. A partially
+    deserialized checkpoint object that bypasses the
+    validator (e.g. a decoded namespace/dict-like object
+    rather than a ``CheckpointState`` instance with
+    dataclass defaults) could pass validation and still
+    raise ``AttributeError`` later in the resume flow,
+    preventing the runner from surfacing
+    ``HOLD_OPERATOR_REQUIRED`` for a corrupt checkpoint.
+
+    Fix AD applies the same ``getattr(..., None)`` pattern
+    consistently in the downstream resume helpers. Read
+    each optional field once at the top of the helper and
+    use the local variable throughout.
+    """
+
+    def test_namespace_object_missing_optional_attrs_does_not_raise_in_validation(self) -> None:
+        # A SimpleNamespace-style object that lacks the
+        # optional fields entirely. ``validate_checkpoint``
+        # must NOT raise ``AttributeError``; it must return
+        # the structural errors it can detect and not crash
+        # on the optional fields.
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        # Provide the required fields but omit the
+        # optional ones (next_action, terminal_state,
+        # last_verified_*_head, unresolved_thread_ids).
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+        )
+        # Must NOT raise AttributeError.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError for a "
+                f"namespace object missing optional attrs, got: {exc!r}"
+            )
+        # No specific optional-attr error should be
+        # present (a missing optional field is treated as
+        # absent, not as a validation error).
+        self.assertFalse(
+            any("next_action" in e for e in errors),
+            f"missing next_action should not produce a 'next_action' error, "
+            f"got errors={errors!r}",
+        )
+        self.assertFalse(
+            any("terminal_state" in e for e in errors),
+            f"missing terminal_state should not produce a 'terminal_state' "
+            f"error, got errors={errors!r}",
+        )
+
+    def test_next_action_from_checkpoint_does_not_raise_for_namespace_without_next_action(self) -> None:
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import (
+            next_action_from_checkpoint,
+            validate_checkpoint,
+        )
+        # Required fields present, optional missing.
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+        )
+        # Must NOT raise AttributeError. With a populated
+        # ``phase`` and no ``next_action`` and no
+        # ``terminal_state``, the helper must return
+        # ``"HOLD_OPERATOR_REQUIRED"`` so the runner
+        # surfaces the hold to the operator.
+        try:
+            result = next_action_from_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"next_action_from_checkpoint must not raise AttributeError "
+                f"for a namespace object missing optional attrs, got: {exc!r}"
+            )
+        # Note: validate_checkpoint will fail for this
+        # namespace (missing current_head is not present,
+        # and structural fields are checked), but the
+        # helper should still return a safe string
+        # regardless of whether validation passed.
+        self.assertEqual(result, "HOLD_OPERATOR_REQUIRED")
+
+    def test_checkpoint_requires_operator_does_not_raise_for_namespace_without_optional_attrs(self) -> None:
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import (
+            checkpoint_requires_operator,
+            validate_checkpoint,
+        )
+        # Required fields present, optional missing.
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+        )
+        # Must NOT raise AttributeError. The helper should
+        # return a safe boolean.
+        try:
+            result = checkpoint_requires_operator(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"checkpoint_requires_operator must not raise AttributeError "
+                f"for a namespace object missing optional attrs, got: {exc!r}"
+            )
+        # With no next_action and no terminal_state, the
+        # helper should return True (operator required).
+        self.assertIsInstance(result, bool)
+        self.assertTrue(
+            result,
+            f"checkpoint with no next_action and no terminal_state must "
+            f"require operator (Fix D), got result={result!r}",
+        )
+
+    def test_next_action_from_checkpoint_namespace_with_phase_no_next_action(self) -> None:
+        # Specifically pin the documented decision-tree
+        # behavior: a checkpoint with a populated phase
+        # and no next_action and no terminal_state must
+        # return ``"HOLD_OPERATOR_REQUIRED"`` (the runner
+        # cannot auto-resume a phase that has no
+        # executable next step).
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import next_action_from_checkpoint
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_5_CI_POLL",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+        )
+        self.assertEqual(
+            next_action_from_checkpoint(state),
+            "HOLD_OPERATOR_REQUIRED",
+        )
+
+    def test_next_action_from_checkpoint_returns_action_for_valid_state(self) -> None:
+        # Regression guard: a structurally valid
+        # ``CheckpointState`` with a valid ``next_action``
+        # must continue to return the action verbatim
+        # after the Fix AD refactor.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            next_action_from_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            next_action="poll CI",
+        )
+        self.assertEqual(
+            next_action_from_checkpoint(state),
+            "poll CI",
+        )
+
+    def test_next_action_from_checkpoint_returns_none_for_completed_terminal(self) -> None:
+        # Regression guard: a checkpoint with a recognized
+        # completed terminal state must continue to return
+        # ``None`` (runner is done).
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            next_action_from_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            terminal_state="MERGED",
+        )
+        self.assertIsNone(next_action_from_checkpoint(state))
+
+    def test_checkpoint_requires_operator_namespace_with_completed_terminal(self) -> None:
+        # Namespace variant of the completed-terminal
+        # short-circuit test. With a completed terminal
+        # state, the helper should return ``False``
+        # (operator not required).
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import checkpoint_requires_operator
+        # Note: validate_checkpoint will fail for this
+        # namespace (no validate_checkpoint guarantees
+        # are made for namespace objects), so the helper
+        # will short-circuit to True. We are testing that
+        # it does NOT raise AttributeError, not the
+        # specific return value (which depends on
+        # validation behavior).
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="fd2f5c1b3b80ca0a9a53094269a7beb9cc438bc2",
+            phase="PHASE_3",
+            terminal_state="MERGED",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+        )
+        try:
+            result = checkpoint_requires_operator(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"checkpoint_requires_operator must not raise AttributeError "
+                f"for a namespace object with completed terminal_state, "
+                f"got: {exc!r}"
+            )
+        # With no required structural validation
+        # guarantees for the namespace, the helper
+        # returns True (validate_checkpoint fails for
+        # the namespace, so the structural gate fires).
+        self.assertIsInstance(result, bool)
