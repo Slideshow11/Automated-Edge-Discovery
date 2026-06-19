@@ -529,6 +529,53 @@ def _is_field_assignment_collision_value(value: object) -> bool:
     :func:`next_action_from_checkpoint`, and
     :func:`evaluate_watchdog`. Tightening the helper
     tightens all four callers in one place.
+
+    Fix U (Codex 3442047933): when the value starts with
+    a leading wrapper character (``"'([{``), the
+    :func:`_first_field_name_token` helper treats that
+    character as a boundary and returns ``None``, so the
+    raw form passes the collision check. The canonical
+    helper now also tries the wrapper-stripped form of
+    the value when looking for the first identifier-like
+    token. A quoted field-assignment value
+    (``"checkpoint_path=/tmp/ckpt.json"``) is
+    recognised as the same collision it is when bare,
+    but a quoted real action whose first word is a
+    field-name word (``"checkpoint current run state"``)
+    is still accepted because the field-assignment
+    check requires both a field-name word AND a
+    delimiter (``=``/``:``) after it — the quoted
+    real-action form has no delimiter after the first
+    word and remains accepted.
+    """
+    if not isinstance(value, str):
+        return False
+    # Fix U (Codex 3442047933): try the raw form first,
+    # then the wrapper-stripped form. If either form
+    # detects a field-assignment collision, the value is
+    # rejected. The wrapper-stripped form catches quoted
+    # field-assignment values like
+    # ``"checkpoint_path=/tmp/ckpt.json"`` whose raw form
+    # starts with a leading quote that
+    # :func:`_first_field_name_token` would treat as a
+    # boundary.
+    return _check_field_assignment_on_form(
+        value
+    ) or _check_field_assignment_on_form(
+        value.lstrip(_PLACEHOLDER_LEADING_WRAPPERS)
+    )
+
+
+def _check_field_assignment_on_form(value: object) -> bool:
+    """Helper for :func:`_is_field_assignment_collision_value`.
+
+    Runs the field-assignment collision check on a single
+    form of the value. Returns True iff the value's first
+    identifier-like token is a known protocol field name
+    AND the first non-whitespace character after that
+    token is ``=`` or ``:``. Returns False for non-string
+    inputs and for values where the first token is not a
+    known protocol field name.
     """
     if not isinstance(value, str):
         return False
@@ -1510,7 +1557,17 @@ def is_valid_next_action(value: object) -> bool:
     # RAW stripped value (no wrapper strip). This is the
     # regression guard against Fix S stripping a quote off
     # a real action's first token and then matching the
-    # bare field name.
+    # bare field name. A real quoted action whose first
+    # word is a field name but has no field-assignment
+    # form (no ``=``/``:``) — e.g.
+    # ``"checkpoint current run state"`` — is accepted
+    # because the raw form is not an exact field name.
+    # The Fix U wrapper-stripped field-assignment check
+    # (below) catches the quoted field-assignment
+    # collision form (``"checkpoint_path=/tmp/ckpt.json"``)
+    # because the full value (passed by the extractor to
+    # :func:`_is_field_assignment_collision_value`) still
+    # contains the ``=`` after the first token.
     if stripped.lower() in _FIELD_NAME_NEXT_ACTIONS:
         return False
     # Fix M (Codex 3438724908): reject only real field
@@ -1529,7 +1586,29 @@ def is_valid_next_action(value: object) -> bool:
     # with the final-output extractor
     # (:func:`_extract_next_action_value`) which uses the
     # same ``_FIELD_NAME_NEXT_ACTIONS`` vocabulary.
-    if _is_field_assignment_collision_value(stripped):
+    #
+    # Fix U (Codex 3442047933): the field-assignment
+    # collision check must also run on the
+    # WRAPPER-STRIPPED form. When a runner quotes a
+    # field-assignment value — e.g.
+    # ``next_action: "checkpoint_path=/tmp/ckpt.json"`` —
+    # the extracted first token is
+    # ``"checkpoint_path=/tmp/ckpt.json`` (with the
+    # leading quote still attached). The
+    # :func:`_first_field_name_token` helper treats the
+    # leading quote as a boundary character and returns
+    # ``None``, so the raw stripped form passes the
+    # collision check and the runner could try to resume
+    # with a quoted field-assignment value. The
+    # wrapper-stripped form (``trimmed``) starts with
+    # the bare field name and is the same form Fix M
+    # already rejects for the unquoted case, so the
+    # canonical validator now runs the collision check on
+    # BOTH the raw and the wrapper-stripped forms.
+    if (
+        _is_field_assignment_collision_value(stripped)
+        or _is_field_assignment_collision_value(trimmed)
+    ):
         return False
     return True
 

@@ -8748,5 +8748,290 @@ class QuotedFieldNameActionRegressionGuardTests(unittest.TestCase):
         )
 
 
+class QuotedFieldAssignmentRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3442047933 (Fix U).
+
+    When a runner quotes a field-assignment value — e.g.
+    ``next_action: "checkpoint_path=/tmp/ckpt.json"`` plus
+    a valid ``checkpoint_path`` on another line — the
+    extracted first whitespace-delimited token is
+    ``"checkpoint_path=/tmp/ckpt.json`` (with the leading
+    quote still attached). The previous
+    :func:`_is_field_assignment_collision_value` check ran
+    :func:`_first_field_name_token` on the raw stripped
+    value; the helper treats the leading quote as a
+    boundary character and returns ``None``, so the
+    collision check passed and the validator accepted the
+    quoted field-assignment value as a real action. The
+    same bypass applied to persisted
+    ``next_action='"terminal_state=MERGED"'``. The
+    unquoted case (``checkpoint_path=/tmp/ckpt.json``) was
+    already correctly rejected as non-executable protocol
+    syntax.
+
+    Fix U runs the field-assignment collision check on
+    BOTH the raw stripped value AND the wrapper-stripped
+    form, so a quoted field-assignment value is
+    recognised as the same collision it is when bare.
+    """
+
+    # --- is_valid_next_action rejects quoted field assignments ---
+
+    def test_quoted_checkpoint_path_equals_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('"checkpoint_path=/tmp/ckpt.json"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"checkpoint_path = /tmp/ckpt.json"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"checkpoint=/tmp/ckpt.json"')
+        )
+
+    def test_quoted_terminal_state_equals_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('"terminal_state=MERGED"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"terminal_state = MERGED"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"state: MERGED"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"phase: PHASE_7"')
+        )
+
+    def test_quoted_next_action_equals_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('"next_action=poll CI"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"next_step=continue"')
+        )
+
+    def test_quoted_colon_form_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('"phase: PHASE_7"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"state: MERGED"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"checkpoint: /tmp/ckpt.json"')
+        )
+
+    def test_bracketed_field_assignment_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action(
+                '[checkpoint_path=/tmp/ckpt.json]'
+            )
+        )
+        self.assertFalse(
+            is_valid_next_action('(terminal_state=MERGED)')
+        )
+        self.assertFalse(
+            is_valid_next_action('{phase: PHASE_7}')
+        )
+
+    def test_paren_wrapped_field_assignment_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('(checkpoint=/tmp/ckpt.json)')
+        )
+
+    # --- Unquoted form still rejected (regression pinned from Fix M) ---
+
+    def test_unquoted_field_assignment_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path = /tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("phase: PHASE_7")
+        )
+
+    # --- Legitimate quoted actions still accepted (regression pinned from Fix T) ---
+
+    def test_quoted_legitimate_action_still_accepted(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # Quoted real action whose first word is NOT a
+        # field name and has no field-assignment form.
+        self.assertTrue(
+            is_valid_next_action('"poll CI status"')
+        )
+        self.assertTrue(
+            is_valid_next_action('"continue bounded CI polling"')
+        )
+        self.assertTrue(
+            is_valid_next_action('"review next steps after CI"')
+        )
+
+    def test_quoted_field_name_action_still_accepted(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # Quoted real action whose first word IS a
+        # field name but has no field-assignment form
+        # (no `=` or `:`). Fix T regression guard.
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
+        )
+        self.assertTrue(
+            is_valid_next_action('"phase transition to next run"')
+        )
+        self.assertTrue(
+            is_valid_next_action('"state current PR status"')
+        )
+
+    # --- Classifier / message-level integration ---
+
+    def test_classifier_rejects_quoted_field_assignment(self) -> None:
+        """The headline case from the Codex finding.
+        ``next_action: "checkpoint_path=/tmp/ckpt.json"``
+        plus ``checkpoint_path=/tmp/other.json`` on
+        another line must NOT classify as
+        OK_PROGRESS_WITH_NEXT_ACTION. The extracted
+        value is ``"checkpoint_path=/tmp/ckpt.json``
+        (first whitespace-delimited token after the
+        marker, including the leading quote), which
+        Fix U recognises as a quoted field-assignment
+        collision."""
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "checkpoint_path=/tmp/ckpt.json"\n'
+            "checkpoint_path=/tmp/other.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_quoted_terminal_state(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "terminal_state=MERGED"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_bracketed_field_assignment(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: [phase: PHASE_7]\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_still_accepts_legitimate_quoted_action(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "poll CI status"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_still_accepts_quoted_field_name_action(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "checkpoint current run state"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Persisted validation pinned (Fix L/M/S/T integration) ---
+
+    def test_persisted_quoted_field_assignment_rejected(self) -> None:
+        """Pinned: persisted ``next_action='"checkpoint_path=/tmp/ckpt.json"'``
+        must not pass validation. The same canonical
+        :func:`is_valid_next_action` helper is used by
+        :func:`validate_checkpoint`,
+        :func:`next_action_from_checkpoint`,
+        :func:`checkpoint_requires_operator`, and
+        :func:`evaluate_watchdog`, so the quoted
+        field-assignment check applies uniformly. Fix U
+        contracts: the wrapper-stripped form of
+        :func:`_is_field_assignment_collision_value` is
+        also checked, so a quoted field-assignment
+        value is recognised as the same collision it is
+        when bare. The field-name check (Fix T) uses
+        only the raw form so a real quoted action whose
+        first word is a field name — e.g.
+        ``"checkpoint"`` (treated as a quoted first
+        token of a real action) — is still accepted."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action('"checkpoint_path=/tmp/ckpt.json"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"terminal_state=MERGED"')
+        )
+        self.assertFalse(
+            is_valid_next_action('"phase: PHASE_7"')
+        )
+        # Pinned from earlier fixes.
+        self.assertFalse(
+            is_valid_next_action('"None."')
+        )
+        self.assertFalse(
+            is_valid_next_action('"none"')
+        )
+        # Fix T contract: a quoted bare field-name word is
+        # accepted (treated as a quoted first token of a
+        # real action). The field-name check uses only
+        # the raw form.
+        self.assertTrue(
+            is_valid_next_action('"checkpoint"')
+        )
+        # Bare forms still rejected.
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+        # Pinned: legitimate forms still accepted.
+        self.assertTrue(
+            is_valid_next_action('"poll CI status"')
+        )
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
+        )
+        self.assertTrue(
+            is_valid_next_action("poll CI status")
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
