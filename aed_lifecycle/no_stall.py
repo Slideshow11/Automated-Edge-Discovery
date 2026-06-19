@@ -427,6 +427,21 @@ _CHECKPOINT_TOKENS = (
     "Checkpoint file",
     "Checkpoint at",
     "Checkpoint saved to",
+    # Fix AG (Codex 3444118871): spaced ``field = value`` forms.
+    # The strict extractor (``_CHECKPOINT_FIELD_MARKERS``) now
+    # accepts spaced assignments, so the broad phase-header
+    # scan must accept them too — otherwise a phase-header
+    # message that names a checkpoint via a spaced assignment
+    # (e.g. ``Starting PHASE 3 — checkpoint_path = /tmp/x``)
+    # would fall through to ``STALL_PHASE_HEADER_ONLY``
+    # despite having a real checkpoint path. The test
+    # ``TitleCaseCheckpointPathBroadCheckTests`` enforces
+    # this sync between the two lists.
+    "checkpoint_path =",
+    "Checkpoint_path =",
+    "Checkpoint path =",
+    "Checkpoint Path =",
+    "Checkpoint =",
 )
 
 
@@ -1126,6 +1141,26 @@ _CHECKPOINT_FIELD_MARKERS = (
     "checkpoint:",
     "Checkpoint:",
     "checkpoint =",
+    # Fix AG (Codex 3444118871): spaced ``field = value`` forms.
+    # The terminal-state parser already accepts spaced
+    # ``field = value`` assignments, but the strict
+    # checkpoint extractor used a case-sensitive ``find``
+    # against this tuple, so a message like
+    # ``next_action: poll CI status`` plus
+    # ``checkpoint_path = /tmp/aed/checkpoint.json`` would
+    # miss every marker here (the no-space ``checkpoint_path=``
+    # entry does not match because of the space before ``=``)
+    # and ``_has_checkpoint_with_value`` would stay False,
+    # causing ``classify_humphry_message_for_stall`` to
+    # return ``STALL_NO_CHECKPOINT`` despite having both
+    # required pieces of resume data. Adding the spaced
+    # variants below keeps the strict extractor in sync with
+    # the terminal-state parser's spaced-assignment behavior.
+    "checkpoint_path =",
+    "Checkpoint_path =",
+    "Checkpoint path =",
+    "Checkpoint Path =",
+    "Checkpoint =",
 )
 
 

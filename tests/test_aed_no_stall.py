@@ -10881,3 +10881,199 @@ class CheckpointPhaseTypeValidationTests(unittest.TestCase):
             f"phase=None should not produce a 'phase' error, "
             f"got phase_errors={phase_errors!r}",
         )
+
+
+class SpacedCheckpointPathAssignmentTests(unittest.TestCase):
+    """Fix AG (Codex 3444118871): the strict checkpoint
+    extractor (``_extract_checkpoint_value``) and the
+    broad phase-header scan (``_CHECKPOINT_TOKENS``) must
+    accept spaced ``field = value`` checkpoint-path
+    assignments.
+
+    Regression for Codex 3444118871 / PRRT_kwDOSHFpYM6K57ks:
+    a final progress message with ``next_action: poll CI``
+    plus ``checkpoint_path = /tmp/aed/checkpoint.json`` was
+    incorrectly classified as ``STALL_NO_CHECKPOINT`` because
+    the strict extractor used a case-sensitive ``find``
+    against ``_CHECKPOINT_FIELD_MARKERS`` and the no-space
+    ``checkpoint_path=`` entry does not match when a space
+    precedes the ``=``. The terminal-state parser already
+    accepted spaced ``field = value`` forms, so the
+    checkpoint parser must too.
+    """
+
+    def test_spaced_checkpoint_path_equals_classifies_as_ok_progress(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path = /tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_spaced_checkpoint_path_title_case_underscore_classifies_as_ok(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint_path = /tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_spaced_checkpoint_path_title_case_space_classifies_as_ok(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint path = /tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_spaced_checkpoint_path_title_case_capitals_classifies_as_ok(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint Path = /tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_no_space_checkpoint_path_equals_still_works(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_no_space_checkpoint_path_colon_still_works(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path: /tmp/aed/checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_spaced_placeholder_checkpoint_path_does_not_classify_as_ok(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        # A spaced assignment whose value is not a real path
+        # must NOT classify as OK progress.
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path = none"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_spaced_placeholder_checkpoint_path_with_none_value(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        # ``None`` is a recognized placeholder; spaced form
+        # must also be rejected.
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path = None"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            "OK_PROGRESS_WITH_NEXT_ACTION",
+        )
+
+    def test_phase_header_with_spaced_checkpoint_only_routes_to_stall(self) -> None:
+        from aed_lifecycle.no_stall import classify_humphry_message_for_stall
+        # Phase-header with a spaced checkpoint path but no
+        # next_action must still route to a stall state (not
+        # OK progress), because the OK progress classification
+        # requires BOTH a valid next_action AND a real
+        # checkpoint value.
+        text = (
+            "Starting PHASE 3 — fix cycle.\n"
+            "checkpoint_path = /tmp/aed/checkpoint.json"
+        )
+        result = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(result, "OK_PROGRESS_WITH_NEXT_ACTION")
+
+    def test_spaced_equals_forms_in_strict_field_marker_list(self) -> None:
+        from aed_lifecycle.no_stall import _CHECKPOINT_FIELD_MARKERS
+        # All spaced ``field = value`` forms required by
+        # the Codex 3444118871 fix must be present in the
+        # strict marker list.
+        required = (
+            "checkpoint_path =",
+            "Checkpoint_path =",
+            "Checkpoint path =",
+            "Checkpoint Path =",
+            "Checkpoint =",
+        )
+        for marker in required:
+            self.assertIn(
+                marker,
+                _CHECKPOINT_FIELD_MARKERS,
+                f"spaced marker {marker!r} must be in _CHECKPOINT_FIELD_MARKERS",
+            )
+
+    def test_spaced_equals_forms_in_broad_token_list(self) -> None:
+        from aed_lifecycle.no_stall import _CHECKPOINT_TOKENS
+        # The broad phase-header scan must also accept the
+        # spaced forms (sync with strict extractor).
+        required = (
+            "checkpoint_path =",
+            "Checkpoint_path =",
+            "Checkpoint path =",
+            "Checkpoint Path =",
+            "Checkpoint =",
+        )
+        for marker in required:
+            self.assertIn(
+                marker,
+                _CHECKPOINT_TOKENS,
+                f"spaced marker {marker!r} must be in _CHECKPOINT_TOKENS",
+            )
+
+    def test_spaced_checkpoint_path_extracts_via_strict_extractor(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        # Direct test of the strict extractor: a spaced
+        # ``checkpoint_path = /tmp/x`` line must yield the
+        # real path as the extracted value.
+        text = "checkpoint_path = /tmp/aed/checkpoint.json"
+        self.assertEqual(
+            _extract_checkpoint_value(text),
+            "/tmp/aed/checkpoint.json",
+        )
+
+    def test_spaced_checkpoint_path_title_case_extracts_via_strict_extractor(self) -> None:
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        # Direct test of the strict extractor for the
+        # title-cased spaced form.
+        text = "Checkpoint Path = /tmp/aed/checkpoint.json"
+        self.assertEqual(
+            _extract_checkpoint_value(text),
+            "/tmp/aed/checkpoint.json",
+        )
+
+    def test_spaced_checkpoint_path_has_checkpoint_with_value(self) -> None:
+        from aed_lifecycle.no_stall import _has_checkpoint_with_value
+        # The strict value-bearing check must return True
+        # for a spaced ``checkpoint_path = /tmp/x`` line.
+        text = "checkpoint_path = /tmp/aed/checkpoint.json"
+        self.assertTrue(_has_checkpoint_with_value(text))
+
+    def test_spaced_checkpoint_path_has_checkpoint_with_value_title_case(self) -> None:
+        from aed_lifecycle.no_stall import _has_checkpoint_with_value
+        text = "Checkpoint Path = /tmp/aed/checkpoint.json"
+        self.assertTrue(_has_checkpoint_with_value(text))
