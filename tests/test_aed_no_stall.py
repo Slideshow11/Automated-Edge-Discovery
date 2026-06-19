@@ -9611,3 +9611,232 @@ class LowercaseCheckpointColonNoSpaceBroadCheckTests(unittest.TestCase):
             "in _CHECKPOINT_TOKENS so the broad phase-header scan matches "
             "the strict field-marker form (Codex 3442962725 / Fix Y)",
         )
+
+
+class CheckpointPathEqualsMarkerExtractionTests(unittest.TestCase):
+    """Regression tests for Codex 3443071841 (Fix AA).
+
+    The broad ``_CHECKPOINT_TOKENS`` substring scan advertises
+    sentence-cased ``Checkpoint_path=`` / ``Checkpoint path=``
+    forms, but the strict ``_CHECKPOINT_FIELD_MARKERS``
+    extractor previously only accepted the colon variants
+    (``Checkpoint path:``, ``Checkpoint Path:``,
+    ``Checkpoint_path:``, ``Checkpoint:``). A resumable
+    message like::
+
+        next_action: poll CI status
+        Checkpoint path=/tmp/ckpt.json
+
+    was downgraded to ``STALL_NO_CHECKPOINT`` instead of
+    ``OK_PROGRESS_WITH_NEXT_ACTION`` because the strict
+    extractor missed the equals form. The fix adds the
+    equals sentence-cased field markers
+    (``Checkpoint_path=``, ``Checkpoint path=``,
+    ``Checkpoint Path=``, ``Checkpoint=``) to
+    ``_CHECKPOINT_FIELD_MARKERS`` so the value-bearing
+    extractor stays in sync with the broad scan.
+    """
+
+    def test_checkpoint_path_equals_is_progress(self) -> None:
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_path_equals_capital_p_is_progress(self) -> None:
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint Path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_path_underscore_equals_is_progress(self) -> None:
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_checkpoint_equals_is_progress(self) -> None:
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_existing_colon_marker_forms_still_work(self) -> None:
+        # Regression guard (Codex 3420268720 / Fix J and
+        # Codex 3442626197 / Fix X): the colon variants
+        # must continue to work after the equals additions.
+        for line in (
+            "checkpoint_path=/tmp/ckpt.json",
+            "checkpoint_path:/tmp/ckpt.json",
+            "Checkpoint path:/tmp/ckpt.json",
+            "Checkpoint Path:/tmp/ckpt.json",
+            "checkpoint=/tmp/ckpt.json",
+            "Checkpoint:/tmp/ckpt.json",
+        ):
+            text = (
+                "next_action: poll CI status\n" + line
+            )
+            self.assertEqual(
+                classify_humphry_message_for_stall(text),
+                OK_PROGRESS_WITH_NEXT_ACTION,
+                f"existing colon form {line!r} must still classify as "
+                f"OK_PROGRESS_WITH_NEXT_ACTION",
+            )
+
+    def test_checkpoint_field_markers_contain_equals_forms(self) -> None:
+        # Direct contract check: the strict
+        # ``_CHECKPOINT_FIELD_MARKERS`` must include all
+        # four equals sentence-cased variants the broad
+        # scan advertises.
+        from aed_lifecycle.no_stall import _CHECKPOINT_FIELD_MARKERS
+        for marker in (
+            "Checkpoint_path=",
+            "Checkpoint path=",
+            "Checkpoint Path=",
+            "Checkpoint=",
+        ):
+            self.assertIn(
+                marker,
+                _CHECKPOINT_FIELD_MARKERS,
+                f"equals sentence-cased marker {marker!r} must be in "
+                f"_CHECKPOINT_FIELD_MARKERS so the strict extractor stays "
+                f"in sync with the broad _CHECKPOINT_TOKENS scan "
+                f"(Codex 3443071841 / Fix AA)",
+            )
+
+    def test_checkpoint_path_equals_extractor_returns_path(self) -> None:
+        # Direct extractor check: the value-bearing
+        # checkpoint parser must extract the path from
+        # the equals form.
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text, expected in [
+            ("Checkpoint path=/tmp/ckpt.json", "/tmp/ckpt.json"),
+            ("Checkpoint Path=/tmp/ckpt.json", "/tmp/ckpt.json"),
+            ("Checkpoint_path=/tmp/ckpt.json", "/tmp/ckpt.json"),
+            ("Checkpoint=/tmp/ckpt.json", "/tmp/ckpt.json"),
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertEqual(
+                value,
+                expected,
+                f"equals-form marker text {text!r} should extract "
+                f"{expected!r}, got {value!r}",
+            )
+
+
+class CheckpointPrNumberHasattrGuardTests(unittest.TestCase):
+    """Regression tests for Codex 3443071832 (Fix Z).
+
+    The structural validator in
+    ``aed_lifecycle/checkpoint.py`` accessed
+    ``state.pr_number`` directly without a ``hasattr``
+    guard. A partially deserialized checkpoint that is
+    missing the ``pr_number`` attribute would raise
+    ``AttributeError`` instead of returning a structural
+    validation error, crashing before the runner could
+    surface ``HOLD_OPERATOR_REQUIRED``. The other required
+    fields already use the ``hasattr`` pattern; the fix
+    brings ``pr_number`` into line with the rest.
+    """
+
+    def test_missing_pr_number_returns_validation_error_not_attribute_error(self) -> None:
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        # Build a minimal valid state, then delete
+        # ``pr_number`` to simulate a partial
+        # deserialization. The dataclass does not override
+        # ``__delattr__``, so a ``del`` on the attribute
+        # works as expected.
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="3c8d2316c99e471d41dca38dc1f6e9c67db3421b",
+            phase="PHASE_3",
+        )
+        del state.pr_number
+        # Must NOT raise AttributeError. The validator
+        # returns a list of error strings.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError for a "
+                f"missing pr_number attribute, got: {exc!r}"
+            )
+        self.assertTrue(
+            any("pr_number" in e for e in errors),
+            f"missing pr_number should produce a 'pr_number' error, "
+            f"got errors={errors!r}",
+        )
+
+    def test_present_invalid_pr_number_still_returns_validation_error(self) -> None:
+        # Regression guard: present-but-invalid
+        # ``pr_number`` values (bool, negative, zero,
+        # non-int) must continue to produce validation
+        # errors after the hasattr guard is added.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        for bad_pr_number in (True, False, -1, 0, "405"):
+            state = CheckpointState(
+                repo="Slideshow11/Automated-Edge-Discovery",
+                pr_number=405,
+                branch="tooling/aed-no-stall-watchdog-v1",
+                current_head="3c8d2316c99e471d41dca38dc1f6e9c67db3421b",
+                phase="PHASE_3",
+            )
+            # Use ``setattr`` to bypass the static type
+            # check (the dataclass declares ``pr_number`` as
+            # ``int``; we are deliberately assigning
+            # non-int values to verify the validator's
+            # runtime rejection).
+            setattr(state, "pr_number", bad_pr_number)
+            errors = validate_checkpoint(state)
+            self.assertTrue(
+                any("pr_number" in e for e in errors),
+                f"bad pr_number {bad_pr_number!r} should produce a "
+                f"'pr_number' error, got errors={errors!r}",
+            )
+
+    def test_valid_pr_number_still_passes(self) -> None:
+        # Regression guard: a structurally valid state
+        # with a positive int pr_number must continue
+        # to pass validation (no 'pr_number' error in
+        # the error list).
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="3c8d2316c99e471d41dca38dc1f6e9c67db3421b",
+            phase="PHASE_3",
+        )
+        errors = validate_checkpoint(state)
+        self.assertFalse(
+            any("pr_number" in e for e in errors),
+            f"valid pr_number should not produce a 'pr_number' error, "
+            f"got errors={errors!r}",
+        )

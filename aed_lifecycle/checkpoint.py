@@ -215,8 +215,15 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
                 f"checkpoint field {fname!r} must be list[str]"
             )
 
-    # pr_number must be a positive int
-    if not isinstance(state.pr_number, int) or isinstance(state.pr_number, bool):
+    # pr_number must be a positive int. Guard with hasattr
+    # first because a partially deserialized checkpoint
+    # may be missing this attribute entirely; the other
+    # required fields already use the hasattr pattern
+    # above. Raising AttributeError here would crash
+    # before the runner can surface HOLD_OPERATOR_REQUIRED.
+    if not hasattr(state, "pr_number"):
+        errors.append("checkpoint missing required field 'pr_number'")
+    elif not isinstance(state.pr_number, int) or isinstance(state.pr_number, bool):
         errors.append("checkpoint pr_number must be a positive int")
     elif state.pr_number <= 0:
         errors.append("checkpoint pr_number must be a positive int")
