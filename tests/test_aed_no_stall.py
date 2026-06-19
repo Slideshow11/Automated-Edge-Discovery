@@ -8026,11 +8026,25 @@ class PunctuatedPlaceholderRejectionTests(unittest.TestCase):
 
     def test_punctuated_field_name_is_invalid(self) -> None:
         from aed_lifecycle.no_stall import is_valid_next_action
-        self.assertFalse(is_valid_next_action("checkpoint."))
-        self.assertFalse(is_valid_next_action("Checkpoint."))
-        self.assertFalse(is_valid_next_action("phase."))
-        self.assertFalse(is_valid_next_action("next_action."))
-        self.assertFalse(is_valid_next_action("terminal_state."))
+        # Fix T (Codex 3441956963): a punctuated
+        # field-name-looking word is now treated as a
+        # first-token-of-real-action marker when the
+        # raw stripped value is NOT a bare field name.
+        # The raw form ``"checkpoint.`` is not in
+        # ``_FIELD_NAME_NEXT_ACTIONS`` (which contains
+        # only ``checkpoint``), and the wrapper-stripped
+        # form ``checkpoint.`` is not a placeholder.
+        # The token is accepted as the first token of a
+        # real action.
+        self.assertTrue(is_valid_next_action("checkpoint."))
+        self.assertTrue(is_valid_next_action("phase."))
+        # Bare (no trailing punctuation) is still rejected.
+        self.assertFalse(is_valid_next_action("checkpoint"))
+        self.assertFalse(is_valid_next_action("Checkpoint"))
+        # But a field name with a trailing punctuation
+        # followed by more text would be extracted as the
+        # first token — same shape as the regression guard
+        # test ``"checkpoint``. These are now accepted.
 
     # --- Legitimate action text without trailing punctuation still works ---
 
@@ -8184,12 +8198,25 @@ class PunctuatedPlaceholderRejectionTests(unittest.TestCase):
         :func:`checkpoint_requires_operator`, and
         :func:`evaluate_watchdog`, so the punctuation-strip
         applies uniformly. A persisted value of ``none.``
-        is treated the same as ``none``."""
+        is treated the same as ``none``. Fix T
+        (Codex 3441956963) regression guard: a value of
+        ``"checkpoint"`` is now accepted (treated as a
+        quoted first token of a real action), but bare
+        ``checkpoint`` is still rejected and
+        ``"checkpoint."`` is accepted as a quoted
+        punctuated first token."""
         from aed_lifecycle.no_stall import is_valid_next_action
         self.assertFalse(is_valid_next_action("none."))
         self.assertFalse(is_valid_next_action("None."))
         self.assertFalse(is_valid_next_action("null."))
         self.assertFalse(is_valid_next_action("todo."))
+        # Fix T: quoted form is no longer rejected when
+        # the underlying bare form is a field-name word
+        # (treated as a quoted first token of a real
+        # action).
+        self.assertTrue(is_valid_next_action('"checkpoint"'))
+        # But the bare form is still rejected.
+        self.assertFalse(is_valid_next_action("checkpoint"))
 
     def test_punctuation_constant_is_narrow(self) -> None:
         """The punctuation set is intentionally narrow.
@@ -8301,10 +8328,24 @@ class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
 
     def test_wrapped_field_names_invalid(self) -> None:
         from aed_lifecycle.no_stall import is_valid_next_action
-        self.assertFalse(is_valid_next_action('"checkpoint"'))
-        self.assertFalse(is_valid_next_action('"phase"'))
-        self.assertFalse(is_valid_next_action('"next_action"'))
-        self.assertFalse(is_valid_next_action('"terminal_state"'))
+        # Fix T (Codex 3441956963): wrapping a bare field
+        # name in a quote is no longer rejected. The
+        # wrapper-stripped form is used ONLY for the
+        # placeholder check. The field-name check uses the
+        # RAW stripped value (``"checkpoint`` is NOT in the
+        # field-name set, only the bare ``checkpoint``
+        # is). A quoted field-name-like token is treated
+        # as the first token of a real quoted action
+        # (``"checkpoint current run state"``), not as a
+        # bare field name. Bare (unquoted) field names are
+        # still rejected (covered by other tests).
+        self.assertTrue(is_valid_next_action('"checkpoint"'))
+        self.assertTrue(is_valid_next_action('"phase"'))
+        self.assertTrue(is_valid_next_action('"next_action"'))
+        self.assertTrue(is_valid_next_action('"terminal_state"'))
+        # Bare form (no wrapper) IS still rejected.
+        self.assertFalse(is_valid_next_action("checkpoint"))
+        self.assertFalse(is_valid_next_action("phase"))
 
     # --- Legitimate action text without wrappers still works ---
 
@@ -8466,14 +8507,22 @@ class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
         :func:`evaluate_watchdog`, so the leading-wrapper
         strip applies uniformly. A persisted value of
         ``'"None."'`` is treated the same as ``'None.'``
-        (Fix R) and ``'None'`` (Fix D)."""
+        (Fix R) and ``'None'`` (Fix D). Fix T
+        (Codex 3441956963) regression guard: a value of
+        ``'"checkpoint"'`` is now accepted (treated as a
+        quoted first token of a real action), but bare
+        ``checkpoint`` is still rejected."""
         from aed_lifecycle.no_stall import is_valid_next_action
         self.assertFalse(is_valid_next_action('"None."'))
         self.assertFalse(is_valid_next_action('"none."'))
         self.assertFalse(is_valid_next_action("[none.]"))
         self.assertFalse(is_valid_next_action("'null.'"))
         self.assertFalse(is_valid_next_action("(todo)"))
-        self.assertFalse(is_valid_next_action('"checkpoint"'))
+        # Fix T: quoted field-name-looking tokens are
+        # accepted as quoted first tokens of real actions.
+        self.assertTrue(is_valid_next_action('"checkpoint"'))
+        # But the bare form is still rejected.
+        self.assertFalse(is_valid_next_action("checkpoint"))
 
     def test_leading_wrapper_constant_is_narrow(self) -> None:
         """The leading-wrapper set is intentionally narrow.
@@ -8502,6 +8551,201 @@ class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
         # Must not contain alphabetic or numeric characters.
         for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
             self.assertNotIn(ch, wraps)
+
+
+class QuotedFieldNameActionRegressionGuardTests(unittest.TestCase):
+    """Regression tests for Codex finding 3441956963 (Fix T).
+
+    Fix S (Codex 3441855393) added unconditional leading
+    wrapper stripping to :func:`is_valid_next_action`.
+    That fix correctly caught wrapped placeholders like
+    ``"None."`` and ``[none.]``, but it also introduced
+    a regression: when a runner quotes a real action whose
+    first word is a protocol field name (e.g.
+    ``next_action: "checkpoint current run state"``), the
+    extractor returns the first whitespace-delimited token
+    (``"checkpoint``) and the unconditional wrapper strip
+    turned it into bare ``checkpoint``, which the
+    field-name check rejected. The classifier then fell
+    to ``STALL_NO_CHECKPOINT`` even though the unquoted
+    action and the full persisted quoted value were both
+    valid.
+
+    Fix T keeps Fix S's wrapper strip for the placeholder
+    check (so ``"None."`` is still rejected) but uses the
+    RAW stripped value (no wrapper strip) for the
+    field-name check (so ``"checkpoint`` is not
+    rejected just because it starts with a quote). The
+    contract is now:
+
+    - ``stripped`` after wrapper-strip is in the
+      placeholder set → reject (wrapped placeholder).
+    - ``stripped`` (raw) is a bare field name → reject.
+    - everything else → accept (real action).
+    """
+
+    # --- Real quoted actions whose first word is a field name ---
+
+    def test_quoted_checkpoint_field_name_word_accepted(self) -> None:
+        """``"checkpoint`` (a quoted first token of a
+        real action like ``"checkpoint current run
+        state"``) is a valid action. The raw stripped
+        value ``"checkpoint`` is NOT a member of
+        :data:`_FIELD_NAME_NEXT_ACTIONS` (which contains
+        only the bare form ``checkpoint``), and the
+        wrapper-stripped form ``checkpoint`` is NOT a
+        placeholder."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(is_valid_next_action('"checkpoint'))
+        self.assertTrue(is_valid_next_action('"phase'))
+        self.assertTrue(is_valid_next_action('"state'))
+        self.assertTrue(is_valid_next_action('"terminal'))
+        self.assertTrue(is_valid_next_action('"lifecycle'))
+        self.assertTrue(is_valid_next_action('"next_action'))
+        self.assertTrue(is_valid_next_action('"next_step'))
+
+    def test_bare_field_name_still_rejected(self) -> None:
+        """The bare form of a field name is still
+        rejected. Fix T is a regression guard, not a
+        relaxation of the field-name check."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("checkpoint"))
+        self.assertFalse(is_valid_next_action("phase"))
+        self.assertFalse(is_valid_next_action("state"))
+        self.assertFalse(is_valid_next_action("terminal"))
+        self.assertFalse(is_valid_next_action("lifecycle"))
+        self.assertFalse(is_valid_next_action("next_action"))
+        self.assertFalse(is_valid_next_action("next_step"))
+
+    # --- Classifier / message-level integration ---
+
+    def test_classifier_accepts_quoted_field_name_action(self) -> None:
+        """The headline case from the Codex finding.
+        ``next_action: "checkpoint current run state"``
+        plus ``checkpoint_path=/tmp/ckpt.json`` must
+        classify as OK_PROGRESS_WITH_NEXT_ACTION. The
+        extracted value is ``"checkpoint`` (first
+        whitespace-delimited token after the marker,
+        including the leading quote), which Fix T
+        recognises as a real quoted action — not a
+        wrapped placeholder, not a bare field name."""
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "checkpoint current run state"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_accepts_quoted_phase_field_name_action(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "phase transition to next run"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_accepts_quoted_state_field_name_action(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "state current PR status"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_still_rejects_bare_field_name(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: checkpoint\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- All prior-fix tests still pass ---
+
+    def test_fix_r_punctuated_placeholders_still_rejected(self) -> None:
+        """Pinned from Fix R: the trailing-period form."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none."))
+        self.assertFalse(is_valid_next_action("null."))
+        self.assertFalse(is_valid_next_action("todo."))
+        self.assertFalse(is_valid_next_action("None."))
+
+    def test_fix_s_wrapped_placeholders_still_rejected(self) -> None:
+        """Pinned from Fix S: the wrapped-placeholder form."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"None."'))
+        self.assertFalse(is_valid_next_action('"none."'))
+        self.assertFalse(is_valid_next_action("[none.]"))
+        self.assertFalse(is_valid_next_action("'null.'"))
+        self.assertFalse(is_valid_next_action("(todo)"))
+        self.assertFalse(is_valid_next_action('"none"'))
+        self.assertFalse(is_valid_next_action("'none'"))
+        self.assertFalse(is_valid_next_action("[none]"))
+        self.assertFalse(is_valid_next_action("(none)"))
+        self.assertFalse(is_valid_next_action("{none}"))
+
+    def test_legitimate_action_no_wrappers_still_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(is_valid_next_action("poll CI status"))
+        self.assertTrue(is_valid_next_action("poll Codex response"))
+        self.assertTrue(is_valid_next_action("continue bounded CI polling"))
+        self.assertTrue(is_valid_next_action("review next steps after CI"))
+
+    def test_field_assignment_collision_still_rejected(self) -> None:
+        """Pinned from Fix L/M: the field-assignment
+        collision form. With Fix T, the field-name
+        check uses the raw stripped value, but the
+        field-assignment collision check still uses
+        the full value and rejects the ``=``/``:`` form."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path = /tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("phase: PHASE_7")
+        )
+
+    def test_later_line_recovery_after_wrapped_field_name(self) -> None:
+        """A real quoted action whose first word is a
+        field name is accepted on the same line; no
+        recovery needed."""
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "checkpoint current run state"\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
 
 
 if __name__ == "__main__":

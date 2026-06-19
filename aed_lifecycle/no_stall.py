@@ -1469,25 +1469,35 @@ def is_valid_next_action(value: object) -> bool:
     stripped = value.strip()
     if not stripped:
         return False
-    # Fix R (Codex 3440952035) + Fix S (Codex 3441855393):
-    # strip trailing sentence-ending punctuation AND
-    # leading wrapper characters so a runner that writes
+    # Fix R (Codex 3440952035) + Fix S (Codex 3441855393) +
+    # Fix T (Codex 3441956963): strip trailing
+    # sentence-ending punctuation AND leading wrapper
+    # characters (R, S) so a runner that writes
     # ``"next_action: None. No repair needed."`` (R) or
     # ``"next_action: \"None.\""`` / ``"next_action:
     # [none.]"`` (S) produces an extracted value that the
-    # placeholder check still recognises. Without these
-    # fixes, the validator accepted ``"None."``,
-    # ``"\"None."`` and ``"[none."`` as real actions and
-    # the runner could try to resume with a wrapped
-    # placeholder instead of surfacing a stall/hold. The
-    # punctuation and wrapper sets are intentionally
-    # narrow: ``.,;:!?'\")}]}`` for trailing, ``"'([{``
-    # for leading. A legitimate action like
-    # ``"poll CI status"`` is unchanged; a leading quote
-    # is treated as a wrapper only when followed by a
-    # placeholder-looking token. The ``while`` form on
-    # ``lstrip`` strips multiple leading wrappers in case
-    # the runner uses nested quoting.
+    # placeholder check still recognises. Fix T regression
+    # guard: the wrapper-stripped form is used ONLY for the
+    # placeholder check. The field-name check uses the RAW
+    # stripped value (no wrapper strip) so a real action
+    # starting with a field-name word — e.g. a quoted
+    # action ``"next_action: \"checkpoint current run
+    # state\""`` whose extracted first token is
+    # ``"checkpoint`` — is not rejected just because its
+    # first token starts with a quote. Without Fix T, the
+    # unconditional lstrip turns ``"checkpoint`` into
+    # ``checkpoint`` and the field-name check rejects the
+    # quoted action even though the unquoted action and
+    # the full persisted quoted value are both valid. The
+    # canonical validator now distinguishes two cases:
+    # (a) ``stripped`` after wrapper-strip is in the
+    # placeholder set — reject (wrapped placeholder,
+    # cannot be a real action); (b) ``stripped`` (raw,
+    # no wrapper strip) is a bare field name — reject
+    # (bare field name, not an action). Everything else
+    # is a real action and is accepted. The wrapper set
+    # is ``"'([{``; the trailing-punctuation set is
+    # ``.,;:!?'\")}]}``.
     trimmed = stripped.lstrip(
         _PLACEHOLDER_LEADING_WRAPPERS
     ).rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION)
@@ -1496,7 +1506,12 @@ def is_valid_next_action(value: object) -> bool:
     lower = trimmed.lower()
     if lower in _PLACEHOLDER_NEXT_ACTIONS:
         return False
-    if lower in _FIELD_NAME_NEXT_ACTIONS:
+    # Fix T (Codex 3441956963): field-name check uses the
+    # RAW stripped value (no wrapper strip). This is the
+    # regression guard against Fix S stripping a quote off
+    # a real action's first token and then matching the
+    # bare field name.
+    if stripped.lower() in _FIELD_NAME_NEXT_ACTIONS:
         return False
     # Fix M (Codex 3438724908): reject only real field
     # assignments, not legitimate actions that merely begin
