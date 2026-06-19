@@ -412,6 +412,8 @@ _NEXT_ACTION_TOKENS = (
     "next_action:",
     "Next action:",
     "next step:",
+    "Next step:",
+    "next action:",
     "next_action=",
     "next step=",
 )
@@ -517,6 +519,77 @@ def _is_field_assignment_collision_value(value: object) -> bool:
         if not ch.isspace():
             return ch in ("=", ":")
     # Token is at the end of the value with nothing after.
+    return False
+
+
+def _contains_nested_next_action_marker(value: object) -> bool:
+    """Return True iff ``value`` contains any supported
+    :data:`_NEXT_ACTION_TOKENS` marker as a substring.
+
+    A value that contains a supported marker is treated
+    as a nested-marker collision. The runner has used a
+    marker as part of the value (e.g.
+    ``"next_action=next step: poll CI"`` contains
+    ``"next step:"`` at position 0 of the value), which
+    is a structured misuse of the marker vocabulary.
+    The parser must not accept such values as
+    executable actions.
+
+    Fix P (Codex 3439619609): the previous
+    earliest-marker selection (Fix O, Codex 3439399122)
+    correctly handled the symmetric field-name
+    collision forms ``"next_action: next_action=poll CI"``
+    and ``"next_action=next_action: poll CI"`` because
+    the first token of the value is a known protocol
+    field name (``next_action``). It missed the spaced
+    sub-marker forms like ``"next step:"`` and
+    ``"Next action:"`` because the first token
+    (``next`` / ``Next``) is NOT a protocol field name,
+    so the narrowed field-assignment collision check
+    did not fire. The canonical :func:`_first_field_name_token`
+    check is not appropriate here because the value is
+    the full stripped remainder, not a single token.
+    The substring check is sufficient: any value
+    containing a literal next_action marker is a
+    misuse, because ordinary executable text never
+    contains a marker token by accident.
+
+    The check is marker-token based (substring of the
+    full marker string), NOT word-based. Ordinary text
+    like ``"review next steps after CI"`` does NOT
+    contain the marker ``"next step:"`` (it has
+    ``"next steps"`` with the trailing ``s``), so the
+    substring search correctly accepts it.
+
+    Examples (True = nested-marker collision detected):
+
+    - ``"next_action: next_action=poll CI"`` -> True
+      (contains ``"next_action="``)
+    - ``"next_action=next_action: poll CI"`` -> True
+      (contains ``"next_action:"``)
+    - ``"next_action=next step: poll CI"`` -> True
+      (contains ``"next step:"``)
+    - ``"next_action=Next action: poll CI"`` -> True
+      (contains ``"Next action:"``)
+    - ``"next_action: next step: poll CI"`` -> True
+      (contains ``"next step:"``)
+    - ``"next_action: Next action: poll CI"`` -> True
+      (contains ``"Next action:"``)
+
+    Examples (False = legitimate action accepted):
+
+    - ``"poll CI status"`` -> False
+    - ``"checkpoint current run state"`` -> False
+    - ``"review next steps after CI"`` -> False
+      (``"next steps"`` != ``"next step:"``)
+    - ``""`` -> False
+    - ``None`` -> False
+    """
+    if not isinstance(value, str):
+        return False
+    for marker in _NEXT_ACTION_TOKENS:
+        if marker in value:
+            return True
     return False
 
 
@@ -754,6 +827,27 @@ def _extract_next_action_value(text: str) -> Optional[str]:
         if not first_token:
             # Delimiter was the first character; keep
             # scanning for other markers.
+            continue
+        if _contains_nested_next_action_marker(stripped):
+            # The value contains another supported
+            # :data:`_NEXT_ACTION_TOKENS` marker (e.g.
+            # ``"next step:"`` in
+            # ``"next step: poll CI"``). The runner
+            # has used a marker as part of the value,
+            # which is a structured misuse of the
+            # marker vocabulary. The narrowed
+            # field-assignment collision check
+            # (below) does not fire here because the
+            # first token of the value (``next`` /
+            # ``Next``) is not a protocol field
+            # name, so the canonical check is the
+            # nested-marker substring check. The
+            # line is rejected (skipped) and the
+            # across-line ``scan past invalid
+            # markers`` behavior in the outer
+            # ``for raw_line in text.splitlines()``
+            # loop will pick up a valid marker on a
+            # later line. Fix P (Codex 3439619609).
             continue
         if _is_field_assignment_collision_value(stripped):
             # The remainder is a real field=value /

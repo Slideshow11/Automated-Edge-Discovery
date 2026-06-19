@@ -7108,26 +7108,423 @@ class EarliestMarkerPositionSafeExtractionTests(unittest.TestCase):
             )
         )
 
-    def test_extractor_returns_real_action_with_sub_marker(self) -> None:
-        """For ``next_action: poll CI status; next_action: more text``
-        the earliest marker is the colon-form ``next_action:``
-        at position 0; its value ``poll CI status; next_action:
-        more text`` is NOT a field-assignment collision
-        (first token ``poll`` is not a field name). The
-        extractor returns the full value so
-        :func:`is_valid_next_action` can validate it.
+    def test_extractor_rejects_value_with_nested_marker(self) -> None:
+        """Fix P (Codex 3439619609): a value that contains
+        another supported :data:`_NEXT_ACTION_TOKENS` marker
+        is a nested-marker collision and must be rejected.
+        For ``next_action: poll CI status; next_action: more text``
+        the value ``poll CI status; next_action: more text``
+        contains the marker ``next_action:`` at a later
+        position. The narrowed field-assignment collision
+        check does not fire (first token ``poll`` is not a
+        protocol field name), but the canonical nested-
+        marker substring check (Fix P) does fire, and the
+        line is rejected.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        self.assertIsNone(
+            _extract_next_action_value(
+                "next_action: poll CI status; next_action: more text"
+            )
+        )
+
+    def test_extractor_returns_value_without_nested_marker(self) -> None:
+        """The complement: a value that does NOT contain
+        any supported marker is returned. Fix P is
+        marker-token based, not broad-word based, so
+        ordinary text like ``poll CI status; review next
+        steps after CI`` is NOT rejected (the substring
+        ``next step:`` is not in ``next steps``).
         """
         from aed_lifecycle.no_stall import _extract_next_action_value
         result = _extract_next_action_value(
-            "next_action: poll CI status; next_action: more text"
+            "next_action: poll CI status; review next steps after CI"
         )
-        # The value is the full stripped remainder after the
-        # earliest marker. The first word is "poll" so
-        # the field-name-as-value check does not apply.
         self.assertIsNotNone(result)
-        # The result should not be a field assignment
-        # (the first token "poll" is not a field name).
         self.assertIn("poll", result)
+
+    # --- Persisted validation tests from Fix M still pass ---
+
+    def test_persisted_validation_unchanged_for_legitimate_action(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("checkpoint current run state")
+        )
+        self.assertTrue(
+            is_valid_next_action("state current PR status")
+        )
+
+    def test_persisted_validation_unchanged_for_field_assignment(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+
+
+class NestedNextActionMarkerRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3439619609 (Fix P).
+
+    After the earliest-marker selection (Fix O), the
+    extracted value can still contain a nested supported
+    :data:`_NEXT_ACTION_TOKENS` marker. Examples:
+
+    - ``next_action=next step: poll CI``
+    - ``next_action=Next action: poll CI``
+    - ``next_action=next action: poll CI``
+    - ``next_action=Next step: poll CI``
+
+    These are same-line nested-marker collisions and must
+    NOT be accepted as valid executable actions. The
+    narrowed field-assignment collision check (Fix N) does
+    not fire for these cases because the first token of
+    the value (``next`` / ``Next``) is not a protocol field
+    name. The canonical
+    :func:`_contains_nested_next_action_marker` helper
+    performs a marker-token substring check on the full
+    stripped value, so any literal marker occurrence is
+    caught. The marker set is extended to include the
+    missing variants ``Next step:`` and ``next action:``
+    so the substring check finds the test cases listed in
+    the Codex finding.
+
+    Important: the check is marker-token based, NOT
+    broad-word based. Ordinary text like ``review next
+    steps after CI`` does NOT contain the marker
+    ``next step:`` (it has ``next steps`` with a trailing
+    ``s``), so the substring search correctly accepts it.
+    """
+
+    # --- Reject all documented nested-marker forms ---
+
+    def test_reject_next_action_colon_sub_marker_collision(self) -> None:
+        """``next_action: next_action=poll CI`` — value
+        contains ``next_action=`` (the equals-form marker
+        at a later position). Fix N's field-assignment
+        check also fires here (first token ``next_action``
+        is a field name), but Fix P's nested-marker check
+        is the additional canonical contract.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action: next_action=poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_action_equals_sub_marker_collision(self) -> None:
+        """``next_action=next_action: poll CI`` — value
+        contains ``next_action:`` (the colon-form marker
+        at a later position). Fix N's field-assignment
+        check also fires here.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_step_sub_marker_in_equals_value(self) -> None:
+        """``next_action=next step: poll CI`` — value
+        contains ``next step:`` (the spaced sub-marker).
+        Fix N's field-assignment check does NOT fire
+        because the first token ``next`` is not a protocol
+        field name. Fix P's nested-marker check is the
+        only thing that catches this.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=next step: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_step_capitalized_sub_marker(self) -> None:
+        """``next_action=Next step: poll CI`` — value
+        contains ``Next step:`` (capitalized spaced
+        sub-marker). The marker set is extended to include
+        ``Next step:`` so the substring check finds it.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=Next step: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_action_sub_marker_in_equals_value(self) -> None:
+        """``next_action=next action: poll CI`` — value
+        contains ``next action:`` (the spaced sub-marker
+        with a different second word than ``next step:``).
+        The marker set is extended to include
+        ``next action:`` so the substring check finds it.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=next action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_action_capitalized_sub_marker(self) -> None:
+        """``next_action=Next action: poll CI`` — value
+        contains ``Next action:`` (capitalized spaced
+        sub-marker). Already in the marker set.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=Next action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_step_sub_marker_in_colon_value(self) -> None:
+        """``next_action: next step: poll CI`` — earliest
+        marker is ``next_action:`` at position 0; value
+        contains ``next step:`` at a later position.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action: next step: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_action_capitalized_sub_marker_colon_value(
+        self,
+    ) -> None:
+        """``next_action: Next action: poll CI`` — earliest
+        marker is ``next_action:`` at position 0; value
+        contains ``Next action:`` at a later position.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action: Next action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Accept legitimate actions that do NOT contain a marker ---
+
+    def test_accept_review_next_steps_after_ci_colon(self) -> None:
+        """``next_action: review next steps after CI`` does
+        NOT contain any marker (the text has ``next steps``
+        with a trailing ``s``, not ``next step:``). Fix P is
+        marker-token based, not broad-word based.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action: review next steps after CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_accept_review_next_steps_after_ci_equals(self) -> None:
+        """``next_action=review next steps after CI`` does
+        NOT contain any marker. Accept via the equals-form
+        marker.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=review next steps after CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Multi-line recovery ---
+
+    def test_multiline_recovery_after_nested_marker_collision(self) -> None:
+        """Line 1 has a nested-marker collision
+        (``next_action=next step: poll CI``). Line 2 has a
+        real action (``next_action: poll CI status``).
+        Line 3 has a value-bearing checkpoint. The
+        message must classify as
+        ``OK_PROGRESS_WITH_NEXT_ACTION`` using the line-2
+        action.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=next step: poll CI\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_multiline_recovery_after_capitalized_nested_marker(
+        self,
+    ) -> None:
+        """Symmetric: line 1 has the capitalized variant
+        ``next_action=Next action: poll CI``. Recovery
+        from line 2.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 \u2014 protected-state verification.\n"
+            "next_action=Next action: poll CI\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Extractor direct tests for the canonical helper ---
+
+    def test_helper_rejects_value_with_nested_marker(self) -> None:
+        """Pin the canonical helper contract: a value
+        containing any supported marker returns True.
+        """
+        from aed_lifecycle.no_stall import (
+            _contains_nested_next_action_marker,
+        )
+        for v in (
+            "next_action=next step: poll CI",
+            "next_action=Next step: poll CI",
+            "next_action=next action: poll CI",
+            "next_action=Next action: poll CI",
+            "next_action: next step: poll CI",
+            "next_action: Next action: poll CI",
+            "next_action: next_action=poll CI",
+            "next_action=next_action: poll CI",
+        ):
+            with self.subTest(v=v):
+                self.assertTrue(
+                    _contains_nested_next_action_marker(v),
+                    f"expected {v!r} to contain a nested marker",
+                )
+
+    def test_helper_accepts_value_without_nested_marker(self) -> None:
+        """Pin the canonical helper contract: a value
+        that does NOT contain any supported marker
+        returns False. Ordinary text like ``review next
+        steps after CI`` is NOT a marker-token collision
+        (the substring ``next step:`` is not in
+        ``next steps``).
+        """
+        from aed_lifecycle.no_stall import (
+            _contains_nested_next_action_marker,
+        )
+        for v in (
+            "poll CI status",
+            "checkpoint current run state",
+            "state current PR status",
+            "review next steps after CI",
+            "poll CI",
+            "next steps after CI",
+            "next actions to review",
+        ):
+            with self.subTest(v=v):
+                self.assertFalse(
+                    _contains_nested_next_action_marker(v),
+                    f"expected {v!r} NOT to contain a nested marker",
+                )
+
+    def test_helper_handles_garbage(self) -> None:
+        from aed_lifecycle.no_stall import (
+            _contains_nested_next_action_marker,
+        )
+        for v in ("", "   ", None, 123, [], {}):
+            with self.subTest(v=v):
+                self.assertFalse(
+                    _contains_nested_next_action_marker(v),
+                    f"expected {v!r} NOT to contain a nested marker",
+                )
+
+    def test_extractor_rejects_value_with_nested_marker(self) -> None:
+        """Pin the extractor contract: a line whose value
+        contains a nested marker returns ``None`` from the
+        extractor.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        for v in (
+            "next_action=next step: poll CI",
+            "next_action=Next step: poll CI",
+            "next_action=next action: poll CI",
+            "next_action=Next action: poll CI",
+            "next_action: next step: poll CI",
+            "next_action: Next action: poll CI",
+        ):
+            with self.subTest(v=v):
+                self.assertIsNone(
+                    _extract_next_action_value(v),
+                    f"expected {v!r} to be rejected",
+                )
 
     # --- Persisted validation tests from Fix M still pass ---
 
