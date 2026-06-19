@@ -393,8 +393,24 @@ _CHECKPOINT_TOKENS = (
 # non-empty, non-placeholder value before classifying as
 # OK_PROGRESS_WITH_NEXT_ACTION.
 #
-# Order matters: the colon-style markers (``next_action:``)
-# are listed BEFORE the equals-style markers (``next_action=``)
+# Top-level ``next_action`` markers scanned by
+# :func:`_extract_next_action_value`. These are the canonical
+# protocol markers — the only forms a real runner is expected
+# to emit at the top of a line. The set is intentionally
+# NARROW: prose variants like ``"Next action:"``,
+# ``"next step:"``, ``"next action:"`` and ``"next step="``
+# are NOT included here because they would be misidentified
+# as real actions in human-prose text such as
+# ``"Recommended next action: None. No repair needed."``
+# or ``"Suggested next step: wait for CI."`` whenever a
+# checkpoint path is also present. Fix Q (Codex 3439736315):
+# those prose variants are needed ONLY for nested-marker
+# rejection inside an already-extracted value, so they live
+# in :data:`_NESTED_NEXT_ACTION_MARKERS` below and are not
+# scanned by the top-level extractor.
+#
+# Order matters: the colon-style marker (``next_action:``)
+# is listed BEFORE the equals-style marker (``next_action=``)
 # so the parser prefers the FIRST occurrence of a marker in
 # the line. For an ambiguous line such as
 # ``"next_action: next_action=poll CI"`` the first
@@ -409,6 +425,26 @@ _CHECKPOINT_TOKENS = (
 # ``"next_action=poll CI"`` value and rejects it as a
 # field-assignment collision.
 _NEXT_ACTION_TOKENS = (
+    "next_action:",
+    "next_action=",
+)
+
+
+# Nested-only ``next_action`` markers. These are the prose
+# variants that look like markers but are typically used as
+# natural language inside a longer sentence. They are NOT
+# valid top-level next_action markers (see the rationale
+# on :data:`_NEXT_ACTION_TOKENS`) and the top-level extractor
+# will not match them. They ARE used by
+# :func:`_contains_nested_next_action_marker` to detect
+# structured misuse when a value extracted from a real
+# marker contains a sub-marker as a substring, e.g.
+# ``"next_action=next step: poll CI"`` or
+# ``"next_action=Next action: poll CI"``. Fix Q
+# (Codex 3439736315): these variants were added to the
+# top-level set in Fix P (Codex 3439619609) but the top-level
+# scan is too broad for them — they need to be nested-only.
+_NESTED_NEXT_ACTION_MARKERS = (
     "next_action:",
     "Next action:",
     "next step:",
@@ -524,7 +560,7 @@ def _is_field_assignment_collision_value(value: object) -> bool:
 
 def _contains_nested_next_action_marker(value: object) -> bool:
     """Return True iff ``value`` contains any supported
-    :data:`_NEXT_ACTION_TOKENS` marker as a substring.
+    :data:`_NESTED_NEXT_ACTION_MARKERS` marker as a substring.
 
     A value that contains a supported marker is treated
     as a nested-marker collision. The runner has used a
@@ -553,6 +589,19 @@ def _contains_nested_next_action_marker(value: object) -> bool:
     containing a literal next_action marker is a
     misuse, because ordinary executable text never
     contains a marker token by accident.
+
+    Fix Q (Codex 3439736315): the nested-marker scan
+    uses :data:`_NESTED_NEXT_ACTION_MARKERS`, NOT the
+    top-level :data:`_NEXT_ACTION_TOKENS`. The two
+    sets are intentionally different: the top-level
+    set is kept narrow (only ``"next_action:"`` and
+    ``"next_action="``) so prose like ``"Recommended
+    next action: None. No repair needed."`` is not
+    matched by the top-level extractor. The nested
+    set still includes the prose variants so the
+    nested-marker collision check catches
+    ``"next_action=Next action: poll CI"`` and
+    similar structured-misuse forms.
 
     The check is marker-token based (substring of the
     full marker string), NOT word-based. Ordinary text
@@ -587,7 +636,7 @@ def _contains_nested_next_action_marker(value: object) -> bool:
     """
     if not isinstance(value, str):
         return False
-    for marker in _NEXT_ACTION_TOKENS:
+    for marker in _NESTED_NEXT_ACTION_MARKERS:
         if marker in value:
             return True
     return False
