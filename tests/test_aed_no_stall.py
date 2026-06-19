@@ -6763,5 +6763,395 @@ class FinalOutputFieldAssignmentRejectionTests(unittest.TestCase):
         )
 
 
+class EarliestMarkerPositionSafeExtractionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3439399122 (Fix O).
+
+    The final-output extractor
+    :func:`_extract_next_action_value` must select the
+    EARLIEST marker occurrence in the line by ``idx`` (with
+    longer-marker tiebreak for the same ``idx``), NOT
+    whichever marker appears first in the
+    :data:`_NEXT_ACTION_TOKENS` tuple. Tuple-order priority
+    is brittle and asymmetric: reordering the tuple to fix
+    ``"next_action: next_action=poll CI"`` introduces the
+    symmetric failure
+    ``"next_action=next_action: poll CI"``. The fix is to
+    walk all markers, collect the lowest ``idx`` (and the
+    longest marker for ties), and parse that earliest
+    occurrence only. Sub-markers inside an invalid earliest
+    marker value CANNOT rescue the line; the across-line
+    ``scan past invalid markers`` behavior is preserved by
+    the outer ``for raw_line in text.splitlines()`` loop.
+    """
+
+    # --- Reject both symmetric forms of nested next_action
+    #     field-assignment collisions ---
+
+    def test_reject_next_action_colon_sub_marker_collision(self) -> None:
+        """``next_action: next_action=poll CI`` (earliest
+        marker is the colon-form ``next_action:``; its
+        value is a field-assignment collision).
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: next_action=poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_next_action_equals_sub_marker_collision(self) -> None:
+        """Symmetric case: ``next_action=next_action: poll CI``
+        (earliest marker is the equals-form ``next_action=``;
+        its value is a field-assignment collision).
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_checkpoint_path_equals_via_colon_marker(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_checkpoint_path_colon_via_equals_marker(self) -> None:
+        """Symmetric case: ``next_action=checkpoint_path: /tmp/ckpt.json``
+        (earliest marker is the equals-form ``next_action=``;
+        its value is a field-assignment collision).
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=checkpoint_path: /tmp/ckpt.json\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_terminal_state_equals_via_colon_marker(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: terminal_state=MERGED\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_reject_terminal_state_colon_via_equals_marker(self) -> None:
+        """Symmetric case: ``next_action=terminal_state: MERGED``.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=terminal_state: MERGED\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Accept legitimate actions via both marker styles ---
+
+    def test_accept_checkpoint_current_run_state_via_colon(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint current run state\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_accept_checkpoint_current_run_state_via_equals(self) -> None:
+        """Symmetric: ``next_action=checkpoint current run state``
+        uses the equals-form marker. Both marker forms must
+        accept the same legitimate action.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=checkpoint current run state\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_accept_state_current_pr_status_via_colon(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: state current PR status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_accept_state_current_pr_status_via_equals(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=state current PR status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Multi-line recovery remains allowed ---
+
+    def test_multiline_recovery_after_collision(self) -> None:
+        """Line 1: ``next_action: next_action=poll CI``
+        (collision, skip the line).
+        Line 2: ``next_action: poll CI status`` (real action).
+        Line 3: ``checkpoint_path=/tmp/ckpt.json``.
+        The message must classify as
+        ``OK_PROGRESS_WITH_NEXT_ACTION`` because the parser
+        scans past the invalid line-1 marker and accepts the
+        line-2 marker.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: next_action=poll CI\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_multiline_recovery_after_collision_equals_form(self) -> None:
+        """Symmetric: line 1 uses the equals-form sub-marker
+        collision.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=next_action: poll CI\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Same-line sub-marker rescue is NOT allowed ---
+
+    def test_same_line_sub_marker_rescue_blocked(self) -> None:
+        """``next_action: checkpoint_path=/tmp/ckpt.json; next_action: poll CI``
+        must NOT be classified as
+        ``OK_PROGRESS_WITH_NEXT_ACTION``. The earliest marker
+        is the colon-form ``next_action:``; its value is a
+        field-assignment collision. The sub-marker
+        ``next_action: poll CI`` at a later position is
+        inside the value of the earliest marker and cannot
+        rescue the line.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: checkpoint_path=/tmp/ckpt.json; "
+            "next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_same_line_sub_marker_rescue_blocked_equals_form(self) -> None:
+        """Symmetric: ``next_action=checkpoint_path: /tmp/ckpt.json; next_action: poll CI``.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=checkpoint_path: /tmp/ckpt.json; "
+            "next_action: poll CI\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_same_line_sub_marker_rescue_blocked_next_action_collision_colon(
+        self,
+    ) -> None:
+        """``next_action: next_action=poll CI; next_action: poll CI status``
+        — the earliest marker's value is a sub-marker
+        field-assignment collision and the line is rejected
+        even though a later real action appears on the same
+        line.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action: next_action=poll CI; "
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_same_line_sub_marker_rescue_blocked_next_action_collision_equals(
+        self,
+    ) -> None:
+        """Symmetric: ``next_action=next_action: poll CI; next_action: poll CI status``.
+        """
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "Starting PHASE 1 — protected-state verification.\n"
+            "next_action=next_action: poll CI; "
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Extractor direct tests for earliest-marker selection ---
+
+    def test_extractor_selects_earliest_marker_colon_first(self) -> None:
+        """For ``next_action: next_action=poll CI`` the
+        earliest marker is the colon-form ``next_action:``
+        at position 0; the extractor uses that marker's
+        value (``next_action=poll CI``) which is a
+        field-assignment collision, so the line is rejected
+        and the extractor returns ``None``.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        self.assertIsNone(
+            _extract_next_action_value(
+                "next_action: next_action=poll CI"
+            )
+        )
+
+    def test_extractor_selects_earliest_marker_equals_first(self) -> None:
+        """For ``next_action=next_action: poll CI`` the
+        earliest marker is the equals-form ``next_action=``
+        at position 0; the extractor uses that marker's
+        value (``next_action: poll CI``) which is a
+        field-assignment collision, so the line is rejected
+        and the extractor returns ``None``.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        self.assertIsNone(
+            _extract_next_action_value(
+                "next_action=next_action: poll CI"
+            )
+        )
+
+    def test_extractor_returns_real_action_with_sub_marker(self) -> None:
+        """For ``next_action: poll CI status; next_action: more text``
+        the earliest marker is the colon-form ``next_action:``
+        at position 0; its value ``poll CI status; next_action:
+        more text`` is NOT a field-assignment collision
+        (first token ``poll`` is not a field name). The
+        extractor returns the full value so
+        :func:`is_valid_next_action` can validate it.
+        """
+        from aed_lifecycle.no_stall import _extract_next_action_value
+        result = _extract_next_action_value(
+            "next_action: poll CI status; next_action: more text"
+        )
+        # The value is the full stripped remainder after the
+        # earliest marker. The first word is "poll" so
+        # the field-name-as-value check does not apply.
+        self.assertIsNotNone(result)
+        # The result should not be a field assignment
+        # (the first token "poll" is not a field name).
+        self.assertIn("poll", result)
+
+    # --- Persisted validation tests from Fix M still pass ---
+
+    def test_persisted_validation_unchanged_for_legitimate_action(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("checkpoint current run state")
+        )
+        self.assertTrue(
+            is_valid_next_action("state current PR status")
+        )
+
+    def test_persisted_validation_unchanged_for_field_assignment(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("checkpoint_path=/tmp/ckpt.json")
+        )
+        self.assertFalse(
+            is_valid_next_action("terminal_state=MERGED")
+        )
+
 if __name__ == "__main__":
     unittest.main()
