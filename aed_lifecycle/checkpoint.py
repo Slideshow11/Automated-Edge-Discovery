@@ -179,6 +179,22 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
     """
     errors: List[str] = []
 
+    # Fix AE (Codex 3443863455): ``phase`` must be
+    # PRESENT on a resumable checkpoint. The dataclass
+    # declares ``phase: Optional[str] = None`` (so
+    # ``CheckpointState(phase=None)`` is valid for a
+    # stale / parked checkpoint), but a TRULY MISSING
+    # ``phase`` attribute on a namespace / dict-like
+    # partially-deserialized checkpoint is a structural
+    # error — the resume helpers would otherwise be
+    # unable to distinguish "explicitly None" from
+    # "truly missing" and a malformed checkpoint with a
+    # valid ``next_action`` but no ``phase`` could
+    # auto-resume. ``hasattr`` distinguishes the two
+    # cases; ``getattr(..., None)`` does not.
+    if not hasattr(state, "phase"):
+        errors.append("checkpoint missing required field 'phase'")
+
     for fname in _REQUIRED_STRING_FIELDS:
         if not hasattr(state, fname):
             errors.append(f"checkpoint missing required field {fname!r}")
@@ -495,6 +511,21 @@ def next_action_from_checkpoint(state: CheckpointState) -> Optional[str]:
     # ``AttributeError`` here.
     terminal_state_value = getattr(state, "terminal_state", None)
     next_action_value = getattr(state, "next_action", None)
+    # Fix AE (Codex 3443863455): distinguish "truly
+    # missing" ``phase`` from "explicitly None". The
+    # dataclass declares ``phase: Optional[str] = None``
+    # so ``CheckpointState(phase=None)`` is valid for a
+    # stale / parked checkpoint (the runner is done
+    # with the previous phase). But a truly missing
+    # ``phase`` attribute on a namespace / dict-like
+    # partially-deserialized checkpoint is a structural
+    # error: the resume helpers must surface
+    # ``HOLD_OPERATOR_REQUIRED`` so the operator
+    # acknowledges the malformed checkpoint before the
+    # runner can act on it. ``hasattr`` distinguishes
+    # the two cases; ``getattr(..., None)`` does not.
+    if not hasattr(state, "phase"):
+        return "HOLD_OPERATOR_REQUIRED"
     phase_value = getattr(state, "phase", None)
 
     # Terminal state: runner is done.

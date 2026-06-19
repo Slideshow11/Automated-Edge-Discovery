@@ -10344,3 +10344,287 @@ class CheckpointResumeHelpersGetattrGuardTests(unittest.TestCase):
         # returns True (validate_checkpoint fails for
         # the namespace, so the structural gate fires).
         self.assertIsInstance(result, bool)
+
+
+class CheckpointPhaseRequiredPresentTests(unittest.TestCase):
+    """Regression tests for Codex 3443863455 (Fix AE).
+
+    The Fix AD ``getattr(..., None)`` guards brought the
+    downstream resume helpers into line with
+    :func:`validate_checkpoint`, but they made a TRULY
+    MISSING ``phase`` attribute indistinguishable from an
+    EXPLICIT ``phase=None``. The dataclass declares
+    ``phase: Optional[str] = None`` so
+    ``CheckpointState(phase=None)`` is valid for a stale
+    / parked checkpoint, but a truly missing ``phase``
+    attribute on a namespace / dict-like partially
+    deserialized checkpoint is a structural error: the
+    resume helpers must surface ``HOLD_OPERATOR_REQUIRED``
+    so the operator acknowledges the malformed checkpoint
+    before the runner can act on it.
+
+    Fix AE applies the ``hasattr`` pattern to distinguish
+    "truly missing" from "explicitly None" in the
+    validator and the downstream resume helpers.
+    """
+
+    def test_validate_checkpoint_namespace_missing_phase_returns_error(self) -> None:
+        # Namespace object with required fields, recorded
+        # heads, and a valid next_action but no phase.
+        # Must produce a structural validation error for
+        # the missing phase attribute.
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            # phase is intentionally omitted
+            next_action="poll CI",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+            last_verified_primary_head="0a8cee5d2406c970e02e9e217c7f25b0767459e0",
+            last_verified_pr_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        errors = validate_checkpoint(state)
+        self.assertTrue(
+            any("phase" in e for e in errors),
+            f"missing phase should produce a 'phase' validation error, "
+            f"got errors={errors!r}",
+        )
+
+    def test_next_action_from_checkpoint_namespace_missing_phase_returns_hold(self) -> None:
+        # The resume helper must not emit a runnable
+        # action when phase is truly missing.
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import next_action_from_checkpoint
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            # phase is intentionally omitted
+            next_action="poll CI",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        result = next_action_from_checkpoint(state)
+        self.assertEqual(
+            result,
+            "HOLD_OPERATOR_REQUIRED",
+            f"namespace object missing phase must NOT auto-resume, "
+            f"got result={result!r}",
+        )
+
+    def test_checkpoint_requires_operator_namespace_missing_phase_returns_true(self) -> None:
+        # The validate_checkpoint gate at the top of
+        # checkpoint_requires_operator will catch the
+        # missing phase, returning True.
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import checkpoint_requires_operator
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            # phase is intentionally omitted
+            next_action="poll CI",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+            authorized_thread_ids=[],
+            unresolved_thread_ids=[],
+            terminal_state=None,
+            updated_at=None,
+        )
+        result = checkpoint_requires_operator(state)
+        self.assertTrue(
+            result,
+            f"namespace object missing phase must require operator "
+            f"(validate_checkpoint should reject it), got result={result!r}",
+        )
+
+    def test_explicit_phase_none_still_works(self) -> None:
+        # Regression guard: ``CheckpointState(phase=None)``
+        # is valid for a stale / parked checkpoint. The
+        # explicit None value must continue to work after
+        # the Fix AE hasattr guard.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            next_action_from_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            phase=None,  # explicitly None
+            next_action="poll CI",
+        )
+        # The dataclass instance has the ``phase``
+        # attribute (set to None), so the hasattr check
+        # passes. The behavior is: ``phase=None`` and
+        # ``next_action="poll CI"`` with no terminal_state
+        # is a stale state — the helper should return
+        # ``HOLD_OPERATOR_REQUIRED`` (per the existing
+        # decision tree: no phase, has next_action, no
+        # terminal_state → stale).
+        result = next_action_from_checkpoint(state)
+        # With phase=None and next_action="poll CI", the
+        # decision tree returns the next_action IF it
+        # passes is_valid_next_action. The function
+        # returns the action verbatim (the "no phase" +
+        # "has next_action" branch is the valid path).
+        # Note: this is a behavior preservation test —
+        # the explicit None phase is treated as a stale
+        # state but the action is still returned because
+        # the runner can act on it.
+        self.assertEqual(
+            result,
+            "poll CI",
+            f"explicit phase=None with valid next_action must continue to "
+            f"return the action (preserve dataclass semantics), got "
+            f"result={result!r}",
+        )
+
+    def test_present_phase_with_valid_next_action_returns_action(self) -> None:
+        # Regression guard: a valid checkpoint with a
+        # present phase and valid next_action must
+        # continue to return the action verbatim.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            next_action_from_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            phase="PHASE_3",
+            next_action="poll CI",
+        )
+        self.assertEqual(
+            next_action_from_checkpoint(state),
+            "poll CI",
+        )
+
+    def test_completed_terminal_still_behaves_as_before(self) -> None:
+        # Regression guard: a checkpoint with a
+        # recognized completed terminal state must
+        # continue to return None from the resume
+        # helper, regardless of whether phase is
+        # present.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            next_action_from_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            phase="PHASE_3",
+            terminal_state="MERGED",
+        )
+        self.assertIsNone(next_action_from_checkpoint(state))
+
+    def test_missing_optional_non_required_fields_still_behave(self) -> None:
+        # Regression guard: missing optional fields
+        # other than ``phase`` (e.g. ``next_action``,
+        # ``terminal_state``, ``last_verified_*_head``)
+        # should still be treated as absent (Fix AD
+        # behavior) — not as validation errors. Only
+        # ``phase`` is required to be present (Fix AE).
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import validate_checkpoint
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            phase="PHASE_3",
+            completed_phases=[],
+            next_phase=None,
+            pending_actions=[],
+            # next_action, terminal_state,
+            # last_verified_*_head, unresolved_thread_ids,
+            # updated_at all omitted
+        )
+        # Must NOT raise AttributeError.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError for a "
+                f"namespace object missing optional non-phase attrs, "
+                f"got: {exc!r}"
+            )
+        # No specific optional-attr error should be
+        # present (other than possibly the recorded-head
+        # missing errors for last_verified_*_head, which
+        # are NOT optional in the same sense — they are
+        # required to be present and non-empty for
+        # validate_resume_observations, but
+        # validate_checkpoint does not check them).
+        optional_attrs = ("next_action", "terminal_state")
+        for attr in optional_attrs:
+            self.assertFalse(
+                any(attr in e for e in errors),
+                f"missing {attr} should not produce a '{attr}' error, "
+                f"got errors={errors!r}",
+            )
+
+    def test_no_attribute_error_escapes_from_validation_or_resume_helpers(self) -> None:
+        # End-to-end safety: a SimpleNamespace object
+        # missing ALL optional attributes (and the
+        # required phase) must not raise AttributeError
+        # from any of the three helpers.
+        from types import SimpleNamespace
+        from aed_lifecycle.checkpoint import (
+            checkpoint_requires_operator,
+            next_action_from_checkpoint,
+            validate_checkpoint,
+        )
+        state = SimpleNamespace(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="0bd888aac66433d13e1bc54f2df10d7bc2eb8a72",
+            # ALL optional attrs missing: phase,
+            # next_action, terminal_state,
+            # last_verified_*_head, unresolved_thread_ids,
+            # next_phase, updated_at, completed_phases,
+            # pending_actions
+        )
+        try:
+            v_errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(f"validate_checkpoint raised: {exc!r}")
+        try:
+            n_result = next_action_from_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(f"next_action_from_checkpoint raised: {exc!r}")
+        try:
+            c_result = checkpoint_requires_operator(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(f"checkpoint_requires_operator raised: {exc!r}")
+        # No AttributeError. The phase error should be
+        # present in v_errors.
+        self.assertTrue(
+            any("phase" in e for e in v_errors),
+            f"validate_checkpoint should report missing phase, "
+            f"got errors={v_errors!r}",
+        )
+        # The resume helper should return a safe hold.
+        self.assertEqual(n_result, "HOLD_OPERATOR_REQUIRED")
+        # The operator-required check should return True.
+        self.assertTrue(c_result)
