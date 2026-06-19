@@ -9035,3 +9035,340 @@ class QuotedFieldAssignmentRejectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SentenceCasedCheckpointTokensBroadCheckTests(unittest.TestCase):
+    """Regression tests for Codex 3442251126 (Fix W).
+
+    The broad ``_CHECKPOINT_TOKENS`` substring scan is used by
+    the phase-header branch of the classifier to decide
+    whether a message mentions a checkpoint in any form. The
+    strict value-bearing extractor
+    (``_extract_checkpoint_value``) already accepted
+    sentence-cased prose forms (Fix J, Codex 3420268720), but
+    the broad check remained case-sensitive and missed the
+    same sentence-cased forms. As a result, a phase-header
+    message like::
+
+        Starting PHASE 3 — Checkpoint: /tmp/ckpt.json
+
+    fell through to ``STALL_PHASE_HEADER_ONLY`` even though a
+    real checkpoint path was present — a runner that wrote a
+    valid checkpoint in sentence-cased prose would be
+    misclassified as a pure phase-header-only stall instead
+    of the documented ``STALL_NO_TERMINAL_STATE`` (broad
+    ``has_checkpoint`` is True, ``has_next_action`` is False).
+
+    The broad token list now also includes the
+    sentence-cased variants (``Wrote checkpoint to``,
+    ``Saved checkpoint to``, ``Checkpoint: ``,
+    ``Checkpoint file``, ``Checkpoint at``,
+    ``Checkpoint saved to``, ``Checkpoint=``,
+    ``Checkpoint_path=``, ``Checkpoint_path:``,
+    ``Checkpoint path=``, ``Checkpoint path:``) so the broad
+    check matches what the strict extractor already accepts.
+    """
+
+    def test_phase_header_with_capitalized_wrote_checkpoint_to_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Wrote checkpoint to /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + sentence-cased prose checkpoint should NOT be "
+            f"STALL_PHASE_HEADER_ONLY (broad has_checkpoint should be True), "
+            f"got {verdict!r}",
+        )
+        self.assertEqual(
+            verdict,
+            STALL_NO_TERMINAL_STATE,
+            f"phase header + sentence-cased prose checkpoint (no next_action) "
+            f"should be STALL_NO_TERMINAL_STATE, got {verdict!r}",
+        )
+
+    def test_phase_header_with_capitalized_saved_checkpoint_to_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Saved checkpoint to /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Saved checkpoint to' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_capitalized_checkpoint_colon_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint: ' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_capitalized_checkpoint_file_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint file /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint file' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_capitalized_checkpoint_at_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint at /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint at' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_capitalized_checkpoint_saved_to_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint saved to /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint saved to' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_capitalized_checkpoint_path_equals_is_stall_no_terminal(self) -> None:
+        # Field-style sentence-cased variants: ``Checkpoint=`` /
+        # ``Checkpoint_path=`` / ``Checkpoint path=`` /
+        # ``Checkpoint path:`` / ``Checkpoint_path:``. The
+        # strict extractor is still case-sensitive on these
+        # forms (Fix J), so the broad check is the only place
+        # the classifier sees them. Verify the broad check
+        # matches.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint path: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint path: ' should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_capitalized_bare_checkpoint_pending_still_phase_header_only(self) -> None:
+        # Regression guard (Codex 3417105899): a sentence-cased
+        # bare ``Checkpoint pending`` is still NOT a real
+        # value-bearing checkpoint reference. The new
+        # sentence-cased broad-check entries (e.g.
+        # ``Checkpoint: ``) only match when followed by a
+        # value, so a bare ``Checkpoint pending`` line is
+        # still rejected by the value-bearing extractor and
+        # the message still falls through to
+        # ``STALL_PHASE_HEADER_ONLY`` (broad has_checkpoint is
+        # False because none of the value-bearing tokens
+        # match). Verify this is preserved.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint pending"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        # The broad check should still miss bare
+        # ``Checkpoint pending`` — none of the listed tokens
+        # match a bare ``Checkpoint`` word. The message
+        # therefore falls through to STALL_PHASE_HEADER_ONLY
+        # for the no-next-action case.
+        self.assertEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + bare 'Checkpoint pending' should still be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+
+    def test_capitalized_checkpoint_tokens_contain_all_variants(self) -> None:
+        # Direct contract check: the broad token list must
+        # include all sentence-cased forms the strict
+        # extractor already accepts. This is a direct
+        # enumeration of the contract the fix must satisfy.
+        from aed_lifecycle.no_stall import _CHECKPOINT_TOKENS
+        required = (
+            "Checkpoint: ",
+            "Checkpoint_path=",
+            "Checkpoint_path:",
+            "Checkpoint path=",
+            "Checkpoint path:",
+            "Checkpoint=",
+            "Wrote checkpoint to",
+            "Saved checkpoint to",
+            "Checkpoint file",
+            "Checkpoint at",
+            "Checkpoint saved to",
+        )
+        for token in required:
+            self.assertIn(
+                token,
+                _CHECKPOINT_TOKENS,
+                f"sentence-cased token {token!r} must be in _CHECKPOINT_TOKENS",
+            )
+
+
+class MainCiPostMergeTokenRoutingTests(unittest.TestCase):
+    """Regression tests for Codex 3442251134 (Fix V).
+
+    The post-merge CI fast path is gated on
+    ``_is_post_merge_closeout_phase(phase, action)``, which
+    matches the action against
+    ``_POST_MERGE_NEXT_ACTION_TOKENS``. The previous
+    implementation omitted the identifier form ``main_ci``
+    even though:
+
+      * the prose form ``main ci`` was already in the list
+      * ``_POST_MERGE_CI_ACTION_TOKENS`` already included
+        ``main_ci``
+      * the nearby contract said ``poll main_ci`` should
+        route to ``HOLD_POST_MERGE_CI_PENDING``
+
+    As a result, an exhausted phase with
+    ``next_action="poll main_ci"`` returned
+    ``HOLD_OPERATOR_REQUIRED`` (the generic fallback)
+    because ``is_post_merge`` was False, ``_CI_TOKEN_PATTERN``
+    did not match the underscore-prefixed ``main_ci``
+    identifier, and the post-merge fast path was unreachable.
+
+    The fix adds ``main_ci`` to
+    ``_POST_MERGE_NEXT_ACTION_TOKENS`` so the post-merge
+    detector matches the identifier form too, and the
+    exhausted phase with ``poll main_ci`` correctly routes
+    to ``HOLD_POST_MERGE_CI_PENDING``.
+    """
+
+    @staticmethod
+    def _exhausted_state(
+        phase_name: str,
+        next_action: str,
+    ) -> "WatchdogState":
+        from aed_lifecycle.watchdog import WatchdogState
+        return WatchdogState(
+            phase_name=phase_name,
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10.0,
+            max_phase_seconds=10.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+        )
+
+    def test_next_action_poll_main_ci_returns_post_merge_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="poll main_ci",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+            f"exhausted phase with next_action 'poll main_ci' should route to "
+            f"HOLD_POST_MERGE_CI_PENDING, not the generic fallback",
+        )
+
+    def test_next_action_audit_main_ci_returns_post_merge_hold(self) -> None:
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        state = self._exhausted_state(
+            phase_name="PHASE_8",
+            next_action="audit main_ci",
+        )
+        self.assertEqual(
+            evaluate_watchdog(state, now=1000.0),
+            HOLD_POST_MERGE_CI_PENDING,
+            f"exhausted phase with next_action 'audit main_ci' should route to "
+            f"HOLD_POST_MERGE_CI_PENDING",
+        )
+
+    def test_post_merge_next_action_tokens_contain_main_ci(self) -> None:
+        # Direct contract check: ``main_ci`` must be in the
+        # post-merge next-action token list (the fix that
+        # unblocks the post-merge fast path for the
+        # identifier form).
+        from aed_lifecycle.watchdog import _POST_MERGE_NEXT_ACTION_TOKENS
+        self.assertIn(
+            "main_ci",
+            _POST_MERGE_NEXT_ACTION_TOKENS,
+            "identifier form 'main_ci' must be in _POST_MERGE_NEXT_ACTION_TOKENS "
+            "so the post-merge fast path matches 'poll main_ci' / "
+            "'audit main_ci' (Codex 3442251134 / Fix V)",
+        )
+
+    def test_post_merge_phase_tokens_still_contain_main_ci(self) -> None:
+        # Regression guard: the phase-name token list still
+        # includes ``main_ci`` (it was already there before
+        # this fix), so a phase like ``PHASE_MAIN_CI`` /
+        # ``main_ci`` continues to route correctly.
+        from aed_lifecycle.watchdog import _POST_MERGE_PHASE_TOKENS
+        self.assertIn("main_ci", _POST_MERGE_PHASE_TOKENS)
+
+    def test_post_merge_ci_action_tokens_still_contain_main_ci(self) -> None:
+        # Regression guard: the post-merge CI action token
+        # list (the pattern used by the post-merge fast
+        # path) still includes ``main_ci``.
+        from aed_lifecycle.watchdog import _POST_MERGE_CI_ACTION_TOKENS
+        self.assertIn("main_ci", _POST_MERGE_CI_ACTION_TOKENS)
+
+    def test_main_ci_does_not_match_claim_ci_or_domain_ci(self) -> None:
+        # The identifier-aware boundary class means the
+        # ``main_ci`` token in ``_POST_MERGE_NEXT_ACTION_TOKENS``
+        # only matches at a non-word-character boundary.
+        # Verify that prose / identifier neighbors like
+        # ``claim_ci`` and ``domain_ci`` do not accidentally
+        # match the new ``main_ci`` token (so they do NOT
+        # route to the post-merge hold via the new
+        # identifier-form fast path). Note: the generic CI
+        # detector also rejects these because the leading
+        # ``c`` is preceded by a word char, so the actions
+        # fall through to the operator fallback rather than
+        # ``HOLD_PR_CI_PENDING`` — that is the pre-existing
+        # contract and is preserved by this fix.
+        from aed_lifecycle.watchdog import (
+            HOLD_POST_MERGE_CI_PENDING,
+            evaluate_watchdog,
+        )
+        for action in ("poll claim_ci", "poll domain_ci"):
+            state = self._exhausted_state(
+                phase_name="PHASE_8",
+                next_action=action,
+            )
+            verdict = evaluate_watchdog(state, now=1000.0)
+            self.assertNotEqual(
+                verdict,
+                HOLD_POST_MERGE_CI_PENDING,
+                f"action {action!r} should NOT route to HOLD_POST_MERGE_CI_PENDING "
+                f"(it does not contain the standalone 'main_ci' token)",
+            )

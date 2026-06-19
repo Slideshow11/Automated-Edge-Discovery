@@ -257,6 +257,7 @@ _POST_MERGE_NEXT_ACTION_TOKENS = (
     # Identifier-style (snake_case) forms.
     "post_merge_ci",
     "post_merge_main_ci",
+    "main_ci",
     "remote_main_ci",
     "audit_post_merge_main_ci",
 )

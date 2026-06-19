@@ -374,6 +374,25 @@ _CONTINUE_PROMPT_TOKENS = (
 
 
 # Substrings that mark an explicit checkpoint reference.
+#
+# Both lowercase and sentence-cased variants are listed so the
+# broad ``_contains_any(text, _CHECKPOINT_TOKENS)`` check
+# (used by the phase-header branch of the classifier) matches
+# agents that emit ``Wrote checkpoint to /tmp/ckpt.json`` or
+# ``Checkpoint: /tmp/ckpt.json`` the same way it matches the
+# lowercase forms. Without the sentence-cased entries, a
+# phase-header message that mentions a checkpoint in
+# sentence-cased prose would fall through to
+# ``STALL_PHASE_HEADER_ONLY`` instead of the documented
+# ``STALL_NO_TERMINAL_STATE`` branch, misclassifying a
+# checkpoint-bearing stall as a pure phase-header-only stall.
+#
+# Fix W (Codex 3442251126): The strict value-bearing
+# extractor (``_extract_checkpoint_value``) already accepts
+# sentence-cased forms (Fix J / Codex 3420268720), but the
+# BROAD ``_CHECKPOINT_TOKENS`` substring scan was
+# case-sensitive. Add the sentence-cased variants here so
+# the broad check stays in sync with the strict extractor.
 _CHECKPOINT_TOKENS = (
     "checkpoint_path=",
     "checkpoint: ",
@@ -383,6 +402,26 @@ _CHECKPOINT_TOKENS = (
     "saved checkpoint to",
     "checkpoint file",
     "checkpoint at",
+    "checkpoint saved to",
+    # Sentence-cased variants — the agent frequently emits
+    # these forms at the start of a line, e.g.
+    # ``Starting PHASE 3 — Checkpoint: /tmp/ckpt.json`` or
+    # ``Wrote checkpoint to /tmp/ckpt.json``. Without these
+    # entries, the broad ``has_checkpoint`` check would miss
+    # the mention and the message would fall through to
+    # ``STALL_PHASE_HEADER_ONLY`` even though a real
+    # checkpoint path is present (Fix W, Codex 3442251126).
+    "Checkpoint_path=",
+    "Checkpoint: ",
+    "Checkpoint_path:",
+    "Checkpoint path=",
+    "Checkpoint path:",
+    "Checkpoint=",
+    "Wrote checkpoint to",
+    "Saved checkpoint to",
+    "Checkpoint file",
+    "Checkpoint at",
+    "Checkpoint saved to",
 )
 
 
