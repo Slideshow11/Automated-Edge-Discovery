@@ -234,15 +234,24 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
     # canonical :func:`is_valid_next_action` helper so this validator
     # and :func:`next_action_from_checkpoint` and
     # :func:`checkpoint_requires_operator` all agree.
-    if state.next_action is not None and not is_valid_next_action(
-        state.next_action
+    #
+    # Fix AC (Codex 3443570411): Guard the ``next_action``
+    # attribute access with ``getattr(..., None)`` because
+    # a partially deserialized checkpoint may be missing
+    # this attribute entirely; the other required fields
+    # already use the ``hasattr`` / guarded pattern. Raising
+    # ``AttributeError`` here would crash before the runner
+    # can surface ``HOLD_OPERATOR_REQUIRED``.
+    next_action_value = getattr(state, "next_action", None)
+    if next_action_value is not None and not is_valid_next_action(
+        next_action_value
     ):
-        if not isinstance(state.next_action, str):
+        if not isinstance(next_action_value, str):
             errors.append(
                 "checkpoint field 'next_action' must be a string, "
-                f"got {type(state.next_action).__name__}"
+                f"got {type(next_action_value).__name__}"
             )
-        elif not state.next_action.strip():
+        elif not next_action_value.strip():
             errors.append(
                 "checkpoint field 'next_action' is empty or "
                 "whitespace-only"
@@ -250,15 +259,18 @@ def validate_checkpoint(state: CheckpointState) -> List[str]:
         else:
             errors.append(
                 f"checkpoint field 'next_action' is a placeholder "
-                f"value: {state.next_action!r}"
+                f"value: {next_action_value!r}"
             )
 
-    # terminal_state, if set, must be a recognized terminal state
-    if state.terminal_state is not None and not is_terminal_lifecycle_state(
-        state.terminal_state
+    # terminal_state, if set, must be a recognized terminal
+    # state. Same ``getattr`` guard pattern as
+    # ``next_action`` above (Fix AC, Codex 3443570411).
+    terminal_state_value = getattr(state, "terminal_state", None)
+    if terminal_state_value is not None and not is_terminal_lifecycle_state(
+        terminal_state_value
     ):
         errors.append(
-            f"checkpoint terminal_state {state.terminal_state!r} is not a "
+            f"checkpoint terminal_state {terminal_state_value!r} is not a "
             "recognized terminal state"
         )
 

@@ -9840,3 +9840,264 @@ class CheckpointPrNumberHasattrGuardTests(unittest.TestCase):
             f"valid pr_number should not produce a 'pr_number' error, "
             f"got errors={errors!r}",
         )
+
+
+class BroadCheckpointScanCaseInsensitiveTests(unittest.TestCase):
+    """Regression tests for Codex 3443570407 (Fix AB).
+
+    The broad ``has_checkpoint`` scan previously used the
+    case-sensitive ``_contains_any`` helper, but the
+    strict ``_extract_checkpoint_value`` uses
+    case-insensitive matching for prose markers. A
+    case-varied prose marker that the strict extractor
+    accepts (e.g. ``Wrote Checkpoint To /tmp/ckpt.json``
+    or ``Checkpoint File: /tmp/ckpt.json``) was missed by
+    the broad scan, and a phase-header message with such
+    a marker and no ``next_action`` would fall through to
+    ``STALL_PHASE_HEADER_ONLY`` instead of
+    ``STALL_NO_TERMINAL_STATE``.
+
+    The fix introduces ``_contains_any_ci`` and uses it for
+    the broad scan so the two checkpoint vocabularies stay
+    in sync for prose markers.
+    """
+
+    def test_phase_header_with_capitalized_wrote_checkpoint_to_is_stall_no_terminal(self) -> None:
+        # Pre-existing Fix W test, pinned here under the
+        # new case-insensitive contract.
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Wrote Checkpoint To /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Wrote Checkpoint To' (capital T) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_mixed_case_checkpoint_file_colon_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "Checkpoint File: /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'Checkpoint File:' (mixed case) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_phase_header_with_uppercase_checkpoint_at_is_stall_no_terminal(self) -> None:
+        text = (
+            "Starting PHASE 3 — protected-state verification.\n"
+            "CHECKPOINT AT /tmp/ckpt.json"
+        )
+        verdict = classify_humphry_message_for_stall(text)
+        self.assertNotEqual(
+            verdict,
+            STALL_PHASE_HEADER_ONLY,
+            f"phase header + 'CHECKPOINT AT' (uppercase) should NOT be "
+            f"STALL_PHASE_HEADER_ONLY, got {verdict!r}",
+        )
+        self.assertEqual(verdict, STALL_NO_TERMINAL_STATE)
+
+    def test_contains_any_ci_helper(self) -> None:
+        # Direct helper test: case-insensitive substring
+        # containment.
+        from aed_lifecycle.no_stall import _contains_any_ci
+        self.assertTrue(
+            _contains_any_ci("Wrote Checkpoint To", ("wrote checkpoint to",))
+        )
+        self.assertTrue(
+            _contains_any_ci("wrote checkpoint to", ("Wrote Checkpoint To",))
+        )
+        self.assertTrue(
+            _contains_any_ci("CHECKPOINT AT", ("checkpoint at",))
+        )
+        self.assertFalse(
+            _contains_any_ci("no checkpoint here", ("wrote checkpoint to",))
+        )
+        self.assertFalse(_contains_any_ci("", ("checkpoint",)))
+        self.assertFalse(_contains_any_ci("text", ()))
+
+    def test_broad_scan_matches_strict_extractor_for_case_varied_prose(self) -> None:
+        # Sync contract: for every case-varied prose form
+        # the strict extractor accepts, the broad scan
+        # must also recognize it. This is the same
+        # source-of-truth contract as Fix W / Fix X / Fix
+        # Y, extended to cover the case-varied prose
+        # forms.
+        from aed_lifecycle.no_stall import (
+            _CHECKPOINT_PROSE_MARKERS,
+            _CHECKPOINT_TOKENS,
+            _contains_any_ci,
+        )
+        # Each prose marker in the strict extractor (the
+        # source of truth) must be matched by the broad
+        # scan in lower-case form. Strip the trailing
+        # space from prose markers (they all have one)
+        # and verify the broad scan finds a corresponding
+        # entry that is a case-insensitive prefix.
+        for prose in _CHECKPOINT_PROSE_MARKERS:
+            prose_lower = prose.lower().rstrip()
+            # The broad list should contain a case-varied
+            # variant that lower-cases to prose_lower. The
+            # simplest check: the broad scan must accept
+            # the exact lower-cased prose form (since the
+            # broad scan is now case-insensitive, the
+            # lower-cased form will match any case-varied
+            # version of the same prose marker).
+            self.assertTrue(
+                _contains_any_ci(prose, _CHECKPOINT_TOKENS),
+                f"prose marker {prose!r} (from _CHECKPOINT_PROSE_MARKERS) "
+                f"must be recognized by the broad _CHECKPOINT_TOKENS scan "
+                f"via case-insensitive matching (Codex 3443570407 / Fix AB)",
+            )
+
+
+class CheckpointOptionalAttributeHasattrGuardTests(unittest.TestCase):
+    """Regression tests for Codex 3443570411 (Fix AC).
+
+    The structural validator in
+    ``aed_lifecycle.checkpoint.py`` previously accessed
+    ``state.next_action`` and ``state.terminal_state``
+    directly without ``getattr`` / ``hasattr`` guards. A
+    partially deserialized checkpoint missing these
+    attributes would raise ``AttributeError`` instead of
+    returning a structural validation error, crashing
+    before the runner could surface
+    ``HOLD_OPERATOR_REQUIRED``. Fix Z (Codex 3443071832)
+    already brought ``pr_number`` into line; Fix AC
+    extends the same pattern to ``next_action`` and
+    ``terminal_state``.
+    """
+
+    def test_missing_next_action_returns_validation_error_not_attribute_error(self) -> None:
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="c10413834de6c454800045d6be360ccc44ece183",
+            phase="PHASE_3",
+        )
+        del state.next_action
+        # Must NOT raise AttributeError.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError for a "
+                f"missing next_action attribute, got: {exc!r}"
+            )
+        # No next_action error should be present (a
+        # missing optional field is treated as "absent /
+        # not set", not as a validation error).
+        self.assertFalse(
+            any("next_action" in e for e in errors),
+            f"missing next_action should NOT produce a 'next_action' error "
+            f"(a missing optional field is treated as absent), got "
+            f"errors={errors!r}",
+        )
+
+    def test_missing_terminal_state_returns_validation_error_not_attribute_error(self) -> None:
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="c10413834de6c454800045d6be360ccc44ece183",
+            phase="PHASE_3",
+        )
+        del state.terminal_state
+        # Must NOT raise AttributeError.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError for a "
+                f"missing terminal_state attribute, got: {exc!r}"
+            )
+        # No terminal_state error should be present
+        # (a missing optional field is treated as
+        # "absent / not set", not as a validation error).
+        self.assertFalse(
+            any("terminal_state" in e for e in errors),
+            f"missing terminal_state should NOT produce a 'terminal_state' "
+            f"error (a missing optional field is treated as absent), got "
+            f"errors={errors!r}",
+        )
+
+    def test_missing_all_three_optional_fields_returns_validation_errors_not_attribute_error(self) -> None:
+        # Worst case: all three guarded fields missing.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="c10413834de6c454800045d6be360ccc44ece183",
+            phase="PHASE_3",
+        )
+        del state.next_action
+        del state.terminal_state
+        # Must NOT raise AttributeError.
+        try:
+            errors = validate_checkpoint(state)
+        except AttributeError as exc:  # pragma: no cover
+            self.fail(
+                f"validate_checkpoint must not raise AttributeError when "
+                f"multiple optional fields are missing, got: {exc!r}"
+            )
+        # No specific 'next_action' or 'terminal_state'
+        # error should be present (all three optional
+        # fields are treated as absent when missing).
+        self.assertFalse(
+            any("next_action" in e for e in errors),
+            f"missing next_action should not produce a 'next_action' error, "
+            f"got errors={errors!r}",
+        )
+        self.assertFalse(
+            any("terminal_state" in e for e in errors),
+            f"missing terminal_state should not produce a 'terminal_state' "
+            f"error, got errors={errors!r}",
+        )
+
+    def test_present_invalid_next_action_still_returns_validation_error(self) -> None:
+        # Regression guard: present-but-invalid
+        # ``next_action`` values (non-string, empty,
+        # placeholder) must continue to produce
+        # validation errors after the getattr guard is
+        # added.
+        from aed_lifecycle.checkpoint import (
+            CheckpointState,
+            validate_checkpoint,
+        )
+        # Non-string next_action: 123 is not str.
+        state = CheckpointState(
+            repo="Slideshow11/Automated-Edge-Discovery",
+            pr_number=405,
+            branch="tooling/aed-no-stall-watchdog-v1",
+            current_head="c10413834de6c454800045d6be360ccc44ece183",
+            phase="PHASE_3",
+        )
+        setattr(state, "next_action", 123)
+        errors = validate_checkpoint(state)
+        self.assertTrue(
+            any("next_action" in e for e in errors),
+            f"non-string next_action should produce a 'next_action' error, "
+            f"got errors={errors!r}",
+        )

@@ -1324,6 +1324,32 @@ def _contains_any(text: str, needles: tuple) -> bool:
     return any(n in text for n in needles)
 
 
+def _contains_any_ci(text: str, needles: tuple) -> bool:
+    """Case-insensitive variant of :func:`_contains_any`.
+
+    Used by the broad ``has_checkpoint`` scan so that a
+    case-varied prose marker that the strict
+    ``_extract_checkpoint_value`` already accepts (e.g.
+    ``Wrote Checkpoint To`` or ``Checkpoint File:``) is
+    also recognized by the broad phase-header scan. The
+    strict extractor uses case-insensitive matching for
+    prose markers; the broad scan now matches the same
+    contract so the two vocabularies stay in sync (Fix AB,
+    Codex 3443570407).
+
+    The check is performed on a lower-cased copy of the
+    text against lower-cased needles. The original-case
+    text is not needed because the broad scan only answers
+    a boolean "does the message mention a checkpoint?"
+    question — it does not extract or return the matched
+    surface form.
+    """
+    if not text:
+        return False
+    text_lower = text.lower()
+    return any(n.lower() in text_lower for n in needles)
+
+
 # A whole-token (word-boundary) match pattern built from
 # TERMINAL_LIFECYCLE_STATES. The classifier previously used
 # this as the primary detector, but a sentence that merely
@@ -1963,7 +1989,19 @@ def classify_humphry_message_for_stall(text: object) -> str:
     # like "checkpoint: /tmp/ckpt.json"). It is used for
     # the STALL_* branches that just need to know whether
     # the runner wrote a checkpoint at all.
-    has_checkpoint = _contains_any(text, _CHECKPOINT_TOKENS)
+    #
+    # The scan is case-insensitive (Fix AB, Codex
+    # 3443570407) so that case-varied prose markers the
+    # strict ``_extract_checkpoint_value`` already accepts
+    # (e.g. ``Wrote Checkpoint To /tmp/ckpt.json`` or
+    # ``Checkpoint File: /tmp/ckpt.json``) are also
+    # recognized by the broad phase-header scan. Without
+    # this, the two checkpoint vocabularies would be out
+    # of sync for prose markers and the phase-header
+    # branch would misclassify a case-varied
+    # checkpoint-bearing stall as
+    # ``STALL_PHASE_HEADER_ONLY``.
+    has_checkpoint = _contains_any_ci(text, _CHECKPOINT_TOKENS)
     # ``has_checkpoint_with_value`` is the strict check:
     # the message contains a value-bearing checkpoint
     # marker (e.g. ``checkpoint_path=``, ``checkpoint:``)
