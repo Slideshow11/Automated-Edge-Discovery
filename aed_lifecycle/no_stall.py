@@ -1382,6 +1382,26 @@ _PLACEHOLDER_NEXT_ACTIONS = frozenset(
 _PLACEHOLDER_TRAILING_PUNCTUATION = ".,;:!?'\")}]}"
 
 
+# Leading wrapper characters stripped from the value before
+# the placeholder / field-name check in
+# :func:`is_valid_next_action`. Fix S (Codex 3441855393):
+# when a runner quotes or brackets a placeholder —
+# ``next_action: "None."`` or ``next_action: [none.]`` —
+# :func:`_extract_next_action_value` passes the wrapped
+# token to :func:`is_valid_next_action`; the previous
+# ``rstrip`` (Fix R) removed only the closing punctuation
+# and left the leading quote/bracket, so the placeholder
+# check missed and the classifier still returned
+# OK_PROGRESS_WITH_NEXT_ACTION. Final agent output is
+# free-form text and quoted field values are common, so
+# the canonical validator must also strip matching
+# leading wrappers before checking the placeholder set.
+# The set is intentionally narrow: only the standard
+# ASCII opening delimiters and quote characters that a
+# runner is likely to wrap a placeholder in.
+_PLACEHOLDER_LEADING_WRAPPERS = "\"'([{"
+
+
 def is_valid_next_action(value: object) -> bool:
     """Return True iff ``value`` is a usable ``next_action``.
 
@@ -1392,17 +1412,29 @@ def is_valid_next_action(value: object) -> bool:
 
     - it is a string (``isinstance(value, str)``)
     - after ``str.strip()`` it is non-empty
-    - its lowercased, stripped form, with trailing
-      sentence-ending punctuation removed, is NOT a
-      placeholder (``none``, ``null``, ``nil``, ``n/a``,
-      ``na``, ``todo``, ``tbd``, ``tba``). Fix R
+    - its lowercased, stripped form, with leading
+      wrapper characters and trailing sentence-ending
+      punctuation removed, is NOT a placeholder
+      (``none``, ``null``, ``nil``, ``n/a``, ``na``,
+      ``todo``, ``tbd``, ``tba``). Fix R
       (Codex 3440952035): the previous version rejected
       only the bare placeholder form ``"none"``, so a
       runner that wrote ``"next_action: None. No repair
       needed."`` produced an extracted value of
       ``"None."`` that the placeholder set did not
       contain, and the validator accepted it as a real
-      action. The runner would then try to resume with
+      action. Fix S (Codex 3441855393): the previous
+      Fix R version stripped only the closing
+      punctuation, so a runner that wrote
+      ``"next_action: \"None.\""`` or
+      ``"next_action: [none.]"`` produced an extracted
+      value of ``"\"None."`` or ``"[none."`` whose
+      leading wrapper prevented the placeholder set
+      from matching. The canonical validator now also
+      strips the leading wrapper characters
+      (``"'([{``) so wrapped or quoted placeholders are
+      recognised as the same placeholder they are when
+      bare. The runner would then try to resume with
       a punctuated placeholder instead of surfacing a
       stall/hold.
     - its lowercased, stripped, punctuation-trimmed form
@@ -1437,23 +1469,28 @@ def is_valid_next_action(value: object) -> bool:
     stripped = value.strip()
     if not stripped:
         return False
-    # Fix R (Codex 3440952035): strip trailing sentence-ending
-    # punctuation so a runner that writes ``"next_action:
-    # None. No repair needed."`` produces an extracted value
-    # of ``"None."`` that the placeholder check still
-    # recognises. Without this, the validator accepted
-    # ``"None."`` as a real action and the runner could
-    # try to resume with a punctuated placeholder. The
-    # punctuation set is intentionally narrow (sentence-end
-    # marks and a small set of structural terminators) so a
-    # legitimate action like ``"poll CI status."`` is
-    # rejected (the trailing period is a real
-    # sentence-ender) but ``"poll CI status"`` continues to
-    # be accepted. If a real action needs a trailing period,
-    # the runner should not be using ``_extract_next_action_value``
-    # to dispatch it; the classifier contract is to surface
-    # a hold when the action value looks like a placeholder.
-    trimmed = stripped.rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION)
+    # Fix R (Codex 3440952035) + Fix S (Codex 3441855393):
+    # strip trailing sentence-ending punctuation AND
+    # leading wrapper characters so a runner that writes
+    # ``"next_action: None. No repair needed."`` (R) or
+    # ``"next_action: \"None.\""`` / ``"next_action:
+    # [none.]"`` (S) produces an extracted value that the
+    # placeholder check still recognises. Without these
+    # fixes, the validator accepted ``"None."``,
+    # ``"\"None."`` and ``"[none."`` as real actions and
+    # the runner could try to resume with a wrapped
+    # placeholder instead of surfacing a stall/hold. The
+    # punctuation and wrapper sets are intentionally
+    # narrow: ``.,;:!?'\")}]}`` for trailing, ``"'([{``
+    # for leading. A legitimate action like
+    # ``"poll CI status"`` is unchanged; a leading quote
+    # is treated as a wrapper only when followed by a
+    # placeholder-looking token. The ``while`` form on
+    # ``lstrip`` strips multiple leading wrappers in case
+    # the runner uses nested quoting.
+    trimmed = stripped.lstrip(
+        _PLACEHOLDER_LEADING_WRAPPERS
+    ).rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION)
     if not trimmed:
         return False
     lower = trimmed.lower()

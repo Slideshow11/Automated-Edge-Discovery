@@ -8216,5 +8216,293 @@ class PunctuatedPlaceholderRejectionTests(unittest.TestCase):
             self.assertNotIn(ch, punct)
 
 
+class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3441855393 (Fix S).
+
+    When a runner quotes or brackets the placeholder — e.g.
+    ``next_action: "None."`` or ``next_action: [none.]`` —
+    :func:`_extract_next_action_value` passes the wrapped
+    token to :func:`is_valid_next_action`. The previous
+    Fix R (Codex 3440952035) implementation only stripped
+    trailing sentence-ending punctuation, so a wrapped
+    placeholder like ``"None."`` or ``[none.]`` was
+    extracted as ``"None."`` or ``[none.`` (with a
+    leading wrapper still attached), the placeholder set
+    did not contain those wrapped forms, and the
+    classifier still returned
+    OK_PROGRESS_WITH_NEXT_ACTION whenever a checkpoint
+    path was present. Final agent output is free-form
+    text and quoted field values are common, so the
+    canonical validator must also strip matching leading
+    wrapper characters before checking the placeholder
+    set.
+
+    Fix S strips a narrow set of leading wrapper
+    characters (``"'([{``) from the value before the
+    placeholder and field-name checks, so wrapped or
+    quoted placeholders are recognised as the same
+    placeholder they are when bare. The set is
+    intentionally narrow: only the standard ASCII
+    opening delimiters and quote characters a runner is
+    likely to wrap a placeholder in.
+    """
+
+    # --- is_valid_next_action rejects wrapped placeholders ---
+
+    def test_double_quote_wrapper_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"None."'))
+        self.assertFalse(is_valid_next_action('"none."'))
+        self.assertFalse(is_valid_next_action('"NONE."'))
+
+    def test_single_quote_wrapper_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("'None.'"))
+        self.assertFalse(is_valid_next_action("'none.'"))
+
+    def test_bracket_wrapper_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("[none.]"))
+        self.assertFalse(is_valid_next_action("[None.]"))
+        self.assertFalse(is_valid_next_action("[nil.]"))
+        self.assertFalse(is_valid_next_action("[null.]"))
+
+    def test_paren_wrapper_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("(none.)"))
+        self.assertFalse(is_valid_next_action("(None.)"))
+
+    def test_brace_wrapper_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("{none.}"))
+        self.assertFalse(is_valid_next_action("{None.}"))
+
+    def test_nested_wrappers_none_period_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"[none.]"'))
+        self.assertFalse(is_valid_next_action("'[[none.]]'"))
+        self.assertFalse(is_valid_next_action("((none.))"))
+
+    def test_wrapped_placeholders_no_trailing_punct_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"none"'))
+        self.assertFalse(is_valid_next_action("'none'"))
+        self.assertFalse(is_valid_next_action("[none]"))
+        self.assertFalse(is_valid_next_action("(none)"))
+        self.assertFalse(is_valid_next_action("{none}"))
+
+    def test_wrapped_other_placeholders_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"null."'))
+        self.assertFalse(is_valid_next_action('"todo."'))
+        self.assertFalse(is_valid_next_action('"tbd"'))
+        self.assertFalse(is_valid_next_action("[n/a]"))
+        self.assertFalse(is_valid_next_action("(tba)"))
+
+    def test_wrapped_field_names_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+        self.assertFalse(is_valid_next_action('"phase"'))
+        self.assertFalse(is_valid_next_action('"next_action"'))
+        self.assertFalse(is_valid_next_action('"terminal_state"'))
+
+    # --- Legitimate action text without wrappers still works ---
+
+    def test_legitimate_action_no_wrappers_still_valid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(is_valid_next_action("poll CI status"))
+        self.assertTrue(is_valid_next_action("poll Codex response"))
+        self.assertTrue(is_valid_next_action("continue bounded CI polling"))
+        self.assertTrue(is_valid_next_action("review next steps after CI"))
+
+    def test_legitimate_action_starting_with_quote_word_still_valid(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # The leading character is not in the wrapper
+        # alphabet. The token does not look like a wrapped
+        # placeholder.
+        self.assertTrue(is_valid_next_action('"poll CI status"'))
+        self.assertTrue(is_valid_next_action('"continue polling"'))
+        # The first character after the quote is not a
+        # placeholder, so the wrapper is preserved.
+        self.assertTrue(is_valid_next_action('"review steps"'))
+
+    def test_bare_placeholders_still_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none"))
+        self.assertFalse(is_valid_next_action("null"))
+        self.assertFalse(is_valid_next_action("None"))
+        self.assertFalse(is_valid_next_action("todo"))
+        self.assertFalse(is_valid_next_action("nil"))
+
+    def test_punctuated_placeholders_still_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # Pinned from Fix R: the trailing-period form.
+        self.assertFalse(is_valid_next_action("none."))
+        self.assertFalse(is_valid_next_action("null."))
+        self.assertFalse(is_valid_next_action("todo."))
+
+    # --- Classifier / message-level integration ---
+
+    def test_classifier_rejects_quoted_punctuated_placeholder(
+        self,
+    ) -> None:
+        """The headline case from the Codex finding.
+        ``next_action: \"None.\"`` plus a checkpoint path
+        must NOT classify as
+        OK_PROGRESS_WITH_NEXT_ACTION. The extracted value
+        is ``\"None.\"`` (the first whitespace-delimited
+        token after the marker), which Fix S recognises as
+        a wrapped punctuated placeholder."""
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            'next_action: "None."\n'
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_bracketed_punctuated_placeholder(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: [none.]\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_paren_wrapped_placeholder(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: (None.)\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_single_quote_wrapped_placeholder(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: 'todo.'\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_rejects_brace_wrapped_placeholder(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: {null}\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_still_accepts_legitimate_action(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_later_line_recovery_after_wrapped_placeholder(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        # Line 1: wrapped placeholder, rejected. Line 2:
+        # canonical real action, accepted.
+        text = (
+            'next_action: "None."\n'
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Watchdog / checkpoint integration (pinned) ---
+
+    def test_wrapped_placeholder_does_NOT_pass_persisted_validation(
+        self,
+    ) -> None:
+        """Pinned: persisted ``next_action='"None."'`` must
+        not pass validation. The same canonical
+        :func:`is_valid_next_action` helper is used by
+        :func:`validate_checkpoint`,
+        :func:`next_action_from_checkpoint`,
+        :func:`checkpoint_requires_operator`, and
+        :func:`evaluate_watchdog`, so the leading-wrapper
+        strip applies uniformly. A persisted value of
+        ``'"None."'`` is treated the same as ``'None.'``
+        (Fix R) and ``'None'`` (Fix D)."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"None."'))
+        self.assertFalse(is_valid_next_action('"none."'))
+        self.assertFalse(is_valid_next_action("[none.]"))
+        self.assertFalse(is_valid_next_action("'null.'"))
+        self.assertFalse(is_valid_next_action("(todo)"))
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+
+    def test_leading_wrapper_constant_is_narrow(self) -> None:
+        """The leading-wrapper set is intentionally narrow.
+        It contains the standard ASCII opening delimiters
+        and quote characters a runner is likely to wrap a
+        placeholder in, NOT arbitrary characters that would
+        corrupt real action values."""
+        from aed_lifecycle import no_stall
+        wraps = no_stall._PLACEHOLDER_LEADING_WRAPPERS
+        # Must contain the standard opening delimiters.
+        self.assertIn('"', wraps)
+        self.assertIn("'", wraps)
+        self.assertIn("(", wraps)
+        self.assertIn("[", wraps)
+        self.assertIn("{", wraps)
+        # Must NOT contain characters that would strip
+        # legitimate action text.
+        self.assertNotIn(" ", wraps)
+        self.assertNotIn("\n", wraps)
+        self.assertNotIn("\t", wraps)
+        # Must not contain closing delimiters (those are
+        # trailing, not leading).
+        self.assertNotIn(")", wraps)
+        self.assertNotIn("]", wraps)
+        self.assertNotIn("}", wraps)
+        # Must not contain alphabetic or numeric characters.
+        for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
+            self.assertNotIn(ch, wraps)
+
+
 if __name__ == "__main__":
     unittest.main()
