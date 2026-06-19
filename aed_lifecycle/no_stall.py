@@ -1363,6 +1363,25 @@ _PLACEHOLDER_NEXT_ACTIONS = frozenset(
 )
 
 
+# Trailing sentence-ending punctuation stripped from the
+# value before the placeholder / field-name check in
+# :func:`is_valid_next_action`. Fix R (Codex 3440952035):
+# a runner that writes ``"next_action: None. No repair
+# needed."`` produces an extracted value of ``"None."`` that
+# the placeholder set did not contain, so the validator
+# accepted it as a real action. The set is intentionally
+# narrow (sentence-end marks and a small set of structural
+# terminators) so a legitimate action like ``"poll CI
+# status."`` is rejected (the trailing period is a real
+# sentence-ender) but ``"poll CI status"`` continues to be
+# accepted. If a real action needs a trailing period, the
+# runner should not be using
+# :func:`_extract_next_action_value` to dispatch it; the
+# classifier contract is to surface a hold when the action
+# value looks like a punctuated placeholder.
+_PLACEHOLDER_TRAILING_PUNCTUATION = ".,;:!?'\")}]}"
+
+
 def is_valid_next_action(value: object) -> bool:
     """Return True iff ``value`` is a usable ``next_action``.
 
@@ -1373,14 +1392,25 @@ def is_valid_next_action(value: object) -> bool:
 
     - it is a string (``isinstance(value, str)``)
     - after ``str.strip()`` it is non-empty
-    - its lowercased, stripped form is NOT a placeholder
-      (``none``, ``null``, ``nil``, ``n/a``, ``na``, ``todo``,
-      ``tbd``, ``tba``)
-    - its lowercased, stripped form is NOT itself a field
-      name. The set of rejected field names is the documented
-      no-stall-protocol field set: ``next_action``,
-      ``next_step``, ``checkpoint``, ``phase``, ``terminal``,
-      ``state``, ``lifecycle``, ``next_phase``,
+    - its lowercased, stripped form, with trailing
+      sentence-ending punctuation removed, is NOT a
+      placeholder (``none``, ``null``, ``nil``, ``n/a``,
+      ``na``, ``todo``, ``tbd``, ``tba``). Fix R
+      (Codex 3440952035): the previous version rejected
+      only the bare placeholder form ``"none"``, so a
+      runner that wrote ``"next_action: None. No repair
+      needed."`` produced an extracted value of
+      ``"None."`` that the placeholder set did not
+      contain, and the validator accepted it as a real
+      action. The runner would then try to resume with
+      a punctuated placeholder instead of surfacing a
+      stall/hold.
+    - its lowercased, stripped, punctuation-trimmed form
+      is NOT itself a field name. The set of rejected
+      field names is the documented no-stall-protocol
+      field set: ``next_action``, ``next_step``,
+      ``checkpoint``, ``phase``, ``terminal``, ``state``,
+      ``lifecycle``, ``next_phase``,
       ``pending_actions``, ``updated_at``. A value that
       matches one of these is treated as a field-name
       collision (``next_action: checkpoint: /tmp/ckpt.json``)
@@ -1389,8 +1419,8 @@ def is_valid_next_action(value: object) -> bool:
       marker as a no-value placeholder.
 
     Anything else — ``None``, ``""``, ``"   "``, ``"none"``,
-    ``"todo"``, ``"checkpoint"``, ``123``, ``[]``, ``{}`` —
-    is invalid.
+    ``"none."``, ``"todo"``, ``"checkpoint"``, ``123``,
+    ``[]``, ``{}`` — is invalid.
 
     Used by :func:`validate_checkpoint` (in checkpoint.py),
     :func:`next_action_from_checkpoint`,
@@ -1407,7 +1437,26 @@ def is_valid_next_action(value: object) -> bool:
     stripped = value.strip()
     if not stripped:
         return False
-    lower = stripped.lower()
+    # Fix R (Codex 3440952035): strip trailing sentence-ending
+    # punctuation so a runner that writes ``"next_action:
+    # None. No repair needed."`` produces an extracted value
+    # of ``"None."`` that the placeholder check still
+    # recognises. Without this, the validator accepted
+    # ``"None."`` as a real action and the runner could
+    # try to resume with a punctuated placeholder. The
+    # punctuation set is intentionally narrow (sentence-end
+    # marks and a small set of structural terminators) so a
+    # legitimate action like ``"poll CI status."`` is
+    # rejected (the trailing period is a real
+    # sentence-ender) but ``"poll CI status"`` continues to
+    # be accepted. If a real action needs a trailing period,
+    # the runner should not be using ``_extract_next_action_value``
+    # to dispatch it; the classifier contract is to surface
+    # a hold when the action value looks like a placeholder.
+    trimmed = stripped.rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION)
+    if not trimmed:
+        return False
+    lower = trimmed.lower()
     if lower in _PLACEHOLDER_NEXT_ACTIONS:
         return False
     if lower in _FIELD_NAME_NEXT_ACTIONS:

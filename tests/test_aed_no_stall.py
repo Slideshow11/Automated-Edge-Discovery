@@ -7959,5 +7959,262 @@ class NestedOnlyMarkerSetSplitTests(unittest.TestCase):
         )
 
 
+class PunctuatedPlaceholderRejectionTests(unittest.TestCase):
+    """Regression tests for Codex finding 3440952035 (Fix R).
+
+    When a runner uses the canonical ``next_action:`` marker
+    but writes a placeholder as prose — e.g.
+    ``next_action: None. No repair needed.`` — the
+    :func:`_extract_next_action_value` helper returns the
+    first whitespace-delimited token after the marker, which
+    is ``"None."`` (with a trailing period). The previous
+    :func:`is_valid_next_action` implementation checked the
+    placeholder set ``{"none", "null", ...}`` against the
+    raw lowercased form, so ``"none."`` was NOT a member of
+    the set and the validator accepted it as a real action.
+    That made the classifier return
+    OK_PROGRESS_WITH_NEXT_ACTION whenever a checkpoint
+    path was also present, and let persisted
+    ``next_action="none."`` pass validation — the runner
+    could then try to resume with a punctuated placeholder
+    instead of surfacing a stall/hold.
+
+    Fix R strips a narrow set of trailing sentence-ending
+    punctuation (``.,;:!?'\")}]}``) from the value before
+    the placeholder and field-name checks, so a punctuated
+    placeholder is recognised as the same placeholder it
+    is when bare. The set is intentionally narrow: a
+    legitimate action like ``"poll CI status."`` is
+    rejected (the trailing period is a real sentence-ender
+    and the action is incomplete), but ``"poll CI status"``
+    continues to be accepted.
+    """
+
+    # --- is_valid_next_action rejects punctuated placeholders ---
+
+    def test_period_suffix_none_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none."))
+        self.assertFalse(is_valid_next_action("None."))
+        self.assertFalse(is_valid_next_action("NONE."))
+
+    def test_exclamation_suffix_none_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none!"))
+        self.assertFalse(is_valid_next_action("none?"))
+
+    def test_multiple_trailing_punctuation_none_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none..."))
+        self.assertFalse(is_valid_next_action("none!?!"))
+        self.assertFalse(is_valid_next_action("none.;"))
+
+    def test_punctuated_null_placeholder_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("null."))
+        self.assertFalse(is_valid_next_action("NULL."))
+        self.assertFalse(is_valid_next_action("nil."))
+
+    def test_punctuated_todo_placeholder_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("todo."))
+        self.assertFalse(is_valid_next_action("Todo."))
+        self.assertFalse(is_valid_next_action("tbd."))
+        self.assertFalse(is_valid_next_action("tba."))
+        self.assertFalse(is_valid_next_action("n/a."))
+        self.assertFalse(is_valid_next_action("na."))
+
+    def test_punctuated_field_name_is_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("checkpoint."))
+        self.assertFalse(is_valid_next_action("Checkpoint."))
+        self.assertFalse(is_valid_next_action("phase."))
+        self.assertFalse(is_valid_next_action("next_action."))
+        self.assertFalse(is_valid_next_action("terminal_state."))
+
+    # --- Legitimate action text without trailing punctuation still works ---
+
+    def test_legitimate_action_no_trailing_punctuation_still_valid(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(is_valid_next_action("poll CI status"))
+        self.assertTrue(is_valid_next_action("poll Codex response"))
+        self.assertTrue(is_valid_next_action("continue bounded CI polling"))
+        self.assertTrue(is_valid_next_action("review next steps after CI"))
+
+    def test_bare_placeholders_still_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none"))
+        self.assertFalse(is_valid_next_action("null"))
+        self.assertFalse(is_valid_next_action("None"))
+        self.assertFalse(is_valid_next_action("todo"))
+        self.assertFalse(is_valid_next_action("nil"))
+
+    def test_empty_string_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action(""))
+        self.assertFalse(is_valid_next_action("   "))
+
+    def test_non_string_still_invalid(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action(None))
+        self.assertFalse(is_valid_next_action(123))
+        self.assertFalse(is_valid_next_action([]))
+        self.assertFalse(is_valid_next_action({}))
+
+    def test_leading_whitespace_stripped_then_checked(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("  none.  "))
+        self.assertFalse(is_valid_next_action("\tnone.\n"))
+        self.assertTrue(is_valid_next_action("  poll CI status  "))
+
+    # --- Classifier / message-level integration ---
+
+    def test_classifier_does_NOT_classify_punctuated_none_as_progress(
+        self,
+    ) -> None:
+        """The headline case from the Codex finding.
+        ``next_action: None. No repair needed.`` plus
+        ``checkpoint_path=/tmp/ckpt.json`` must NOT classify
+        as OK_PROGRESS_WITH_NEXT_ACTION. The extracted value
+        is ``None.`` (the first whitespace-delimited token
+        after the marker), which Fix R recognises as a
+        punctuated placeholder."""
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: None. No repair needed.\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_does_NOT_classify_punctuated_equals_none(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action=None. Nothing to do.\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_does_NOT_classify_punctuated_todo(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: todo. wait for codex.\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_does_NOT_classify_punctuated_null(self) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        text = (
+            "next_action: null. nothing pending.\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertNotEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_classifier_still_accepts_legitimate_action_with_prose(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        # The next_action value is ``poll`` (first token
+        # after the marker). The trailing prose "CI status"
+        # is not part of the extracted value.
+        text = (
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_later_line_recovery_after_punctuated_placeholder(
+        self,
+    ) -> None:
+        from aed_lifecycle.no_stall import (
+            classify_humphry_message_for_stall,
+        )
+        # Line 1 has a punctuated placeholder, which is
+        # rejected. Line 2 has a canonical real action, which
+        # is accepted.
+        text = (
+            "next_action: None. No repair needed.\n"
+            "next_action: poll CI status\n"
+            "checkpoint_path=/tmp/ckpt.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    # --- Watchdog / checkpoint integration (pinned) ---
+
+    def test_punctuated_placeholder_does_NOT_pass_persisted_validation(
+        self,
+    ) -> None:
+        """Pinned: persisted ``next_action='none.'`` must
+        not pass validation. The same canonical
+        :func:`is_valid_next_action` helper is used by
+        :func:`validate_checkpoint`,
+        :func:`next_action_from_checkpoint`,
+        :func:`checkpoint_requires_operator`, and
+        :func:`evaluate_watchdog`, so the punctuation-strip
+        applies uniformly. A persisted value of ``none.``
+        is treated the same as ``none``."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none."))
+        self.assertFalse(is_valid_next_action("None."))
+        self.assertFalse(is_valid_next_action("null."))
+        self.assertFalse(is_valid_next_action("todo."))
+
+    def test_punctuation_constant_is_narrow(self) -> None:
+        """The punctuation set is intentionally narrow.
+        It contains sentence-end marks and structural
+        terminators, NOT characters that would corrupt
+        real action values like ``"poll CI status"`` or
+        ``"review next steps"``."""
+        from aed_lifecycle import no_stall
+        punct = no_stall._PLACEHOLDER_TRAILING_PUNCTUATION
+        # Must contain sentence-end marks.
+        self.assertIn(".", punct)
+        self.assertIn("!", punct)
+        self.assertIn("?", punct)
+        # Must contain some structural terminators.
+        self.assertIn(",", punct)
+        self.assertIn(";", punct)
+        # Must NOT contain characters that would strip
+        # legitimate action text.
+        self.assertNotIn(" ", punct)
+        self.assertNotIn("\n", punct)
+        self.assertNotIn("\t", punct)
+        # Must not contain alphabetic or numeric characters.
+        for ch in "abcdefghijklmnopqrstuvwxyz0123456789":
+            self.assertNotIn(ch, punct)
+
+
 if __name__ == "__main__":
     unittest.main()
