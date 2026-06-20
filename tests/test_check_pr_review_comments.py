@@ -279,6 +279,102 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P1")
         self.assertEqual(got[0]["user"], "chatgpt-codex-connector[bot]")
 
+    def test_p1_at_codex_not_dropped_by_coordination_skip(self):
+        """Regression for Codex finding AJ: a comment with an
+        explicit P1 severity token must NOT be dropped by the
+        coordination-skip, even if it also contains a broad
+        coordination pattern like ``@codex`` or ``bumping``."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "P1: @codex flagged a security issue; must fix",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            len(got), 1,
+            "P1 comment containing @codex must still be detected"
+        )
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_p0_at_codex_not_dropped(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "P0: @codex — this is a critical issue",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P0")
+
+    def test_p2_bumping_not_dropped(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "P2: this bumping retry logic can fail",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_p1_re_requesting_not_dropped(self):
+        """Even though 'Re-requesting' is a coordination pattern,
+        a comment with explicit P1 severity must still be
+        detected."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "P1: Re-requesting this because the fix is wrong",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_p3_colon_coordination_still_skipped(self):
+        """P3 is not a blocking severity, so a coordination
+        comment with P3: declaration should still be skipped
+        (it's non-blocking info). The guard only protects
+        P0/P1/P2."""
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": "P3: Bumping this thread — fix is minor",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        # P3 with coordination pattern: still skipped because
+        # P3 is not blocking. The guard only protects P0/P1/P2.
+        self.assertEqual(got, [])
+
+    def test_is_coordination_comment_p1_colon_returns_false(self):
+        """is_coordination_comment must return False for bodies
+        with explicit P0/P1/P2 severity declarations (P0:/P1:/P2:
+        followed by colon), regardless of other patterns."""
+        self.assertFalse(crc.is_coordination_comment(
+            "P1: @codex flagged a security issue; must fix"
+        ))
+        self.assertFalse(crc.is_coordination_comment(
+            "P0: bumping this because it's critical"
+        ))
+        self.assertFalse(crc.is_coordination_comment(
+            "P2: Re-requesting review on this"
+        ))
+
+    def test_is_coordination_comment_p1_reference_still_true(self):
+        """A bare P0/P1/P2 reference in prose (not followed by
+        colon) must NOT be treated as a severity declaration.
+        Coordination comments commonly reference prior findings
+        like 'The active P1 current-head finding'."""
+        self.assertTrue(crc.is_coordination_comment(
+            "Re-requesting Codex review. The active P1 current-head "
+            "finding from the previous review has been addressed."
+        ))
+
+    def test_is_coordination_comment_p3_still_true(self):
+        """P3 is not a blocking severity, so a coordination
+        comment with P3 is still treated as coordination."""
+        self.assertTrue(crc.is_coordination_comment(
+            "P3: Bumping this thread"
+        ))
+
     def test_actual_codex_p2_finding_still_detected(self):
         """An actual Codex P2 review finding must still be detected."""
         item = {

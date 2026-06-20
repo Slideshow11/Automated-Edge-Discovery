@@ -102,8 +102,31 @@ def is_coordination_comment(body: str) -> bool:
     coordination messages and not actual review findings. The
     check is case-insensitive substring matching against
     :data:`_COORDINATION_PATTERNS`.
+
+    Guard: a body that contains an explicit P0/P1/P2 SEVERITY
+    DECLARATION (i.e. ``P0:``/``P1:``/``P2:`` followed by a
+    colon) is NEVER treated as a coordination comment, even if
+    it also matches a coordination pattern. This prevents the
+    broad patterns (``@codex``, ``bumping``, etc.) from
+    silently discarding real blockers like
+    ``P1: @codex flagged a security issue; must fix`` (Codex
+    finding AJ).
+
+    The colon requirement distinguishes a severity declaration
+    (``P1: ...``) from a reference to a prior finding
+    (``The active P1 current-head finding``), which commonly
+    appears in coordination comments describing which fix
+    addresses which prior finding.
     """
-    body_lower = (body or "").lower()
+    body_str = body or ""
+    upper = body_str.upper()
+    for sev in ("P0", "P1", "P2"):
+        # Only treat as a severity declaration if followed by
+        # a colon (e.g. "P1: ..."). Bare "P1" references in
+        # prose are not severity declarations.
+        if sev + ":" in upper:
+            return False
+    body_lower = body_str.lower()
     return any(pat in body_lower for pat in _COORDINATION_PATTERNS)
 
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
