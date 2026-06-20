@@ -11077,3 +11077,210 @@ class SpacedCheckpointPathAssignmentTests(unittest.TestCase):
         from aed_lifecycle.no_stall import _has_checkpoint_with_value
         text = "Checkpoint Path = /tmp/aed/checkpoint.json"
         self.assertTrue(_has_checkpoint_with_value(text))
+
+
+class PlaceholderLedSentenceTests(unittest.TestCase):
+    """Fix AL (Codex 3444118871 / PRRT_kwDOSHFpYM6K87fV):
+    the canonical next-action validity check must reject
+    placeholder-led explanatory sentences such as
+    ``"None. No repair needed."`` or
+    ``"N/A. Waiting for operator."``. The previous exact-match
+    check only matched bare placeholder tokens like ``"none"``
+    or ``"tbd"``, so a persisted checkpoint or watchdog value
+    whose first sentence starts with a placeholder but
+    continues with explanatory text bypassed the filter and
+    was accepted as a runnable action. The canonical validator
+    now also inspects the first normalized token of the first
+    sentence.
+    """
+
+    def test_first_placeholder_token_none_period(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("None. No repair needed."),
+            "none",
+        )
+
+    def test_first_placeholder_token_na_period(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("N/A. Waiting for operator."),
+            "n/a",
+        )
+
+    def test_first_placeholder_token_tbd_period(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("TBD. Follow up later."),
+            "tbd",
+        )
+
+    def test_first_placeholder_token_todo_colon(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("TODO: investigate later"),
+            "todo",
+        )
+
+    def test_first_placeholder_token_bare_none(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("None"),
+            "none",
+        )
+
+    def test_first_placeholder_token_lowercase(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertEqual(
+            _first_placeholder_token("none. no repair needed"),
+            "none",
+        )
+
+    def test_first_placeholder_token_wrapped(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        # Wrapped/punctuated placeholder forms are normalised
+        # before comparison.
+        self.assertEqual(
+            _first_placeholder_token("[None]. no repair needed"),
+            "none",
+        )
+
+    def test_first_placeholder_token_real_action(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        # Real actions are NOT detected as placeholders even
+        # when they contain placeholder words mid-sentence.
+        self.assertIsNone(_first_placeholder_token("poll CI status"))
+        self.assertIsNone(
+            _first_placeholder_token("resolve review threads")
+        )
+        self.assertIsNone(
+            _first_placeholder_token(
+                "poll none of the failing CI checks"
+            )
+        )
+        self.assertIsNone(
+            _first_placeholder_token("continue from checkpoint")
+        )
+
+    def test_first_placeholder_token_empty(self) -> None:
+        from aed_lifecycle.no_stall import _first_placeholder_token
+        self.assertIsNone(_first_placeholder_token(""))
+        self.assertIsNone(_first_placeholder_token("   "))
+
+    def test_is_valid_next_action_rejects_placeholder_sentence(self) -> None:
+        """The exact Finding AL scenario: a persisted next_action
+        value like ``"None. No repair needed."`` must be
+        rejected by the canonical validator."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("None. No repair needed.")
+        )
+
+    def test_is_valid_next_action_rejects_na_sentence(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("N/A. Waiting for operator.")
+        )
+
+    def test_is_valid_next_action_rejects_tbd_sentence(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("TBD. Follow up later.")
+        )
+
+    def test_is_valid_next_action_rejects_lowercase_placeholder_sentence(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("none. no repair needed")
+        )
+
+    def test_is_valid_next_action_rejects_null_sentence(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("null. no checkpoint state")
+        )
+
+    def test_is_valid_next_action_rejects_todo_colon_sentence(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(
+            is_valid_next_action("TODO: investigate later")
+        )
+
+    def test_is_valid_next_action_accepts_real_actions(self) -> None:
+        """Real actions that do not start with a placeholder
+        must still be accepted."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(is_valid_next_action("poll CI status"))
+        self.assertTrue(is_valid_next_action("poll Codex response"))
+        self.assertTrue(is_valid_next_action("continue bounded CI polling"))
+        self.assertTrue(is_valid_next_action("resume from checkpoint"))
+        self.assertTrue(is_valid_next_action("wait for required checks"))
+
+    def test_is_valid_next_action_accepts_real_actions_with_placeholder_word_midsentence(self) -> None:
+        """Real actions that contain placeholder words
+        mid-sentence must still be accepted (the placeholder
+        check is only on the FIRST sentence's first token)."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action("poll none of the failing CI checks")
+        )
+        self.assertTrue(
+            is_valid_next_action("investigate why TODO items remain")
+        )
+
+    def test_is_valid_next_action_existing_bare_placeholder_still_rejected(self) -> None:
+        """Existing placeholder exact-match tests must still pass."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none"))
+        self.assertFalse(is_valid_next_action("None"))
+        self.assertFalse(is_valid_next_action("NONE"))
+        self.assertFalse(is_valid_next_action("null"))
+        self.assertFalse(is_valid_next_action("n/a"))
+        self.assertFalse(is_valid_next_action("N/A"))
+        self.assertFalse(is_valid_next_action("todo"))
+        self.assertFalse(is_valid_next_action("tbd"))
+        self.assertFalse(is_valid_next_action("tba"))
+        self.assertFalse(is_valid_next_action("nil"))
+
+    def test_is_valid_next_action_existing_punctuated_placeholder_still_rejected(self) -> None:
+        """Existing punctuated placeholder tests (Fix R) must
+        still pass."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("none."))
+        self.assertFalse(is_valid_next_action("None."))
+        self.assertFalse(is_valid_next_action("n/a."))
+
+    def test_is_valid_next_action_existing_wrapped_placeholder_still_rejected(self) -> None:
+        """Existing wrapped placeholder tests (Fix S) must
+        still pass."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"None."'))
+        self.assertFalse(is_valid_next_action("[none.]"))
+        self.assertFalse(is_valid_next_action("'None'"))
+
+    def test_is_valid_next_action_empty_still_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action(""))
+        self.assertFalse(is_valid_next_action("   "))
+        self.assertFalse(is_valid_next_action(None))
+
+    def test_checkpoint_requires_operator_for_placeholder_sentence(self) -> None:
+        """The canonical helper is used by checkpoint_requires_operator
+        in checkpoint.py. A persisted checkpoint with
+        ``next_action='None. No repair needed.'`` must trigger
+        operator intervention."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # The canonical helper must reject the placeholder
+        # sentence — this is what checkpoint_requires_operator
+        # checks via validate_checkpoint.
+        self.assertFalse(
+            is_valid_next_action("None. No repair needed.")
+        )
+
+    def test_field_assignment_collisions_still_rejected(self) -> None:
+        """Existing field-assignment collision tests (Fixes M,
+        U) must still pass."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("checkpoint_path=/tmp/x"))
+        self.assertFalse(is_valid_next_action("checkpoint: /tmp/x"))
+        self.assertFalse(is_valid_next_action("next_action: poll CI"))

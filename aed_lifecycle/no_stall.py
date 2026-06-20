@@ -1519,6 +1519,19 @@ _PLACEHOLDER_NEXT_ACTIONS = frozenset(
 )
 
 
+# Sentence-ending delimiters used by :func:`_first_placeholder_token`
+# to split a value into sentences when checking for
+# placeholder-led explanatory sentences (Fix AL, Codex 3444118871).
+# A runner that writes ``"None. No repair needed."`` produces an
+# extracted value whose first SENTENCE is ``"None"`` (a placeholder)
+# even though the full value is not an exact placeholder token.
+# The delimiter set is intentionally narrow: only standard
+# sentence-ending marks plus the colon (which often introduces
+# an explanatory clause after a placeholder like
+# ``"N/A: waiting for operator"``).
+_PLACEHOLDER_SENTENCE_DELIMITERS = ".!?:;"
+
+
 # Trailing sentence-ending punctuation stripped from the
 # value before the placeholder / field-name check in
 # :func:`is_valid_next_action`. Fix R (Codex 3440952035):
@@ -1556,6 +1569,73 @@ _PLACEHOLDER_TRAILING_PUNCTUATION = ".,;:!?'\")}]}"
 # ASCII opening delimiters and quote characters that a
 # runner is likely to wrap a placeholder in.
 _PLACEHOLDER_LEADING_WRAPPERS = "\"'([{"
+
+
+def _first_placeholder_token(value: str) -> "str | None":
+    """Return the lowercased first token of the first sentence
+    in ``value`` if it matches a known placeholder vocabulary
+    entry; otherwise return ``None``.
+
+    Fix AL (Codex 3444118871): the canonical placeholder
+    check in :func:`is_valid_next_action` only matched
+    exact placeholder tokens (``"none"``, ``"tbd"``, etc.).
+    A persisted checkpoint or watchdog state that stores a
+    placeholder plus explanatory text — e.g.
+    ``"None. No repair needed."`` — bypassed the placeholder
+    filter because the full sentence is not an exact
+    placeholder token. The canonical validator now also
+    checks the first normalized token of the first sentence:
+    if it is a placeholder, the entire value is rejected as a
+    placeholder-led explanatory sentence.
+
+    The check is intentionally narrow:
+
+    - Only the FIRST sentence is inspected. A real action like
+      ``"poll none of the failing CI checks"`` (which contains
+      ``none`` mid-sentence) is NOT rejected because the
+      first sentence's first token is ``poll``, not a
+      placeholder.
+    - Leading wrapper characters and trailing punctuation are
+      stripped from the first token before comparison, so
+      wrapped placeholders (``"None."``, ``"[none.]"``) are
+      recognised the same way as bare placeholders.
+    - Only the documented placeholder vocabulary
+      (:data:`_PLACEHOLDER_NEXT_ACTIONS`) is matched. New
+      placeholder tokens are added there, not here.
+
+    Returns the lowercased placeholder token if the first
+    sentence starts with a placeholder, or ``None`` if the
+    first sentence starts with a real word.
+    """
+    if not value:
+        return None
+    # Split on the first sentence-ending delimiter.
+    # re.split is used so we can split on multiple delimiters
+    # in one pass.
+    import re as _re
+    parts = _re.split(
+        "[" + _re.escape(_PLACEHOLDER_SENTENCE_DELIMITERS) + "]",
+        value,
+        maxsplit=1,
+    )
+    first_sentence = parts[0] if parts else ""
+    # ``.split(None)`` splits on whitespace and removes empty
+    # tokens, so a value that is all whitespace (e.g. ``"   "``)
+    # or contains only a delimiter (e.g. ``"."``) yields an
+    # empty list. Guard with a truthiness check.
+    tokens = first_sentence.split()
+    if not tokens:
+        return None
+    first_token = tokens[0]
+    # Strip leading wrappers and trailing punctuation (same
+    # logic as :func:`is_valid_next_action`) so wrapped /
+    # punctuated placeholders are normalised before comparison.
+    normalized = first_token.lstrip(_PLACEHOLDER_LEADING_WRAPPERS)
+    normalized = normalized.rstrip(_PLACEHOLDER_TRAILING_PUNCTUATION)
+    normalized_lower = normalized.lower()
+    if normalized_lower in _PLACEHOLDER_NEXT_ACTIONS:
+        return normalized_lower
+    return None
 
 
 def is_valid_next_action(value: object) -> bool:
@@ -1661,6 +1741,24 @@ def is_valid_next_action(value: object) -> bool:
         return False
     lower = trimmed.lower()
     if lower in _PLACEHOLDER_NEXT_ACTIONS:
+        return False
+    # Fix AL (Codex 3444118871): reject placeholder-led
+    # explanatory sentences. A value like
+    # ``"None. No repair needed."`` or
+    # ``"N/A. Waiting for operator."`` is not itself an
+    # exact placeholder token (the full sentence is not in
+    # :data:`_PLACEHOLDER_NEXT_ACTIONS`), so the canonical
+    # validator now also checks the first normalized token of
+    # the first sentence. If that token is a placeholder,
+    # the entire value is rejected as a placeholder-led
+    # explanatory sentence. The check is intentionally narrow:
+    # only the FIRST sentence is inspected, and the placeholder
+    # vocabulary is the same documented set. Real actions that
+    # contain placeholder words mid-sentence
+    # (``"poll none of the failing CI checks"``) are NOT
+    # rejected because the first sentence's first token is
+    # ``poll``, not a placeholder.
+    if _first_placeholder_token(trimmed) is not None:
         return False
     # Fix T (Codex 3441956963): field-name check uses the
     # RAW stripped value (no wrapper strip). This is the
