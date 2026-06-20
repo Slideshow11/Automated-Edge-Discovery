@@ -356,6 +356,191 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P2")
 
 
+class TestExtractSeverityWordBoundary(unittest.TestCase):
+    """Regression for Codex finding AI: severity aliases
+    ``high``/``medium``/``low`` must be matched as whole
+    WORDS, not substrings, so that words like ``highlight``,
+    ``mediumship``, or ``below`` do not falsely match.
+    """
+
+    def test_high_severity_word_still_maps_to_p1(self):
+        # ``High severity: ...`` must still map to P1.
+        self.assertEqual(crc.extract_severity("High severity: path traversal"), "P1")
+
+    def test_medium_severity_word_still_maps_to_p2(self):
+        # ``Medium: ...`` must still map to P2.
+        self.assertEqual(crc.extract_severity("Medium: test coverage gap"), "P2")
+
+    def test_low_severity_word_still_maps_to_p3(self):
+        # ``Low: ...`` must still map to P3.
+        self.assertEqual(crc.extract_severity("Low: nit on variable name"), "P3")
+
+    def test_highlight_does_not_match_high(self):
+        # ``highlight`` contains ``high`` as a substring but must
+        # NOT be classified as P1.
+        self.assertIsNone(crc.extract_severity("Please highlight the docs"))
+
+    def test_mediumship_does_not_match_medium(self):
+        # ``mediumship`` contains ``medium`` as a substring but
+        # must NOT be classified as P2.
+        self.assertIsNone(crc.extract_severity("The mediumship of the message"))
+
+    def test_below_does_not_match_low(self):
+        # ``below`` contains ``low`` as a substring but must NOT
+        # be classified as P3.
+        self.assertIsNone(crc.extract_severity("See the section below"))
+
+    def test_classify_item_highlight_not_p1(self):
+        """The exact Codex finding AI scenario: a non-finding
+        comment containing ``highlight`` must NOT be classified
+        as a P1 blocker."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "Please highlight the docs in the README.",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        # Should be either empty (no severity) or UNSPECIFIED_INFO,
+        # but NOT P1.
+        for f in got:
+            self.assertNotEqual(
+                f["severity"], "P1",
+                f"'highlight' must not be classified as P1, got {f}"
+            )
+
+    def test_p0_token_still_substring_match(self):
+        # P0/P1/P2/P3 are short unambiguous tokens and should
+        # still match as substrings.
+        self.assertEqual(crc.extract_severity("this is a P0 critical bug"), "P0")
+
+    def test_p1_token_still_substring_match(self):
+        self.assertEqual(crc.extract_severity("P1: this is important"), "P1")
+
+    def test_p2_token_still_substring_match(self):
+        self.assertEqual(crc.extract_severity("P2: minor issue"), "P2")
+
+    def test_p3_token_still_substring_match(self):
+        self.assertEqual(crc.extract_severity("P3: nit"), "P3")
+
+    def test_p0_takes_priority_over_aliases(self):
+        # P0 must take priority over text aliases.
+        self.assertEqual(crc.extract_severity("P0: high critical bug"), "P0")
+
+    def test_existing_high_maps_to_p1_test_still_works(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "High severity: path traversal risk",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_existing_medium_maps_to_p2_test_still_works(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "Medium: test coverage gap",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+
+class TestGhApiSlurpPagination(unittest.TestCase):
+    """Regression for Codex finding AH: ``gh_api`` must use
+    ``--slurp`` so that multi-page responses are wrapped into
+    a single JSON array, then flattened into a single list of
+    items. Without ``--slurp``, ``gh api --paginate`` writes
+    each page as a separate JSON document and ``json.loads``
+    fails on the concatenated output.
+    """
+
+    def test_gh_api_uses_slurp_flag(self):
+        """The ``gh api`` subprocess invocation must include
+        the ``--slurp`` flag so multi-page responses are
+        wrapped into a single JSON array."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout="[]")
+            crc.gh_api("OWNER/REPO", "issues/1/comments")
+            cmd = mock_run.call_args[0][0]
+            self.assertIn(
+                "--slurp", cmd,
+                "gh api command must include --slurp flag "
+                "(Codex finding AH)"
+            )
+
+    def test_gh_api_uses_paginate_flag(self):
+        """The ``gh api`` subprocess invocation must include
+        the ``--paginate`` flag so multi-page responses are
+        fetched."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout="[]")
+            crc.gh_api("OWNER/REPO", "issues/1/comments")
+            cmd = mock_run.call_args[0][0]
+            self.assertIn(
+                "--paginate", cmd,
+                "gh api command must include --paginate flag"
+            )
+
+    def test_gh_api_flattens_multi_page_response(self):
+        """A multi-page response (list of lists) must be
+        flattened into a single list of items."""
+        page1 = [{"id": 1, "body": "first"}]
+        page2 = [{"id": 2, "body": "second"}]
+        slurped = json.dumps([page1, page2])  # --slurp output
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout=slurped)
+            ok, data, err = crc.gh_api("OWNER/REPO", "issues/1/comments")
+            self.assertTrue(ok, f"expected ok=True, got err={err!r}")
+            self.assertEqual(len(data), 2, "two pages should flatten to 2 items")
+            self.assertEqual(data[0]["id"], 1)
+            self.assertEqual(data[1]["id"], 2)
+
+    def test_gh_api_single_page_response_works(self):
+        """A single-page response (flat list) must still work."""
+        single = [{"id": 1, "body": "only"}]
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout=json.dumps(single))
+            ok, data, err = crc.gh_api("OWNER/REPO", "issues/1/comments")
+            self.assertTrue(ok, f"expected ok=True, got err={err!r}")
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["id"], 1)
+
+    def test_gh_api_three_page_response_flattened(self):
+        """A three-page response must be fully flattened."""
+        pages = [
+            [{"id": 1}],
+            [{"id": 2}, {"id": 3}],
+            [{"id": 4}],
+        ]
+        slurped = json.dumps(pages)
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout=slurped)
+            ok, data, err = crc.gh_api("OWNER/REPO", "issues/1/comments")
+            self.assertTrue(ok, f"expected ok=True, got err={err!r}")
+            self.assertEqual(len(data), 4)
+            self.assertEqual([d["id"] for d in data], [1, 2, 3, 4])
+
+    def test_gh_api_empty_response(self):
+        """An empty response must return an empty list."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout="")
+            ok, data, err = crc.gh_api("OWNER/REPO", "issues/1/comments")
+            self.assertTrue(ok)
+            self.assertEqual(data, [])
+
+    def test_gh_api_single_object_response(self):
+        """A single-object response (not a list) must be wrapped
+        into a single-item list."""
+        with mock.patch("subprocess.run") as mock_run:
+            mock_run.return_value = FakeResult(stdout=json.dumps({"id": 1}))
+            ok, data, err = crc.gh_api("OWNER/REPO", "pulls/1")
+            self.assertTrue(ok)
+            self.assertEqual(len(data), 1)
+            self.assertEqual(data[0]["id"], 1)
+
+
 class TestDedup(unittest.TestCase):
     def test_exact_duplicate_removed(self):
         item = {

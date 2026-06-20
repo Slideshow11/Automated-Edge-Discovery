@@ -210,8 +210,18 @@ def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
 
     Returns (success, data_list, error_msg).
     Fails closed: any non-zero return code, stderr, or bad JSON => error.
+
+    Uses ``--paginate --slurp`` so that multi-page responses are
+    wrapped into a single JSON array of arrays, which is then
+    flattened into a single list of items. Without ``--slurp``,
+    ``gh api --paginate`` writes each page as a separate JSON
+    document and ``json.loads`` fails on the concatenated output
+    (Codex finding AH).
     """
-    cmd = ["gh", "api", f"repos/{repo}/{endpoint}", "--paginate"]
+    cmd = [
+        "gh", "api", f"repos/{repo}/{endpoint}",
+        "--paginate", "--slurp",
+    ]
     try:
         result = subprocess.run(
             cmd,
@@ -231,11 +241,23 @@ def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
 
     try:
         data = json.loads(result.stdout)
-        if isinstance(data, list):
-            return True, data, ""
-        return True, [data], ""
     except json.JSONDecodeError as exc:
         return False, [], f"invalid JSON from gh api: {exc}"
+
+    # ``--slurp`` wraps all pages into a single JSON array, so
+    # the result is either:
+    #   - a list of items (single page)
+    #   - a list of lists (multi-page: each page is a list)
+    # Flatten the latter into a single list of items.
+    if isinstance(data, list):
+        flat: list[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, list):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        return True, flat, ""
+    return True, [data], ""
 
 
 def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
@@ -270,13 +292,24 @@ def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
 # ---------------------------------------------------------------------------
 
 def extract_severity(text: str) -> str | None:
-    """Return P0-P3 from text or None if not found."""
+    """Return P0-P3 from text or None if not found.
+
+    P0/P1/P2/P3 tokens are matched as substrings (case-insensitive)
+    because they are short, unambiguous tokens. The
+    ``high``/``medium``/``low`` aliases are matched as whole
+    WORDS using regex word boundaries, so that substrings like
+    ``highlight``, ``mediumship``, or ``below`` do not falsely
+    match (Codex finding AI).
+    """
     upper = text.upper()
     for sev in ("P0", "P1", "P2", "P3"):
         if sev in upper:
             return sev
     for token, sev in SEVERITY_MAP.items():
-        if token.upper() in upper:
+        # Use regex word-boundary matching for the text aliases
+        # to avoid false positives like "highlight" matching
+        # "high". P0-P3 tokens are already unambiguous.
+        if re.search(r"\b" + re.escape(token) + r"\b", text, re.IGNORECASE):
             return sev
     return None
 
