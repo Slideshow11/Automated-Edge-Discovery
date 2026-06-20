@@ -8214,7 +8214,14 @@ class PunctuatedPlaceholderRejectionTests(unittest.TestCase):
         # the underlying bare form is a field-name word
         # (treated as a quoted first token of a real
         # action).
-        self.assertTrue(is_valid_next_action('"checkpoint"'))
+        # Fix AN: fully-wrapped bare field names are now
+        # rejected. Fix T regression guard preserved for
+        # partial quotes and multi-word quoted actions.
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+        self.assertTrue(is_valid_next_action('"checkpoint'))
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
+        )
         # But the bare form is still rejected.
         self.assertFalse(is_valid_next_action("checkpoint"))
 
@@ -8328,21 +8335,33 @@ class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
 
     def test_wrapped_field_names_invalid(self) -> None:
         from aed_lifecycle.no_stall import is_valid_next_action
-        # Fix T (Codex 3441956963): wrapping a bare field
-        # name in a quote is no longer rejected. The
-        # wrapper-stripped form is used ONLY for the
-        # placeholder check. The field-name check uses the
-        # RAW stripped value (``"checkpoint`` is NOT in the
-        # field-name set, only the bare ``checkpoint``
-        # is). A quoted field-name-like token is treated
-        # as the first token of a real quoted action
-        # (``"checkpoint current run state"``), not as a
-        # bare field name. Bare (unquoted) field names are
-        # still rejected (covered by other tests).
-        self.assertTrue(is_valid_next_action('"checkpoint"'))
-        self.assertTrue(is_valid_next_action('"phase"'))
-        self.assertTrue(is_valid_next_action('"next_action"'))
-        self.assertTrue(is_valid_next_action('"terminal_state"'))
+        # Fix AN (Codex Finding AN / PRRT_kwDOSHFpYM6K9TsN):
+        # FULLY-WRAPPED bare field names (e.g. ``"checkpoint"``
+        # with both leading and trailing wrapper characters
+        # and no other content) are now rejected. The
+        # wrapper-stripped form ``checkpoint`` is a bare
+        # field name, and the raw form ``"checkpoint"`` is
+        # not in the field-name set, so the previous Fix T
+        # contract allowed it through. Fix AN closes that gap.
+        #
+        # The Fix T regression guard is preserved for:
+        # - Partial quotes (``"checkpoint`` with only a
+        #   leading quote) — still accepted.
+        # - Multi-word quoted actions
+        #   (``"checkpoint current run state"``) — still
+        #   accepted.
+        # - Bare (unquoted) field names are still rejected
+        #   (covered below).
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+        self.assertFalse(is_valid_next_action('"phase"'))
+        self.assertFalse(is_valid_next_action('"next_action"'))
+        self.assertFalse(is_valid_next_action('"terminal_state"'))
+        # Fix T regression guards:
+        # - Partial quote (leading only): still accepted.
+        self.assertTrue(is_valid_next_action('"checkpoint'))
+        self.assertTrue(is_valid_next_action('"phase'))
+        # - Multi-word quoted action: still accepted.
+        self.assertTrue(is_valid_next_action('"checkpoint current run state"'))
         # Bare form (no wrapper) IS still rejected.
         self.assertFalse(is_valid_next_action("checkpoint"))
         self.assertFalse(is_valid_next_action("phase"))
@@ -8520,7 +8539,14 @@ class LeadingWrapperPlaceholderRejectionTests(unittest.TestCase):
         self.assertFalse(is_valid_next_action("(todo)"))
         # Fix T: quoted field-name-looking tokens are
         # accepted as quoted first tokens of real actions.
-        self.assertTrue(is_valid_next_action('"checkpoint"'))
+        # Fix AN: fully-wrapped bare field names are now
+        # rejected. Fix T regression guard preserved for
+        # partial quotes and multi-word quoted actions.
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+        self.assertTrue(is_valid_next_action('"checkpoint'))
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
+        )
         # But the bare form is still rejected.
         self.assertFalse(is_valid_next_action("checkpoint"))
 
@@ -8985,11 +9011,13 @@ class QuotedFieldAssignmentRejectionTests(unittest.TestCase):
         :func:`_is_field_assignment_collision_value` is
         also checked, so a quoted field-assignment
         value is recognised as the same collision it is
-        when bare. The field-name check (Fix T) uses
-        only the raw form so a real quoted action whose
-        first word is a field name — e.g.
-        ``"checkpoint"`` (treated as a quoted first
-        token of a real action) — is still accepted."""
+        when bare. Fix T regression guard (preserved by
+        Fix AN): partial quotes (``"checkpoint`` with only
+        a leading quote) and multi-word quoted actions
+        (``"checkpoint current run state"``) are still
+        accepted. Fix AN closes the gap for FULLY-WRAPPED
+        bare field names (``"checkpoint"`` with both
+        leading and trailing wrapper characters)."""
         from aed_lifecycle.no_stall import is_valid_next_action
         self.assertFalse(
             is_valid_next_action('"checkpoint_path=/tmp/ckpt.json"')
@@ -9007,12 +9035,22 @@ class QuotedFieldAssignmentRejectionTests(unittest.TestCase):
         self.assertFalse(
             is_valid_next_action('"none"')
         )
-        # Fix T contract: a quoted bare field-name word is
-        # accepted (treated as a quoted first token of a
-        # real action). The field-name check uses only
-        # the raw form.
-        self.assertTrue(
+        # Fix AN (Codex Finding AN / PRRT_kwDOSHFpYM6K9TsN):
+        # fully-wrapped bare field names are now rejected.
+        # Fix T regression guard preserved for partial quotes
+        # and multi-word quoted actions.
+        self.assertFalse(
             is_valid_next_action('"checkpoint"')
+        )
+        # Fix T regression guard: partial quote (leading
+        # only) is still accepted.
+        self.assertTrue(
+            is_valid_next_action('"checkpoint')
+        )
+        # Fix T regression guard: multi-word quoted action
+        # is still accepted.
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
         )
         # Bare forms still rejected.
         self.assertFalse(
@@ -11284,3 +11322,82 @@ class PlaceholderLedSentenceTests(unittest.TestCase):
         self.assertFalse(is_valid_next_action("checkpoint_path=/tmp/x"))
         self.assertFalse(is_valid_next_action("checkpoint: /tmp/x"))
         self.assertFalse(is_valid_next_action("next_action: poll CI"))
+
+
+class QuotedFieldNameCollisionTests(unittest.TestCase):
+    """Fix AN (Codex Finding AN / PRRT_kwDOSHFpYM6K9TsN):
+    the canonical next-action validity check must also reject
+    WRAPPER-STRIPPED bare field names. A value like
+    ``"checkpoint"`` (quoted bare protocol field) passes the
+    raw-stripped field-name check because ``'"checkpoint"'``
+    is not an exact field name, but its wrapper-stripped form
+    ``'checkpoint'`` IS a bare field name and must be rejected.
+
+    The check is restricted to SINGLE-WORD wrapper-stripped
+    forms so multi-word actions that begin with a field-name
+    word — e.g. ``"checkpoint current run state"`` — continue
+    to be accepted (Fix T regression guard).
+    """
+
+    def test_quoted_checkpoint_field_name_rejected(self) -> None:
+        """The exact Finding AN scenario: a quoted bare field
+        name ``\"checkpoint\"`` must be rejected."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"checkpoint"'))
+
+    def test_quoted_state_field_name_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"state"'))
+
+    def test_quoted_phase_field_name_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action('"phase"'))
+
+    def test_bracketed_checkpoint_field_name_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("[checkpoint]"))
+
+    def test_single_quoted_checkpoint_field_name_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("'checkpoint'"))
+
+    def test_bare_field_name_still_rejected(self) -> None:
+        """Existing bare field-name tests must still pass."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertFalse(is_valid_next_action("checkpoint"))
+        self.assertFalse(is_valid_next_action("phase"))
+        self.assertFalse(is_valid_next_action("state"))
+        self.assertFalse(is_valid_next_action("next_action"))
+
+    def test_multi_word_quoted_field_name_word_still_accepted(self) -> None:
+        """Multi-word actions that begin with a field-name
+        word must still be accepted (Fix T regression guard).
+        ``\"checkpoint current run state\"`` is a real action,
+        not a field-name collision."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        self.assertTrue(
+            is_valid_next_action('"checkpoint current run state"')
+        )
+        self.assertTrue(
+            is_valid_next_action("checkpoint current run state")
+        )
+        self.assertTrue(
+            is_valid_next_action("phase 3 review")
+        )
+
+    def test_quoted_field_name_with_trailing_punct_rejected(self) -> None:
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # ``"checkpoint."`` — fully wrapped, wrapper-stripped +
+        # punct-stripped is ``"checkpoint"``, which is a bare
+        # field name.
+        self.assertFalse(is_valid_next_action('"checkpoint."'))
+
+    def test_partial_quote_field_name_still_accepted(self) -> None:
+        """Partial quotes (``"checkpoint`` with only a leading
+        quote) must still be accepted — Fix T regression guard.
+        Only FULLY wrapped bare field names are rejected."""
+        from aed_lifecycle.no_stall import is_valid_next_action
+        # Leading quote only (no closing quote): partial quote.
+        # Must still be accepted per Fix T.
+        self.assertTrue(is_valid_next_action('"checkpoint'))
+        self.assertTrue(is_valid_next_action('"state'))

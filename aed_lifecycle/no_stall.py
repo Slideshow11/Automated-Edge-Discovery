@@ -1777,6 +1777,34 @@ def is_valid_next_action(value: object) -> bool:
     # contains the ``=`` after the first token.
     if stripped.lower() in _FIELD_NAME_NEXT_ACTIONS:
         return False
+    # Fix AN (Codex Finding AN / PRRT_kwDOSHFpYM6K9TsN):
+    # reject FULLY-WRAPPED bare field names. A value like
+    # ``"checkpoint"`` (both leading and trailing wrapper
+    # characters, single word) passes the raw-stripped check
+    # because ``'"checkpoint"'`` is not in
+    # :data:`_FIELD_NAME_NEXT_ACTIONS`, but its
+    # wrapper-stripped form ``'checkpoint'`` IS a bare field
+    # name and must be rejected.
+    #
+    # The check is restricted to FULLY-WRAPPED single-word
+    # forms so:
+    # - Partial quotes (``"checkpoint`` with only a leading
+    #   quote) are still accepted (Fix T regression guard).
+    # - Multi-word actions that begin with a field-name word
+    #   — e.g. ``"checkpoint current run state"`` — continue
+    #   to be accepted (Fix T regression guard).
+    # - Bare field names (without any wrapping) are still
+    #   rejected by the raw-stripped check above.
+    trimmed_lower = trimmed.lower()
+    if (
+        " " not in trimmed_lower
+        and "\t" not in trimmed_lower
+        and trimmed_lower in _FIELD_NAME_NEXT_ACTIONS
+        and len(stripped) >= 2
+        and stripped[0] in _PLACEHOLDER_LEADING_WRAPPERS
+        and stripped[-1] in _PLACEHOLDER_TRAILING_PUNCTUATION
+    ):
+        return False
     # Fix M (Codex 3438724908): reject only real field
     # assignments, not legitimate actions that merely begin
     # with a field-name word. A value like
