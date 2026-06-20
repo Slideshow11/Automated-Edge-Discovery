@@ -121,6 +121,241 @@ class TestClassify(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P2")
 
 
+class TestCoordinationCommentSkip(unittest.TestCase):
+    """Regression for review-comment-gate false positives:
+    human PR-author coordination comments that mention Codex
+    (e.g. 'Re-requesting Codex review...') must NOT be
+    classified as blocking findings, even though they contain
+    Codex needles. Actual Codex review findings from the Codex
+    bot must still be detected.
+    """
+
+    def test_is_coordination_comment_detects_re_requesting(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "Re-requesting Codex review on 3982ee6 (Fix AF)."
+        ))
+
+    def test_is_coordination_comment_detects_re_request(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "Re-request on commit a9555afaea44d13c02c67ab22ba1bc34e2e81009."
+        ))
+
+    def test_is_coordination_comment_detects_gentle_nudge(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "Gentle nudge to @chatgpt-codex-connector — Fix AF pushed."
+        ))
+
+    def test_is_coordination_comment_detects_bumping(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "Bumping this thread — Fix AG is now on 266a92e."
+        ))
+
+    def test_is_coordination_comment_detects_nudge_to_at(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "Quick nudge to @codex — please re-review."
+        ))
+
+    def test_is_coordination_comment_case_insensitive(self):
+        self.assertTrue(crc.is_coordination_comment(
+            "RE-REQUESTING codex review."
+        ))
+
+    def test_is_coordination_comment_rejects_real_finding(self):
+        # A real Codex review finding must NOT be classified as
+        # a coordination comment.
+        self.assertFalse(crc.is_coordination_comment(
+            "**<sub><sub>![P1 Badge](https://img.shields.io/badge/P1-orange) "
+            "Emit a real newline marker**"
+        ))
+
+    def test_is_coordination_comment_rejects_plain_text(self):
+        self.assertFalse(crc.is_coordination_comment(
+            "Looks good to me."
+        ))
+
+    def test_is_coordination_comment_rejects_empty(self):
+        self.assertFalse(crc.is_coordination_comment(""))
+
+    def test_is_coordination_comment_handles_none(self):
+        # Defensive: None body must not crash.
+        self.assertFalse(crc.is_coordination_comment(None))  # type: ignore[arg-type]
+
+    def test_human_re_requesting_issue_comment_not_classified(self):
+        """The exact blocker from PR #405 run on 266a92e: a
+        human issue comment by the PR author re-requesting
+        Codex review must not produce a finding."""
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": (
+                "Re-requesting Codex review on 3982ee6 (Fix AF). "
+                "The active P1 current-head finding from the previous "
+                "review has been addressed.\n\n"
+                "- 3443990130 (Fix AF): validate_checkpoint() now "
+                "also validates that a present phase is a string."
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Re-requesting Codex review...' issue comment "
+            "must not be classified as a finding"
+        )
+
+    def test_human_gentle_nudge_issue_comment_not_classified(self):
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": (
+                "Gentle nudge to @chatgpt-codex-connector — "
+                "Fix AF (Codex 3443990130) pushed in 3982ee6, "
+                "CI is 5/5 green, local tests pass."
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Gentle nudge to @codex' issue comment must "
+            "not be classified as a finding"
+        )
+
+    def test_human_at_codex_mention_not_classified(self):
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": "@codex review\n\nFix L (Codex 3422779962) addresses...",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human '@codex review' issue comment must not be "
+            "classified as a finding"
+        )
+
+    def test_human_bumping_issue_comment_not_classified(self):
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": "Bumping this — Fix AG is now on 266a92e, CI green.",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Bumping' issue comment must not be classified "
+            "as a finding"
+        )
+
+    def test_human_coordination_inline_review_not_classified(self):
+        """Coordination comments posted as inline review comments
+        must also be skipped, not just issue comments."""
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": "Re-requesting Codex review on this thread.",
+            "path": "aed_lifecycle/no_stall.py",
+            "line": 1118,
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human coordination inline review comment must not "
+            "be classified as a finding"
+        )
+
+    def test_actual_codex_review_finding_still_detected(self):
+        """An actual Codex review finding must still be detected
+        after the coordination-comment fix."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "**<sub><sub>![P1 Badge]"
+                "(https://img.shields.io/badge/P1-orange) "
+                "Emit a real newline marker**"
+            ),
+            "path": "scripts/local/run_temp_worktree_execution.py",
+            "line": 1821,
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1, "Actual Codex P1 finding must be detected")
+        self.assertEqual(got[0]["severity"], "P1")
+        self.assertEqual(got[0]["user"], "chatgpt-codex-connector[bot]")
+
+    def test_actual_codex_p2_finding_still_detected(self):
+        """An actual Codex P2 review finding must still be detected."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "**<sub><sub>![P2 Badge]"
+                "(https://img.shields.io/badge/P2-yellow) "
+                "Parse spaced checkpoint_path assignments**"
+            ),
+            "path": "aed_lifecycle/no_stall.py",
+            "line": 1118,
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, "Actual Codex P2 finding must be detected")
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_existing_p2_issue_comment_still_classified(self):
+        """The pre-existing test_p2_issue_comment scenario (a
+        non-Codex user posting a P2 finding) must still work."""
+        item = {
+            "user": {"login": "codex-reviewer"},
+            "body": "### P2\nValidate literal base SHA as object",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1, "Non-coordination P2 finding must still be detected")
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_existing_unspecified_blocking_still_classified(self):
+        """The pre-existing test_unspecified_blocking scenario must
+        still work."""
+        item = {
+            "user": {"login": "safety-bot"},
+            "body": "Codex finding: CRITICAL — shell=True found in subprocess call — must fix",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1, "Non-coordination blocking finding must still be detected")
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_BLOCKING")
+
+    def test_ignore_user_still_works(self):
+        """The pre-existing ignore-users behavior must still work."""
+        item = {
+            "user": {"login": "alice"},
+            "body": "P1: this is a finding",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", {"alice"})
+        self.assertEqual(got, [], "Ignored user must still be skipped")
+
+    def test_no_findings_when_no_needles_still_works(self):
+        """The pre-existing no-needles test must still work."""
+        item = {"user": {"login": "alice"}, "body": "looks good to me"}
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(got, [])
+
+    def test_high_maps_to_p1_still_works(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "High severity: path traversal risk",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_medium_maps_to_p2_still_works(self):
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "Medium: test coverage gap",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+
 class TestDedup(unittest.TestCase):
     def test_exact_duplicate_removed(self):
         item = {

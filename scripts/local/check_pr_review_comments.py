@@ -68,6 +68,44 @@ BLOCKING_WORDS = (
     "ready false positive",
 )
 
+# Coordination comment patterns (case-insensitive substrings).
+# Human PR authors post "Re-requesting Codex review..." or
+# "Gentle nudge to @chatgpt-codex-connector..." issue comments
+# after pushing fixes. These are coordination messages, not
+# actual findings, but they contain Codex needles and were
+# being misclassified as blocking findings. The gate must
+# skip them while still detecting real Codex review findings.
+_COORDINATION_PATTERNS = (
+    "re-requesting",
+    "re-request",
+    "gentle nudge",
+    "bumping",
+    "nudge to @",
+    # Any direct @-mention of the Codex bot (e.g. ``@codex
+    # review``) is a coordination signal from the human PR
+    # author asking the bot to re-review. The
+    # ``chatgpt-codex-connector[bot]`` user is already excluded
+    # by ``--ignore-users``, so this only fires for human
+    # comments that mention @codex.
+    "@codex",
+)
+
+
+def is_coordination_comment(body: str) -> bool:
+    """Return True if ``body`` matches a coordination-comment
+    pattern (human PR-author messages that re-request Codex
+    review, nudge the Codex bot, or describe which fix addresses
+    a prior finding).
+
+    These comments contain Codex needles and would otherwise be
+    misclassified as blocking findings, even though they are
+    coordination messages and not actual review findings. The
+    check is case-insensitive substring matching against
+    :data:`_COORDINATION_PATTERNS`.
+    """
+    body_lower = (body or "").lower()
+    return any(pat in body_lower for pat in _COORDINATION_PATTERNS)
+
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
 SEVERITY_MAP = {
     "high": "P1",
@@ -282,6 +320,19 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
         return findings
 
     body = item.get("body") or ""
+
+    # Human PR-author coordination comments (re-requests, nudges,
+    # fix descriptions) are NOT findings. They contain Codex
+    # needles and would otherwise be misclassified as blocking
+    # findings. The check is source-agnostic: any comment body
+    # matching a coordination pattern is skipped, regardless of
+    # whether it arrived as an issue comment, inline review
+    # comment, or review submission. This prevents false-positive
+    # gate failures caused by the human workflow of re-requesting
+    # Codex review after each fix push.
+    if is_coordination_comment(body):
+        return findings
+
     state = item.get("state") or ""
     file_path = item.get("path") or ""
     line = item.get("line") or item.get("original_line") or ""
