@@ -1994,6 +1994,107 @@ class NarrowCITokenMatchingTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Section 19b: Fix AP — Recognize snake_case CI watchdog actions
+#              (Codex Finding AP / PRRT_kwDOSHFpYM6K9eBX)
+# ---------------------------------------------------------------------------
+
+
+class SnakeCaseCITokenMatchingTests(unittest.TestCase):
+    """Fix AP: snake_case CI action variants must be classified as
+    ``HOLD_PR_CI_PENDING`` instead of falling through to
+    ``HOLD_OPERATOR_REQUIRED``. The space-separated alternatives in
+    ``_CI_TOKEN_PATTERN`` only match forms like ``status checks``;
+    the new snake_case alternatives (``poll_pr_ci``, ``pr_ci``,
+    ``status_checks``, ``required_checks``) cover the underscores.
+    """
+
+    def _state(self, next_action: str) -> WatchdogState:
+        return WatchdogState(
+            phase_name="PHASE_X",
+            started_at=0.0,
+            last_progress_at=0.0,
+            max_idle_seconds=10000.0,
+            max_phase_seconds=1800.0,
+            next_action=next_action,
+            checkpoint_path="/tmp/ckpt.json",
+            terminal_state=None,
+        )
+
+    # --- Spec positives: these ARE CI (snake_case) ---
+
+    def test_poll_pr_ci_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("poll_pr_ci"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_poll_pr_ci_with_prefix_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("wait for poll_pr_ci status"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_pr_ci_bare_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(self._state("poll pr_ci"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_status_checks_singular_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("wait for status_check"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_status_checks_plural_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("wait for status_checks"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_required_checks_singular_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("required_check pending"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_required_checks_plural_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("required_checks pending"), now=10000.0
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    def test_poll_pr_ci_prose_is_ci_pending(self) -> None:
+        self.assertEqual(
+            evaluate_watchdog(
+                self._state("continue polling poll_pr_ci for status"),
+                now=10000.0,
+            ),
+            "HOLD_PR_CI_PENDING",
+        )
+
+    # --- Spec negatives: these are NOT CI ---
+
+    def test_pr_ci_bare_action_routes_to_ci_hold_not_operator(self) -> None:
+        # ``pr_ci`` alone must be classified as CI pending
+        # rather than falling through to the operator fallback.
+        self.assertEqual(
+            evaluate_watchdog(self._state("pr_ci"), now=10000.0),
+            "HOLD_PR_CI_PENDING",
+        )
+
+
+# ---------------------------------------------------------------------------
 # Section 20: Fix D — checkpoint_requires_operator uses canonical
 #             next_action validity check (Codex 3414948261)
 # ---------------------------------------------------------------------------

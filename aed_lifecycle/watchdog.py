@@ -435,6 +435,21 @@ _CI_TOKEN_PATTERN = re.compile(
     r"|\btest\s+run\b"
     r"|\bstatus\s+checks?\b"
     r"|\brequired\s+checks?\b"
+    # Fix AP (Codex 3443990130 successor — Finding AP):
+    # snake_case CI action variants. The space-separated
+    # alternatives above only match forms like ``status
+    # checks`` or ``required checks``; the
+    # ``_CI_IDENTIFIER_BOUNDARY`` explicitly disallows
+    # underscores next to ``ci``, so ``poll_pr_ci``,
+    # ``pr_ci``, ``status_checks``, and ``required_checks``
+    # would all fall through to the generic
+    # ``HOLD_OPERATOR_REQUIRED`` instead of the CI-specific
+    # ``HOLD_PR_CI_PENDING``. The four new alternatives
+    # below cover these snake_case forms.
+    r"|\bpoll_pr_ci\b"
+    r"|\bpr_ci\b"
+    r"|\bstatus_checks?\b"
+    r"|\brequired_checks?\b"
     r"|"
     + _CI_IDENTIFIER_BOUNDARY
 )
