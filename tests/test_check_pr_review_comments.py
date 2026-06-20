@@ -516,6 +516,80 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         body = "Must fix: Bumping retry counter can skip failures"
         self.assertFalse(crc.is_coordination_comment(body))
 
+    def test_aq_blocking_word_in_body_blocks_coordination(self):
+        """Regression for Codex finding AQ: a body that starts
+        with a coordination pattern (``Bumping``) AND contains
+        a blocking-word indicator (``can fail``) anywhere must
+        NOT be dropped as a coordination comment. Real
+        coordination messages like ``Bumping this thread —
+        Fix AG is now on 266a92e.`` never contain blocking
+        vocabulary, so this guard doesn't affect them.
+        """
+        body = (
+            "Bumping the retry counter can fail when Codex "
+            "reruns after a stale head"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_aq_re_requesting_with_must_fix_not_coordination(self):
+        """Regression for Codex finding AQ: a body that starts
+        with ``Re-requesting`` AND contains ``must fix``
+        (BLOCKING_WORDS) anywhere must NOT be dropped as a
+        coordination comment.
+        """
+        body = (
+            "Re-requesting this because the must fix test is "
+            "still failing"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_aq_gentle_nudge_with_stale_not_coordination(self):
+        """Regression for Codex finding AQ: a body that starts
+        with ``Gentle nudge`` AND contains ``stale`` (a
+        BLOCKING_WORDS indicator) must NOT be dropped as a
+        coordination comment.
+        """
+        body = (
+            "Gentle nudge — the stale head ref is still wrong, "
+            "must fix"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_aq_bumping_with_path_traversal_not_coordination(self):
+        """Regression for Codex finding AQ: ``Bumping`` at start
+        with ``path traversal`` (BLOCKING_WORDS) anywhere in
+        the body must NOT be dropped as coordination.
+        """
+        body = (
+            "Bumping this thread — the new helper introduces "
+            "a path traversal risk in the input parser"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_aq_classify_aq_finding_detected(self):
+        """End-to-end: the exact Codex finding AQ scenario — a
+        body starting with ``Bumping`` and containing
+        ``can fail`` and ``stale`` — must be detected by
+        ``classify_item`` rather than silently dropped.
+        """
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "Bumping the retry counter can fail when Codex "
+                "reruns after a stale head"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertGreaterEqual(
+            len(got), 1,
+            "Codex AQ finding with blocking vocabulary must "
+            "NOT be dropped by coordination skip",
+        )
+        # The finding should be classified as blocking
+        # because of the blocking-word indicators.
+        self.assertIn(got[0]["severity"], ("UNSPECIFIED_BLOCKING", "P2"))
+
     def test_classify_high_severity_bumping_detected(self):
         """End-to-end: ``High severity: Bumping ...`` must be
         detected by classify_item as P1."""

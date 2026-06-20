@@ -184,6 +184,31 @@ def is_coordination_comment(body: str) -> bool:
     # as findings, while still skipping coordination messages
     # that begin with ``Re-requesting``, ``Gentle nudge``,
     # ``Bumping``, etc.
+    #
+    # Guard 5 (Fix AQ, Codex Finding AQ): a body that STARTS
+    # with a coordination pattern must NOT be treated as a
+    # coordination comment if it ALSO contains a blocking-word
+    # indicator within the LEADING 100 characters. Real
+    # coordination messages like ``Re-requesting Codex review
+    # on 3982ee6 (Fix AF). The active P1 current-head
+    # finding ...`` or ``Bumping this thread — Fix AG is now
+    # on 266a92e.`` are typically 100+ characters and only
+    # mention blocking vocabulary (``stale``, ``malformed``)
+    # in the meta-discussion about which fix addressed which
+    # prior finding, well past the leading 100 characters.
+    #
+    # Real blocker findings that happen to start with a
+    # coordination word — e.g. ``Bumping the retry counter can
+    # fail when Codex reruns after a stale head`` — DO
+    # contain blocking vocabulary (``can fail``, ``stale``)
+    # tightly within the leading 100 characters and must be
+    # detected as findings rather than silently dropped.
+    # The previous ``startswith``-only check returned before
+    # ``is_blocking()`` could run, so the gate could report
+    # clean despite an unresolved blocker.
+    leading = body_str[:100].lower()
+    if any(bw in leading for bw in BLOCKING_WORDS):
+        return False
     return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
 
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
