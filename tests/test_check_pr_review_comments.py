@@ -433,6 +433,38 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         # are never dropped.
         self.assertTrue(crc.is_coordination_comment(body))
 
+    def test_bracketed_p1_finding_not_coordination(self):
+        """Regression for Codex finding AM: a bracketed priority
+        finding like ``[P1] ...`` must NOT be treated as a
+        coordination comment, even if it contains a coordination
+        word like 'bumping'."""
+        body = "[P1] Bumping the retry counter can skip failures"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_bracketed_p2_finding_not_coordination(self):
+        body = "[P2] @codex review missed a regression"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_bracketed_p0_finding_not_coordination(self):
+        body = "[P0] Re-requesting review on this critical path"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_bracketed_p1_bumping_detected_by_classify(self):
+        """The exact Codex finding AM scenario: a bracketed P1
+        finding containing 'bumping' must still be detected by
+        classify_item."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "[P1] Bumping the retry counter can skip failures",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            len(got), 1,
+            "Bracketed P1 finding with 'bumping' must be detected"
+        )
+        self.assertEqual(got[0]["severity"], "P1")
+
     def test_actual_codex_p2_finding_still_detected(self):
         """An actual Codex P2 review finding must still be detected."""
         item = {

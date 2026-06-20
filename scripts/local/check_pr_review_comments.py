@@ -120,14 +120,16 @@ def is_coordination_comment(body: str) -> bool:
 
     Guard 2: a body that contains a badge-style severity marker
     (``![P0 Badge]``, ``![P1 Badge]``, ``![P2 Badge]``,
-    ``![P3 Badge]``) is NEVER treated as a coordination
-    comment, even if it also matches a coordination pattern.
-    Badge-formatted findings are always real findings — the
-    badge format is the standard Codex output format and
-    indicates an actual review finding rather than a
-    coordination message. Without this guard, a finding like
+    ``![P3 Badge]``) or a bracketed priority marker
+    (``[P0]``, ``[P1]``, ``[P2]``) is NEVER treated as a
+    coordination comment, even if it also matches a
+    coordination pattern. Badge-formatted and bracketed
+    findings are always real findings — these formats
+    indicate actual review findings rather than coordination
+    messages. Without this guard, a finding like
     ``![P1 Badge] Bumping the retry counter can skip failures``
-    would be silently dropped (Codex finding AK).
+    or ``[P1] Bumping the retry counter can skip failures``
+    would be silently dropped (Codex findings AK and AM).
     """
     body_str = body or ""
     upper = body_str.upper()
@@ -137,6 +139,9 @@ def is_coordination_comment(body: str) -> bool:
             return False
         # Guard 2: badge-style severity marker.
         if f"![{sev} BADGE]" in upper:
+            return False
+        # Guard 3: bracketed priority marker.
+        if f"[{sev}]" in upper:
             return False
     body_lower = body_str.lower()
     return any(pat in body_lower for pat in _COORDINATION_PATTERNS)
