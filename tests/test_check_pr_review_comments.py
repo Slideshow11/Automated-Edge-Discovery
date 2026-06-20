@@ -375,6 +375,64 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "P3: Bumping this thread"
         ))
 
+    def test_badge_finding_with_bumping_not_coordination(self):
+        """Regression for Codex finding AK: a badge-formatted
+        finding containing a coordination word like 'bumping'
+        must NOT be treated as a coordination comment."""
+        body = (
+            "**<sub><sub>![P1 Badge]"
+            "(https://img.shields.io/badge/P1-orange) "
+            "Bumping the retry counter can skip failures**"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_badge_finding_with_at_codex_not_coordination(self):
+        body = (
+            "**<sub><sub>![P2 Badge]"
+            "(https://img.shields.io/badge/P2-yellow) "
+            "@codex review missed a regression**"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_badge_finding_with_re_requesting_not_coordination(self):
+        body = (
+            "**<sub><sub>![P0 Badge]"
+            "(https://img.shields.io/badge/P0-red) "
+            "Re-requesting review on this critical path**"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_badge_finding_p2_bumping_detected_by_classify(self):
+        """The exact Codex finding AK scenario: a P2 badge finding
+        containing 'bumping' must still be detected by classify_item."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": (
+                "**<sub><sub>![P2 Badge]"
+                "(https://img.shields.io/badge/P2-yellow) "
+                "Bumping the retry counter can skip failures**"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1, "Badge finding with 'bumping' must be detected")
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_p3_badge_still_skipped(self):
+        """P3 is not blocking. A P3 badge with coordination
+        pattern is still skipped (non-blocking info)."""
+        body = (
+            "**<sub><sub>![P3 Badge]"
+            "(https://img.shields.io/badge/P3-lightgrey) "
+            "Bumping this minor nit**"
+        )
+        # P3 badge: guard 2 does NOT apply (only P0/P1/P2).
+        # So coordination check still runs and "bumping" matches.
+        # The finding is non-blocking anyway, so being skipped
+        # is acceptable. The important thing is P0/P1/P2 badges
+        # are never dropped.
+        self.assertTrue(crc.is_coordination_comment(body))
+
     def test_actual_codex_p2_finding_still_detected(self):
         """An actual Codex P2 review finding must still be detected."""
         item = {

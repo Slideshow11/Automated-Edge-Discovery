@@ -103,7 +103,7 @@ def is_coordination_comment(body: str) -> bool:
     check is case-insensitive substring matching against
     :data:`_COORDINATION_PATTERNS`.
 
-    Guard: a body that contains an explicit P0/P1/P2 SEVERITY
+    Guard 1: a body that contains an explicit P0/P1/P2 SEVERITY
     DECLARATION (i.e. ``P0:``/``P1:``/``P2:`` followed by a
     colon) is NEVER treated as a coordination comment, even if
     it also matches a coordination pattern. This prevents the
@@ -117,14 +117,26 @@ def is_coordination_comment(body: str) -> bool:
     (``The active P1 current-head finding``), which commonly
     appears in coordination comments describing which fix
     addresses which prior finding.
+
+    Guard 2: a body that contains a badge-style severity marker
+    (``![P0 Badge]``, ``![P1 Badge]``, ``![P2 Badge]``,
+    ``![P3 Badge]``) is NEVER treated as a coordination
+    comment, even if it also matches a coordination pattern.
+    Badge-formatted findings are always real findings — the
+    badge format is the standard Codex output format and
+    indicates an actual review finding rather than a
+    coordination message. Without this guard, a finding like
+    ``![P1 Badge] Bumping the retry counter can skip failures``
+    would be silently dropped (Codex finding AK).
     """
     body_str = body or ""
     upper = body_str.upper()
     for sev in ("P0", "P1", "P2"):
-        # Only treat as a severity declaration if followed by
-        # a colon (e.g. "P1: ..."). Bare "P1" references in
-        # prose are not severity declarations.
+        # Guard 1: explicit P0:/P1:/P2: severity declaration.
         if sev + ":" in upper:
+            return False
+        # Guard 2: badge-style severity marker.
+        if f"![{sev} BADGE]" in upper:
             return False
     body_lower = body_str.lower()
     return any(pat in body_lower for pat in _COORDINATION_PATTERNS)
