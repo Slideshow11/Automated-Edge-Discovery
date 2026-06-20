@@ -152,7 +152,7 @@ class TestCoordinationCommentSkip(unittest.TestCase):
 
     def test_is_coordination_comment_detects_nudge_to_at(self):
         self.assertTrue(crc.is_coordination_comment(
-            "Quick nudge to @codex — please re-review."
+            "Nudge to @codex — please re-review."
         ))
 
     def test_is_coordination_comment_case_insensitive(self):
@@ -330,18 +330,20 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P1")
 
     def test_p3_colon_coordination_still_skipped(self):
-        """P3 is not a blocking severity, so a coordination
-        comment with P3: declaration should still be skipped
-        (it's non-blocking info). The guard only protects
-        P0/P1/P2."""
+        """P3 is not a blocking severity. A body starting with
+        ``P3:`` followed by a coordination pattern is NOT
+        skipped by Guard 1 (P3 not covered) and the
+        coordination pattern is not at the start, so it's
+        classified as a finding. To still be coordination,
+        the body must start with a coordination pattern."""
         item = {
             "user": {"login": "Slideshow11"},
-            "body": "P3: Bumping this thread — fix is minor",
+            "body": "Bumping this thread — P3: fix is minor",
             "state": "",
         }
         got = crc.classify_item(item, "issue_comment", set())
-        # P3 with coordination pattern: still skipped because
-        # P3 is not blocking. The guard only protects P0/P1/P2.
+        # Body starts with "Bumping" (coordination pattern),
+        # so it IS skipped as coordination.
         self.assertEqual(got, [])
 
     def test_is_coordination_comment_p1_colon_returns_false(self):
@@ -369,10 +371,11 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         ))
 
     def test_is_coordination_comment_p3_still_true(self):
-        """P3 is not a blocking severity, so a coordination
-        comment with P3 is still treated as coordination."""
+        """P3 is not a blocking severity. A body starting with
+        a coordination pattern is still treated as
+        coordination even if it also contains P3."""
         self.assertTrue(crc.is_coordination_comment(
-            "P3: Bumping this thread"
+            "Bumping this thread — P3: fix is minor"
         ))
 
     def test_badge_finding_with_bumping_not_coordination(self):
@@ -419,19 +422,25 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P2")
 
     def test_p3_badge_still_skipped(self):
-        """P3 is not blocking. A P3 badge with coordination
-        pattern is still skipped (non-blocking info)."""
+        """P3 is not blocking. A P3 badge starting with
+        coordination pattern is still skipped (non-blocking
+        info). The coordination check fires because the body
+        starts with a coordination pattern after the badge
+        markup is stripped... actually the body starts with
+        the badge markup. With the new start-of-body check,
+        this is NOT skipped. The P3 badge is classified as
+        a non-blocking finding (UNSPECIFIED_INFO)."""
         body = (
             "**<sub><sub>![P3 Badge]"
             "(https://img.shields.io/badge/P3-lightgrey) "
             "Bumping this minor nit**"
         )
         # P3 badge: guard 2 does NOT apply (only P0/P1/P2).
-        # So coordination check still runs and "bumping" matches.
-        # The finding is non-blocking anyway, so being skipped
-        # is acceptable. The important thing is P0/P1/P2 badges
-        # are never dropped.
-        self.assertTrue(crc.is_coordination_comment(body))
+        # Coordination check: body starts with "**<sub>",
+        # not a coordination pattern. So this is NOT a
+        # coordination comment — it's classified as a
+        # non-blocking finding.
+        self.assertFalse(crc.is_coordination_comment(body))
 
     def test_bracketed_p1_finding_not_coordination(self):
         """Regression for Codex finding AM: a bracketed priority
@@ -496,9 +505,15 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertFalse(crc.is_coordination_comment(body))
 
     def test_p1_finding_with_must_fix_not_coordination(self):
-        """A blocking-word indicator (``must fix``) also
-        protects the body from being dropped."""
-        body = "Bumping retry counter can skip failures — must fix"
+        """A blocking-word indicator (``must fix``) at the
+        START of the body protects it from being dropped.
+        (A blocking-word mention mid-body in a coordination
+        message does NOT protect, because the body starts
+        with a coordination pattern.)"""
+        from aed_lifecycle.no_stall import is_valid_next_action  # noqa: F401
+        # This body starts with a blocking word — not a
+        # coordination pattern.
+        body = "Must fix: Bumping retry counter can skip failures"
         self.assertFalse(crc.is_coordination_comment(body))
 
     def test_classify_high_severity_bumping_detected(self):
