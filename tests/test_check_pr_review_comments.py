@@ -465,6 +465,70 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         )
         self.assertEqual(got[0]["severity"], "P1")
 
+    def test_high_severity_bumping_not_coordination(self) -> None:
+        """Regression for Codex finding AO: a comment using the
+        ``High severity: ...`` text-alias form (which maps to
+        P1 via :func:`extract_severity`) must NOT be dropped as
+        a coordination comment, even if it contains a
+        coordination word like 'bumping'."""
+        body = "High severity: Bumping retry counter can skip failures"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_codex_finding_bumping_not_coordination(self) -> None:
+        """The exact Codex finding AO scenario: a comment using
+        the ``Codex finding: ... — must fix`` form (which maps
+        to UNSPECIFIED_BLOCKING via :func:`is_blocking`) must
+        NOT be dropped as a coordination comment, even if it
+        contains a coordination word like 'bumping'."""
+        body = (
+            "Codex finding: Bumping retry counter can skip "
+            "failures — must fix"
+        )
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_medium_severity_bumping_not_coordination(self):
+        """``Medium: ...`` maps to P2. Must not be dropped."""
+        body = "Medium: Bumping the retry counter is a regression"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_high_severity_at_codex_not_coordination(self):
+        body = "High severity: @codex missed a regression"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_p1_finding_with_must_fix_not_coordination(self):
+        """A blocking-word indicator (``must fix``) also
+        protects the body from being dropped."""
+        body = "Bumping retry counter can skip failures — must fix"
+        self.assertFalse(crc.is_coordination_comment(body))
+
+    def test_classify_high_severity_bumping_detected(self):
+        """End-to-end: ``High severity: Bumping ...`` must be
+        detected by classify_item as P1."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": "High severity: Bumping retry counter can skip failures",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_classify_codex_finding_bumping_detected(self):
+        """End-to-end: ``Codex finding: Bumping ... — must fix``
+        must be detected by classify_item as
+        UNSPECIFIED_BLOCKING."""
+        item = {
+            "user": {"login": "reviewer"},
+            "body": (
+                "Codex finding: Bumping retry counter can skip "
+                "failures — must fix"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertGreaterEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_BLOCKING")
+
     def test_actual_codex_p2_finding_still_detected(self):
         """An actual Codex P2 review finding must still be detected."""
         item = {

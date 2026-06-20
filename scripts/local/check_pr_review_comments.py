@@ -143,7 +143,42 @@ def is_coordination_comment(body: str) -> bool:
         # Guard 3: bracketed priority marker.
         if f"[{sev}]" in upper:
             return False
+    # Guard 4 (Fix AO, Codex Finding AO): a body that contains
+    # an explicit severity DECLARATION (in any recognized
+    # format) must NOT be dropped as a coordination comment,
+    # even if it also contains a coordination pattern. This
+    # catches the ``High severity: ...`` text-alias form
+    # (mapped to P1 by :func:`extract_severity`) and the
+    # ``Codex finding: ... — must fix`` form (mapped to
+    # UNSPECIFIED_BLOCKING by :func:`is_blocking`). Without
+    # this guard, a genuine finding like
+    # ``High severity: Bumping retry counter can skip failures``
+    # or
+    # ``Codex finding: Bumping retry counter can skip failures
+    # — must fix`` would be silently dropped by the
+    # coordination skip.
+    #
+    # The check is intentionally targeted to explicit
+    # declarations to avoid false positives from bare P-token
+    # references in coordination text (e.g. ``The active P1
+    # current-head finding``):
+    # - Text-alias declarations: ``High severity:``,
+    #   ``Medium:``, ``Low:`` (whole-word + colon).
+    # - Blocking-word indicators: any of the BLOCKING_WORDS
+    #   (e.g. ``must fix``, ``security``, ``path traversal``).
     body_lower = body_str.lower()
+    # Text-alias severity declarations.
+    text_alias_decls = (
+        "high severity:",
+        "medium:",
+        "low:",
+    )
+    if any(decl in body_lower for decl in text_alias_decls):
+        return False
+    # Blocking-word indicators.
+    if any(bw in body_lower for bw in BLOCKING_WORDS):
+        return False
+    # Now run the coordination pattern check.
     return any(pat in body_lower for pat in _COORDINATION_PATTERNS)
 
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
