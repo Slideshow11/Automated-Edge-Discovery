@@ -1309,6 +1309,274 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "'is a very very high severity issue' (2 intensifiers, same word) MUST trigger Guard 6 rescue"
         )
 
+    def test_dbID_3447899921_em_dash_priority_rescued(self):
+        """Exact-pattern regression test for the cycle-8 fresh
+        Codex P2 finding dbID 3447899921 (2026-06-21T04:20:36Z
+        on head d44c5ddaea8): 'Bumping retry is high
+        priority\u2014this skips CI' MUST be rescued by Guard 6.
+        The cycle-8 helper's token-based splitting produced
+        ``priority\u2014this`` as one token (no whitespace
+        between priority and the em-dash), which failed the
+        noun check. The cycle-9 helper inserts a whitespace
+        boundary after a severity/priority noun followed by
+        a dash separator, restoring the cycle-7 regex's
+        ``\b`` word-boundary behavior."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping retry is high priority\u2014this skips CI and must be fixed before merge",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is high priority\u2014this' (em-dash after priority) MUST trigger Guard 6 rescue (dbID 3447899921)"
+        )
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_dbID_3447899921_hyphen_priority_rescued(self):
+        """Same as above for ASCII hyphen separator."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping retry is high priority-this skips CI and must be fixed before merge",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is high priority-this' (hyphen after priority) MUST trigger Guard 6 rescue (dbID 3447899921)"
+        )
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_cycle9_en_dash_severity_rescued(self):
+        """En dash after severity must also be rescued."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this has high severity\u2013the system blocks all retries",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'has high severity\u2013' (en dash after severity) MUST trigger Guard 6 rescue (cycle 9)"
+        )
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_cycle9_hyphen_compound_severity_rescued(self):
+        """The 'has a high severity-impact case' form (hyphen
+        in compound modifier after severity) must be rescued.
+        The dash is converted to a whitespace boundary, so the
+        helper sees ``severity`` as the noun."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this has a high severity-impact case that must be fixed",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'has a high severity-impact case' (hyphen after severity) MUST trigger Guard 6 rescue (cycle 9)"
+        )
+
+    def test_cycle9_em_dash_after_intensifier_rescued(self):
+        """Em dash after the intensifier-bearing declaration
+        must also be rescued (e.g. 'is an extremely high
+        severity\u2014this matters')."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is an extremely high severity\u2014this matters and must be addressed",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is an extremely high severity\u2014' (em dash after intensifier form) MUST trigger Guard 6 rescue (cycle 9)"
+        )
+
+    def test_cycle9_dash_does_not_rescue_negation(self):
+        """The dash preprocessor must not interfere with the
+        negation path. 'is not high priority\u2014this is
+        wrong' has 'is not' which is the immediate negation
+        pattern; the helper should return False (definitive)."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review \u2014 this is not high priority\u2014please skip this re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "'is not high priority\u2014' (dash after negated priority) must NOT trigger Guard 6 rescue (cycle 9)"
+        )
+
+    def test_cycle9_compound_high_priority_no_rescue(self):
+        """The dash between 'high' and 'priority' in the
+        compound modifier 'high-priority' must NOT trigger
+        rescue — the cycle-9 preprocessor is restricted to
+        (severity|priority) + dash, not (high|medium|low) +
+        dash. The body has no coordination prefix either, so
+        is_coordination_comment returns False (the body
+        would go through extract_severity, which is a
+        separate path). This test pins the cycle-9 scope
+        invariant."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "this is a high-priority issue that should be addressed",
+            "state": "",
+        }
+        # Helper should NOT rescue (compound dash between
+        # 'high' and 'priority' is out of scope).
+        self.assertFalse(
+            crc._has_direct_text_severity_declaration(item["body"]),
+            "'high-priority' compound (dash BEFORE priority) must NOT trigger Guard 6 rescue (cycle 9 scope invariant)"
+        )
+
+
+class TestHasDirectTextSeverityDeclarationCycle9Dash(unittest.TestCase):
+    """Cycle 9 (PR #405 fresh Codex P2 finding, dbID 3447899921,
+    2026-06-21T04:20:36Z on head d44c5ddaea8): the cycle-8 helper
+    did not strip dash separators that appear immediately after
+    a severity/priority noun, so tokens like ``priority\u2014this``
+    (em dash, no whitespace) failed the noun check. Cycle 9:
+
+      1. extends ``_TEXT_SEVERITY_TRAILING_PUNCT`` to include
+         ASCII hyphen (``-``), em dash (``\u2014``), and en dash
+         (``\u2013``), AND
+      2. adds a noun-boundary regex preprocessor that inserts a
+         whitespace token boundary immediately after a recognized
+         severity/priority noun followed by a dash.
+
+    The preprocessor is restricted to ``(severity|priority) +
+    dash`` so it does not affect compound words like
+    ``high-priority issue`` (where the dash is between ``high``
+    and ``priority``, neither of which is the noun itself).
+
+    These tests verify the cycle 9 fix on both the helper
+    directly (table-driven) and end-to-end via the gate.
+    """
+
+    POSITIVE_CASES = (
+        # Required by auth prompt — dash variants.
+        ("em dash after priority — dbID 3447899921 exact",
+         "Bumping retry is high priority\u2014this skips CI", True),
+        ("hyphen after priority — dbID 3447899921 variant",
+         "is high priority-this skips CI", True),
+        ("em dash after severity",
+         "has high severity\u2014this is blocking", True),
+        ("hyphen in compound modifier after severity",
+         "has a high severity-impact case", True),
+        ("em dash after intensifier form",
+         "is an extremely high severity\u2014this matters", True),
+        # Additional cycle 9 dash forms.
+        ("en dash after severity",
+         "is high severity\u2013this matters", True),
+        ("en dash after priority",
+         "has high priority\u2013this is blocking", True),
+        ("em dash after medium priority",
+         "is medium priority\u2014please check", True),
+        ("hyphen after medium severity",
+         "is medium severity-must fix", True),
+        ("em dash after low severity with article",
+         "has a low severity\u2014please recheck", True),
+    )
+
+    NEGATIVE_CASES = (
+        # Required by auth prompt — preserve prior negative behavior.
+        ("negation",
+         "is not high priority", False),
+        ("meta 'classified as'",
+         "classified as high priority", False),
+        ("context 'with ...'",
+         "with high priority context", False),
+        ("P0/P1/P2 taxonomy",
+         "P0/P1/P2 severity taxonomy", False),
+        ("bare noun phrase",
+         "high priority context only", False),
+        # Dash must NOT rescue negated forms.
+        ("dash after negated priority (definitive)",
+         "is not high priority\u2014please skip", False),
+        ("dash after negated severity (definitive)",
+         "has no high severity\u2014this is wrong", False),
+        # Dash must NOT rescue meta forms.
+        ("dash after classified-as form",
+         "classified as high priority\u2014with extras", False),
+        ("dash after with-context form",
+         "with high priority context\u2014please recheck", False),
+        # Compound with dash BEFORE the noun must NOT match (dash
+        # only triggers when AFTER severity/priority).
+        ("dash between 'high' and 'priority' (compound)",
+         "is a high-priority issue", False),
+        # Meta 'described as' with dash after priority.
+        ("described as + dash",
+         "described as a high priority issue\u2014fixed", False),
+    )
+
+    def test_positive_cases_table(self):
+        for desc, text, expected in self.POSITIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    True,
+                    f"Positive case '{desc}': text={text!r} should return True"
+                )
+
+    def test_negative_cases_table(self):
+        for desc, text, expected in self.NEGATIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    False,
+                    f"Negative case '{desc}': text={text!r} should return False"
+                )
+
+    def test_cycle9_no_regression_on_cycle8_positive(self):
+        """All cycle-8 positive forms must still rescue after
+        cycle 9. Run a sanity check on a representative set."""
+        cycle8_positive = [
+            "is high priority",
+            "is a high priority issue",
+            "is an high severity issue",
+            "is an extremely high severity issue",
+            "has high severity",
+            "has a high severity impact",
+            "has an extremely high priority impact",
+            "this is a very high severity issue",
+            "this has a clearly high priority impact",
+            "is medium priority",
+            "is low severity",
+            "this is a very extremely high severity issue",
+        ]
+        for text in cycle8_positive:
+            with self.subTest(text=text):
+                self.assertTrue(
+                    crc._has_direct_text_severity_declaration(text),
+                    f"Cycle-8 positive regression: {text!r} must still rescue"
+                )
+
+    def test_cycle9_no_regression_on_cycle8_negative(self):
+        """All cycle-8 negative forms must still NOT rescue
+        after cycle 9."""
+        cycle8_negative = [
+            "is not high priority",
+            "is not a high priority issue",
+            "has no high severity impact",
+            "not high severity",
+            "classified as high priority",
+            "flagged as high severity",
+            "described as a high priority issue",
+            "with high priority context",
+            "with high severity language",
+            "P0/P1/P2 severity taxonomy",
+            "high priority context only",
+            "not actually high priority",
+            "is no longer high severity",
+        ]
+        for text in cycle8_negative:
+            with self.subTest(text=text):
+                self.assertFalse(
+                    crc._has_direct_text_severity_declaration(text),
+                    f"Cycle-8 negative regression: {text!r} must still NOT rescue"
+                )
+
 
 class TestHasDirectTextSeverityDeclaration(unittest.TestCase):
     """Table-driven unit tests for the cycle-8 helper
@@ -1471,6 +1739,15 @@ class TestHasDirectTextSeverityDeclaration(unittest.TestCase):
         self.assertIn("no", crc._TEXT_SEVERITY_NEGATIONS)
         # MAX_INTENSIFIERS is 2 per design constraint.
         self.assertEqual(crc._MAX_TEXT_SEVERITY_INTENSIFIERS, 2)
+        # Cycle 9: trailing punct set must include dash separators
+        # (dbID 3447899921) so that tokens like ``priority\u2014this``
+        # are split into ``priority`` + ``this`` via the helper's
+        # noun-boundary regex preprocessor.
+        for ch in ("-", "\u2014", "\u2013"):
+            self.assertIn(
+                ch, crc._TEXT_SEVERITY_TRAILING_PUNCT,
+                f"dash {ch!r} must be in _TEXT_SEVERITY_TRAILING_PUNCT (cycle 9)"
+            )
 
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):

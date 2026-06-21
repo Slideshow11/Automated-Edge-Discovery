@@ -159,7 +159,18 @@ _TEXT_SEVERITY_NOUNS_SET = frozenset(_TEXT_SEVERITY_NOUNS)
 # The cycle-7 regex used ``\b`` word boundaries which tolerate
 # this; the cycle-8 token-based helper strips a small set of
 # trailing punctuation characters to preserve the same behavior.
-_TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}"
+#
+# Cycle 9 (PR #405 fresh Codex P2 finding, 2026-06-21T04:20:36Z
+# on head d44c5ddaea8, dbID 3447899921): the cycle-8 punct set
+# did NOT include dash separators, so real Codex findings phrased
+# with em-dash / en-dash / hyphen separators (e.g. ``Bumping
+# retry is high priority—this skips CI``) had ``priority—this``
+# as a single token after ``.split()`` and ``.rstrip()`` did not
+# strip the dash. The cycle-7 regex's ``\b`` word boundary
+# accepted these common Markdown separators. Cycle 9 adds the
+# three dash characters (``-``, ``—``, ``–``) to the trailing
+# punct set so the helper matches the cycle-7 behavior again.
+_TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}-—–"
 
 
 def _has_direct_text_severity_declaration(leading_text: str) -> bool:
@@ -214,7 +225,23 @@ def _has_direct_text_severity_declaration(leading_text: str) -> bool:
     """
     if not leading_text:
         return False
-    raw_tokens = leading_text.lower().split()
+    text = leading_text.lower()
+    # Cycle 9 (dbID 3447899921): insert a whitespace token
+    # boundary immediately after a recognized severity/priority
+    # noun when it is followed (with no whitespace) by a dash
+    # separator. This converts tokens like ``priority\u2014this``
+    # (a single token after ``.split()``) into the two-token
+    # sequence ``priority this``, so the noun check succeeds.
+    # The substitution is restricted to (severity|priority) +
+    # dash so it does not affect other compound words (e.g.
+    # ``high-priority issue`` keeps its dash intact because
+    # ``high`` is not a severity/priority noun).
+    text = re.sub(
+        r"\b(severity|priority)([\-\u2014\u2013])",
+        r"\1 \2",
+        text,
+    )
+    raw_tokens = text.split()
     # Strip trailing punctuation so ``priority:`` matches the
     # ``priority`` noun entry (the cycle-7 regex tolerated this
     # via ``\b`` word boundaries).
