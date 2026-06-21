@@ -400,17 +400,64 @@ def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
 def extract_severity(text: str) -> str | None:
     """Return P0-P3 from text or None if not found.
 
-    P0/P1/P2/P3 tokens are matched as substrings (case-insensitive)
-    because they are short, unambiguous tokens. The
-    ``high``/``medium``/``low`` aliases are matched as whole
-    WORDS using regex word boundaries, so that substrings like
-    ``highlight``, ``mediumship``, or ``below`` do not falsely
-    match (Codex finding AI).
+    Priority order (highest specificity first):
+
+    1. Badge-style severity marker: ``![P0 Badge]``, ``![P1 Badge]``,
+       ``![P2 Badge]``, ``![P3 Badge]``. The badge URL contains
+       ``badge/P1-orange`` etc. which would otherwise be matched as
+       a plain ``P1`` substring; the badge wrapper is the
+       unambiguous signal that the author is declaring severity.
+    2. Bracketed priority marker: ``[P0]``, ``[P1]``, ``[P2]``,
+       ``[P3]``. This is the second-most-specific declaration form
+       used by some Codex findings.
+    3. Explicit colon declaration: ``P0:``, ``P1:``, ``P2:``,
+       ``P3:`` followed by a colon. The colon distinguishes a
+       declaration from a reference (e.g. "the active P1
+       current-head finding has been addressed" contains ``P1``
+       but not ``P1:``).
+    4. Plain ``P0``/``P1``/``P2``/``P3`` substring (the previous
+       behavior). Kept last because it is the most ambiguous:
+       a comment body that documents the severity taxonomy
+       ("P0/P1/P2 findings") contains all three tokens; the
+       first one (``P0``) would otherwise be picked
+       incorrectly.
+    5. Text-alias ``high``/``medium``/``low`` matched as whole
+       WORDS using regex word boundaries. Same rationale as
+       before (Codex finding AI).
+
+    Codex findings K87fX (Do not skip bracketed priority
+    findings) and K8vlc (Narrow coordination skips) both have
+    bodies that include ``P0/P1/P2`` as part of describing the
+    severity taxonomy. Under the previous substring-first order,
+    these were misclassified as P0 even though the actual
+    declared severity is P1 (K87fX) and P2 (K8vlc). The
+    badge-priority fix ensures the declared severity is the
+    one returned, not the first substring match.
     """
     upper = text.upper()
+
+    # Priority 1: badge-style severity marker.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"![{sev} BADGE]" in upper:
+            return sev
+
+    # Priority 2: bracketed priority marker.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"[{sev}]" in upper:
+            return sev
+
+    # Priority 3: explicit colon declaration.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if sev + ":" in upper:
+            return sev
+
+    # Priority 4: plain P-token substring (legacy behavior,
+    # only reached if no more-specific form was found).
     for sev in ("P0", "P1", "P2", "P3"):
         if sev in upper:
             return sev
+
+    # Priority 5: text-alias severity declarations.
     for token, sev in SEVERITY_MAP.items():
         # Use regex word-boundary matching for the text aliases
         # to avoid false positives like "highlight" matching

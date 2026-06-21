@@ -787,6 +787,109 @@ class TestExtractSeverityWordBoundary(unittest.TestCase):
         self.assertEqual(got[0]["severity"], "P2")
 
 
+class TestExtractSeverityBadgePriority(unittest.TestCase):
+    """Regression for Codex findings K87fX and K8vlc (PR #405
+    repair). When a comment body documents the severity taxonomy
+    (e.g. "P0/P1/P2 findings") AND declares a specific severity
+    via badge/bracket/colon, the declared severity must win.
+    The previous substring-first order returned the first
+    P-token match, which was P0 in bodies that mentioned the
+    P0/P1/P2 sequence before the declared P1 or P2.
+    """
+
+    def test_p1_badge_beats_p0_substring_in_taxonomy_body(self):
+        # K87fX scenario: the body has ![P1 Badge] AND mentions
+        # the P0/P1/P2 taxonomy. The declared P1 must win.
+        body = (
+            "<sub><sub>![P1 Badge]</sub></sub> Do not skip bracketed priority findings. "
+            "When an actual review finding uses the bracketed priority format, "
+            "e.g. [P1] Bumping the retry counter, this guard does not exempt it "
+            "because it only recognizes P0/P1/P2: and badge syntax before applying "
+            "the broad coordination substrings."
+        )
+        self.assertEqual(crc.extract_severity(body), "P1")
+
+    def test_p2_badge_beats_p0_substring_in_taxonomy_body(self):
+        # K8vlc scenario: the body has ![P2 Badge] AND mentions
+        # the P0/P1/P2 taxonomy. The declared P2 must win.
+        body = (
+            "<sub><sub>![P2 Badge]</sub></sub> Narrow coordination skips before dropping findings. "
+            "For example, a human review comment like P1: @codex flagged a security issue; "
+            "must fix or P1: this bumping retry logic can fail. please restrict the skip "
+            "to clearly identified PR-author coordination comments or classify explicit "
+            "P0/P1/P2 findings first."
+        )
+        self.assertEqual(crc.extract_severity(body), "P2")
+
+    def test_bracketed_priority_beats_substring(self):
+        # The body has [P1] (bracketed) and P0 as a substring.
+        # The bracketed form should win.
+        body = "P0/P1/P2 finding forms: [P1] Bumping the retry counter"
+        self.assertEqual(crc.extract_severity(body), "P1")
+
+    def test_colon_form_beats_substring(self):
+        # The body has P1: and P0 as a substring.
+        # The colon form should win.
+        body = "P0/P1/P2 findings exist. P1: this is the actual severity."
+        self.assertEqual(crc.extract_severity(body), "P1")
+
+    def test_badge_beats_bracket_and_colon(self):
+        # If multiple specific forms are present, the highest-priority
+        # (badge) wins. This is a tie-breaker, not a regression.
+        body = "[P0] P1: something ![P2 Badge]"
+        self.assertEqual(crc.extract_severity(body), "P2")
+
+    def test_plain_substring_still_works_when_no_specific_form(self):
+        # Backwards compatibility: if no badge/bracket/colon form
+        # is present, the plain P-token substring still matches.
+        self.assertEqual(crc.extract_severity("this is a P0 critical bug"), "P0")
+        self.assertEqual(crc.extract_severity("this is a P1 important bug"), "P1")
+        self.assertEqual(crc.extract_severity("this is a P2 minor issue"), "P2")
+        self.assertEqual(crc.extract_severity("this is a P3 nit"), "P3")
+
+    def test_p0_with_mentions_of_p1_p2_substring_still_returns_p0(self):
+        # If a comment declares P0 and only mentions the P1/P2 taxonomy
+        # in passing, P0 should still be returned. This was the
+        # previous behavior and is preserved.
+        body = "P0: critical bug. Note that P1/P2 findings are also relevant."
+        self.assertEqual(crc.extract_severity(body), "P0")
+
+    def test_classify_item_k87fx_severity(self):
+        """End-to-end: classify_item on the K87fX body must return P1."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "<sub><sub>![P1 Badge]</sub></sub> Do not skip bracketed priority findings. "
+                "When an actual review finding uses the bracketed priority format, "
+                "e.g. [P1] Bumping the retry counter can skip failures, this guard "
+                "does not exempt it because it only recognizes P0/P1/P2: and badge "
+                "syntax before applying the broad coordination substrings."
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_classify_item_k8vlc_severity(self):
+        """End-to-end: classify_item on the K8vlc body must return P2."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "<sub><sub>![P2 Badge]</sub></sub> Narrow coordination skips before dropping findings. "
+                "For example, a human review comment like P1: @codex flagged a security issue; "
+                "must fix or P1: this bumping retry logic can fail now returns no finding, so the "
+                "gate can report clean despite an unresolved blocker; please restrict the skip to "
+                "clearly identified PR-author coordination comments or classify explicit P0/P1/P2 "
+                "findings first."
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+
 class TestGhApiSlurpPagination(unittest.TestCase):
     """Regression for Codex finding AH: ``gh_api`` must use
     ``--slurp`` so that multi-page responses are wrapped into
