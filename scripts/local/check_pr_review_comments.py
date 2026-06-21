@@ -23,6 +23,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -68,6 +69,454 @@ BLOCKING_WORDS = (
     "ready false positive",
 )
 
+# Coordination comment patterns (case-insensitive substrings).
+# Human PR authors post "Re-requesting Codex review..." or
+# "Gentle nudge to @chatgpt-codex-connector..." issue comments
+# after pushing fixes. These are coordination messages, not
+# actual findings, but they contain Codex needles and were
+# being misclassified as blocking findings. The gate must
+# skip them while still detecting real Codex review findings.
+_COORDINATION_PATTERNS = (
+    "re-requesting",
+    "re-request",
+    "gentle nudge",
+    "bumping",
+    "nudge to @",
+    # Any direct @-mention of the Codex bot (e.g. ``@codex
+    # review``) is a coordination signal from the human PR
+    # author asking the bot to re-review. The
+    # ``chatgpt-codex-connector[bot]`` user is already excluded
+    # by ``--ignore-users``, so this only fires for human
+    # comments that mention @codex.
+    "@codex",
+)
+
+
+# ---------------------------------------------------------------------------
+# Actionable-finding-signal detector tables.
+# ---------------------------------------------------------------------------
+# These tables are used by ``_has_direct_text_severity_declaration``
+# (the copula-based detector) to identify text-alias severity/priority
+# declarations of the shape
+#     [subject?] <verb> [negation?] [article?] <intensifier{0,2}> <level> <noun>
+# where <verb> is a copula (``is``/``has`` only; ``as`` and ``with``
+# are excluded so meta-discussion forms like ``classified as high
+# priority`` and ``with high priority context`` do NOT match).
+#
+# The detector is invoked by ``_has_actionable_finding_signal`` as
+# the copula-based actionable-signal component of the centralized
+# actionability decision. See that helper for the overall design.
+_TEXT_SEVERITY_VERBS = ("is", "has")
+_TEXT_SEVERITY_ARTICLES = ("a", "an")
+_TEXT_SEVERITY_INTENSIFIERS = (
+    "very",
+    "extremely",
+    "particularly",
+    "especially",
+    "clearly",
+    "obviously",
+    "materially",
+    "highly",
+)
+_TEXT_SEVERITY_LEVELS = ("high", "medium", "low")
+_TEXT_SEVERITY_NOUNS = ("severity", "priority")
+_TEXT_SEVERITY_NEGATIONS = frozenset({
+    "not",
+    "no",
+    "never",
+    "without",
+    "isnt",
+    "hasnt",
+    "arent",
+    "wasnt",
+    "werent",
+})
+_MAX_TEXT_SEVERITY_INTENSIFIERS = 2
+# frozenset views for O(1) membership tests inside the hot loop.
+_TEXT_SEVERITY_VERBS_SET = frozenset(_TEXT_SEVERITY_VERBS)
+_TEXT_SEVERITY_ARTICLES_SET = frozenset(_TEXT_SEVERITY_ARTICLES)
+_TEXT_SEVERITY_INTENSIFIERS_SET = frozenset(_TEXT_SEVERITY_INTENSIFIERS)
+_TEXT_SEVERITY_LEVELS_SET = frozenset(_TEXT_SEVERITY_LEVELS)
+_TEXT_SEVERITY_NOUNS_SET = frozenset(_TEXT_SEVERITY_NOUNS)
+# Past-participles / meta-verbs that mark a comment as REFERENCING
+# a prior fix rather than DECLARING a current issue. The narrow
+# colon-form helper uses this to reject coordination-prefixed
+# bodies of the shape
+#     ``Re-requesting Codex review: fixed the high severity
+#     regression from the prior finding``
+# which contain the words ``high severity`` but are
+# meta-discussion about a prior cycle's fix (Codex finding
+# 3448570717). The list is intentionally short and closed: no
+# arbitrary grammar expansion, no natural-language heuristic.
+_META_VERBS = frozenset({
+    "fixed",
+    "addressed",
+    "described",
+    "classified",
+    "flagged",
+    "reviewed",
+    "identified",
+    "mentioned",
+})
+# Trailing punctuation that may follow a level or noun token
+# without breaking the pattern (e.g. ``is medium priority:``).
+# The ``\b`` word-boundary style of regexes tolerates trailing
+# punctuation; the token-based helper strips a small set of
+# characters so the helper matches the regex behavior. The set
+# includes dash separators (``-``/``—``/``–``) so em-dash and
+# hyphen after ``priority``/``severity`` are accepted.
+_TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}-—–"
+
+
+def _has_narrow_colon_form_declaration(leading_text: str) -> bool:
+    """Return ``True`` iff ``leading_text`` (the lowercased first
+    100 chars of a comment body) contains a NARROW colon-form
+    text-alias severity/priority declaration of the shape
+    ``<coordination_prefix>: <level> <noun>`` that should count
+    as an actionable finding signal.
+
+    The detection is intentionally narrow:
+
+    * Only the FIRST FOUR tokens after the FIRST ``:`` in the
+      leading window are considered. This rejects prior-finding
+      descriptions like
+      ``Re-requesting Codex review: fixed the high severity
+      regression from the prior finding`` (Codex finding
+      3448570717) where the ``high severity`` phrase appears
+      past the coordination-prefix segment.
+    * The FIRST token after the colon must NOT be a
+      meta-verb/past-participle (``fixed``/``addressed``/
+      ``described``/``classified``/``flagged``/``reviewed``/
+      ``identified``/``mentioned``). This is the second
+      discriminator for Codex finding 3448570717 — the past
+      participle is the marker that the comment is REFERENCING
+      a prior fix rather than DECLARING a current issue.
+    * The level token must NOT be preceded by a negation token
+      (with up to 3-token look-back so ``this is not a high
+      priority issue`` is rejected — Codex finding 3448570719).
+    * The level/noun pair must NOT be followed by ``context``
+      or ``only`` (meta/context-only form, e.g. ``high priority
+      context only``).
+
+    The shape grammar is intentionally constrained — there is no
+    "scan the whole text after the colon" behavior, no broad
+    grammar expansion, and no natural-language heuristic for
+    arbitrary verb/noun permutations. This keeps the detector
+    narrow so the same body cannot trigger an adjacent-shape
+    Codex finding next cycle.
+
+    Examples returning ``True`` (actionable):
+        ``bumping retry counter: high severity regression``
+        ``re-requesting review: high priority issue``
+        ``following up: medium severity problem``
+        ``bumping this: low priority cleanup``
+
+    Examples returning ``False`` (not actionable):
+        ``bumping retry counter for review``       (no colon)
+        ``re-requesting review on latest head``   (no colon)
+        ``re-requesting codex review: fixed the high severity
+            regression from the prior finding``   (meta-verb;
+                                                  Codex 3448570717)
+        ``re-requesting review: this is not a high priority
+            issue, just a re-prompt``             (negation;
+                                                  Codex 3448570719)
+        ``bumping retry counter: p0/p1/p2 severity taxonomy``
+                                                (P-token, not text-alias)
+        ``bumping retry counter: not high severity``
+                                                (bare negation)
+        ``bumping retry counter: high priority context only``
+                                                (meta/context-only)
+    """
+    if not leading_text:
+        return False
+    colon_idx = leading_text.find(":")
+    if colon_idx == -1:
+        return False
+    after = leading_text[colon_idx + 1:]
+    if not after.strip():
+        return False
+    raw_tokens = after.split()
+    if not raw_tokens:
+        return False
+    # Discriminator 1: if the first post-colon token is a
+    # meta-verb/past-participle, the comment is describing a
+    # prior fix and is NOT actionable. This is the cycle-12
+    # finding 3448570717 fix.
+    if raw_tokens[0].rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) in _META_VERBS:
+        return False
+    # Restrict the scan to the first 4 post-colon tokens. This
+    # is the window-boundary fix for cycle-12 finding 3448570717.
+    window = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens[:4]]
+    levels = _TEXT_SEVERITY_LEVELS_SET
+    nouns = _TEXT_SEVERITY_NOUNS_SET
+    negations = _TEXT_SEVERITY_NEGATIONS
+    context_only_words = frozenset({"context", "only"})
+    for i, tok in enumerate(window):
+        if tok in levels:
+            # Discriminator 2: negation look-back (cycle-12
+            # finding 3448570719 fix). Scan up to 3 tokens
+            # before the level so ``this is not a high
+            # priority issue`` rejects on the ``not`` at
+            # distance 3.
+            for j in range(max(0, i - 3), i):
+                if window[j] in negations:
+                    return False
+            # Discriminator 3: meta/context-only form.
+            if i + 1 < len(window) and window[i + 1] in nouns:
+                if (i + 2 < len(window)
+                        and window[i + 2] in context_only_words):
+                    return False
+                return True
+    return False
+
+
+def _has_direct_text_severity_declaration(leading_text: str) -> bool:
+    """Return ``True`` iff ``leading_text`` (the lowercased first
+    100 chars of a comment body) contains a direct affirmative
+    severity/priority declaration that should be rescued from
+    Guard 6's coordination-skip path.
+
+    Recognized shape (whitespace-tokenized):
+
+        [subject?] <verb> [negation?] [article?] <intensifier>{0,2} <level> <noun>
+
+    where:
+
+        * ``<verb>``    ∈ ``{"is", "has"}``  (copulas only;
+          ``as`` and ``with`` excluded)
+        * ``[subject?]``∈ ``{"this", "that", "it"}``  (optional)
+        * ``[negation?]`` ∈ ``NOT_NEGATIONS``  — if present
+          IMMEDIATELY after the verb, that candidate copula
+          is rejected and the helper moves on to the NEXT
+          copula in the input. The negation is per-phrase,
+          not per-helper-call: a later affirmative copula in
+          the same input still rescues the comment.
+        * ``[article?]`` ∈ ``{"a", "an"}``  (optional)
+        * ``<intensifier>`` ∈ ``INTENSIFIER_WHITELIST``, max 2
+          consecutive tokens
+        * ``<level>``    ∈ ``{"high", "medium", "low"}``
+        * ``<noun>``     ∈ ``{"severity", "priority"}``
+
+    The helper iterates every copula in the input. If a copula
+    has an immediate negation, that copula is rejected and the
+    helper continues to the next copula. If any copula matches
+    the full pattern (copula → [article?] → [intensifier{0,2}]
+    → level → noun), it returns ``True``. If no copula matches
+    the pattern, it returns ``False``.
+
+    Examples returning ``True``:
+        ``is high priority``
+        ``is a high priority issue``
+        ``is an extremely high severity issue``
+        ``has high severity``
+        ``has a high severity impact``
+        ``this has a very high priority impact``
+        ``this is a very extremely high severity issue``
+        # Multiple copulas where a later one is affirmative:
+        ``Bumping the retry counter is not safe; this is high priority because it skips CI``
+        ``Re-requesting review: this has high severity impact``
+
+    Examples returning ``False``:
+        ``is not high priority``           (negation, no later affirmative copula)
+        ``is not a high priority issue``  (negation with article, no later affirmative copula)
+        ``has no high severity impact``   (negation with article, no later affirmative copula)
+        ``not high severity``             (no copula, bare negation)
+        ``classified as high priority``   (no copula)
+        ``with high priority context``    (no copula)
+        ``P0/P1/P2 severity taxonomy``    (no copula)
+        ``not actually high priority``    (no copula)
+    """
+    if not leading_text:
+        return False
+    text = leading_text.lower()
+    # Cycle 9 (dbID 3447899921): insert a whitespace token
+    # boundary immediately after a recognized severity/priority
+    # noun when it is followed (with no whitespace) by a dash
+    # separator. This converts tokens like ``priority\u2014this``
+    # (a single token after ``.split()``) into the two-token
+    # sequence ``priority this``, so the noun check succeeds.
+    # The substitution is restricted to (severity|priority) +
+    # dash so it does not affect other compound words (e.g.
+    # ``high-priority issue`` keeps its dash intact because
+    # ``high`` is not a severity/priority noun).
+    text = re.sub(
+        r"\b(severity|priority)([\-\u2014\u2013])",
+        r"\1 \2",
+        text,
+    )
+    raw_tokens = text.split()
+    # Strip trailing punctuation so ``priority:`` matches the
+    # ``priority`` noun entry (the cycle-7 regex tolerated this
+    # via ``\b`` word boundaries).
+    tokens = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens]
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        if tok not in _TEXT_SEVERITY_VERBS_SET:
+            continue
+        # Found a copula. Validate the pattern that follows.
+        j = i + 1
+        # Definitive negation immediately after the copula.
+        # Cycle-10 fix (Codex 3448488549): the previous helper
+        # returned ``False`` for the WHOLE helper on this branch,
+        # which silently filtered out a real P1 finding whenever
+        # the comment contained ANY negated copula early in the
+        # body. Reject only THIS candidate copula and continue
+        # scanning subsequent copulas so a later affirmative
+        # declaration (e.g. ``Bumping the retry counter is not
+        # safe; this is high priority because it skips CI``)
+        # still triggers the Guard 6 rescue.
+        if j < n and tokens[j] in _TEXT_SEVERITY_NEGATIONS:
+            continue
+        # Optional article.
+        if j < n and tokens[j] in _TEXT_SEVERITY_ARTICLES_SET:
+            j += 1
+        # Up to MAX intensifiers (whitelist only — arbitrary words
+        # between article and level are not accepted).
+        intensifier_count = 0
+        while (
+            j < n
+            and tokens[j] in _TEXT_SEVERITY_INTENSIFIERS_SET
+            and intensifier_count < _MAX_TEXT_SEVERITY_INTENSIFIERS
+        ):
+            j += 1
+            intensifier_count += 1
+        # Required level.
+        if j >= n or tokens[j] not in _TEXT_SEVERITY_LEVELS_SET:
+            continue  # try the next copula, if any
+        j += 1
+        # Required noun.
+        if j >= n or tokens[j] not in _TEXT_SEVERITY_NOUNS_SET:
+            continue  # try the next copula, if any
+        return True
+    return False
+
+
+def _has_actionable_finding_signal(body: str) -> bool:
+    """Return ``True`` iff ``body`` contains an actionable finding
+    signal — a clear indicator that the comment is DECLARING a
+    current issue rather than REFERENCING a prior fix or
+    producing meta-discussion about a finding.
+
+    This helper is the SINGLE SOURCE OF TRUTH for the
+    actionability decision in the classifier. The full
+    coordination-skip / early-bypass heuristic ladder from
+    cycles 3-11 (Guards 1-7 inside the old
+    ``is_coordination_comment``) has been replaced by this
+    central detector plus a final-suppressor coordination check
+    inside :func:`classify_item`.
+
+    The signal is a disjunction of three narrow detectors,
+    evaluated left-to-right (most-specific first):
+
+    1. **Explicit P0/P1/P2/P3 marker.** A badge
+       (``![Pn Badge]``), bracketed (``[Pn]``), or colon-declared
+       (``Pn:``) severity is always actionable — these formats
+       are unambiguous declarations of severity by the Codex
+       reviewer. This consolidates Guards 1-3 from the
+       cycle-3-11 stack.
+
+    2. **Copula-based text-alias declaration.** A text-alias
+       declaration of the shape
+       ``[subject?] is/has [negation?] [article?] <intensifier{0,2}> <level> <noun>``
+       in the leading 100 characters is actionable. This is
+       delegated to :func:`_has_direct_text_severity_declaration`
+       (the cycle-8 table-driven helper, unchanged). It handles
+       dbIDs 3447794638, 3447818802, 3447825478, 3447830523,
+       3447849261, 3447871114, 3447899921, and 3448488549.
+
+    3. **Narrow colon-form declaration.** A coordination-prefixed
+       body of the shape
+       ``<coordination_prefix>: <level> <noun>``
+       where the level/noun pair appears in the first four
+       tokens after the first ``:`` and the first token after
+       the colon is not a meta-verb/past-participle. This is
+       delegated to :func:`_has_narrow_colon_form_declaration`
+       (the cycle-12-narrowed helper). It handles dbID
+       3448545827 and is intentionally narrow so it does NOT
+       over-rescue dbIDs 3448570717 + 3448570719.
+
+    4. **Blocking-word indicator in the leading 100 characters.**
+       A body that contains a :data:`BLOCKING_WORDS` token
+       (``can fail`` / ``stale`` / ``must fix`` / ``security`` /
+       etc.) tightly within the leading 100 characters is
+       actionable. This is the move of the OLD cycle-7
+       Guard 5 (Codex finding AQ) into the centralized
+       detector. The discriminator for meta-discussion
+       coordination messages like
+       ``Re-requesting Codex review — Fix AG is now on 266a92e``
+       is the leading-100-char window: real coordination
+       messages that happen to mention blocking vocabulary
+       (``stale`` / ``malformed``) do so well past the
+       leading 100 characters (in the meta-discussion about
+       which fix addressed which prior finding).
+
+    The detector is conservative by design: a body that merely
+    REFERENCES severity (e.g. ``fixed the high severity regression
+    from the prior finding``, ``classified as high priority``,
+    ``with high priority context``, taxonomy references,
+    negated forms) does NOT count as actionable and is left to
+    the final-suppressor coordination check.
+    """
+    if not body:
+        return False
+    # Detector 1: explicit P0/P1/P2/P3 marker.
+    upper = body.upper()
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"![{sev} BADGE]" in upper:
+            return True
+        if f"[{sev}]" in upper:
+            return True
+        if sev + ":" in upper:
+            return True
+    # Detector 2/3/4 share the leading[:100] window.
+    leading = body[:100].lower()
+    # Detector 2: copula-based text-alias declaration.
+    if _has_direct_text_severity_declaration(leading):
+        return True
+    # Detector 3: narrow colon-form declaration.
+    if _has_narrow_colon_form_declaration(leading):
+        return True
+    # Detector 4: blocking-word indicator in the leading
+    # 100 characters. Catches bodies like
+    # ``Bumping the retry counter can fail when Codex reruns
+    # after a stale head`` which declare an issue using
+    # BLOCKING_WORDS vocabulary even without a copula or P-marker.
+    # The leading-100-char window keeps the check narrow so
+    # coordination messages that mention blocking vocabulary
+    # in meta-discussion past the leading 100 chars (e.g.
+    # ``Re-requesting Codex review on 3982ee6 (Fix AF). The
+    # active P1 current-head finding ... allowing a
+    # malformed checkpoint ...``) do NOT match.
+    if any(bw in leading for bw in BLOCKING_WORDS):
+        return True
+    return False
+
+
+def is_coordination_comment(body: str) -> bool:
+    """Return True if ``body`` STARTS with a coordination
+    pattern (human PR-author messages that re-request Codex
+    review, nudge the Codex bot, or describe which fix addresses
+    a prior finding).
+
+    This is the FINAL SUPPRESSOR in the classifier pipeline,
+    not an early bypass. The actionability decision is made
+    upstream by :func:`_has_actionable_finding_signal`; this
+    function only answers the simpler question "does this body
+    start with a coordination prefix?".
+
+    A coordination-prefixed body that ALSO has an actionable
+    finding signal is NOT suppressed here — it is detected as
+    actionable upstream and emitted as a finding by
+    :func:`classify_item`. The coordination-suppress path only
+    fires when there is no actionable signal AND the body
+    starts with a coordination pattern (e.g. ``Bumping retry
+    counter for review`` — coordination noise with no
+    severity/blocking signal).
+    """
+    body_str = body or ""
+    body_lower = body_str.lower().lstrip()
+    return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
+
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
 SEVERITY_MAP = {
     "high": "P1",
@@ -92,7 +541,19 @@ def gh_graphql_review_threads(
     Fetch PR review-thread resolution state via GraphQL.
 
     Returns (success, threads_list, error_msg).
-    threads_list entries: {id, isResolved, isOutdated, comments: [{databaseId, url}]}
+    threads_list entries:
+        {thread_id, is_resolved, is_outdated, database_id, url,
+         author_login}
+
+    The ``author_login`` field is the GitHub login of the
+    thread's first-comment author. Under the option-B2
+    source-aware architecture, this is used to distinguish
+    Codex-authored threads (``chatgpt-codex-connector[bot]``)
+    from human-authored review threads. Only Codex-authored
+    threads that are current and unresolved are treated as
+    fail-closed actionable findings; human-authored threads
+    follow the existing coordination-skip / severity-extraction
+    flow.
 
     Note: gh api graphql -f passes all variables as strings, which GraphQL rejects
     for Int. We embed the PR number as a raw integer literal in the query.
@@ -101,8 +562,9 @@ def gh_graphql_review_threads(
     """
     owner, name = repo.split("/", 1)
     # Build with explicit brace counting via a list to ensure balance.
-    # comments(first:50) { nodes { databaseId url } }
-    #                                     ^^--- +1 extra } to close the inner nodes
+    # comments(first:50) { nodes { databaseId url author { login } } }
+    #                                                  ^^--- +1 extra } to
+    #                                                       close inner nodes
     query_parts = [
         "query {",
         f'repository(owner:"{owner}", name:"{name}") {{',
@@ -110,7 +572,7 @@ def gh_graphql_review_threads(
         "reviewThreads(first:100) {",
         "nodes {",
         "id isResolved isOutdated",
-        "comments(first:50) { nodes { databaseId url } }",  # note: inner nodes needs extra }
+        "comments(first:50) { nodes { databaseId url author { login } } }",
         "}",  # close nodes
         "}",  # close reviewThreads
         "}",  # close pullRequest
@@ -142,19 +604,24 @@ def gh_graphql_review_threads(
             .get("reviewThreads", {})
             .get("nodes", [])
         )
-        # Flatten: keep thread metadata + each comment's databaseId/url
+        # Flatten: keep thread metadata + each comment's databaseId/url/author.
         threads: list[dict[str, Any]] = []
         for node in nodes:
             thread_id = node.get("id", "")
             is_resolved = node.get("isResolved", False)
             is_outdated = node.get("isOutdated", False)
             for comment in (node.get("comments", {}) or {}).get("nodes", []):
+                author_login = (
+                    (comment.get("author") or {}).get("login", "")
+                    if comment.get("author") else ""
+                )
                 threads.append({
                     "thread_id": thread_id,
                     "is_resolved": is_resolved,
                     "is_outdated": is_outdated,
                     "database_id": comment.get("databaseId"),
                     "url": comment.get("url") or "",
+                    "author_login": author_login,
                 })
         return True, threads, ""
     except (json.JSONDecodeError, KeyError) as exc:
@@ -172,8 +639,18 @@ def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
 
     Returns (success, data_list, error_msg).
     Fails closed: any non-zero return code, stderr, or bad JSON => error.
+
+    Uses ``--paginate --slurp`` so that multi-page responses are
+    wrapped into a single JSON array of arrays, which is then
+    flattened into a single list of items. Without ``--slurp``,
+    ``gh api --paginate`` writes each page as a separate JSON
+    document and ``json.loads`` fails on the concatenated output
+    (Codex finding AH).
     """
-    cmd = ["gh", "api", f"repos/{repo}/{endpoint}", "--paginate"]
+    cmd = [
+        "gh", "api", f"repos/{repo}/{endpoint}",
+        "--paginate", "--slurp",
+    ]
     try:
         result = subprocess.run(
             cmd,
@@ -193,11 +670,23 @@ def gh_api(repo: str, endpoint: str) -> tuple[bool, list[dict[str, Any]], str]:
 
     try:
         data = json.loads(result.stdout)
-        if isinstance(data, list):
-            return True, data, ""
-        return True, [data], ""
     except json.JSONDecodeError as exc:
         return False, [], f"invalid JSON from gh api: {exc}"
+
+    # ``--slurp`` wraps all pages into a single JSON array, so
+    # the result is either:
+    #   - a list of items (single page)
+    #   - a list of lists (multi-page: each page is a list)
+    # Flatten the latter into a single list of items.
+    if isinstance(data, list):
+        flat: list[dict[str, Any]] = []
+        for item in data:
+            if isinstance(item, list):
+                flat.extend(item)
+            else:
+                flat.append(item)
+        return True, flat, ""
+    return True, [data], ""
 
 
 def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
@@ -232,13 +721,71 @@ def gh_pr_view(repo: str, pr_number: int) -> tuple[bool, dict[str, Any], str]:
 # ---------------------------------------------------------------------------
 
 def extract_severity(text: str) -> str | None:
-    """Return P0-P3 from text or None if not found."""
+    """Return P0-P3 from text or None if not found.
+
+    Priority order (highest specificity first):
+
+    1. Badge-style severity marker: ``![P0 Badge]``, ``![P1 Badge]``,
+       ``![P2 Badge]``, ``![P3 Badge]``. The badge URL contains
+       ``badge/P1-orange`` etc. which would otherwise be matched as
+       a plain ``P1`` substring; the badge wrapper is the
+       unambiguous signal that the author is declaring severity.
+    2. Bracketed priority marker: ``[P0]``, ``[P1]``, ``[P2]``,
+       ``[P3]``. This is the second-most-specific declaration form
+       used by some Codex findings.
+    3. Explicit colon declaration: ``P0:``, ``P1:``, ``P2:``,
+       ``P3:`` followed by a colon. The colon distinguishes a
+       declaration from a reference (e.g. "the active P1
+       current-head finding has been addressed" contains ``P1``
+       but not ``P1:``).
+    4. Plain ``P0``/``P1``/``P2``/``P3`` substring (the previous
+       behavior). Kept last because it is the most ambiguous:
+       a comment body that documents the severity taxonomy
+       ("P0/P1/P2 findings") contains all three tokens; the
+       first one (``P0``) would otherwise be picked
+       incorrectly.
+    5. Text-alias ``high``/``medium``/``low`` matched as whole
+       WORDS using regex word boundaries. Same rationale as
+       before (Codex finding AI).
+
+    Codex findings K87fX (Do not skip bracketed priority
+    findings) and K8vlc (Narrow coordination skips) both have
+    bodies that include ``P0/P1/P2`` as part of describing the
+    severity taxonomy. Under the previous substring-first order,
+    these were misclassified as P0 even though the actual
+    declared severity is P1 (K87fX) and P2 (K8vlc). The
+    badge-priority fix ensures the declared severity is the
+    one returned, not the first substring match.
+    """
     upper = text.upper()
+
+    # Priority 1: badge-style severity marker.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"![{sev} BADGE]" in upper:
+            return sev
+
+    # Priority 2: bracketed priority marker.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"[{sev}]" in upper:
+            return sev
+
+    # Priority 3: explicit colon declaration.
+    for sev in ("P0", "P1", "P2", "P3"):
+        if sev + ":" in upper:
+            return sev
+
+    # Priority 4: plain P-token substring (legacy behavior,
+    # only reached if no more-specific form was found).
     for sev in ("P0", "P1", "P2", "P3"):
         if sev in upper:
             return sev
+
+    # Priority 5: text-alias severity declarations.
     for token, sev in SEVERITY_MAP.items():
-        if token.upper() in upper:
+        # Use regex word-boundary matching for the text aliases
+        # to avoid false positives like "highlight" matching
+        # "high". P0-P3 tokens are already unambiguous.
+        if re.search(r"\b" + re.escape(token) + r"\b", text, re.IGNORECASE):
             return sev
     return None
 
@@ -271,10 +818,59 @@ def make_finding_id(
     return f"codex-{digest}"
 
 
-def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]) -> list[dict[str, Any]]:
+def classify_item(
+    item: dict[str, Any],
+    source_kind: str,
+    ignore_users: set[str],
+    is_codex_review_thread_current_unresolved: bool = False,
+) -> list[dict[str, Any]]:
     """
     Given a single comment/review dict from any endpoint, scan for Codex
     findings and return a list of finding dicts (may be empty).
+
+    The classifier pipeline is SOURCE-AWARE (option B2
+    refactor). The actionability decision is made by inspecting
+    the SOURCE TYPE first, with shape-grammar serving only as a
+    secondary fallback for non-Codex-thread comments.
+
+    Pipeline order:
+
+    1. Author filter — drop comments from ``ignore_users``.
+
+    2. Codex-needle check — drop comments without any Codex
+       needle (high/medium/P0/P1/P2/P3/badge/...).
+
+    3. **Source-aware actionability check (PRIMARY under B2).**
+       If ``is_codex_review_thread_current_unresolved`` is True
+       (the comment is part of a current, unresolved Codex
+       review thread), the comment is actionable by default
+       regardless of body shape. Coordination suppression does
+       NOT apply. This is the fail-closed path.
+
+       If the source is not a current unresolved Codex
+       review thread, fall back to the shape-grammar detector
+       :func:`_has_actionable_finding_signal` (secondary
+       path).
+
+    4. Coordination suppression — :func:`is_coordination_comment`
+       ONLY suppresses bodies that have no actionable signal AND
+       start with a coordination pattern. This applies ONLY on
+       the non-Codex-thread path. Codex review-thread findings
+       are NEVER suppressed by coordination-skip.
+
+    5. Severity extraction — :func:`extract_severity` maps the
+       body text to P0-P3 (or None). :func:`is_blocking` is the
+       fallback for unspecified-severity blocking comments.
+
+    6. **Fail-closed default for unresolved Codex threads.** If
+       the source is a current unresolved Codex review thread
+       and no severity could be extracted (no P0:/P1:/P2:/P3:,
+       no badge, no bracket, no text-alias), default to
+       ``P2`` (blocking). This is the auth-prompt-mandated
+       conservative default for unresolved Codex findings
+       without an explicit severity.
+
+    7. Finding emission — emit the finding dict.
     """
     findings = []
     user = (item.get("user") or {}).get("login", "")
@@ -292,10 +888,35 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
     if not any(needle in combined for needle in CODEX_NEEDLES):
         return findings
 
-    # Classify severity: explicit P0-P3 tokens take priority. High/Medium/Low are
-    # mapped. Only if no severity keyword is found do we check blocking words.
+    # PRIMARY actionability decision: source-aware.
+    # Current unresolved Codex review-thread comments are
+    # actionable by default. This is the architectural shift
+    # that breaks the cycle-3-13 shape-grammar heuristic ladder.
+    if is_codex_review_thread_current_unresolved:
+        has_actionable = True
+    else:
+        # SECONDARY actionability decision: shape-grammar
+        # fallback for non-Codex-thread comments (issue
+        # comments, human review comments, resolved threads,
+        # outdated threads).
+        has_actionable = _has_actionable_finding_signal(body)
+
+    # Coordination suppression is a FINAL SUPPRESSOR for
+    # non-Codex-thread bodies only. Codex review-thread
+    # findings NEVER go through coordination suppression
+    # (this is the fail-closed guarantee).
+    if not has_actionable and is_coordination_comment(body):
+        return findings
+
+    # Severity extraction (unchanged — already a single source
+    # of truth for severity level mapping).
     severity = extract_severity(combined)
-    if severity is None and is_blocking(combined):
+
+    # Fail-closed default: unresolved Codex threads without
+    # extractable severity default to P2 (blocking).
+    if severity is None and is_codex_review_thread_current_unresolved:
+        severity = "P2"
+    elif severity is None and is_blocking(combined):
         severity = "UNSPECIFIED_BLOCKING"
     elif severity is None:
         severity = "UNSPECIFIED_INFO"
@@ -540,9 +1161,107 @@ def main() -> int:
 
     ignore_users = set(u.strip() for u in args.ignore_users.split(",") if u.strip())
 
+    # Policy safeguard: refuse to silently ignore the Codex bot.
+    # The chatgpt-codex-connector[bot] is the source of all automated
+    # review findings for this repository. Globally ignoring its
+    # findings via --ignore-users would re-introduce the gate
+    # false-negative that caused PR #405's review-comment-gate to be
+    # green while 18 unresolved P1/P2 Codex findings remained
+    # actionable.
+    #
+    # If a legitimate need to ignore the Codex bot arises (e.g. a
+    # coordination-noise experiment), the caller must opt in
+    # explicitly by setting AED_ALLOW_CODEX_IGNORE=1 in the
+    # environment. The override is logged to stderr so it is visible
+    # in CI output.
+    CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+    if CODEX_BOT_LOGIN in ignore_users:
+        if os.environ.get("AED_ALLOW_CODEX_IGNORE") != "1":
+            print(
+                f"ERROR: --ignore-users contains '{CODEX_BOT_LOGIN}' "
+                f"but AED_ALLOW_CODEX_IGNORE is not set to '1'.",
+                file=sys.stderr,
+            )
+            print(
+                "Refusing to silently filter all Codex findings. "
+                "Codex review findings must be classified by the "
+                "gate, not globally ignored. Set "
+                "AED_ALLOW_CODEX_IGNORE=1 only if you have an "
+                "explicit, documented reason to bypass this "
+                "safeguard.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"WARNING: ignoring '{CODEX_BOT_LOGIN}' per "
+            f"AED_ALLOW_CODEX_IGNORE=1",
+            file=sys.stderr,
+        )
+
     all_findings: list[dict[str, Any]] = []
     sources_fetched: list[str] = []
     api_errors: list[str] = []
+
+    # -----------------------------------------------------------------------
+    # Review-thread resolution state via GraphQL — fetch FIRST so that
+    # classify_item can use source-aware actionability (option B2).
+    # -----------------------------------------------------------------------
+    # Under option B2, the actionability decision is made by inspecting
+    # the SOURCE TYPE: current unresolved Codex review-thread comments
+    # are actionable by default. This requires knowing, at classification
+    # time, whether a comment belongs to a current unresolved Codex
+    # review thread. We fetch the thread metadata first (via GraphQL),
+    # build a URL → metadata map, and pass a per-item
+    # ``is_codex_review_thread_current_unresolved`` flag into
+    # :func:`classify_item`.
+    #
+    # If the GraphQL fetch fails, the gate is FAIL-CLOSED: we proceed
+    # with an empty thread map (flag=False everywhere → shape-grammar
+    # fallback) and the gate status is set to INCONCLUSIVE later in
+    # this function (existing behavior).
+    thread_meta_by_url: dict[str, dict[str, Any]] = {}
+    thread_api_error: str | None = None
+    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
+        args.repo, args.pr_number
+    )
+    if not ok_threads:
+        thread_api_error = err_threads
+    else:
+        for entry in thread_entries:
+            url = entry.get("url", "")
+            if url:
+                thread_meta_by_url[url] = entry
+
+    # Codex bot login — same constant used by the policy safeguard
+    # further down. Defined here so the source-aware helper can
+    # reference it. GitHub may render the login as either
+    # ``chatgpt-codex-connector`` or ``chatgpt-codex-connector[bot]``
+    # depending on the API surface; we match the prefix.
+    CODEX_BOT_LOGIN_PREFIX = "chatgpt-codex-connector"
+
+    def _is_codex_review_thread_current_unresolved(item: dict[str, Any]) -> bool:
+        """Return True iff ``item`` belongs to a current unresolved
+        Codex review thread.
+
+        The check uses the URL of the item to look up thread
+        metadata in ``thread_meta_by_url``. A thread is
+        considered a "Codex review-thread" iff:
+
+        * the thread is NOT resolved,
+        * the thread is NOT outdated,
+        * the thread's first comment is authored by a
+          ``chatgpt-codex-connector`` user (bot or not).
+        """
+        url = item.get("html_url") or item.get("url") or ""
+        meta = thread_meta_by_url.get(url)
+        if not meta:
+            return False
+        if meta.get("is_resolved", False):
+            return False
+        if meta.get("is_outdated", False):
+            return False
+        author_login = meta.get("author_login", "") or ""
+        return author_login.startswith(CODEX_BOT_LOGIN_PREFIX)
 
     # 1. Issue comments
     ok, data, err = gh_api(args.repo, f"issues/{args.pr_number}/comments")
@@ -551,7 +1270,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"issues/{args.pr_number}/comments ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "issue_comment", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "issue_comment", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "issue_comment"
             all_findings.extend(findings)
@@ -563,7 +1286,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"pulls/{args.pr_number}/comments ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "inline_review_comment", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "inline_review_comment", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "inline_review_comment"
             all_findings.extend(findings)
@@ -575,7 +1302,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"pulls/{args.pr_number}/reviews ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "review", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "review", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "review"
             all_findings.extend(findings)
@@ -592,7 +1323,11 @@ def main() -> int:
                         f"pulls/{args.pr_number}/reviews/{rev_id}/comments ({len(comments2)} items)"
                     )
                     for c in comments2:
-                        findings2 = classify_item(c, "per_review_comment", ignore_users)
+                        is_codex_thread = _is_codex_review_thread_current_unresolved(c)
+                        findings2 = classify_item(
+                            c, "per_review_comment", ignore_users,
+                            is_codex_review_thread_current_unresolved=is_codex_thread,
+                        )
                         for f2 in findings2:
                             f2["_source_kind"] = "per_review_comment"
                         all_findings.extend(findings2)
@@ -600,26 +1335,13 @@ def main() -> int:
     all_findings = dedup_findings(all_findings)
 
     # -----------------------------------------------------------------------
-    # Review-thread resolution state via GraphQL (read-only)
+    # Attach thread metadata to each finding for rendering / blocker logic.
+    # This is the existing behavior — preserved unchanged. The
+    # source-aware flag passed into classify_item above already used
+    # the thread metadata for the PRIMARY actionability decision; this
+    # post-classify attachment is for the thread_id / is_resolved /
+    # is_outdated fields used by the blocker classification below.
     # -----------------------------------------------------------------------
-    # Build a mapping: finding URL -> thread metadata (isResolved, isOutdated, thread_id).
-    # Findings in resolved threads are reported but do not block.
-    # Key: URL (from inline_review_comment or per_review_comment).
-    # Fallback key: "databaseId:<id>" for findings with a known databaseId.
-    thread_meta_by_url: dict[str, dict[str, Any]] = {}
-    thread_api_error: str | None = None
-    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
-        args.repo, args.pr_number
-    )
-    if not ok_threads:
-        thread_api_error = err_threads
-    else:
-        for entry in thread_entries:
-            url = entry.get("url", "")
-            if url:
-                thread_meta_by_url[url] = entry
-
-    # Attach thread metadata to each finding by URL.
     for f in all_findings:
         url = f.get("url", "")
         meta = thread_meta_by_url.get(url, {})

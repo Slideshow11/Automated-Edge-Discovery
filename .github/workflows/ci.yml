@@ -146,7 +146,6 @@ jobs:
             --repo "$REPO" \
             --pr-number "$PR_NUMBER" \
             --reported-head-sha "$HEAD_SHA" \
-            --ignore-users "chatgpt-codex-connector[bot]" \
             --output-json /tmp/review_comment_gate/status.json \
             --output-md /tmp/review_comment_gate/status.md
           echo "=== REVIEW COMMENT GATE OUTPUT ==="
