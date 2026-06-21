@@ -763,6 +763,46 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Real coordination message with severity only in meta-discussion must still be skipped"
         )
 
+    def test_priority_word_alias_in_leading_rescues_coordination_skip(self):
+        """Regression for the second fresh Codex P1 finding on
+        head b4ff12deb316 (2026-06-21T02:46:26Z, dbID
+        3447818802): 'Bumping the retry counter is high
+        priority ...' must NOT be classified as coordination.
+        The previous Guard 6 only covered 'high/medium/low
+        severity'; extract_severity also accepts
+        'high/medium/low priority' as text aliases, so the
+        guard must cover both noun forms."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping the retry counter is high priority and should be treated as a finding, not coordination",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_medium_priority_in_leading_rescues_coordination_skip(self):
+        """Same as above for the medium priority alias (P2)."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping this thread is medium priority: keep the new marker logic in the broad scan",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_low_priority_in_leading_rescues_coordination_skip(self):
+        """Same as above for the low priority alias (P3)."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping this thread is low priority: cosmetic issue in the rendered output",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P3")
+
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):
     """Regression for Codex finding AI: severity aliases
