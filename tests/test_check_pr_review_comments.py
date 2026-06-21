@@ -763,6 +763,45 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Real coordination message with severity only in meta-discussion must still be skipped"
         )
 
+    def test_negated_priority_does_not_rescue_coordination(self):
+        """Regression for the third fresh Codex P2 finding on
+        head a0ab489e9e54 (2026-06-21T02:54:45Z, dbID
+        3447825478): 'Re-requesting Codex review — this is
+        not high priority' must NOT be classified as a
+        finding. The previous substring-based Guard 6
+        matched the literal 'high priority' in the negation
+        phrase and incorrectly rescued the body. The new
+        regex-based Guard 6 requires an affirmative verb
+        ('is'/'has'/'as'/'with') directly before the
+        priority/severity token, so 'is not high priority'
+        does not match."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this is not high priority, please skip this re-prompt",
+            "state": "",
+        }
+        # is_coordination_comment should return True (skip)
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Negated priority ('is not high priority') must NOT trigger the Guard 6 rescue"
+        )
+
+    def test_negated_severity_does_not_rescue_coordination(self):
+        """Same as above for the severity noun form."""
+        body = "Re-requesting Codex review on 3982ee6 — this is not high severity, just a re-prompt"
+        self.assertTrue(
+            crc.is_coordination_comment(body),
+            "Negated severity ('is not high severity') must NOT trigger the Guard 6 rescue"
+        )
+
+    def test_no_longer_severity_does_not_rescue_coordination(self):
+        """Same as above for 'is no longer high severity' form."""
+        body = "Re-requesting Codex review on 3982ee6 — is no longer high severity, please ignore"
+        self.assertTrue(
+            crc.is_coordination_comment(body),
+            "'is no longer high severity' must NOT trigger the Guard 6 rescue"
+        )
+
     def test_priority_word_alias_in_leading_rescues_coordination_skip(self):
         """Regression for the second fresh Codex P1 finding on
         head b4ff12deb316 (2026-06-21T02:46:26Z, dbID
