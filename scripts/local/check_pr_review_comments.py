@@ -92,6 +92,166 @@ _COORDINATION_PATTERNS = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Guard 6 helper: direct-affirmative text-severity declaration detector.
+# ---------------------------------------------------------------------------
+# Cycle 8 (PR #405 fresh Codex P2 finding, 2026-06-21T03:52:50Z on head
+# 7377eada08, dbID 3447871114): the cycle-7 regex required the level
+# token to come IMMEDIATELY after the optional ``a``/``an`` article,
+# which silently dropped real Codex findings phrased with an
+# intensifier between the article and the level — e.g. ``is an
+# extremely high severity issue``. The fix is to extract Guard 6
+# into a small, table-driven helper that tokenizes the leading
+# window and verifies the copula → [negation?] → [article?] →
+# [intensifier{0,2}] → level → noun shape using explicit word
+# tables, rather than a single brittle regex.
+#
+# Design constraints (PR #405 cycle 8 design-narrow extension):
+#   1. The verb set is narrowed to the copulas ``is``/``has`` only —
+#      ``as`` and ``with`` remain excluded so meta-discussion
+#      forms (``classified as high priority``, ``with high
+#      priority context``) keep failing the rescue.
+#   2. Negation is treated as definitive (returns False immediately
+#      on the first copula-following negation token), matching
+#      cycle-5/6/7 behavior.
+#   3. Up to TWO intensifier tokens are accepted from a fixed
+#      whitelist (``very``, ``extremely``, ``particularly``,
+#      ``especially``, ``clearly``, ``obviously``, ``materially``,
+#      ``highly``) — arbitrary words between article and level
+#      are not accepted, to avoid the regex-whack-a-mole pattern
+#      that produced finding cycles 3-7.
+#   4. The subject pronoun (``this``/``that``/``it``) before the
+#      verb is supported but not required.
+_TEXT_SEVERITY_VERBS = ("is", "has")
+_TEXT_SEVERITY_ARTICLES = ("a", "an")
+_TEXT_SEVERITY_INTENSIFIERS = (
+    "very",
+    "extremely",
+    "particularly",
+    "especially",
+    "clearly",
+    "obviously",
+    "materially",
+    "highly",
+)
+_TEXT_SEVERITY_LEVELS = ("high", "medium", "low")
+_TEXT_SEVERITY_NOUNS = ("severity", "priority")
+_TEXT_SEVERITY_NEGATIONS = frozenset({
+    "not",
+    "no",
+    "never",
+    "without",
+    "isnt",
+    "hasnt",
+    "arent",
+    "wasnt",
+    "werent",
+})
+_MAX_TEXT_SEVERITY_INTENSIFIERS = 2
+# frozenset views for O(1) membership tests inside the hot loop.
+_TEXT_SEVERITY_VERBS_SET = frozenset(_TEXT_SEVERITY_VERBS)
+_TEXT_SEVERITY_ARTICLES_SET = frozenset(_TEXT_SEVERITY_ARTICLES)
+_TEXT_SEVERITY_INTENSIFIERS_SET = frozenset(_TEXT_SEVERITY_INTENSIFIERS)
+_TEXT_SEVERITY_LEVELS_SET = frozenset(_TEXT_SEVERITY_LEVELS)
+_TEXT_SEVERITY_NOUNS_SET = frozenset(_TEXT_SEVERITY_NOUNS)
+# Trailing punctuation that may follow a level or noun token
+# without breaking the pattern (e.g. ``is medium priority:``).
+# The cycle-7 regex used ``\b`` word boundaries which tolerate
+# this; the cycle-8 token-based helper strips a small set of
+# trailing punctuation characters to preserve the same behavior.
+_TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}"
+
+
+def _has_direct_text_severity_declaration(leading_text: str) -> bool:
+    """Return ``True`` iff ``leading_text`` (the lowercased first
+    100 chars of a comment body) contains a direct affirmative
+    severity/priority declaration that should be rescued from
+    Guard 6's coordination-skip path.
+
+    Recognized shape (whitespace-tokenized):
+
+        [subject?] <verb> [negation?] [article?] <intensifier>{0,2} <level> <noun>
+
+    where:
+
+        * ``<verb>``    ∈ ``{"is", "has"}``  (copulas only;
+          ``as`` and ``with`` excluded)
+        * ``[subject?]``∈ ``{"this", "that", "it"}``  (optional)
+        * ``[negation?]`` ∈ ``NOT_NEGATIONS``  — if present
+          IMMEDIATELY after the verb, the helper returns ``False``
+          (definitive; subsequent copulas are not consulted)
+        * ``[article?]`` ∈ ``{"a", "an"}``  (optional)
+        * ``<intensifier>`` ∈ ``INTENSIFIER_WHITELIST``, max 2
+          consecutive tokens
+        * ``<level>``    ∈ ``{"high", "medium", "low"}``
+        * ``<noun>``     ∈ ``{"severity", "priority"}``
+
+    The helper iterates every copula in the input. If the FIRST
+    copula encountered has an immediate negation, it returns
+    ``False`` (definitive). If a copula matches the full pattern
+    (copula → [article?] → [intensifier{0,2}] → level → noun), it
+    returns ``True``. If no copula matches the pattern, it returns
+    ``False``.
+
+    Examples returning ``True``:
+        ``is high priority``
+        ``is a high priority issue``
+        ``is an extremely high severity issue``
+        ``has high severity``
+        ``has a high severity impact``
+        ``this has a very high priority impact``
+        ``this is a very extremely high severity issue``
+
+    Examples returning ``False``:
+        ``is not high priority``           (negation after copula)
+        ``is not a high priority issue``  (negation with article)
+        ``has no high severity impact``   (negation with article)
+        ``not high severity``             (no copula, bare negation)
+        ``classified as high priority``   (no copula)
+        ``with high priority context``    (no copula)
+        ``P0/P1/P2 severity taxonomy``    (no copula)
+        ``not actually high priority``    (no copula)
+    """
+    if not leading_text:
+        return False
+    raw_tokens = leading_text.lower().split()
+    # Strip trailing punctuation so ``priority:`` matches the
+    # ``priority`` noun entry (the cycle-7 regex tolerated this
+    # via ``\b`` word boundaries).
+    tokens = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens]
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        if tok not in _TEXT_SEVERITY_VERBS_SET:
+            continue
+        # Found a copula. Validate the pattern that follows.
+        j = i + 1
+        # Definitive negation immediately after the copula.
+        if j < n and tokens[j] in _TEXT_SEVERITY_NEGATIONS:
+            return False
+        # Optional article.
+        if j < n and tokens[j] in _TEXT_SEVERITY_ARTICLES_SET:
+            j += 1
+        # Up to MAX intensifiers (whitelist only — arbitrary words
+        # between article and level are not accepted).
+        intensifier_count = 0
+        while (
+            j < n
+            and tokens[j] in _TEXT_SEVERITY_INTENSIFIERS_SET
+            and intensifier_count < _MAX_TEXT_SEVERITY_INTENSIFIERS
+        ):
+            j += 1
+            intensifier_count += 1
+        # Required level.
+        if j >= n or tokens[j] not in _TEXT_SEVERITY_LEVELS_SET:
+            continue  # try the next copula, if any
+        j += 1
+        # Required noun.
+        if j >= n or tokens[j] not in _TEXT_SEVERITY_NOUNS_SET:
+            continue  # try the next copula, if any
+        return True
+    return False
+
+
 def is_coordination_comment(body: str) -> bool:
     """Return True if ``body`` matches a coordination-comment
     pattern (human PR-author messages that re-request Codex
@@ -212,16 +372,17 @@ def is_coordination_comment(body: str) -> bool:
         return False
     # Guard 6 (PR #405 fresh Codex reviews, 2026-06-21T02:15:04Z,
     # 2026-06-21T02:46:26Z, 2026-06-21T02:54:45Z,
-    # 2026-06-21T03:01:27Z, and 2026-06-21T03:25:34Z, dbIDs
-    # 3447794638 + 3447818802 + 3447825478 + 3447830523 +
-    # 3447849261): a body that STARTS with a coordination
-    # pattern but declares severity using a text alias in
-    # the leading 100 characters must NOT be treated as a
-    # coordination comment. The previous Guard 4 only
-    # protected the colon-start forms (``high severity:`` at
-    # body start), so a real P1/P2/P3 text-severity finding
-    # like ``Bumping the retry counter is high severity ...
-    # must fix`` was silently dropped as coordination.
+    # 2026-06-21T03:01:27Z, 2026-06-21T03:25:34Z, and
+    # 2026-06-21T03:52:50Z, dbIDs 3447794638 + 3447818802 +
+    # 3447825478 + 3447830523 + 3447849261 + 3447871114): a
+    # body that STARTS with a coordination pattern but
+    # declares severity using a text alias in the leading 100
+    # characters must NOT be treated as a coordination
+    # comment. The previous Guard 4 only protected the
+    # colon-start forms (``high severity:`` at body start),
+    # so a real P1/P2/P3 text-severity finding like
+    # ``Bumping the retry counter is high severity ... must
+    # fix`` was silently dropped as coordination.
     #
     # The initial implementation used a plain substring tuple
     # of the ``severity`` and ``priority`` noun forms. A
@@ -243,38 +404,50 @@ def is_coordination_comment(body: str) -> bool:
     # high priority issue`` or ``has a high severity impact``
     # no longer matched the regex and were dropped as
     # coordination before ``extract_severity`` could classify
-    # them (dbID 3447849261). The current implementation
-    # restores the optional article (``a``/``an``) while
-    # keeping the verb set narrowed to ``is``/``has`` only —
-    # the two copula forms that declare a severity/priority
-    # as the comment's own finding. This rejects every meta
-    # and negated form:
-    #   - ``classified as high priority``
-    #   - ``flagged as high severity``
-    #   - ``described as a high priority issue``
-    #   - ``with high priority context``
-    #   - ``with high severity language``
-    #   - ``is not high priority`` (negation)
+    # them (dbID 3447849261). The cycle-7 implementation
+    # restored the optional article but still required the
+    # level token to come IMMEDIATELY after the article,
+    # which dropped real findings phrased with an intensifier
+    # between the article and the level — e.g. ``is an
+    # extremely high severity issue`` (dbID 3447871114).
+    #
+    # The cycle-8 implementation replaces the regex with a
+    # small table-driven helper
+    # (:func:`_has_direct_text_severity_declaration`) that
+    # tokenizes the leading window and verifies the
+    # copula → [negation?] → [article?] → [intensifier{0,2}]
+    # → level → noun shape using explicit word tables.
+    # This:
+    #   - keeps the copula verb set narrowed to ``is``/``has``
+    #     (preserves cycle-6/7 protections against meta
+    #     ``as``/``with`` phrases),
+    #   - accepts the optional ``a``/``an`` article
+    #     (restores cycle-7 protection against false-negative
+    #     on direct article-bearing declarations),
+    #   - accepts up to TWO intensifier tokens from a fixed
+    #     whitelist between the article and the level
+    #     (new in cycle 8; rejects arbitrary words to avoid
+    #     regex whack-a-mole),
+    #   - treats negation immediately after a copula as
+    #     definitive (preserves cycle-5 negation rejection),
+    # while still rescuing every form from prior cycles:
+    #   - direct copula:    ``is high priority``
+    #   - article copula:   ``is a high priority issue``
+    #   - intensifier:      ``is an extremely high severity issue``
+    #   - subject pronoun:  ``this has a very high priority impact``
+    # and still rejecting every meta/context/negated form:
+    #   - ``classified as high priority`` (no copula)
+    #   - ``flagged as high severity`` (no copula)
+    #   - ``with high priority context`` (no copula)
+    #   - ``described as a high priority issue`` (no copula)
+    #   - ``P0/P1/P2 severity taxonomy`` (no copula)
+    #   - ``high priority context only`` (no copula)
+    #   - ``is not high priority`` (negation after copula)
     #   - ``is not a high priority issue`` (negation with article)
-    #   - ``not high severity`` (negation)
     #   - ``has no high severity impact`` (negation with article)
-    # while still rescuing:
-    #   - ``is high priority``
-    #   - ``is a high priority issue``
-    #   - ``is high severity``
-    #   - ``is an extremely high severity issue``
-    #   - ``has high severity``
-    #   - ``has a high severity impact``
-    #   - ``has low priority``
     # The leading-100-char window keeps the rescue narrow
     # and matches the leading-window pattern of Guard 5.
-    text_alias_declaration_re = re.compile(
-        r"\b(?:is|has)\s+(?:a\s+|an\s+)?"
-        r"(?:high|medium|low)\s+"
-        r"(?:severity|priority)\b",
-        re.IGNORECASE,
-    )
-    if text_alias_declaration_re.search(leading):
+    if _has_direct_text_severity_declaration(leading):
         return False
     return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
 

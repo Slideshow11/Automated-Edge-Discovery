@@ -1153,6 +1153,325 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Cycle-5 regression: 'is not high priority' must STILL NOT be rescued (cycle 7 regression check)"
         )
 
+    def test_dbID_3447871114_intensifier_rescued(self):
+        """Exact-pattern regression test for the cycle-7 fresh
+        Codex P2 finding dbID 3447871114 (2026-06-21T03:52:50Z
+        on head 7377eada08): 'Re-requesting review: this is
+        an extremely high severity issue' MUST be rescued by
+        Guard 6 and classified as a P1 finding. The cycle-7
+        regex required the level token to come IMMEDIATELY
+        after the optional article, which dropped this real
+        Codex finding. The cycle-8 helper accepts up to two
+        intensifier tokens between the article and the level
+        from a fixed whitelist (``very``, ``extremely``,
+        ``particularly``, ``especially``, ``clearly``,
+        ``obviously``, ``materially``, ``highly``)."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is an extremely high severity issue and must be addressed before merge",
+            "state": "",
+        }
+        # is_coordination_comment should return False (NOT skip)
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Intensifier form 'is an extremely high severity issue' MUST trigger Guard 6 rescue (dbID 3447871114)"
+        )
+        # And classify_item must classify it as P1
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_dbID_3447871114_very_priority_rescued(self):
+        """Direct intensifier form: 'has a very high priority
+        impact' MUST be rescued."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this comment has a very high priority impact and should be treated as a finding",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'has a very high priority impact' MUST trigger Guard 6 rescue"
+        )
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_p0_p1_p2_taxonomy_not_rescued(self):
+        """P0/P1/P2 severity taxonomy meta-text must NOT be
+        rescued. The body contains P0/P1/P2 and severity
+        tokens but no copula verb, so Guard 6 should not
+        rescue. This guards against the cycle-8 helper
+        accidentally matching taxonomy-shaped prose.
+
+        The test wraps the taxonomy prose in a coordination
+        prefix (``Re-requesting Codex review``) so the
+        end-to-end ``is_coordination_comment`` returns
+        ``True`` (skip), confirming Guard 6 does not rescue."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — the P0/P1/P2 severity taxonomy is being revised, please skip",
+            "state": "",
+        }
+        # is_coordination_comment should return True (skip)
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "'P0/P1/P2 severity taxonomy' meta-text must NOT trigger Guard 6 rescue"
+        )
+
+    def test_high_priority_context_only_not_rescued(self):
+        """'high priority context only' — a bare noun phrase
+        with no copula — must NOT be rescued. Wrapped in a
+        coordination prefix so the end-to-end check returns
+        ``True``."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — high priority context only, discussion not a finding",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "'high priority context only' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_not_actually_high_priority_not_rescued(self):
+        """'not actually high priority' — bare negation with
+        intervening adverb and no copula — must NOT be
+        rescued."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this is not actually high priority, just a re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "'not actually high priority' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_no_p0_misclassification_regression(self):
+        """P0 tokens in a body must still be classified as
+        P0 findings after the cycle-8 helper refactor. The
+        helper should not change P-token classification."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "P0 critical security issue: CVE-2024-XXXX in dependency chain",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        p0_findings = [f for f in got if f["severity"] == "P0"]
+        self.assertGreaterEqual(
+            len(p0_findings), 1,
+            f"P0 token in body must classify as P0, got {got}"
+        )
+
+    def test_two_intensifiers_max_rescued(self):
+        """The cycle-8 helper accepts up to TWO intensifier
+        tokens. 'is a very extremely high severity issue'
+        uses two intensifiers and must be rescued."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is a very extremely high severity issue that must be fixed",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is a very extremely high severity issue' (2 intensifiers) MUST trigger Guard 6 rescue"
+        )
+
+    def test_three_intensifiers_overflow_not_rescued(self):
+        """Three consecutive intensifiers (over MAX=2) must
+        NOT be rescued — the third intensifier ('particularly')
+        is not consumed by the WHILE loop (which stops at 2),
+        then fails the required-level check, so the pattern
+        doesn't match. This documents the MAX_INTENSIFIERS=2
+        invariant from the cycle-8 design constraints."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is a very extremely particularly high severity issue",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "3 intensifiers (over MAX=2) must NOT trigger Guard 6 rescue"
+        )
+
+    def test_two_intensifiers_any_combination_rescued(self):
+        """Two intensifiers in any combination from the
+        whitelist must be rescued. The MAX=2 limit is on
+        COUNT, not on UNIQUE values."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is a very very high severity issue that must be fixed",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is a very very high severity issue' (2 intensifiers, same word) MUST trigger Guard 6 rescue"
+        )
+
+
+class TestHasDirectTextSeverityDeclaration(unittest.TestCase):
+    """Table-driven unit tests for the cycle-8 helper
+    :func:`check_pr_review_comments._has_direct_text_severity_declaration`.
+
+    The helper replaces the cycle-7 regex-based Guard 6 with a
+    table-driven tokenizer that accepts a limited intensifier
+    list (max 2) between the optional article and the level
+    token, while still rejecting negation, meta-discussion
+    forms (``as``/``with``), and bare taxonomy prose.
+
+    Positive cases must return ``True``; negative cases must
+    return ``False``. The tables are the canonical spec of the
+    helper's behavior, derived from the cycle-8 design-narrow
+    extension authorization prompt.
+    """
+
+    POSITIVE_CASES = (
+        # Required by auth prompt — direct affirmative forms.
+        ("direct copula, no article",
+         "is high priority", True),
+        ("direct copula with article 'a'",
+         "is a high priority issue", True),
+        ("direct copula with article 'an'",
+         "is an high severity issue", True),
+        ("intensifier 'extremely' between article and level — dbID 3447871114",
+         "is an extremely high severity issue", True),
+        ("direct copula 'has'",
+         "has high severity", True),
+        ("'has' with article 'a'",
+         "has a high severity impact", True),
+        ("'has' with intensifier 'extremely'",
+         "has an extremely high priority impact", True),
+        ("subject 'this' with intensifier 'very'",
+         "this is a very high severity issue", True),
+        ("subject 'this' + 'has' with intensifier 'clearly'",
+         "this has a clearly high priority impact", True),
+        # Additional positive forms (not exhaustive).
+        ("medium priority, no article",
+         "is medium priority", True),
+        ("low severity, no article",
+         "is low severity", True),
+        ("two intensifiers (very extremely)",
+         "this is a very extremely high severity issue", True),
+        ("subject 'that'",
+         "that has a very high priority impact", True),
+        ("subject 'it'",
+         "it has a high priority issue", True),
+        # Legacy cycle-3/4/5/7 forms (regression — must still rescue).
+        ("cycle-3 example (Bumping + is + high severity)",
+         "Bumping the retry counter is high severity and must be fixed", True),
+        ("cycle-4 example (is + high priority)",
+         "Bumping the retry counter is high priority and should be treated as a finding", True),
+        ("cycle-5 example (Re-requesting + is + high priority)",
+         "Re-requesting review: this comment is high priority and must be addressed", True),
+        ("cycle-7 example (Re-requesting + has + a + high severity impact)",
+         "Re-requesting review: this comment has a high severity impact", True),
+    )
+
+    NEGATIVE_CASES = (
+        # Required by auth prompt — must NOT be rescued.
+        ("negation after copula — is not high priority",
+         "is not high priority", False),
+        ("negation with article — is not a high priority issue",
+         "is not a high priority issue", False),
+        ("'has no' negation with article",
+         "has no high severity impact", False),
+        ("bare negation at start",
+         "not high severity", False),
+        ("meta 'classified as'",
+         "classified as high priority", False),
+        ("meta 'flagged as'",
+         "flagged as high severity", False),
+        ("meta 'described as a' (with article)",
+         "described as a high priority issue", False),
+        ("context 'with high priority context'",
+         "with high priority context", False),
+        ("context 'with high severity language'",
+         "with high severity language", False),
+        ("taxonomy P0/P1/P2 severity",
+         "P0/P1/P2 severity taxonomy", False),
+        ("bare noun phrase 'high priority context only'",
+         "high priority context only", False),
+        ("bare negation with adverb 'not actually high priority'",
+         "not actually high priority", False),
+        # Regression — cycle 5/6/7 forms that must STILL not rescue.
+        ("cycle-5 regression: 'is not high priority' in coordination wrapper",
+         "Re-requesting Codex review — this is not high priority, please skip", False),
+        ("cycle-6 regression: 'classified as high priority' in coordination wrapper",
+         "Re-requesting Codex review — this was classified as high priority", False),
+        ("cycle-6 regression: 'with high priority context' in coordination wrapper",
+         "Re-requesting Codex review — with high priority context", False),
+        ("cycle-7 regression: 'is not a high priority issue' (negation with article)",
+         "Re-requesting Codex review — this is not a high priority issue, just a re-prompt", False),
+        ("cycle-7 regression: 'has no high severity impact' (has no)",
+         "Re-requesting Codex review — this comment has no high severity impact, just a re-prompt", False),
+        # dbID 3447871114 exact pattern (must NOT rescue — meta form).
+        ("dbID 3447871114 NEGATIVE case: meta + intensifier",
+         "Re-requesting Codex review — this prior finding was described as an extremely high severity issue in the prior round", False),
+        # Overflow: 3 intensifiers > MAX=2.
+        ("3 intensifiers overflows MAX=2",
+         "this is a very extremely particularly high severity issue", False),
+        # No copula, arbitrary prose.
+        ("no copula, just noun phrase",
+         "high severity issue exists in the code", False),
+        # Taxonomy prose.
+        ("taxonomy text mentioning severity/priority without copula",
+         "the high priority taxonomy includes P0/P1/P2 severity levels", False),
+        # Contractions (not recognized as copulas — conservative).
+        ("'isnt' contraction not recognized",
+         "isnt a high priority issue", False),
+    )
+
+    def test_positive_cases_table(self):
+        """All positive cases must return True."""
+        for desc, text, expected in self.POSITIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    True,
+                    f"Positive case '{desc}': text={text!r} should return True"
+                )
+
+    def test_negative_cases_table(self):
+        """All negative cases must return False."""
+        for desc, text, expected in self.NEGATIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    False,
+                    f"Negative case '{desc}': text={text!r} should return False"
+                )
+
+    def test_helper_handles_empty_input(self):
+        """Edge case: empty string must return False (no copula)."""
+        self.assertFalse(crc._has_direct_text_severity_declaration(""))
+
+    def test_helper_handles_none_input(self):
+        """Edge case: None must return False (no copula)."""
+        self.assertFalse(crc._has_direct_text_severity_declaration(None))
+
+    def test_helper_uses_documented_word_tables(self):
+        """The cycle-8 design constraints specify fixed word
+        tables. Verify the tables are exposed at module
+        level and contain the expected tokens."""
+        self.assertEqual(set(crc._TEXT_SEVERITY_VERBS), {"is", "has"})
+        self.assertEqual(set(crc._TEXT_SEVERITY_ARTICLES), {"a", "an"})
+        self.assertEqual(set(crc._TEXT_SEVERITY_LEVELS), {"high", "medium", "low"})
+        self.assertEqual(set(crc._TEXT_SEVERITY_NOUNS), {"severity", "priority"})
+        # Intensifier whitelist per cycle-8 design.
+        self.assertEqual(
+            set(crc._TEXT_SEVERITY_INTENSIFIERS),
+            {
+                "very", "extremely", "particularly", "especially",
+                "clearly", "obviously", "materially", "highly",
+            }
+        )
+        # Negation set includes standard English negation tokens.
+        self.assertIn("not", crc._TEXT_SEVERITY_NEGATIONS)
+        self.assertIn("no", crc._TEXT_SEVERITY_NEGATIONS)
+        # MAX_INTENSIFIERS is 2 per design constraint.
+        self.assertEqual(crc._MAX_TEXT_SEVERITY_INTENSIFIERS, 2)
+
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):
     """Regression for Codex finding AI: severity aliases
