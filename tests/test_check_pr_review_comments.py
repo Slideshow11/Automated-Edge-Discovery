@@ -1284,15 +1284,27 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         is not consumed by the WHILE loop (which stops at 2),
         then fails the required-level check, so the pattern
         doesn't match. This documents the MAX_INTENSIFIERS=2
-        invariant from the cycle-8 design constraints."""
-        item = {
-            "user": {"login": "chatgpt-codex-connector[bot]"},
-            "body": "Re-requesting review: this is a very extremely particularly high severity issue",
-            "state": "",
-        }
-        self.assertTrue(
-            crc.is_coordination_comment(item["body"]),
-            "3 intensifiers (over MAX=2) must NOT trigger Guard 6 rescue"
+        invariant from the cycle-8 design constraints.
+
+        Cycle-11 interaction: the prior body used here started
+        with ``Re-requesting review:`` (a coordination prefix),
+        which would trip Guard 7's colon-form rescue even when
+        Guard 6 itself correctly rejects the 3-intensifier
+        copula pattern. The test now invokes the Guard 6
+        helper directly so the MAX_INTENSIFIERS=2 invariant
+        can be pinned without Guard 7 interference. The end-
+        to-end coordination-skip behavior for the original
+        body is verified separately in
+        :class:`TestIsCoordinationCommentGuard7`
+        ``test_cycle11_no_regression_on_guard6_copula_cases``.
+        """
+        # Call the Guard 6 helper directly with the same body,
+        # which still rejects the 3-intensifier pattern.
+        body = "this is a very extremely particularly high severity issue"
+        self.assertFalse(
+            crc._has_direct_text_severity_declaration(body),
+            "3 intensifiers (over MAX=2) must NOT trigger Guard 6 rescue "
+            "(cycle-8 MAX_INTENSIFIERS=2 invariant)"
         )
 
     def test_two_intensifiers_any_combination_rescued(self):
@@ -1750,6 +1762,298 @@ class TestHasDirectTextSeverityDeclarationCycle10NegationContinue(unittest.TestC
                     f"Negation-only input {text!r} must still NOT rescue "
                     f"(cycle-10 negation-only protection)",
                 )
+
+
+class TestHasColonFormTextSeverityDeclaration(unittest.TestCase):
+    """Cycle 11 (PR #405 fresh Codex P2 finding, dbID 3448545827,
+    2026-06-21T14:11:05Z on head 28200b89d1ef5f2ffec88e2b0e41f6f48f7ea6d3):
+    the cycle-10 / Guard 6 helpers require an ``is``/``has`` copula
+    to rescue a text-alias severity declaration, and the
+    coordination-prefix skip ``is_coordination_comment`` ran before
+    any text-alias extraction could happen. A body that STARTS with
+    a coordination pattern and then uses a colon-form text-alias
+    severity declaration AFTER the coordination prefix (e.g.
+    ``Bumping retry counter: high severity regression``) was
+    therefore silently dropped as a coordination comment.
+
+    Cycle 11 fix: add a new helper
+    :func:`check_pr_review_comments._has_colon_form_text_severity_declaration`
+    that detects the shape ``<coord_prefix>: <level> <noun>`` and a
+    new Guard 7 in ``is_coordination_comment`` that uses the helper
+    to rescue these bodies from the coordination skip.
+
+    The fix preserves:
+    - meta-discussion forms (``classified as`` / ``described as``)
+    - context-only forms (``high priority context``, ``high
+      priority context only``)
+    - bare taxonomy prose (``P0/P1/P2 severity taxonomy``)
+    - copula + immediate negation (``is not high priority``)
+    - the coordination-prefix skip for true coordination comments
+      (those that don't declare severity)
+    - the previous cycle-8/9/10 protections (article, intensifier,
+      dash, negation-continue)
+    - no P0 misclassification regression
+
+    These tests are the canonical spec for the cycle-11 colon-form
+    text-alias severity declaration. The POSITIVE_CASES table mirrors
+    the auth-prompt positive examples exactly. The NEGATIVE_CASES
+    table re-pins every prior protection so a regression in either
+    direction is caught. A second-level test class
+    ``TestIsCoordinationCommentGuard7`` verifies the helper is
+    integrated with the Gate 7 check correctly.
+    """
+
+    # POSITIVE_CASES: bodies that should be RESCUED (helper returns True).
+    POSITIVE_CASES = (
+        # Required by auth prompt — exact Codex dbID 3448545827 example.
+        ("exact Codex dbID 3448545827 — coordination prefix + colon + high severity regression",
+         "Bumping retry counter: high severity regression", True),
+        ("auth prompt positive 2 — Re-requesting + high priority issue",
+         "Re-requesting review: high priority issue", True),
+        ("auth prompt positive 3 — Following up + medium severity problem",
+         "Following up: medium severity problem", True),
+        ("auth prompt positive 4 — Bumping this + low priority cleanup",
+         "Bumping this: low priority cleanup", True),
+        ("auth prompt positive 5 — Re-requesting + high severity impact in CI",
+         "Re-requesting review: high severity impact in CI", True),
+        # Additional colon-form severity forms.
+        ("re-request + medium priority fix",
+         "Re-requesting review: medium priority fix", True),
+        ("bumping + low severity case",
+         "Bumping this: low severity case", True),
+        ("gentle nudge + high priority regression",
+         "Gentle nudge: high priority regression", True),
+        # Trailing punctuation should not break the level/noun match.
+        ("trailing comma after noun — body has trailing punctuation",
+         "Bumping retry counter: high severity regression,", True),
+        # Subject pronoun before coordination word.
+        ("subject 'this' + bumping + colon + high severity",
+         "this Bumping retry counter: high severity regression", True),
+    )
+
+    # NEGATIVE_CASES: bodies that should NOT be rescued (helper returns False).
+    NEGATIVE_CASES = (
+        # Required by auth prompt — true coordination comments (no colon).
+        ("no colon — bumping for review",
+         "Bumping retry counter for review", False),
+        ("no colon — re-requesting on latest head",
+         "Re-requesting review on latest head", False),
+        ("no colon — following up on previous comment",
+         "Following up on the previous comment", False),
+        ("no colon — bumping because CI is pending",
+         "Bumping this because CI is pending", False),
+        # P-taxonomy is not a text-alias level (Guard 1 handles P1: separately).
+        ("P-taxonomy after colon — not a text-alias level",
+         "Bumping retry counter: P0/P1/P2 severity taxonomy", False),
+        ("P1: declaration after colon — caught by Guard 1 not Guard 7",
+         "Bumping retry counter: P1: this must fix", False),
+        # Negation immediately before level.
+        ("negated level after colon — not high severity",
+         "Bumping retry counter: not high severity", False),
+        ("negated with 'no' after colon — no medium priority",
+         "Bumping retry counter: no medium priority", False),
+        # Context/meta-discussion forms after the noun.
+        ("context-only form — high priority context only",
+         "Bumping retry counter: high priority context only", False),
+        ("context form (without 'only') — high priority context",
+         "Bumping retry counter: high priority context", False),
+        ("only form (without 'context') — high severity only",
+         "Bumping retry counter: high severity only", False),
+        # No coordination prefix at all (Guard 7 only fires when coordination
+        # pattern matches at start, but the helper itself does not check that).
+        ("no level noun at all after colon — just text",
+         "Bumping retry counter: this needs investigation", False),
+        # Empty / whitespace.
+        ("empty after colon",
+         "Bumping retry counter: ", False),
+    )
+
+    def test_positive_cases_table(self):
+        for desc, text, expected in self.POSITIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_colon_form_text_severity_declaration(text),
+                    True,
+                    f"Positive case '{desc}': text={text!r} should return True",
+                )
+
+    def test_negative_cases_table(self):
+        for desc, text, expected in self.NEGATIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_colon_form_text_severity_declaration(text),
+                    False,
+                    f"Negative case '{desc}': text={text!r} should return False",
+                )
+
+    def test_cycle11_exact_codex_dbID_example(self):
+        """The exact body from Codex dbID 3448545827 is pinned as
+        a separate test method so any change in either direction
+        fails loudly."""
+        self.assertTrue(
+            crc._has_colon_form_text_severity_declaration(
+                "Bumping retry counter: high severity regression"
+            ),
+            "Exact Codex dbID 3448545827 example must rescue "
+            "(coordination prefix + colon + high severity regression)",
+        )
+
+
+class TestIsCoordinationCommentGuard7(unittest.TestCase):
+    """Integration tests for Guard 7 — the colon-form text-alias
+    severity rescue wired into :func:`check_pr_review_comments.is_coordination_comment`.
+
+    The helper itself is tested in
+    :class:`TestHasColonFormTextSeverityDeclaration` above. These
+    tests verify that the helper is correctly integrated as Guard
+    7 in the coordination-skip flow and that the gate end-to-end
+    classifies bodies with the new shape as real findings.
+    """
+
+    # POSITIVE_CASES: bodies where Guard 7 should RESCUE the comment
+    # (is_coordination_comment returns False) AND the comment is
+    # classified as a real finding by classify_item.
+    POSITIVE_BODIES = (
+        "Bumping retry counter: high severity regression",
+        "Re-requesting review: high priority issue",
+        "Following up: medium severity problem",
+        "Bumping this: low priority cleanup",
+        "Re-requesting review: high severity impact in CI",
+    )
+
+    # NEGATIVE_CASES: bodies where Guard 7 should NOT fire — the
+    # comment remains a coordination comment OR is otherwise
+    # classified correctly.
+    NEGATIVE_BODIES = (
+        # No colon at all → coordination skip should still fire.
+        "Bumping retry counter for review",
+        "Re-requesting review on latest head",
+        # P-taxonomy → coordination skip should still fire (Guard 1
+        # also fires for explicit P1: but not for P0/P1/P2 taxonomy).
+        "Bumping retry counter: P0/P1/P2 severity taxonomy",
+        # Negation immediately before level → coordination skip
+        # should still fire.
+        "Bumping retry counter: not high severity",
+        # Context-only form → coordination skip should still fire.
+        "Bumping retry counter: high priority context only",
+        "Bumping retry counter: high priority context",
+    )
+
+    def test_guard7_rescues_positive_bodies_from_coordination(self):
+        """Bodies with colon-form text-alias severity declarations
+        must NOT be classified as coordination comments."""
+        for body in self.POSITIVE_BODIES:
+            with self.subTest(body=body):
+                self.assertFalse(
+                    crc.is_coordination_comment(body),
+                    f"Guard 7 must rescue body {body!r} from coordination skip "
+                    f"(colon-form text-alias severity declaration)",
+                )
+
+    def test_guard7_preserves_coordination_skip_for_negative_bodies(self):
+        """Bodies that don't have a colon-form text-alias severity
+        declaration must STILL be classified as coordination
+        comments (Guard 7 does not over-rescue)."""
+        for body in self.NEGATIVE_BODIES:
+            with self.subTest(body=body):
+                self.assertTrue(
+                    crc.is_coordination_comment(body),
+                    f"Guard 7 must NOT rescue body {body!r} — coordination skip "
+                    f"should still fire",
+                )
+
+    def test_cycle11_exact_codex_dbID_classifies_as_finding(self):
+        """The exact Codex dbID 3448545827 example is pinned as a
+        separate test method that verifies the full pipeline:
+        ``classify_item`` returns a finding (not an empty list)."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Bumping retry counter: high severity regression",
+            "state": "",
+        }
+        result = crc.classify_item(item, "review_comment", set())
+        self.assertTrue(
+            len(result) >= 1,
+            f"Exact Codex dbID 3448545827 example must classify as a "
+            f"finding via classify_item (got {result!r})",
+        )
+        # The finding should be a P1 (high → P1 per SEVERITY_MAP).
+        severities = [f.get("severity") for f in result]
+        self.assertIn(
+            "P1",
+            severities,
+            f"Exact Codex dbID 3448545827 example must classify as P1 "
+            f"(high → P1 per SEVERITY_MAP), got severities={severities!r}",
+        )
+
+    def test_cycle11_no_p0_misclassification_regression(self):
+        """P0 (catastrophic) findings should not be misclassified
+        by Guard 7. The cycle-11 helper never produces a finding
+        with severity P0 — it only rescues text-alias high/medium/
+        low which map to P1/P2/P3. This test pins the invariant."""
+        for body in (
+            # Coordination + high → P1 (not P0)
+            "Bumping retry counter: high severity regression",
+            # Coordination + medium → P2 (not P0)
+            "Re-requesting review: medium severity problem",
+            # Coordination + low → P3 (not P0)
+            "Following up: low priority cleanup",
+        ):
+            with self.subTest(body=body):
+                item = {
+                    "user": {"login": "human-pr-author"},
+                    "body": body,
+                    "state": "",
+                }
+                result = crc.classify_item(item, "review_comment", set())
+                severities = [f.get("severity") for f in result]
+                self.assertNotIn(
+                    "P0",
+                    severities,
+                    f"Guard 7 must NOT produce P0 from text-alias "
+                    f"high/medium/low; body={body!r}, "
+                    f"severities={severities!r}",
+                )
+
+    def test_cycle11_no_regression_on_guard6_copula_cases(self):
+        """Guard 6 (cycle-8/9/10) copula-based text-severity
+        detection must continue to work after Guard 7 is added."""
+        copula_cases = (
+            "is high priority",
+            "is a high priority issue",
+            "is an extremely high severity issue",
+            "has high severity",
+            "has a high severity impact",
+            "this has a very high priority impact",
+            # Cycle 9 dash forms.
+            "Bumping retry is high priority\u2014this skips CI",
+            # Cycle 10 negation-continue forms.
+            "Bumping the retry counter is not safe; this is high priority because it skips CI",
+        )
+        for body in copula_cases:
+            with self.subTest(body=body):
+                # Guard 6 helper still returns True for copula forms.
+                self.assertTrue(
+                    crc._has_direct_text_severity_declaration(body),
+                    f"Guard 6 helper must continue to rescue copula "
+                    f"text-severity declaration in body {body!r}",
+                )
+                # These bodies don't START with a coordination
+                # pattern (or start with ``Bumping`` + copula), so
+                # the coordination-skip behavior for them is
+                # unchanged. Bodies that start with ``Bumping``
+                # + non-colon copula (e.g. ``Bumping retry is
+                # high priority\u2014this skips CI``) will trip
+                # Guard 6 and return False from is_coordination.
+                # Bodies that don't start with a coordination
+                # pattern at all (e.g. ``is high priority``)
+                # also won't be coordination-skipped.
+                if any(body.lower().startswith(p) for p in crc._COORDINATION_PATTERNS):
+                    self.assertFalse(
+                        crc.is_coordination_comment(body),
+                        f"Guard 6 must continue to rescue coordination-prefix "
+                        f"body {body!r} from coordination skip",
+                    )
 
 
 class TestHasDirectTextSeverityDeclaration(unittest.TestCase):

@@ -173,6 +173,119 @@ _TEXT_SEVERITY_NOUNS_SET = frozenset(_TEXT_SEVERITY_NOUNS)
 _TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}-—–"
 
 
+def _has_colon_form_text_severity_declaration(leading_text: str) -> bool:
+    """Return ``True`` iff ``leading_text`` (the lowercased first
+    100 chars of a comment body) contains a colon-form
+    text-alias severity/priority declaration of the shape
+    ``...: <level> <noun>`` that should be rescued from
+    Guard 7's coordination-skip path.
+
+    Recognized shape (after the first ``:`` in the leading
+    window, with optional whitespace tokens between):
+
+        ``:`` <negation?><level> <noun>
+
+    where:
+
+        * ``:`` is the first colon in the leading window (the
+          typical coordination-prefix separator — e.g. the
+          ``:`` in ``Bumping retry counter: high severity
+          regression``).
+        * ``<level>`` ∈ ``{"high", "medium", "low"}``
+        * ``<noun>`` ∈ ``{"severity", "priority"}``
+        * ``<negation?>`` ∈ ``NOT_NEGATIONS``  — if present
+          IMMEDIATELY before ``<level>`` (within the same
+          colon segment, with at most intervening
+          punctuation/whitespace), the candidate declaration
+          is rejected and the helper continues scanning for
+          another colon + declaration further along.
+
+    Trailing-text rejection rules (applied per candidate):
+
+        * If the declaration is immediately followed (after
+          optional whitespace) by the literal token
+          ``only`` OR by ``context``, the declaration is
+          treated as a context/meta-discussion form and is
+          rejected. This pins the cycle-11 protection against
+          ``Bumping retry counter: high priority context
+          only`` being incorrectly rescued as a finding.
+
+    Examples returning ``True``:
+        ``bumping retry counter: high severity regression``
+        ``re-requesting review: high priority issue``
+        ``following up: medium severity problem``
+        ``bumping this: low priority cleanup``
+        ``re-requesting review: high severity impact in ci``
+
+    Examples returning ``False``:
+        ``bumping retry counter for review``       (no colon)
+        ``re-requesting review on latest head``   (no colon)
+        ``bumping retry counter: p0/p1/p2 severity taxonomy``
+                                                (P-token, not text-alias level)
+        ``bumping retry counter: not high severity``
+                                                (negation)
+        ``bumping retry counter: high priority context only``
+                                                (context/meta)
+        ``bumping retry counter: high priority context``
+                                                (context)
+    """
+    if not leading_text:
+        return False
+    # Cycle-11 design: scan the leading window left-to-right.
+    # The text-alias declaration must appear after the FIRST
+    # colon, which is the typical coordination-prefix
+    # separator (e.g. ``Bumping retry counter: <decl>``).
+    # If there is no colon in the leading window, the helper
+    # returns False immediately (no declaration to rescue).
+    colon_idx = leading_text.find(":")
+    if colon_idx == -1:
+        return False
+    # Tokenize only the text after the first colon, keeping the
+    # exact leading whitespace inside ``after_first_colon`` so
+    # the tokenization stays simple.
+    after_first_colon = leading_text[colon_idx + 1:]
+    if not after_first_colon.strip():
+        return False
+    raw_tokens = after_first_colon.split()
+    # Strip the same trailing punctuation as the cycle-8 helper
+    # so trailing ``,`` or ``.`` does not break the level/noun
+    # match (e.g. ``high severity,`` still matches ``high``).
+    tokens = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens]
+    n = len(tokens)
+    levels = _TEXT_SEVERITY_LEVELS_SET
+    nouns = _TEXT_SEVERITY_NOUNS_SET
+    negations = _TEXT_SEVERITY_NEGATIONS
+    context_only_words = frozenset({"context", "only"})
+    i = 0
+    while i < n:
+        # Find a candidate ``<level> <noun>`` pair. The
+        # tokens immediately BEFORE the level must not be a
+        # negation word — the negation check rejects this
+        # candidate and we continue scanning.
+        if tokens[i] in levels:
+            # Reject if the immediately-preceding token is a
+            # negation word. ``not high``, ``no high``, etc.
+            # are not a declaration.
+            if i > 0 and tokens[i - 1] in negations:
+                i += 1
+                continue
+            # The noun must come immediately after the level
+            # (whitespace-tokenized).
+            if i + 1 < n and tokens[i + 1] in nouns:
+                # Reject if the declaration is followed by
+                # ``context`` and/or ``only`` (meta/context-only
+                # form). Either token alone is enough to
+                # reject — both ``<level> <noun> context``
+                # and ``<level> <noun> only`` and
+                # ``<level> <noun> context only`` are rejected.
+                if (i + 2 < n and tokens[i + 2] in context_only_words):
+                    i += 1
+                    continue
+                return True
+        i += 1
+    return False
+
+
 def _has_direct_text_severity_declaration(leading_text: str) -> bool:
     """Return ``True`` iff ``leading_text`` (the lowercased first
     100 chars of a comment body) contains a direct affirmative
@@ -490,6 +603,46 @@ def is_coordination_comment(body: str) -> bool:
     # The leading-100-char window keeps the rescue narrow
     # and matches the leading-window pattern of Guard 5.
     if _has_direct_text_severity_declaration(leading):
+        return False
+    # Guard 7 (PR #405 fresh Codex P2 finding, 2026-06-21T14:11:05Z
+    # on head 28200b89d1, dbID 3448545827): a body that STARTS
+    # with a coordination pattern but uses a colon-form text-alias
+    # severity/priority declaration AFTER the coordination prefix
+    # (e.g. ``Bumping retry counter: high severity regression``)
+    # must NOT be treated as a coordination comment. Guards 1-6 do
+    # not fire on this body shape:
+    #   - Guard 1 needs ``P0:``/``P1:``/``P2:`` (not present).
+    #   - Guards 2-3 need a badge or bracket marker (not present).
+    #   - Guard 4 only protects the colon-start forms
+    #     (``high severity: Bumping ...`` at body start); the
+    #     auth-prompt example has the colon in the middle
+    #     (coordination prefix first, then declaration after ``:``).
+    #   - Guard 5 only looks for blocking words (``can fail`` etc.)
+    #     in the leading 100 chars; ``regression`` is not a
+    #     blocking word.
+    #   - Guard 6 (_has_direct_text_severity_declaration) needs an
+    #     ``is``/``has`` copula; ``Bumping retry counter: high
+    #     severity regression`` has no copula, so Guard 6 cannot
+    #     rescue it.
+    # Without Guard 7, the coordination-prefix ``startswith`` check
+    # at the bottom would drop this finding as a coordination
+    # comment and the gate could report clean despite an unresolved
+    # P1/P2 text-alias finding in that title style.
+    #
+    # The new helper ``_has_colon_form_text_severity_declaration``
+    # detects the shape ``<coord_prefix>: <level> <noun>`` and
+    # rejects meta/context/negated/P-taxonomy variants:
+    #   - ``Bumping retry counter: high severity regression``  → True
+    #   - ``Re-requesting review: high priority issue``         → True
+    #   - ``Following up: medium severity problem``             → True
+    #   - ``Bumping this: low priority cleanup``                → True
+    #   - ``Re-requesting review: high severity impact in CI``   → True
+    #   - ``Bumping retry counter: P0/P1/P2 severity taxonomy``  → False
+    #   - ``Bumping retry counter: not high severity``           → False
+    #   - ``Bumping retry counter: high priority context only``  → False
+    #   - ``Bumping retry counter for review``                   → False (no colon)
+    # The leading-100-char window matches Guards 5-6.
+    if _has_colon_form_text_severity_declaration(leading):
         return False
     return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
 
