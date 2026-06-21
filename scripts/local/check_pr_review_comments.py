@@ -189,20 +189,23 @@ def _has_direct_text_severity_declaration(leading_text: str) -> bool:
           ``as`` and ``with`` excluded)
         * ``[subject?]``∈ ``{"this", "that", "it"}``  (optional)
         * ``[negation?]`` ∈ ``NOT_NEGATIONS``  — if present
-          IMMEDIATELY after the verb, the helper returns ``False``
-          (definitive; subsequent copulas are not consulted)
+          IMMEDIATELY after the verb, that candidate copula
+          is rejected and the helper moves on to the NEXT
+          copula in the input. The negation is per-phrase,
+          not per-helper-call: a later affirmative copula in
+          the same input still rescues the comment.
         * ``[article?]`` ∈ ``{"a", "an"}``  (optional)
         * ``<intensifier>`` ∈ ``INTENSIFIER_WHITELIST``, max 2
           consecutive tokens
         * ``<level>``    ∈ ``{"high", "medium", "low"}``
         * ``<noun>``     ∈ ``{"severity", "priority"}``
 
-    The helper iterates every copula in the input. If the FIRST
-    copula encountered has an immediate negation, it returns
-    ``False`` (definitive). If a copula matches the full pattern
-    (copula → [article?] → [intensifier{0,2}] → level → noun), it
-    returns ``True``. If no copula matches the pattern, it returns
-    ``False``.
+    The helper iterates every copula in the input. If a copula
+    has an immediate negation, that copula is rejected and the
+    helper continues to the next copula. If any copula matches
+    the full pattern (copula → [article?] → [intensifier{0,2}]
+    → level → noun), it returns ``True``. If no copula matches
+    the pattern, it returns ``False``.
 
     Examples returning ``True``:
         ``is high priority``
@@ -212,11 +215,14 @@ def _has_direct_text_severity_declaration(leading_text: str) -> bool:
         ``has a high severity impact``
         ``this has a very high priority impact``
         ``this is a very extremely high severity issue``
+        # Multiple copulas where a later one is affirmative:
+        ``Bumping the retry counter is not safe; this is high priority because it skips CI``
+        ``Re-requesting review: this has high severity impact``
 
     Examples returning ``False``:
-        ``is not high priority``           (negation after copula)
-        ``is not a high priority issue``  (negation with article)
-        ``has no high severity impact``   (negation with article)
+        ``is not high priority``           (negation, no later affirmative copula)
+        ``is not a high priority issue``  (negation with article, no later affirmative copula)
+        ``has no high severity impact``   (negation with article, no later affirmative copula)
         ``not high severity``             (no copula, bare negation)
         ``classified as high priority``   (no copula)
         ``with high priority context``    (no copula)
@@ -253,8 +259,17 @@ def _has_direct_text_severity_declaration(leading_text: str) -> bool:
         # Found a copula. Validate the pattern that follows.
         j = i + 1
         # Definitive negation immediately after the copula.
+        # Cycle-10 fix (Codex 3448488549): the previous helper
+        # returned ``False`` for the WHOLE helper on this branch,
+        # which silently filtered out a real P1 finding whenever
+        # the comment contained ANY negated copula early in the
+        # body. Reject only THIS candidate copula and continue
+        # scanning subsequent copulas so a later affirmative
+        # declaration (e.g. ``Bumping the retry counter is not
+        # safe; this is high priority because it skips CI``)
+        # still triggers the Guard 6 rescue.
         if j < n and tokens[j] in _TEXT_SEVERITY_NEGATIONS:
-            return False
+            continue
         # Optional article.
         if j < n and tokens[j] in _TEXT_SEVERITY_ARTICLES_SET:
             j += 1

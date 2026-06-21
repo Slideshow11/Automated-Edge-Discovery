@@ -1578,6 +1578,180 @@ class TestHasDirectTextSeverityDeclarationCycle9Dash(unittest.TestCase):
                 )
 
 
+class TestHasDirectTextSeverityDeclarationCycle10NegationContinue(unittest.TestCase):
+    """Cycle 10 (PR #405 fresh Codex P2 finding, dbID 3448488549,
+    2026-06-21T13:28:56Z on head ecb271b26cca29b): the cycle-9
+    helper returned ``False`` for the WHOLE helper on the first
+    negated copula it encountered. That silently filtered out a
+    real P1 finding whenever the comment contained ANY negated
+    copula early in the body, even if a later clause had an
+    affirmative severity declaration.
+
+    Cycle 10 fix: change the immediate-negation branch from
+    ``return False`` to ``continue`` so the helper rejects only
+    THAT candidate copula and moves on to the next copula in the
+    input. A later affirmative copula still rescues the comment.
+
+    The fix preserves the protections against:
+
+    - meta-discussion forms (``classified as`` / ``described as``)
+    - context-only forms (``with high priority context``)
+    - bare negation (``not high severity``)
+    - copula + immediate negation when no later affirmative copula
+      exists in the input
+    - ``as`` and ``with`` as rescue verbs
+
+    These tests are the canonical spec for the cycle-10
+    negation-continue behavior. The POSITIVE_CASES table mirrors
+    the multi-clause example from the fresh Codex review body
+    exactly. The NEGATIVE_CASES table re-pins every prior
+    protection so a regression in any of those directions would
+    be caught.
+    """
+
+    POSITIVE_CASES = (
+        # Required by auth prompt — multiple copulas with a
+        # negated early copula and an affirmative later copula.
+        ("auth prompt — early negated 'is not', later 'is high priority'",
+         "Bumping the retry counter is not safe; this is high priority because it skips CI",
+         True),
+        ("auth prompt variant — early negated 'has no', later 'has high severity'",
+         "Re-requesting review: this has high severity impact",
+         True),
+        # Additional multi-copula forms.
+        ("two copulas, first negated, second affirmative (semicolon split)",
+         "this is not high priority; this has high severity impact",
+         True),
+        ("three copulas, first two negated, last affirmative",
+         "this is not safe; that has no impact; it is high priority because it breaks CI",
+         True),
+        # Subject + negation + subject + affirmative
+        ("subject 'this' + negated copula, then affirmative copula later",
+         "this is not a high priority issue, but it has a high severity impact later",
+         True),
+        # Negation in second clause is followed by affirmative in third clause
+        ("negated copula in middle, affirmative copula at end",
+         "this is medium priority, that is not blocking, this is high severity",
+         True),
+    )
+
+    NEGATIVE_CASES = (
+        # Required by auth prompt — protections preserved.
+        ("negation only — no later affirmative copula",
+         "Bumping this is not high priority", False),
+        ("negation with article — no later affirmative copula",
+         "Bumping this has no high severity impact", False),
+        # Meta-discussion forms (no copula).
+        ("meta 'classified as' — no copula at all",
+         "classified as high priority", False),
+        ("context 'with ...' — no copula at all",
+         "with high priority context", False),
+        ("meta 'described as' — no copula at all",
+         "described as a high priority issue", False),
+        # Bare negation (no copula).
+        ("bare negation — no copula at all",
+         "not high severity", False),
+        ("bare negation with article",
+         "not actually high priority", False),
+        # Cycle-8/9 negative regression guards — these must
+        # still NOT rescue after the cycle-10 fix.
+        ("single negated copula — cycle 5 regression check",
+         "is not high priority", False),
+        ("negated copula with article — cycle 7 regression check",
+         "is not a high priority issue", False),
+        ("negated copula with 'no' — cycle 7 regression check",
+         "has no high severity impact", False),
+        # Multiple copulas, ALL negated — must NOT rescue.
+        ("two copulas, both negated",
+         "this is not high priority and has no high severity impact", False),
+        ("three copulas, all negated",
+         "this is not high priority; that has no high severity; this is not blocking", False),
+    )
+
+    def test_positive_cases_table(self):
+        for desc, text, expected in self.POSITIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    True,
+                    f"Positive case '{desc}': text={text!r} should return True",
+                )
+
+    def test_negative_cases_table(self):
+        for desc, text, expected in self.NEGATIVE_CASES:
+            with self.subTest(case=desc, text=text):
+                self.assertEqual(
+                    crc._has_direct_text_severity_declaration(text),
+                    False,
+                    f"Negative case '{desc}': text={text!r} should return False",
+                )
+
+    def test_cycle10_exact_auth_prompt_examples(self):
+        """Exact text from the auth prompt and fresh Codex
+        review body, pinned as separate test methods so any
+        change in either direction fails loudly."""
+        # Example 1 (auth prompt):
+        # "Bumping the retry counter is not safe; this is
+        #  high priority because it skips CI"
+        # Early copula: "is not safe" (negated).
+        # Later copula: "is high priority" (affirmative).
+        # Expected: True — the later affirmative copula
+        # rescues the comment.
+        self.assertTrue(
+            crc._has_direct_text_severity_declaration(
+                "Bumping the retry counter is not safe; "
+                "this is high priority because it skips CI"
+            ),
+            "Cycle-10 exact example 1 (auth prompt) must rescue "
+            "(later affirmative copula is 'is high priority')",
+        )
+        # Example 2 (auth prompt):
+        # "Re-requesting review: this has high severity impact"
+        # Single copula, no negation.
+        # Expected: True.
+        self.assertTrue(
+            crc._has_direct_text_severity_declaration(
+                "Re-requesting review: this has high severity impact"
+            ),
+            "Cycle-10 exact example 2 (auth prompt) must rescue "
+            "(single affirmative copula)",
+        )
+        # Example 3 (auth prompt):
+        # "Bumping this is not high priority by itself, but it
+        #  has a high severity impact later"
+        # Early copula: "is not high priority by itself"
+        # (negated).
+        # Later copula: "has a high severity impact later"
+        # (affirmative).
+        # Expected: True.
+        self.assertTrue(
+            crc._has_direct_text_severity_declaration(
+                "Bumping this is not high priority by itself, "
+                "but it has a high severity impact later"
+            ),
+            "Cycle-10 exact example 3 (auth prompt) must rescue "
+            "(later affirmative copula is 'has a high severity impact')",
+        )
+
+    def test_cycle10_negation_only_inputs_still_fail(self):
+        """Inputs where EVERY copula is negated must still NOT
+        rescue — the cycle-5/6/7/8/9 protection against
+        negated-only input is preserved."""
+        for text in (
+            "Bumping this is not high priority",
+            "Bumping this is not high severity",
+            "Bumping this has no high severity impact",
+            "this is not a high priority issue",
+            "this is not high priority; this has no high severity impact",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(
+                    crc._has_direct_text_severity_declaration(text),
+                    f"Negation-only input {text!r} must still NOT rescue "
+                    f"(cycle-10 negation-only protection)",
+                )
+
+
 class TestHasDirectTextSeverityDeclaration(unittest.TestCase):
     """Table-driven unit tests for the cycle-8 helper
     :func:`check_pr_review_comments._has_direct_text_severity_declaration`.

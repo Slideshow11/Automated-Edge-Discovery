@@ -9879,6 +9879,136 @@ class CheckpointPathEqualsMarkerExtractionTests(unittest.TestCase):
             )
 
 
+class CheckpointPathUnderscoreColonMarkerTests(unittest.TestCase):
+    """Regression tests for Codex 3448488545 (Fix AM).
+
+    The broad ``_CHECKPOINT_TOKENS`` substring scan advertises
+    the sentence-cased underscore colon form ``Checkpoint_path:``
+    (it appears alongside ``Checkpoint_path=`` in the broad
+    tuple), but the strict ``_CHECKPOINT_FIELD_MARKERS``
+    extractor previously only knew the equals variant. A
+    resumable message like::
+
+        next_action: poll CI status
+        Checkpoint_path: /tmp/aed_checkpoint.json
+
+    was therefore downgraded to ``STALL_NO_CHECKPOINT`` instead
+    of ``OK_PROGRESS_WITH_NEXT_ACTION`` despite having both
+    required pieces of resume data. The fix adds
+    ``Checkpoint_path:`` to ``_CHECKPOINT_FIELD_MARKERS`` so the
+    strict extractor stays in sync with the broad scan
+    vocabulary and the resume-data completeness classifier can
+    progress.
+    """
+
+    def test_checkpoint_path_underscore_colon_is_progress(self) -> None:
+        text = (
+            "next_action: poll CI status\n"
+            "Checkpoint_path: /tmp/aed_checkpoint.json"
+        )
+        self.assertEqual(
+            classify_humphry_message_for_stall(text),
+            OK_PROGRESS_WITH_NEXT_ACTION,
+        )
+
+    def test_existing_equals_marker_forms_still_work(self) -> None:
+        # Regression guard (Codex 3443071841 / Fix AA): the
+        # equals variants added previously must still classify
+        # as progress after the colon addition.
+        for line in (
+            "Checkpoint_path=/tmp/ckpt.json",
+            "Checkpoint path=/tmp/ckpt.json",
+            "Checkpoint Path=/tmp/ckpt.json",
+            "Checkpoint=/tmp/ckpt.json",
+        ):
+            text = "next_action: poll CI status\n" + line
+            self.assertEqual(
+                classify_humphry_message_for_stall(text),
+                OK_PROGRESS_WITH_NEXT_ACTION,
+                f"existing equals form {line!r} must still classify as "
+                f"OK_PROGRESS_WITH_NEXT_ACTION",
+            )
+
+    def test_existing_colon_marker_forms_still_work(self) -> None:
+        # Regression guard (Codex 3420268720 / Fix J,
+        # Codex 3442626197 / Fix X, Codex 3443071841 / Fix AA):
+        # the previously-supported colon variants must continue
+        # to work after the new colon form is added.
+        for line in (
+            "checkpoint_path=/tmp/ckpt.json",
+            "checkpoint_path:/tmp/ckpt.json",
+            "Checkpoint path:/tmp/ckpt.json",
+            "Checkpoint Path:/tmp/ckpt.json",
+            "checkpoint=/tmp/ckpt.json",
+            "Checkpoint:/tmp/ckpt.json",
+        ):
+            text = "next_action: poll CI status\n" + line
+            self.assertEqual(
+                classify_humphry_message_for_stall(text),
+                OK_PROGRESS_WITH_NEXT_ACTION,
+                f"existing colon form {line!r} must still classify as "
+                f"OK_PROGRESS_WITH_NEXT_ACTION",
+            )
+
+    def test_checkpoint_path_underscore_colon_extractor_returns_path(self) -> None:
+        # Direct extractor check: the value-bearing
+        # checkpoint parser must extract the path from
+        # the sentence-cased underscore colon form.
+        from aed_lifecycle.no_stall import _extract_checkpoint_value
+        for text, expected in [
+            ("Checkpoint_path: /tmp/aed_checkpoint.json", "/tmp/aed_checkpoint.json"),
+            ("Checkpoint_path:/tmp/aed_checkpoint.json", "/tmp/aed_checkpoint.json"),
+        ]:
+            value = _extract_checkpoint_value(text)
+            self.assertEqual(
+                value,
+                expected,
+                f"underscore-colon-form marker text {text!r} should extract "
+                f"{expected!r}, got {value!r}",
+            )
+
+    def test_checkpoint_field_markers_contain_underscore_colon_form(self) -> None:
+        # Direct contract check: the strict
+        # ``_CHECKPOINT_FIELD_MARKERS`` must include
+        # ``Checkpoint_path:`` so the strict extractor
+        # stays in sync with the broad ``_CHECKPOINT_TOKENS``
+        # scan (Codex 3448488545 / Fix AM).
+        from aed_lifecycle.no_stall import _CHECKPOINT_FIELD_MARKERS
+        self.assertIn(
+            "Checkpoint_path:",
+            _CHECKPOINT_FIELD_MARKERS,
+            "sentence-cased underscore colon marker 'Checkpoint_path:' "
+            "must be in _CHECKPOINT_FIELD_MARKERS so the strict "
+            "extractor stays in sync with the broad _CHECKPOINT_TOKENS "
+            "scan (Codex 3448488545 / Fix AM)",
+        )
+
+    def test_invalid_or_missing_checkpoint_cases_still_fail(self) -> None:
+        # Regression guard: the new colon form must not
+        # accidentally accept invalid or missing checkpoint
+        # values. These cases should still classify as
+        # ``STALL_NO_CHECKPOINT`` because they are missing
+        # the required marker/value pair (no path-shaped
+        # value present).
+        from aed_lifecycle.no_stall import STALL_NO_CHECKPOINT
+        for text in (
+            # Colon form with no value
+            "next_action: poll CI status\nCheckpoint_path:",
+            # Colon form with empty after the colon
+            "next_action: poll CI status\nCheckpoint_path: ",
+            # Colon form with non-path-shaped value
+            # (placeholder status word, not path-shaped)
+            "next_action: poll CI status\nCheckpoint_path: pending",
+            # No checkpoint marker at all
+            "next_action: poll CI status",
+        ):
+            self.assertEqual(
+                classify_humphry_message_for_stall(text),
+                STALL_NO_CHECKPOINT,
+                f"text {text!r} should still classify as STALL_NO_CHECKPOINT",
+            )
+
+
 class CheckpointPrNumberHasattrGuardTests(unittest.TestCase):
     """Regression tests for Codex 3443071832 (Fix Z).
 

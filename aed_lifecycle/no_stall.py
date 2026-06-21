@@ -1134,6 +1134,22 @@ _CHECKPOINT_FIELD_MARKERS = (
     "Checkpoint path:",
     "Checkpoint Path:",
     "Checkpoint_path=",
+    # Fix AM (Codex 3448488545): the broad ``_CHECKPOINT_TOKENS``
+    # scan advertises the sentence-cased underscore colon form
+    # ``Checkpoint_path:`` (it appears alongside ``Checkpoint_path=``
+    # in the broad tuple), but the strict value-bearing
+    # extractor only knew the equals variant. A resumable message
+    # like::
+    #
+    #     next_action: poll CI status
+    #     Checkpoint_path: /tmp/aed_checkpoint.json
+    #
+    # was therefore downgraded to ``STALL_NO_CHECKPOINT`` instead
+    # of ``OK_PROGRESS_WITH_NEXT_ACTION`` despite having both
+    # required pieces of resume data. Adding the colon variant
+    # here keeps the strict extractor in sync with the broad
+    # scan.
+    "Checkpoint_path:",
     "Checkpoint path=",
     "Checkpoint Path=",
     "checkpoint=",
