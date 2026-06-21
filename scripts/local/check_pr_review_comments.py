@@ -93,35 +93,19 @@ _COORDINATION_PATTERNS = (
 
 
 # ---------------------------------------------------------------------------
-# Guard 6 helper: direct-affirmative text-severity declaration detector.
+# Actionable-finding-signal detector tables.
 # ---------------------------------------------------------------------------
-# Cycle 8 (PR #405 fresh Codex P2 finding, 2026-06-21T03:52:50Z on head
-# 7377eada08, dbID 3447871114): the cycle-7 regex required the level
-# token to come IMMEDIATELY after the optional ``a``/``an`` article,
-# which silently dropped real Codex findings phrased with an
-# intensifier between the article and the level — e.g. ``is an
-# extremely high severity issue``. The fix is to extract Guard 6
-# into a small, table-driven helper that tokenizes the leading
-# window and verifies the copula → [negation?] → [article?] →
-# [intensifier{0,2}] → level → noun shape using explicit word
-# tables, rather than a single brittle regex.
+# These tables are used by ``_has_direct_text_severity_declaration``
+# (the copula-based detector) to identify text-alias severity/priority
+# declarations of the shape
+#     [subject?] <verb> [negation?] [article?] <intensifier{0,2}> <level> <noun>
+# where <verb> is a copula (``is``/``has`` only; ``as`` and ``with``
+# are excluded so meta-discussion forms like ``classified as high
+# priority`` and ``with high priority context`` do NOT match).
 #
-# Design constraints (PR #405 cycle 8 design-narrow extension):
-#   1. The verb set is narrowed to the copulas ``is``/``has`` only —
-#      ``as`` and ``with`` remain excluded so meta-discussion
-#      forms (``classified as high priority``, ``with high
-#      priority context``) keep failing the rescue.
-#   2. Negation is treated as definitive (returns False immediately
-#      on the first copula-following negation token), matching
-#      cycle-5/6/7 behavior.
-#   3. Up to TWO intensifier tokens are accepted from a fixed
-#      whitelist (``very``, ``extremely``, ``particularly``,
-#      ``especially``, ``clearly``, ``obviously``, ``materially``,
-#      ``highly``) — arbitrary words between article and level
-#      are not accepted, to avoid the regex-whack-a-mole pattern
-#      that produced finding cycles 3-7.
-#   4. The subject pronoun (``this``/``that``/``it``) before the
-#      verb is supported but not required.
+# The detector is invoked by ``_has_actionable_finding_signal`` as
+# the copula-based actionable-signal component of the centralized
+# actionability decision. See that helper for the overall design.
 _TEXT_SEVERITY_VERBS = ("is", "has")
 _TEXT_SEVERITY_ARTICLES = ("a", "an")
 _TEXT_SEVERITY_INTENSIFIERS = (
@@ -154,135 +138,135 @@ _TEXT_SEVERITY_ARTICLES_SET = frozenset(_TEXT_SEVERITY_ARTICLES)
 _TEXT_SEVERITY_INTENSIFIERS_SET = frozenset(_TEXT_SEVERITY_INTENSIFIERS)
 _TEXT_SEVERITY_LEVELS_SET = frozenset(_TEXT_SEVERITY_LEVELS)
 _TEXT_SEVERITY_NOUNS_SET = frozenset(_TEXT_SEVERITY_NOUNS)
+# Past-participles / meta-verbs that mark a comment as REFERENCING
+# a prior fix rather than DECLARING a current issue. The narrow
+# colon-form helper uses this to reject coordination-prefixed
+# bodies of the shape
+#     ``Re-requesting Codex review: fixed the high severity
+#     regression from the prior finding``
+# which contain the words ``high severity`` but are
+# meta-discussion about a prior cycle's fix (Codex finding
+# 3448570717). The list is intentionally short and closed: no
+# arbitrary grammar expansion, no natural-language heuristic.
+_META_VERBS = frozenset({
+    "fixed",
+    "addressed",
+    "described",
+    "classified",
+    "flagged",
+    "reviewed",
+    "identified",
+    "mentioned",
+})
 # Trailing punctuation that may follow a level or noun token
 # without breaking the pattern (e.g. ``is medium priority:``).
-# The cycle-7 regex used ``\b`` word boundaries which tolerate
-# this; the cycle-8 token-based helper strips a small set of
-# trailing punctuation characters to preserve the same behavior.
-#
-# Cycle 9 (PR #405 fresh Codex P2 finding, 2026-06-21T04:20:36Z
-# on head d44c5ddaea8, dbID 3447899921): the cycle-8 punct set
-# did NOT include dash separators, so real Codex findings phrased
-# with em-dash / en-dash / hyphen separators (e.g. ``Bumping
-# retry is high priority—this skips CI``) had ``priority—this``
-# as a single token after ``.split()`` and ``.rstrip()`` did not
-# strip the dash. The cycle-7 regex's ``\b`` word boundary
-# accepted these common Markdown separators. Cycle 9 adds the
-# three dash characters (``-``, ``—``, ``–``) to the trailing
-# punct set so the helper matches the cycle-7 behavior again.
+# The ``\b`` word-boundary style of regexes tolerates trailing
+# punctuation; the token-based helper strips a small set of
+# characters so the helper matches the regex behavior. The set
+# includes dash separators (``-``/``—``/``–``) so em-dash and
+# hyphen after ``priority``/``severity`` are accepted.
 _TEXT_SEVERITY_TRAILING_PUNCT = ".,;:!?\"'()[]{}-—–"
 
 
-def _has_colon_form_text_severity_declaration(leading_text: str) -> bool:
+def _has_narrow_colon_form_declaration(leading_text: str) -> bool:
     """Return ``True`` iff ``leading_text`` (the lowercased first
-    100 chars of a comment body) contains a colon-form
+    100 chars of a comment body) contains a NARROW colon-form
     text-alias severity/priority declaration of the shape
-    ``...: <level> <noun>`` that should be rescued from
-    Guard 7's coordination-skip path.
+    ``<coordination_prefix>: <level> <noun>`` that should count
+    as an actionable finding signal.
 
-    Recognized shape (after the first ``:`` in the leading
-    window, with optional whitespace tokens between):
+    The detection is intentionally narrow:
 
-        ``:`` <negation?><level> <noun>
+    * Only the FIRST FOUR tokens after the FIRST ``:`` in the
+      leading window are considered. This rejects prior-finding
+      descriptions like
+      ``Re-requesting Codex review: fixed the high severity
+      regression from the prior finding`` (Codex finding
+      3448570717) where the ``high severity`` phrase appears
+      past the coordination-prefix segment.
+    * The FIRST token after the colon must NOT be a
+      meta-verb/past-participle (``fixed``/``addressed``/
+      ``described``/``classified``/``flagged``/``reviewed``/
+      ``identified``/``mentioned``). This is the second
+      discriminator for Codex finding 3448570717 — the past
+      participle is the marker that the comment is REFERENCING
+      a prior fix rather than DECLARING a current issue.
+    * The level token must NOT be preceded by a negation token
+      (with up to 3-token look-back so ``this is not a high
+      priority issue`` is rejected — Codex finding 3448570719).
+    * The level/noun pair must NOT be followed by ``context``
+      or ``only`` (meta/context-only form, e.g. ``high priority
+      context only``).
 
-    where:
+    The shape grammar is intentionally constrained — there is no
+    "scan the whole text after the colon" behavior, no broad
+    grammar expansion, and no natural-language heuristic for
+    arbitrary verb/noun permutations. This keeps the detector
+    narrow so the same body cannot trigger an adjacent-shape
+    Codex finding next cycle.
 
-        * ``:`` is the first colon in the leading window (the
-          typical coordination-prefix separator — e.g. the
-          ``:`` in ``Bumping retry counter: high severity
-          regression``).
-        * ``<level>`` ∈ ``{"high", "medium", "low"}``
-        * ``<noun>`` ∈ ``{"severity", "priority"}``
-        * ``<negation?>`` ∈ ``NOT_NEGATIONS``  — if present
-          IMMEDIATELY before ``<level>`` (within the same
-          colon segment, with at most intervening
-          punctuation/whitespace), the candidate declaration
-          is rejected and the helper continues scanning for
-          another colon + declaration further along.
-
-    Trailing-text rejection rules (applied per candidate):
-
-        * If the declaration is immediately followed (after
-          optional whitespace) by the literal token
-          ``only`` OR by ``context``, the declaration is
-          treated as a context/meta-discussion form and is
-          rejected. This pins the cycle-11 protection against
-          ``Bumping retry counter: high priority context
-          only`` being incorrectly rescued as a finding.
-
-    Examples returning ``True``:
+    Examples returning ``True`` (actionable):
         ``bumping retry counter: high severity regression``
         ``re-requesting review: high priority issue``
         ``following up: medium severity problem``
         ``bumping this: low priority cleanup``
-        ``re-requesting review: high severity impact in ci``
 
-    Examples returning ``False``:
+    Examples returning ``False`` (not actionable):
         ``bumping retry counter for review``       (no colon)
         ``re-requesting review on latest head``   (no colon)
+        ``re-requesting codex review: fixed the high severity
+            regression from the prior finding``   (meta-verb;
+                                                  Codex 3448570717)
+        ``re-requesting review: this is not a high priority
+            issue, just a re-prompt``             (negation;
+                                                  Codex 3448570719)
         ``bumping retry counter: p0/p1/p2 severity taxonomy``
-                                                (P-token, not text-alias level)
+                                                (P-token, not text-alias)
         ``bumping retry counter: not high severity``
-                                                (negation)
+                                                (bare negation)
         ``bumping retry counter: high priority context only``
-                                                (context/meta)
-        ``bumping retry counter: high priority context``
-                                                (context)
+                                                (meta/context-only)
     """
     if not leading_text:
         return False
-    # Cycle-11 design: scan the leading window left-to-right.
-    # The text-alias declaration must appear after the FIRST
-    # colon, which is the typical coordination-prefix
-    # separator (e.g. ``Bumping retry counter: <decl>``).
-    # If there is no colon in the leading window, the helper
-    # returns False immediately (no declaration to rescue).
     colon_idx = leading_text.find(":")
     if colon_idx == -1:
         return False
-    # Tokenize only the text after the first colon, keeping the
-    # exact leading whitespace inside ``after_first_colon`` so
-    # the tokenization stays simple.
-    after_first_colon = leading_text[colon_idx + 1:]
-    if not after_first_colon.strip():
+    after = leading_text[colon_idx + 1:]
+    if not after.strip():
         return False
-    raw_tokens = after_first_colon.split()
-    # Strip the same trailing punctuation as the cycle-8 helper
-    # so trailing ``,`` or ``.`` does not break the level/noun
-    # match (e.g. ``high severity,`` still matches ``high``).
-    tokens = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens]
-    n = len(tokens)
+    raw_tokens = after.split()
+    if not raw_tokens:
+        return False
+    # Discriminator 1: if the first post-colon token is a
+    # meta-verb/past-participle, the comment is describing a
+    # prior fix and is NOT actionable. This is the cycle-12
+    # finding 3448570717 fix.
+    if raw_tokens[0].rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) in _META_VERBS:
+        return False
+    # Restrict the scan to the first 4 post-colon tokens. This
+    # is the window-boundary fix for cycle-12 finding 3448570717.
+    window = [t.rstrip(_TEXT_SEVERITY_TRAILING_PUNCT) for t in raw_tokens[:4]]
     levels = _TEXT_SEVERITY_LEVELS_SET
     nouns = _TEXT_SEVERITY_NOUNS_SET
     negations = _TEXT_SEVERITY_NEGATIONS
     context_only_words = frozenset({"context", "only"})
-    i = 0
-    while i < n:
-        # Find a candidate ``<level> <noun>`` pair. The
-        # tokens immediately BEFORE the level must not be a
-        # negation word — the negation check rejects this
-        # candidate and we continue scanning.
-        if tokens[i] in levels:
-            # Reject if the immediately-preceding token is a
-            # negation word. ``not high``, ``no high``, etc.
-            # are not a declaration.
-            if i > 0 and tokens[i - 1] in negations:
-                i += 1
-                continue
-            # The noun must come immediately after the level
-            # (whitespace-tokenized).
-            if i + 1 < n and tokens[i + 1] in nouns:
-                # Reject if the declaration is followed by
-                # ``context`` and/or ``only`` (meta/context-only
-                # form). Either token alone is enough to
-                # reject — both ``<level> <noun> context``
-                # and ``<level> <noun> only`` and
-                # ``<level> <noun> context only`` are rejected.
-                if (i + 2 < n and tokens[i + 2] in context_only_words):
-                    i += 1
-                    continue
+    for i, tok in enumerate(window):
+        if tok in levels:
+            # Discriminator 2: negation look-back (cycle-12
+            # finding 3448570719 fix). Scan up to 3 tokens
+            # before the level so ``this is not a high
+            # priority issue`` rejects on the ``not`` at
+            # distance 3.
+            for j in range(max(0, i - 3), i):
+                if window[j] in negations:
+                    return False
+            # Discriminator 3: meta/context-only form.
+            if i + 1 < len(window) and window[i + 1] in nouns:
+                if (i + 2 < len(window)
+                        and window[i + 2] in context_only_words):
+                    return False
                 return True
-        i += 1
     return False
 
 
@@ -407,243 +391,130 @@ def _has_direct_text_severity_declaration(leading_text: str) -> bool:
     return False
 
 
+def _has_actionable_finding_signal(body: str) -> bool:
+    """Return ``True`` iff ``body`` contains an actionable finding
+    signal — a clear indicator that the comment is DECLARING a
+    current issue rather than REFERENCING a prior fix or
+    producing meta-discussion about a finding.
+
+    This helper is the SINGLE SOURCE OF TRUTH for the
+    actionability decision in the classifier. The full
+    coordination-skip / early-bypass heuristic ladder from
+    cycles 3-11 (Guards 1-7 inside the old
+    ``is_coordination_comment``) has been replaced by this
+    central detector plus a final-suppressor coordination check
+    inside :func:`classify_item`.
+
+    The signal is a disjunction of three narrow detectors,
+    evaluated left-to-right (most-specific first):
+
+    1. **Explicit P0/P1/P2/P3 marker.** A badge
+       (``![Pn Badge]``), bracketed (``[Pn]``), or colon-declared
+       (``Pn:``) severity is always actionable — these formats
+       are unambiguous declarations of severity by the Codex
+       reviewer. This consolidates Guards 1-3 from the
+       cycle-3-11 stack.
+
+    2. **Copula-based text-alias declaration.** A text-alias
+       declaration of the shape
+       ``[subject?] is/has [negation?] [article?] <intensifier{0,2}> <level> <noun>``
+       in the leading 100 characters is actionable. This is
+       delegated to :func:`_has_direct_text_severity_declaration`
+       (the cycle-8 table-driven helper, unchanged). It handles
+       dbIDs 3447794638, 3447818802, 3447825478, 3447830523,
+       3447849261, 3447871114, 3447899921, and 3448488549.
+
+    3. **Narrow colon-form declaration.** A coordination-prefixed
+       body of the shape
+       ``<coordination_prefix>: <level> <noun>``
+       where the level/noun pair appears in the first four
+       tokens after the first ``:`` and the first token after
+       the colon is not a meta-verb/past-participle. This is
+       delegated to :func:`_has_narrow_colon_form_declaration`
+       (the cycle-12-narrowed helper). It handles dbID
+       3448545827 and is intentionally narrow so it does NOT
+       over-rescue dbIDs 3448570717 + 3448570719.
+
+    4. **Blocking-word indicator in the leading 100 characters.**
+       A body that contains a :data:`BLOCKING_WORDS` token
+       (``can fail`` / ``stale`` / ``must fix`` / ``security`` /
+       etc.) tightly within the leading 100 characters is
+       actionable. This is the move of the OLD cycle-7
+       Guard 5 (Codex finding AQ) into the centralized
+       detector. The discriminator for meta-discussion
+       coordination messages like
+       ``Re-requesting Codex review — Fix AG is now on 266a92e``
+       is the leading-100-char window: real coordination
+       messages that happen to mention blocking vocabulary
+       (``stale`` / ``malformed``) do so well past the
+       leading 100 characters (in the meta-discussion about
+       which fix addressed which prior finding).
+
+    The detector is conservative by design: a body that merely
+    REFERENCES severity (e.g. ``fixed the high severity regression
+    from the prior finding``, ``classified as high priority``,
+    ``with high priority context``, taxonomy references,
+    negated forms) does NOT count as actionable and is left to
+    the final-suppressor coordination check.
+    """
+    if not body:
+        return False
+    # Detector 1: explicit P0/P1/P2/P3 marker.
+    upper = body.upper()
+    for sev in ("P0", "P1", "P2", "P3"):
+        if f"![{sev} BADGE]" in upper:
+            return True
+        if f"[{sev}]" in upper:
+            return True
+        if sev + ":" in upper:
+            return True
+    # Detector 2/3/4 share the leading[:100] window.
+    leading = body[:100].lower()
+    # Detector 2: copula-based text-alias declaration.
+    if _has_direct_text_severity_declaration(leading):
+        return True
+    # Detector 3: narrow colon-form declaration.
+    if _has_narrow_colon_form_declaration(leading):
+        return True
+    # Detector 4: blocking-word indicator in the leading
+    # 100 characters. Catches bodies like
+    # ``Bumping the retry counter can fail when Codex reruns
+    # after a stale head`` which declare an issue using
+    # BLOCKING_WORDS vocabulary even without a copula or P-marker.
+    # The leading-100-char window keeps the check narrow so
+    # coordination messages that mention blocking vocabulary
+    # in meta-discussion past the leading 100 chars (e.g.
+    # ``Re-requesting Codex review on 3982ee6 (Fix AF). The
+    # active P1 current-head finding ... allowing a
+    # malformed checkpoint ...``) do NOT match.
+    if any(bw in leading for bw in BLOCKING_WORDS):
+        return True
+    return False
+
+
 def is_coordination_comment(body: str) -> bool:
-    """Return True if ``body`` matches a coordination-comment
+    """Return True if ``body`` STARTS with a coordination
     pattern (human PR-author messages that re-request Codex
     review, nudge the Codex bot, or describe which fix addresses
     a prior finding).
 
-    These comments contain Codex needles and would otherwise be
-    misclassified as blocking findings, even though they are
-    coordination messages and not actual review findings. The
-    check is case-insensitive substring matching against
-    :data:`_COORDINATION_PATTERNS`.
+    This is the FINAL SUPPRESSOR in the classifier pipeline,
+    not an early bypass. The actionability decision is made
+    upstream by :func:`_has_actionable_finding_signal`; this
+    function only answers the simpler question "does this body
+    start with a coordination prefix?".
 
-    Guard 1: a body that contains an explicit P0/P1/P2 SEVERITY
-    DECLARATION (i.e. ``P0:``/``P1:``/``P2:`` followed by a
-    colon) is NEVER treated as a coordination comment, even if
-    it also matches a coordination pattern. This prevents the
-    broad patterns (``@codex``, ``bumping``, etc.) from
-    silently discarding real blockers like
-    ``P1: @codex flagged a security issue; must fix`` (Codex
-    finding AJ).
-
-    The colon requirement distinguishes a severity declaration
-    (``P1: ...``) from a reference to a prior finding
-    (``The active P1 current-head finding``), which commonly
-    appears in coordination comments describing which fix
-    addresses which prior finding.
-
-    Guard 2: a body that contains a badge-style severity marker
-    (``![P0 Badge]``, ``![P1 Badge]``, ``![P2 Badge]``,
-    ``![P3 Badge]``) or a bracketed priority marker
-    (``[P0]``, ``[P1]``, ``[P2]``) is NEVER treated as a
-    coordination comment, even if it also matches a
-    coordination pattern. Badge-formatted and bracketed
-    findings are always real findings — these formats
-    indicate actual review findings rather than coordination
-    messages. Without this guard, a finding like
-    ``![P1 Badge] Bumping the retry counter can skip failures``
-    or ``[P1] Bumping the retry counter can skip failures``
-    would be silently dropped (Codex findings AK and AM).
+    A coordination-prefixed body that ALSO has an actionable
+    finding signal is NOT suppressed here — it is detected as
+    actionable upstream and emitted as a finding by
+    :func:`classify_item`. The coordination-suppress path only
+    fires when there is no actionable signal AND the body
+    starts with a coordination pattern (e.g. ``Bumping retry
+    counter for review`` — coordination noise with no
+    severity/blocking signal).
     """
     body_str = body or ""
-    upper = body_str.upper()
-    for sev in ("P0", "P1", "P2"):
-        # Guard 1: explicit P0:/P1:/P2: severity declaration.
-        if sev + ":" in upper:
-            return False
-        # Guard 2: badge-style severity marker.
-        if f"![{sev} BADGE]" in upper:
-            return False
-        # Guard 3: bracketed priority marker.
-        if f"[{sev}]" in upper:
-            return False
-    # Guard 4 (Fix AO, Codex Finding AO): a body that STARTS
-    # with an explicit severity DECLARATION (in any recognized
-    # format) or a blocking-word indicator must NOT be dropped
-    # as a coordination comment, even if it also contains a
-    # coordination pattern elsewhere. This catches the
-    # ``High severity: ...`` text-alias form (mapped to P1 by
-    # :func:`extract_severity`) and the ``Codex finding: ...
-    # must fix`` form (mapped to UNSPECIFIED_BLOCKING by
-    # :func:`is_blocking`). Without this guard, a genuine
-    # finding like
-    # ``High severity: Bumping retry counter can skip failures``
-    # or
-    # ``Codex finding: Bumping retry counter can skip failures
-    # — must fix`` would be silently dropped by the
-    # coordination skip.
-    #
-    # The check is intentionally targeted to START-of-body
-    # declarations to avoid false positives from bare P-token
-    # references or blocking-word mentions in the middle of
-    # coordination text (e.g. ``Re-requesting Codex review...
-    # The active P1 current-head finding has been addressed...
-    # allowing a malformed checkpoint...``).
     body_lower = body_str.lower().lstrip()
-    # Text-alias severity declarations at start of body.
-    text_alias_decls = (
-        "high severity:",
-        "medium:",
-        "low:",
-    )
-    if any(body_lower.startswith(decl) for decl in text_alias_decls):
-        return False
-    # Blocking-word indicators at start of body.
-    if any(body_lower.startswith(bw) for bw in BLOCKING_WORDS):
-        return False
-    # Coordination check: only flag as coordination if the
-    # body STARTS with a coordination pattern. This prevents
-    # coordination messages that contain blocking-word
-    # mentions mid-sentence from being incorrectly classified
-    # as findings, while still skipping coordination messages
-    # that begin with ``Re-requesting``, ``Gentle nudge``,
-    # ``Bumping``, etc.
-    #
-    # Guard 5 (Fix AQ, Codex Finding AQ): a body that STARTS
-    # with a coordination pattern must NOT be treated as a
-    # coordination comment if it ALSO contains a blocking-word
-    # indicator within the LEADING 100 characters. Real
-    # coordination messages like ``Re-requesting Codex review
-    # on 3982ee6 (Fix AF). The active P1 current-head
-    # finding ...`` or ``Bumping this thread — Fix AG is now
-    # on 266a92e.`` are typically 100+ characters and only
-    # mention blocking vocabulary (``stale``, ``malformed``)
-    # in the meta-discussion about which fix addressed which
-    # prior finding, well past the leading 100 characters.
-    #
-    # Real blocker findings that happen to start with a
-    # coordination word — e.g. ``Bumping the retry counter can
-    # fail when Codex reruns after a stale head`` — DO
-    # contain blocking vocabulary (``can fail``, ``stale``)
-    # tightly within the leading 100 characters and must be
-    # detected as findings rather than silently dropped.
-    # The previous ``startswith``-only check returned before
-    # ``is_blocking()`` could run, so the gate could report
-    # clean despite an unresolved blocker.
-    leading = body_str[:100].lower()
-    if any(bw in leading for bw in BLOCKING_WORDS):
-        return False
-    # Guard 6 (PR #405 fresh Codex reviews, 2026-06-21T02:15:04Z,
-    # 2026-06-21T02:46:26Z, 2026-06-21T02:54:45Z,
-    # 2026-06-21T03:01:27Z, 2026-06-21T03:25:34Z, and
-    # 2026-06-21T03:52:50Z, dbIDs 3447794638 + 3447818802 +
-    # 3447825478 + 3447830523 + 3447849261 + 3447871114): a
-    # body that STARTS with a coordination pattern but
-    # declares severity using a text alias in the leading 100
-    # characters must NOT be treated as a coordination
-    # comment. The previous Guard 4 only protected the
-    # colon-start forms (``high severity:`` at body start),
-    # so a real P1/P2/P3 text-severity finding like
-    # ``Bumping the retry counter is high severity ... must
-    # fix`` was silently dropped as coordination.
-    #
-    # The initial implementation used a plain substring tuple
-    # of the ``severity`` and ``priority`` noun forms. A
-    # follow-up Codex review found a false-positive rescue:
-    # a coordination message saying ``Re-requesting Codex
-    # review — this is not high priority`` matched the
-    # literal ``high priority`` substring and was incorrectly
-    # classified as a P1 finding. The cycle-5 implementation
-    # used a regex with affirmative verbs
-    # (``is``/``has``/``as``/``with``) before the priority or
-    # severity token, which rejected negations but still
-    # rescued meta-discussion forms like ``classified as
-    # high priority`` and ``with high priority context``
-    # (dbID 3447830523). The cycle-6 implementation narrowed
-    # the verb set to copulas (``is``/``has``) only and
-    # dropped the optional ``a``/``an`` article, which fixed
-    # the meta-priority false-positive but created a new
-    # false-negative: real Codex findings phrased as ``is a
-    # high priority issue`` or ``has a high severity impact``
-    # no longer matched the regex and were dropped as
-    # coordination before ``extract_severity`` could classify
-    # them (dbID 3447849261). The cycle-7 implementation
-    # restored the optional article but still required the
-    # level token to come IMMEDIATELY after the article,
-    # which dropped real findings phrased with an intensifier
-    # between the article and the level — e.g. ``is an
-    # extremely high severity issue`` (dbID 3447871114).
-    #
-    # The cycle-8 implementation replaces the regex with a
-    # small table-driven helper
-    # (:func:`_has_direct_text_severity_declaration`) that
-    # tokenizes the leading window and verifies the
-    # copula → [negation?] → [article?] → [intensifier{0,2}]
-    # → level → noun shape using explicit word tables.
-    # This:
-    #   - keeps the copula verb set narrowed to ``is``/``has``
-    #     (preserves cycle-6/7 protections against meta
-    #     ``as``/``with`` phrases),
-    #   - accepts the optional ``a``/``an`` article
-    #     (restores cycle-7 protection against false-negative
-    #     on direct article-bearing declarations),
-    #   - accepts up to TWO intensifier tokens from a fixed
-    #     whitelist between the article and the level
-    #     (new in cycle 8; rejects arbitrary words to avoid
-    #     regex whack-a-mole),
-    #   - treats negation immediately after a copula as
-    #     definitive (preserves cycle-5 negation rejection),
-    # while still rescuing every form from prior cycles:
-    #   - direct copula:    ``is high priority``
-    #   - article copula:   ``is a high priority issue``
-    #   - intensifier:      ``is an extremely high severity issue``
-    #   - subject pronoun:  ``this has a very high priority impact``
-    # and still rejecting every meta/context/negated form:
-    #   - ``classified as high priority`` (no copula)
-    #   - ``flagged as high severity`` (no copula)
-    #   - ``with high priority context`` (no copula)
-    #   - ``described as a high priority issue`` (no copula)
-    #   - ``P0/P1/P2 severity taxonomy`` (no copula)
-    #   - ``high priority context only`` (no copula)
-    #   - ``is not high priority`` (negation after copula)
-    #   - ``is not a high priority issue`` (negation with article)
-    #   - ``has no high severity impact`` (negation with article)
-    # The leading-100-char window keeps the rescue narrow
-    # and matches the leading-window pattern of Guard 5.
-    if _has_direct_text_severity_declaration(leading):
-        return False
-    # Guard 7 (PR #405 fresh Codex P2 finding, 2026-06-21T14:11:05Z
-    # on head 28200b89d1, dbID 3448545827): a body that STARTS
-    # with a coordination pattern but uses a colon-form text-alias
-    # severity/priority declaration AFTER the coordination prefix
-    # (e.g. ``Bumping retry counter: high severity regression``)
-    # must NOT be treated as a coordination comment. Guards 1-6 do
-    # not fire on this body shape:
-    #   - Guard 1 needs ``P0:``/``P1:``/``P2:`` (not present).
-    #   - Guards 2-3 need a badge or bracket marker (not present).
-    #   - Guard 4 only protects the colon-start forms
-    #     (``high severity: Bumping ...`` at body start); the
-    #     auth-prompt example has the colon in the middle
-    #     (coordination prefix first, then declaration after ``:``).
-    #   - Guard 5 only looks for blocking words (``can fail`` etc.)
-    #     in the leading 100 chars; ``regression`` is not a
-    #     blocking word.
-    #   - Guard 6 (_has_direct_text_severity_declaration) needs an
-    #     ``is``/``has`` copula; ``Bumping retry counter: high
-    #     severity regression`` has no copula, so Guard 6 cannot
-    #     rescue it.
-    # Without Guard 7, the coordination-prefix ``startswith`` check
-    # at the bottom would drop this finding as a coordination
-    # comment and the gate could report clean despite an unresolved
-    # P1/P2 text-alias finding in that title style.
-    #
-    # The new helper ``_has_colon_form_text_severity_declaration``
-    # detects the shape ``<coord_prefix>: <level> <noun>`` and
-    # rejects meta/context/negated/P-taxonomy variants:
-    #   - ``Bumping retry counter: high severity regression``  → True
-    #   - ``Re-requesting review: high priority issue``         → True
-    #   - ``Following up: medium severity problem``             → True
-    #   - ``Bumping this: low priority cleanup``                → True
-    #   - ``Re-requesting review: high severity impact in CI``   → True
-    #   - ``Bumping retry counter: P0/P1/P2 severity taxonomy``  → False
-    #   - ``Bumping retry counter: not high severity``           → False
-    #   - ``Bumping retry counter: high priority context only``  → False
-    #   - ``Bumping retry counter for review``                   → False (no colon)
-    # The leading-100-char window matches Guards 5-6.
-    if _has_colon_form_text_severity_declaration(leading):
-        return False
     return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
 
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
@@ -933,6 +804,29 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
     """
     Given a single comment/review dict from any endpoint, scan for Codex
     findings and return a list of finding dicts (may be empty).
+
+    The classifier pipeline has been restructured (option B
+    refactor) to consolidate the actionability decision in
+    :func:`_has_actionable_finding_signal` (single source of
+    truth) and demote :func:`is_coordination_comment` from an
+    early bypass to a final suppressor.
+
+    Pipeline order:
+
+    1. Author filter — drop comments from ``ignore_users``.
+    2. Codex-needle check — drop comments without any Codex
+       needle (high/medium/P0/P1/P2/P3/badge/...).
+    3. Actionability check — :func:`_has_actionable_finding_signal`
+       decides whether the comment is DECLARING a current issue.
+    4. Coordination suppression — :func:`is_coordination_comment`
+       ONLY suppresses bodies that have no actionable signal AND
+       start with a coordination pattern. Bodies with an
+       actionable signal pass through regardless of coordination
+       prefix.
+    5. Severity extraction — :func:`extract_severity` maps the
+       body text to P0-P3 (or None). :func:`is_blocking` is the
+       fallback for unspecified-severity blocking comments.
+    6. Finding emission — emit the finding dict.
     """
     findings = []
     user = (item.get("user") or {}).get("login", "")
@@ -940,19 +834,6 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
         return findings
 
     body = item.get("body") or ""
-
-    # Human PR-author coordination comments (re-requests, nudges,
-    # fix descriptions) are NOT findings. They contain Codex
-    # needles and would otherwise be misclassified as blocking
-    # findings. The check is source-agnostic: any comment body
-    # matching a coordination pattern is skipped, regardless of
-    # whether it arrived as an issue comment, inline review
-    # comment, or review submission. This prevents false-positive
-    # gate failures caused by the human workflow of re-requesting
-    # Codex review after each fix push.
-    if is_coordination_comment(body):
-        return findings
-
     state = item.get("state") or ""
     file_path = item.get("path") or ""
     line = item.get("line") or item.get("original_line") or ""
@@ -963,8 +844,24 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
     if not any(needle in combined for needle in CODEX_NEEDLES):
         return findings
 
-    # Classify severity: explicit P0-P3 tokens take priority. High/Medium/Low are
-    # mapped. Only if no severity keyword is found do we check blocking words.
+    # Single-source-of-truth actionability decision. The old
+    # cycle-3-11 ladder encoded this across 7 hand-tuned guards
+    # inside ``is_coordination_comment``; the centralized
+    # detector now handles the same shapes and rejects the
+    # meta/negated/taxonomy forms that the guards were
+    # repeatedly patched to handle.
+    has_actionable = _has_actionable_finding_signal(body)
+
+    # Coordination suppression is now a FINAL SUPPRESSOR, not
+    # an early bypass. It only fires for bodies that have NO
+    # actionable signal AND start with a coordination pattern
+    # (e.g. ``Bumping retry counter for review`` — pure
+    # coordination noise with no severity/blocking signal).
+    if not has_actionable and is_coordination_comment(body):
+        return findings
+
+    # Severity extraction (unchanged — already a single source
+    # of truth for severity level mapping).
     severity = extract_severity(combined)
     if severity is None and is_blocking(combined):
         severity = "UNSPECIFIED_BLOCKING"
