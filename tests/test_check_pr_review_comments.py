@@ -842,6 +842,134 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["severity"], "P3")
 
+    def test_classified_as_high_priority_not_rescued(self):
+        """Regression for the fourth fresh Codex P2 finding on
+        head aa41a25b1bad (2026-06-21T03:01:27Z, dbID
+        3447830523): a coordination comment that says a prior
+        finding was 'classified as high priority' must NOT
+        trigger the Guard 6 rescue. The previous cycle-5
+        regex used ``as`` as an affirmative verb and falsely
+        rescued this meta-discussion form. The cycle-6
+        implementation narrows the verb set to copulas
+        (``is``/``has``) only, so ``classified as high
+        priority`` no longer matches."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — the prior finding was classified as high priority and fixed",
+            "state": "",
+        }
+        # is_coordination_comment should return True (skip)
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Meta-discussion 'classified as high priority' must NOT trigger Guard 6 rescue (dbID 3447830523)"
+        )
+
+    def test_flagged_as_high_severity_not_rescued(self):
+        """Same as above for the 'flagged as high severity'
+        meta-discussion form."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this was flagged as high severity in the previous round",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Meta-discussion 'flagged as high severity' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_with_high_priority_context_not_rescued(self):
+        """Regression for dbID 3447830523: a coordination
+        comment that mentions a 'with high priority context'
+        form must NOT trigger the Guard 6 rescue. The
+        cycle-5 regex used ``with`` as an affirmative verb
+        and falsely rescued this context-form."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — fixed in prior commit with high priority context, please re-check",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Context phrase 'with high priority context' must NOT trigger Guard 6 rescue (dbID 3447830523)"
+        )
+
+    def test_with_high_severity_language_not_rescued(self):
+        """Same as above for the 'with high severity language'
+        context form."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — addressed previously with high severity language in the comment",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Context phrase 'with high severity language' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_not_high_severity_negation_not_rescued(self):
+        """Regression for cycle 5 (dbID 3447825478): the bare
+        negation form 'not high severity' (no copula before
+        'not') must NOT trigger Guard 6 rescue. The cycle-5
+        regex with affirmative verbs handled this correctly;
+        cycle 6 must preserve that behavior."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this comment is not high severity, just a re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Negation 'not high severity' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_direct_is_high_priority_still_rescues(self):
+        """Cycle-6 sanity check: the direct copula form
+        'is high priority' MUST still trigger the Guard 6
+        rescue. The cycle-5 cycle-6 fix only narrowed the
+        verb set, did not eliminate the rescue itself."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this comment is high priority and must be addressed before merge",
+            "state": "",
+        }
+        # is_coordination_comment should return False (NOT skip)
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Direct copula 'is high priority' MUST still trigger Guard 6 rescue"
+        )
+
+    def test_direct_has_high_severity_still_rescues(self):
+        """Same as above for the 'has high severity' form."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this finding has high severity implications for the watchdog loop",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Direct copula 'has high severity' MUST still trigger Guard 6 rescue"
+        )
+
+    def test_dbID_3447830523_exact_pattern_not_rescued(self):
+        """Exact-pattern regression test for the Codex finding
+        dbID 3447830523 (2026-06-21T03:01:27Z on head
+        aa41a25b1bad). The finding's body contained 'classified
+        as high priority' and 'with high priority context' as
+        meta-discussion examples; both must NOT rescue. This
+        test is the canonical pin for that specific Codex
+        review finding."""
+        body = (
+            "Re-requesting Codex review — this prior finding was "
+            "classified as high priority and was fixed with high "
+            "priority context in the first 100 chars of this comment"
+        )
+        self.assertGreater(len(body), 100, "test body must exceed the leading-100 window")
+        self.assertTrue(
+            crc.is_coordination_comment(body),
+            "The exact dbID 3447830523 pattern ('classified as high priority' "
+            "+ 'with high priority context') must NOT trigger Guard 6 rescue"
+        )
+
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):
     """Regression for Codex finding AI: severity aliases
