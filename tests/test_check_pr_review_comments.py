@@ -2843,6 +2843,484 @@ class TestWaiverLoad(unittest.TestCase):
             Path(path).unlink()
 
 
+class TestSourceAwareFailClosedClassification(unittest.TestCase):
+    """Table-driven unit tests for the source-aware fail-closed
+    gate (option B2 refactor).
+
+    The CORE DESIGN RULE under B2:
+
+    * A current unresolved Codex inline review-thread
+      comment is **actionable by default**.
+    * Severity extraction ranks it.
+    * If severity is absent but the thread is current,
+      unresolved, Codex-authored, and not waived, default
+      to blocking severity (``P2``).
+    * Coordination suppression does NOT bypass Codex
+      review-thread findings.
+    * Coordination suppression remains available for
+      human/top-level coordination comments such as
+      re-request comments, bump comments, or status
+      chatter.
+
+    This test class covers 4 groups per the auth prompt:
+
+    A. Codex review-thread comments are fail-closed.
+    B. Coordination suppression still works for
+       human/top-level comments.
+    C. State filters still win (resolved / outdated /
+       stale / waived).
+    D. Regression coverage for prior Codex edge cases
+       (cycle-3 through cycle-13 dbIDs).
+    """
+
+    # ------------------------------------------------------------------
+    # A. Codex review-thread comments are fail-closed
+    # ------------------------------------------------------------------
+    # Bodies + expected severity when
+    # ``is_codex_review_thread_current_unresolved=True``.
+    A_POSITIVE_BODIES = (
+        # Explicit P1 / P2 markers (highest priority in extract_severity).
+        ("A1 — explicit P1: marker",
+         "P1: this is a finding",
+         "P1"),
+        ("A2 — explicit P2: marker",
+         "P2: review-comment gate fail",
+         "P2"),
+        ("A3 — explicit P3: marker",
+         "P3: minor nit",
+         "P3"),
+        # Text-alias severity declaration (Priority 5 in extract_severity).
+        ("A4 — text-severity 'high severity'",
+         "This is a high severity issue",
+         "P1"),
+        ("A5 — text-priority 'high priority'",
+         "This is a high priority impact",
+         "P1"),
+        ("A6 — text-severity 'medium severity'",
+         "This is a medium severity issue",
+         "P2"),
+        # Colon-form severity declaration (coordination-prefixed bodies
+        # are the original motivation for the gate; B2 must still detect
+        # them when the source is a current unresolved Codex thread).
+        ("A7 — colon-form 'Bumping + high severity' (exact dbID 3448545827)",
+         "Bumping retry counter: high severity regression",
+         "P1"),
+        ("A8 — colon-form 'Re-requesting + high priority'",
+         "Re-requesting review: high priority issue",
+         "P1"),
+        # The exact Codex dbID 3448621236 body — the actual Codex
+        # comment starts with a P2 Badge (Priority 1 in extract_severity).
+        ("A9 — exact dbID 3448621236 body with P2 Badge",
+         "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow) "
+         "Preserve colon findings with short lead-ins**\n\n"
+         "Architectural concern: With this four-token window, a "
+         "coordination-prefixed finding such as `Bumping retry counter: "
+         "this will be a high severity regression` puts `high severity` "
+         "just outside the scanned tokens.",
+         "P2"),
+        # No severity at all — defaults to P2 (fail-closed).
+        ("A10 — no severity at all — fail-closed default to P2",
+         "This body has Codex needles but no severity or text-alias or "
+         "colon-form declaration",
+         "P2"),
+        # dbID 3448621236 shape-grammar escape — under the OLD
+        # architecture, the shape-grammar detector missed this body
+        # (4-token colon window). Under B2 source-aware, the comment
+        # IS a Codex review thread, so it's actionable regardless.
+        # The body has 'high severity' which Priority 5 catches → P1.
+        ("A11 — dbID 3448621236 — 'this will be' lead-in (cycle-13 body)",
+         "Bumping retry counter: this will be a high severity regression",
+         "P1"),
+    )
+
+    # ------------------------------------------------------------------
+    # B. Coordination suppression still works for human/top-level
+    #    comments (is_codex_review_thread_current_unresolved=False).
+    # ------------------------------------------------------------------
+    B_SUPPRESSED_BODIES = (
+        # Coordination noise with no severity/blocking mention.
+        ("B1 — bumping for review (coord noise)",
+         "Bumping retry counter for review"),
+        ("B2 — re-requesting on latest head",
+         "Re-requesting review on latest head"),
+        ("B3 — following up on previous comment",
+         "Following up on the previous comment"),
+        # Fixed-prior-finding description — even though it mentions
+        # severity, it's NOT actionable (it's referencing a prior
+        # fix). Under B2 with the source flag False, this falls
+        # through to the shape-grammar detector which correctly
+        # rejects it via the meta-verb / window-boundary guards.
+        ("B4 — fixed-prior-finding description (dbID 3448570717)",
+         "Re-requesting Codex review: fixed the high severity regression "
+         "from the prior finding"),
+        # Article-separated negation — also correctly rejected by
+        # the shape-grammar detector.
+        ("B5 — article-separated negation (dbID 3448570719)",
+         "Re-requesting review: this is not a high priority issue, "
+         "just a re-prompt"),
+        # CI pending / status chatter — coordination noise with no
+        # severity.
+        ("B6 — bumping because CI pending",
+         "Bumping this because CI is pending"),
+    )
+
+    # ------------------------------------------------------------------
+    # D. Regression coverage for prior Codex edge cases.
+    # ------------------------------------------------------------------
+    # Each row is (dbID, description, body, expected_severity).
+    # Bodies are the cycle-specific test cases that drove each
+    # Codex finding; expected severity is what the B2 source-aware
+    # gate produces when the source flag is True.
+    #
+    # Note on severity expectations: ``extract_severity`` does
+    # pure-text matching (no negation/meta-awareness), so any
+    # body that contains the words "high severity" or "high
+    # priority" classifies as P1 even if the surrounding text
+    # is meta-discussion or a negation. Under B2 source-aware
+    # architecture, this is the CORRECT behavior: a current
+    # unresolved Codex review-thread comment is actionable by
+    # default, and the severity ranking is done by
+    # ``extract_severity`` (which already handles P0/P1/P2/P3
+    # markers, badges, brackets, and text-alias). The
+    # fail-closed default to P2 only applies when no severity
+    # can be extracted at all.
+    D_REGRESSION_CASES = (
+        # Cycle 3 — Coordination + copula text-severity.
+        # extract_severity catches "high severity" → P1.
+        ("3447794638", "cycle 3 — bumping + is high severity because skips CI",
+         "Bumping the retry counter is high severity because it skips CI",
+         "P1"),
+        # Cycle 4 — Coordination + copula text-priority.
+        # extract_severity catches "high priority" → P1.
+        ("3447818802", "cycle 4 — bumping + is high priority because skips CI",
+         "Bumping the retry counter is high priority because it skips CI",
+         "P1"),
+        # Cycle 5 — Coordination + negated copula.
+        # extract_severity finds "high priority" → P1 (text-alias
+        # is unaware of negation in surrounding text).
+        ("3447825478", "cycle 5 — coordination + negated copula",
+         "Re-requesting Codex review — this is not high priority",
+         "P1"),
+        # Cycle 6 — Meta 'classified as'.
+        # extract_severity finds "high priority" → P1.
+        ("3447830523", "cycle 6 — meta 'classified as'",
+         "Re-requesting Codex review — this was classified as high priority",
+         "P1"),
+        # Cycle 7 — Article-bearing copula form.
+        # extract_severity finds "high priority" → P1.
+        ("3447849261", "cycle 7 — article-bearing copula",
+         "Bumping the retry counter is a high priority issue",
+         "P1"),
+        # Cycle 8 — Intensifier.
+        # extract_severity finds "high severity" → P1.
+        ("3447871114", "cycle 8 — intensifier",
+         "Re-requesting review: this is an extremely high severity issue",
+         "P1"),
+        # Cycle 9 — Dash after noun.
+        # extract_severity finds "high priority" → P1.
+        ("3447899921", "cycle 9 — dash after noun",
+         "Bumping retry is high priority—this skips CI",
+         "P1"),
+        # Cycle 10 — Multi-copula with later affirmative.
+        # extract_severity finds "high priority" → P1.
+        ("3448488549", "cycle 10 — multi-copula later affirmative",
+         "Bumping the retry counter is not safe; this is high priority because it skips CI",
+         "P1"),
+        # Cycle 11 — Colon-form severity.
+        # extract_severity finds "high severity" → P1.
+        ("3448545827", "cycle 11 — colon-form severity (exact Codex example)",
+         "Bumping retry counter: high severity regression",
+         "P1"),
+        # Cycle 12 #1 — Meta-verb "fixed".
+        # extract_severity finds "high severity" → P1.
+        ("3448570717", "cycle 12 #1 — meta-verb fixed past window",
+         "Re-requesting Codex review: fixed the high severity regression from the prior finding",
+         "P1"),
+        # Cycle 12 #2 — Article-separated negation.
+        # extract_severity finds "high priority" → P1.
+        ("3448570719", "cycle 12 #2 — article-separated negation",
+         "Re-requesting review: this is not a high priority issue, just a re-prompt",
+         "P1"),
+        # Cycle 13 — Short lead-in past 4-token window. THIS is the
+        # finding that drove the B2 refactor. Under the OLD shape-grammar
+        # architecture, this body escaped the 4-token colon window and
+        # was suppressed as coordination. Under B2 source-aware, the
+        # comment IS a current unresolved Codex review thread, so it
+        # is actionable regardless of body shape. extract_severity
+        # finds "high severity" → P1.
+        ("3448621236", "cycle 13 — short lead-in 'this will be'",
+         "Bumping retry counter: this will be a high severity regression",
+         "P1"),
+    )
+
+    # ------------------------------------------------------------------
+    # Helper to construct a Codex-authored item dict.
+    # ------------------------------------------------------------------
+    def _codex_item(self, body, line=1):
+        return {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+            "path": "scripts/local/check_pr_review_comments.py",
+            "line": line,
+            "commit_id": "cfc223809ebfe8e0e70475a171e99486c83933dd"[:12],
+            "html_url": "https://github.com/OWNER/REPO/pull/405#discussion_r1",
+        }
+
+    def _human_item(self, body, line=1):
+        return {
+            "user": {"login": "Slideshow11"},
+            "body": body,
+            "state": "",
+            "path": "scripts/local/check_pr_review_comments.py",
+            "line": line,
+            "commit_id": "cfc223809ebfe8e0e70475a171e99486c83933dd"[:12],
+            "html_url": "https://github.com/OWNER/REPO/pull/405#issuecomment-1",
+        }
+
+    # ------------------------------------------------------------------
+    # GROUP A — Codex review-thread comments are fail-closed.
+    # ------------------------------------------------------------------
+    def test_a_codex_review_thread_findings_are_fail_closed(self):
+        """Current unresolved Codex review-thread comments
+        are actionable by default and never suppressed by
+        coordination-skip. Severity extraction ranks them; if
+        no severity is found, default to P2 (blocking)."""
+        for desc, body, expected_severity in self.A_POSITIVE_BODIES:
+            with self.subTest(case=desc, body=body):
+                item = self._codex_item(body)
+                findings = crc.classify_item(
+                    item, "inline_review_comment", set(),
+                    is_codex_review_thread_current_unresolved=True,
+                )
+                self.assertGreaterEqual(
+                    len(findings), 1,
+                    f"A: '{desc}' must produce at least one finding "
+                    f"(body={body!r}); got {findings!r}",
+                )
+                severities = [f.get("severity") for f in findings]
+                self.assertIn(
+                    expected_severity, severities,
+                    f"A: '{desc}' must classify as {expected_severity}; "
+                    f"got severities={severities!r}",
+                )
+
+    # ------------------------------------------------------------------
+    # GROUP B — Coordination suppression still works for
+    #          human/top-level comments.
+    # ------------------------------------------------------------------
+    def test_b_human_coordination_suppression_still_works(self):
+        """Human coordination comments (re-requests, bumps,
+        follow-ups, CI-pending) remain suppressible via
+        coordination-skip. The source flag is False for these
+        (they're not Codex review threads), so they fall
+        through to the shape-grammar detector which suppresses
+        them as coordination noise.
+
+        Important: this test does NOT call main() to fetch
+        thread metadata. Instead it directly verifies that
+        ``classify_item`` with ``is_codex_review_thread_current_unresolved=False``
+        (the default for non-Codex-thread comments) suppresses
+        coordination-prefixed bodies with no actionable signal."""
+        for desc, body in self.B_SUPPRESSED_BODIES:
+            with self.subTest(case=desc, body=body):
+                item = self._human_item(body)
+                findings = crc.classify_item(
+                    item, "issue_comment", set(),
+                    is_codex_review_thread_current_unresolved=False,
+                )
+                self.assertEqual(
+                    findings, [],
+                    f"B: '{desc}' must be suppressed as coordination "
+                    f"(body={body!r}); got {findings!r}",
+                )
+
+    # ------------------------------------------------------------------
+    # GROUP C — State filters still win.
+    # ------------------------------------------------------------------
+    # Note: state filtering is done in main() (post-classify) by
+    # comparing commit_id to live_head_sha, and by the blocker
+    # classification logic which checks thread_resolved and
+    # thread_outdated. The flag itself encodes (current AND
+    # unresolved AND Codex-authored), so the per-item flag
+    # already encodes most state filtering. These tests verify
+    # the flag computation logic at the boundary:
+    def test_c_flag_false_for_resolved_threads(self):
+        """A Codex-authored thread that is already resolved is
+        NOT actionable by default (the flag should be False).
+        In the gate pipeline, main() only passes the flag=True
+        when ``is_resolved=False``; resolved threads get the
+        shape-grammar fallback. We simulate this at the unit
+        level by verifying that ``is_codex_review_thread_current_unresolved=False``
+        (the resolved-thread path) is the safe default."""
+        body = "P1: this is a finding"
+        item = self._codex_item(body)
+        # Resolved-thread path: flag=False (the source-aware
+        # main() would not pass flag=True for a resolved thread).
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=False,
+        )
+        # With flag=False, the body still has explicit P1: marker
+        # so extract_severity returns P1 and the shape-grammar
+        # detector does NOT suppress. Resolved threads are
+        # reported but not blocking (post-classify logic).
+        self.assertGreaterEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "P1")
+
+    def test_c_flag_false_for_outdated_threads(self):
+        """A Codex-authored thread that is outdated is NOT
+        actionable by default. Outdated threads reference
+        older commits; the gate treats them as stale."""
+        body = "P2: stale finding on old commit"
+        item = self._codex_item(body)
+        # Outdated-thread path: flag=False.
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=False,
+        )
+        # Severity is still extracted correctly. The post-classify
+        # blocker logic checks thread_outdated (set later in main())
+        # and excludes outdated threads from current_head_blockers.
+        self.assertGreaterEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "P2")
+
+    def test_c_flag_false_for_human_authored_threads(self):
+        """A review thread that is NOT authored by Codex is
+        treated as a human comment. The shape-grammar fallback
+        handles it normally. Even if the comment has a P1:
+        marker, it should classify as P1 (the source flag
+        doesn't change severity extraction — it only affects
+        whether coordination-skip applies)."""
+        body = "P1: this is a finding from a human reviewer"
+        item = self._human_item(body)
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=False,
+        )
+        self.assertGreaterEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "P1")
+
+    # ------------------------------------------------------------------
+    # GROUP D — Regression coverage for prior Codex edge cases.
+    # ------------------------------------------------------------------
+    def test_d_regression_for_prior_cycle_findings(self):
+        """Verify that all 12 prior Codex findings (cycle-3
+        through cycle-13) classify correctly under the B2
+        source-aware architecture when the source flag is
+        True (the comment is a current unresolved Codex
+        review thread)."""
+        for dbid, desc, body, expected_severity in self.D_REGRESSION_CASES:
+            with self.subTest(dbid=dbid, body=body):
+                item = self._codex_item(body)
+                findings = crc.classify_item(
+                    item, "inline_review_comment", set(),
+                    is_codex_review_thread_current_unresolved=True,
+                )
+                self.assertGreaterEqual(
+                    len(findings), 1,
+                    f"D: dbID {dbid} '{desc}' must classify as a "
+                    f"finding under B2 source-aware; got {findings!r}",
+                )
+                severities = [f.get("severity") for f in findings]
+                self.assertIn(
+                    expected_severity, severities,
+                    f"D: dbID {dbid} '{desc}' must classify as "
+                    f"{expected_severity} under B2; got "
+                    f"severities={severities!r}",
+                )
+
+    # ------------------------------------------------------------------
+    # Shape-grammar fallback path (no source flag) — verifies that
+    # the OLD cycle-by-cycle behavior is preserved for non-Codex
+    # comments.
+    # ------------------------------------------------------------------
+    def test_shape_grammar_fallback_for_non_codex_thread(self):
+        """When ``is_codex_review_thread_current_unresolved``
+        is False (non-Codex-thread comment), the shape-grammar
+        detector runs as a secondary actionability check. This
+        is the fallback path that preserves the cycle-3-12
+        protections."""
+        # Positive case: human reviewer writes a P1: comment.
+        item = self._human_item("P1: this is a critical issue")
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=False,
+        )
+        self.assertGreaterEqual(len(findings), 1)
+        self.assertEqual(findings[0]["severity"], "P1")
+
+        # Negative case: human reviewer posts a coordination comment
+        # with no severity mention. Should be suppressed.
+        item = self._human_item("Bumping this thread for review")
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=False,
+        )
+        self.assertEqual(findings, [])
+
+    # ------------------------------------------------------------------
+    # The cycle-13 body must NOT be a false-negative under B2.
+    # ------------------------------------------------------------------
+    def test_dbID_3448621236_no_longer_a_false_negative(self):
+        """The exact Codex dbID 3448621236 body is the cycle-13
+        finding that drove the B2 refactor. Under the OLD
+        architecture (4-token colon window), this body was
+        suppressed because ``high severity`` was at position 4-5
+        past the window AND the copula detector missed ``will be``.
+
+        Under the B2 source-aware architecture, when the
+        comment is a current unresolved Codex review thread
+        (flag=True), this body IS actionable regardless of
+        shape. The body is classified as P1 (because Priority 5
+        in extract_severity matches ``high severity`` after
+        ``will be a``)."""
+        body = "Bumping retry counter: this will be a high severity regression"
+        item = self._codex_item(body)
+        findings = crc.classify_item(
+            item, "inline_review_comment", set(),
+            is_codex_review_thread_current_unresolved=True,
+        )
+        self.assertGreaterEqual(
+            len(findings), 1,
+            f"dbID 3448621236 body must classify as a finding under "
+            f"B2 source-aware; got {findings!r}",
+        )
+        severities = [f.get("severity") for f in findings]
+        self.assertIn(
+            "P1", severities,
+            f"dbID 3448621236 body must classify as P1 (text-alias "
+            f"'high severity' → P1 per SEVERITY_MAP); got "
+            f"severities={severities!r}",
+        )
+
+    # ------------------------------------------------------------------
+    # Verify NO P0 misclassification regression.
+    # ------------------------------------------------------------------
+    def test_no_p0_misclassification_regression(self):
+        """Under B2 source-aware, current unresolved Codex
+        threads default to P2 (not P0) when no severity can
+        be extracted. This test pins the invariant."""
+        for body in (
+            "P1: text-only body with no severity beyond the P1 marker",
+            "Bumping retry counter: this will be a high severity regression",
+            "This is a high severity issue",
+        ):
+            with self.subTest(body=body):
+                item = self._codex_item(body)
+                findings = crc.classify_item(
+                    item, "inline_review_comment", set(),
+                    is_codex_review_thread_current_unresolved=True,
+                )
+                severities = [f.get("severity") for f in findings]
+                self.assertNotIn(
+                    "P0", severities,
+                    f"B2 source-aware must NOT produce P0 from text "
+                    f"or default-to-P2 logic; body={body!r}, "
+                    f"severities={severities!r}",
+                )
+
+
 class TestIntegration(unittest.TestCase):
     """Run the script end-to-end with mocked gh API calls."""
 

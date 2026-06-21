@@ -541,7 +541,19 @@ def gh_graphql_review_threads(
     Fetch PR review-thread resolution state via GraphQL.
 
     Returns (success, threads_list, error_msg).
-    threads_list entries: {id, isResolved, isOutdated, comments: [{databaseId, url}]}
+    threads_list entries:
+        {thread_id, is_resolved, is_outdated, database_id, url,
+         author_login}
+
+    The ``author_login`` field is the GitHub login of the
+    thread's first-comment author. Under the option-B2
+    source-aware architecture, this is used to distinguish
+    Codex-authored threads (``chatgpt-codex-connector[bot]``)
+    from human-authored review threads. Only Codex-authored
+    threads that are current and unresolved are treated as
+    fail-closed actionable findings; human-authored threads
+    follow the existing coordination-skip / severity-extraction
+    flow.
 
     Note: gh api graphql -f passes all variables as strings, which GraphQL rejects
     for Int. We embed the PR number as a raw integer literal in the query.
@@ -550,8 +562,9 @@ def gh_graphql_review_threads(
     """
     owner, name = repo.split("/", 1)
     # Build with explicit brace counting via a list to ensure balance.
-    # comments(first:50) { nodes { databaseId url } }
-    #                                     ^^--- +1 extra } to close the inner nodes
+    # comments(first:50) { nodes { databaseId url author { login } } }
+    #                                                  ^^--- +1 extra } to
+    #                                                       close inner nodes
     query_parts = [
         "query {",
         f'repository(owner:"{owner}", name:"{name}") {{',
@@ -559,7 +572,7 @@ def gh_graphql_review_threads(
         "reviewThreads(first:100) {",
         "nodes {",
         "id isResolved isOutdated",
-        "comments(first:50) { nodes { databaseId url } }",  # note: inner nodes needs extra }
+        "comments(first:50) { nodes { databaseId url author { login } } }",
         "}",  # close nodes
         "}",  # close reviewThreads
         "}",  # close pullRequest
@@ -591,19 +604,24 @@ def gh_graphql_review_threads(
             .get("reviewThreads", {})
             .get("nodes", [])
         )
-        # Flatten: keep thread metadata + each comment's databaseId/url
+        # Flatten: keep thread metadata + each comment's databaseId/url/author.
         threads: list[dict[str, Any]] = []
         for node in nodes:
             thread_id = node.get("id", "")
             is_resolved = node.get("isResolved", False)
             is_outdated = node.get("isOutdated", False)
             for comment in (node.get("comments", {}) or {}).get("nodes", []):
+                author_login = (
+                    (comment.get("author") or {}).get("login", "")
+                    if comment.get("author") else ""
+                )
                 threads.append({
                     "thread_id": thread_id,
                     "is_resolved": is_resolved,
                     "is_outdated": is_outdated,
                     "database_id": comment.get("databaseId"),
                     "url": comment.get("url") or "",
+                    "author_login": author_login,
                 })
         return True, threads, ""
     except (json.JSONDecodeError, KeyError) as exc:
@@ -800,33 +818,59 @@ def make_finding_id(
     return f"codex-{digest}"
 
 
-def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]) -> list[dict[str, Any]]:
+def classify_item(
+    item: dict[str, Any],
+    source_kind: str,
+    ignore_users: set[str],
+    is_codex_review_thread_current_unresolved: bool = False,
+) -> list[dict[str, Any]]:
     """
     Given a single comment/review dict from any endpoint, scan for Codex
     findings and return a list of finding dicts (may be empty).
 
-    The classifier pipeline has been restructured (option B
-    refactor) to consolidate the actionability decision in
-    :func:`_has_actionable_finding_signal` (single source of
-    truth) and demote :func:`is_coordination_comment` from an
-    early bypass to a final suppressor.
+    The classifier pipeline is SOURCE-AWARE (option B2
+    refactor). The actionability decision is made by inspecting
+    the SOURCE TYPE first, with shape-grammar serving only as a
+    secondary fallback for non-Codex-thread comments.
 
     Pipeline order:
 
     1. Author filter — drop comments from ``ignore_users``.
+
     2. Codex-needle check — drop comments without any Codex
        needle (high/medium/P0/P1/P2/P3/badge/...).
-    3. Actionability check — :func:`_has_actionable_finding_signal`
-       decides whether the comment is DECLARING a current issue.
+
+    3. **Source-aware actionability check (PRIMARY under B2).**
+       If ``is_codex_review_thread_current_unresolved`` is True
+       (the comment is part of a current, unresolved Codex
+       review thread), the comment is actionable by default
+       regardless of body shape. Coordination suppression does
+       NOT apply. This is the fail-closed path.
+
+       If the source is not a current unresolved Codex
+       review thread, fall back to the shape-grammar detector
+       :func:`_has_actionable_finding_signal` (secondary
+       path).
+
     4. Coordination suppression — :func:`is_coordination_comment`
        ONLY suppresses bodies that have no actionable signal AND
-       start with a coordination pattern. Bodies with an
-       actionable signal pass through regardless of coordination
-       prefix.
+       start with a coordination pattern. This applies ONLY on
+       the non-Codex-thread path. Codex review-thread findings
+       are NEVER suppressed by coordination-skip.
+
     5. Severity extraction — :func:`extract_severity` maps the
        body text to P0-P3 (or None). :func:`is_blocking` is the
        fallback for unspecified-severity blocking comments.
-    6. Finding emission — emit the finding dict.
+
+    6. **Fail-closed default for unresolved Codex threads.** If
+       the source is a current unresolved Codex review thread
+       and no severity could be extracted (no P0:/P1:/P2:/P3:,
+       no badge, no bracket, no text-alias), default to
+       ``P2`` (blocking). This is the auth-prompt-mandated
+       conservative default for unresolved Codex findings
+       without an explicit severity.
+
+    7. Finding emission — emit the finding dict.
     """
     findings = []
     user = (item.get("user") or {}).get("login", "")
@@ -844,26 +888,35 @@ def classify_item(item: dict[str, Any], source_kind: str, ignore_users: set[str]
     if not any(needle in combined for needle in CODEX_NEEDLES):
         return findings
 
-    # Single-source-of-truth actionability decision. The old
-    # cycle-3-11 ladder encoded this across 7 hand-tuned guards
-    # inside ``is_coordination_comment``; the centralized
-    # detector now handles the same shapes and rejects the
-    # meta/negated/taxonomy forms that the guards were
-    # repeatedly patched to handle.
-    has_actionable = _has_actionable_finding_signal(body)
+    # PRIMARY actionability decision: source-aware.
+    # Current unresolved Codex review-thread comments are
+    # actionable by default. This is the architectural shift
+    # that breaks the cycle-3-13 shape-grammar heuristic ladder.
+    if is_codex_review_thread_current_unresolved:
+        has_actionable = True
+    else:
+        # SECONDARY actionability decision: shape-grammar
+        # fallback for non-Codex-thread comments (issue
+        # comments, human review comments, resolved threads,
+        # outdated threads).
+        has_actionable = _has_actionable_finding_signal(body)
 
-    # Coordination suppression is now a FINAL SUPPRESSOR, not
-    # an early bypass. It only fires for bodies that have NO
-    # actionable signal AND start with a coordination pattern
-    # (e.g. ``Bumping retry counter for review`` — pure
-    # coordination noise with no severity/blocking signal).
+    # Coordination suppression is a FINAL SUPPRESSOR for
+    # non-Codex-thread bodies only. Codex review-thread
+    # findings NEVER go through coordination suppression
+    # (this is the fail-closed guarantee).
     if not has_actionable and is_coordination_comment(body):
         return findings
 
     # Severity extraction (unchanged — already a single source
     # of truth for severity level mapping).
     severity = extract_severity(combined)
-    if severity is None and is_blocking(combined):
+
+    # Fail-closed default: unresolved Codex threads without
+    # extractable severity default to P2 (blocking).
+    if severity is None and is_codex_review_thread_current_unresolved:
+        severity = "P2"
+    elif severity is None and is_blocking(combined):
         severity = "UNSPECIFIED_BLOCKING"
     elif severity is None:
         severity = "UNSPECIFIED_INFO"
@@ -1149,6 +1202,67 @@ def main() -> int:
     sources_fetched: list[str] = []
     api_errors: list[str] = []
 
+    # -----------------------------------------------------------------------
+    # Review-thread resolution state via GraphQL — fetch FIRST so that
+    # classify_item can use source-aware actionability (option B2).
+    # -----------------------------------------------------------------------
+    # Under option B2, the actionability decision is made by inspecting
+    # the SOURCE TYPE: current unresolved Codex review-thread comments
+    # are actionable by default. This requires knowing, at classification
+    # time, whether a comment belongs to a current unresolved Codex
+    # review thread. We fetch the thread metadata first (via GraphQL),
+    # build a URL → metadata map, and pass a per-item
+    # ``is_codex_review_thread_current_unresolved`` flag into
+    # :func:`classify_item`.
+    #
+    # If the GraphQL fetch fails, the gate is FAIL-CLOSED: we proceed
+    # with an empty thread map (flag=False everywhere → shape-grammar
+    # fallback) and the gate status is set to INCONCLUSIVE later in
+    # this function (existing behavior).
+    thread_meta_by_url: dict[str, dict[str, Any]] = {}
+    thread_api_error: str | None = None
+    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
+        args.repo, args.pr_number
+    )
+    if not ok_threads:
+        thread_api_error = err_threads
+    else:
+        for entry in thread_entries:
+            url = entry.get("url", "")
+            if url:
+                thread_meta_by_url[url] = entry
+
+    # Codex bot login — same constant used by the policy safeguard
+    # further down. Defined here so the source-aware helper can
+    # reference it. GitHub may render the login as either
+    # ``chatgpt-codex-connector`` or ``chatgpt-codex-connector[bot]``
+    # depending on the API surface; we match the prefix.
+    CODEX_BOT_LOGIN_PREFIX = "chatgpt-codex-connector"
+
+    def _is_codex_review_thread_current_unresolved(item: dict[str, Any]) -> bool:
+        """Return True iff ``item`` belongs to a current unresolved
+        Codex review thread.
+
+        The check uses the URL of the item to look up thread
+        metadata in ``thread_meta_by_url``. A thread is
+        considered a "Codex review-thread" iff:
+
+        * the thread is NOT resolved,
+        * the thread is NOT outdated,
+        * the thread's first comment is authored by a
+          ``chatgpt-codex-connector`` user (bot or not).
+        """
+        url = item.get("html_url") or item.get("url") or ""
+        meta = thread_meta_by_url.get(url)
+        if not meta:
+            return False
+        if meta.get("is_resolved", False):
+            return False
+        if meta.get("is_outdated", False):
+            return False
+        author_login = meta.get("author_login", "") or ""
+        return author_login.startswith(CODEX_BOT_LOGIN_PREFIX)
+
     # 1. Issue comments
     ok, data, err = gh_api(args.repo, f"issues/{args.pr_number}/comments")
     if not ok:
@@ -1156,7 +1270,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"issues/{args.pr_number}/comments ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "issue_comment", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "issue_comment", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "issue_comment"
             all_findings.extend(findings)
@@ -1168,7 +1286,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"pulls/{args.pr_number}/comments ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "inline_review_comment", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "inline_review_comment", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "inline_review_comment"
             all_findings.extend(findings)
@@ -1180,7 +1302,11 @@ def main() -> int:
     else:
         sources_fetched.append(f"pulls/{args.pr_number}/reviews ({len(data)} items)")
         for item in data:
-            findings = classify_item(item, "review", ignore_users)
+            is_codex_thread = _is_codex_review_thread_current_unresolved(item)
+            findings = classify_item(
+                item, "review", ignore_users,
+                is_codex_review_thread_current_unresolved=is_codex_thread,
+            )
             for f in findings:
                 f["_source_kind"] = "review"
             all_findings.extend(findings)
@@ -1197,7 +1323,11 @@ def main() -> int:
                         f"pulls/{args.pr_number}/reviews/{rev_id}/comments ({len(comments2)} items)"
                     )
                     for c in comments2:
-                        findings2 = classify_item(c, "per_review_comment", ignore_users)
+                        is_codex_thread = _is_codex_review_thread_current_unresolved(c)
+                        findings2 = classify_item(
+                            c, "per_review_comment", ignore_users,
+                            is_codex_review_thread_current_unresolved=is_codex_thread,
+                        )
                         for f2 in findings2:
                             f2["_source_kind"] = "per_review_comment"
                         all_findings.extend(findings2)
@@ -1205,26 +1335,13 @@ def main() -> int:
     all_findings = dedup_findings(all_findings)
 
     # -----------------------------------------------------------------------
-    # Review-thread resolution state via GraphQL (read-only)
+    # Attach thread metadata to each finding for rendering / blocker logic.
+    # This is the existing behavior — preserved unchanged. The
+    # source-aware flag passed into classify_item above already used
+    # the thread metadata for the PRIMARY actionability decision; this
+    # post-classify attachment is for the thread_id / is_resolved /
+    # is_outdated fields used by the blocker classification below.
     # -----------------------------------------------------------------------
-    # Build a mapping: finding URL -> thread metadata (isResolved, isOutdated, thread_id).
-    # Findings in resolved threads are reported but do not block.
-    # Key: URL (from inline_review_comment or per_review_comment).
-    # Fallback key: "databaseId:<id>" for findings with a known databaseId.
-    thread_meta_by_url: dict[str, dict[str, Any]] = {}
-    thread_api_error: str | None = None
-    ok_threads, thread_entries, err_threads = gh_graphql_review_threads(
-        args.repo, args.pr_number
-    )
-    if not ok_threads:
-        thread_api_error = err_threads
-    else:
-        for entry in thread_entries:
-            url = entry.get("url", "")
-            if url:
-                thread_meta_by_url[url] = entry
-
-    # Attach thread metadata to each finding by URL.
     for f in all_findings:
         url = f.get("url", "")
         meta = thread_meta_by_url.get(url, {})
