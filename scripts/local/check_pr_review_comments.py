@@ -211,12 +211,13 @@ def is_coordination_comment(body: str) -> bool:
     if any(bw in leading for bw in BLOCKING_WORDS):
         return False
     # Guard 6 (PR #405 fresh Codex reviews, 2026-06-21T02:15:04Z,
-    # 2026-06-21T02:46:26Z, 2026-06-21T02:54:45Z, and
-    # 2026-06-21T03:01:27Z, dbIDs 3447794638 + 3447818802 +
-    # 3447825478 + 3447830523): a body that STARTS with a
-    # coordination pattern but declares severity using a text
-    # alias in the leading 100 characters must NOT be treated
-    # as a coordination comment. The previous Guard 4 only
+    # 2026-06-21T02:46:26Z, 2026-06-21T02:54:45Z,
+    # 2026-06-21T03:01:27Z, and 2026-06-21T03:25:34Z, dbIDs
+    # 3447794638 + 3447818802 + 3447825478 + 3447830523 +
+    # 3447849261): a body that STARTS with a coordination
+    # pattern but declares severity using a text alias in
+    # the leading 100 characters must NOT be treated as a
+    # coordination comment. The previous Guard 4 only
     # protected the colon-start forms (``high severity:`` at
     # body start), so a real P1/P2/P3 text-severity finding
     # like ``Bumping the retry counter is high severity ...
@@ -234,27 +235,41 @@ def is_coordination_comment(body: str) -> bool:
     # severity token, which rejected negations but still
     # rescued meta-discussion forms like ``classified as
     # high priority`` and ``with high priority context``
-    # (dbID 3447830523). The current implementation uses
-    # only the copula verbs ``is``/``has`` — the two forms
-    # that declare a severity/priority as the comment's own
-    # finding. The copula must be followed directly by the
-    # level token, with no article (``a``/``an``) or other
-    # intervening material. This rejects every meta form:
+    # (dbID 3447830523). The cycle-6 implementation narrowed
+    # the verb set to copulas (``is``/``has``) only and
+    # dropped the optional ``a``/``an`` article, which fixed
+    # the meta-priority false-positive but created a new
+    # false-negative: real Codex findings phrased as ``is a
+    # high priority issue`` or ``has a high severity impact``
+    # no longer matched the regex and were dropped as
+    # coordination before ``extract_severity`` could classify
+    # them (dbID 3447849261). The current implementation
+    # restores the optional article (``a``/``an``) while
+    # keeping the verb set narrowed to ``is``/``has`` only —
+    # the two copula forms that declare a severity/priority
+    # as the comment's own finding. This rejects every meta
+    # and negated form:
     #   - ``classified as high priority``
     #   - ``flagged as high severity``
+    #   - ``described as a high priority issue``
     #   - ``with high priority context``
     #   - ``with high severity language``
     #   - ``is not high priority`` (negation)
+    #   - ``is not a high priority issue`` (negation with article)
     #   - ``not high severity`` (negation)
+    #   - ``has no high severity impact`` (negation with article)
     # while still rescuing:
     #   - ``is high priority``
+    #   - ``is a high priority issue``
     #   - ``is high severity``
+    #   - ``is an extremely high severity issue``
     #   - ``has high severity``
+    #   - ``has a high severity impact``
     #   - ``has low priority``
     # The leading-100-char window keeps the rescue narrow
     # and matches the leading-window pattern of Guard 5.
     text_alias_declaration_re = re.compile(
-        r"\b(?:is|has)\s+"
+        r"\b(?:is|has)\s+(?:a\s+|an\s+)?"
         r"(?:high|medium|low)\s+"
         r"(?:severity|priority)\b",
         re.IGNORECASE,

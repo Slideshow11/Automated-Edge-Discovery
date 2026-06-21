@@ -970,6 +970,189 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "+ 'with high priority context') must NOT trigger Guard 6 rescue"
         )
 
+    def test_dbID_3447849261_article_bearing_priority_rescued(self):
+        """Exact-pattern regression test for the cycle-6 fresh
+        Codex P1 finding dbID 3447849261 (2026-06-21T03:25:34Z
+        on head dfad7c833dd): 'Re-requesting review: this is a
+        high priority issue' MUST be rescued by Guard 6 and
+        classified as a P1 finding. The cycle-6 regex without
+        the optional article dropped this real Codex finding
+        as coordination. The cycle-7 regex restores the
+        optional ``a``/``an`` article while keeping the verb
+        set narrowed to copulas only."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this comment is a high priority issue and must be addressed before merge",
+            "state": "",
+        }
+        # is_coordination_comment should return False (NOT skip)
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Article-bearing copula form 'is a high priority issue' MUST trigger Guard 6 rescue (dbID 3447849261)"
+        )
+        # And classify_item must classify it as P1
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_dbID_3447849261_article_bearing_severity_rescued(self):
+        """Same as above for the 'has a high severity impact'
+        form from the same Codex finding body."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this comment has a high severity impact and should be treated as a finding",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Article-bearing copula form 'has a high severity impact' MUST trigger Guard 6 rescue (dbID 3447849261)"
+        )
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, f"Expected exactly 1 finding, got {got}")
+        self.assertEqual(got[0]["severity"], "P1", f"Expected P1, got {got[0]['severity']}")
+
+    def test_an_article_severity_rescued(self):
+        """The 'an' article form must also be rescued (e.g.
+        'is an high severity issue'). The 'an' article
+        option in the regex matches when followed directly
+        by the level token. This is grammatically unusual
+        ('an high' is non-standard English) but tests the
+        regex's 'an' code path directly."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this is an high severity issue that must be fixed",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "'is an high severity issue' MUST trigger Guard 6 rescue (testing 'an' code path)"
+        )
+
+    def test_direct_is_high_priority_preserved_from_cycle_5(self):
+        """Cycle-7 sanity check: the cycle-5 direct copula
+        form 'is high priority' (no article) MUST still
+        trigger Guard 6 rescue. The cycle-7 fix only
+        re-added the OPTIONAL article — it did not break
+        the existing direct form."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this comment is high priority and must be addressed before merge",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Direct copula 'is high priority' MUST still trigger Guard 6 rescue (cycle 5 regression check)"
+        )
+
+    def test_direct_has_high_severity_preserved_from_cycle_5(self):
+        """Same as above for the 'has high severity' cycle-5
+        direct form."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting review: this finding has high severity implications for the watchdog loop",
+            "state": "",
+        }
+        self.assertFalse(
+            crc.is_coordination_comment(item["body"]),
+            "Direct copula 'has high severity' MUST still trigger Guard 6 rescue (cycle 5 regression check)"
+        )
+
+    def test_negated_article_bearing_priority_not_rescued(self):
+        """Cycle-7 edge case: 'is not a high priority issue'
+        (negation with article) must NOT be rescued. The
+        article is optional, but the negation word 'not'
+        between the copula and the article still breaks the
+        regex match because the copula must be immediately
+        followed by the optional article (no intervening
+        'not')."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this is not a high priority issue, just a re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Negated article-bearing form 'is not a high priority issue' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_has_no_severity_negation_not_rescued(self):
+        """Cycle-7 edge case: 'has no high severity impact'
+        (negation with article) must NOT be rescued. The
+        copula is immediately followed by 'no', not by the
+        optional article 'a' or 'an' or by the level token."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this comment has no high severity impact, just a re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Negation 'has no high severity impact' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_described_as_article_priority_not_rescued(self):
+        """Cycle-7 edge case: 'described as a high priority
+        issue' (meta-discussion with article) must NOT be
+        rescued. The verb 'as' is excluded, so the article
+        pattern never engages here even though the article
+        is technically allowed. The copula form would be
+        'is a high priority issue' which IS rescued; the
+        meta form 'described as a high priority issue' is
+        NOT."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this was described as a high priority issue in the prior round",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Meta-discussion 'described as a high priority issue' must NOT trigger Guard 6 rescue"
+        )
+
+    def test_classified_as_priority_preserved_from_cycle_6(self):
+        """Cycle-7 regression check: the cycle-6 exact pattern
+        'classified as high priority' must STILL NOT be
+        rescued. The cycle-7 fix only added the optional
+        article to the verb set; it did not change the
+        verb set itself. The verb 'as' is still excluded."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — the prior finding was classified as high priority and fixed",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Cycle-6 regression: 'classified as high priority' must STILL NOT be rescued (cycle 7 regression check)"
+        )
+
+    def test_with_priority_context_preserved_from_cycle_6(self):
+        """Cycle-7 regression check: the cycle-6 exact pattern
+        'with high priority context' must STILL NOT be
+        rescued. The verb 'with' is still excluded."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — fixed in prior commit with high priority context, please re-check",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Cycle-6 regression: 'with high priority context' must STILL NOT be rescued (cycle 7 regression check)"
+        )
+
+    def test_negated_priority_preserved_from_cycle_5(self):
+        """Cycle-7 regression check: the cycle-5 exact
+        negation 'is not high priority' must STILL NOT be
+        rescued."""
+        item = {
+            "user": {"login": "human-pr-author"},
+            "body": "Re-requesting Codex review — this is not high priority, please skip this re-prompt",
+            "state": "",
+        }
+        self.assertTrue(
+            crc.is_coordination_comment(item["body"]),
+            "Cycle-5 regression: 'is not high priority' must STILL NOT be rescued (cycle 7 regression check)"
+        )
+
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):
     """Regression for Codex finding AI: severity aliases
