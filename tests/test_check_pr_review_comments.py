@@ -695,6 +695,74 @@ class TestCoordinationCommentSkip(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["severity"], "P2")
 
+    def test_text_alias_severity_in_leading_rescues_coordination_skip(self):
+        """Regression for the fresh Codex P1 finding on head
+        74e6b8e9e3fb (2026-06-21T02:15:04Z, dbID 3447794638):
+        a body that starts with a coordination verb but
+        declares severity using a text alias in the leading
+        100 characters must NOT be classified as
+        coordination. Previously, Guard 4 only protected
+        colon-start forms like 'high severity:'; the new
+        Guard 6 covers the no-colon forms like 'is high
+        severity' as well. The finding example was:
+        'Bumping the retry counter is high severity ...'."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping the retry counter is high severity: classification must fail when stale",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(
+            len(got), 1,
+            "Body with leading text-alias severity must be classified as a finding, not coordination"
+        )
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_text_alias_severity_no_colon_in_leading_rescues_too(self):
+        """Same as above but the body uses 'is high severity'
+        without the trailing colon. Guard 6 must also cover
+        the no-colon form, which is the exact form from the
+        fresh Codex finding."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping the retry counter is high severity and this should be treated as a finding, not coordination",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_medium_severity_in_leading_rescues_coordination_skip(self):
+        """Same as above for the medium alias (P2)."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Bumping this thread is medium severity: keep the new marker logic in the broad scan",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_text_alias_severity_in_meta_after_first_100_chars_still_skipped(self):
+        """Sanity: a real coordination message that mentions
+        severity only in meta-discussion past the first 100
+        characters (the pattern Guard 5 protects against for
+        blocking words) must still be skipped. The leading
+        window keeps the rescue narrow and prevents
+        false-positive rescues."""
+        # 100+ char prefix, severity mentioned only after position 100
+        body = (
+            "Re-requesting Codex review on 3982ee6 (Fix AF). "
+            "The active P1 current-head finding has been addressed "
+            "by Fix AG and Fix T combined; allowing a malformed "
+            "checkpoint to resume is no longer high severity."
+        )
+        self.assertGreater(len(body), 100, "test body must be over 100 chars to test the leading window")
+        self.assertTrue(
+            crc.is_coordination_comment(body),
+            "Real coordination message with severity only in meta-discussion must still be skipped"
+        )
+
 
 class TestExtractSeverityWordBoundary(unittest.TestCase):
     """Regression for Codex finding AI: severity aliases

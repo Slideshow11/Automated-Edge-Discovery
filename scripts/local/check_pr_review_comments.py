@@ -210,6 +210,31 @@ def is_coordination_comment(body: str) -> bool:
     leading = body_str[:100].lower()
     if any(bw in leading for bw in BLOCKING_WORDS):
         return False
+    # Guard 6 (PR #405 fresh Codex review, 2026-06-21T02:15:04Z):
+    # a body that STARTS with a coordination pattern but
+    # declares severity using a text-alias (e.g. ``Bumping the
+    # retry counter is high severity: ...`` or
+    # ``Bumping the retry counter is high severity ...``) must
+    # NOT be treated as a coordination comment. The previous
+    # Guard 4 only protected the colon-start forms
+    # (``high severity:`` at body start), so a real
+    # P1/P2/P3 text-severity finding like
+    # ``Bumping the retry counter is high severity ... must
+    # fix`` was silently dropped as coordination. The new
+    # guard checks the same leading-100-char window used by
+    # Guard 5 for the text-alias tokens (``is high severity``,
+    # ``is medium severity``, ``is low severity`` and the
+    # colon forms). Real coordination messages typically
+    # mention severity only in meta-discussion past the first
+    # 100 characters, so the leading-window check stays
+    # narrow and avoids false-positive rescues.
+    text_alias_in_leading = (
+        "high severity",
+        "medium severity",
+        "low severity",
+    )
+    if any(tok in leading for tok in text_alias_in_leading):
+        return False
     return any(body_lower.startswith(pat) for pat in _COORDINATION_PATTERNS)
 
 SEVERITY_RECORDS = {"P0": "P0", "P1": "P1", "P2": "P2", "P3": "P3"}
