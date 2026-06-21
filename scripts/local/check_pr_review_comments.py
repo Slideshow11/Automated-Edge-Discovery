@@ -23,6 +23,7 @@ import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -728,6 +729,43 @@ def main() -> int:
     args = parser.parse_args()
 
     ignore_users = set(u.strip() for u in args.ignore_users.split(",") if u.strip())
+
+    # Policy safeguard: refuse to silently ignore the Codex bot.
+    # The chatgpt-codex-connector[bot] is the source of all automated
+    # review findings for this repository. Globally ignoring its
+    # findings via --ignore-users would re-introduce the gate
+    # false-negative that caused PR #405's review-comment-gate to be
+    # green while 18 unresolved P1/P2 Codex findings remained
+    # actionable.
+    #
+    # If a legitimate need to ignore the Codex bot arises (e.g. a
+    # coordination-noise experiment), the caller must opt in
+    # explicitly by setting AED_ALLOW_CODEX_IGNORE=1 in the
+    # environment. The override is logged to stderr so it is visible
+    # in CI output.
+    CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+    if CODEX_BOT_LOGIN in ignore_users:
+        if os.environ.get("AED_ALLOW_CODEX_IGNORE") != "1":
+            print(
+                f"ERROR: --ignore-users contains '{CODEX_BOT_LOGIN}' "
+                f"but AED_ALLOW_CODEX_IGNORE is not set to '1'.",
+                file=sys.stderr,
+            )
+            print(
+                "Refusing to silently filter all Codex findings. "
+                "Codex review findings must be classified by the "
+                "gate, not globally ignored. Set "
+                "AED_ALLOW_CODEX_IGNORE=1 only if you have an "
+                "explicit, documented reason to bypass this "
+                "safeguard.",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"WARNING: ignoring '{CODEX_BOT_LOGIN}' per "
+            f"AED_ALLOW_CODEX_IGNORE=1",
+            file=sys.stderr,
+        )
 
     all_findings: list[dict[str, Any]] = []
     sources_fetched: list[str] = []

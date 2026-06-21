@@ -7,6 +7,7 @@ Uses mock subprocess to avoid real GitHub calls.
 
 import contextlib
 import json
+import os
 import subprocess
 import sys
 import unittest
@@ -2281,6 +2282,130 @@ class TestGhPrViewREST:
 
 
 import tempfile
+
+
+class TestCodexIgnoreSafeguard(unittest.TestCase):
+    """Regression tests for the gate-policy safeguard added in PR #405 repair.
+
+    The previous policy invoked the gate with
+    --ignore-users "chatgpt-codex-connector[bot]" which silently
+    filtered out every Codex finding, making the gate green while
+    18 unresolved P1/P2 Codex findings remained actionable. The
+    repair introduces a script-level safeguard: ignoring the Codex
+    bot without the explicit AED_ALLOW_CODEX_IGNORE=1 env override
+    must fail closed.
+    """
+
+    def test_codex_p1_classified_as_finding(self):
+        """A Codex-authored P1 must reach the findings list when the
+        author is not in ignore_users. (The previous bug was that
+        --ignore-users contained codex, so this never happened.)"""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "<sub><sub>![P1 Badge]</sub></sub> Reject malformed phase values",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1, "Codex P1 must be classified as a finding")
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_codex_p2_classified_as_finding(self):
+        """A Codex-authored P2 must reach the findings list."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "<sub><sub>![P2 Badge]</sub></sub> Allow documented optional checkpoint fields",
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P2")
+
+    def test_codex_coordination_still_skipped_via_classification(self):
+        """A Codex coordination comment must not be classified as a
+        finding. This confirms the existing is_coordination_comment
+        logic is still the right place to handle codex noise — not
+        --ignore-users. The body uses 'Re-requesting' which is a
+        coordination marker; it does NOT contain a P-bare or badge
+        that would exempt it from the coordination skip."""
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Re-requesting Codex review on 3982ee6. The active P1 finding has been addressed.",
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(got, [], "Codex coordination must still be skipped via classification, not ignore-users")
+
+    def test_main_refuses_codex_ignore_without_env_override(self):
+        """The script must exit non-zero (fail closed) when --ignore-users
+        contains the codex bot login and AED_ALLOW_CODEX_IGNORE is not '1'."""
+        with tempfile.TemporaryDirectory() as td:
+            out_json = os.path.join(td, "status.json")
+            out_md = os.path.join(td, "status.md")
+            argv = [
+                "check_pr_review_comments.py",
+                "--repo", "OWNER/REPO",
+                "--pr-number", "1",
+                "--reported-head-sha", "deadbeef" * 5,
+                "--ignore-users", "chatgpt-codex-connector[bot]",
+                "--output-json", out_json,
+                "--output-md", out_md,
+            ]
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AED_ALLOW_CODEX_IGNORE", None)
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(crc, "gh_api", return_value=(True, [], "")):
+                        with mock.patch.object(crc, "gh_graphql_review_threads", return_value=(True, [], "")):
+                            with mock.patch.object(crc, "gh_pr_view", return_value=(True, {"headRefOid": "deadbeef" * 5, "state": "OPEN", "url": ""}, "")):
+                                rc = crc.main()
+        self.assertEqual(rc, 1, "Codex ignore without AED_ALLOW_CODEX_IGNORE must fail closed with rc=1")
+
+    def test_main_allows_codex_ignore_with_env_override(self):
+        """With AED_ALLOW_CODEX_IGNORE=1, the script must proceed (and
+        log a warning to stderr). The pre-existing ignore behavior is
+        preserved under the explicit opt-in."""
+        with tempfile.TemporaryDirectory() as td:
+            out_json = os.path.join(td, "status.json")
+            out_md = os.path.join(td, "status.md")
+            argv = [
+                "check_pr_review_comments.py",
+                "--repo", "OWNER/REPO",
+                "--pr-number", "1",
+                "--reported-head-sha", "deadbeef" * 5,
+                "--ignore-users", "chatgpt-codex-connector[bot]",
+                "--output-json", out_json,
+                "--output-md", out_md,
+            ]
+            with mock.patch.dict(os.environ, {"AED_ALLOW_CODEX_IGNORE": "1"}, clear=False):
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(crc, "gh_api", return_value=(True, [], "")):
+                        with mock.patch.object(crc, "gh_graphql_review_threads", return_value=(True, [], "")):
+                            with mock.patch.object(crc, "gh_pr_view", return_value=(True, {"headRefOid": "deadbeef" * 5, "state": "OPEN", "url": ""}, "")):
+                                rc = crc.main()
+        self.assertEqual(rc, 0, "With AED_ALLOW_CODEX_IGNORE=1, gate must run to completion (rc=0 for empty-data CLEAN)")
+
+    def test_main_does_not_refuse_non_codex_ignore(self):
+        """Sanity check: a non-codex ignore user must not trigger the safeguard."""
+        with tempfile.TemporaryDirectory() as td:
+            out_json = os.path.join(td, "status.json")
+            out_md = os.path.join(td, "status.md")
+            argv = [
+                "check_pr_review_comments.py",
+                "--repo", "OWNER/REPO",
+                "--pr-number", "1",
+                "--reported-head-sha", "deadbeef" * 5,
+                "--ignore-users", "some-other-user",
+                "--output-json", out_json,
+                "--output-md", out_md,
+            ]
+            with mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("AED_ALLOW_CODEX_IGNORE", None)
+                with mock.patch.object(sys, "argv", argv):
+                    with mock.patch.object(crc, "gh_api", return_value=(True, [], "")):
+                        with mock.patch.object(crc, "gh_graphql_review_threads", return_value=(True, [], "")):
+                            with mock.patch.object(crc, "gh_pr_view", return_value=(True, {"headRefOid": "deadbeef" * 5, "state": "OPEN", "url": ""}, "")):
+                                rc = crc.main()
+        self.assertEqual(rc, 0, "Non-codex ignore must not be blocked by the safeguard")
+
 
 if __name__ == "__main__":
     unittest.main()
