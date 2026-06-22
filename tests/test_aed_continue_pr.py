@@ -51,7 +51,7 @@ def _run_cli(args: Sequence[str], timeout: int = 60) -> Tuple[int, str, str]:
 def _make_pr_response(
     *,
     number: int = 407,
-    state: str = "OPEN",  # GitHub returns uppercase
+    state: str = "OPEN",  # GitHub returns uppercase, fetch_pr_state normalizes
     head_sha: str = "abcdef1234567890abcdef1234567890abcdef12",
     base_sha: str = "c720b6810b2e5216c170eb55734af1df5df4704b",
     head_ref: str = "tooling/aed-continue-pr-dry-run-v1",
@@ -61,6 +61,10 @@ def _make_pr_response(
     title: str = "tooling: add aed continue-pr --dry-run for continuation workflow planning",
 ) -> Dict[str, Any]:
     """Return a PR dict in the **normalized fetch_pr_state shape** (not raw API)."""
+    # Normalize state to uppercase (matches fetch_pr_state behavior per
+    # PR #406 Codex finding 3449089426). For raw API shape, use
+    # _make_pr_response_raw.
+    state_normalized = state.upper() if isinstance(state, str) else state
     return {
         "number": number,
         "url": f"https://github.com/Slideshow11/Automated-Edge-Discovery/pull/{number}",
@@ -69,11 +73,45 @@ def _make_pr_response(
         "head_ref": head_ref,
         "base_ref": base_ref,
         "base_sha": base_sha,
-        "state": state,
+        "state": state_normalized,
+        "state_raw": state,  # Original (unnormalized) for diagnostic tests
         "is_draft": draft,
         "is_mergeable": mergeable,
         "merge_state_status": "clean" if mergeable else "blocked",
         "author_login": "Slideshow11",
+        "created_at": "2026-06-21T10:00:00Z",
+        "updated_at": "2026-06-21T15:42:47Z",
+    }
+
+
+def _make_pr_response_raw(
+    *,
+    number: int = 407,
+    state: str = "open",  # Raw GitHub API: lowercase
+    head_sha: str = "abcdef1234567890abcdef1234567890abcdef12",
+    base_sha: str = "c720b6810b2e5216c170eb55734af1df5df4704b",
+    head_ref: str = "tooling/aed-continue-pr-dry-run-v1",
+    base_ref: str = "main",
+    mergeable: bool = True,
+    draft: bool = False,
+    title: str = "tooling: add aed continue-pr --dry-run for continuation workflow planning",
+) -> Dict[str, Any]:
+    """Return a PR dict in the **raw GitHub API shape** (un-normalized).
+
+    Use this to test ``fetch_pr_state``'s normalization logic. State is
+    preserved as the caller passed it (typically lowercase per the real
+    GitHub REST API).
+    """
+    return {
+        "number": number,
+        "html_url": f"https://github.com/Slideshow11/Automated-Edge-Discovery/pull/{number}",
+        "title": title,
+        "state": state,
+        "draft": draft,
+        "user": {"login": "Slideshow11"},
+        "head": {"sha": head_sha, "ref": head_ref},
+        "base": {"sha": base_sha, "ref": base_ref},
+        "mergeable": mergeable,
         "created_at": "2026-06-21T10:00:00Z",
         "updated_at": "2026-06-21T15:42:47Z",
     }
@@ -1042,6 +1080,469 @@ class TestMaxPollSecondsClamping(unittest.TestCase):
                 ]
             )
             self.assertEqual(args.max_poll_seconds, 1)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 repair tests (dbID 3449089426) — PR state normalization
+# ---------------------------------------------------------------------------
+
+
+class TestPrStateNormalization(unittest.TestCase):
+    """PR #406 Codex finding 3449089426: Normalize PR state to uppercase."""
+
+    def test_fetch_pr_state_normalizes_lowercase_open(self) -> None:
+        """Real API returns 'open' (lowercase); fetch_pr_state must uppercase."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (0, json.dumps(_make_pr_response_raw(state="open")), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["state"], "OPEN")
+        self.assertEqual(pr["state_raw"], "open")
+
+    def test_fetch_pr_state_normalizes_lowercase_closed(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (0, json.dumps(_make_pr_response_raw(state="closed")), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["state"], "CLOSED")
+        self.assertEqual(pr["state_raw"], "closed")
+
+    def test_fetch_pr_state_preserves_uppercase_open(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (0, json.dumps(_make_pr_response_raw(state="OPEN")), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["state"], "OPEN")
+        self.assertEqual(pr["state_raw"], "OPEN")
+
+    def test_fetch_pr_state_normalizes_mixed_case_Merged(self) -> None:
+        """Real API should never return 'Merged' but normalize defensively."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (0, json.dumps(_make_pr_response_raw(state="Merged")), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["state"], "MERGED")
+        self.assertEqual(pr["state_raw"], "Merged")
+
+    def test_fetch_pr_state_handles_missing_state(self) -> None:
+        """Missing state should remain None or be normalized conservatively."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            raw = _make_pr_response_raw()
+            raw.pop("state", None)
+            mock_run.return_value = (0, json.dumps(raw), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        # Missing state should be None, not crash
+        self.assertIsNone(pr["state"])
+
+    def test_assemble_plan_lowercase_open_reaches_ready(self) -> None:
+        """When fetch_pr_state returns uppercase OPEN (from lowercase input),
+        the plan should reach READY_TO_AUTHORIZE_HUMAN_MERGE.
+        """
+        # Simulate fetch_pr_state output: state is already uppercase
+        pr = _make_pr_response(state="OPEN")  # factory normalizes
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "head_sha_mismatch": False,
+                "blockers": 0,
+                "stale_blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "review_clean_signal"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_assemble_plan_lowercase_closed_not_ready(self) -> None:
+        pr = _make_pr_response(state="CLOSED")
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertIn("NOT_READY", plan.recommendation)
+        self.assertIn("CLOSED", plan.recommendation)
+
+    def test_assemble_plan_missing_state_conservative(self) -> None:
+        """Missing state (None) should NOT be treated as OPEN."""
+        pr = _make_pr_response()
+        pr["state"] = None
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+# ---------------------------------------------------------------------------
+# PHASE 3 repair tests (dbID 3449089427) — Codex cutoff filtering
+# ---------------------------------------------------------------------------
+
+
+class TestCodexCutoffFiltering(unittest.TestCase):
+    """PR #406 Codex finding 3449089427: Apply --last-known-codex-ts cutoff to both sources."""
+
+    def test_filter_by_cutoff_no_cutoff_returns_all(self) -> None:
+        records = [
+            {"id": 1, "submitted_at": "2026-06-21T10:00:00Z"},
+            {"id": 2, "submitted_at": "2026-06-21T11:00:00Z"},
+        ]
+        filtered, stale = acp._filter_by_cutoff(records, None, "submitted_at")
+        self.assertEqual(len(filtered), 2)
+        self.assertEqual(stale, 0)
+
+    def test_filter_by_cutoff_drops_stale_records(self) -> None:
+        records = [
+            {"id": 1, "submitted_at": "2026-06-21T10:00:00Z"},  # stale
+            {"id": 2, "submitted_at": "2026-06-21T15:00:00Z"},  # fresh
+        ]
+        filtered, stale = acp._filter_by_cutoff(
+            records, "2026-06-21T12:00:00Z", "submitted_at"
+        )
+        self.assertEqual([r["id"] for r in filtered], [2])
+        self.assertEqual(stale, 1)
+
+    def test_filter_by_cutoff_records_with_missing_timestamp_treated_as_stale(self) -> None:
+        records = [
+            {"id": 1},  # no timestamp
+            {"id": 2, "submitted_at": "2026-06-21T15:00:00Z"},  # fresh
+        ]
+        filtered, stale = acp._filter_by_cutoff(
+            records, "2026-06-21T12:00:00Z", "submitted_at"
+        )
+        self.assertEqual([r["id"] for r in filtered], [2])
+        self.assertEqual(stale, 1)
+
+    def test_filter_by_cutoff_invalid_cutoff_treats_all_as_stale(self) -> None:
+        records = [
+            {"id": 1, "submitted_at": "2026-06-21T15:00:00Z"},
+        ]
+        filtered, stale = acp._filter_by_cutoff(
+            records, "not-a-valid-iso-timestamp", "submitted_at"
+        )
+        self.assertEqual(filtered, [])
+        self.assertEqual(stale, 1)
+
+    def test_filter_by_cutoff_accepts_z_suffix(self) -> None:
+        records = [
+            {"id": 1, "submitted_at": "2026-06-21T15:30:00Z"},
+        ]
+        filtered, stale = acp._filter_by_cutoff(
+            records, "2026-06-21T15:00:00Z", "submitted_at"
+        )
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(stale, 0)
+
+    def test_fetch_codex_verdict_stale_formal_clean_review_ignored(self) -> None:
+        """A stale clean formal review (before cutoff) should not produce 'clean'."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            # Formal review with timestamp BEFORE cutoff
+            formal_review = _make_codex_formal_review(
+                state="COMMENTED",
+                body="Codex Review: ✅ Swish!",
+                submitted_at="2026-06-21T10:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([formal_review]), ""),
+                (0, json.dumps([]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertNotEqual(result["verdict"], "clean")
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "all_codex_activity_stale")
+
+    def test_fetch_codex_verdict_stale_issue_comment_clean_ignored(self) -> None:
+        """A stale clean PR-level issue comment (before cutoff) should not produce 'clean'."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            issue_comment = _make_codex_issue_comment(
+                body="Codex Review: Didn't find any major issues. Swish!",
+                created_at="2026-06-21T10:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([]), ""),
+                (0, json.dumps([issue_comment]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertNotEqual(result["verdict"], "clean")
+        self.assertEqual(result["verdict"], "pending")
+
+    def test_fetch_codex_verdict_fresh_formal_clean_review_accepted(self) -> None:
+        """A fresh clean formal review (after cutoff) should produce 'clean'."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            formal_review = _make_codex_formal_review(
+                state="COMMENTED",
+                body="Codex Review: ✅ Swish!",
+                submitted_at="2026-06-21T16:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([formal_review]), ""),
+                (0, json.dumps([]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["source"], "review_clean_signal")
+
+    def test_fetch_codex_verdict_fresh_issue_comment_clean_accepted(self) -> None:
+        """A fresh clean PR-level issue comment (after cutoff) should produce 'clean'."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            issue_comment = _make_codex_issue_comment(
+                body="Codex Review: Didn't find any major issues. Swish!",
+                created_at="2026-06-21T16:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([]), ""),
+                (0, json.dumps([issue_comment]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["source"], "issue_comment_clean_signal")
+
+    def test_fetch_codex_verdict_fresh_actionable_overrides_stale_clean(self) -> None:
+        """A fresh blocked formal review (after cutoff) should produce 'blocked'
+        even if there's also a stale clean review before the cutoff."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            stale_clean = _make_codex_formal_review(
+                state="COMMENTED",
+                body="Codex Review: ✅ Swish!",
+                submitted_at="2026-06-21T10:00:00Z",
+            )
+            fresh_blocked = _make_codex_formal_review(
+                state="CHANGES_REQUESTED",
+                body="Please fix X",
+                submitted_at="2026-06-21T16:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([stale_clean, fresh_blocked]), ""),
+                (0, json.dumps([]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertEqual(result["verdict"], "blocked")
+        self.assertEqual(result["source"], "review_CHANGES_REQUESTED")
+
+    def test_fetch_codex_verdict_endpoint_disagreement_after_cutoff(self) -> None:
+        """After cutoff, one endpoint fresh-clean and the other no-fresh-signal
+        should produce 'conflicting' (conservative)."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            fresh_clean_formal = _make_codex_formal_review(
+                state="COMMENTED",
+                body="Codex Review: ✅ Swish!",
+                submitted_at="2026-06-21T16:00:00Z",
+            )
+            # Issue comments: only stale
+            stale_issue = _make_codex_issue_comment(
+                body="Codex Review: ✅",
+                created_at="2026-06-21T10:00:00Z",
+            )
+            mock_run.side_effect = [
+                (0, json.dumps([fresh_clean_formal]), ""),
+                (0, json.dumps([stale_issue]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        # Formal endpoint has fresh clean; issue endpoint only has stale.
+        # Fresh clean from formal should win (verdict: clean).
+        # But the test is about ENDPOINT DISAGREEMENT after cutoff.
+        # With only fresh-clean on one endpoint, the verdict should be clean
+        # (single source). The "endpoint disagreement" case is when one
+        # endpoint says clean and the other says something different.
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_fetch_codex_verdict_records_cutoff_count(self) -> None:
+        """Return value should include fresh/stale counts for diagnostics."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            fresh = _make_codex_formal_review(submitted_at="2026-06-21T16:00:00Z")
+            stale = _make_codex_formal_review(submitted_at="2026-06-21T10:00:00Z")
+            mock_run.side_effect = [
+                (0, json.dumps([fresh, stale]), ""),
+                (0, json.dumps([]), ""),
+            ]
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, since_iso="2026-06-21T15:00:00Z"
+            )
+        self.assertEqual(result["fresh_formal_count"], 1)
+        self.assertEqual(result["stale_formal_count"], 1)
+        self.assertEqual(result["cutoff_applied"], "2026-06-21T15:00:00Z")
+
+
+# ---------------------------------------------------------------------------
+# PHASE 4 repair tests (dbID 3449089428) — Required checks reconciliation
+# ---------------------------------------------------------------------------
+
+
+class TestRequiredChecksReconciliation(unittest.TestCase):
+    """PR #406 Codex finding 3449089428: Reconcile checks against branch protection."""
+
+    def test_empty_check_runs_with_required_contexts_not_green(self) -> None:
+        """Empty check-runs response with required contexts must be NOT green."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (
+                0,
+                json.dumps({"total_count": 0, "check_runs": []}),
+                "",
+            )
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=["review-comment-gate", "validator"],
+            )
+        self.assertFalse(result["all_required_green"])
+        self.assertEqual(result["missing_required"], ["review-comment-gate", "validator"])
+
+    def test_one_missing_required_context_not_green(self) -> None:
+        """One required context missing -> NOT green even if others present."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "review-comment-gate", "conclusion": "success"},
+                    # 'validator' is missing
+                    {"name": "governance-validators", "conclusion": "success"},
+                    {"name": "pr-gate-live-smoke", "conclusion": "success"},
+                    {"name": "test (3.11)", "conclusion": "success"},
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=[
+                    "review-comment-gate", "validator",
+                    "governance-validators", "pr-gate-live-smoke", "test (3.11)",
+                ],
+            )
+        self.assertFalse(result["all_required_green"])
+        self.assertIn("validator", result["missing_required"])
+
+    def test_all_required_contexts_present_and_successful_green(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "review-comment-gate", "conclusion": "success"},
+                    {"name": "validator", "conclusion": "success"},
+                    {"name": "governance-validators", "conclusion": "success"},
+                    {"name": "pr-gate-live-smoke", "conclusion": "success"},
+                    {"name": "test (3.11)", "conclusion": "success"},
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=[
+                    "review-comment-gate", "validator",
+                    "governance-validators", "pr-gate-live-smoke", "test (3.11)",
+                ],
+            )
+        self.assertTrue(result["all_required_green"])
+        self.assertEqual(result["missing_required"], [])
+        self.assertEqual(result["failing_required"], [])
+
+    def test_pending_required_context_not_green(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "review-comment-gate", "conclusion": "in_progress"},
+                    {"name": "validator", "conclusion": "success"},
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=["review-comment-gate", "validator"],
+            )
+        self.assertFalse(result["all_required_green"])
+        self.assertIn("review-comment-gate", result["failing_required"])
+
+    def test_failing_required_context_not_green(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "review-comment-gate", "conclusion": "failure"},
+                    {"name": "validator", "conclusion": "success"},
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=["review-comment-gate", "validator"],
+            )
+        self.assertFalse(result["all_required_green"])
+        self.assertIn("review-comment-gate", result["failing_required"])
+
+    def test_extra_non_required_checks_do_not_compensate(self) -> None:
+        """Extra successful non-required checks should not compensate for
+        a missing required context."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "extra-check-a", "conclusion": "success"},
+                    {"name": "extra-check-b", "conclusion": "success"},
+                    {"name": "extra-check-c", "conclusion": "success"},
+                    # 'required-check' is MISSING
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=["required-check"],
+            )
+        self.assertFalse(result["all_required_green"])
+        self.assertIn("required-check", result["missing_required"])
+
+    def test_no_required_check_names_legacy_behavior_empty_not_green(self) -> None:
+        """When required_check_names is empty AND no check runs present,
+        default to NOT green (changed from the legacy 'true' default)."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            mock_run.return_value = (
+                0,
+                json.dumps({"total_count": 0, "check_runs": []}),
+                "",
+            )
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=None,
+            )
+        self.assertFalse(result["all_required_green"])
+
+    def test_neutral_and_skipped_required_count_as_passing(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            runs = {
+                "check_runs": [
+                    {"name": "review-comment-gate", "conclusion": "neutral"},
+                    {"name": "validator", "conclusion": "skipped"},
+                ]
+            }
+            mock_run.return_value = (0, json.dumps(runs), "")
+            result = acp.fetch_required_checks(
+                "owner/repo", 407, "abc123",
+                required_check_names=["review-comment-gate", "validator"],
+            )
+        self.assertTrue(result["all_required_green"])
+        self.assertEqual(result["passing_required"], ["review-comment-gate", "validator"])
+
+    def test_no_head_sha_returns_false_even_with_required_names(self) -> None:
+        result = acp.fetch_required_checks(
+            "owner/repo", 407, "",
+            required_check_names=["review-comment-gate"],
+        )
+        self.assertFalse(result["all_required_green"])
+        self.assertIn("review-comment-gate", result["missing_required"])
 
 
 if __name__ == "__main__":

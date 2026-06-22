@@ -190,13 +190,24 @@ def _run_gh_api(
 
 
 def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
-    """Fetch the current PR state via ``gh api /pulls/{N}``."""
+    """Fetch the current PR state via ``gh api /pulls/{N}``.
+
+    Normalizes the GitHub REST ``state`` field to uppercase (GitHub
+    returns ``open``/``closed`` lowercase; downstream readiness logic
+    compares against ``OPEN``/``CLOSED`` uppercase). The original
+    case is preserved as ``state_raw`` for diagnostic purposes.
+    """
     data = _run_gh_api(repo, f"/pulls/{pr_number}")
     if not isinstance(data, dict):
         raise RuntimeError(f"unexpected PR API response shape: {type(data).__name__}")
     head = data.get("head", {})
     base = data.get("base", {})
     user = data.get("user") or {}
+    state_raw = data.get("state")
+    # Normalize state to uppercase so downstream code can compare
+    # against OPEN/CLOSED/MERGED consistently. Unknown values
+    # are preserved as-is (uppercased) for downstream handling.
+    state_normalized = state_raw.upper() if isinstance(state_raw, str) else state_raw
     return {
         "number": data.get("number"),
         "url": data.get("html_url"),
@@ -205,7 +216,8 @@ def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
         "head_ref": head.get("ref"),
         "base_ref": base.get("ref"),
         "base_sha": base.get("sha"),
-        "state": data.get("state"),
+        "state": state_normalized,
+        "state_raw": state_raw,
         "is_draft": bool(data.get("draft")),
         "is_mergeable": data.get("mergeable"),
         "merge_state_status": (
@@ -250,17 +262,51 @@ def fetch_branch_protection(repo: str, base_branch: str) -> Dict[str, Any]:
 
 
 def fetch_required_checks(
-    repo: str, pr_number: int, head_sha: str
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    *,
+    required_check_names: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Fetch the status check rollup for the PR's head SHA."""
+    """Fetch the status check rollup for the PR's head SHA.
+
+    Reconciliation with branch-protection required contexts
+    -----------------------------------------------------
+    When ``required_check_names`` is provided (the branch protection's
+    list of required status-check contexts), this function reconciles
+    the present check-runs against that list. Per PR #406 Codex
+    finding 3449089428:
+
+    - If any required context is **missing** from the check-runs
+      response, ``all_required_green`` is ``False`` even if other
+      contexts are successful.
+    - If any required context is present but not ``success`` /
+      ``neutral`` / ``skipped``, ``all_required_green`` is ``False``.
+    - If ``required_check_names`` is empty or ``None``, the old
+      behavior is preserved (all present checks must be successful).
+    """
     if not head_sha:
-        return {"all_required_green": False, "per_check_status": {}, "error": "no head_sha"}
+        return {
+            "all_required_green": False,
+            "per_check_status": {},
+            "error": "no head_sha",
+            "missing_required": list(required_check_names or []),
+        }
     try:
         data = _run_gh_api(repo, f"/commits/{head_sha}/check-runs?per_page=100")
     except RuntimeError as exc:
-        return {"all_required_green": False, "per_check_status": {}, "error": str(exc)}
+        return {
+            "all_required_green": False,
+            "per_check_status": {},
+            "error": str(exc),
+            "missing_required": list(required_check_names or []),
+        }
     if not isinstance(data, dict):
-        return {"all_required_green": False, "per_check_status": {}}
+        return {
+            "all_required_green": False,
+            "per_check_status": {},
+            "missing_required": list(required_check_names or []),
+        }
     runs = data.get("check_runs") or []
     per_check: Dict[str, str] = {}
     for run in runs:
@@ -268,13 +314,50 @@ def fetch_required_checks(
         conclusion = run.get("conclusion") or run.get("status") or "unknown"
         if name:
             per_check[name] = str(conclusion).lower()
+
+    # Reconcile against required contexts (PR #406 Codex finding 3449089428).
+    # Default to required_check_names if provided; otherwise, no reconciliation
+    # (legacy behavior: only check present runs).
+    required = list(required_check_names or [])
+    if required:
+        # Determine missing required contexts (not present in check-runs at all).
+        missing_required = [
+            name for name in required if name not in per_check
+        ]
+        # Determine failing required contexts (present but not successful).
+        failing_required = [
+            name
+            for name in required
+            if name in per_check
+            and per_check[name] not in {"success", "neutral", "skipped"}
+        ]
+        # Present required contexts that passed.
+        passing_required = [
+            name
+            for name in required
+            if name in per_check
+            and per_check[name] in {"success", "neutral", "skipped"}
+        ]
+        all_required_green = (
+            len(missing_required) == 0 and len(failing_required) == 0
+        )
+        return {
+            "all_required_green": all_required_green,
+            "per_check_status": per_check,
+            "required_check_names": required,
+            "missing_required": missing_required,
+            "failing_required": failing_required,
+            "passing_required": passing_required,
+        }
+    # Legacy: when no required_check_names is provided, only verify present runs.
     return {
         "all_required_green": all(
             v in {"success", "neutral", "skipped"} for v in per_check.values()
         )
         if per_check
-        else True,
+        else False,  # Changed: empty check-runs is NOT all green by default.
         "per_check_status": per_check,
+        "missing_required": [],
     }
 
 
@@ -293,6 +376,16 @@ def fetch_codex_verdict(
 
     Returns a dict describing what each endpoint returned and the
     resolved verdict (with source attribution).
+
+    Cutoff filtering
+    ----------------
+    When ``since_iso`` is provided (as an ISO 8601 timestamp string),
+    BOTH endpoints' records are filtered to only those whose
+    timestamp (``submitted_at`` for formal reviews; ``created_at``
+    for issue comments) is at-or-after ``since_iso``. Records older
+    than the cutoff are excluded from the verdict computation, the
+    per-endpoint ``found_fresh_review`` / ``found_clean_comment``
+    counts, and the latest-activity timestamp.
     """
     endpoint_formal = f"/pulls/{pr_number}/reviews?per_page=100"
     endpoint_issue = f"/issues/{pr_number}/comments?per_page=100"
@@ -323,10 +416,6 @@ def fetch_codex_verdict(
     # --- Issue-level comments endpoint ---
     try:
         query = endpoint_issue
-        if since_iso:
-            # ``gh api`` supports ``--field since=...`` via ``-f`` but for
-            # simplicity we just call without since; the caller filters.
-            pass
         data = _run_gh_api(repo, query)
         if isinstance(data, list):
             issue_comments = [
@@ -341,17 +430,37 @@ def fetch_codex_verdict(
         issue_endpoint_checked = False
         issue_error = str(exc)
 
-    # --- Resolve verdict ---
-    verdict, source = _resolve_codex_verdict(formal_reviews, issue_comments)
-    last_receipt_at = _latest_codex_activity_at(formal_reviews, issue_comments)
+    # --- Apply cutoff filter to both sources (PR #406 Codex finding 3449089427) ---
+    # Records older than the cutoff are excluded. The cutoff is the
+    # ISO 8601 timestamp the operator passed via --last-known-codex-ts.
+    fresh_formal_reviews, stale_formal_count = _filter_by_cutoff(
+        formal_reviews, since_iso, "submitted_at"
+    )
+    fresh_issue_comments, stale_issue_count = _filter_by_cutoff(
+        issue_comments, since_iso, "created_at"
+    )
+
+    # --- Resolve verdict using ONLY fresh (post-cutoff) records ---
+    verdict, source = _resolve_codex_verdict(fresh_formal_reviews, fresh_issue_comments)
+    # If a blocked signal is found in fresh data, prefer it; otherwise
+    # if one endpoint has stale-clean and the other has no fresh signal,
+    # we report a conservative "no fresh Codex confirmation" status
+    # rather than promoting stale-clean to fresh-clean.
+    if not fresh_formal_reviews and not fresh_issue_comments and (
+        formal_reviews or issue_comments
+    ):
+        # All Codex activity is older than the cutoff — be conservative
+        verdict = "pending"
+        source = "all_codex_activity_stale"
+    last_receipt_at = _latest_codex_activity_at(fresh_formal_reviews, fresh_issue_comments)
     last_review_id = (
-        sorted(formal_reviews, key=lambda r: r.get("submitted_at") or "")[-1].get("id")
-        if formal_reviews
+        sorted(fresh_formal_reviews, key=lambda r: r.get("submitted_at") or "")[-1].get("id")
+        if fresh_formal_reviews
         else None
     )
     last_comment_id = (
-        sorted(issue_comments, key=lambda c: c.get("created_at") or "")[-1].get("id")
-        if issue_comments
+        sorted(fresh_issue_comments, key=lambda c: c.get("created_at") or "")[-1].get("id")
+        if fresh_issue_comments
         else None
     )
     return {
@@ -362,6 +471,11 @@ def fetch_codex_verdict(
         "last_comment_id": last_comment_id,
         "would_ping_codex": verdict in {"pending", "blocked"},
         "duplicate_ping_detected": False,
+        "cutoff_applied": since_iso,
+        "fresh_formal_count": len(fresh_formal_reviews),
+        "fresh_issue_count": len(fresh_issue_comments),
+        "stale_formal_count": stale_formal_count,
+        "stale_issue_count": stale_issue_count,
         "dual_endpoint_check": {
             "formal_review_endpoint": {
                 "checked": formal_endpoint_checked,
@@ -387,6 +501,45 @@ def _is_clean_signal(body: str) -> bool:
 def _is_blocked_signal(body: str) -> bool:
     """Return True if the comment body matches a Codex blocked-signal pattern."""
     return bool(BLOCKED_PATTERN.search(body))
+
+
+def _filter_by_cutoff(
+    records: List[Dict[str, Any]],
+    since_iso: Optional[str],
+    timestamp_field: str,
+) -> Tuple[List[Dict[str, Any]], int]:
+    """Filter ``records`` to those whose ``timestamp_field`` is at-or-after ``since_iso``.
+
+    Returns ``(filtered_records, stale_count)``.
+
+    If ``since_iso`` is ``None`` or empty, all records are returned
+    (no cutoff). Records with a missing or unparseable timestamp are
+    excluded (treated as stale) when a cutoff is provided — this is the
+    conservative behavior per PR #406 Codex finding 3449089427.
+    """
+    if not since_iso or not records:
+        return list(records), 0
+    try:
+        cutoff_dt = datetime.fromisoformat(since_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        # Invalid cutoff — be conservative: treat all records as stale.
+        return [], len(records)
+    filtered: List[Dict[str, Any]] = []
+    stale_count = 0
+    for r in records:
+        ts = r.get(timestamp_field)
+        if not ts:
+            stale_count += 1
+            continue
+        try:
+            rec_dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if rec_dt >= cutoff_dt:
+                filtered.append(r)
+            else:
+                stale_count += 1
+        except (ValueError, AttributeError):
+            stale_count += 1
+    return filtered, stale_count
 
 
 def _resolve_codex_verdict(
@@ -1028,7 +1181,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         bp = fetch_branch_protection(repo, pr.get("base_ref") or "main")
 
         # 3. Fetch required checks
-        checks = fetch_required_checks(repo, pr_number, pr.get("head_sha") or "")
+        # Pass the branch-protection required contexts so the check
+        # can be reconciled against branch protection requirements
+        # (PR #406 Codex finding 3449089428).
+        required_names = []
+        if isinstance(bp, dict):
+            required_names = bp.get("required_status_checks") or []
+        checks = fetch_required_checks(
+            repo,
+            pr_number,
+            pr.get("head_sha") or "",
+            required_check_names=required_names,
+        )
 
         # 4. Run gate
         repo_root = Path(args.repo_root) if args.repo_root else None
