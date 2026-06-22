@@ -66,11 +66,32 @@ SCHEMA_VERSION = 1
 PLAN_KIND = "aed.continue_pr.dry_run"
 DEFAULT_REPO = "Slideshow11/Automated-Edge-Discovery"
 CODEX_LOGIN = "chatgpt-codex-connector[bot]"
+# PR #406 Codex finding PRRT_kwDOSHFpYM6LSODH: the clean-signal
+# patterns must accept BOTH the ASCII apostrophe (', U+0027) and
+# the curly apostrophe (', U+2019) that Codex actually emits. The
+# original pattern only matched the straight-apostrophe variant.
+# NB: in a raw string r"['’]" the curly apostrophe must be
+# embedded as the literal U+2019 character (not the escape).
+_APOSTROPHE = r"['’]"
+# Codex's documented clean phrase is "Didn't find any major issues"
+# (or "Did not find any major issues"). The actual characters are
+# Did + n + apostrophe + t. The pattern must allow an optional 'n'
+# between 'Did' and the apostrophe to handle both "Didn't" and the
+# rarer "Did'nt" / OCR variants.
+_DID_PREFIX = r"[Dd]id"
 CLEAN_PATTERN = re.compile(
-    r"^Codex Review:.*(?:[Nn]o major issues|✅|Swish|👍|[Dd]id(?:n't| not)? find any major)"
+    r"^Codex Review:.*(?:[Nn]o major issues|✅|Swish|👍|"
+    + _DID_PREFIX
+    + r"n?"
+    + _APOSTROPHE
+    + r"(?:t| not)? find any major)"
 )
 CLEAN_FALLBACK_PATTERN = re.compile(
-    r"(?:[Nn]o major issues|✅|Swish|👍|looks good|[Dd]id(?:n't| not)? find any major)",
+    r"(?:[Nn]o major issues|✅|Swish|👍|looks good|"
+    + _DID_PREFIX
+    + r"n?"
+    + _APOSTROPHE
+    + r"(?:t| not)? find any major)",
     re.IGNORECASE,
 )
 BLOCKED_PATTERN = re.compile(
@@ -152,6 +173,48 @@ def _run_subprocess(
     return result.returncode, result.stdout, result.stderr
 
 
+class GhApiError(RuntimeError):
+    """Exception raised when a ``gh api`` call fails.
+
+    Carries the gh exit code (``rc``) and the API endpoint
+    (``endpoint``) so callers can distinguish a 404 (unprotected
+    branch) from permission/rate-limit/malformed errors. PR #406
+    Codex finding PRRT_kwDOSHFpYM6LSOC_ requires this distinction.
+    """
+
+    def __init__(self, message: str, rc: int = -1, endpoint: str = ""):
+        super().__init__(message)
+        self.rc = rc
+        self.endpoint = endpoint
+
+
+def _is_not_found_error(stderr: str) -> bool:
+    """Return True if the gh error output indicates a 404 Not Found."""
+    s = (stderr or "").lower()
+    return (
+        "404" in s
+        or "not found" in s
+        or "branch not protected" in s
+    )
+
+
+def _is_permission_error(stderr: str) -> bool:
+    """Return True if the gh error output indicates a permission/403 error."""
+    s = (stderr or "").lower()
+    return (
+        "403" in s
+        or "forbidden" in s
+        or "permission" in s
+        or "access denied" in s
+    )
+
+
+def _is_rate_limit_error(stderr: str) -> bool:
+    """Return True if the gh error output indicates a rate-limit/429 error."""
+    s = (stderr or "").lower()
+    return "rate limit" in s or "429" in s or "abuse detection" in s
+
+
 def _run_gh_api(
     repo: str,
     endpoint: str,
@@ -171,16 +234,20 @@ def _run_gh_api(
     ]
     rc, stdout, stderr = _run_subprocess(argv, timeout=timeout)
     if rc != 0:
-        raise RuntimeError(
-            f"gh api GET /repos/{repo}{endpoint} failed (rc={rc}): {stderr.strip()[:500]}"
+        raise GhApiError(
+            f"gh api GET /repos/{repo}{endpoint} failed (rc={rc}): {stderr.strip()[:500]}",
+            rc=rc,
+            endpoint=endpoint,
         )
     if not stdout.strip():
         return None
     try:
         return json.loads(stdout)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(
-            f"gh api GET /repos/{repo}{endpoint} returned non-JSON: {exc}: {stdout[:500]}"
+        raise GhApiError(
+            f"gh api GET /repos/{repo}{endpoint} returned non-JSON: {exc}: {stdout[:500]}",
+            rc=-1,
+            endpoint=endpoint,
         ) from exc
 
 
@@ -340,19 +407,88 @@ def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
 
 
 def fetch_branch_protection(repo: str, base_branch: str) -> Dict[str, Any]:
-    """Fetch branch protection rules for ``base_branch``."""
+    """Fetch branch protection rules for ``base_branch``.
+
+    PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC_
+    -------------------------------------------
+    Distinguish:
+      - confirmed unprotected branch (404)
+      - protected branch (success)
+      - branch-protection API failure (403 permission, 429 rate-limit,
+        malformed response, etc.)
+
+    Only a confirmed 404 sets ``is_protected=False``. Any other API
+    failure sets ``is_protected=None`` (unknown) and ``protection_status
+    = "api_error"`` so the planner can fail closed on merge.
+    """
+    endpoint = f"/branches/{base_branch}/protection"
     try:
-        data = _run_gh_api(repo, f"/branches/{base_branch}/protection")
+        data = _run_gh_api(repo, endpoint)
+    except GhApiError as exc:
+        # Try to inspect stderr-like info in the exception message
+        # to classify the failure. The exception message embeds the
+        # gh stderr (truncated to 500 chars).
+        msg = str(exc)
+        is_404 = (
+            exc.rc == 404
+            or _is_not_found_error(msg)
+            or "branch not protected" in msg.lower()
+        )
+        if is_404:
+            # Confirmed unprotected branch.
+            return {
+                "base_branch": base_branch,
+                "is_protected": False,
+                "protection_status": "unprotected",
+                "required_status_checks": [],
+                "required_conversation_resolution": False,
+                "error": None,
+            }
+        # Other API failure: permission, rate-limit, malformed, etc.
+        kind = "unknown_error"
+        if _is_permission_error(msg):
+            kind = "permission_denied"
+        elif _is_rate_limit_error(msg):
+            kind = "rate_limited"
+        elif "non-json" in msg.lower() or "returned non-json" in msg.lower():
+            # Malformed response (JSON parse error)
+            kind = "malformed_response"
+        return {
+            "base_branch": base_branch,
+            "is_protected": None,  # unknown — NOT False
+            "protection_status": "api_error",
+            "protection_error_kind": kind,
+            "required_status_checks": [],
+            "required_conversation_resolution": False,
+            "error": str(exc),
+        }
     except RuntimeError as exc:
-        # If the branch is not protected, the API may 404.
-        return {"base_branch": base_branch, "is_protected": False, "error": str(exc)}
+        # Defensive: any other RuntimeError → treat as API error.
+        return {
+            "base_branch": base_branch,
+            "is_protected": None,
+            "protection_status": "api_error",
+            "protection_error_kind": "unknown_error",
+            "required_status_checks": [],
+            "required_conversation_resolution": False,
+            "error": str(exc),
+        }
     if not isinstance(data, dict):
-        return {"base_branch": base_branch, "is_protected": False}
+        return {
+            "base_branch": base_branch,
+            "is_protected": None,
+            "protection_status": "api_error",
+            "protection_error_kind": "malformed_response",
+            "required_status_checks": [],
+            "required_conversation_resolution": False,
+            "error": "branch protection response was not a JSON object",
+        }
     status_checks = data.get("required_status_checks") or {}
     reviews = data.get("required_pull_request_reviews") or {}
     return {
         "base_branch": base_branch,
         "is_protected": True,
+        "protection_status": "protected",
         "required_status_checks": status_checks.get("contexts") or [],
         "strict_status_checks": bool(status_checks.get("strict")),
         "required_conversation_resolution": bool(
@@ -469,12 +605,12 @@ def fetch_required_checks(
         "missing_required": [],
     }
 
-
 def fetch_codex_verdict(
     repo: str,
     pr_number: int,
     *,
     since_iso: Optional[str] = None,
+    head_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Dual-endpoint Codex verdict fetcher (PR #405 lesson).
 
@@ -495,6 +631,25 @@ def fetch_codex_verdict(
     than the cutoff are excluded from the verdict computation, the
     per-endpoint ``found_fresh_review`` / ``found_clean_comment``
     counts, and the latest-activity timestamp.
+
+    Exact-head freshness (PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7)
+    ----------------------------------------------------------------
+    When ``since_iso`` is NOT provided (the documented default), a
+    conservative default freshness check is applied: the verdict can
+    only be ``clean`` if at least one Codex record explicitly maps to
+    the current head SHA.
+
+    For formal reviews: the review's ``commit_id`` (or
+    ``commit_sha``/``commit.oid``) must match ``head_sha`` (prefix
+    or full).
+
+    For issue comments: the body must contain a
+    ``**Reviewed commit:** `SHA` `` marker that matches ``head_sha``.
+
+    If neither endpoint has an exact-head signal, the verdict is
+    ``pending`` with source ``no_exact_head_codex_signal`` — the
+    planner will NOT recommend merge authorization from old Codex
+    clean comments/reviews.
     """
     endpoint_formal = f"/pulls/{pr_number}/reviews?per_page=100"
     endpoint_issue = f"/issues/{pr_number}/comments?per_page=100"
@@ -555,6 +710,43 @@ def fetch_codex_verdict(
         issue_comments, since_iso, "created_at"
     )
 
+    # --- Exact-head freshness filter (PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7) ---
+    # When the operator does NOT pass --last-known-codex-ts (the
+    # documented default), historical Codex activity is NOT trusted
+    # as "fresh". A Codex clean/actionable signal must explicitly
+    # map to the current head SHA to be accepted.
+    #
+    # Formal reviews: the review's commit_id / commit_sha /
+    # commit.oid must match head_sha.
+    #
+    # Issue comments: the body must contain a
+    # "**Reviewed commit:** `SHA`" marker (or "Reviewed commit: SHA"
+    # in plain text) that matches head_sha.
+    exact_head_applied = False
+    if not since_iso and head_sha:
+        # Capture pre-exact-head fresh counts so we can update
+        # the stale counts correctly.
+        pre_exact_head_formal = list(fresh_formal_reviews)
+        pre_exact_head_issue = list(fresh_issue_comments)
+        fresh_formal_reviews = [
+            r
+            for r in fresh_formal_reviews
+            if _review_commit_matches_head(r, head_sha)
+        ]
+        fresh_issue_comments = [
+            c
+            for c in fresh_issue_comments
+            if _body_has_reviewed_commit_marker(c.get("body") or "", head_sha)
+        ]
+        # The records that were "fresh" by timestamp but did NOT
+        # match the current head are reclassified as "stale" (they
+        # are not actionable for the current head).
+        dropped_formal = len(pre_exact_head_formal) - len(fresh_formal_reviews)
+        dropped_issue = len(pre_exact_head_issue) - len(fresh_issue_comments)
+        stale_formal_count = stale_formal_count + dropped_formal
+        stale_issue_count = stale_issue_count + dropped_issue
+        exact_head_applied = True
+
     # --- Resolve verdict using ONLY fresh (post-cutoff) records ---
     verdict, source = _resolve_codex_verdict(fresh_formal_reviews, fresh_issue_comments)
 
@@ -585,6 +777,33 @@ def fetch_codex_verdict(
         # All Codex activity is older than the cutoff — be conservative
         verdict = "pending"
         source = "all_codex_activity_stale"
+
+    # --- Fail-closed when no exact-head Codex signal exists (PR #406
+    # Codex finding PRRT_kwDOSHFpYM6LSOC7). When --last-known-codex-ts
+    # is omitted, we ONLY trust records that map to the current head.
+    # If no such record was found, demote the verdict to pending with
+    # source "no_exact_head_codex_signal" — the planner must not
+    # authorize a merge based on a stale clean Codex signal.
+    if (
+        exact_head_applied
+        and not fresh_formal_reviews
+        and not fresh_issue_comments
+        and not endpoint_errors
+        and verdict in {"clean", "conflicting", "pending"}
+    ):
+        verdict = "pending"
+        source = "no_exact_head_codex_signal"
+    # If no cutoff and no head_sha was provided, the freshness check
+    # is not possible — be conservative and refuse to call verdict
+    # "clean" based on unverified historical activity.
+    elif (
+        not since_iso
+        and not head_sha
+        and not endpoint_errors
+        and verdict == "clean"
+    ):
+        verdict = "pending"
+        source = "no_exact_head_codex_signal_no_head_sha"
     last_receipt_at = _latest_codex_activity_at(fresh_formal_reviews, fresh_issue_comments)
     last_review_id = (
         sorted(fresh_formal_reviews, key=lambda r: r.get("submitted_at") or "")[-1].get("id")
@@ -605,6 +824,8 @@ def fetch_codex_verdict(
         "would_ping_codex": verdict in {"pending", "blocked"},
         "duplicate_ping_detected": False,
         "cutoff_applied": since_iso,
+        "head_sha_checked": head_sha,
+        "exact_head_applied": exact_head_applied,
         "fresh_formal_count": len(fresh_formal_reviews),
         "fresh_issue_count": len(fresh_issue_comments),
         "stale_formal_count": stale_formal_count,
@@ -674,6 +895,75 @@ def _filter_by_cutoff(
         except (ValueError, AttributeError):
             stale_count += 1
     return filtered, stale_count
+
+
+def _review_commit_matches_head(
+    review: Dict[str, Any],
+    head_sha: str,
+) -> bool:
+    """Return True if a formal review's commit_id matches the head SHA.
+
+    PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7: When
+    ``--last-known-codex-ts`` is omitted, a formal review is only
+    trusted as a fresh signal if its commit_id (the SHA the review
+    was anchored to) matches the current PR head SHA.
+
+    GitHub's review API exposes the anchor commit under several
+    aliases (``commit_id`` is the field name in the REST response;
+    ``commit_sha`` and ``commit.oid`` are also accepted for
+    GraphQL-style payloads). We match on full equality or on a
+    unique 12+ character prefix.
+    """
+    if not head_sha or not isinstance(review, dict):
+        return False
+    head = head_sha.lower()
+    candidates: List[str] = []
+    if review.get("commit_id"):
+        candidates.append(str(review["commit_id"]))
+    if review.get("commit_sha"):
+        candidates.append(str(review["commit_sha"]))
+    commit_obj = review.get("commit")
+    if isinstance(commit_obj, dict):
+        if commit_obj.get("oid"):
+            candidates.append(str(commit_obj["oid"]))
+        if commit_obj.get("sha"):
+            candidates.append(str(commit_obj["sha"]))
+    for c in candidates:
+        c_lc = c.lower()
+        if c_lc == head:
+            return True
+        # 12-char prefix match (GitHub short-SHA convention).
+        if len(head) >= 12 and len(c_lc) >= 12 and c_lc[:12] == head[:12]:
+            return True
+    return False
+
+
+# PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7: parse a
+# "**Reviewed commit:** `SHA`" marker in a Codex issue comment.
+_REVIEWED_COMMIT_MARKER = re.compile(
+    r"\*\*(?:Reviewed commit|reviewed commit):\*\*\s*[`'\"]?([0-9a-fA-F]{7,40})[`'\"]?",
+)
+# Plain-text variant: "Reviewed commit: abc1234" (no markdown emphasis).
+_REVIEWED_COMMIT_PLAIN = re.compile(
+    r"(?:Reviewed commit|reviewed commit):\s*[`'\"]?([0-9a-fA-F]{7,40})[`'\"]?"
+)
+
+
+def _body_has_reviewed_commit_marker(body: str, head_sha: str) -> bool:
+    """Return True if a Codex issue comment body contains a
+    ``Reviewed commit: SHA`` marker matching ``head_sha``."""
+    if not body or not head_sha:
+        return False
+    head = head_sha.lower()
+    for pattern in (_REVIEWED_COMMIT_MARKER, _REVIEWED_COMMIT_PLAIN):
+        m = pattern.search(body)
+        if m:
+            sha = m.group(1).lower()
+            if sha == head:
+                return True
+            if len(head) >= 12 and len(sha) >= 12 and sha[:12] == head[:12]:
+                return True
+    return False
 
 
 def _resolve_codex_verdict(
@@ -803,9 +1093,58 @@ def run_review_gate(
             "gate_timeout_used": gate_timeout,
         }
     if rc != 0:
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LSODA: do NOT
+        # discard the gate JSON when the subprocess exits non-zero.
+        # ``check_pr_review_comments.py`` writes a JSON file with
+        # the gate status (``REVIEW_COMMENTS_BLOCKED`` etc.) and
+        # exits 1 to signal a blocked result. The previous behavior
+        # of returning ``REVIEW_COMMENTS_INCONCLUSIVE`` on any non-
+        # zero exit discarded the exact blocker status the gate
+        # produced. We now read the JSON (if present) and surface
+        # the gate's own status; only fall back to INCONCLUSIVE
+        # when no JSON is present.
+        if tmp_json.exists():
+            try:
+                gate_data = json.loads(tmp_json.read_text())
+                # Surface the gate's verdict along with the non-zero
+                # exit code so the planner can still act on the
+                # gate's actual status.
+                return {
+                    "status": gate_data.get("status")
+                    or "REVIEW_COMMENTS_INCONCLUSIVE",
+                    "head_sha_mismatch": gate_data.get("head_sha_mismatch"),
+                    "reported_head_sha": gate_data.get("reported_head_sha"),
+                    "live_head_sha": gate_data.get("live_head_sha"),
+                    "blockers": len(gate_data.get("blockers") or []),
+                    "stale_blockers": len(gate_data.get("stale_blockers") or []),
+                    "p0_count": (gate_data.get("summary_counts") or {}).get("P0", 0),
+                    "p1_count": (gate_data.get("summary_counts") or {}).get("P1", 0),
+                    "p2_count": (gate_data.get("summary_counts") or {}).get("P2", 0),
+                    "p3_count": (gate_data.get("summary_counts") or {}).get("P3", 0),
+                    "current_unresolved_threads": (
+                        gate_data.get("current_unresolved_threads", 0)
+                    ),
+                    "gate_timeout_used": gate_timeout,
+                    "gate_subprocess_nonzero_exit": True,
+                    "gate_subprocess_rc": rc,
+                    "gate_subprocess_stderr": (stderr or "").strip()[:500],
+                    "raw_path": str(tmp_json),
+                }
+            except (json.JSONDecodeError, OSError) as exc:
+                # JSON unreadable — fall through to inconclusive.
+                return {
+                    "status": "REVIEW_COMMENTS_INCONCLUSIVE",
+                    "error": (
+                        f"gate subprocess failed (rc={rc}) and produced "
+                        f"unreadable JSON: {exc}: {stderr.strip()[:500]}"
+                    ),
+                    "gate_timeout_used": gate_timeout,
+                }
+        # No JSON at all — genuine command/error failure.
         return {
             "status": "REVIEW_COMMENTS_INCONCLUSIVE",
             "error": f"gate subprocess failed (rc={rc}): {stderr.strip()[:500]}",
+            "gate_timeout_used": gate_timeout,
         }
     if not tmp_json.exists():
         return {"status": "REVIEW_COMMENTS_INCONCLUSIVE", "error": "gate output JSON missing"}
@@ -934,6 +1273,26 @@ def assemble_plan(
                     ),
                 }
             )
+    # PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC_: when
+    # ``is_protected`` is None (API error), the planner must fail
+    # closed on merge authorization. The original code treated None
+    # the same as False (no protection), which is unsafe.
+    if branch_protection.get("is_protected") is None:
+        bp_err_kind = branch_protection.get("protection_error_kind") or "unknown"
+        blockers_for_merge.append(
+            {
+                "kind": "BRANCH_PROTECTION_API_ERROR",
+                "detail": (
+                    f"branch protection API returned an error "
+                    f"(kind={bp_err_kind!r}); cannot confirm required "
+                    f"status checks or conversation resolution — fail closed"
+                ),
+            }
+        )
+        warnings.append(
+            f"Branch protection API error (kind={bp_err_kind!r}): "
+            f"{branch_protection.get('error') or 'unknown'}"
+        )
     if branch_protection.get("is_protected") and branch_protection.get(
         "required_conversation_resolution"
     ):
@@ -1143,7 +1502,15 @@ def render_markdown(plan: ContinuePlan) -> str:
     lines.append("## Branch protection")
     lines.append("")
     bp = plan.branch_protection
-    if not bp.get("is_protected"):
+    if bp.get("is_protected") is None:
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC_: API error.
+        lines.append(
+            f"- **Base branch:** {bp.get('base_branch')} "
+            f"(branch protection API ERROR: kind={bp.get('protection_error_kind')!r})"
+        )
+        if bp.get("error"):
+            lines.append(f"  - error: {bp['error']}")
+    elif not bp.get("is_protected"):
         lines.append(f"- **Base branch:** {bp.get('base_branch')} (no protection / 404)")
     else:
         lines.append(f"- **Base branch:** {bp.get('base_branch')}")
@@ -1425,8 +1792,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # 5. Dual-endpoint Codex
         if args.check_codex:
+            # PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7: pass the
+            # current head_sha so fetch_codex_verdict can apply
+            # exact-head freshness checking.
             codex = fetch_codex_verdict(
-                repo, pr_number, since_iso=args.last_known_codex_ts
+                repo,
+                pr_number,
+                since_iso=args.last_known_codex_ts,
+                head_sha=pr.get("head_sha"),
             )
         else:
             codex = {

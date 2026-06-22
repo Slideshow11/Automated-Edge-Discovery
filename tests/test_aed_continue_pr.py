@@ -165,7 +165,7 @@ def _make_protection_raw_response(
 
 def _make_protection_normalized(
     *,
-    is_protected: bool = True,
+    is_protected: Optional[bool] = True,
     required_status_checks: Optional[List[str]] = None,
     conversation_resolution: bool = True,
     linear_history: bool = True,
@@ -180,11 +180,29 @@ def _make_protection_normalized(
             "pr-gate-live-smoke",
             "test (3.11)",
         ]
+    if is_protected is None:
+        return {
+            "base_branch": "main",
+            "is_protected": None,
+            "protection_status": "api_error",
+            "protection_error_kind": "permission_denied",
+            "required_status_checks": [],
+            "required_conversation_resolution": False,
+            "error": "Branch protection API error (test fixture)",
+        }
     if not is_protected:
-        return {"base_branch": "main", "is_protected": False, "error": "Branch not protected"}
+        return {
+            "base_branch": "main",
+            "is_protected": False,
+            "protection_status": "unprotected",
+            "required_status_checks": [],
+            "required_conversation_resolution": False,
+            "error": None,
+        }
     return {
         "base_branch": "main",
         "is_protected": True,
+        "protection_status": "protected",
         "required_status_checks": required_status_checks,
         "strict_status_checks": True,
         "required_conversation_resolution": conversation_resolution,
@@ -269,14 +287,18 @@ def _make_codex_formal_review(
     body: str = "Looks good to me!",
     submitted_at: str = "2026-06-21T15:42:47Z",
     review_id: int = 9999999999,
+    commit_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    rec: Dict[str, Any] = {
         "id": review_id,
         "user": {"login": "chatgpt-codex-connector[bot]"},
         "state": state,
         "body": body,
         "submitted_at": submitted_at,
     }
+    if commit_id is not None:
+        rec["commit_id"] = commit_id
+    return rec
 
 
 def _make_codex_issue_comment(
@@ -558,7 +580,7 @@ class TestMergeCommandExactHeadProtection(unittest.TestCase):
             checks={"all_required_green": True, "per_check_status": {}},
             gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
             codex={"verdict": "clean", "source": "issue_comment_xxx"},
-            branch_protection={},
+            branch_protection=_make_protection_normalized(),
             generated_at="2026-06-21T15:00:00Z",
         )
         merge_actions = [a for a in plan.proposed_actions if a["action_kind"] == "merge"]
@@ -764,10 +786,12 @@ class TestNoMutationEnforcement(unittest.TestCase):
     def test_fetch_codex_formal_review_endpoint_only(self) -> None:
         with mock.patch.object(acp, "_run_subprocess") as mock_run:
             mock_run.side_effect = [
-                (0, json.dumps([_make_codex_formal_review()]), ""),
+                (0, json.dumps([_make_codex_formal_review(commit_id="abcdef1234567890abcdef1234567890abcdef12")]), ""),
                 (0, json.dumps([]), ""),
             ]
-            result = acp.fetch_codex_verdict("owner/repo", 407)
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 407, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
             # Both endpoint calls should be GET-style
             self.assertEqual(mock_run.call_count, 2)
             for call_args in mock_run.call_args_list:
@@ -920,7 +944,7 @@ class TestBlockerDetection(unittest.TestCase):
                 "current_unresolved_threads": 0,
             },
             codex={"verdict": "clean", "source": "x"},
-            branch_protection={},
+            branch_protection=_make_protection_normalized(),
             generated_at="2026-06-21T15:00:00Z",
         )
         defaults.update(overrides)
@@ -1810,17 +1834,23 @@ class TestCodexEndpointErrorFailClosed(unittest.TestCase):
                             "body": "Codex Review: no major issues ✅",
                             "submitted_at": "2026-06-22T13:00:00Z",
                             "state": "COMMENTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
                         }
                     ]
                 return [
                     {
                         "user": {"login": acp.CODEX_LOGIN},
-                        "body": "Codex Review: no major issues",
+                        "body": (
+                            "Codex Review: no major issues\n"
+                            "**Reviewed commit:** `abcdef1234567890abcdef1234567890abcdef12`"
+                        ),
                         "created_at": "2026-06-22T13:00:00Z",
                     }
                 ]
             mock_page.side_effect = _side_effect
-            result = acp.fetch_codex_verdict("owner/repo", 406)
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
         self.assertEqual(result["verdict"], "clean")
         self.assertEqual(result["endpoint_errors"], [])
 
@@ -1932,11 +1962,14 @@ class TestCodexEndpointPagination(unittest.TestCase):
                             "body": "Codex Review: no major issues ✅",
                             "submitted_at": "2026-06-22T13:00:00Z",
                             "state": "COMMENTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
                         },
                     ]
                 return []
             mock_page.side_effect = _side_effect
-            result = acp.fetch_codex_verdict("owner/repo", 406)
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
         self.assertEqual(result["verdict"], "clean")
 
     def test_actionable_signal_on_second_page_detected(self) -> None:
@@ -2123,6 +2156,577 @@ class TestGateTimeoutHonored(unittest.TestCase):
         md = acp.render_markdown(plan)
         self.assertIn("gate_timeout_used", md)
         self.assertIn("42", md)
+
+
+# ---------------------------------------------------------------------------
+# PHASE V3 repair tests (dbID PRRT_kwDOSHFpYM6LSOC7) — Exact-head Codex freshness
+# ---------------------------------------------------------------------------
+
+
+class TestExactHeadCodexFreshness(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC7: fail closed when
+    Codex freshness cutoff is absent (--last-known-codex-ts not provided)
+    and no exact-head Codex signal is available."""
+
+    HEAD = "abcdef1234567890abcdef1234567890abcdef12"
+    OLD_HEAD = "1111111111111111111111111111111111111111"
+
+    def test_no_cutoff_old_formal_clean_review_pending(self) -> None:
+        """No cutoff + old formal clean review on old head → pending."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues ✅",
+                            "submitted_at": "2026-06-21T10:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": self.OLD_HEAD,
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "no_exact_head_codex_signal")
+
+    def test_no_cutoff_old_issue_comment_clean_pending(self) -> None:
+        """No cutoff + old issue-comment clean without exact-head marker → pending."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "comments" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": (
+                                "Codex Review: no major issues\n"
+                                f"**Reviewed commit:** `{self.OLD_HEAD}`"
+                            ),
+                            "created_at": "2026-06-21T10:00:00Z",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "no_exact_head_codex_signal")
+
+    def test_no_cutoff_formal_clean_with_matching_commit_id_clean(self) -> None:
+        """No cutoff + formal clean review with commit_id matching current head → clean."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues ✅",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": self.HEAD,
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_no_cutoff_issue_comment_with_reviewed_commit_marker_clean(self) -> None:
+        """No cutoff + issue comment with Reviewed commit marker matching current head → clean."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "comments" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": (
+                                "Codex Review: no major issues\n"
+                                f"**Reviewed commit:** `{self.HEAD}`"
+                            ),
+                            "created_at": "2026-06-22T13:00:00Z",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_no_cutoff_issue_comment_with_old_marker_ignored(self) -> None:
+        """No cutoff + issue comment with Reviewed commit marker for old head → ignored/pending."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "comments" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": (
+                                "Codex Review: no major issues\n"
+                                f"**Reviewed commit:** `{self.OLD_HEAD}`"
+                            ),
+                            "created_at": "2026-06-22T13:00:00Z",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "pending")
+
+    def test_cutoff_explicitly_provided_still_works(self) -> None:
+        """When --last-known-codex-ts is explicitly provided, exact-head filter is NOT applied."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues ✅",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": self.OLD_HEAD,  # Old head, but cutoff OK
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406,
+                since_iso="2026-06-22T00:00:00Z",
+                head_sha=self.HEAD,
+            )
+        self.assertEqual(result["verdict"], "clean")
+        self.assertFalse(result["exact_head_applied"])
+
+    def test_fresh_actionable_signal_remains_actionable(self) -> None:
+        """A fresh actionable (CHANGES_REQUESTED) signal for current head is still blocked."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "I require changes",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "CHANGES_REQUESTED",
+                            "commit_id": self.HEAD,
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha=self.HEAD
+            )
+        self.assertEqual(result["verdict"], "blocked")
+
+    def test_no_cutoff_no_head_sha_fails_closed(self) -> None:
+        """Without cutoff and without head_sha, clean → pending (no freshness check possible)."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            mock_page.return_value = [
+                {
+                    "id": 1,
+                    "user": {"login": acp.CODEX_LOGIN},
+                    "body": "Codex Review: no major issues ✅",
+                    "submitted_at": "2026-06-22T13:00:00Z",
+                    "state": "COMMENTED",
+                }
+            ]
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "no_exact_head_codex_signal_no_head_sha")
+
+    def test_review_commit_matches_head_short_prefix(self) -> None:
+        """12-char prefix match is accepted."""
+        review = {"commit_id": self.HEAD[:12]}
+        self.assertTrue(acp._review_commit_matches_head(review, self.HEAD))
+
+    def test_review_commit_no_match(self) -> None:
+        review = {"commit_id": self.OLD_HEAD}
+        self.assertFalse(acp._review_commit_matches_head(review, self.HEAD))
+
+    def test_body_reviewed_commit_marker_plain(self) -> None:
+        """Plain-text variant 'Reviewed commit: SHA' (no markdown) also matches."""
+        body = f"Codex Review: no major issues\nReviewed commit: {self.HEAD}"
+        self.assertTrue(acp._body_has_reviewed_commit_marker(body, self.HEAD))
+
+    def test_body_reviewed_commit_marker_old(self) -> None:
+        body = f"Codex Review: no major issues\n**Reviewed commit:** `{self.OLD_HEAD}`"
+        self.assertFalse(acp._body_has_reviewed_commit_marker(body, self.HEAD))
+
+
+# ---------------------------------------------------------------------------
+# PHASE V3 repair tests (dbID PRRT_kwDOSHFpYM6LSOC_) — Branch protection API errors
+# ---------------------------------------------------------------------------
+
+
+class TestBranchProtectionApiErrors(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LSOC_: distinguish
+    unprotected branch (404) from API errors (403/429/malformed)."""
+
+    def test_branch_protection_success_returns_protected(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api") as mock_api:
+            mock_api.return_value = {
+                "required_status_checks": {"contexts": ["review-comment-gate"]},
+                "required_pull_request_reviews": {"required_approving_review_count": 1},
+                "required_conversation_resolution": {"enabled": True},
+                "enforce_admins": {"enabled": False},
+                "allow_force_pushes": {"enabled": False},
+            }
+            result = acp.fetch_branch_protection("owner/repo", "main")
+        self.assertEqual(result["is_protected"], True)
+        self.assertEqual(result["protection_status"], "protected")
+        self.assertEqual(result["required_status_checks"], ["review-comment-gate"])
+
+    def test_404_unprotected_branch(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api") as mock_api:
+            mock_api.side_effect = acp.GhApiError(
+                "gh api ... failed (rc=1): 404 Not Found",
+                rc=1,
+                endpoint="/branches/main/protection",
+            )
+            result = acp.fetch_branch_protection("owner/repo", "main")
+        self.assertEqual(result["is_protected"], False)
+        self.assertEqual(result["protection_status"], "unprotected")
+
+    def test_403_permission_error_returns_api_error(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api") as mock_api:
+            mock_api.side_effect = acp.GhApiError(
+                "gh api ... failed (rc=1): 403 Forbidden - permission denied",
+                rc=1,
+                endpoint="/branches/main/protection",
+            )
+            result = acp.fetch_branch_protection("owner/repo", "main")
+        self.assertIsNone(result["is_protected"])
+        self.assertEqual(result["protection_status"], "api_error")
+        self.assertEqual(result["protection_error_kind"], "permission_denied")
+
+    def test_429_rate_limit_returns_api_error(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api") as mock_api:
+            mock_api.side_effect = acp.GhApiError(
+                "gh api ... failed (rc=1): 429 rate limit exceeded",
+                rc=1,
+                endpoint="/branches/main/protection",
+            )
+            result = acp.fetch_branch_protection("owner/repo", "main")
+        self.assertIsNone(result["is_protected"])
+        self.assertEqual(result["protection_error_kind"], "rate_limited")
+
+    def test_malformed_json_returns_api_error(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api") as mock_api:
+            mock_api.side_effect = acp.GhApiError(
+                "non-JSON: ...",
+                rc=-1,
+                endpoint="/branches/main/protection",
+            )
+            result = acp.fetch_branch_protection("owner/repo", "main")
+        self.assertIsNone(result["is_protected"])
+        self.assertEqual(result["protection_error_kind"], "malformed_response")
+
+    def test_api_error_blocks_merge_in_plan(self) -> None:
+        """API error on branch protection must NOT recommend merge."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(is_protected=None),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("BRANCH_PROTECTION_API_ERROR", kinds)
+
+    def test_api_error_appears_in_markdown(self) -> None:
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(is_protected=None),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("BRANCH_PROTECTION_API_ERROR", md.upper() + md)
+        # The markdown should mention the API error (case-insensitive)
+        self.assertIn("branch protection api", md.lower())
+
+
+# ---------------------------------------------------------------------------
+# PHASE V3 repair tests (dbID PRRT_kwDOSHFpYM6LSODA) — Preserve gate JSON on non-zero exit
+# ---------------------------------------------------------------------------
+
+
+class TestPreserveGateJsonOnNonzeroExit(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LSODA: when the gate
+    subprocess exits non-zero but writes valid JSON, preserve that
+    JSON rather than discarding it as a hard subprocess failure."""
+
+    def test_gate_exit_1_with_blocked_json_preserved(self) -> None:
+        """Gate exits 1 + writes REVIEW_COMMENTS_BLOCKED JSON → result status preserved."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (
+                1,
+                "",
+                "gate found 3 unresolved threads",
+            )
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_BLOCKED",
+                     "blockers": [
+                         {"kind": "UNRESOLVED_THREADS",
+                          "path": "scripts/local/aed_continue_pr.py",
+                          "line": 1,
+                          "severity": "P1",
+                          "comment_id": 12345,
+                          "thread_id": "PRRT_test",
+                          "title": "Test blocker",
+                          "rationale": "x",
+                          "reviewer": "codex",
+                          "is_stale": False,
+                          "raw": "x",
+                         }
+                     ],
+                     "stale_blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 1, "P2": 0, "P3": 0},
+                     "current_unresolved_threads": 3,
+                 })):
+                result = acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=30
+                )
+        self.assertEqual(result["status"], "REVIEW_COMMENTS_BLOCKED")
+        self.assertEqual(result["blockers"], 1)
+        self.assertEqual(result["current_unresolved_threads"], 3)
+        self.assertTrue(result["gate_subprocess_nonzero_exit"])
+        self.assertEqual(result["gate_subprocess_rc"], 1)
+
+    def test_gate_exit_1_blockers_in_plan(self) -> None:
+        """Blockers from a non-zero-exit gate JSON appear in the planner."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        gate_result = {
+            "status": "REVIEW_COMMENTS_BLOCKED",
+            "blockers": 1,
+            "stale_blockers": 0,
+            "current_unresolved_threads": 1,
+            "summary_counts": {"P0": 0, "P1": 1, "P2": 0, "P3": 0},
+        }
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate=gate_result,
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("GATE_BLOCKED", kinds)
+
+    def test_gate_exit_1_no_json_inconclusive(self) -> None:
+        """Gate exits 1 with no JSON → command failure/inconclusive."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (1, "", "fatal: command failed")
+            with mock.patch("pathlib.Path.exists", return_value=False):
+                result = acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=30
+                )
+        self.assertEqual(result["status"], "REVIEW_COMMENTS_INCONCLUSIVE")
+        self.assertIn("rc=1", result.get("error", ""))
+
+    def test_gate_exit_0_clean_json_unchanged(self) -> None:
+        """Gate exits 0 with clean JSON → clean behavior unchanged."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, "", "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "stale_blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                     "current_unresolved_threads": 0,
+                 })):
+                result = acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=30
+                )
+        self.assertEqual(result["status"], "REVIEW_COMMENTS_CLEAN")
+        self.assertEqual(result["blockers"], 0)
+        # gate_subprocess_nonzero_exit should be False (or absent)
+        self.assertFalse(result.get("gate_subprocess_nonzero_exit", False))
+
+    def test_gate_exit_1_malformed_json_inconclusive(self) -> None:
+        """Gate exits 1 with malformed JSON → command failure/inconclusive."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (1, "", "fatal")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value="not json {{"):
+                result = acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=30
+                )
+        self.assertEqual(result["status"], "REVIEW_COMMENTS_INCONCLUSIVE")
+
+
+# ---------------------------------------------------------------------------
+# PHASE V3 repair tests (dbID PRRT_kwDOSHFpYM6LSODH) — Curly-apostrophe clean phrase
+# ---------------------------------------------------------------------------
+
+
+class TestCurlyApostropheCleanPhrase(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LSODH: match Codex's
+    curly-apostrophe (U+2019) clean phrase, not just the ASCII
+    apostrophe variant."""
+
+    def test_ascii_apostrophe_clean_phrase_accepted(self) -> None:
+        """ASCII "Didn't find any major issues" is accepted when fresh/exact-head."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: Didn't find any major issues. Swish!",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_curly_apostrophe_clean_phrase_accepted(self) -> None:
+        """Curly "Didn’t find any major issues" (U+2019) is accepted when fresh/exact-head."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            # Note: ’ is U+2019 (right single quotation mark)
+                            "body": "Codex Review: Didn’t find any major issues. Swish!",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_curly_apostrophe_phrase_in_issue_comment_accepted(self) -> None:
+        """Curly-apostrophe phrase in an issue comment is also accepted."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "comments" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": (
+                                "Codex Review: Didn’t find any major issues.\n"
+                                "**Reviewed commit:** `abcdef1234567890abcdef1234567890abcdef12`"
+                            ),
+                            "created_at": "2026-06-22T13:00:00Z",
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_clean_phrase_on_old_head_ignored(self) -> None:
+        """Curly-apostrophe clean phrase on old head is ignored (no exact-head match)."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: Didn’t find any major issues.",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": "1111111111111111111111111111111111111111",  # old
+                        }
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
+        self.assertEqual(result["verdict"], "pending")
+
+    def test_actionable_after_clean_phrase_still_blocks(self) -> None:
+        """If an actionable (CHANGES_REQUESTED) signal exists for the same head,
+        the actionable verdict wins over the clean phrase."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: Didn't find any major issues.",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                        },
+                        {
+                            "id": 2,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "I require changes",
+                            "submitted_at": "2026-06-22T13:00:01Z",
+                            "state": "CHANGES_REQUESTED",
+                            "commit_id": "abcdef1234567890abcdef1234567890abcdef12",
+                        },
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, head_sha="abcdef1234567890abcdef1234567890abcdef12"
+            )
+        self.assertEqual(result["verdict"], "blocked")
+
+    def test_is_clean_signal_recognizes_curly(self) -> None:
+        """Direct test of _is_clean_signal with curly apostrophe."""
+        self.assertTrue(acp._is_clean_signal("Codex Review: Didn’t find any major issues"))
+        self.assertTrue(acp._is_clean_signal("Codex Review: Didn't find any major issues"))
+        # "no major issues" alone also matches (existing fallback)
+        self.assertTrue(acp._is_clean_signal("Codex Review: no major issues"))
 
 
 if __name__ == "__main__":
