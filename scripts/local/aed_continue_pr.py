@@ -184,6 +184,95 @@ def _run_gh_api(
         ) from exc
 
 
+def _run_gh_api_paginated(
+    repo: str,
+    endpoint: str,
+    *args: Any,
+    **kwargs: Any,
+) -> List[Any]:
+    """Run ``gh api --paginate`` against ``/repos/{repo}{endpoint}``.
+
+    PR #406 Codex finding PRRT_kwDOSHFpYM6LRny5
+    -------------------------------------------
+    GitHub's list endpoints return at most 100 records per page. To
+    see all pages we must invoke ``gh api`` with ``--paginate`` and
+    ``--slurp`` so the per-page JSON arrays are flattened into one
+    combined array (the default ``--paginate`` would just dump
+    newline-separated arrays, which is not parseable as a single
+    JSON document).
+
+    Returns a flat list of records across all pages. Any error from
+    the underlying ``gh api`` invocation propagates as a
+    ``RuntimeError`` so the caller can fail closed.
+    """
+    if not endpoint.startswith("/"):
+        raise ValueError(f"endpoint must start with '/': {endpoint!r}")
+    # ``--slurp`` tells gh api to collect each page's JSON output
+    # into a single JSON array, which is then parseable as one
+    # document. ``--paginate`` walks the Link header. The result is
+    # a JSON array of JSON arrays; we flatten it.
+    argv = [
+        "gh",
+        "api",
+        "-H",
+        "Accept: application/vnd.github+json",
+        "--paginate",
+        "--slurp",
+        f"/repos/{repo}{endpoint}",
+    ]
+    timeout = kwargs.get("timeout", 60)
+    rc, stdout, stderr = _run_subprocess(argv, timeout=timeout)
+    if rc != 0:
+        raise RuntimeError(
+            f"gh api --paginate --slurp /repos/{repo}{endpoint} "
+            f"failed (rc={rc}): {stderr.strip()[:500]}"
+        )
+    if not stdout.strip():
+        return []
+    try:
+        pages = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"gh api --paginate --slurp /repos/{repo}{endpoint} "
+            f"returned non-JSON: {exc}: {stdout[:500]}"
+        ) from exc
+    # ``--slurp`` wraps every page's output in a top-level array.
+    # Each element is either an object (if the endpoint returns a
+    # single object per page, unusual for our list endpoints) or an
+    # array of objects (the common case for /reviews and
+    # /comments). Flatten into one list of records.
+    flat: List[Any] = []
+    if isinstance(pages, list):
+        for page in pages:
+            if isinstance(page, list):
+                flat.extend(page)
+            elif page is not None:
+                flat.append(page)
+    return flat
+
+
+def _normalize_merge_state(raw: Any) -> Optional[str]:
+    """Normalize a merge-state value to an uppercase lifecycle string.
+
+    Returns one of: ``CLEAN``, ``BLOCKED``, ``DIRTY``, ``BEHIND``,
+    ``UNSTABLE``, ``DRAFT``, ``UNKNOWN``.  ``None`` or empty returns
+    ``None`` (no signal — caller should treat as not-clean).
+
+    PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyv
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    s_upper = s.upper()
+    if s_upper in {"CLEAN"}:
+        return "CLEAN"
+    if s_upper in {"BLOCKED", "DIRTY", "BEHIND", "UNSTABLE", "DRAFT"}:
+        return s_upper
+    return "UNKNOWN"
+
+
 # ---------------------------------------------------------------------------
 # Fetchers (one per external signal)
 # ---------------------------------------------------------------------------
@@ -208,6 +297,27 @@ def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
     # against OPEN/CLOSED/MERGED consistently. Unknown values
     # are preserved as-is (uppercased) for downstream handling.
     state_normalized = state_raw.upper() if isinstance(state_raw, str) else state_raw
+    # Resolve the merge-state field. GitHub's REST endpoint is
+    # ``mergeable_state`` (not ``merge_state_status``). We read
+    # whichever of the known aliases is present, normalize to
+    # uppercase, and preserve the raw value + source field for
+    # diagnostics. PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyv.
+    raw_merge_value: Any = None
+    raw_merge_field: Optional[str] = None
+    for _ms_field in (
+        "mergeable_state",        # REST /pulls/{N}
+        "mergeStateStatus",       # GraphQL PullRequest
+        "merge_state_status",     # legacy / internal
+    ):
+        if _ms_field in data and data.get(_ms_field) is not None:
+            raw_merge_value = data.get(_ms_field)
+            raw_merge_field = _ms_field
+            break
+    if raw_merge_value is None and data.get("mergeable") is False:
+        raw_merge_value = "BLOCKED"
+        raw_merge_field = "mergeable_false_inferred"
+    merge_state_normalized = _normalize_merge_state(raw_merge_value)
+
     return {
         "number": data.get("number"),
         "url": data.get("html_url"),
@@ -220,10 +330,9 @@ def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
         "state_raw": state_raw,
         "is_draft": bool(data.get("draft")),
         "is_mergeable": data.get("mergeable"),
-        "merge_state_status": (
-            data.get("merge_state_status")
-            or ("BLOCKED" if data.get("mergeable") is False else "UNKNOWN")
-        ),
+        "merge_state_status": merge_state_normalized,
+        "merge_state_raw": raw_merge_value,
+        "merge_state_field": raw_merge_field,
         "author_login": user.get("login"),
         "created_at": data.get("created_at"),
         "updated_at": data.get("updated_at"),
@@ -397,9 +506,11 @@ def fetch_codex_verdict(
     formal_error: Optional[str] = None
     issue_error: Optional[str] = None
 
-    # --- Formal reviews endpoint ---
+    # --- Formal reviews endpoint (paginated) ---
+    # PR #406 Codex finding PRRT_kwDOSHFpYM6LRny5: use --paginate so
+    # we see all pages, not just the first 100.
     try:
-        data = _run_gh_api(repo, endpoint_formal)
+        data = _run_gh_api_paginated(repo, endpoint_formal)
         if isinstance(data, list):
             formal_reviews = [
                 r
@@ -410,13 +521,16 @@ def fetch_codex_verdict(
         else:
             formal_reviews = []
     except RuntimeError as exc:
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyz: preserve the
+        # error (do NOT silently convert to empty list) so the
+        # verdict can fail closed.
         formal_endpoint_checked = False
         formal_error = str(exc)
+        formal_reviews = []
 
-    # --- Issue-level comments endpoint ---
+    # --- Issue-level comments endpoint (paginated) ---
     try:
-        query = endpoint_issue
-        data = _run_gh_api(repo, query)
+        data = _run_gh_api_paginated(repo, endpoint_issue)
         if isinstance(data, list):
             issue_comments = [
                 c
@@ -429,6 +543,7 @@ def fetch_codex_verdict(
     except RuntimeError as exc:
         issue_endpoint_checked = False
         issue_error = str(exc)
+        issue_comments = []
 
     # --- Apply cutoff filter to both sources (PR #406 Codex finding 3449089427) ---
     # Records older than the cutoff are excluded. The cutoff is the
@@ -442,12 +557,30 @@ def fetch_codex_verdict(
 
     # --- Resolve verdict using ONLY fresh (post-cutoff) records ---
     verdict, source = _resolve_codex_verdict(fresh_formal_reviews, fresh_issue_comments)
+
+    # --- Fail-closed on endpoint errors (PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyz) ---
+    # If EITHER endpoint failed, the verdict MUST be ``pending`` /
+    # ``inconclusive`` (NOT ``clean``) regardless of what the
+    # successful endpoint returned. A clean signal from one side
+    # must never override a hard error on the other side.
+    endpoint_errors: List[str] = []
+    if not formal_endpoint_checked:
+        endpoint_errors.append(f"formal_review_endpoint: {formal_error}")
+    if not issue_endpoint_checked:
+        endpoint_errors.append(f"issue_comment_endpoint: {issue_error}")
+    if endpoint_errors:
+        verdict = "pending"
+        source = "endpoint_error_fail_closed"
+
     # If a blocked signal is found in fresh data, prefer it; otherwise
     # if one endpoint has stale-clean and the other has no fresh signal,
     # we report a conservative "no fresh Codex confirmation" status
     # rather than promoting stale-clean to fresh-clean.
-    if not fresh_formal_reviews and not fresh_issue_comments and (
-        formal_reviews or issue_comments
+    if (
+        not endpoint_errors
+        and not fresh_formal_reviews
+        and not fresh_issue_comments
+        and (formal_reviews or issue_comments)
     ):
         # All Codex activity is older than the cutoff — be conservative
         verdict = "pending"
@@ -476,6 +609,7 @@ def fetch_codex_verdict(
         "fresh_issue_count": len(fresh_issue_comments),
         "stale_formal_count": stale_formal_count,
         "stale_issue_count": stale_issue_count,
+        "endpoint_errors": endpoint_errors,
         "dual_endpoint_check": {
             "formal_review_endpoint": {
                 "checked": formal_endpoint_checked,
@@ -603,21 +737,39 @@ def _latest_codex_activity_at(
         return None
     return max(timestamps)
 
-
 def run_review_gate(
     repo: str,
     pr_number: int,
     head_sha: str,
-    *,
+    *args: Any,
     repo_root: Optional[Path] = None,
     gate_script: str = "scripts/local/check_pr_review_comments.py",
+    max_poll_seconds: int = DEFAULT_MAX_POLL_SECONDS,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Run the B2 review-comment gate via subprocess and parse its JSON output.
 
     NEVER imports or modifies ``check_pr_review_comments.py``.
+
+    PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_
+    --------------------------------------------
+    The subprocess timeout MUST use the parsed/clamped
+    ``max_poll_seconds`` value (defaulting to ``DEFAULT_MAX_POLL_SECONDS``),
+    NOT a hard-coded ``120``. This preserves the bounded no-stall
+    contract: passing ``--max-poll-seconds 1`` actually passes
+    ``timeout=1`` to the gate subprocess.
     """
     if not head_sha:
         return {"status": "REVIEW_COMMENTS_INCONCLUSIVE", "error": "no head_sha"}
+    # Clamp the gate timeout to safe lower/upper bounds, matching
+    # the CLI parser's clamping in ``parse_args``. This keeps the
+    # documented contract intact: the subprocess timeout equals the
+    # operator-supplied (or default) max-poll-seconds value.
+    gate_timeout = int(max_poll_seconds)
+    if gate_timeout < 1:
+        gate_timeout = 1
+    if gate_timeout > MAX_POLL_SECONDS_CAP:
+        gate_timeout = MAX_POLL_SECONDS_CAP
     # Use a temp file for gate output
     tmp_json = Path("/tmp") / f"aed_gate_{pr_number}_{head_sha[:12]}.json"
     tmp_md = Path("/tmp") / f"aed_gate_{pr_number}_{head_sha[:12]}.md"
@@ -638,9 +790,18 @@ def run_review_gate(
     ]
     cwd = str(repo_root) if repo_root else None
     try:
-        rc, stdout, stderr = _run_subprocess(cmd, cwd=Path(cwd) if cwd else None, timeout=120)
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_: use the
+        # operator-supplied (or default) max-poll-seconds as the
+        # subprocess timeout, NOT a hard-coded 120.
+        rc, stdout, stderr = _run_subprocess(
+            cmd, cwd=Path(cwd) if cwd else None, timeout=gate_timeout
+        )
     except RuntimeError as exc:
-        return {"status": "REVIEW_COMMENTS_INCONCLUSIVE", "error": str(exc)}
+        return {
+            "status": "REVIEW_COMMENTS_INCONCLUSIVE",
+            "error": str(exc),
+            "gate_timeout_used": gate_timeout,
+        }
     if rc != 0:
         return {
             "status": "REVIEW_COMMENTS_INCONCLUSIVE",
@@ -666,6 +827,10 @@ def run_review_gate(
         "current_unresolved_threads": (
             gate_data.get("current_unresolved_threads", 0)
         ),
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_: surface the
+        # actual subprocess timeout used so the operator can verify
+        # the bounded no-stall contract.
+        "gate_timeout_used": gate_timeout,
         "raw_path": str(tmp_json),
     }
 
@@ -698,6 +863,25 @@ def assemble_plan(
             {
                 "kind": "MERGE_CONFLICT",
                 "detail": "GitHub reports mergeable=False (likely conflict or blocked)",
+            }
+        )
+
+    # Merge-state gate (PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyv).
+    # Per the repo cookbook, we hold unless ``mergeable_state`` /
+    # ``mergeStateStatus`` is ``CLEAN``. Any non-clean value
+    # (BLOCKED, DIRTY, BEHIND, UNSTABLE, DRAFT, UNKNOWN, or
+    # missing) blocks the merge command from being emitted.
+    merge_state = pr.get("merge_state_status")
+    if merge_state is None or str(merge_state).upper() != "CLEAN":
+        blockers_for_merge.append(
+            {
+                "kind": "MERGE_STATE_NOT_CLEAN",
+                "detail": (
+                    f"merge_state_status={merge_state!r} "
+                    f"(raw={pr.get('merge_state_raw')!r}, "
+                    f"field={pr.get('merge_state_field')!r}); "
+                    f"cookbook requires CLEAN before authorizing merge"
+                ),
             }
         )
     gate_status = gate.get("status") or "UNKNOWN"
@@ -733,6 +917,23 @@ def assemble_plan(
         warnings.append(
             "Codex signals conflict between formal review and issue comment endpoints"
         )
+    # Surface Codex endpoint errors as a warning and an explicit
+    # blocker when the verdict was demoted to pending because of an
+    # endpoint failure. PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyz.
+    codex_endpoint_errors = codex.get("endpoint_errors") or []
+    if codex_endpoint_errors:
+        for err in codex_endpoint_errors:
+            warnings.append(f"Codex endpoint error: {err}")
+        if codex.get("source") == "endpoint_error_fail_closed":
+            blockers_for_merge.append(
+                {
+                    "kind": "CODEX_ENDPOINT_ERROR",
+                    "detail": (
+                        f"one or more Codex endpoints failed; "
+                        f"verdict demoted to pending: {codex_endpoint_errors}"
+                    ),
+                }
+            )
     if branch_protection.get("is_protected") and branch_protection.get(
         "required_conversation_resolution"
     ):
@@ -898,6 +1099,13 @@ def render_markdown(plan: ContinuePlan) -> str:
     lines.append(
         f"- **current_unresolved_threads:** {plan.gate.get('current_unresolved_threads')}"
     )
+    # PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_: surface the
+    # subprocess timeout used for the gate so the operator can
+    # verify the bounded no-stall contract.
+    if plan.gate.get("gate_timeout_used") is not None:
+        lines.append(
+            f"- **gate_timeout_used (s):** {plan.gate.get('gate_timeout_used')}"
+        )
     if plan.gate.get("error"):
         lines.append(f"- **Error:** {plan.gate['error']}")
     lines.append("")
@@ -922,6 +1130,14 @@ def render_markdown(plan: ContinuePlan) -> str:
                  f"found_clean_comment={issue.get('found_clean_comment')}")
     if issue.get("error"):
         lines.append(f"  - error: {issue['error']}")
+    # PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyz: surface the
+    # raw endpoint_errors list (may contain error messages from
+    # either endpoint).
+    endpoint_errors = plan.codex.get("endpoint_errors") or []
+    if endpoint_errors:
+        lines.append("- **endpoint_errors:**")
+        for err in endpoint_errors:
+            lines.append(f"  - {err}")
     lines.append("")
 
     lines.append("## Branch protection")
@@ -1196,8 +1412,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         # 4. Run gate
         repo_root = Path(args.repo_root) if args.repo_root else None
+        # PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_: pass the
+        # operator-supplied (or default) max-poll-seconds into the
+        # gate subprocess timeout, NOT a hard-coded 120.
         gate = run_review_gate(
-            repo, pr_number, pr.get("head_sha") or "", repo_root=repo_root
+            repo,
+            pr_number,
+            pr.get("head_sha") or "",
+            repo_root=repo_root,
+            max_poll_seconds=args.max_poll_seconds,
         )
 
         # 5. Dual-endpoint Codex

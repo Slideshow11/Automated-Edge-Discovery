@@ -93,6 +93,9 @@ def _make_pr_response_raw(
     head_ref: str = "tooling/aed-continue-pr-dry-run-v1",
     base_ref: str = "main",
     mergeable: bool = True,
+    mergeable_state: Optional[str] = None,
+    mergeStateStatus: Optional[str] = None,
+    merge_state_status: Optional[str] = None,
     draft: bool = False,
     title: str = "tooling: add aed continue-pr --dry-run for continuation workflow planning",
 ) -> Dict[str, Any]:
@@ -100,9 +103,11 @@ def _make_pr_response_raw(
 
     Use this to test ``fetch_pr_state``'s normalization logic. State is
     preserved as the caller passed it (typically lowercase per the real
-    GitHub REST API).
+    GitHub REST API). Optionally include the merge-state field under
+    any of the known aliases (``mergeable_state``, ``mergeStateStatus``,
+    ``merge_state_status``).
     """
-    return {
+    raw: Dict[str, Any] = {
         "number": number,
         "html_url": f"https://github.com/Slideshow11/Automated-Edge-Discovery/pull/{number}",
         "title": title,
@@ -115,6 +120,13 @@ def _make_pr_response_raw(
         "created_at": "2026-06-21T10:00:00Z",
         "updated_at": "2026-06-21T15:42:47Z",
     }
+    if mergeable_state is not None:
+        raw["mergeable_state"] = mergeable_state
+    if mergeStateStatus is not None:
+        raw["mergeStateStatus"] = mergeStateStatus
+    if merge_state_status is not None:
+        raw["merge_state_status"] = merge_state_status
+    return raw
 
 
 def _make_protection_raw_response(
@@ -1543,6 +1555,574 @@ class TestRequiredChecksReconciliation(unittest.TestCase):
         )
         self.assertFalse(result["all_required_green"])
         self.assertIn("review-comment-gate", result["missing_required"])
+
+
+# ---------------------------------------------------------------------------
+# PHASE 2 repair tests (dbID PRRT_kwDOSHFpYM6LRnyv) — Require CLEAN merge state
+# ---------------------------------------------------------------------------
+
+
+class TestCleanMergeStateGate(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyv: Require CLEAN merge state."""
+
+    def test_normalize_merge_state_clean(self) -> None:
+        self.assertEqual(acp._normalize_merge_state("clean"), "CLEAN")
+        self.assertEqual(acp._normalize_merge_state("CLEAN"), "CLEAN")
+        self.assertEqual(acp._normalize_merge_state(" Clean "), "CLEAN")
+
+    def test_normalize_merge_state_other_values(self) -> None:
+        self.assertEqual(acp._normalize_merge_state("blocked"), "BLOCKED")
+        self.assertEqual(acp._normalize_merge_state("dirty"), "DIRTY")
+        self.assertEqual(acp._normalize_merge_state("behind"), "BEHIND")
+        self.assertEqual(acp._normalize_merge_state("unstable"), "UNSTABLE")
+        self.assertEqual(acp._normalize_merge_state("draft"), "DRAFT")
+        self.assertEqual(acp._normalize_merge_state("has_hooks"), "UNKNOWN")
+        self.assertEqual(acp._normalize_merge_state(""), None)
+        self.assertEqual(acp._normalize_merge_state(None), None)
+        self.assertEqual(acp._normalize_merge_state("garbage"), "UNKNOWN")
+
+    def test_fetch_pr_state_reads_mergeable_state_field(self) -> None:
+        """Real REST field is mergeable_state; fetch_pr_state must read it."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            raw = _make_pr_response_raw(
+                state="open", mergeable=True, mergeable_state="clean"
+            )
+            mock_run.return_value = (0, json.dumps(raw), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["merge_state_status"], "CLEAN")
+        self.assertEqual(pr["merge_state_raw"], "clean")
+        self.assertEqual(pr["merge_state_field"], "mergeable_state")
+
+    def test_fetch_pr_state_reads_legacy_field(self) -> None:
+        """Legacy merge_state_status (internal/legacy) still works."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            raw = _make_pr_response_raw(
+                state="open", mergeable=True, merge_state_status="CLEAN"
+            )
+            mock_run.return_value = (0, json.dumps(raw), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["merge_state_status"], "CLEAN")
+        self.assertEqual(pr["merge_state_field"], "merge_state_status")
+
+    def test_fetch_pr_state_reads_graphql_field(self) -> None:
+        """GraphQL mergeStateStatus still works."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            raw = _make_pr_response_raw(
+                state="open", mergeable=True, mergeStateStatus="CLEAN"
+            )
+            mock_run.return_value = (0, json.dumps(raw), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["merge_state_status"], "CLEAN")
+        self.assertEqual(pr["merge_state_field"], "mergeStateStatus")
+
+    def test_fetch_pr_state_normalizes_blocked(self) -> None:
+        with mock.patch.object(acp, "_run_subprocess") as mock_run:
+            raw = _make_pr_response_raw(
+                state="open", mergeable=True, mergeable_state="blocked"
+            )
+            mock_run.return_value = (0, json.dumps(raw), "")
+            pr = acp.fetch_pr_state("owner/repo", 407)
+        self.assertEqual(pr["merge_state_status"], "BLOCKED")
+
+    def test_assemble_plan_clean_mergeable_state_allows_ready(self) -> None:
+        """REST-style mergeable_state=clean + all gates green → READY."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["merge_state_raw"] = "clean"
+        pr["merge_state_field"] = "mergeable_state"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "head_sha_mismatch": False,
+                "blockers": 0,
+                "stale_blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "review_clean_signal"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_assemble_plan_blocked_mergeable_state_not_ready(self) -> None:
+        """REST-style mergeable_state=blocked must block merge even if all
+        other gates are green."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "BLOCKED"
+        pr["merge_state_raw"] = "blocked"
+        pr["merge_state_field"] = "mergeable_state"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "head_sha_mismatch": False,
+                "blockers": 0,
+                "stale_blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "review_clean_signal"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("MERGE_STATE_NOT_CLEAN", kinds)
+
+    def test_assemble_plan_missing_mergeable_state_not_ready(self) -> None:
+        """Missing mergeable_state must NOT be treated as clean."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = None
+        pr["merge_state_raw"] = None
+        pr["merge_state_field"] = None
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("MERGE_STATE_NOT_CLEAN", kinds)
+
+    def test_assemble_plan_unknown_mergeable_state_not_ready(self) -> None:
+        """Unknown mergeable_state values must NOT be treated as clean."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "UNKNOWN"
+        pr["merge_state_raw"] = "weird"
+        pr["merge_state_field"] = "mergeable_state"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_assemble_plan_merge_command_preview_absent_when_not_clean(self) -> None:
+        """The merge command preview must NOT be emitted unless merge state is CLEAN."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "BLOCKED"
+        pr["merge_state_raw"] = "blocked"
+        pr["merge_state_field"] = "mergeable_state"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        for action in plan.proposed_actions:
+            if action.get("action_kind") == "merge":
+                self.fail("merge action emitted despite non-clean merge state")
+
+
+# ---------------------------------------------------------------------------
+# PHASE 3 repair tests (dbID PRRT_kwDOSHFpYM6LRnyz) — Fail closed on Codex endpoint errors
+# ---------------------------------------------------------------------------
+
+
+class TestCodexEndpointErrorFailClosed(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LRnyz: Fail closed on endpoint errors."""
+
+    def test_formal_endpoint_error_with_clean_issue_comment_not_clean(self) -> None:
+        """Endpoint error on formal reviews + clean issue comment must NOT
+        produce a clean verdict (fail-closed)."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    raise RuntimeError("gh api --paginate failed: connection refused")
+                # Issue comments endpoint returns a clean signal
+                return [
+                    {
+                        "user": {"login": acp.CODEX_LOGIN},
+                        "body": "Codex Review: no major issues ✅",
+                        "created_at": "2026-06-22T13:00:00Z",
+                    }
+                ]
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "endpoint_error_fail_closed")
+        self.assertTrue(result["endpoint_errors"])
+        self.assertIn("formal_review_endpoint", result["endpoint_errors"][0])
+
+    def test_issue_endpoint_error_with_clean_formal_review_not_clean(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "comments" in endpoint:
+                    raise RuntimeError("gh api --paginate failed: timeout")
+                return [
+                    {
+                        "user": {"login": acp.CODEX_LOGIN},
+                        "body": "Codex Review: no major issues",
+                        "submitted_at": "2026-06-22T13:00:00Z",
+                        "state": "COMMENTED",
+                    }
+                ]
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "endpoint_error_fail_closed")
+        self.assertTrue(result["endpoint_errors"])
+        self.assertIn("issue_comment_endpoint", result["endpoint_errors"][0])
+
+    def test_both_endpoints_error_pending(self) -> None:
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            mock_page.side_effect = RuntimeError("both endpoints failed")
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "pending")
+        self.assertEqual(result["source"], "endpoint_error_fail_closed")
+        self.assertEqual(len(result["endpoint_errors"]), 2)
+
+    def test_no_endpoint_error_fresh_clean_still_works(self) -> None:
+        """No endpoint errors + fresh clean signal on both sides → clean."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues ✅",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                        }
+                    ]
+                return [
+                    {
+                        "user": {"login": acp.CODEX_LOGIN},
+                        "body": "Codex Review: no major issues",
+                        "created_at": "2026-06-22T13:00:00Z",
+                    }
+                ]
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["endpoint_errors"], [])
+
+    def test_endpoint_error_blocks_merge_in_plan(self) -> None:
+        """If Codex endpoint failed, plan should NOT recommend merge."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={
+                "verdict": "pending",
+                "source": "endpoint_error_fail_closed",
+                "endpoint_errors": ["formal_review_endpoint: connection refused"],
+            },
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CODEX_ENDPOINT_ERROR", kinds)
+        # Warning should mention the endpoint error
+        self.assertTrue(
+            any("endpoint error" in w.lower() for w in plan.warnings),
+            f"expected endpoint error warning, got: {plan.warnings}",
+        )
+
+    def test_endpoint_error_appears_in_markdown(self) -> None:
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+            },
+            codex={
+                "verdict": "pending",
+                "source": "endpoint_error_fail_closed",
+                "endpoint_errors": ["formal_review_endpoint: timeout"],
+            },
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("endpoint_errors", md)
+        self.assertIn("formal_review_endpoint: timeout", md)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 4 repair tests (dbID PRRT_kwDOSHFpYM6LRny5) — Page through Codex endpoints
+# ---------------------------------------------------------------------------
+
+
+class TestCodexEndpointPagination(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LRny5: Page through Codex endpoints."""
+
+    def test_paginated_command_uses_paginate_and_slurp(self) -> None:
+        """Verify _run_gh_api_paginated builds the correct gh api command."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, "[]", "")
+            acp._run_gh_api_paginated("owner/repo", "/pulls/406/reviews?per_page=100")
+            argv = mock_sub.call_args[0][0]
+        self.assertIn("--paginate", argv)
+        self.assertIn("--slurp", argv)
+        self.assertIn("/repos/owner/repo/pulls/406/reviews", " ".join(argv))
+
+    def test_slurped_paginated_arrays_flattened(self) -> None:
+        """_run_gh_api_paginated should flatten a top-level list of page
+        arrays into a single flat list."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            # Simulate --slurp output: [[page1_records], [page2_records], ...]
+            slurped_output = json.dumps([
+                [
+                    {"id": 1, "user": {"login": "a"}},
+                    {"id": 2, "user": {"login": "b"}},
+                ],
+                [
+                    {"id": 3, "user": {"login": "c"}},
+                ],
+                [],
+            ])
+            mock_sub.return_value = (0, slurped_output, "")
+            result = acp._run_gh_api_paginated("owner/repo", "/pulls/406/reviews?per_page=100")
+        self.assertEqual(len(result), 3)
+        self.assertEqual([r["id"] for r in result], [1, 2, 3])
+
+    def test_clean_signal_on_second_page_detected(self) -> None:
+        """A clean Codex signal on page 2+ must be detected."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        # Page 1: only non-Codex records
+                        {"id": 1, "user": {"login": "human"}, "body": "noise"},
+                        # Page 2: a clean Codex record
+                        {
+                            "id": 2,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues ✅",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "COMMENTED",
+                        },
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "clean")
+
+    def test_actionable_signal_on_second_page_detected(self) -> None:
+        """A CHANGES_REQUESTED review on page 2+ must produce 'blocked'."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {"id": 1, "user": {"login": "human"}, "body": "noise"},
+                        {
+                            "id": 2,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "I require changes",
+                            "submitted_at": "2026-06-22T13:00:00Z",
+                            "state": "CHANGES_REQUESTED",
+                        },
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict("owner/repo", 406)
+        self.assertEqual(result["verdict"], "blocked")
+
+    def test_cutoff_filtering_still_applies_after_pagination(self) -> None:
+        """Cutoff filtering (PHASE 3 finding 3449089427) must still work
+        after pagination."""
+        with mock.patch.object(acp, "_run_gh_api_paginated") as mock_page:
+            def _side_effect(repo, endpoint, *args, **kwargs):
+                if "reviews" in endpoint:
+                    return [
+                        {
+                            "id": 1,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues",
+                            "submitted_at": "2026-06-21T10:00:00Z",  # Before cutoff
+                            "state": "COMMENTED",
+                        },
+                        {
+                            "id": 2,
+                            "user": {"login": acp.CODEX_LOGIN},
+                            "body": "Codex Review: no major issues",
+                            "submitted_at": "2026-06-22T14:00:00Z",  # After cutoff
+                            "state": "COMMENTED",
+                        },
+                    ]
+                return []
+            mock_page.side_effect = _side_effect
+            result = acp.fetch_codex_verdict(
+                "owner/repo", 406, since_iso="2026-06-22T13:00:00Z"
+            )
+        # The fresh record (after cutoff) should make it clean
+        self.assertEqual(result["verdict"], "clean")
+        self.assertEqual(result["fresh_formal_count"], 1)
+        self.assertEqual(result["stale_formal_count"], 1)
+
+
+# ---------------------------------------------------------------------------
+# PHASE 5 repair tests (dbID PRRT_kwDOSHFpYM6LRny_) — Honor gate timeout
+# ---------------------------------------------------------------------------
+
+
+class TestGateTimeoutHonored(unittest.TestCase):
+    """PR #406 Codex finding PRRT_kwDOSHFpYM6LRny_: Honor --max-poll-seconds."""
+
+    def test_max_poll_seconds_1_passes_timeout_1(self) -> None:
+        """--max-poll-seconds 1 must result in timeout=1 to gate subprocess."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, json.dumps({
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": [],
+                "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+            }), "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                 })):
+                acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=1
+                )
+                call_kwargs = mock_sub.call_args[1]
+        self.assertEqual(call_kwargs.get("timeout"), 1)
+
+    def test_default_max_poll_seconds_passed_to_subprocess(self) -> None:
+        """Default max_poll_seconds value (DEFAULT_MAX_POLL_SECONDS) must
+        be passed to subprocess, NOT a hard-coded 120."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, json.dumps({
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": [],
+                "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+            }), "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                 })):
+                acp.run_review_gate(
+                    "owner/repo", 406, "abc123"
+                )
+                call_kwargs = mock_sub.call_args[1]
+        # Default is DEFAULT_MAX_POLL_SECONDS (30), NOT 120
+        self.assertEqual(call_kwargs.get("timeout"), acp.DEFAULT_MAX_POLL_SECONDS)
+        self.assertNotEqual(call_kwargs.get("timeout"), 120)
+
+    def test_clamped_low_value_honored(self) -> None:
+        """max_poll_seconds < 1 is clamped to 1, not silently overridden."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, json.dumps({
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": [],
+                "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+            }), "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                 })):
+                acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=0
+                )
+                call_kwargs = mock_sub.call_args[1]
+        self.assertEqual(call_kwargs.get("timeout"), 1)
+
+    def test_clamped_high_value_honored(self) -> None:
+        """max_poll_seconds > MAX_POLL_SECONDS_CAP is clamped to cap."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, json.dumps({
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": [],
+                "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+            }), "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                 })):
+                acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=99999
+                )
+                call_kwargs = mock_sub.call_args[1]
+        self.assertEqual(call_kwargs.get("timeout"), acp.MAX_POLL_SECONDS_CAP)
+
+    def test_gate_timeout_surfaced_in_result(self) -> None:
+        """run_review_gate's returned dict must include gate_timeout_used."""
+        with mock.patch.object(acp, "_run_subprocess") as mock_sub:
+            mock_sub.return_value = (0, json.dumps({
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": [],
+                "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+            }), "")
+            with mock.patch("pathlib.Path.exists", return_value=True), \
+                 mock.patch("pathlib.Path.read_text", return_value=json.dumps({
+                     "status": "REVIEW_COMMENTS_CLEAN",
+                     "blockers": [],
+                     "summary_counts": {"P0": 0, "P1": 0, "P2": 0, "P3": 0},
+                 })):
+                result = acp.run_review_gate(
+                    "owner/repo", 406, "abc123", max_poll_seconds=15
+                )
+        self.assertEqual(result.get("gate_timeout_used"), 15)
+
+    def test_gate_timeout_appears_in_markdown(self) -> None:
+        """Markdown rendering must surface gate_timeout_used."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={
+                "status": "REVIEW_COMMENTS_CLEAN",
+                "blockers": 0,
+                "current_unresolved_threads": 0,
+                "gate_timeout_used": 42,
+            },
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection={},
+            generated_at="2026-06-21T15:00:00Z",
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("gate_timeout_used", md)
+        self.assertIn("42", md)
 
 
 if __name__ == "__main__":
