@@ -57,6 +57,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -73,25 +74,33 @@ CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 # NB: in a raw string r"['’]" the curly apostrophe must be
 # embedded as the literal U+2019 character (not the escape).
 _APOSTROPHE = r"['’]"
-# Codex's documented clean phrase is "Didn't find any major issues"
-# (or "Did not find any major issues"). The actual characters are
-# Did + n + apostrophe + t. The pattern must allow an optional 'n'
-# between 'Did' and the apostrophe to handle both "Didn't" and the
-# rarer "Did'nt" / OCR variants.
-_DID_PREFIX = r"[Dd]id"
+# PR #406 Codex finding 3453151187 (P2): Codex's documented clean
+# phrase appears in THREE variants and the patterns must accept
+# all of them while remaining conservative (no arbitrary "no issues"
+# phrase matching). The three variants are:
+#   - "Didn't find any major issues"   (ASCII + contracted)
+#   - "Didn’t find any major issues"   (curly  + contracted)
+#   - "Did not find any major issues"  (no apostrophe, non-contracted)
+# We model this with a single alternation inside the pattern:
+#   (?:n['’]?t | not)
+# which matches either "nt" / "n't" / "n’t" (contracted, with
+# optional apostrophe) OR " not" (non-contracted). The optional
+# apostrophe means the contracted variants work with or without
+# an apostrophe, while " not" preserves the documented non-
+# contracted form. The outer regex stays anchored on "Did" so we
+# do not broaden to arbitrary "no issues" text.
+_DID_AFFIRMATIVE = r"(?:n['’]?t| not)"
+_CLEAN_DID_PHRASE = (
+    r"(?:[Nn]o major issues|✅|Swish|👍|"
+    + r"[Dd]id"
+    + _DID_AFFIRMATIVE
+    + r" find any major)"
+)
 CLEAN_PATTERN = re.compile(
-    r"^Codex Review:.*(?:[Nn]o major issues|✅|Swish|👍|"
-    + _DID_PREFIX
-    + r"n?"
-    + _APOSTROPHE
-    + r"(?:t| not)? find any major)"
+    r"^Codex Review:.*" + _CLEAN_DID_PHRASE
 )
 CLEAN_FALLBACK_PATTERN = re.compile(
-    r"(?:[Nn]o major issues|✅|Swish|👍|looks good|"
-    + _DID_PREFIX
-    + r"n?"
-    + _APOSTROPHE
-    + r"(?:t| not)? find any major)",
+    r"(?:[Nn]o major issues|✅|Swish|👍|looks good|" + _CLEAN_DID_PHRASE + ")",
     re.IGNORECASE,
 )
 BLOCKED_PATTERN = re.compile(
@@ -171,6 +180,45 @@ def _run_subprocess(
             f"command timed out after {timeout}s: {' '.join(argv)}"
         ) from exc
     return result.returncode, result.stdout, result.stderr
+
+
+def _safe_unlink(path: Path) -> None:
+    """Unlink ``path`` if it exists; ignore missing-file errors.
+
+    PR #406 Codex finding 3453151179 (P1): the deterministic gate
+    output path ``/tmp/aed_gate_<pr>_<sha>.json`` can persist from
+    a prior invocation. ``run_review_gate`` unlinks any pre-existing
+    file at that path before launching the subprocess so a stale
+    JSON cannot be read as if it were current.
+    """
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        # Don't fail the planner if unlink fails (e.g., permission
+        # error on someone else's file). The freshness check below
+        # will catch a stale or unwritable file anyway.
+        return
+
+
+def _is_fresh_written(path: Path, invocation_start: float) -> bool:
+    """Return True iff ``path`` exists and was written at/after ``invocation_start``.
+
+    PR #406 Codex finding 3453151179 (P1): ``run_review_gate`` only
+    trusts a gate-output JSON if its mtime is at or after the
+    recorded invocation start. Files with older mtime (i.e., from
+    a prior run) or files that don't exist return False so the
+    caller treats the result as a command failure rather than
+    trusting stale data.
+    """
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return st.st_mtime >= invocation_start
 
 
 class GhApiError(RuntimeError):
@@ -1060,9 +1108,26 @@ def run_review_gate(
         gate_timeout = 1
     if gate_timeout > MAX_POLL_SECONDS_CAP:
         gate_timeout = MAX_POLL_SECONDS_CAP
-    # Use a temp file for gate output
+    # Use a temp file for gate output.
+    # PR #406 Codex finding 3453151179 (P1): the deterministic
+    # ``aed_gate_<pr>_<sha>.json`` path can still exist from a
+    # prior invocation. If the current subprocess exits non-zero
+    # before writing a fresh report, the V3 logic would otherwise
+    # trust the stale JSON from the prior run. We therefore:
+    #   1. Unlink any pre-existing file at the deterministic path
+    #      before launching the subprocess so a stale file cannot
+    #      be read as if it were current.
+    #   2. Record the invocation start time so we can verify any
+    #      JSON present after the subprocess returns was written
+    #      by *this* invocation (mtime >= start time).
+    #   3. Only trust the post-subprocess JSON if its mtime is
+    #      >= the recorded start time; otherwise treat it as a
+    #      command failure / inconclusive.
     tmp_json = Path("/tmp") / f"aed_gate_{pr_number}_{head_sha[:12]}.json"
     tmp_md = Path("/tmp") / f"aed_gate_{pr_number}_{head_sha[:12]}.md"
+    invocation_start = time.time()
+    _safe_unlink(tmp_json)
+    _safe_unlink(tmp_md)
     python_exe = sys.executable or "python3"
     cmd = [
         python_exe,
@@ -1092,6 +1157,12 @@ def run_review_gate(
             "error": str(exc),
             "gate_timeout_used": gate_timeout,
         }
+    # PR #406 Codex finding 3453151179 (P1): never trust a JSON
+    # file unless we can prove it was written by the current
+    # invocation. If the file is missing, or its mtime predates
+    # this invocation, it is either stale or was never written;
+    # treat the run as a command failure regardless of rc.
+    fresh_json = _is_fresh_written(tmp_json, invocation_start)
     if rc != 0:
         # PR #406 Codex finding PRRT_kwDOSHFpYM6LSODA: do NOT
         # discard the gate JSON when the subprocess exits non-zero.
@@ -1100,10 +1171,10 @@ def run_review_gate(
         # exits 1 to signal a blocked result. The previous behavior
         # of returning ``REVIEW_COMMENTS_INCONCLUSIVE`` on any non-
         # zero exit discarded the exact blocker status the gate
-        # produced. We now read the JSON (if present) and surface
-        # the gate's own status; only fall back to INCONCLUSIVE
-        # when no JSON is present.
-        if tmp_json.exists():
+        # produced. We now read the JSON (if present AND fresh)
+        # and surface the gate's own status; only fall back to
+        # INCONCLUSIVE when no fresh JSON exists.
+        if fresh_json:
             try:
                 gate_data = json.loads(tmp_json.read_text())
                 # Surface the gate's verdict along with the non-zero
@@ -1131,7 +1202,7 @@ def run_review_gate(
                     "raw_path": str(tmp_json),
                 }
             except (json.JSONDecodeError, OSError) as exc:
-                # JSON unreadable — fall through to inconclusive.
+                # Fresh JSON but unreadable — fall through to inconclusive.
                 return {
                     "status": "REVIEW_COMMENTS_INCONCLUSIVE",
                     "error": (
@@ -1140,14 +1211,31 @@ def run_review_gate(
                     ),
                     "gate_timeout_used": gate_timeout,
                 }
-        # No JSON at all — genuine command/error failure.
+        # No fresh JSON — either the subprocess never wrote one,
+        # or the file present is stale from a prior invocation.
+        # Treat as a genuine command failure.
         return {
             "status": "REVIEW_COMMENTS_INCONCLUSIVE",
-            "error": f"gate subprocess failed (rc={rc}): {stderr.strip()[:500]}",
+            "error": (
+                f"gate subprocess failed (rc={rc}) without a fresh JSON "
+                f"report (stale or missing output at {tmp_json}): "
+                f"{stderr.strip()[:500]}"
+            ),
             "gate_timeout_used": gate_timeout,
         }
-    if not tmp_json.exists():
-        return {"status": "REVIEW_COMMENTS_INCONCLUSIVE", "error": "gate output JSON missing"}
+    if not fresh_json:
+        # rc==0 but no fresh JSON — the subprocess claimed success
+        # but produced no usable report. This is a command failure
+        # (or the file was unlinked between subprocess write and
+        # our stat). Treat as inconclusive.
+        return {
+            "status": "REVIEW_COMMENTS_INCONCLUSIVE",
+            "error": (
+                f"gate subprocess exited 0 but produced no fresh JSON "
+                f"at {tmp_json} (missing or stale)"
+            ),
+            "gate_timeout_used": gate_timeout,
+        }
     try:
         gate_data = json.loads(tmp_json.read_text())
     except (json.JSONDecodeError, OSError) as exc:
