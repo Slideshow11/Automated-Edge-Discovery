@@ -3706,12 +3706,22 @@ class TestCheckpointV2PrimaryDriftWarning(unittest.TestCase):
         )
 
     def test_primary_head_drift_does_not_block_merge_ready_both_sides(self) -> None:
-        """A primary-head drift warning must not prevent merge_ready_both_sides."""
+        """A primary-head drift warning must not prevent merge_ready_both_sides
+        for NON-merge-ready checkpoints.
+
+        Per the V4 fix (``3456665866``), the same drift IS a
+        blocker for MERGE-READY checkpoints (because we cannot
+        confirm the operator verified the protected primary at
+        the merge moment). This test exercises the NON-merge-
+        ready case to lock in the V2 warning semantics for that
+        scenario.
+        """
         pr = _make_pr_response(state="OPEN")
         pr["merge_state_status"] = "CLEAN"
+        # NOTE: no ``terminal_state`` → checkpoint is NOT
+        # merge-ready. Per V4 the primary drift must therefore
+        # remain a warning, not a blocker.
         payload = _make_checkpoint_payload(
-            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
-            next_action="pr_merge",
             current_head="abcdef1234567890abcdef1234567890abcdef12",
             last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
             last_verified_primary_head="dddd4444dddd4444dddd4444dddd4444dddd4444",
@@ -3719,7 +3729,17 @@ class TestCheckpointV2PrimaryDriftWarning(unittest.TestCase):
         envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
         acp._validate_checkpoint_payload(envelope)
         acp._cross_reference_checkpoint(envelope, pr, live_main_sha="eeee5555eeee5555eeee5555eeee5555eeee5555")
-        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+        # V4: for a non-merge-ready checkpoint, primary drift
+        # is still a warning. merge_ready_both_sides stays
+        # False because the checkpoint has no merge-ready
+        # terminal state — but the cause is the absence of a
+        # merge-ready state, NOT a primary-blocker.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+        # And the primary drift surfaces as a warning, not a blocker.
+        blockers_kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn("CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE", blockers_kinds)
+        warnings = envelope["cross_reference"]["warnings"]
+        self.assertTrue(any("primary" in w for w in warnings))
 
     def test_pr_head_drift_still_blocks(self) -> None:
         """``last_verified_pr_head`` != live_pr_head → still a blocker."""
@@ -4140,6 +4160,325 @@ class TestCheckpointV3LiveBaseSha(unittest.TestCase):
             codex={"verdict": "clean", "source": "x"},
             branch_protection=_make_protection_normalized(),
             generated_at="2026-06-23T02:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV4PhaseValidation(unittest.TestCase):
+    """PR #407 Codex finding 3456665870 (P2).
+
+    ``phase`` must be validated on the RAW payload before
+    any coercion. Non-string, non-None values
+    (``[]``, ``{}``, ``42``, etc.) must surface as
+    ``CHECKPOINT_VALIDATION_INVALID`` instead of being
+    silently coerced to ``None``.
+    """
+
+    def test_validate_raw_phase_catches_empty_list(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["phase"] = []
+        errors = acp._validate_raw_phase(payload)
+        joined = "; ".join(errors)
+        self.assertIn("phase", joined)
+        self.assertIn("list", joined)
+
+    def test_validate_raw_phase_catches_empty_dict(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["phase"] = {}
+        errors = acp._validate_raw_phase(payload)
+        joined = "; ".join(errors)
+        self.assertIn("phase", joined)
+        self.assertIn("dict", joined)
+
+    def test_validate_raw_phase_catches_int(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["phase"] = 42
+        errors = acp._validate_raw_phase(payload)
+        joined = "; ".join(errors)
+        self.assertIn("phase", joined)
+        self.assertIn("int", joined)
+
+    def test_validate_raw_phase_accepts_valid_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["phase"] = "PHASE_5_MERGE_AUTHORIZATION"
+        errors = acp._validate_raw_phase(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_phase_accepts_none(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["phase"] = None
+        errors = acp._validate_raw_phase(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_phase_accepts_missing_field(self) -> None:
+        payload = _make_checkpoint_payload()
+        del payload["phase"]
+        errors = acp._validate_raw_phase(payload)
+        self.assertEqual(errors, [])
+
+    def test_malformed_phase_produces_validation_blocker(self) -> None:
+        """Malformed ``phase`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["phase"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_int_phase_produces_validation_blocker(self) -> None:
+        """Integer ``phase`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["phase"] = 42
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_validation_error_details_in_json_envelope(self) -> None:
+        """Raw ``phase`` error details appear in JSON envelope."""
+        payload = _make_checkpoint_payload()
+        payload["phase"] = {"weird": "object"}
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        joined = " ".join(envelope["validation"]["errors"])
+        self.assertIn("phase", joined)
+        self.assertIn("dict", joined)
+        # Also surfaced under the raw_phase_errors key for explicit diagnostics.
+        self.assertIn(
+            "phase",
+            " ".join(envelope["validation"].get("raw_phase_errors", [])),
+        )
+
+    def test_validation_error_details_in_markdown_section(self) -> None:
+        """Raw ``phase`` error details appear in markdown ``## Checkpoint`` section."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["phase"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("## Checkpoint", md)
+        self.assertIn("phase", md)
+
+    def test_valid_string_phase_still_validates(self) -> None:
+        """A valid ``phase`` string still passes end-to-end."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            phase="PHASE_5_MERGE_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "clean")
+
+    def test_missing_phase_follows_existing_policy(self) -> None:
+        """Missing ``phase`` is allowed (follows existing optional policy)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        del payload["phase"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        # Validation should not produce phase-related errors.
+        joined = " ".join(envelope["validation"].get("errors", []))
+        self.assertNotIn("phase", joined)
+        self.assertNotIn(
+            "phase",
+            " ".join(envelope["validation"].get("raw_phase_errors", [])),
+        )
+
+    def test_no_checkpoint_behavior_unchanged_for_phase_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV4MergeReadyPrimaryEvidence(unittest.TestCase):
+    """PR #407 Codex finding 3456665866 (P1).
+
+    A checkpoint parked at ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+    must NOT satisfy ``merge_ready_both_sides`` if it is missing
+    ``last_verified_primary_head``. The cross-reference must
+    promote the canonical "recorded primary head missing" /
+    "primary worktree head changed" message from a warning to
+    a blocker (``CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE``)
+    ONLY when the checkpoint is in a merge-ready state.
+
+    For non-merge-ready checkpoints, primary drift remains a
+    warning per the V2 design.
+    """
+
+    def test_merge_ready_missing_primary_blocks(self) -> None:
+        """Merge-ready checkpoint with no ``last_verified_primary_head`` → blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        # Build a checkpoint that is merge-ready but persisted
+        # WITHOUT ``last_verified_primary_head`` (explicitly
+        # removed from the payload, not just defaulted to None).
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            phase="PHASE_5_MERGE_AUTHORIZATION",
+        )
+        # Force the missing-evidence condition by removing
+        # the field entirely from the payload.
+        del payload["last_verified_primary_head"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertIn(
+            "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE", kinds
+        )
+        # And merge_ready_both_sides must be False.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_merge_ready_with_matching_primary_can_pass(self) -> None:
+        """Merge-ready checkpoint with matching primary evidence → no primary-blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            phase="PHASE_5_MERGE_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn(
+            "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE", kinds
+        )
+        # merge_ready_both_sides should be true since the
+        # live state is clean and the checkpoint agrees on
+        # both PR and primary heads.
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_non_merge_ready_missing_primary_remains_warning(self) -> None:
+        """Non-merge-ready checkpoint with no primary head → warning (V2 semantics)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        # No terminal_state → not merge-ready.
+        payload = _make_checkpoint_payload(
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            phase="PHASE_3_CODEX_HARDENING",
+        )
+        # Remove the last_verified_primary_head field entirely.
+        del payload["last_verified_primary_head"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        # Should NOT be promoted to a blocker.
+        kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn(
+            "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE", kinds
+        )
+        # The "recorded primary head missing" diagnostic
+        # should appear in the warnings bucket.
+        warnings = envelope["cross_reference"]["warnings"]
+        self.assertTrue(any("primary" in w for w in warnings))
+
+    def test_merge_ready_conflicting_primary_blocks(self) -> None:
+        """Merge-ready checkpoint whose primary conflicts with live → blocker (primary evidence missing/conflicting)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        # Checkpoint primary head differs from live primary.
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            phase="PHASE_5_MERGE_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="dddd4444dddd4444dddd4444dddd4444dddd4444",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        # The merge-ready promotion logic should have
+        # elevated the "primary worktree head changed"
+        # message to a CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE
+        # blocker because the checkpoint terminal_state is
+        # in MERGE_READY_TERMINAL_STATES.
+        kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertIn(
+            "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE", kinds
+        )
+        # And merge_ready_both_sides must be False.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_no_checkpoint_behavior_unchanged_for_primary_evidence_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
         )
         self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
 

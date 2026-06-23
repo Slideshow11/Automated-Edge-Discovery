@@ -1561,6 +1561,53 @@ def _validate_raw_next_action(payload: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``phase`` on the RAW payload before coercion.
+
+    Codex finding 3456665870 (P2): the previous coercion
+    passed ``phase`` through ``_coerce_optional_str``, which
+    silently returned ``None`` for any non-string value
+    (``[]``, ``{}``, ``42``, ``True``, etc.). A malformed
+    ``phase`` therefore validated as if it were absent,
+    hiding the structural problem from the operator and the
+    canonical validator. This validator runs BEFORE
+    ``_coerce_optional_str`` and surfaces any non-string,
+    non-``None`` ``phase`` as a fail-closed structural
+    error.
+
+    Rules (mirroring ``CheckpointState.phase`` typing):
+
+    - Field is **absent from payload** → no error (``phase``
+      is documented as optional; missing is the "fresh,
+      pre-phase checkpoint" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **string** → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject placeholder strings, but the type itself
+      is valid.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "phase" not in payload:
+        return errors
+    value = payload["phase"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        return errors
+    errors.append(
+        f"checkpoint field 'phase' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
 def _checkpoint_state_from_payload(payload: Dict[str, Any]) -> Any:
     """Construct an ``aed_lifecycle.checkpoint.CheckpointState`` from a raw payload.
 
@@ -1664,6 +1711,20 @@ def _validate_checkpoint_payload(envelope: Dict[str, Any]) -> List[str]:
         )
         envelope["errors"].extend(raw_next_action_errors)
         return list(raw_next_action_errors)
+    # Codex finding 3456665870 (P2): validate the raw payload's
+    # ``phase`` BEFORE any ``_coerce_optional_str`` call so a
+    # malformed ``phase`` (e.g. ``[]``, ``{}``, ``42``) cannot
+    # be silently converted to ``None`` and pass validation.
+    # The validator emits fail-closed structural errors that
+    # the operator can see in both the JSON envelope and the
+    # markdown ``## Checkpoint`` section.
+    raw_phase_errors = _validate_raw_phase(payload)
+    if raw_phase_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_phase_errors)
+        envelope["validation"]["raw_phase_errors"] = list(raw_phase_errors)
+        envelope["errors"].extend(raw_phase_errors)
+        return list(raw_phase_errors)
     state = _checkpoint_state_from_payload(payload)
     if state is None:
         envelope["validation"]["status"] = "schema_invalid"
@@ -1737,6 +1798,27 @@ def _cross_reference_checkpoint(
     """
     blockers: List[Dict[str, str]] = []
     warnings: List[str] = []
+    # ``MERGE_READY_TERMINAL_STATES`` is the canonical set of
+    # checkpoint terminal states that authorize a merge. It is
+    # referenced both inside the ``validate_resume_observations``
+    # block (to promote primary drift to a blocker for
+    # merge-ready checkpoints that are missing primary evidence)
+    # and later (to compute ``merge_ready_both_sides``).
+    # Defining it here at the top of the function so the entire
+    # body sees it as a local — assigning it later in the
+    # function would shadow it and cause ``UnboundLocalError``
+    # when read before the assignment.
+    #
+    # Codex finding 3455441244 (P2): ``PR_MERGED_AND_CLOSED_OUT``
+    # is intentionally EXCLUDED. The canonical schema in
+    # ``schemas/aed_lifecycle_states_v1.json:211-220`` marks
+    # it as ``merge_allowed=false`` — a closed-out checkpoint
+    # paired with a live OPEN PR surfaces a distinct
+    # cross-reference blocker (handled later in this function)
+    # and never satisfies ``merge_ready_both_sides``.
+    MERGE_READY_TERMINAL_STATES = {
+        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+    }
     if envelope.get("load_status") != "loaded":
         envelope["cross_reference"]["status"] = "skipped"
         envelope["cross_reference"]["blockers"] = []
@@ -1860,6 +1942,16 @@ def _cross_reference_checkpoint(
                 observed_pr_head=live_pr_head or "",
                 observed_primary_head=live_main_sha or "",
             )
+            # Look up the checkpoint's terminal_state from the
+            # envelope's state summary. The split below needs
+            # this to decide whether primary drift is a
+            # warning (default) or a blocker (merge-ready
+            # checkpoints missing primary evidence).
+            ckpt_terminal_state = (
+                envelope.get("validation", {})
+                .get("state_summary", {})
+                .get("terminal_state")
+            )
             for err in obs_errors:
                 # The canonical validator prefixes the kind of
                 # drift into the message string. We dispatch
@@ -1868,8 +1960,35 @@ def _cross_reference_checkpoint(
                 if err.startswith("primary worktree head changed") or err.startswith(
                     "recorded primary head missing"
                 ):
-                    # Primary drift → warning, not blocker.
-                    warnings.append(err)
+                    # Codex finding 3456665866 (P1): a primary
+                    # drift (missing OR conflicting) is normally
+                    # a WARNING because primary/main drift is a
+                    # normal workflow event (rebase of main into
+                    # the feature branch). BUT — a checkpoint
+                    # parked at ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+                    # (or any other merge-ready terminal state)
+                    # without ``last_verified_primary_head`` is
+                    # unsafe to advance: we cannot confirm the
+                    # operator actually verified the protected
+                    # primary branch at the merge moment.
+                    # Promote the message to a blocker in that
+                    # case so ``merge_ready_both_sides`` cannot
+                    # be silently true.
+                    if ckpt_terminal_state in MERGE_READY_TERMINAL_STATES:
+                        blockers.append(
+                            {
+                                "kind": "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE",
+                                "detail": (
+                                    f"checkpoint terminal_state="
+                                    f"{ckpt_terminal_state!r} is "
+                                    f"merge-ready but {err}"
+                                ),
+                            }
+                        )
+                    else:
+                        # Non-merge-ready checkpoint: primary
+                        # drift stays a warning per V2 semantics.
+                        warnings.append(err)
                 else:
                     # PR head changed / recorded PR head
                     # missing → still a blocker.
@@ -1888,6 +2007,13 @@ def _cross_reference_checkpoint(
         warnings.append(
             f"observation drift check raised {type(exc).__name__}: {exc}"
         )
+    # ``MERGE_READY_TERMINAL_STATES`` is defined at the top of
+    # this function (see the block right after the early-skip
+    # checks) so the entire body, including the
+    # ``validate_resume_observations`` block above, sees it
+    # as a function-local constant. Defining it again here
+    # would shadow the top-level definition and break the
+    # promote-to-blocker logic with an ``UnboundLocalError``.
     # Combination rules: when checkpoint says merge-ready but live
     # is blocked, that is a fail-closed blocker. When live is clean
     # but checkpoint says an earlier phase, that is a warning (live
@@ -1899,21 +2025,12 @@ def _cross_reference_checkpoint(
     # fail-closed cross-reference disagreement (handled below),
     # never a merge-ready signal.
     #
-    # Codex finding 3455441244 (P2): ``PR_MERGED_AND_CLOSED_OUT``
-    # was previously included here as a "safety net", but that
-    # allowed a closed-out checkpoint to satisfy
-    # ``merge_ready_both_sides`` and emit a merge authorization
-    # preview. The canonical schema in
-    # ``schemas/aed_lifecycle_states_v1.json:211-220`` marks
-    # ``PR_MERGED_AND_CLOSED_OUT`` as ``merge_allowed=false``,
-    # which is inconsistent with a merge-ready recommendation.
-    # A closed-out checkpoint paired with a live OPEN PR must
-    # surface as a distinct cross-reference blocker so the
-    # operator can reconcile the divergence instead of being
-    # silently told to merge.
-    MERGE_READY_TERMINAL_STATES = {
-        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
-    }
+    # ``MERGE_READY_TERMINAL_STATES`` is defined earlier (see
+    # the top of this function and the promote-to-blocker logic
+    # in the ``validate_resume_observations`` block) and is
+    # referenced here for ``merge_ready_both_sides``. The
+    # definition is intentionally hoisted to the top so the
+    # entire function body sees it as a local constant.
     terminal = state_summary.get("terminal_state")
     next_action = state_summary.get("next_action")
     if (
