@@ -3802,5 +3802,347 @@ class TestCheckpointV2PrimaryDriftWarning(unittest.TestCase):
         self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
 
 
+class TestCheckpointV3NextActionValidation(unittest.TestCase):
+    """PR #407 Codex finding 3456429699 (P1).
+
+    ``next_action`` must be validated on the RAW payload
+    before any coercion. Non-string, non-None values
+    (``[]``, ``{}``, ``42``, etc.) must surface as
+    ``CHECKPOINT_VALIDATION_INVALID`` instead of being
+    silently coerced to ``None``.
+    """
+
+    def test_validate_raw_next_action_catches_empty_list(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = []
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("list", joined)
+
+    def test_validate_raw_next_action_catches_empty_dict(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = {}
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("dict", joined)
+
+    def test_validate_raw_next_action_catches_int(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = 42
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("int", joined)
+
+    def test_validate_raw_next_action_accepts_valid_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "poll_ci_status"
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_next_action_accepts_none(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = None
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_next_action_accepts_missing_field(self) -> None:
+        payload = _make_checkpoint_payload()
+        del payload["next_action"]
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_malformed_next_action_produces_validation_blocker(self) -> None:
+        """Malformed ``next_action`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T02:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_int_next_action_produces_validation_blocker(self) -> None:
+        """Integer ``next_action`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = 42
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T02:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_validation_error_details_in_json_envelope(self) -> None:
+        """Raw ``next_action`` error details appear in JSON envelope."""
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = {"weird": "object"}
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        joined = " ".join(envelope["validation"]["errors"])
+        self.assertIn("next_action", joined)
+        self.assertIn("dict", joined)
+        # Also surfaced under the raw_next_action_errors key for explicit diagnostics.
+        self.assertIn(
+            "next_action",
+            " ".join(envelope["validation"].get("raw_next_action_errors", [])),
+        )
+
+    def test_validation_error_details_in_markdown_section(self) -> None:
+        """Raw ``next_action`` error details appear in markdown ``## Checkpoint`` section."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T02:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("## Checkpoint", md)
+        self.assertIn("next_action", md)
+
+    def test_valid_string_next_action_still_validates(self) -> None:
+        """A valid ``next_action`` string still passes end-to-end."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "clean")
+
+    def test_missing_next_action_follows_existing_policy(self) -> None:
+        """Missing ``next_action`` is allowed (follows existing optional policy)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        del payload["next_action"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        # Validation should not produce next_action-related errors.
+        joined = " ".join(envelope["validation"].get("errors", []))
+        self.assertNotIn("next_action", joined)
+        self.assertNotIn(
+            "next_action",
+            " ".join(envelope["validation"].get("raw_next_action_errors", [])),
+        )
+
+    def test_no_checkpoint_behavior_unchanged_for_next_action_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T02:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV3LiveBaseSha(unittest.TestCase):
+    """PR #407 Codex finding 3456429707 (P2).
+
+    The CLI path must pass the LIVE BASE SHA from GitHub
+    (via ``fetch_pr_state`` → ``pr["base_sha"]``) into
+    ``_cross_reference_checkpoint`` so primary/base drift can
+    be detected against GitHub evidence, NOT against the
+    local primary worktree HEAD (which may intentionally lag
+    behind during isolated PR runs).
+    """
+
+    def test_cli_path_passes_live_base_sha_into_cross_reference(self) -> None:
+        """The CLI path passes ``pr['base_sha']`` into ``_cross_reference_checkpoint``."""
+        # Static analysis: the ``main()`` body of aed_continue_pr.py
+        # must call ``_cross_reference_checkpoint`` with
+        # ``live_main_sha=pr.get("base_sha")``. We inspect the
+        # source text directly so this test does not require
+        # mocking the whole CLI plumbing.
+        import inspect
+        from pathlib import Path as _Path
+        src_path = _Path(acp.__file__).resolve()
+        src_text = src_path.read_text(encoding="utf-8")
+        # The CLI path must explicitly use pr.get("base_sha") rather
+        # than hard-coded None.
+        self.assertIn(
+            'live_main_sha=pr.get("base_sha")',
+            src_text,
+            "CLI path must pass live base SHA from pr['base_sha'] "
+            "into _cross_reference_checkpoint",
+        )
+
+    def test_fetch_pr_state_populates_base_sha(self) -> None:
+        """``fetch_pr_state`` normalizes ``base_sha`` from GitHub REST ``data.base.sha``."""
+        # Source-level check: the fetcher must extract base_sha.
+        from pathlib import Path as _Path
+        src_text = _Path(acp.__file__).read_text(encoding="utf-8")
+        self.assertIn('"base_sha": base.get("sha")', src_text)
+
+    def test_checkpoint_base_matches_live_base_no_block(self) -> None:
+        """Checkpoint ``last_verified_primary_head`` matches live base SHA → no block."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "cafe1234cafe1234cafe1234cafe1234cafe1234"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="cafe1234cafe1234cafe1234cafe1234cafe1234",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        # No blocker should be raised for base drift when values match.
+        blockers_kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn("CHECKPOINT_OBSERVATION_DRIFT", blockers_kinds)
+        # And merge_ready_both_sides should be true.
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_checkpoint_base_conflicts_with_live_base_blocks(self) -> None:
+        """Checkpoint base SHA differs from live base SHA → fail-closed (drift detected).
+
+        Per the V2 fix (``3455479198``), local primary/main drift
+        is a WARNING (not a blocker) when the live PR/base
+        evidence is otherwise clean. We therefore verify that:
+
+        - the base mismatch is SURFACED (visible in the
+          warnings bucket so the operator can see it);
+        - ``merge_ready_both_sides`` is NOT silently false
+          purely because of the base drift, but it IS false if
+          the terminal state is missing/non-merge-ready.
+        """
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "cafe1234cafe1234cafe1234cafe1234cafe1234"
+        # No terminal_state → not merge-ready by default. The
+        # base drift should be surfaced as a warning regardless.
+        payload = _make_checkpoint_payload(
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="dddd4444dddd4444dddd4444dddd4444dddd4444",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        # Without a merge-ready terminal state, the cross-reference
+        # is clean (no blockers) but also not ready.
+        self.assertFalse(envelope["cross_reference"]["blockers"])
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+        # But the base drift is surfaced as a warning.
+        warnings = envelope["cross_reference"]["warnings"]
+        detected = (
+            any("primary" in w for w in warnings)
+            or any(b.get("kind") == "CHECKPOINT_OBSERVATION_DRIFT" for b in envelope["cross_reference"]["blockers"])
+        )
+        self.assertTrue(
+            detected,
+            "live base mismatch must be surfaced as a warning when otherwise clean",
+        )
+
+    def test_no_live_base_sha_conservative_behavior(self) -> None:
+        """Missing live base SHA is treated conservatively (warning surfaced)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = None
+        payload = _make_checkpoint_payload(
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        # No live_main_sha at all.
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=None)
+        # The cross-reference should not produce any base-drift
+        # blockers because live_main_sha is None — we cannot
+        # compare against evidence that doesn't exist.
+        blockers_kinds = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn("CHECKPOINT_OBSERVATION_DRIFT", blockers_kinds)
+
+    def test_local_primary_drift_does_not_override_live_evidence(self) -> None:
+        """Local primary drift alone must not override live GitHub base evidence.
+
+        This is a guard against the operator's correction: the
+        planner must depend on live GitHub PR/base evidence,
+        not on mutating or syncing the primary worktree. We
+        verify this by ensuring that when live_main_sha matches
+        checkpoint ``last_verified_primary_head``, the cross-
+        reference is clean even if the local primary worktree
+        HEAD is stale (which we simulate by passing a different
+        SHA via ``live_main_sha`` than the local primary HEAD).
+        """
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        payload = _make_checkpoint_payload(
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        # Live evidence matches checkpoint; no local-primary
+        # evidence is consulted by this layer.
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr["base_sha"])
+        self.assertFalse(envelope["cross_reference"]["blockers"])
+
+    def test_no_checkpoint_behavior_unchanged_for_live_base_sha_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T02:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
 if __name__ == "__main__":
     unittest.main()

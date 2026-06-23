@@ -1514,6 +1514,53 @@ def _validate_raw_required_list_fields(payload: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _validate_raw_next_action(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``next_action`` on the RAW payload before coercion.
+
+    Codex finding 3456429699 (P1): the previous coercion
+    passed ``next_action`` through ``_coerce_optional_str``,
+    which silently returned ``None`` for any non-string value
+    (``[]``, ``{}``, ``42``, ``True``, etc.). A malformed
+    ``next_action`` therefore validated as if it were absent,
+    hiding the structural problem from the operator and the
+    canonical validator. This validator runs BEFORE
+    ``_coerce_optional_str`` and surfaces any non-string,
+    non-``None`` ``next_action`` as a fail-closed structural
+    error.
+
+    Rules (mirroring ``CheckpointState.next_action`` typing):
+
+    - Field is **absent from payload** → no error
+      (``next_action`` is optional; missing is equivalent to
+      ``None`` and is the documented "no next action yet" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **string** → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject placeholder strings, but the type itself
+      is valid.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "next_action" not in payload:
+        return errors
+    value = payload["next_action"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        return errors
+    errors.append(
+        f"checkpoint field 'next_action' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
 def _checkpoint_state_from_payload(payload: Dict[str, Any]) -> Any:
     """Construct an ``aed_lifecycle.checkpoint.CheckpointState`` from a raw payload.
 
@@ -1601,6 +1648,22 @@ def _validate_checkpoint_payload(envelope: Dict[str, Any]) -> List[str]:
         envelope["validation"]["raw_list_errors"] = list(raw_list_errors)
         envelope["errors"].extend(raw_list_errors)
         return list(raw_list_errors)
+    # Codex finding 3456429699 (P1): validate the raw payload's
+    # ``next_action`` BEFORE any ``_coerce_optional_str`` call so
+    # a malformed ``next_action`` (e.g. ``[]``, ``{}``, ``42``)
+    # cannot be silently converted to ``None`` and pass
+    # validation. The validator emits fail-closed structural
+    # errors that the operator can see in both the JSON
+    # envelope and the markdown ``## Checkpoint`` section.
+    raw_next_action_errors = _validate_raw_next_action(payload)
+    if raw_next_action_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_next_action_errors)
+        envelope["validation"]["raw_next_action_errors"] = list(
+            raw_next_action_errors
+        )
+        envelope["errors"].extend(raw_next_action_errors)
+        return list(raw_next_action_errors)
     state = _checkpoint_state_from_payload(payload)
     if state is None:
         envelope["validation"]["status"] = "schema_invalid"
@@ -2709,13 +2772,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # read-only; we never write back. When omitted the envelope
         # is the minimal absent form so the rest of the pipeline is
         # byte-equivalent to PR #406 for fixed live inputs.
+        #
+        # Codex finding 3456429707 (P2): pass the LIVE BASE SHA
+        # (from GitHub via ``fetch_pr_state``) into the checkpoint
+        # cross-reference so primary/base drift can be detected
+        # against GitHub evidence. We deliberately do NOT use the
+        # local primary worktree HEAD here — the primary may
+        # intentionally lag behind during isolated PR runs, and the
+        # planner must depend on GitHub PR/base evidence, not on
+        # mutating or syncing the primary worktree. If
+        # ``pr["base_sha"]`` is missing (defensive: should never
+        # happen because ``fetch_pr_state`` populates it from
+        # ``data.base.sha``), we fall back to ``None`` and let the
+        # cross-reference's existing conservative-missing-evidence
+        # behavior apply.
         if args.checkpoint_json is not None:
             checkpoint_envelope = _load_checkpoint_payload(args.checkpoint_json)
             _validate_checkpoint_payload(checkpoint_envelope)
             _cross_reference_checkpoint(
                 checkpoint_envelope,
                 pr,
-                live_main_sha=None,  # PR head only at this layer; primary fetch is future work
+                live_main_sha=pr.get("base_sha"),
             )
         else:
             checkpoint_envelope = _absent_checkpoint_envelope()
