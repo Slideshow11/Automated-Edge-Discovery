@@ -45,6 +45,10 @@ python3 scripts/local/aed_continue_pr.py \
 - `--admin`
 - `--no-dry-run`
 
+### CWD independence
+
+The script computes the repo root from its own `__file__` and inserts it into `sys.path` at module load time, so `aed_lifecycle` is importable regardless of the current working directory. The documented form (`python3 scripts/local/aed_continue_pr.py ...`) works from `/tmp`, a different worktree, or any parent directory — no `cd` into the repo root is required.
+
 ## Required `--dry-run`
 
 The `--dry-run` flag is **mandatory**. The script refuses to run without it. A future PR (#407+) will introduce a separate `aed continue-pr --execute` command that consumes the JSON plan emitted here.
@@ -263,8 +267,10 @@ A base/main SHA drift (`last_verified_primary_head` differs from live primary HE
 
 The plan JSON's `checkpoint.combination.merge_ready_both_sides` field is the single boolean a future `--execute` command should consume:
 
-- `true` only when the checkpoint is loaded, structurally valid, cross-references cleanly with the live PR state, **and** the checkpoint `terminal_state` is `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` (or `PR_MERGED_AND_CLOSED_OUT`).
+- `true` only when the checkpoint is loaded, structurally valid, cross-references cleanly with the live PR state, **and** the checkpoint `terminal_state` is `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`.
 - `false` otherwise.
+
+The completed terminal state `PR_MERGED_AND_CLOSED_OUT` is **excluded** from the merge-ready set. A closed-out checkpoint paired with a live OPEN PR surfaces a `CHECKPOINT_CLOSED_OUT_LIVE_OPEN` blocker; it cannot satisfy `merge_ready_both_sides` under any circumstance. The canonical schema marks `PR_MERGED_AND_CLOSED_OUT` as `merge_allowed=false`, so treating it as merge-ready would be inconsistent.
 
 This is the canonical "both the runner's recorded evidence and the live GitHub state agree the PR is ready to authorize" signal.
 
