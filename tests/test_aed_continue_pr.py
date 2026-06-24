@@ -4483,5 +4483,398 @@ class TestCheckpointV4MergeReadyPrimaryEvidence(unittest.TestCase):
         self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
 
 
+class TestCheckpointV5TerminalStateValidation(unittest.TestCase):
+    """PR #407 Codex finding 3462952517 (P2).
+
+    ``terminal_state`` must be validated on the RAW payload before
+    any coercion. Non-string, non-None values (``123``, ``[]``,
+    ``{}``, etc.) must surface as ``CHECKPOINT_VALIDATION_INVALID``
+    instead of being silently coerced to ``None``. This mirrors the
+    V3 (``next_action``) and V4 (``phase``) raw-validation fixes
+    and closes the last string-typed field in ``CheckpointState``
+    that was still vulnerable to silent coercion.
+    """
+
+    def test_validate_raw_terminal_state_catches_int(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = 123
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("int", joined)
+
+    def test_validate_raw_terminal_state_catches_empty_list(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = []
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("list", joined)
+
+    def test_validate_raw_terminal_state_catches_empty_dict(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = {}
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("dict", joined)
+
+    def test_validate_raw_terminal_state_accepts_valid_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
+        errors = acp._validate_raw_terminal_state(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_terminal_state_accepts_none(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = None
+        errors = acp._validate_raw_terminal_state(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_terminal_state_accepts_missing_field(self) -> None:
+        payload = _make_checkpoint_payload()
+        del payload["terminal_state"]
+        errors = acp._validate_raw_terminal_state(payload)
+        self.assertEqual(errors, [])
+
+    def test_int_terminal_state_produces_validation_blocker(self) -> None:
+        """Integer ``terminal_state`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = 123
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_list_terminal_state_produces_validation_blocker(self) -> None:
+        """List ``terminal_state`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_dict_terminal_state_produces_validation_blocker(self) -> None:
+        """Dict ``terminal_state`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = {"k": "v"}
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_validation_error_details_in_json_envelope(self) -> None:
+        """Raw ``terminal_state`` error details appear in JSON envelope."""
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = 123
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        joined = " ".join(envelope["validation"]["errors"])
+        self.assertIn("terminal_state", joined)
+        self.assertIn("int", joined)
+        # Also surfaced under the raw_terminal_state_errors key for explicit
+        # diagnostics, alongside raw_next_action_errors and raw_phase_errors.
+        self.assertIn(
+            "terminal_state",
+            " ".join(envelope["validation"].get("raw_terminal_state_errors", [])),
+        )
+
+    def test_validation_error_details_in_markdown_section(self) -> None:
+        """Raw ``terminal_state`` error details appear in markdown ``## Checkpoint`` section."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = []
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("## Checkpoint", md)
+        self.assertIn("terminal_state", md)
+
+    def test_valid_string_terminal_state_still_validates(self) -> None:
+        """A valid string ``terminal_state`` still passes end-to-end."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            next_action="pr_merge",
+            phase="PHASE_5_MERGE_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(errors, [])
+        self.assertEqual(envelope["validation"]["status"], "clean")
+
+    def test_missing_terminal_state_follows_existing_policy(self) -> None:
+        """Missing ``terminal_state`` is allowed (existing optional policy)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        del payload["terminal_state"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        joined = " ".join(errors)
+        self.assertNotIn("terminal_state", joined)
+
+    def test_no_checkpoint_behavior_unchanged_for_terminal_state_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV5MergedLiveOpen(unittest.TestCase):
+    """PR #407 Codex finding 3462952512 (P2).
+
+    A checkpoint marked ``terminal_state="MERGED"`` (claims the PR
+    has already been merged in a prior checkpoint session) but a
+    live PR that is still ``OPEN`` is a cross-reference
+    disagreement that must fail closed. The new rule mirrors the
+    existing ``PR_MERGED_AND_CLOSED_OUT`` + ``OPEN`` blocker:
+
+    - Add a distinct ``CHECKPOINT_MERGED_LIVE_OPEN`` blocker.
+    - ``merge_ready_both_sides`` must be False.
+    - Merge preview must not be emitted
+      (``blockers_for_merge`` is non-empty).
+    - Legitimate already-closed/merged live PRs
+      (``live_pr_state="CLOSED"``) follow documented completed
+      behavior and are NOT affected.
+    - Existing ``PR_MERGED_AND_CLOSED_OUT`` handling remains correct.
+    - No-checkpoint behavior remains PR #406-compatible.
+    """
+
+    def _make_pr_with_clean_live_state(
+        self,
+        *,
+        state: str = "OPEN",
+        is_draft: bool = False,
+        base_sha: str = "c720b6810b2e5216c170eb55734af1df5df4704b",
+    ) -> Dict[str, Any]:
+        pr = _make_pr_response(state=state, draft=is_draft)
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = base_sha
+        return pr
+
+    def test_merged_checkpoint_live_open_blocks(self) -> None:
+        """Checkpoint terminal_state=MERGED + live PR OPEN → CHECKPOINT_MERGED_LIVE_OPEN blocker."""
+        pr = self._make_pr_with_clean_live_state(state="OPEN")
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(envelope, pr)
+        kinds = [b["kind"] for b in blockers]
+        self.assertIn("CHECKPOINT_MERGED_LIVE_OPEN", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_merged_checkpoint_live_open_blocks_merge_preview(self) -> None:
+        """Merge preview is not emitted for MERGED-checkpoint/live-OPEN disagreement."""
+        pr = self._make_pr_with_clean_live_state(state="OPEN")
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_MERGED_LIVE_OPEN", kinds)
+        # No merge recommendation when a cross-reference disagreement exists.
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_merged_checkpoint_live_open_draft_does_not_raise_new_blocker(
+        self,
+    ) -> None:
+        """Live OPEN draft is not a disagreement with MERGED checkpoint on the
+        merge axis — the existing live-clean check (which requires ``is_draft=False``)
+        already prevents merge preview. The new rule is intentionally narrow:
+        ``live_pr_state == "OPEN"`` matches OPEN regardless of draft, but the
+        MERGED checkpoint + OPEN live PR is the cross-reference disagreement.
+
+        The ``CHECKPOINT_MERGED_LIVE_OPEN`` blocker does fire here because the
+        rule does NOT condition on draft — that's by design: a draft PR still
+        has ``state="OPEN"`` in GitHub and the checkpoint's "already merged"
+        evidence is still a disagreement. The merge-preview gate then blocks
+        via the standard draft path (``pr.get('is_draft')`` check)."""
+        pr = self._make_pr_with_clean_live_state(state="OPEN", is_draft=True)
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(envelope, pr)
+        kinds = [b["kind"] for b in blockers]
+        # Disagreement blocker fires even on draft — by design.
+        self.assertIn("CHECKPOINT_MERGED_LIVE_OPEN", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_merged_checkpoint_live_closed_no_disagreement_blocker(self) -> None:
+        """Checkpoint terminal_state=MERGED + live PR CLOSED → no CHECKPOINT_MERGED_LIVE_OPEN blocker.
+
+        A legitimately merged PR has ``state="closed"`` (lowercase → uppercased to
+        ``CLOSED`` by ``fetch_pr_state``). Live GitHub and checkpoint agree. The
+        existing merge-preview gate (which requires ``live_pr_state == "OPEN"``)
+        correctly suppresses merge preview via the standard "PR state is CLOSED;
+        no merge proposed" warning path."""
+        pr = self._make_pr_with_clean_live_state(state="CLOSED")
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(envelope, pr)
+        kinds = [b["kind"] for b in blockers]
+        # No MERGED-vs-OPEN blocker in the legitimate already-closed case.
+        self.assertNotIn("CHECKPOINT_MERGED_LIVE_OPEN", kinds)
+        # merge_ready_both_sides is also False because live_clean requires OPEN.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_merged_checkpoint_live_closed_follows_documented_completed_behavior(
+        self,
+    ) -> None:
+        """End-to-end: MERGED checkpoint + live CLOSED PR behaves like the
+        documented 'already completed' path — no merge preview, no
+        CHECKPOINT_MERGED_LIVE_OPEN blocker, but other completion-style
+        cross-reference rules may still apply (none here for the basic
+        matching case)."""
+        pr = self._make_pr_with_clean_live_state(state="CLOSED")
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        # No merge preview recommended because the PR is already CLOSED.
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+        # And the new disagreement blocker is NOT present.
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_MERGED_LIVE_OPEN", kinds)
+
+    def test_pr_merged_and_closed_out_checkpoint_unchanged(self) -> None:
+        """Existing PR_MERGED_AND_CLOSED_OUT + OPEN blocker still fires
+        (regression guard for the V2 closed-out rule)."""
+        pr = self._make_pr_with_clean_live_state(state="OPEN")
+        payload = _make_checkpoint_payload(
+            terminal_state="PR_MERGED_AND_CLOSED_OUT",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(envelope, pr)
+        kinds = [b["kind"] for b in blockers]
+        self.assertIn("CHECKPOINT_CLOSED_OUT_LIVE_OPEN", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_no_checkpoint_behavior_unchanged_for_merged_live_open_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = self._make_pr_with_clean_live_state(state="OPEN")
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
 if __name__ == "__main__":
     unittest.main()

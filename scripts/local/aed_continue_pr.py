@@ -1608,6 +1608,54 @@ def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``terminal_state`` on the RAW payload before coercion.
+
+    Codex finding 3462952517 (P2): the previous coercion passed
+    ``terminal_state`` through ``_coerce_optional_str``, which
+    silently returned ``None`` for any non-string value (``123``,
+    ``[]``, ``{}``, ``True``, etc.). A malformed ``terminal_state``
+    therefore validated as if it were absent, hiding the structural
+    problem from the operator and the canonical validator. This
+    validator runs BEFORE ``_coerce_optional_str`` and surfaces any
+    non-string, non-``None`` ``terminal_state`` as a fail-closed
+    structural error.
+
+    Rules (mirroring ``CheckpointState.terminal_state`` typing):
+
+    - Field is **absent from payload** → no error
+      (``terminal_state`` is optional; missing is the
+      "checkpoint has not reached a terminal state yet" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **string** → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject unknown terminal-state strings, but the type
+      itself is valid.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect and remove the only signal the
+      cross-reference has that the checkpoint recorded a
+      terminal_state at all.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "terminal_state" not in payload:
+        return errors
+    value = payload["terminal_state"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        return errors
+    errors.append(
+        f"checkpoint field 'terminal_state' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
 def _checkpoint_state_from_payload(payload: Dict[str, Any]) -> Any:
     """Construct an ``aed_lifecycle.checkpoint.CheckpointState`` from a raw payload.
 
@@ -1725,6 +1773,25 @@ def _validate_checkpoint_payload(envelope: Dict[str, Any]) -> List[str]:
         envelope["validation"]["raw_phase_errors"] = list(raw_phase_errors)
         envelope["errors"].extend(raw_phase_errors)
         return list(raw_phase_errors)
+    # Codex finding 3462952517 (P2): validate the raw payload's
+    # ``terminal_state`` BEFORE any ``_coerce_optional_str`` call
+    # so a malformed ``terminal_state`` (e.g. ``123``, ``[]``,
+    # ``{}``, ``True``) cannot be silently converted to ``None``
+    # and pass validation. This validator is structurally
+    # identical to ``_validate_raw_phase`` and
+    # ``_validate_raw_next_action`` and is intentionally placed
+    # alongside them so the operator can see all raw-validation
+    # failures in one place in the JSON envelope and the
+    # markdown ``## Checkpoint`` section.
+    raw_terminal_state_errors = _validate_raw_terminal_state(payload)
+    if raw_terminal_state_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_terminal_state_errors)
+        envelope["validation"]["raw_terminal_state_errors"] = list(
+            raw_terminal_state_errors
+        )
+        envelope["errors"].extend(raw_terminal_state_errors)
+        return list(raw_terminal_state_errors)
     state = _checkpoint_state_from_payload(payload)
     if state is None:
         envelope["validation"]["status"] = "schema_invalid"
@@ -2063,6 +2130,32 @@ def _cross_reference_checkpoint(
                     f"checkpoint terminal_state=PR_MERGED_AND_CLOSED_OUT "
                     f"(closed-out) but live PR is OPEN (state={live_pr_state!r}, "
                     f"is_draft={live_pr_draft!r}); reconciling requires operator action"
+                ),
+            }
+        )
+    # Codex finding 3462952512 (P2): a checkpoint marked as
+    # ``MERGED`` claims the PR has already been merged in a
+    # prior checkpoint session. If the live PR is still OPEN
+    # and not a draft, that is a cross-reference disagreement —
+    # the checkpoint evidence says the work is already
+    # completed/merged, but GitHub shows an OPEN PR. This must
+    # surface as a distinct fail-closed blocker (mirroring the
+    # ``PR_MERGED_AND_CLOSED_OUT`` + OPEN rule above) so the
+    # planner cannot emit a merge preview from clean live gates
+    # that contradict the checkpoint's "already completed"
+    # evidence. The legitimate already-closed/merged live
+    # case (``live_pr_state`` in ``{"CLOSED", "MERGED"}``)
+    # continues to follow the documented completed behavior and
+    # is NOT affected by this rule.
+    if terminal == "MERGED" and live_pr_state == "OPEN":
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_MERGED_LIVE_OPEN",
+                "detail": (
+                    f"checkpoint terminal_state=MERGED "
+                    f"(claims PR already merged) but live PR is OPEN "
+                    f"(state={live_pr_state!r}, is_draft={live_pr_draft!r}); "
+                    f"reconciling requires operator action"
                 ),
             }
         )
