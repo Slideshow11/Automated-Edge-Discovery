@@ -63,6 +63,28 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
+# Codex finding 3455479190 (P1): the planner imports
+# ``aed_lifecycle`` (for ``CheckpointState``,
+# ``validate_checkpoint``, ``validate_resume_observations``)
+# at function-call time, which works only when the script is
+# run from the repo root (where ``aed_lifecycle/`` is a
+# top-level package). When the operator invokes the documented
+# form ``python3 scripts/local/aed_continue_pr.py ...`` from
+# anywhere else — including ``/tmp``, a different worktree,
+# or any parent directory — Python's import resolution does
+# not find ``aed_lifecycle`` and the checkpoint loading path
+# silently degrades to "validator unavailable". Add the repo
+# root (the parent of ``scripts/`` and of ``aed_lifecycle/``)
+# to ``sys.path`` at module load time, computed stably from
+# the script's own location so the import works regardless of
+# the current working directory. This is the canonical fix
+# prescribed by ``docs/aed_continue_pr.md`` — the documented
+# invocation assumes the script can find its sibling package.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
 SCHEMA_VERSION = 1
 PLAN_KIND = "aed.continue_pr.dry_run"
 DEFAULT_REPO = "Slideshow11/Automated-Edge-Discovery"
@@ -150,6 +172,11 @@ class ContinuePlan:
     mutations_proposed: int
     warnings: List[str]
     recommendation: str
+    # PR #407: optional checkpoint envelope. When the operator does
+    # NOT pass ``--checkpoint-json`` this is a minimal
+    # ``{"present": False, "path": None}`` dict, and the rest of the
+    # plan is byte-equivalent to PR #406 for any fixed live input.
+    checkpoint: Dict[str, Any] = dataclasses.field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -1267,6 +1294,974 @@ def run_review_gate(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# PR #407: Checkpoint ingestion helpers
+#
+# Read-only consumer of aed_lifecycle.checkpoint. We never write back to
+# the checkpoint file, never modify aed_lifecycle/*, and never invoke any
+# mutating helper from that package. The contract is:
+#
+#   - _load_checkpoint_payload(path) -> raw dict or {"present": False}
+#   - _validate_checkpoint_payload(raw) -> (envelope, blockers, warnings)
+#   - _cross_reference_checkpoint(envelope, live_pr) -> (blockers, warnings)
+#
+# All helpers return structured dicts so the assemble_plan layer can
+# combine them with the live signals without ever importing the
+# aed_lifecycle dataclasses by name. This keeps the dry-run command
+# resilient to aed_lifecycle refactors.
+# ---------------------------------------------------------------------------
+
+CHECKPOINT_ENVELOPE_SCHEMA_VERSION = 1
+
+
+def _absent_checkpoint_envelope(path: Optional[Path] = None) -> Dict[str, Any]:
+    """Return a minimal envelope when no checkpoint was provided."""
+    return {
+        "present": False,
+        "path": str(path) if path else None,
+        "load_status": "not_provided",
+        "schema_version": CHECKPOINT_ENVELOPE_SCHEMA_VERSION,
+        "errors": [],
+        "warnings": [],
+        "validation": {
+            "status": "skipped",
+            "errors": [],
+            "warnings": [],
+        },
+        "cross_reference": {
+            "status": "skipped",
+            "blockers": [],
+            "warnings": [],
+        },
+        "combination": {
+            "live_state_agrees": True,
+            "merge_ready_both_sides": False,
+            "blockers": [],
+            "warnings": [],
+        },
+    }
+
+
+def _load_checkpoint_payload(path: Path) -> Dict[str, Any]:
+    """Load a checkpoint JSON file read-only and return a raw dict.
+
+    The function is fail-closed: missing, malformed, or unreadable files
+    are surfaced as ``{"present": True, "load_status": "...", "errors":
+    [...]}`` rather than raising. Callers should treat any
+    ``load_status`` other than ``loaded`` as a fail-closed condition.
+    """
+    envelope: Dict[str, Any] = {
+        "present": True,
+        "path": str(path),
+        "load_status": "pending",
+        "schema_version": CHECKPOINT_ENVELOPE_SCHEMA_VERSION,
+        "errors": [],
+        "warnings": [],
+        "validation": {
+            "status": "skipped",
+            "errors": [],
+            "warnings": [],
+        },
+        "cross_reference": {
+            "status": "skipped",
+            "blockers": [],
+            "warnings": [],
+        },
+        "combination": {
+            "live_state_agrees": False,
+            "merge_ready_both_sides": False,
+            "blockers": [],
+            "warnings": [],
+        },
+    }
+    if not path.exists():
+        envelope["load_status"] = "file_missing"
+        envelope["errors"].append(f"checkpoint file not found: {path}")
+        return envelope
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except json.JSONDecodeError as exc:
+        envelope["load_status"] = "malformed_json"
+        envelope["errors"].append(f"checkpoint JSON is malformed: {exc}")
+        return envelope
+    except OSError as exc:
+        envelope["load_status"] = "unreadable"
+        envelope["errors"].append(f"checkpoint file is unreadable: {exc}")
+        return envelope
+    if not isinstance(payload, dict):
+        envelope["load_status"] = "malformed_json"
+        envelope["errors"].append(
+            f"checkpoint JSON must be an object, got {type(payload).__name__}"
+        )
+        return envelope
+    envelope["load_status"] = "loaded"
+    envelope["raw"] = payload
+    return envelope
+
+
+def _coerce_optional_str(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) and value else None
+
+
+def _coerce_optional_int(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _coerce_str_list(value: Any) -> List[str]:
+    """STRICT list coercion for checkpoint list fields.
+
+    Codex findings 3455441250 (P2) and 3455479194 (P1): the
+    previous coercion silently dropped non-string entries, which
+    allowed structurally malformed checkpoints (e.g. ``"foo"``,
+    ``42``, ``"bar"``) to validate cleanly because the
+    canonical ``aed_lifecycle.checkpoint.validate_checkpoint``
+    only ever saw the string-only subset. The raw payload
+    is now validated FIRST via
+    :func:`_validate_raw_required_list_fields` so this function
+    is only ever called with one of three inputs:
+
+      - ``None`` (field missing from payload) — returned as ``[]``
+      - a list of strings (already structurally validated) —
+        returned verbatim
+      - anything else — refused (returned as ``[]`` AND flagged
+        by the caller; canonical validation will surface the
+        real error)
+
+    The strict pass-through is intentional: callers should
+    rely on the canonical validator to report bad lists with
+    full diagnostics, not on this helper to silently clean
+    them.
+    """
+    if value is None:
+        return []
+    if isinstance(value, list) and all(isinstance(x, str) for x in value):
+        return list(value)
+    # Caller has not validated the raw payload yet; refuse to
+    # silently coerce. The canonical validator will surface
+    # the real error with full diagnostics.
+    return []
+
+
+def _validate_raw_required_list_fields(payload: Dict[str, Any]) -> List[str]:
+    """Validate required checkpoint list fields on the RAW payload.
+
+    Codex findings 3455441250 (P2) and 3455479194 (P1):
+    before any ``_coerce_str_list`` call, the raw payload must
+    be checked for missing/malformed required list fields.
+    Returns a list of human-readable error messages (empty =
+    structurally acceptable). The canonical
+    ``aed_lifecycle.checkpoint._REQUIRED_LIST_FIELDS`` is the
+    source of truth for which fields are required; we mirror
+    that list here so this validator agrees with the canonical
+    one.
+
+    Rules:
+
+    - Field is **missing** from the payload → error (the
+      canonical validator requires the field to be a list;
+      defaulting it to ``None`` before validation hides the
+      "field missing" condition from the operator).
+    - Field is **not a list** → error (must be ``list[str]``).
+    - Field is a list with **any non-string entries** → error.
+    - Field is a list of strings → OK.
+
+    This validator runs BEFORE
+    :func:`_checkpoint_state_from_payload` and BEFORE the
+    canonical ``validate_checkpoint`` so that malformed
+    checkpoints cannot be silently normalized into a clean
+    ``CheckpointState``.
+    """
+    errors: List[str] = []
+    required_list_fields = (
+        "completed_phases",
+        "pending_actions",
+        "authorized_thread_ids",
+        "unresolved_thread_ids",
+    )
+    for fname in required_list_fields:
+        if fname not in payload:
+            errors.append(
+                f"checkpoint missing required list field {fname!r}"
+            )
+            continue
+        value = payload[fname]
+        if not isinstance(value, list):
+            errors.append(
+                f"checkpoint field {fname!r} must be list[str], "
+                f"got {type(value).__name__}"
+            )
+            continue
+        if not all(isinstance(x, str) for x in value):
+            bad = [
+                (i, type(x).__name__)
+                for i, x in enumerate(value)
+                if not isinstance(x, str)
+            ]
+            errors.append(
+                f"checkpoint field {fname!r} must be list[str]; "
+                f"non-string entries at indices {bad}"
+            )
+    return errors
+
+
+def _validate_raw_next_action(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``next_action`` on the RAW payload before coercion.
+
+    Codex findings 3456429699 (P1) and 3471367263 (P2):
+    the previous coercion passed ``next_action`` through
+    ``_coerce_optional_str``, which silently returned ``None``
+    for falsy values (``""``, ``"   "``, ``"\\n\\t"``) and
+    silently returned ``None`` for non-string values
+    (``[]``, ``{}``, ``42``, ``True``). A malformed
+    ``next_action`` therefore validated as if it were absent,
+    hiding the structural problem from the operator and the
+    canonical validator. This validator runs BEFORE
+    ``_coerce_optional_str`` and surfaces any non-string,
+    non-``None`` ``next_action`` AND any present-but-empty /
+    present-but-whitespace-only ``next_action`` as a fail-closed
+    structural error.
+
+    Rules (mirroring ``CheckpointState.next_action`` typing and
+    the canonical "must be a real next action if present"
+    intent):
+
+    - Field is **absent from payload** → no error
+      (``next_action`` is optional; missing is equivalent to
+      ``None`` and is the documented "no next action yet" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **non-empty string** with at least one
+      non-whitespace character → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject placeholder strings, but the type itself
+      is valid and the content is non-blank.
+    - Field is an **empty string** (``""``) → error. Silent
+      coercion to ``None`` is forbidden because an empty
+      ``next_action`` is a structural defect, not a missing
+      one — the operator (or an upstream automation) wrote
+      something and meant it, even if what they wrote is
+      syntactically blank.
+    - Field is a **whitespace-only string** (``"   "``,
+      ``"\\n\\t"``, etc.) → error, for the same reason as
+      above. ``str.strip()`` of such a value is empty.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "next_action" not in payload:
+        return errors
+    value = payload["next_action"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        if value.strip():
+            return errors
+        errors.append(
+            "checkpoint field 'next_action' must be a non-empty, "
+            f"non-whitespace string if present, got {value!r}"
+        )
+        return errors
+    errors.append(
+        f"checkpoint field 'next_action' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
+def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``phase`` on the RAW payload before coercion.
+
+    Codex finding 3456665870 (P2): the previous coercion
+    passed ``phase`` through ``_coerce_optional_str``, which
+    silently returned ``None`` for any non-string value
+    (``[]``, ``{}``, ``42``, ``True``, etc.). A malformed
+    ``phase`` therefore validated as if it were absent,
+    hiding the structural problem from the operator and the
+    canonical validator. This validator runs BEFORE
+    ``_coerce_optional_str`` and surfaces any non-string,
+    non-``None`` ``phase`` as a fail-closed structural
+    error.
+
+    Rules (mirroring ``CheckpointState.phase`` typing):
+
+    - Field is **absent from payload** → no error (``phase``
+      is documented as optional; missing is the "fresh,
+      pre-phase checkpoint" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **string** → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject placeholder strings, but the type itself
+      is valid.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "phase" not in payload:
+        return errors
+    value = payload["phase"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        return errors
+    errors.append(
+        f"checkpoint field 'phase' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
+def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``terminal_state`` on the RAW payload before coercion.
+
+    Codex finding 3462952517 (P2): the previous coercion passed
+    ``terminal_state`` through ``_coerce_optional_str``, which
+    silently returned ``None`` for any non-string value (``123``,
+    ``[]``, ``{}``, ``True``, etc.). A malformed ``terminal_state``
+    therefore validated as if it were absent, hiding the structural
+    problem from the operator and the canonical validator. This
+    validator runs BEFORE ``_coerce_optional_str`` and surfaces any
+    non-string, non-``None`` ``terminal_state`` as a fail-closed
+    structural error.
+
+    Rules (mirroring ``CheckpointState.terminal_state`` typing):
+
+    - Field is **absent from payload** → no error
+      (``terminal_state`` is optional; missing is the
+      "checkpoint has not reached a terminal state yet" case).
+    - Field is **explicitly** ``None`` → no error.
+    - Field is a **string** → no error here. The canonical
+      ``aed_lifecycle.checkpoint.validate_checkpoint`` may
+      still reject unknown terminal-state strings, but the type
+      itself is valid.
+    - Field is any **other type** (list, dict, int, bool,
+      float, tuple, etc.) → error. Silent coercion to
+      ``None`` is forbidden because it would mask the
+      structural defect and remove the only signal the
+      cross-reference has that the checkpoint recorded a
+      terminal_state at all.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "terminal_state" not in payload:
+        return errors
+    value = payload["terminal_state"]
+    if value is None:
+        return errors
+    if isinstance(value, str):
+        return errors
+    errors.append(
+        f"checkpoint field 'terminal_state' must be a string or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
+def _checkpoint_state_from_payload(payload: Dict[str, Any]) -> Any:
+    """Construct an ``aed_lifecycle.checkpoint.CheckpointState`` from a raw payload.
+
+    Returns the constructed ``CheckpointState`` instance, or ``None`` if
+    ``aed_lifecycle`` is unavailable (e.g., running outside the AED
+    repo) or the required fields cannot be coerced. The dry-run command
+    must never crash if ``aed_lifecycle`` is missing — that would break
+    the read-only contract.
+
+    Codex findings 3455441250 (P2) and 3455479194 (P1):
+    ``_coerce_str_list`` is now strict — callers must run
+    :func:`_validate_raw_required_list_fields` on the raw
+    payload FIRST and surface any errors before reaching this
+    function. The canonical
+    ``aed_lifecycle.checkpoint.validate_checkpoint`` is the
+    authority on structural correctness; this function only
+    hands the raw payload through and lets the canonical
+    validator flag malformed lists.
+    """
+    try:
+        from aed_lifecycle.checkpoint import CheckpointState  # type: ignore
+    except ImportError:
+        return None
+    repo = _coerce_optional_str(payload.get("repo"))
+    pr_number = _coerce_optional_int(payload.get("pr_number"))
+    branch = _coerce_optional_str(payload.get("branch"))
+    current_head = _coerce_optional_str(payload.get("current_head"))
+    if not (repo and pr_number is not None and branch and current_head):
+        return None
+    return CheckpointState(
+        repo=repo,
+        pr_number=pr_number,
+        branch=branch,
+        current_head=current_head,
+        phase=_coerce_optional_str(payload.get("phase")),
+        completed_phases=_coerce_str_list(payload.get("completed_phases")),
+        next_phase=_coerce_optional_str(payload.get("next_phase")),
+        next_action=_coerce_optional_str(payload.get("next_action")),
+        pending_actions=_coerce_str_list(payload.get("pending_actions")),
+        last_verified_primary_head=_coerce_optional_str(
+            payload.get("last_verified_primary_head")
+        ),
+        last_verified_pr_head=_coerce_optional_str(
+            payload.get("last_verified_pr_head")
+        ),
+        authorized_thread_ids=_coerce_str_list(payload.get("authorized_thread_ids")),
+        unresolved_thread_ids=_coerce_str_list(payload.get("unresolved_thread_ids")),
+        terminal_state=_coerce_optional_str(payload.get("terminal_state")),
+        updated_at=_coerce_optional_str(payload.get("updated_at")),
+    )
+
+
+def _validate_checkpoint_payload(envelope: Dict[str, Any]) -> List[str]:
+    """Run AED checkpoint validators and return a list of error messages.
+
+    Mutates ``envelope["validation"]`` in place to record the
+    validator status. Returns a flat list of error messages suitable
+    for surfacing as ``CHECKPOINT_VALIDATION_INVALID`` blockers. The
+    validators consumed are:
+
+      - ``validate_checkpoint`` from ``aed_lifecycle.checkpoint``
+      - ``validate_resume_observations`` (only if the checkpoint
+        recorded ``last_verified_pr_head`` and we have a live PR head
+        to compare against — handled by ``_cross_reference_checkpoint``).
+    """
+    if envelope.get("load_status") != "loaded":
+        envelope["validation"]["status"] = "skipped"
+        envelope["validation"]["errors"] = list(envelope.get("errors", []))
+        envelope["validation"]["warnings"] = list(envelope.get("warnings", []))
+        return list(envelope.get("errors", []))
+    payload = envelope.get("raw") or {}
+    # Codex findings 3455441250 (P2) and 3455479194 (P1):
+    # validate the raw payload's required list fields BEFORE
+    # any coercion / CheckpointState construction so that
+    # missing or malformed list fields cannot be silently
+    # normalized into a clean validation pass. The raw
+    # validator returns a list of structural errors that the
+    # canonical ``aed_lifecycle.checkpoint.validate_checkpoint``
+    # would otherwise only see AFTER coercion has stripped the
+    # non-string entries.
+    raw_list_errors = _validate_raw_required_list_fields(payload)
+    if raw_list_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_list_errors)
+        envelope["validation"]["raw_list_errors"] = list(raw_list_errors)
+        envelope["errors"].extend(raw_list_errors)
+        return list(raw_list_errors)
+    # Codex finding 3456429699 (P1): validate the raw payload's
+    # ``next_action`` BEFORE any ``_coerce_optional_str`` call so
+    # a malformed ``next_action`` (e.g. ``[]``, ``{}``, ``42``)
+    # cannot be silently converted to ``None`` and pass
+    # validation. The validator emits fail-closed structural
+    # errors that the operator can see in both the JSON
+    # envelope and the markdown ``## Checkpoint`` section.
+    raw_next_action_errors = _validate_raw_next_action(payload)
+    if raw_next_action_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_next_action_errors)
+        envelope["validation"]["raw_next_action_errors"] = list(
+            raw_next_action_errors
+        )
+        envelope["errors"].extend(raw_next_action_errors)
+        return list(raw_next_action_errors)
+    # Codex finding 3456665870 (P2): validate the raw payload's
+    # ``phase`` BEFORE any ``_coerce_optional_str`` call so a
+    # malformed ``phase`` (e.g. ``[]``, ``{}``, ``42``) cannot
+    # be silently converted to ``None`` and pass validation.
+    # The validator emits fail-closed structural errors that
+    # the operator can see in both the JSON envelope and the
+    # markdown ``## Checkpoint`` section.
+    raw_phase_errors = _validate_raw_phase(payload)
+    if raw_phase_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_phase_errors)
+        envelope["validation"]["raw_phase_errors"] = list(raw_phase_errors)
+        envelope["errors"].extend(raw_phase_errors)
+        return list(raw_phase_errors)
+    # Codex finding 3462952517 (P2): validate the raw payload's
+    # ``terminal_state`` BEFORE any ``_coerce_optional_str`` call
+    # so a malformed ``terminal_state`` (e.g. ``123``, ``[]``,
+    # ``{}``, ``True``) cannot be silently converted to ``None``
+    # and pass validation. This validator is structurally
+    # identical to ``_validate_raw_phase`` and
+    # ``_validate_raw_next_action`` and is intentionally placed
+    # alongside them so the operator can see all raw-validation
+    # failures in one place in the JSON envelope and the
+    # markdown ``## Checkpoint`` section.
+    raw_terminal_state_errors = _validate_raw_terminal_state(payload)
+    if raw_terminal_state_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_terminal_state_errors)
+        envelope["validation"]["raw_terminal_state_errors"] = list(
+            raw_terminal_state_errors
+        )
+        envelope["errors"].extend(raw_terminal_state_errors)
+        return list(raw_terminal_state_errors)
+    state = _checkpoint_state_from_payload(payload)
+    if state is None:
+        envelope["validation"]["status"] = "schema_invalid"
+        envelope["validation"]["errors"] = [
+            "checkpoint is missing required fields "
+            "(repo, pr_number, branch, current_head) or aed_lifecycle "
+            "is unavailable"
+        ]
+        envelope["errors"].extend(envelope["validation"]["errors"])
+        return list(envelope["validation"]["errors"])
+    envelope["validation"]["state_summary"] = {
+        "repo": state.repo,
+        "pr_number": state.pr_number,
+        "branch": state.branch,
+        "current_head": state.current_head,
+        "phase": state.phase,
+        "next_phase": state.next_phase,
+        "next_action": state.next_action,
+        "terminal_state": state.terminal_state,
+        "updated_at": state.updated_at,
+        "completed_phases_count": len(state.completed_phases or []),
+        "pending_actions_count": len(state.pending_actions or []),
+        "authorized_thread_ids_count": len(state.authorized_thread_ids or []),
+        "unresolved_thread_ids_count": len(state.unresolved_thread_ids or []),
+        "last_verified_pr_head": state.last_verified_pr_head,
+        "last_verified_primary_head": state.last_verified_primary_head,
+    }
+    try:
+        from aed_lifecycle.checkpoint import validate_checkpoint  # type: ignore
+        structural_errors = validate_checkpoint(state)
+    except ImportError:
+        envelope["validation"]["status"] = "validator_unavailable"
+        envelope["validation"]["errors"] = [
+            "aed_lifecycle.checkpoint.validate_checkpoint is unavailable"
+        ]
+        envelope["errors"].extend(envelope["validation"]["errors"])
+        return list(envelope["validation"]["errors"])
+    except Exception as exc:  # pragma: no cover — defensive
+        envelope["validation"]["status"] = "validator_raised"
+        envelope["validation"]["errors"] = [
+            f"checkpoint validator raised: {type(exc).__name__}: {exc}"
+        ]
+        envelope["errors"].extend(envelope["validation"]["errors"])
+        return list(envelope["validation"]["errors"])
+    if structural_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(structural_errors)
+        envelope["errors"].extend(structural_errors)
+        return list(structural_errors)
+    envelope["validation"]["status"] = "clean"
+    envelope["validation"]["errors"] = []
+    envelope["validation"]["warnings"] = []
+    return []
+
+
+def _cross_reference_checkpoint(
+    envelope: Dict[str, Any],
+    live_pr: Dict[str, Any],
+    live_main_sha: Optional[str] = None,
+    live_repo: Optional[str] = None,
+) -> Tuple[List[Dict[str, str]], List[str]]:
+    """Compare checkpoint evidence against live GitHub state.
+
+    Returns ``(blockers, warnings)`` where each blocker is a dict
+    ``{"kind": str, "detail": str}``. The function mutates
+    ``envelope["cross_reference"]`` and ``envelope["combination"]`` in
+    place so callers can render the structured envelope.
+
+    Live state is passed in as a dict (already fetched by
+    ``fetch_pr_state``); ``live_main_sha`` is optional and only used if
+    the checkpoint recorded a ``last_verified_primary_head``;
+    ``live_repo`` is optional and only used if the checkpoint recorded
+    a repository identity (``repo`` field). All three live signals
+    are independent — passing ``None`` for any of them is safe and
+    simply means the corresponding cross-reference rule degrades to
+    "not enough live evidence, skip" rather than "fail closed".
+    """
+    blockers: List[Dict[str, str]] = []
+    warnings: List[str] = []
+    # ``MERGE_READY_TERMINAL_STATES`` is the canonical set of
+    # checkpoint terminal states that authorize a merge. It is
+    # referenced both inside the ``validate_resume_observations``
+    # block (to promote primary drift to a blocker for
+    # merge-ready checkpoints that are missing primary evidence)
+    # and later (to compute ``merge_ready_both_sides``).
+    # Defining it here at the top of the function so the entire
+    # body sees it as a local — assigning it later in the
+    # function would shadow it and cause ``UnboundLocalError``
+    # when read before the assignment.
+    #
+    # Codex finding 3455441244 (P2): ``PR_MERGED_AND_CLOSED_OUT``
+    # is intentionally EXCLUDED. The canonical schema in
+    # ``schemas/aed_lifecycle_states_v1.json:211-220`` marks
+    # it as ``merge_allowed=false`` — a closed-out checkpoint
+    # paired with a live OPEN PR surfaces a distinct
+    # cross-reference blocker (handled later in this function)
+    # and never satisfies ``merge_ready_both_sides``.
+    MERGE_READY_TERMINAL_STATES = {
+        "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+    }
+    if envelope.get("load_status") != "loaded":
+        envelope["cross_reference"]["status"] = "skipped"
+        envelope["cross_reference"]["blockers"] = []
+        envelope["cross_reference"]["warnings"] = []
+        envelope["combination"]["blockers"] = []
+        envelope["combination"]["warnings"] = []
+        envelope["combination"]["live_state_agrees"] = True
+        envelope["combination"]["merge_ready_both_sides"] = False
+        return blockers, warnings
+    state_summary = envelope.get("validation", {}).get("state_summary") or {}
+    if envelope.get("validation", {}).get("status") != "clean":
+        envelope["cross_reference"]["status"] = "skipped_due_to_validation_error"
+        envelope["cross_reference"]["warnings"].append(
+            "cross-reference skipped because checkpoint validation failed"
+        )
+        envelope["combination"]["live_state_agrees"] = False
+        envelope["combination"]["merge_ready_both_sides"] = False
+        envelope["combination"]["blockers"] = []
+        envelope["combination"]["warnings"] = list(
+            envelope["cross_reference"]["warnings"]
+        )
+        return blockers, warnings
+    live_pr_number = live_pr.get("number")
+    live_pr_head = live_pr.get("head_sha")
+    live_pr_state = live_pr.get("state")
+    live_pr_draft = live_pr.get("is_draft")
+    live_branch = live_pr.get("head_ref")
+    live_merge_state = live_pr.get("merge_state_status")
+    # Cross-reference rules. Each rule produces either a blocker or a
+    # warning; we never silently downgrade a real disagreement.
+    if state_summary.get("pr_number") != live_pr_number:
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_PR_NUMBER_MISMATCH",
+                "detail": (
+                    f"checkpoint pr_number={state_summary.get('pr_number')!r} "
+                    f"does not match live pr_number={live_pr_number!r}"
+                ),
+            }
+        )
+    # Codex finding 3471367261 (P1): a checkpoint that records
+    # a repository identity (``repo``) but that identity does
+    # not match the live GitHub repository must fail closed.
+    # A checkpoint from another repo is NOT valid evidence
+    # for the current PR, regardless of whether the
+    # pr_number, head_sha, or other fields happen to agree.
+    # This rule is independent of the pr_number rule above —
+    # a cross-repo checkpoint could carry the correct
+    # pr_number for a same-numbered PR in a different
+    # repository and still be invalid evidence. The rule
+    # only fires when both the checkpoint recorded a repo
+    # identity AND a live repo identity is available for
+    # comparison; if either side is missing the rule skips
+    # (per "preserve existing policy for missing optional
+    # repository metadata").
+    ckpt_repo = state_summary.get("repo")
+    if ckpt_repo and live_repo and ckpt_repo != live_repo:
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_REPO_MISMATCH",
+                "detail": (
+                    f"checkpoint repo={ckpt_repo!r} "
+                    f"does not match live repo={live_repo!r}; "
+                    f"a checkpoint from another repository is not "
+                    f"valid evidence for this PR"
+                ),
+            }
+        )
+    if (
+        state_summary.get("current_head")
+        and live_pr_head
+        and state_summary["current_head"] != live_pr_head
+    ):
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_HEAD_MISMATCH",
+                "detail": (
+                    f"checkpoint current_head={state_summary['current_head']!r} "
+                    f"does not match live PR head_sha={live_pr_head!r}"
+                ),
+            }
+        )
+    if (
+        state_summary.get("branch")
+        and live_branch
+        and state_summary["branch"] != live_branch
+    ):
+        warnings.append(
+            f"checkpoint branch={state_summary['branch']!r} does not match "
+            f"live head_ref={live_branch!r}"
+        )
+    if (
+        state_summary.get("last_verified_primary_head")
+        and live_main_sha
+        and state_summary["last_verified_primary_head"] != live_main_sha
+    ):
+        # Base/main drift is recorded as a warning rather than a
+        # hard blocker, because a base update mid-PR is a normal
+        # workflow event (rebase / merge of main into the branch).
+        warnings.append(
+            f"checkpoint last_verified_primary_head="
+            f"{state_summary['last_verified_primary_head']!r} differs from "
+            f"live primary HEAD={live_main_sha!r}"
+        )
+    # Normalize merge_state for comparison. fetch_pr_state returns
+    # the canonical lowercase ``clean`` but tests may pass either
+    # case. We compare on the normalized value.
+    live_merge_state_norm = (
+        str(live_merge_state).lower() if live_merge_state else ""
+    )
+    # Resume-observation drift detector (head-drift only). We only
+    # call this when both the live PR head and the recorded
+    # last_verified_pr_head are available.
+    #
+    # Codex finding 3455479198 (P2): the canonical
+    # ``aed_lifecycle.checkpoint.validate_resume_observations``
+    # produces TWO kinds of errors —
+    # ``"PR head changed: ..."`` and
+    # ``"primary worktree head changed: ..."``. Local
+    # primary/main drift is a normal workflow event (rebase
+    # of main into the feature branch, or a merge of main
+    # into the PR) and must NOT produce a merge-blocking
+    # checkpoint/live-state blocker when:
+    #
+    #   - PR head is exact (no PR head changed)
+    #   - GitHub base/main evidence is current
+    #   - checkpoint agrees with live PR state
+    #   - all live gates are clean
+    #
+    # Split the canonical errors into PR-head blockers and
+    # primary-head warnings. PR-head drift still blocks
+    # (the PR head itself moved). Primary-head drift only
+    # emits a warning so a stale local primary can't
+    # falsely block a continuation plan whose live evidence
+    # is otherwise clean.
+    try:
+        from aed_lifecycle.checkpoint import (  # type: ignore
+            CheckpointState,
+            validate_resume_observations,
+        )
+        # Rebuild a minimal CheckpointState for the validator — only
+        # the head fields are needed for head-drift detection.
+        from aed_lifecycle.checkpoint import CheckpointState as _CS  # noqa
+        payload = envelope.get("raw") or {}
+        state_for_obs = _checkpoint_state_from_payload(payload)
+        if state_for_obs is not None:
+            obs_errors = validate_resume_observations(
+                state_for_obs,
+                observed_pr_head=live_pr_head or "",
+                observed_primary_head=live_main_sha or "",
+            )
+            # Look up the checkpoint's terminal_state from the
+            # envelope's state summary. The split below needs
+            # this to decide whether primary drift is a
+            # warning (default) or a blocker (merge-ready
+            # checkpoints missing primary evidence).
+            ckpt_terminal_state = (
+                envelope.get("validation", {})
+                .get("state_summary", {})
+                .get("terminal_state")
+            )
+            for err in obs_errors:
+                # The canonical validator prefixes the kind of
+                # drift into the message string. We dispatch
+                # on that prefix to keep the rest of the
+                # diagnostic intact.
+                if err.startswith("primary worktree head changed") or err.startswith(
+                    "recorded primary head missing"
+                ):
+                    # Codex finding 3456665866 (P1): a primary
+                    # drift (missing OR conflicting) is normally
+                    # a WARNING because primary/main drift is a
+                    # normal workflow event (rebase of main into
+                    # the feature branch). BUT — a checkpoint
+                    # parked at ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+                    # (or any other merge-ready terminal state)
+                    # without ``last_verified_primary_head`` is
+                    # unsafe to advance: we cannot confirm the
+                    # operator actually verified the protected
+                    # primary branch at the merge moment.
+                    # Promote the message to a blocker in that
+                    # case so ``merge_ready_both_sides`` cannot
+                    # be silently true.
+                    if ckpt_terminal_state in MERGE_READY_TERMINAL_STATES:
+                        blockers.append(
+                            {
+                                "kind": "CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE",
+                                "detail": (
+                                    f"checkpoint terminal_state="
+                                    f"{ckpt_terminal_state!r} is "
+                                    f"merge-ready but {err}"
+                                ),
+                            }
+                        )
+                    else:
+                        # Non-merge-ready checkpoint: primary
+                        # drift stays a warning per V2 semantics.
+                        warnings.append(err)
+                else:
+                    # PR head changed / recorded PR head
+                    # missing → still a blocker.
+                    blockers.append(
+                        {
+                            "kind": "CHECKPOINT_OBSERVATION_DRIFT",
+                            "detail": err,
+                        }
+                    )
+    except ImportError:
+        warnings.append(
+            "aed_lifecycle.checkpoint.validate_resume_observations "
+            "is unavailable; observation drift not checked"
+        )
+    except Exception as exc:  # pragma: no cover — defensive
+        warnings.append(
+            f"observation drift check raised {type(exc).__name__}: {exc}"
+        )
+    # ``MERGE_READY_TERMINAL_STATES`` is defined at the top of
+    # this function (see the block right after the early-skip
+    # checks) so the entire body, including the
+    # ``validate_resume_observations`` block above, sees it
+    # as a function-local constant. Defining it again here
+    # would shadow the top-level definition and break the
+    # promote-to-blocker logic with an ``UnboundLocalError``.
+    # Combination rules: when checkpoint says merge-ready but live
+    # is blocked, that is a fail-closed blocker. When live is clean
+    # but checkpoint says an earlier phase, that is a warning (live
+    # trumps checkpoint for forward progress). The only checkpoint
+    # terminal state that supports ``merge_ready_both_sides`` is
+    # ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``. The completed
+    # terminal state ``PR_MERGED_AND_CLOSED_OUT`` is EXCLUDED —
+    # a closed-out checkpoint paired with a live OPEN PR is a
+    # fail-closed cross-reference disagreement (handled below),
+    # never a merge-ready signal.
+    #
+    # ``MERGE_READY_TERMINAL_STATES`` is defined earlier (see
+    # the top of this function and the promote-to-blocker logic
+    # in the ``validate_resume_observations`` block) and is
+    # referenced here for ``merge_ready_both_sides``. The
+    # definition is intentionally hoisted to the top so the
+    # entire function body sees it as a local constant.
+    terminal = state_summary.get("terminal_state")
+    next_action = state_summary.get("next_action")
+    if (
+        terminal == "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
+        and live_merge_state_norm != "clean"
+    ):
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_LIVE_GATE_DISAGREEMENT",
+                "detail": (
+                    f"checkpoint terminal_state=MERGE_READY_AWAITING_HUMAN_AUTHORIZATION "
+                    f"but live merge_state_status={live_merge_state!r}"
+                ),
+            }
+        )
+    # Codex finding 3455441244 (P2): a checkpoint marked as
+    # ``PR_MERGED_AND_CLOSED_OUT`` is a closed-out checkpoint
+    # (terminal, ``merge_allowed=false``). If the live PR is
+    # still OPEN and not a draft, that is a cross-reference
+    # disagreement — the checkpoint thinks the work is closed
+    # out, but GitHub shows an OPEN PR. Surface it as a
+    # distinct blocker so the operator can reconcile the
+    # divergence. ``merge_ready_both_sides`` cannot be true
+    # for this pairing under any circumstance.
+    if terminal == "PR_MERGED_AND_CLOSED_OUT" and live_pr_state == "OPEN":
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_CLOSED_OUT_LIVE_OPEN",
+                "detail": (
+                    f"checkpoint terminal_state=PR_MERGED_AND_CLOSED_OUT "
+                    f"(closed-out) but live PR is OPEN (state={live_pr_state!r}, "
+                    f"is_draft={live_pr_draft!r}); reconciling requires operator action"
+                ),
+            }
+        )
+    # Codex finding 3462952512 (P2): a checkpoint marked as
+    # ``MERGED`` claims the PR has already been merged in a
+    # prior checkpoint session. If the live PR is still OPEN
+    # and not a draft, that is a cross-reference disagreement —
+    # the checkpoint evidence says the work is already
+    # completed/merged, but GitHub shows an OPEN PR. This must
+    # surface as a distinct fail-closed blocker (mirroring the
+    # ``PR_MERGED_AND_CLOSED_OUT`` + OPEN rule above) so the
+    # planner cannot emit a merge preview from clean live gates
+    # that contradict the checkpoint's "already completed"
+    # evidence. The legitimate already-closed/merged live
+    # case (``live_pr_state`` in ``{"CLOSED", "MERGED"}``)
+    # continues to follow the documented completed behavior and
+    # is NOT affected by this rule.
+    if terminal == "MERGED" and live_pr_state == "OPEN":
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_MERGED_LIVE_OPEN",
+                "detail": (
+                    f"checkpoint terminal_state=MERGED "
+                    f"(claims PR already merged) but live PR is OPEN "
+                    f"(state={live_pr_state!r}, is_draft={live_pr_draft!r}); "
+                    f"reconciling requires operator action"
+                ),
+            }
+        )
+    if next_action == "pr_merge" and live_merge_state_norm != "clean":
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_NEXT_ACTION_UNSAFE",
+                "detail": (
+                    f"checkpoint next_action=pr_merge but live "
+                    f"merge_state_status={live_merge_state!r}"
+                ),
+            }
+        )
+    if (
+        state_summary.get("phase")
+        and live_pr_state == "OPEN"
+        and not live_pr_draft
+        and live_merge_state_norm == "clean"
+        and not str(state_summary["phase"]).startswith("PHASE_5")
+        and not str(state_summary["phase"]).startswith("PHASE_4")
+    ):
+        warnings.append(
+            f"live preflight is clean but checkpoint phase="
+            f"{state_summary['phase']!r} suggests an earlier stage; "
+            "treating live evidence as authoritative"
+        )
+    # Update envelope fields used by render_markdown and JSON consumers.
+    envelope["cross_reference"]["status"] = (
+        "clean" if not blockers else "disagreement"
+    )
+    envelope["cross_reference"]["blockers"] = list(blockers)
+    envelope["cross_reference"]["warnings"] = list(warnings)
+    envelope["combination"]["live_state_agrees"] = not blockers
+    envelope["combination"]["blockers"] = list(blockers)
+    envelope["combination"]["warnings"] = list(warnings)
+    # merge_ready_both_sides is true only when the checkpoint is
+    # loaded, structurally valid, cross-references cleanly with live
+    # state, AND the checkpoint signals a merge-ready terminal state.
+    live_clean = (
+        live_pr_state == "OPEN"
+        and not live_pr_draft
+        and live_merge_state_norm == "clean"
+    )
+    envelope["combination"]["merge_ready_both_sides"] = (
+        live_clean
+        and not blockers
+        and terminal in MERGE_READY_TERMINAL_STATES
+    )
+    return blockers, warnings
+
+
 def assemble_plan(
     *,
     pr: Dict[str, Any],
@@ -1276,10 +2271,81 @@ def assemble_plan(
     codex: Dict[str, Any],
     branch_protection: Dict[str, Any],
     generated_at: str,
+    checkpoint_envelope: Optional[Dict[str, Any]] = None,
+    live_main_sha: Optional[str] = None,
+    live_repo: Optional[str] = None,
 ) -> ContinuePlan:
-    """Assemble the structured continuation plan from all signals."""
+    """Assemble the structured continuation plan from all signals.
+
+    The ``checkpoint_envelope`` parameter is PR #407's optional
+    checkpoint integration. When omitted (the default, PR #406
+    behavior), the function produces a plan that is byte-equivalent
+    to PR #406 for any fixed live input. When provided, the envelope
+    is rendered into the plan and any cross-reference blockers are
+    added to ``blockers_for_merge``.
+    """
     blockers_for_merge: List[Dict[str, Any]] = []
     warnings: List[str] = []
+
+    # PR #407: ingest checkpoint evidence if provided. The envelope
+    # is the canonical structured form returned by
+    # ``_load_checkpoint_payload`` + ``_validate_checkpoint_payload``
+    # + ``_cross_reference_checkpoint``. When no checkpoint is
+    # provided we use the minimal absent-envelope so the plan output
+    # is stable and the markdown section is consistently rendered.
+    if checkpoint_envelope is None:
+        checkpoint_envelope = _absent_checkpoint_envelope()
+    # If the envelope has not yet been cross-referenced (e.g., the
+    # caller constructed it manually), do so now. The helper mutates
+    # the envelope in place so downstream rendering sees the final
+    # state.
+    if checkpoint_envelope.get("cross_reference", {}).get("status") == "skipped" \
+            and checkpoint_envelope.get("present") \
+            and checkpoint_envelope.get("load_status") == "loaded":
+        _cross_reference_checkpoint(
+            checkpoint_envelope,
+            pr,
+            live_main_sha=live_main_sha,
+            live_repo=live_repo,
+        )
+    # Surface checkpoint load and validation errors as blockers. This
+    # is the canonical "checkpoint evidence is unusable" code path.
+    if checkpoint_envelope.get("present"):
+        load_status = checkpoint_envelope.get("load_status")
+        if load_status in {"file_missing", "malformed_json", "unreadable"}:
+            blockers_for_merge.append(
+                {
+                    "kind": "CHECKPOINT_LOAD_FAILED",
+                    "detail": (
+                        f"checkpoint load failed: load_status={load_status!r}; "
+                        f"errors={checkpoint_envelope.get('errors', [])}"
+                    ),
+                }
+            )
+        validation_status = (
+            checkpoint_envelope.get("validation", {}).get("status")
+        )
+        if validation_status in {"invalid", "schema_invalid", "validator_raised", "validator_unavailable"}:
+            blockers_for_merge.append(
+                {
+                    "kind": "CHECKPOINT_VALIDATION_INVALID",
+                    "detail": (
+                        f"checkpoint validation status={validation_status!r}; "
+                        f"errors={checkpoint_envelope.get('validation', {}).get('errors', [])}"
+                    ),
+                }
+            )
+        # Cross-reference disagreements are fail-closed blockers.
+        for blocker in (
+            checkpoint_envelope.get("cross_reference", {}).get("blockers") or []
+        ):
+            blockers_for_merge.append(
+                {"kind": blocker.get("kind", "CHECKPOINT_DISAGREEMENT"),
+                 "detail": blocker.get("detail", "")}
+            )
+        # Cross-reference warnings surface as plan warnings (not blockers).
+        for w in checkpoint_envelope.get("cross_reference", {}).get("warnings", []) or []:
+            warnings.append(f"checkpoint cross-reference warning: {w}")
 
     if pr.get("is_draft"):
         warnings.append("PR is a draft; no merge proposed")
@@ -1467,6 +2533,7 @@ def assemble_plan(
         mutations_proposed=mutations_proposed,
         warnings=warnings,
         recommendation=recommendation,
+        checkpoint=checkpoint_envelope,
     )
 
 
@@ -1519,6 +2586,57 @@ def render_markdown(plan: ContinuePlan) -> str:
         f"- **Blocked mutations:** "
         f"{', '.join(plan.lifecycle.get('blocked_mutations') or []) or '(none)'}"
     )
+    lines.append("")
+
+    # PR #407: Checkpoint section. Renders between Lifecycle state
+    # and Checks per the design plan. When no checkpoint was provided
+    # the envelope is the minimal absent form and the section renders
+    # a single "Not provided" line so the markdown shape stays
+    # consistent across invocations.
+    lines.append("## Checkpoint")
+    lines.append("")
+    cp = plan.checkpoint or _absent_checkpoint_envelope()
+    if not cp.get("present"):
+        lines.append("- **Present:** no (use `--checkpoint-json <path>` to ingest)")
+    else:
+        lines.append(f"- **Present:** yes")
+        lines.append(f"- **Path:** `{cp.get('path')}`")
+        lines.append(f"- **Load status:** `{cp.get('load_status')}`")
+        lines.append(f"- **Schema version:** {cp.get('schema_version')}")
+        val = cp.get("validation", {})
+        lines.append(f"- **Validation status:** `{val.get('status')}`")
+        if val.get("errors"):
+            for err in val["errors"]:
+                lines.append(f"  - error: {err}")
+        if val.get("warnings"):
+            for w in val["warnings"]:
+                lines.append(f"  - warning: {w}")
+        xref = cp.get("cross_reference", {})
+        lines.append(f"- **Cross-reference status:** `{xref.get('status')}`")
+        if xref.get("blockers"):
+            for blk in xref["blockers"]:
+                lines.append(f"  - blocker: `{blk.get('kind')}`: {blk.get('detail')}")
+        if xref.get("warnings"):
+            for w in xref["warnings"]:
+                lines.append(f"  - warning: {w}")
+        combo = cp.get("combination", {})
+        lines.append(f"- **Live/checkpoint agreement:** {combo.get('live_state_agrees')}")
+        lines.append(f"- **merge_ready_both_sides:** {combo.get('merge_ready_both_sides')}")
+        if combo.get("blockers"):
+            for blk in combo["blockers"]:
+                lines.append(f"  - blocker: `{blk.get('kind')}`: {blk.get('detail')}")
+        if combo.get("warnings"):
+            for w in combo["warnings"]:
+                lines.append(f"  - warning: {w}")
+        ss = val.get("state_summary") or {}
+        if ss:
+            lines.append(f"- **Recorded head:** `{ss.get('current_head')}`")
+            lines.append(f"- **Recorded phase:** `{ss.get('phase')}`")
+            lines.append(f"- **Recorded terminal_state:** `{ss.get('terminal_state')}`")
+            lines.append(f"- **Recorded next_action:** `{ss.get('next_action')}`")
+            lines.append(
+                f"- **Recorded updated_at:** `{ss.get('updated_at')}`"
+            )
     lines.append("")
 
     lines.append("## Checks")
@@ -1758,6 +2876,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional ISO timestamp for filtering stale Codex signals",
     )
+    parser.add_argument(
+        "--checkpoint-json",
+        type=Path,
+        default=None,
+        help=(
+            "Optional path to an AED checkpoint snapshot (aed_lifecycle.checkpoint "
+            "CheckpointState serialized as JSON). The file is read-only: this "
+            "command never writes back to it. When provided, the plan gains a "
+            "checkpoint envelope with load/validation/cross-reference status and "
+            "any disagreement becomes a fail-closed blocker."
+        ),
+    )
     # We register these as hidden/forbidden for clarity (argparse
     # can reject them with a custom action). They are explicitly
     # rejected to prevent accidental misuse.
@@ -1907,7 +3037,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # 6. Compute lifecycle
         lifecycle = compute_lifecycle_state(pr, checks)
 
-        # 7. Assemble plan
+        # 7. Checkpoint ingestion (PR #407, optional). The file is
+        # read-only; we never write back. When omitted the envelope
+        # is the minimal absent form so the rest of the pipeline is
+        # byte-equivalent to PR #406 for fixed live inputs.
+        #
+        # Codex finding 3456429707 (P2): pass the LIVE BASE SHA
+        # (from GitHub via ``fetch_pr_state``) into the checkpoint
+        # cross-reference so primary/base drift can be detected
+        # against GitHub evidence. We deliberately do NOT use the
+        # local primary worktree HEAD here — the primary may
+        # intentionally lag behind during isolated PR runs, and the
+        # planner must depend on GitHub PR/base evidence, not on
+        # mutating or syncing the primary worktree. If
+        # ``pr["base_sha"]`` is missing (defensive: should never
+        # happen because ``fetch_pr_state`` populates it from
+        # ``data.base.sha``), we fall back to ``None`` and let the
+        # cross-reference's existing conservative-missing-evidence
+        # behavior apply.
+        if args.checkpoint_json is not None:
+            checkpoint_envelope = _load_checkpoint_payload(args.checkpoint_json)
+            _validate_checkpoint_payload(checkpoint_envelope)
+            _cross_reference_checkpoint(
+                checkpoint_envelope,
+                pr,
+                live_main_sha=pr.get("base_sha"),
+                live_repo=args.repo,
+            )
+        else:
+            checkpoint_envelope = _absent_checkpoint_envelope()
+
+        # 8. Assemble plan
         plan = assemble_plan(
             pr=pr,
             lifecycle=lifecycle,
@@ -1916,6 +3076,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             codex=codex,
             branch_protection=bp,
             generated_at=generated_at,
+            checkpoint_envelope=checkpoint_envelope,
+            live_repo=args.repo,
         )
         plan_dict = plan.to_dict()
 

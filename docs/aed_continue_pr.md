@@ -45,6 +45,10 @@ python3 scripts/local/aed_continue_pr.py \
 - `--admin`
 - `--no-dry-run`
 
+### CWD independence
+
+The script computes the repo root from its own `__file__` and inserts it into `sys.path` at module load time, so `aed_lifecycle` is importable regardless of the current working directory. The documented form (`python3 scripts/local/aed_continue_pr.py ...`) works from `/tmp`, a different worktree, or any parent directory — no `cd` into the repo root is required.
+
 ## Required `--dry-run`
 
 The `--dry-run` flag is **mandatory**. The script refuses to run without it. A future PR (#407+) will introduce a separate `aed continue-pr --execute` command that consumes the JSON plan emitted here.
@@ -228,7 +232,101 @@ Every proposed merge action includes `--match-head-commit <HEAD_SHA>` for exact-
 
 If the PR head has changed between plan generation and merge execution, GitHub's merge API will refuse the merge with a clear error, and the operator should re-run this dry-run to refresh the plan.
 
-## Out-of-scope (deferred to PR #407+)
+## Optional checkpoint ingestion (PR #407)
+
+The dry-run command can optionally consume an AED checkpoint snapshot to cross-reference runner-recorded evidence against the live PR state. This is gated behind the optional `--checkpoint-json <path>` flag.
+
+### What it does
+
+When `--checkpoint-json` is provided, the script:
+
+1. **Loads** the checkpoint JSON file read-only (the file is never written back).
+2. **Validates** it through the canonical `aed_lifecycle.checkpoint.validate_checkpoint` and `validate_resume_observations` helpers.
+3. **Cross-references** the checkpoint's recorded `pr_number`, `current_head`, `branch`, `last_verified_primary_head`, `phase`, `next_action`, and `terminal_state` against the live GitHub PR state.
+4. **Surfaces** any disagreement as a fail-closed `blockers_for_merge` entry. The merge command preview is **never** emitted when a checkpoint disagreement is present.
+
+When `--checkpoint-json` is **omitted**, the plan is byte-equivalent to PR #406 for any fixed live input (the dry-run command's behavior is otherwise unchanged).
+
+### Fail-closed blockers
+
+The following disagreement types each produce a distinct `kind` in `plan.blockers_for_merge`:
+
+| Blocker kind | Trigger |
+|---|---|
+| `CHECKPOINT_LOAD_FAILED` | file missing / malformed JSON / unreadable |
+| `CHECKPOINT_VALIDATION_INVALID` | `validate_checkpoint` returned errors; or required fields missing |
+| `CHECKPOINT_PR_NUMBER_MISMATCH` | checkpoint `pr_number` does not match the requested PR |
+| `CHECKPOINT_HEAD_MISMATCH` | checkpoint `current_head` does not match live PR `head_sha` |
+| `CHECKPOINT_OBSERVATION_DRIFT` | `validate_resume_observations` reports head drift (recorded vs observed) |
+| `CHECKPOINT_LIVE_GATE_DISAGREEMENT` | checkpoint `terminal_state=MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` but live `merge_state_status` is not `clean` |
+| `CHECKPOINT_NEXT_ACTION_UNSAFE` | checkpoint `next_action=pr_merge` but live `merge_state_status` is not `clean` |
+
+A base/main SHA drift (`last_verified_primary_head` differs from live primary HEAD) is recorded as a **warning**, not a blocker, because base updates mid-PR are a normal workflow event.
+
+### Combination: `merge_ready_both_sides`
+
+The plan JSON's `checkpoint.combination.merge_ready_both_sides` field is the single boolean a future `--execute` command should consume:
+
+- `true` only when the checkpoint is loaded, structurally valid, cross-references cleanly with the live PR state, **and** the checkpoint `terminal_state` is `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`.
+- `false` otherwise.
+
+The completed terminal state `PR_MERGED_AND_CLOSED_OUT` is **excluded** from the merge-ready set. A closed-out checkpoint paired with a live OPEN PR surfaces a `CHECKPOINT_CLOSED_OUT_LIVE_OPEN` blocker; it cannot satisfy `merge_ready_both_sides` under any circumstance. The canonical schema marks `PR_MERGED_AND_CLOSED_OUT` as `merge_allowed=false`, so treating it as merge-ready would be inconsistent.
+
+This is the canonical "both the runner's recorded evidence and the live GitHub state agree the PR is ready to authorize" signal.
+
+### JSON envelope schema
+
+```jsonc
+{
+  "checkpoint": {
+    "present": true,
+    "path": "/tmp/aed_runs/pr407_checkpoint.json",
+    "load_status": "loaded",
+    "schema_version": 1,
+    "errors": [],
+    "warnings": [],
+    "validation": {
+      "status": "clean",
+      "errors": [],
+      "warnings": [],
+      "state_summary": {
+        "repo": "Slideshow11/Automated-Edge-Discovery",
+        "pr_number": 407,
+        "branch": "tooling/...",
+        "current_head": "abcdef12...",
+        "phase": "PHASE_2_CI_PROTECTION_GATE",
+        "terminal_state": "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        ...
+      }
+    },
+    "cross_reference": {
+      "status": "clean",  // or "disagreement"
+      "blockers": [],
+      "warnings": []
+    },
+    "combination": {
+      "live_state_agrees": true,
+      "merge_ready_both_sides": true,
+      "blockers": [],
+      "warnings": []
+    }
+  }
+}
+```
+
+When `--checkpoint-json` is omitted, the envelope reduces to `{"present": false, "path": null, "load_status": "not_provided", ...}`.
+
+### Markdown output
+
+When a checkpoint is provided, the memo gains a `## Checkpoint` section between `## Lifecycle state` and `## Checks`. It records path, load status, validation status, cross-reference status, `live_state_agrees`, `merge_ready_both_sides`, blockers, warnings, and the recorded `current_head` / `phase` / `terminal_state` / `next_action` / `updated_at`.
+
+When omitted, the section renders a single "Present: no" line so the markdown shape stays consistent.
+
+### Future `--execute` note
+
+A future PR will introduce a separate `aed continue-pr --execute` command. That executor must consume both the live evidence (PR state, merge_state_status, gate status, Codex verdict, branch protection) **and** `checkpoint.combination.merge_ready_both_sides` to authorize a merge. Live execution remains out of scope here.
+
+## Out-of-scope (deferred to PR #408+)
 
 - **`aed continue-pr --execute`**: the actual executor that consumes the JSON plan emitted here. PR #407+ will introduce a separate command with explicit per-mutation authorization prompts.
 - **Checkpoint file reading**: `next_action_from_checkpoint(state)` is intentionally NOT consumed by this CLI. That is the runner's responsibility (a separate future component).
