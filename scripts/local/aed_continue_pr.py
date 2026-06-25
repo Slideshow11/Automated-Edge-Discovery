@@ -1517,27 +1517,42 @@ def _validate_raw_required_list_fields(payload: Dict[str, Any]) -> List[str]:
 def _validate_raw_next_action(payload: Dict[str, Any]) -> List[str]:
     """Validate ``next_action`` on the RAW payload before coercion.
 
-    Codex finding 3456429699 (P1): the previous coercion
-    passed ``next_action`` through ``_coerce_optional_str``,
-    which silently returned ``None`` for any non-string value
-    (``[]``, ``{}``, ``42``, ``True``, etc.). A malformed
+    Codex findings 3456429699 (P1) and 3471367263 (P2):
+    the previous coercion passed ``next_action`` through
+    ``_coerce_optional_str``, which silently returned ``None``
+    for falsy values (``""``, ``"   "``, ``"\\n\\t"``) and
+    silently returned ``None`` for non-string values
+    (``[]``, ``{}``, ``42``, ``True``). A malformed
     ``next_action`` therefore validated as if it were absent,
     hiding the structural problem from the operator and the
     canonical validator. This validator runs BEFORE
     ``_coerce_optional_str`` and surfaces any non-string,
-    non-``None`` ``next_action`` as a fail-closed structural
-    error.
+    non-``None`` ``next_action`` AND any present-but-empty /
+    present-but-whitespace-only ``next_action`` as a fail-closed
+    structural error.
 
-    Rules (mirroring ``CheckpointState.next_action`` typing):
+    Rules (mirroring ``CheckpointState.next_action`` typing and
+    the canonical "must be a real next action if present"
+    intent):
 
     - Field is **absent from payload** → no error
       (``next_action`` is optional; missing is equivalent to
       ``None`` and is the documented "no next action yet" case).
     - Field is **explicitly** ``None`` → no error.
-    - Field is a **string** → no error here. The canonical
+    - Field is a **non-empty string** with at least one
+      non-whitespace character → no error here. The canonical
       ``aed_lifecycle.checkpoint.validate_checkpoint`` may
       still reject placeholder strings, but the type itself
-      is valid.
+      is valid and the content is non-blank.
+    - Field is an **empty string** (``""``) → error. Silent
+      coercion to ``None`` is forbidden because an empty
+      ``next_action`` is a structural defect, not a missing
+      one — the operator (or an upstream automation) wrote
+      something and meant it, even if what they wrote is
+      syntactically blank.
+    - Field is a **whitespace-only string** (``"   "``,
+      ``"\\n\\t"``, etc.) → error, for the same reason as
+      above. ``str.strip()`` of such a value is empty.
     - Field is any **other type** (list, dict, int, bool,
       float, tuple, etc.) → error. Silent coercion to
       ``None`` is forbidden because it would mask the
@@ -1553,6 +1568,12 @@ def _validate_raw_next_action(payload: Dict[str, Any]) -> List[str]:
     if value is None:
         return errors
     if isinstance(value, str):
+        if value.strip():
+            return errors
+        errors.append(
+            "checkpoint field 'next_action' must be a non-empty, "
+            f"non-whitespace string if present, got {value!r}"
+        )
         return errors
     errors.append(
         f"checkpoint field 'next_action' must be a string or None, "
@@ -1851,6 +1872,7 @@ def _cross_reference_checkpoint(
     envelope: Dict[str, Any],
     live_pr: Dict[str, Any],
     live_main_sha: Optional[str] = None,
+    live_repo: Optional[str] = None,
 ) -> Tuple[List[Dict[str, str]], List[str]]:
     """Compare checkpoint evidence against live GitHub state.
 
@@ -1861,7 +1883,12 @@ def _cross_reference_checkpoint(
 
     Live state is passed in as a dict (already fetched by
     ``fetch_pr_state``); ``live_main_sha`` is optional and only used if
-    the checkpoint recorded a ``last_verified_primary_head``.
+    the checkpoint recorded a ``last_verified_primary_head``;
+    ``live_repo`` is optional and only used if the checkpoint recorded
+    a repository identity (``repo`` field). All three live signals
+    are independent — passing ``None`` for any of them is safe and
+    simply means the corresponding cross-reference rule degrades to
+    "not enough live evidence, skip" rather than "fail closed".
     """
     blockers: List[Dict[str, str]] = []
     warnings: List[str] = []
@@ -1923,6 +1950,34 @@ def _cross_reference_checkpoint(
                 "detail": (
                     f"checkpoint pr_number={state_summary.get('pr_number')!r} "
                     f"does not match live pr_number={live_pr_number!r}"
+                ),
+            }
+        )
+    # Codex finding 3471367261 (P1): a checkpoint that records
+    # a repository identity (``repo``) but that identity does
+    # not match the live GitHub repository must fail closed.
+    # A checkpoint from another repo is NOT valid evidence
+    # for the current PR, regardless of whether the
+    # pr_number, head_sha, or other fields happen to agree.
+    # This rule is independent of the pr_number rule above —
+    # a cross-repo checkpoint could carry the correct
+    # pr_number for a same-numbered PR in a different
+    # repository and still be invalid evidence. The rule
+    # only fires when both the checkpoint recorded a repo
+    # identity AND a live repo identity is available for
+    # comparison; if either side is missing the rule skips
+    # (per "preserve existing policy for missing optional
+    # repository metadata").
+    ckpt_repo = state_summary.get("repo")
+    if ckpt_repo and live_repo and ckpt_repo != live_repo:
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_REPO_MISMATCH",
+                "detail": (
+                    f"checkpoint repo={ckpt_repo!r} "
+                    f"does not match live repo={live_repo!r}; "
+                    f"a checkpoint from another repository is not "
+                    f"valid evidence for this PR"
                 ),
             }
         )
@@ -2218,6 +2273,7 @@ def assemble_plan(
     generated_at: str,
     checkpoint_envelope: Optional[Dict[str, Any]] = None,
     live_main_sha: Optional[str] = None,
+    live_repo: Optional[str] = None,
 ) -> ContinuePlan:
     """Assemble the structured continuation plan from all signals.
 
@@ -2247,7 +2303,10 @@ def assemble_plan(
             and checkpoint_envelope.get("present") \
             and checkpoint_envelope.get("load_status") == "loaded":
         _cross_reference_checkpoint(
-            checkpoint_envelope, pr, live_main_sha=live_main_sha
+            checkpoint_envelope,
+            pr,
+            live_main_sha=live_main_sha,
+            live_repo=live_repo,
         )
     # Surface checkpoint load and validation errors as blockers. This
     # is the canonical "checkpoint evidence is unusable" code path.
@@ -3003,6 +3062,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 checkpoint_envelope,
                 pr,
                 live_main_sha=pr.get("base_sha"),
+                live_repo=args.repo,
             )
         else:
             checkpoint_envelope = _absent_checkpoint_envelope()
@@ -3017,6 +3077,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             branch_protection=bp,
             generated_at=generated_at,
             checkpoint_envelope=checkpoint_envelope,
+            live_repo=args.repo,
         )
         plan_dict = plan.to_dict()
 

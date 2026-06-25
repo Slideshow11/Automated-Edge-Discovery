@@ -3029,7 +3029,7 @@ class TestAcceptDocumentedDidNotPhrase(unittest.TestCase):
 
 def _make_checkpoint_payload(
     *,
-    repo: str = "Slideshow11/Automated-Edge-Discovery",
+    repo: Optional[str] = "Slideshow11/Automated-Edge-Discovery",
     pr_number: int = 407,
     branch: str = "tooling/aed-continue-pr-dry-run-v1",
     current_head: str = "abcdef1234567890abcdef1234567890abcdef12",
@@ -4864,6 +4864,386 @@ class TestCheckpointV5MergedLiveOpen(unittest.TestCase):
     def test_no_checkpoint_behavior_unchanged_for_merged_live_open_fix(self) -> None:
         """No --checkpoint-json → PR #406 plan shape unchanged."""
         pr = self._make_pr_with_clean_live_state(state="OPEN")
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV6RepoMismatch(unittest.TestCase):
+    """PR #407 Codex finding 3471367261 (P1).
+
+    A checkpoint that records a ``repo`` field but whose value
+    does not match the live GitHub repository
+    (``Slideshow11/Automated-Edge-Discovery``) must surface a
+    fail-closed ``CHECKPOINT_REPO_MISMATCH`` blocker in the
+    cross-reference output. A checkpoint from another repo is
+    not valid evidence for this PR even if pr_number, head,
+    and other fields happen to agree.
+
+    The rule only fires when both the checkpoint recorded a
+    ``repo`` AND the caller passed a ``live_repo`` to
+    ``_cross_reference_checkpoint``; if either side is missing
+    the rule skips (per "preserve existing policy for missing
+    optional repository metadata").
+    """
+
+    LIVE_REPO = "Slideshow11/Automated-Edge-Discovery"
+
+    def _make_pr_open_clean(self) -> Dict[str, Any]:
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        return pr
+
+    def test_matching_repo_passes(self) -> None:
+        """Checkpoint repo matches live repo → no repo-mismatch blocker."""
+        pr = self._make_pr_open_clean()
+        payload = _make_checkpoint_payload(
+            repo=self.LIVE_REPO,
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(
+            envelope, pr, live_repo=self.LIVE_REPO
+        )
+        kinds = [b["kind"] for b in blockers]
+        self.assertNotIn("CHECKPOINT_REPO_MISMATCH", kinds)
+
+    def test_mismatched_repo_blocks(self) -> None:
+        """Checkpoint repo differs from live repo → CHECKPOINT_REPO_MISMATCH blocker."""
+        pr = self._make_pr_open_clean()
+        payload = _make_checkpoint_payload(
+            repo="attacker-org/some-other-repo",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(
+            envelope, pr, live_repo=self.LIVE_REPO
+        )
+        kinds = [b["kind"] for b in blockers]
+        self.assertIn("CHECKPOINT_REPO_MISMATCH", kinds)
+        # merge_ready_both_sides must be False.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_repo_mismatch_blocks_merge_preview(self) -> None:
+        """End-to-end: repo mismatch → no merge recommendation."""
+        pr = self._make_pr_open_clean()
+        payload = _make_checkpoint_payload(
+            repo="attacker-org/some-other-repo",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+            live_repo=self.LIVE_REPO,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_REPO_MISMATCH", kinds)
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_repo_mismatch_in_json_envelope(self) -> None:
+        """Repo-mismatch blocker details appear in JSON envelope."""
+        pr = self._make_pr_open_clean()
+        payload = _make_checkpoint_payload(
+            repo="attacker-org/some-other-repo",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_repo=self.LIVE_REPO)
+        kinds = [
+            b["kind"]
+            for b in envelope["cross_reference"]["blockers"]
+        ]
+        self.assertIn("CHECKPOINT_REPO_MISMATCH", kinds)
+        # The detail message includes the offending and expected repos.
+        details = " ".join(
+            b["detail"] for b in envelope["cross_reference"]["blockers"]
+        )
+        self.assertIn("attacker-org/some-other-repo", details)
+        self.assertIn(self.LIVE_REPO, details)
+
+    def test_repo_mismatch_in_markdown_section(self) -> None:
+        """Repo-mismatch blocker details appear in markdown ``## Checkpoint`` section."""
+        pr = self._make_pr_open_clean()
+        payload = _make_checkpoint_payload(
+            repo="attacker-org/some-other-repo",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+            live_repo=self.LIVE_REPO,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("## Checkpoint", md)
+        self.assertIn("CHECKPOINT_REPO_MISMATCH", md)
+        self.assertIn("attacker-org/some-other-repo", md)
+
+    def test_missing_repo_metadata_follows_existing_policy(self) -> None:
+        """Missing checkpoint repo OR missing live_repo → no repo-mismatch blocker."""
+        pr = self._make_pr_open_clean()
+        # _make_checkpoint_payload defaults repo to LIVE_REPO; override to None.
+        payload = _make_checkpoint_payload(
+            repo=None,
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        blockers, _warnings = acp._cross_reference_checkpoint(
+            envelope, pr, live_repo=self.LIVE_REPO
+        )
+        kinds = [b["kind"] for b in blockers]
+        self.assertNotIn("CHECKPOINT_REPO_MISMATCH", kinds)
+
+    def test_no_checkpoint_behavior_unchanged_for_repo_mismatch_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = self._make_pr_open_clean()
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+        )
+        self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+
+class TestCheckpointV6EmptyNextAction(unittest.TestCase):
+    """PR #407 Codex finding 3471367263 (P2).
+
+    A present but empty / whitespace-only ``next_action`` must
+    fail closed (raw validation runs before
+    ``_coerce_optional_str``). This complements the V3 fix
+    (non-string ``next_action``) and the existing missing/None
+    policy.
+
+    Rules:
+
+    - ``next_action: ""`` (empty string) → fail closed.
+    - ``next_action: "   "`` (whitespace only) → fail closed.
+    - ``next_action: "\\n\\t"`` (whitespace only) → fail closed.
+    - ``next_action: "poll_ci_status"`` → accepted.
+    - Missing ``next_action`` → follows existing optional policy
+      (no error).
+    - ``next_action: None`` → follows existing optional policy
+      (no error).
+    - Validation error appears in JSON envelope under
+      ``raw_next_action_errors`` and is propagated through
+      ``blockers_for_merge`` as ``CHECKPOINT_VALIDATION_INVALID``.
+    - Validation error appears in markdown ``## Checkpoint``
+      section.
+    """
+
+    def test_validate_raw_next_action_rejects_empty_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = ""
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("non-empty", joined)
+
+    def test_validate_raw_next_action_rejects_whitespace_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "   "
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("non-empty", joined)
+
+    def test_validate_raw_next_action_rejects_tab_newline_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "\n\t"
+        errors = acp._validate_raw_next_action(payload)
+        joined = "; ".join(errors)
+        self.assertIn("next_action", joined)
+        self.assertIn("non-empty", joined)
+
+    def test_validate_raw_next_action_accepts_non_empty_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "poll_ci_status"
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_next_action_accepts_none(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = None
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_next_action_accepts_missing_field(self) -> None:
+        payload = _make_checkpoint_payload()
+        del payload["next_action"]
+        errors = acp._validate_raw_next_action(payload)
+        self.assertEqual(errors, [])
+
+    def test_empty_next_action_produces_validation_blocker(self) -> None:
+        """``next_action=""`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = ""
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_whitespace_next_action_produces_validation_blocker(self) -> None:
+        """``next_action="   "`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "   "
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_tab_newline_next_action_produces_validation_blocker(self) -> None:
+        """``next_action="\\n\\t"`` end-to-end → CHECKPOINT_VALIDATION_INVALID blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "\n\t"
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+
+    def test_empty_next_action_error_in_json_envelope(self) -> None:
+        """Raw ``next_action`` empty-string error details appear in JSON envelope."""
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = ""
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        joined = " ".join(envelope["validation"]["errors"])
+        self.assertIn("next_action", joined)
+        self.assertIn("non-empty", joined)
+        # Also surfaced under the raw_next_action_errors key for explicit
+        # diagnostics, alongside raw_phase_errors and raw_terminal_state_errors.
+        self.assertIn(
+            "next_action",
+            " ".join(envelope["validation"].get("raw_next_action_errors", [])),
+        )
+
+    def test_empty_next_action_error_in_markdown_section(self) -> None:
+        """Raw ``next_action`` empty-string error appears in markdown ``## Checkpoint`` section."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = ""
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-23T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("## Checkpoint", md)
+        self.assertIn("next_action", md)
+
+    def test_valid_non_empty_next_action_still_validates(self) -> None:
+        """A non-empty ``next_action`` string still passes end-to-end."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["next_action"] = "poll_ci_status"
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(errors, [])
+        self.assertEqual(envelope["validation"]["status"], "clean")
+
+    def test_missing_next_action_follows_existing_policy(self) -> None:
+        """Missing ``next_action`` is allowed (existing optional policy)."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        del payload["next_action"]
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        joined = " ".join(errors)
+        self.assertNotIn("next_action", joined)
+
+    def test_no_checkpoint_behavior_unchanged_for_empty_next_action_fix(self) -> None:
+        """No --checkpoint-json → PR #406 plan shape unchanged."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
         plan = acp.assemble_plan(
             pr=pr,
             lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
