@@ -1677,6 +1677,80 @@ def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
     return errors
 
 
+def _validate_raw_pr_number(payload: Dict[str, Any]) -> List[str]:
+    """Validate ``pr_number`` on the RAW payload before coercion.
+
+    Codex finding 3471569932 (P2): the previous coercion passed
+    ``pr_number`` through ``_coerce_optional_int``, which silently
+    turned a string ``"407"`` into the integer ``407`` before the
+    canonical ``aed_lifecycle.checkpoint.validate_checkpoint`` saw
+    it. ``CheckpointState.pr_number`` is declared as ``int`` and
+    the canonical validator rejects a string ``pr_number`` — but
+    after the silent string-to-int coercion the validator saw
+    ``407`` (int) and the checkpoint validated clean, hiding the
+    structural defect from the operator and any downstream tool
+    that relies on the raw payload's type fidelity.
+
+    This validator runs BEFORE ``_coerce_optional_int`` and
+    surfaces any non-int, non-``None`` ``pr_number`` as a
+    fail-closed structural error — including the now-banned
+    numeric-string form. Rules (mirroring
+    ``CheckpointState.pr_number`` typing):
+
+    - Field is **absent from payload** → no error here. ``pr_number``
+      is treated as optional by the loader (a missing ``pr_number``
+      surfaces ``CHECKPOINT_PR_NUMBER_MISMATCH`` later because the
+      loader falls back to ``None`` which cannot equal the live
+      ``live_pr.get("number")``). The downstream existing policy
+      applies, so this validator does NOT add a redundant error.
+    - Field is **explicitly** ``None`` → no error here, for the
+      same reason as above.
+    - Field is a **plain Python ``int``** (and not a ``bool`` —
+      ``bool`` is a subclass of ``int`` in Python and a deliberate
+      mistake to accept) → no error here. The canonical
+      ``validate_checkpoint`` will still reject non-positive ints,
+      but the raw type is valid.
+    - Field is a **string** (including a numeric string such as
+      ``"407"``) → error. Silent coercion to ``int`` is forbidden
+      because it masks malformed identity evidence that downstream
+      consumers of the raw payload might reasonably surface.
+    - Field is a **float** (``407.0``) → error. Same reasoning:
+      silent truncation/``int(value)`` coercion masks identity
+      defects.
+    - Field is a **bool** (``True`` / ``False``) → error. ``bool``
+      is a subclass of ``int`` in Python; accepting it would let
+      a checkpoint author smuggle ``pr_number=True`` past the
+      type gate.
+    - Field is any **other type** (list, dict, tuple, etc.) → error.
+
+    Returns a list of human-readable error messages
+    (empty = structurally acceptable).
+    """
+    errors: List[str] = []
+    if "pr_number" not in payload:
+        return errors
+    value = payload["pr_number"]
+    if value is None:
+        return errors
+    # ``bool`` is a subclass of ``int`` — check it FIRST so we never
+    # accept a sneaky True/False via the int branch. The same
+    # exclusion is applied in ``_coerce_optional_int``.
+    if isinstance(value, bool):
+        errors.append(
+            f"checkpoint field 'pr_number' must be an int or None, "
+            f"got bool ({value!r})"
+        )
+        return errors
+    if isinstance(value, int):
+        return errors
+    # Note: ``str``, ``float``, ``list``, ``dict``, ``tuple`` all land here.
+    errors.append(
+        f"checkpoint field 'pr_number' must be an int or None, "
+        f"got {type(value).__name__} ({value!r})"
+    )
+    return errors
+
+
 def _checkpoint_state_from_payload(payload: Dict[str, Any]) -> Any:
     """Construct an ``aed_lifecycle.checkpoint.CheckpointState`` from a raw payload.
 
@@ -1813,6 +1887,25 @@ def _validate_checkpoint_payload(envelope: Dict[str, Any]) -> List[str]:
         )
         envelope["errors"].extend(raw_terminal_state_errors)
         return list(raw_terminal_state_errors)
+    # Codex finding 3471569932 (P2): validate the raw payload's
+    # ``pr_number`` BEFORE ``_coerce_optional_int`` so a malformed
+    # ``pr_number`` (e.g. ``"407"``, ``407.0``, ``True``, ``[]``)
+    # cannot be silently coerced into a valid ``int`` and pass the
+    # canonical ``validate_checkpoint``. The validator emits
+    # fail-closed structural errors that the operator can see in
+    # both the JSON envelope (``validation.raw_pr_number_errors``)
+    # and the markdown ``## Checkpoint`` section. This mirrors the
+    # same raw-validation-before-coercion pattern used for ``phase``,
+    # ``next_action``, and ``terminal_state``.
+    raw_pr_number_errors = _validate_raw_pr_number(payload)
+    if raw_pr_number_errors:
+        envelope["validation"]["status"] = "invalid"
+        envelope["validation"]["errors"] = list(raw_pr_number_errors)
+        envelope["validation"]["raw_pr_number_errors"] = list(
+            raw_pr_number_errors
+        )
+        envelope["errors"].extend(raw_pr_number_errors)
+        return list(raw_pr_number_errors)
     state = _checkpoint_state_from_payload(payload)
     if state is None:
         envelope["validation"]["status"] = "schema_invalid"
@@ -2342,6 +2435,71 @@ def assemble_plan(
             blockers_for_merge.append(
                 {"kind": blocker.get("kind", "CHECKPOINT_DISAGREEMENT"),
                  "detail": blocker.get("detail", "")}
+            )
+        # Codex finding 3471569930 (P1): a checkpoint that was
+        # loaded + structurally validated + cross-referenced cleanly
+        # but does NOT record a merge-ready terminal state must
+        # still produce an explicit blocker. Without this, a
+        # checkpoint that says ``terminal_state`` is ``HOLD_OPERATOR_REQUIRED``,
+        # ``FAILED``, ``PR_MERGED_AND_CLOSED_OUT``, or any other
+        # non-authorizing state would silently allow clean live
+        # gates to recommend a merge — the checkpoint evidence
+        # would be ignored instead of failing closed.
+        #
+        # The decision is sourced from
+        # ``combination.merge_ready_both_sides``, which is the
+        # single field a future ``--execute`` executor should
+        # consume. When the checkpoint is present, validated, and
+        # cross-referenced but ``merge_ready_both_sides`` is False,
+        # we emit a ``CHECKPOINT_NOT_MERGE_READY`` blocker. This
+        # prevents both the merge recommendation (handled by the
+        # ``elif blockers_for_merge`` branch in the recommendation
+        # block below) and the merge preview (gated by
+        # ``plan.recommendation == "READY_TO_AUTHORIZE_HUMAN_MERGE"``
+        # in the proposed-actions builder).
+        #
+        # The fix only fires when the checkpoint was actually
+        # loaded + validated + cross-referenced (not absent and not
+        # already failing validation / cross-reference). A merge-ready
+        # terminal state (``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``)
+        # combined with clean live evidence keeps
+        # ``merge_ready_both_sides=True`` and is unaffected. The
+        # cross-reference-driven disagreement blockers above (e.g.
+        # ``CHECKPOINT_MERGED_LIVE_OPEN``, ``CHECKPOINT_CLOSED_OUT_LIVE_OPEN``)
+        # continue to fire on top of this gate because they are
+        # pushed into ``blockers_for_merge`` first, independently
+        # of the merge-ready check.
+        merge_ready_both_sides = bool(
+            checkpoint_envelope.get("combination", {}).get(
+                "merge_ready_both_sides", False
+            )
+        )
+        ckpt_terminal_for_block = (
+            checkpoint_envelope.get("validation", {})
+            .get("state_summary", {})
+            .get("terminal_state")
+        )
+        if (
+            checkpoint_envelope.get("load_status") == "loaded"
+            and validation_status == "clean"
+            and not merge_ready_both_sides
+            and ckpt_terminal_for_block is not None
+        ):
+            blockers_for_merge.append(
+                {
+                    "kind": "CHECKPOINT_NOT_MERGE_READY",
+                    "detail": (
+                        f"checkpoint loaded, validated, and cross-referenced "
+                        f"cleanly, but records terminal_state="
+                        f"{ckpt_terminal_for_block!r} which is not a "
+                        f"merge-ready authorization state "
+                        f"(only MERGE_READY_AWAITING_HUMAN_AUTHORIZATION "
+                        f"authorizes a merge with all live evidence "
+                        f"agreeing); ignoring the checkpoint and "
+                        f"recommending a merge would let a held or "
+                        f"failed run bypass its own operator gate"
+                    ),
+                }
             )
         # Cross-reference warnings surface as plan warnings (not blockers).
         for w in checkpoint_envelope.get("cross_reference", {}).get("warnings", []) or []:
@@ -2918,6 +3076,62 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         sys.exit(1)
     if args.max_poll_seconds > MAX_POLL_SECONDS_CAP:
         args.max_poll_seconds = MAX_POLL_SECONDS_CAP
+    # Codex finding 3471551408 (P2): --checkpoint-json must NEVER resolve to
+    # the same path as --output-json or --output-md. The help text promises
+    # the checkpoint file is read-only, but without an explicit rejection
+    # this command loads the checkpoint and then ``main()`` overwrites it
+    # with the generated plan via ``args.output_json.write_text(...)`` /
+    # ``args.output_md.write_text(...)``. The check uses ``Path.resolve()``
+    # so relative paths, ``./`` prefixes, and symlinked equivalents are
+    # all normalized to the same canonical path. The check runs BEFORE any
+    # PR fetch / checkpoint load / output write, so a rejected invocation
+    # never touches the checkpoint file or any output path. No-output
+    # behavior (when ``--output-json``/``--output-md`` were omitted) is
+    # preserved because the rejection only fires when both ``--checkpoint-json``
+    # AND a matching output path are present.
+    if args.checkpoint_json is not None:
+        try:
+            _ckpt_resolved = args.checkpoint_json.resolve()
+        except OSError:
+            # If the checkpoint path itself is unresolvable the load step
+            # will surface a CHECKPOINT_LOAD_FAILED error; we still want
+            # to compare canonical paths here. Fall through using the raw
+            # path so an obvious ``./out.json == out.json`` style conflict
+            # is still caught even when the checkpoint file doesn't exist
+            # yet (e.g. the operator typo'd a missing output path).
+            _ckpt_resolved = args.checkpoint_json
+        # --output-json / --output-md are typed as ``Path`` in
+        # ``build_arg_parser``; they are required flags, so they
+        # are always present here. We ``resolve()`` each one and
+        # compare stringwise to catch relative-path equivalence
+        # and symlink-aliasing. ``resolve`` on missing targets is
+        # safe — it uses the absolute, normalized form of the
+        # path string without requiring the file to exist.
+        try:
+            _oj_resolved = args.output_json.resolve()
+        except OSError:
+            _oj_resolved = args.output_json
+        try:
+            _om_resolved = args.output_md.resolve()
+        except OSError:
+            _om_resolved = args.output_md
+        _ckpt_str = str(_ckpt_resolved)
+        if _ckpt_str == str(_oj_resolved):
+            print(
+                "ERROR: --checkpoint-json must not be the same path as "
+                "--output-json (the checkpoint file is read-only and would "
+                "be overwritten by the generated plan)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        if _ckpt_str == str(_om_resolved):
+            print(
+                "ERROR: --checkpoint-json must not be the same path as "
+                "--output-md (the checkpoint file is read-only and would "
+                "be overwritten by the generated plan)",
+                file=sys.stderr,
+            )
+            sys.exit(2)
     if args.max_poll_seconds < 1:
         args.max_poll_seconds = 1
     return args

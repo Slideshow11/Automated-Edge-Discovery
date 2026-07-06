@@ -376,4 +376,74 @@ This script is a **planner**, not an executor. The operator must:
 3. Verify the state matches reality (e.g., manually check the PR on GitHub).
 4. If the recommendation is `READY_TO_AUTHORIZE_HUMAN_MERGE`, copy the proposed merge command from the memo and execute it from a separate terminal.
 
-**The CLI never performs the merge. The operator is always the human-in-the-loop.**
+- **The CLI never performs the merge. The operator is always the human-in-the-loop.**
+
+## V7 changes (PR #407 round 7)
+
+V7 addresses three Codex findings on the V6 head (`9142af69`):
+
+### 1. Reject outputs that overwrite checkpoints (Codex 3471551408, P2)
+
+`--checkpoint-json` is documented as a read-only file. A invocation that points
+`--checkpoint-json` at the same resolved path as `--output-json` or
+`--output-md` would silently overwrite the checkpoint after it is loaded. The
+fix rejects these collisions in `parse_args` BEFORE any file write, PR fetch,
+or checkpoint load, so the rejected invocation never touches the checkpoint or
+any output path. The check uses `Path.resolve()` so relative paths, `./`
+prefixes, and symlinked equivalents are normalized to the same canonical path.
+
+| Invocation | Result |
+|---|---|
+| `--checkpoint-json <p>` + `--output-json <p>` (same resolved path) | `exit 2`, error: "must not be the same path as --output-json (the checkpoint file is read-only and would be overwritten by the generated plan)" |
+| `--checkpoint-json <p>` + `--output-md <p>` (same resolved path) | `exit 2`, error: "must not be the same path as --output-md ..." |
+| `--checkpoint-json <p>` + distinct `--output-json` / `--output-md` | pass |
+| `--checkpoint-json` omitted | not affected; rejection block is gated on `args.checkpoint_json is not None` |
+
+### 2. Block merges unless the provided checkpoint is merge-ready (Codex 3471569930, P1)
+
+A structurally valid checkpoint that cross-references cleanly but that records
+a non-merge-ready `terminal_state` (e.g. `HOLD_OPERATOR_REQUIRED`, `FAILED`,
+`PR_MERGED_AND_CLOSED_OUT`) must NOT be silently ignored when the live gates
+are otherwise clean. The fix adds an explicit `CHECKPOINT_NOT_MERGE_READY`
+blocker when:
+
+- The checkpoint was loaded + structurally validated + cross-referenced, AND
+- `merge_ready_both_sides=False` because `terminal_state` is not the
+  authorization state, AND
+- The checkpoint has a recorded `terminal_state` (not absent).
+
+The blocker prevents both the merge recommendation (`NOT_READY_BLOCKERS_PRESENT`
+via the `elif blockers_for_merge` branch) and the merge preview in
+`proposed_actions` (gated by `plan.recommendation == "READY_TO_AUTHORIZE_HUMAN_MERGE"`).
+
+The merge-ready terminal state `MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` with
+clean live evidence continues to recommend a merge. The existing
+cross-reference disagreement blockers (`CHECKPOINT_MERGED_LIVE_OPEN`,
+`CHECKPOINT_CLOSED_OUT_LIVE_OPEN`, `CHECKPOINT_REPO_MISMATCH`, etc.) continue
+to fire on top of this gate because they are pushed into `blockers_for_merge`
+first, independently of the merge-ready check.
+
+### 3. Validate `pr_number` before coercing strings to ints (Codex 3471569932, P2)
+
+The previous coercion (`_coerce_optional_int`) silently turned a numeric
+string like `"407"` into the integer `407` before the canonical
+`validate_checkpoint` saw it. `CheckpointState.pr_number` is declared as `int`
+and the canonical validator rejects a string `pr_number` — but after the silent
+string-to-int coercion the validator saw `407` (int) and the checkpoint
+validated clean, hiding the structural defect from the operator.
+
+The fix mirrors the same raw-validation-before-coercion pattern used for
+`phase`, `next_action`, and `terminal_state`:
+
+| `pr_number` value | Result |
+|---|---|
+| `407` (int) | accepted |
+| `"407"` (numeric string) | fail closed: `validation.raw_pr_number_errors` + `CHECKPOINT_VALIDATION_INVALID` blocker |
+| `407.0` (float) | fail closed |
+| `True` / `False` (bool) | fail closed |
+| `[]` / `{}` / other non-int | fail closed |
+| `None` | no error here; existing optional policy applies |
+| missing | no error here; existing optional policy applies (`CHECKPOINT_PR_NUMBER_MISMATCH` later if unable to match live) |
+
+The structural error is recorded in `envelope["validation"]["raw_pr_number_errors"]`
+and rendered in the markdown `## Checkpoint` section.

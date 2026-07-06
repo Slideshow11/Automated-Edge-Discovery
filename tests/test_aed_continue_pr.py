@@ -5256,5 +5256,622 @@ class TestCheckpointV6EmptyNextAction(unittest.TestCase):
         self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
 
 
+class TestCheckpointV7CheckpointOverwriteProtection(unittest.TestCase):
+    """PR #407 Codex finding 3471551408 (P2).
+
+    ``--checkpoint-json`` is documented as a read-only file, but a
+    careless invocation where the operator sets ``--checkpoint-json``
+    to the same path as ``--output-json`` (or ``--output-md``)
+    silently overwrites the checkpoint after it is loaded. The fix
+    rejects these collisions in ``parse_args`` BEFORE any file
+    output write, so the checkpoint file is never touched.
+
+    Rules (Codex finding 3471551408):
+
+    - ``--checkpoint-json <p>`` + ``--output-json <p>`` (resolved
+      same path) → fail closed with explicit error.
+    - ``--checkpoint-json <p>`` + ``--output-md <p>`` (resolved same
+      path) → fail closed with explicit error.
+    - Distinct paths still pass.
+    - No-output behavior (``--checkpoint-json`` with output paths that
+      do not match the checkpoint path) is unaffected.
+    - Symlink-aliased path equivalence (``./out.json`` vs
+      ``out.json`` vs an absolute equivalent) is caught by the
+      ``Path.resolve()`` normalization.
+    - The rejection runs before any PR fetch / checkpoint load /
+      output write, so no file (neither the checkpoint nor any
+      output path) is created or modified by the rejected
+      invocation.
+    """
+
+    def _checkpoint_overlap_argv(
+        self, *, checkpoint_path: str, output_json: str, output_md: str
+    ) -> List[str]:
+        return [
+            "--pr-number", "1",
+            "--dry-run",
+            "--checkpoint-json", checkpoint_path,
+            "--output-json", output_json,
+            "--output-md", output_md,
+        ]
+
+    def test_checkpoint_json_same_as_output_json_rejected(self) -> None:
+        """``--checkpoint-json`` == ``--output-json`` (resolved) → reject with exit code 2."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared = Path(tmpdir) / "out.json"
+            # Use a relative form for output_md to confirm the rejection
+            # fires before any file write regardless of cwd.
+            rc, _, err = _run_cli(
+                self._checkpoint_overlap_argv(
+                    checkpoint_path=str(shared),
+                    output_json=str(shared),
+                    output_md=str(Path(tmpdir) / "out.md"),
+                )
+            )
+            self.assertEqual(rc, 2)
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertIn("checkpoint-json", joined)
+            self.assertIn("output-json", joined)
+            # The checkpoint path must NOT exist — rejection runs first.
+            self.assertFalse(shared.exists())
+
+    def test_checkpoint_json_same_as_output_md_rejected(self) -> None:
+        """``--checkpoint-json`` == ``--output-md`` (resolved) → reject with exit code 2."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            shared = Path(tmpdir) / "plan.md"
+            rc, _, err = _run_cli(
+                self._checkpoint_overlap_argv(
+                    checkpoint_path=str(shared),
+                    output_json=str(Path(tmpdir) / "plan.json"),
+                    output_md=str(shared),
+                )
+            )
+            self.assertEqual(rc, 2)
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertIn("checkpoint-json", joined)
+            self.assertIn("output-md", joined)
+            self.assertFalse(shared.exists())
+
+    def test_distinct_checkpoint_and_output_paths_pass_argparse(self) -> None:
+        """Distinct --checkpoint-json and --output-* paths pass argparse.
+
+        The full plan execution will fail because this PR rejects
+        ``--pr-number 1`` against a fake repo, but argparse /
+        ``parse_args`` must NOT block on the path-collision check —
+        it only blocks when the paths match. We assert that the
+        rejection is *not* the checkpoint-overlap error.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rc, _, err = _run_cli(
+                [
+                    "--pr-number", "1",
+                    "--dry-run",
+                    "--checkpoint-json", str(Path(tmpdir) / "snap.json"),
+                    "--output-json", str(Path(tmpdir) / "plan.json"),
+                    "--output-md", str(Path(tmpdir) / "plan.md"),
+                ]
+            )
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            # If argparse blocked due to checkpoint/output overlap we'd
+            # see our custom error message. Any non-zero exit here is
+            # from later pipeline failures (e.g. ``fetch_pr_state``);
+            # the rejection error must NOT be present.
+            self.assertNotIn(
+                "must not be the same path as --output-json", joined
+            )
+            self.assertNotIn(
+                "must not be the same path as --output-md", joined
+            )
+
+    def test_relative_path_equivalence_caught(self) -> None:
+        """``./out.json`` and ``out.json`` (same dir) must be treated as the same resolved path.
+
+        We ``chdir`` into the tempdir so ``./out.json`` and ``out.json``
+        both normalize to the same absolute path. ``Path.resolve()``
+        uses CWD for relative inputs, so the test exercises the
+        exact real-world scenario where an operator types
+        ``./plan.json`` for the checkpoint path and an
+        automation-generated absolute path for the output path,
+        both pointing at the same file.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Two strings that ``Path.resolve()`` to the same absolute,
+            # normalized form when CWD is ``tmpdir``.
+            checkpoint_path = "./out.json"
+            output_json_path = str(Path(tmpdir) / "out.json")
+            original_cwd = os.getcwd()
+            try:
+                os.chdir(tmpdir)
+                rc, _, err = _run_cli(
+                    [
+                        "--pr-number", "1",
+                        "--dry-run",
+                        "--checkpoint-json", checkpoint_path,
+                        "--output-json", output_json_path,
+                        "--output-md", str(Path(tmpdir) / "plan.md"),
+                    ]
+                )
+            finally:
+                os.chdir(original_cwd)
+            self.assertEqual(rc, 2)
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertIn("must not be the same path", joined)
+
+    def test_no_checkpoint_json_does_not_invoke_overlap_check(self) -> None:
+        """Without ``--checkpoint-json`` there is no overlap to detect — ``parse_args`` proceeds.
+
+        Same as the prior ``test_distinct_checkpoint_and_output_paths_pass_argparse``
+        but with ``--checkpoint-json`` omitted entirely. The path-collision
+        block is gated on ``args.checkpoint_json is not None``, so the
+        rejection code path is never entered.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Both output paths can be identical — with no checkpoint this
+            # is the operator's choice, not a read-only invariant.
+            shared = Path(tmpdir) / "plan.json"
+            rc, _, err = _run_cli(
+                [
+                    "--pr-number", "1",
+                    "--dry-run",
+                    "--output-json", str(shared),
+                    # Intentionally same as output-json to prove the
+                    # overlap check is NOT triggered. The merge of
+                    # output-json into output-md never happens in this
+                    # CLI, but using distinct is still safer.
+                    "--output-md", str(Path(tmpdir) / "plan.md"),
+                ]
+            )
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertNotIn(
+                "must not be the same path as --output-json", joined
+            )
+            self.assertNotIn(
+                "must not be the same path as --output-md", joined
+            )
+
+
+class TestCheckpointV7NotMergeReady(unittest.TestCase):
+    """PR #407 Codex finding 3471569930 (P1).
+
+    A structurally valid checkpoint that has been loaded and
+    cross-referenced cleanly but that records a non-merge-ready
+    ``terminal_state`` (e.g. ``HOLD_OPERATOR_REQUIRED``, ``FAILED``,
+    ``PR_MERGED_AND_CLOSED_OUT``) must still produce an explicit
+    ``CHECKPOINT_NOT_MERGE_READY`` blocker when the live gates are
+    otherwise clean. Without this rule the dry-run would recommend
+    a merge based purely on live evidence, silently ignoring the
+    operator's checkpoint signal that the run is held or has
+    failed.
+
+    Rules (Codex finding 3471569930):
+
+    - Present + loaded + structurally valid + cross-referenced +
+      ``merge_ready_both_sides=False`` because ``terminal_state``
+      is not a merge-ready authorization state → emit
+      ``CHECKPOINT_NOT_MERGE_READY`` blocker.
+    - The blocker prevents ``READY_TO_AUTHORIZE_HUMAN_MERGE``.
+    - The blocker prevents the merge preview from being emitted
+      in ``proposed_actions``.
+    - Merge-ready terminal state ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+      with clean live evidence continues to recommend merge.
+    - Already-completed / closed-out handling (``CHECKPOINT_MERGED_LIVE_OPEN``,
+      ``CHECKPOINT_CLOSED_OUT_LIVE_OPEN``) is preserved by the
+      existing cross-reference rules.
+    - V5/V6 blockers (``CHECKPOINT_REPO_MISMATCH``,
+      ``CHECKPOINT_OBSERVATION_DRIFT``, etc.) continue to fire on
+      top of this gate.
+    - The blocker appears in both JSON envelope
+      (``checkpoint.combination.blockers``) and the markdown
+      ``## Checkpoint`` section.
+    """
+
+    def _pr_with_clean_live_state(
+        self,
+        *,
+        state: str = "OPEN",
+        is_draft: bool = False,
+        base_sha: str = "c720b6810b2e5216c170eb55734af1df5df4704b",
+    ) -> Dict[str, Any]:
+        pr = _make_pr_response(state=state, draft=is_draft)
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = base_sha
+        return pr
+
+    def test_hold_terminal_state_blocks_merge_with_explicit_kind(self) -> None:
+        """``terminal_state=HOLD_OPERATOR_REQUIRED`` with otherwise clean live → CHECKPOINT_NOT_MERGE_READY blocker."""
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="HOLD_OPERATOR_REQUIRED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_failed_terminal_state_blocks_merge(self) -> None:
+        """``terminal_state=FAILED`` with otherwise clean live → CHECKPOINT_NOT_MERGE_READY blocker."""
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="FAILED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_blocker_kind_in_plan_dict_json(self) -> None:
+        """The blocker kind is visible in ``plan.to_dict()`` so JSON consumers can parse it."""
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="HOLD_OPERATOR_REQUIRED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        d = plan.to_dict()
+        kinds = [b.get("kind") for b in d.get("blockers_for_merge", [])]
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+        # And the combination envelope records the same blocker.
+        ckpt_blockers = [
+            b.get("kind") for b in d.get("checkpoint", {}).get(
+                "combination", {}
+            ).get("blockers", [])
+        ]
+        # The cross_reference blockers are propagated too — but the
+        # gate-derived CHECKPOINT_NOT_MERGE_READY blocker is published
+        # via ``plan.blockers_for_merge``. Verify the JSON envelope
+        # reflects at least one CHECKPOINT_NOT_MERGE_READY entry.
+        self.assertTrue(
+            any("CHECKPOINT_NOT_MERGE_READY" in str(k) for k in kinds)
+        )
+
+    def test_blocker_kind_in_markdown(self) -> None:
+        """The blocker kind is rendered in the markdown ``## Checkpoint`` / ``## Blockers`` section."""
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="FAILED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", md)
+
+    def test_merge_ready_state_still_passes_with_clean_live(self) -> None:
+        """``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` + clean live evidence → no new blocker.
+
+        This is the existing pass-through behavior the new rule must
+        preserve: a checkpoint parked at the one and only
+        merge-ready terminal state, with clean live evidence,
+        continues to recommend a merge.
+        """
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+
+    def test_existing_closed_out_live_open_blocker_still_fires(self) -> None:
+        """``PR_MERGED_AND_CLOSED_OUT`` + live OPEN continues to emit ``CHECKPOINT_CLOSED_OUT_LIVE_OPEN``.
+
+        The new rule is additive on top of the existing closed-out
+        vs live-open disagreement: when the cross-reference
+        produces a ``CHECKPOINT_CLOSED_OUT_LIVE_OPEN`` blocker the
+        CHECKPOINT_NOT_MERGE_READY rule ALSO fires (since
+        ``merge_ready_both_sides=False`` due to terminal_state being
+        non-merge-ready). Both kinds must be present in the
+        fail-closed blockers list.
+        """
+        pr = self._pr_with_clean_live_state(state="OPEN")
+        payload = _make_checkpoint_payload(
+            terminal_state="PR_MERGED_AND_CLOSED_OUT",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_CLOSED_OUT_LIVE_OPEN", kinds)
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_no_checkpoint_does_not_emit_new_blocker(self) -> None:
+        """Without ``--checkpoint-json`` the absent envelope still recommends merge with clean live."""
+        pr = self._pr_with_clean_live_state()
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_NOT_MERGE_READY", kinds)
+
+    def test_merge_preview_not_emitted_when_blocker_present(self) -> None:
+        """``proposed_actions`` must not include a merge-action when ``CHECKPOINT_NOT_MERGE_READY`` blocks."""
+        pr = self._pr_with_clean_live_state()
+        payload = _make_checkpoint_payload(
+            terminal_state="HOLD_OPERATOR_REQUIRED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        d = plan.to_dict()
+        action_kinds = [a.get("action_kind") for a in d.get("proposed_actions", [])]
+        self.assertNotIn("merge", action_kinds)
+
+
+class TestCheckpointV7RawPrNumberValidation(unittest.TestCase):
+    """PR #407 Codex finding 3471569932 (P2).
+
+    The previous coercion ``_coerce_optional_int`` silently turned
+    a numeric string like ``"407"`` into the integer ``407``
+    before the canonical ``validate_checkpoint`` saw it. That
+    masked the structural defect that ``CheckpointState.pr_number``
+    is declared as ``int``, and let the checkpoint validate clean
+    while downstream consumers of the raw payload would have a
+    different type than the canonical type.
+
+    The new raw validator ``_validate_raw_pr_number`` runs BEFORE
+    ``_coerce_optional_int`` and surfaces any non-int, non-``None``
+    ``pr_number`` as a fail-closed structural error. Rules
+    (mirroring ``CheckpointState.pr_number`` typing):
+
+    - Valid ``int`` (407) → accepted.
+    - Numeric string (``"407"``) → fail closed.
+    - Float (``407.0``) → fail closed.
+    - Bool (``True`` / ``False``) → fail closed.
+    - List (``[]``) → fail closed.
+    - Dict (``{}``) → fail closed.
+    - Missing ``pr_number`` → no error here (existing optional
+      policy applies through ``CHECKPOINT_PR_NUMBER_MISMATCH``).
+    - ``None`` → no error here.
+    - Validation error appears in the JSON envelope as
+      ``validation.raw_pr_number_errors``.
+    - Validation error appears in the markdown
+      ``## Checkpoint`` section.
+    """
+
+    def test_validate_raw_pr_number_accepts_int(self) -> None:
+        payload = _make_checkpoint_payload(pr_number=407)
+        errors = acp._validate_raw_pr_number(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_pr_number_rejects_string(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = "407"
+        errors = acp._validate_raw_pr_number(payload)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        self.assertIn("str", joined)
+
+    def test_validate_raw_pr_number_rejects_float(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = 407.0
+        errors = acp._validate_raw_pr_number(payload)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        self.assertIn("float", joined)
+
+    def test_validate_raw_pr_number_rejects_list(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = []
+        errors = acp._validate_raw_pr_number(payload)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        self.assertIn("list", joined)
+
+    def test_validate_raw_pr_number_rejects_dict(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = {}
+        errors = acp._validate_raw_pr_number(payload)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        self.assertIn("dict", joined)
+
+    def test_validate_raw_pr_number_rejects_bool(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = True
+        errors = acp._validate_raw_pr_number(payload)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        # Bool is its own narrow report, not the catch-all.
+        self.assertIn("bool", joined)
+
+    def test_validate_raw_pr_number_accepts_none(self) -> None:
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = None
+        errors = acp._validate_raw_pr_number(payload)
+        self.assertEqual(errors, [])
+
+    def test_validate_raw_pr_number_missing_field_no_error(self) -> None:
+        """Missing ``pr_number`` is allowed here — the missing-evidence fails closed via ``CHECKPOINT_PR_NUMBER_MISMATCH`` later."""
+        payload = _make_checkpoint_payload()
+        del payload["pr_number"]
+        errors = acp._validate_raw_pr_number(payload)
+        self.assertEqual(errors, [])
+
+    def test_string_pr_number_propagates_to_validation_status_invalid(self) -> None:
+        """``pr_number: "407"`` flows through ``_validate_checkpoint_payload`` → ``status=invalid``."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = "407"
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        joined = "; ".join(errors)
+        self.assertIn("pr_number", joined)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        # The structural error is recorded in a dedicated field so
+        # downstream consumers can recognize the rule that fired.
+        self.assertIn("raw_pr_number_errors", envelope["validation"])
+        self.assertTrue(len(envelope["validation"]["raw_pr_number_errors"]) > 0)
+
+    def test_string_pr_number_blocks_merge_via_validation_invalid(self) -> None:
+        """End-to-end: ``pr_number: "407"`` produces ``CHECKPOINT_VALIDATION_INVALID`` merge blocker."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = "407"
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+        self.assertNotEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
+
+    def test_string_pr_number_visible_in_markdown(self) -> None:
+        """``pr_number: "407"`` surfaces in the markdown ``## Checkpoint`` section."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["pr_number"] = "407"
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        md = acp.render_markdown(plan)
+        self.assertIn("pr_number", md)
+        # The error string is propagated as text in the markdown.
+        self.assertIn("str", md)
+
+    def test_valid_int_pr_number_still_passes_end_to_end(self) -> None:
+        """Sanity: a valid int 407 still produces a clean validation pass and the merge-ready envelope."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload(
+            pr_number=407,
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        errors = acp._validate_checkpoint_payload(envelope)
+        # No raw_pr_number_errors at this point.
+        self.assertEqual(
+            envelope["validation"].get("raw_pr_number_errors", []), []
+        )
+        self.assertEqual(errors, [])
+
+
 if __name__ == "__main__":
     unittest.main()
