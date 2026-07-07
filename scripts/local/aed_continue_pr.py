@@ -1632,7 +1632,7 @@ def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
 def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
     """Validate ``terminal_state`` on the RAW payload before coercion.
 
-    Codex finding 3462952517 (P2): the previous coercion passed
+    Codex finding 3462952517 (P2, V5): the previous coercion passed
     ``terminal_state`` through ``_coerce_optional_str``, which
     silently returned ``None`` for any non-string value (``123``,
     ``[]``, ``{}``, ``True``, etc.). A malformed ``terminal_state``
@@ -1642,16 +1642,37 @@ def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
     non-string, non-``None`` ``terminal_state`` as a fail-closed
     structural error.
 
+    Codex finding 3536684906 (P2, V10): the V5 validator still
+    accepted any string, including the blank string ``""`` and
+    whitespace-only strings like ``"   "``. ``_coerce_optional_str``
+    then coerced ``""`` to ``None`` (empty string is falsy) and
+    passed the value through as if no terminal state had been
+    recorded, allowing a malformed checkpoint to validate and emit
+    a merge preview. The fix is to treat a blank or whitespace-only
+    string as a structural error: an operator who wrote ``""`` was
+    not asserting "no terminal state yet" (they would have omitted
+    the field or written ``null``); they were asserting a terminal
+    state value that happens to be empty. That assertion is
+    semantically meaningless and must be surfaced, not silently
+    normalized.
+
     Rules (mirroring ``CheckpointState.terminal_state`` typing):
 
     - Field is **absent from payload** → no error
       (``terminal_state`` is optional; missing is the
       "checkpoint has not reached a terminal state yet" case).
     - Field is **explicitly** ``None`` → no error.
-    - Field is a **string** → no error here. The canonical
+    - Field is a **non-blank string** → no error here. The canonical
       ``aed_lifecycle.checkpoint.validate_checkpoint`` may
       still reject unknown terminal-state strings, but the type
       itself is valid.
+    - Field is a **blank string** (``""``) or a **whitespace-only**
+      string (``"   "``, ``"\t"``, ``"\n"``, ``" \t\n "``, etc.)
+      → error. An empty terminal-state value is a structural defect;
+      it is NEVER coerced to ``None`` (that would silently mask the
+      malformed payload) and it is NEVER accepted as a valid
+      terminal state (there is no canonical terminal state called
+      ``""`` or ``"   "``).
     - Field is any **other type** (list, dict, int, bool,
       float, tuple, etc.) → error. Silent coercion to
       ``None`` is forbidden because it would mask the
@@ -1669,6 +1690,21 @@ def _validate_raw_terminal_state(payload: Dict[str, Any]) -> List[str]:
     if value is None:
         return errors
     if isinstance(value, str):
+        # Codex finding 3536684906 (P2, V10): reject blank or
+        # whitespace-only terminal_state. ``str.strip()`` collapses
+        # ``""``, ``"   "``, ``"\t"``, ``"\n"``, and any mix thereof
+        # to the empty string, which is the canonical "no content"
+        # sentinel. A non-blank string is forwarded without
+        # modification to the canonical validator, which decides
+        # whether it is a *known* terminal state; this validator's
+        # only job is the blank-check, not the whitelist check.
+        if value.strip():
+            return errors
+        errors.append(
+            f"checkpoint field 'terminal_state' must be a non-blank "
+            f"string, None, or omitted entirely (got blank string "
+            f"{value!r})"
+        )
         return errors
     errors.append(
         f"checkpoint field 'terminal_state' must be a string or None, "

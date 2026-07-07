@@ -4684,6 +4684,287 @@ class TestCheckpointV5TerminalStateValidation(unittest.TestCase):
         self.assertEqual(plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE")
 
 
+class TestCheckpointV10BlankTerminalState(unittest.TestCase):
+    """PR #407 Codex finding 3536684906 (P2).
+
+    The V5 raw ``terminal_state`` validator (``3462952517``) rejects
+    non-string, non-``None`` values, but it accepted ANY string —
+    including the blank string ``""`` and whitespace-only strings
+    like ``"   "``. ``_coerce_optional_str`` then coerced ``""`` to
+    ``None`` (empty string is falsy), silently masking the malformed
+    payload: the canonical ``validate_checkpoint`` saw ``None``,
+    treated the checkpoint as "no terminal state recorded yet", and
+    allowed a merge preview under otherwise clean live gates.
+
+    The fix tightens ``_validate_raw_terminal_state`` so a blank or
+    whitespace-only ``terminal_state`` is a fail-closed structural
+    error. The error is surfaced in the same envelope as V5
+    (``validation.raw_terminal_state_errors`` and
+    ``validation.errors``), and the resulting plan carries a
+    ``CHECKPOINT_VALIDATION_INVALID`` blocker.
+
+    Rules (Codex finding 3536684906):
+
+    - ``"terminal_state": ""`` → fail-closed with
+      ``CHECKPOINT_VALIDATION_INVALID``. The checkpoint must NOT
+      emit a merge preview or ``READY_TO_AUTHORIZE_HUMAN_MERGE``.
+    - ``"terminal_state": "   "`` (whitespace-only) → same fail-
+      closed behavior as the empty string.
+    - ``"terminal_state": "\\t\\n "`` (mixed whitespace) → same.
+    - ``"terminal_state": None`` and a missing field → still
+      accepted (existing optional policy preserved).
+    - A valid non-blank string (e.g.
+      ``"MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"``) → still
+      passes end-to-end with ``READY_TO_AUTHORIZE_HUMAN_MERGE``
+      when all other evidence is merge-ready.
+    - Invalid non-blank strings (e.g.
+      ``"NOT_A_REAL_STATE_42"``) → still blocked by the canonical
+      ``validate_checkpoint`` as before (V5 invariant preserved).
+    """
+
+    def test_validate_raw_terminal_state_catches_empty_string(self) -> None:
+        """``"terminal_state": ""`` → fail-closed structural error.
+
+        Codex finding 3536684906 (P2): the V5 validator accepted
+        this string and ``_coerce_optional_str`` then coerced it to
+        ``None``. The V10 fix rejects the blank string up-front.
+        """
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = ""
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("non-blank", joined)
+        # The blank value itself should appear in the error so the
+        # operator can see what was wrong.
+        self.assertIn("blank", joined)
+
+    def test_validate_raw_terminal_state_catches_whitespace_only_string(self) -> None:
+        """``"terminal_state": "   "`` (whitespace only) → fail-closed.
+
+        Whitespace-only strings are semantically equivalent to the
+        empty string for the purposes of terminal-state assertion —
+        they assert "I have reached a terminal state called '   '",
+        which is meaningless. The fix rejects them so the operator
+        either writes a real terminal state or omits the field.
+        """
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = "   "
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("non-blank", joined)
+
+    def test_validate_raw_terminal_state_catches_mixed_whitespace(self) -> None:
+        """``"terminal_state": "\\t\\n "`` (tab + newline + space) → fail-closed.
+
+        Belt-and-braces against the corner case where the operator
+        pastes a tab/newline mix. ``str.strip()`` collapses every
+        whitespace class to the empty sentinel, so this and any
+        other whitespace mix is rejected uniformly.
+        """
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = "\t\n "
+        errors = acp._validate_raw_terminal_state(payload)
+        joined = "; ".join(errors)
+        self.assertIn("terminal_state", joined)
+        self.assertIn("non-blank", joined)
+
+    def test_blank_terminal_state_produces_validation_blocker(self) -> None:
+        """End-to-end: blank ``terminal_state`` → ``CHECKPOINT_VALIDATION_INVALID`` blocker.
+
+        With otherwise matching checkpoint heads and clean live
+        gates, the malformed blank-string checkpoint must validate
+        as invalid and prevent both a merge preview and the
+        ``READY_TO_AUTHORIZE_HUMAN_MERGE`` recommendation.
+        """
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = ""
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+        # The blank-string error must NOT be allowed to recommend a
+        # merge under otherwise-clean live evidence.
+        self.assertNotEqual(
+            plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE"
+        )
+
+    def test_whitespace_terminal_state_produces_validation_blocker(self) -> None:
+        """End-to-end: whitespace-only ``terminal_state`` → ``CHECKPOINT_VALIDATION_INVALID``."""
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = "   "
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_VALIDATION_INVALID", kinds)
+        self.assertNotEqual(
+            plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE"
+        )
+
+    def test_blank_terminal_state_surfaces_in_json_envelope(self) -> None:
+        """Blank ``terminal_state`` error appears in JSON envelope.
+
+        Mirrors the V5 ``test_validation_error_details_in_json_envelope``
+        shape so operators can see the malformed value in the
+        envelope without having to read the markdown rendering.
+        """
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = ""
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        self.assertEqual(envelope["validation"]["status"], "invalid")
+        joined = " ".join(envelope["validation"]["errors"])
+        self.assertIn("terminal_state", joined)
+        # Also surfaced under the raw_terminal_state_errors key for
+        # explicit diagnostics, alongside other raw_*_errors keys.
+        self.assertIn(
+            "terminal_state",
+            " ".join(
+                envelope["validation"].get("raw_terminal_state_errors", [])
+            ),
+        )
+
+    def test_existing_optional_terminal_state_policy_preserved(self) -> None:
+        """``terminal_state=None`` and missing field still validate cleanly when all other evidence is merge-ready.
+
+        The V10 fix must NOT regress the existing optional-field
+        policy. Operators who omit ``terminal_state`` or set it to
+        ``None`` (the common case for a checkpoint that has not yet
+        reached a terminal state) must continue to see a clean merge
+        recommendation when live evidence is clean.
+        """
+        for terminal_state_value in (None, "MISSING"):
+            pr = _make_pr_response(state="OPEN")
+            pr["merge_state_status"] = "CLEAN"
+            payload = _make_checkpoint_payload()
+            if terminal_state_value == "MISSING":
+                del payload["terminal_state"]
+            else:
+                payload["terminal_state"] = terminal_state_value
+            envelope = acp._load_checkpoint_payload(
+                _write_checkpoint_tmp(None, payload)
+            )
+            errors = acp._validate_checkpoint_payload(envelope)
+            self.assertEqual(errors, [])
+            plan = acp.assemble_plan(
+                pr=pr,
+                lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+                checks={"all_required_green": True, "per_check_status": {}},
+                gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+                codex={"verdict": "clean", "source": "x"},
+                branch_protection=_make_protection_normalized(),
+                generated_at="2026-06-25T03:00:00Z",
+                checkpoint_envelope=envelope,
+            )
+            self.assertEqual(
+                plan.recommendation,
+                "READY_TO_AUTHORIZE_HUMAN_MERGE",
+                f"V10 must not regress existing optional policy for "
+                f"terminal_state={terminal_state_value!r}",
+            )
+
+    def test_existing_invalid_nonblank_terminal_state_still_blocked(self) -> None:
+        """Invalid NON-BLANK terminal-state strings remain blocked (V5 invariant).
+
+        The V10 fix is narrow: it adds the blank-check on top of the
+        V5 type check. It must not change how unknown but
+        non-blank terminal-state strings are handled — those still
+        flow through to the canonical ``validate_checkpoint`` which
+        rejects them as an unknown terminal state.
+
+        ``CHECKPOINT_VALIDATION_INVALID`` is the umbrella blocker
+        for ALL validation failures (raw-type errors from V5/V10
+        AND canonical unknown-state errors), so its presence here
+        is correct — what matters is that the underlying source of
+        the rejection is the canonical validator's unknown-state
+        check, NOT V10's raw blank check. We assert that by
+        checking ``raw_terminal_state_errors`` is empty (V10/V5 did
+        NOT fire) and that the envelope's error messages reference
+        the canonical unknown-state complaint, not the V10 blank-
+        string complaint.
+        """
+        pr = _make_pr_response(state="OPEN")
+        pr["merge_state_status"] = "CLEAN"
+        payload = _make_checkpoint_payload()
+        payload["terminal_state"] = "NOT_A_REAL_STATE_42"
+        # The raw validator accepts this (it's a non-blank string);
+        # the canonical validator rejects it. V10 must not interfere.
+        raw_errors = acp._validate_raw_terminal_state(
+            {"terminal_state": "NOT_A_REAL_STATE_42"}
+        )
+        self.assertEqual(raw_errors, [])
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        # Confirm V10 did not contribute any raw blank-string error.
+        # The raw_terminal_state_errors key exists but must be empty
+        # for a non-blank invalid string.
+        raw_terminal_state_errors = envelope["validation"].get(
+            "raw_terminal_state_errors", []
+        )
+        self.assertEqual(
+            raw_terminal_state_errors, [],
+            "V10 must NOT contribute a raw_terminal_state_error for "
+            "a non-blank invalid string; the rejection should come "
+            "from the canonical validator instead.",
+        )
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0},
+            codex={"verdict": "clean", "source": "x"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-06-25T03:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+        # The umbrella CHECKPOINT_VALIDATION_INVALID blocker is the
+        # correct surface — it covers canonical unknown-state errors
+        # too. What we MUST NOT see is ``READY_TO_AUTHORIZE_HUMAN_MERGE``.
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn(
+            "CHECKPOINT_VALIDATION_INVALID", kinds,
+            "Canonical validator should reject the unknown non-blank "
+            "terminal state via the umbrella CHECKPOINT_VALIDATION_INVALID.",
+        )
+        self.assertNotEqual(
+            plan.recommendation, "READY_TO_AUTHORIZE_HUMAN_MERGE"
+        )
+        # Belt-and-braces: the V10 blank-string error message must
+        # not appear in the envelope — the canonical path is the
+        # only one complaining about this string.
+        joined_errors = " ".join(envelope["validation"]["errors"])
+        self.assertNotIn(
+            "non-blank", joined_errors,
+            "V10 must not surface a non-blank complaint for a "
+            "non-blank string; the canonical validator owns this case.",
+        )
+
+
 class TestCheckpointV5MergedLiveOpen(unittest.TestCase):
     """PR #407 Codex finding 3462952512 (P2).
 
