@@ -31,8 +31,21 @@ def run_cli(
     allow_gh_api_mutation: bool = False,
     output_json: str | None = None,
     output_md: str | None = None,
+    policy_mode: str = "legacy-denylist",
+    env: dict[str, str] | None = None,
 ):
-    """Run the script and return (returncode, json_data, md_data)."""
+    """Run the script and return (returncode, json_data, md_data).
+
+    ``policy_mode`` defaults to ``"legacy-denylist"`` for backward
+    compatibility with the V1 test suite (tests that pre-date the
+    PR A1 allowlist hardening). New tests should pass
+    ``policy_mode="allowlist"`` to exercise the new allowlist
+    behavior.
+
+    ``env`` (optional) is the env passed to the runner subprocess. If
+    None, the runner inherits the test process's env. Used by env
+    sanitization tests to inject fake sensitive env vars.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         json_path = output_json or os.path.join(tmp, "result.json")
         md_path = output_md or os.path.join(tmp, "result.md")
@@ -44,6 +57,7 @@ def run_cli(
             "--timeout-seconds", str(timeout_seconds),
             "--output-json", json_path,
             "--output-md", md_path,
+            "--policy-mode", policy_mode,
         ]
         if cwd:
             cmd.extend(["--cwd", cwd])
@@ -54,7 +68,10 @@ def run_cli(
         if stderr_tail_bytes != 12000:
             cmd.extend(["--stderr-tail-bytes", str(stderr_tail_bytes)])
 
-        rc = subprocess.run(cmd, capture_output=True, text=True).returncode
+        run_kwargs: dict = {"capture_output": True, "text": True}
+        if env is not None:
+            run_kwargs["env"] = env
+        rc = subprocess.run(cmd, **run_kwargs).returncode
 
         with open(json_path) as f:
             jdata = json.load(f)
@@ -69,16 +86,35 @@ def run_cli(
 # ---------------------------------------------------------------------------
 
 def test_successful_command_returns_command_succeeded():
-    rc, j, _ = run_cli('["python", "-c", "print(\'ok\')"]')
-    assert j["status"] == "COMMAND_SUCCEEDED"
-    assert j["exit_code"] == 0
-    assert "ok" in j["stdout_tail"]
+    # PR A1 — use an allowlisted form (``python3 -m py_compile`` on a
+    # temp file) instead of ``python -c`` (now denied by the new
+    # denylist). The intent — confirm a successful run produces
+    # ``COMMAND_SUCCEEDED`` with ``exit_code=0`` — is preserved.
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write("print('ok')\n")
+        tmp_path = f.name
+    try:
+        rc, j, _ = run_cli(f'["python3", "-m", "py_compile", "{tmp_path}"]')
+        assert j["status"] == "COMMAND_SUCCEEDED"
+        assert j["exit_code"] == 0
+    finally:
+        os.unlink(tmp_path)
 
 
 def test_failing_command_returns_command_failed():
-    rc, j, _ = run_cli('["python", "-c", "import sys; sys.exit(3)"]')
-    assert j["status"] == "COMMAND_FAILED"
-    assert j["exit_code"] == 3
+    # PR A1 — use a script that py_compile rejects (syntax error
+    # in a .py file). py_compile on a bad file exits 1. The intent
+    # — confirm a non-zero exit produces ``COMMAND_FAILED`` — is
+    # preserved.
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write("def broken(:\n")  # syntax error
+        tmp_path = f.name
+    try:
+        rc, j, _ = run_cli(f'["python3", "-m", "py_compile", "{tmp_path}"]')
+        assert j["status"] == "COMMAND_FAILED"
+        assert j["exit_code"] != 0
+    finally:
+        os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -86,13 +122,28 @@ def test_failing_command_returns_command_failed():
 # ---------------------------------------------------------------------------
 
 def test_timeout_returns_command_timeout_and_killed():
-    rc, j, _ = run_cli(
-        '["python", "-c", "import time; time.sleep(30)"]',
-        timeout_seconds=2,
-    )
-    assert j["status"] == "COMMAND_TIMEOUT"
-    assert j["killed"] is True
-    assert j["exit_code"] == -1
+    # PR A1 — use a script file that sleeps (the legacy ``python -c``
+    # form is now denied by the denylist). The intent — confirm a
+    # long-running process is killed by the timeout — is preserved.
+    # We use ``--policy-mode legacy-denylist`` here so that an
+    # arbitrary ``python3 <script>`` invocation is accepted by the
+    # runner (the new allowlist is too narrow to include it). The
+    # timeout-firing behavior under test is orthogonal to the
+    # allowlist hardening.
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write("import time; time.sleep(30)\n")
+        tmp_path = f.name
+    try:
+        rc, j, _ = run_cli(
+            f'["python3", "{tmp_path}"]',
+            timeout_seconds=2,
+            policy_mode="legacy-denylist",
+        )
+        assert j["status"] == "COMMAND_TIMEOUT"
+        assert j["killed"] is True
+        assert j["exit_code"] == -1
+    finally:
+        os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -120,10 +171,16 @@ def test_non_string_element_returns_command_invalid_json():
 # ---------------------------------------------------------------------------
 
 def test_output_json_and_markdown_are_written(tmp_path):
+    # PR A1 — use an allowlisted form (``python3 -m py_compile`` on a
+    # temp file) instead of ``python -c`` (now denied by the
+    # denylist). The intent — confirm both files are written —
+    # is preserved.
+    script_path = tmp_path / "tiny.py"
+    script_path.write_text("print('x')\n")
     json_path = tmp_path / "result.json"
     md_path = tmp_path / "result.md"
     rc, j, m = run_cli(
-        '["python", "-c", "print(\'x\')"]',
+        f'["python3", "-m", "py_compile", "{script_path}"]',
         output_json=str(json_path),
         output_md=str(md_path),
     )
@@ -138,31 +195,39 @@ def test_output_json_and_markdown_are_written(tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_stdout_tailed_to_configured_limit():
+    # PR A1 — use ``--policy-mode legacy-denylist`` so the
+    # ``python -c`` form is accepted. The intent — confirm the
+    # ring buffer discards bytes beyond the configured limit — is
+    # preserved.
     big_output = "x" * 20000
     rc, j, _ = run_cli(
         f'["python", "-c", "print(\'{big_output}\')"]',
         stdout_tail_bytes=100,
+        policy_mode="legacy-denylist",
     )
     # stdout_tail must be <= 100 bytes
     assert len(j["stdout_tail"].encode("utf-8")) <= 100
 
 
 def test_stderr_tailed_to_configured_limit():
+    # PR A1 — see test_stdout_tailed_to_configured_limit.
     big_output = "x" * 20000
     rc, j, _ = run_cli(
         f'["python", "-c", "import sys; sys.stderr.write(\'{big_output}\')"]',
         stderr_tail_bytes=100,
+        policy_mode="legacy-denylist",
     )
-    # stderr_tail must be <= 100 bytes
     assert len(j["stderr_tail"].encode("utf-8")) <= 100
 
 
 def test_output_json_size_remains_bounded_relative_to_tail_limits():
     """Verify JSON output tail fields are bounded by configured limits."""
+    # PR A1 — see test_stdout_tailed_to_configured_limit.
     big = "x" * 20000
     rc, j, _ = run_cli(
         f'["python", "-c", "print(\'{big}\')"]',
         stdout_tail_bytes=200,
+        policy_mode="legacy-denylist",
     )
     # The key assertion: stdout_tail is bounded by the configured limit
     assert len(j["stdout_tail"].encode("utf-8")) <= 200
@@ -346,15 +411,28 @@ def test_graphql_mutation_operation_bypass_forms_denied(cmd_json):
 
 @pytest.mark.parametrize("cmd_json", [
     # 'immutable' contains 'mutation' as substring but is not a GraphQL operation
-    '["python", "-c", "print(\'immutable_state\')"]',
+    '["echo", "immutable_state"]',
     # 'permutation' contains 'mutation' as substring
-    '["python", "-c", "import itertools; print(list(itertools.permutations([1,2])))"]',
+    '["echo", "permutations_xyz"]',
     # 'mutation' inside a string argument that is not a GraphQL operation
     '["echo", "no-mutation-here"]',
 ])
 def test_mutation_substring_not_blocked(cmd_json):
-    """Words containing 'mutation' as a substring must not be policy-blocked."""
-    rc, j, _ = run_cli(cmd_json)
+    """Words containing 'mutation' as a substring must not be policy-blocked.
+
+    PR A1 — the V1 test used ``python -c`` as a vehicle, but the
+    new denylist denies ``python -c`` before the GraphQL mutation
+    check ever runs. The intent of this test — distinguish a
+    bare ``mutation`` keyword (which is a GraphQL mutation) from
+    a word containing ``mutation`` as a substring (which is not)
+    — is preserved by using ``echo`` with the substring as a
+    string arg. The ``echo`` form is not in the allowlist, so we
+    use ``--policy-mode legacy-denylist`` to exercise the V1
+    denylist-only path (the legacy denylist does NOT contain an
+    ``echo`` rule, so the runner reaches the GraphQL mutation
+    check, which then correctly leaves the substring alone).
+    """
+    rc, j, _ = run_cli(cmd_json, policy_mode="legacy-denylist")
     assert j["status"] != "COMMAND_POLICY_DENIED", \
         f"Unexpected policy denial for '{cmd_json}': {j['policy_errors']}"
 
@@ -411,12 +489,26 @@ def test_dismiss_mutation_name_in_graphql_payload_denied():
 # ---------------------------------------------------------------------------
 
 def test_shell_metacharacters_are_normal_argv():
-    """Semicolons, pipes etc. passed as literal argv, not executed."""
-    rc, j, _ = run_cli(
-        '["python", "-c", "import sys; sys.stderr.write(\'error\\n\'); sys.exit(1)"]'
-    )
-    assert j["status"] in ("COMMAND_FAILED", "COMMAND_SUCCEEDED")
-    assert j["status"] != "COMMAND_POLICY_DENIED"
+    """Semicolons, pipes etc. passed as literal argv, not executed.
+
+    PR A1 — the V1 test used ``python -c`` to test that
+    shell-metacharacter arguments are passed as literal argv.
+    That command is now denied by the new denylist, so we use a
+    script file with the same shape. The runner still uses
+    ``shell=False`` (verified separately by ``test_popen_uses_start_new_session_on_posix``).
+    """
+    with tempfile.NamedTemporaryFile(suffix=".py", mode="w", delete=False) as f:
+        f.write("import sys; sys.stderr.write('error\\n'); sys.exit(1)\n")
+        tmp_path = f.name
+    try:
+        rc, j, _ = run_cli(
+            f'["python3", "{tmp_path}"]',
+            policy_mode="legacy-denylist",
+        )
+        assert j["status"] in ("COMMAND_FAILED", "COMMAND_SUCCEEDED")
+        assert j["status"] != "COMMAND_POLICY_DENIED"
+    finally:
+        os.unlink(tmp_path)
 
 
 # ---------------------------------------------------------------------------
@@ -424,13 +516,21 @@ def test_shell_metacharacters_are_normal_argv():
 # ---------------------------------------------------------------------------
 
 def test_cwd_option_is_respected(tmp_path):
+    # PR A1 — the V1 test used ``python -c "import os; print(...)"`` to
+    # verify that ``--cwd`` is honored. On many CI images ``python``
+    # is not in PATH (only ``python3`` is), so the V1 test was
+    # fragile — it pre-failed with COMMAND_FAILED. The A1 fix is
+    # to use ``python3`` explicitly. We still need
+    # ``--policy-mode legacy-denylist`` because ``python3 -c`` is
+    # denied in the new policy.
     json_path = tmp_path / "result.json"
     md_path = tmp_path / "result.md"
     rc, j, _ = run_cli(
-        '["python", "-c", "import os; print(os.getcwd())"]',
+        '["python3", "-c", "import os; print(os.getcwd())"]',
         cwd=str(tmp_path),
         output_json=str(json_path),
         output_md=str(md_path),
+        policy_mode="legacy-denylist",
     )
     assert j["status"] == "COMMAND_SUCCEEDED"
     assert j["cwd"] == str(tmp_path)
@@ -514,3 +614,558 @@ def test_ring_buffer_discard_old_bytes():
     assert len(result.encode("utf-8")) <= 10
     assert "j" in result  # last part of original string must be present
     assert "a" not in result  # oldest bytes should be gone
+
+
+# ===========================================================================
+# PR A1 hardening tests
+# ===========================================================================
+#
+# These tests cover the new deny-by-default allowlist policy mode, the
+# secondary denylist defense, the new env sanitization, and the new
+# JSON output fields (policy_mode, policy_decision, policy_rule_id,
+# policy_reason, sanitized_env_applied, blocked_env_keys).
+#
+# All new tests use ``policy_mode="allowlist"`` (the new default) and
+# assert on the new policy + env fields. They cover both the
+# "safe command allowed" path and the "dangerous command blocked"
+# path from the audit requirements.
+
+
+# ---------------------------------------------------------------------------
+# Allowlist: safe commands still allowed
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_python_py_compile_safe_file_is_allowed(tmp_path):
+    """BC-POL-001: ``python3 -m py_compile <safe file>`` is allowed."""
+    script = tmp_path / "ok.py"
+    script.write_text("x = 1\n")
+    rc, j, _ = run_cli(
+        f'["python3", "-m", "py_compile", "{script}"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["policy_mode"] == "allowlist"
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-001"
+    assert j["policy_reason"] == "python_pytest_pycompile"
+
+
+def test_allowlist_python_pytest_safe_target_is_allowed(tmp_path):
+    """BC-POL-001: ``python3 -m pytest <test dir>`` is allowed."""
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_ok.py").write_text("def test_ok(): assert True\n")
+    rc, j, _ = run_cli(
+        f'["python3", "-m", "pytest", "{test_dir}"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-001"
+
+
+def test_allowlist_git_status_short_is_allowed():
+    """BC-POL-002: ``git status --short`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-002"
+    assert j["policy_reason"] == "git_status"
+
+
+def test_allowlist_git_status_porcelain_is_allowed():
+    """BC-POL-002: ``git status --porcelain`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "status", "--porcelain"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-002"
+
+
+def test_allowlist_git_diff_check_is_allowed():
+    """BC-POL-003: ``git diff --check`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "diff", "--check"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-003"
+    assert j["policy_reason"] == "git_diff_check"
+
+
+def test_allowlist_git_diff_name_only_is_allowed():
+    """BC-POL-004: ``git diff --name-only`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "diff", "--name-only"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-004"
+    assert j["policy_reason"] == "git_diff_name_only"
+
+
+def test_allowlist_git_diff_stat_is_allowed():
+    """BC-POL-005: ``git diff --stat`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "diff", "--stat"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-005"
+    assert j["policy_reason"] == "git_diff_stat"
+
+
+def test_allowlist_git_rev_parse_head_is_allowed():
+    """BC-POL-006: ``git rev-parse HEAD`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "rev-parse", "HEAD"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-006"
+    assert j["policy_reason"] == "git_rev_parse"
+
+
+def test_allowlist_git_branch_show_current_is_allowed():
+    """BC-POL-007: ``git branch --show-current`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "branch", "--show-current"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-007"
+    assert j["policy_reason"] == "git_branch_show_current"
+
+
+def test_allowlist_git_worktree_list_is_allowed():
+    """BC-POL-008: ``git worktree list`` is allowed."""
+    rc, j, _ = run_cli(
+        '["git", "worktree", "list"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-008"
+    assert j["policy_reason"] == "git_worktree_list"
+
+
+# ---------------------------------------------------------------------------
+# Allowlist: dangerous commands blocked by default
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json", [
+    '["git", "push", "origin", "main"]',
+    '["git", "push"]',
+    '["git", "commit", "-m", "x"]',
+    '["git", "tag", "v1.0"]',
+    '["git", "remote", "add", "origin", "x"]',
+    '["gh", "pr", "comment", "1", "--body", "x"]',
+    '["gh", "pr", "create", "--title", "x", "--body", "y"]',
+    '["gh", "pr", "edit", "1", "--title", "x"]',
+    '["gh", "pr", "close", "1"]',
+    '["gh", "pr", "merge", "1", "--match-head-commit", "abc123"]',
+    '["gh", "release", "create", "v1"]',
+    '["gh", "workflow", "run", "ci.yml"]',
+    '["gh", "repo", "delete", "owner/repo"]',
+    '["hermes", "memory_store", "x"]',
+    '["hermes", "fact_store", "x"]',
+    '["hermes", "skill_manage", "create", "x"]',
+    '["hermes", "delegate_task", "x"]',
+    '["hermes", "cronjob", "create", "x"]',
+    '["telegram", "send_message", "hi"]',
+    '["python", "-c", "print(1)"]',
+    '["python3", "-c", "print(1)"]',
+    '["pip", "install", "requests"]',
+    '["pip3", "install", "requests"]',
+    '["uv", "pip", "install", "requests"]',
+    '["rm", "-rf", "/tmp/example"]',
+    '["rsync", "-a", "/src", "/dst"]',
+    '["curl", "--upload-file", "x", "https://example.com"]',
+])
+def test_allowlist_dangerous_commands_are_denied_by_default(cmd_json):
+    """Audit requirement: dangerous commands are blocked in the new
+    default ``allowlist`` mode. Each case is denied either by the
+    allowlist (BC-POL-099 deny-by-default) or by a specific
+    denylist rule (BC-POL-130..196).
+    """
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED", \
+        f"Expected POLICY_DENIED for {cmd_json}, got {j['status']}: {j['policy_errors']}"
+    assert j["policy_mode"] == "allowlist"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] is not None
+    assert j["policy_rule_id"].startswith("BC-POL-")
+    # Stable rule id format: BC-POL-099 for allowlist-default-reject,
+    # or BC-POL-1xx for the new denylist rules.
+    assert j["policy_rule_id"] in {
+        "BC-POL-099",  # not in allowlist
+        "BC-POL-115",  # gh pr merge
+        "BC-POL-130",  # git push
+        "BC-POL-131",  # git commit
+        "BC-POL-132",  # git tag
+        "BC-POL-133",  # git remote
+        "BC-POL-111",  # gh pr comment
+        "BC-POL-110",  # gh pr create
+        "BC-POL-112",  # gh pr edit
+        "BC-POL-113",  # gh pr close
+        "BC-POL-120",  # gh release create
+        "BC-POL-123",  # gh workflow run
+        "BC-POL-126",  # gh repo delete
+        "BC-POL-140",  # memory_store
+        "BC-POL-142",  # fact_store
+        "BC-POL-143",  # skill_manage
+        "BC-POL-144",  # delegate_task
+        "BC-POL-145",  # cronjob
+        "BC-POL-146",  # telegram send_message
+        "BC-POL-150",  # python -c
+        "BC-POL-151",  # python3 -c
+        "BC-POL-160",  # pip install
+        "BC-POL-161",  # pip3 install
+        "BC-POL-162",  # uv pip install
+        "BC-POL-170",  # rm -rf
+        "BC-POL-172",  # rsync
+        "BC-POL-174",  # curl --upload-file
+    }, f"Unexpected rule id {j['policy_rule_id']} for {cmd_json}"
+
+
+# ---------------------------------------------------------------------------
+# Existing V1 denylist cases still block in allowlist mode
+# ---------------------------------------------------------------------------
+
+
+def test_allowlist_still_blocks_admin_flag():
+    """BC-POL-101: ``--admin`` is blocked in allowlist mode too."""
+    rc, j, _ = run_cli(
+        '["gh", "pr", "merge", "1", "--admin"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    # V1 rule still fires in allowlist mode.
+    assert j["policy_rule_id"] in {"BC-POL-099", "BC-POL-101"}
+
+
+def test_allowlist_still_blocks_bash_c_wrapper():
+    """BC-POL-190: shell wrapper is blocked in allowlist mode too."""
+    rc, j, _ = run_cli(
+        '["bash", "-c", "echo danger"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] in {"BC-POL-099", "BC-POL-190"}
+
+
+def test_allowlist_still_blocks_graphql_mutation_without_allow_flag():
+    """BC-POL-201: GraphQL mutation is blocked in allowlist mode too."""
+    rc, j, _ = run_cli(
+        '["gh", "api", "graphql", "-f", "query=mutation { viewer { login } }"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    # Either allowlist-rejected (BC-POL-099) or V1 GraphQL rule (BC-POL-201).
+    assert j["policy_rule_id"] in {"BC-POL-099", "BC-POL-201"}
+
+
+def test_allowlist_still_blocks_review_thread_mutation():
+    """BC-POL-102..108: review-thread mutation names are blocked."""
+    rc, j, _ = run_cli(
+        '["gh", "api", "graphql", "-f", "query=mutation { resolveReviewThread(input:{threadId:\\"x\\\"}) { thread { id } } }"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+
+
+# ---------------------------------------------------------------------------
+# Environment sanitization
+# ---------------------------------------------------------------------------
+
+
+def test_env_sanitization_strips_hermes_token():
+    """HERMES_* env vars are stripped before child exec."""
+    env = {
+        "HERMES_TOKEN": "FAKE_HERMES_TOKEN_VALUE",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["sanitized_env_applied"] is True
+    assert "HERMES_TOKEN" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_gateway_relay_token():
+    """GATEWAY_RELAY_* env vars are stripped."""
+    env = {
+        "GATEWAY_RELAY_TOKEN": "FAKE_GATEWAY_VALUE",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert j["sanitized_env_applied"] is True
+    assert "GATEWAY_RELAY_TOKEN" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_openai_api_key():
+    """OPENAI_API_KEY (matches ``*_API_KEY`` suffix) is stripped."""
+    env = {
+        "OPENAI_API_KEY": "FAKE_OPENAI_VALUE",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "OPENAI_API_KEY" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_anthropic_api_key():
+    """ANTHROPIC_API_KEY (matches ``*_API_KEY`` suffix) is stripped."""
+    env = {
+        "ANTHROPIC_API_KEY": "FAKE_ANTHROPIC_VALUE",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "ANTHROPIC_API_KEY" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_gh_token():
+    """GH_TOKEN is in the exact-name strip list."""
+    env = {
+        "GH_TOKEN": "FAKE_GH_VALUE",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "GH_TOKEN" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_custom_secret_suffix():
+    """``*_SECRET`` suffix is stripped."""
+    env = {
+        "CUSTOM_SECRET": "FAKE_SECRET",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "CUSTOM_SECRET" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_strips_custom_password_suffix():
+    """``*_PASSWORD`` suffix is stripped."""
+    env = {
+        "CUSTOM_PASSWORD": "FAKE_PASSWORD",
+        "PATH": "/usr/bin:/bin",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "CUSTOM_PASSWORD" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_preserves_path_and_home():
+    """PATH, HOME, etc. are in the explicit preserve set."""
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/tmp",
+        "HERMES_TOKEN": "FAKE_VALUE",
+    }
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+        env=env,
+    )
+    assert "PATH" not in j["blocked_env_keys"]
+    assert "HOME" not in j["blocked_env_keys"]
+    assert "HERMES_TOKEN" in j["blocked_env_keys"]
+
+
+def test_env_sanitization_child_cannot_see_stripped_token():
+    """End-to-end: a child that prints its own env cannot see the
+    stripped ``HERMES_TOKEN``. The runner passes the sanitized env
+    to Popen explicitly (via the ``env=`` kwarg), so the child
+    inherits only the sanitized set.
+    """
+    env = {
+        "HERMES_TOKEN": "FAKE_HERMES_TOKEN_VALUE",
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/tmp",
+    }
+    rc, j, _ = run_cli(
+        # Use legacy-denylist mode so the python3 invocation is
+        # accepted; the policy decision is orthogonal to env
+        # sanitization (which always runs).
+        '["python3", "-c", "import os,sys; sys.stdout.write(os.environ.get(\'HERMES_TOKEN\',\'<NOT_SET>\'))"]',
+        policy_mode="legacy-denylist",
+        env=env,
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    # The child's stdout_tail must NOT contain the fake token.
+    assert "FAKE_HERMES_TOKEN_VALUE" not in j["stdout_tail"]
+    # And the env-audit field confirms HERMES_TOKEN was stripped.
+    assert "HERMES_TOKEN" in j["blocked_env_keys"]
+
+
+# ---------------------------------------------------------------------------
+# JSON output contract (PR A1 audit fields)
+# ---------------------------------------------------------------------------
+
+
+def test_json_output_contains_all_pr_a1_audit_fields_on_success():
+    """Allow case: ``policy_decision="allow"`` + env audit fields."""
+    rc, j, _ = run_cli(
+        '["git", "status", "--short"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_mode"] == "allowlist"
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-002"
+    assert j["policy_reason"] == "git_status"
+    assert j["sanitized_env_applied"] is True
+    assert isinstance(j["blocked_env_keys"], list)
+
+
+def test_json_output_contains_all_pr_a1_audit_fields_on_block():
+    """Block case: ``policy_decision="block"`` + stable rule id + env audit fields."""
+    rc, j, _ = run_cli(
+        '["git", "push", "origin", "main"]',
+        policy_mode="allowlist",
+    )
+    assert j["policy_mode"] == "allowlist"
+    assert j["policy_decision"] == "block"
+    # BC-POL-099 because the command never matches an allowlist rule.
+    # (Could also be BC-POL-130 if the allowlist entry for git push
+    # was added later; either is correct — both are stable ids.)
+    assert j["policy_rule_id"] in {"BC-POL-099", "BC-POL-130"}
+    assert j["sanitized_env_applied"] is True
+    assert isinstance(j["blocked_env_keys"], list)
+
+
+def test_json_output_invalid_json_path_has_n_a_decision():
+    """COMMAND_INVALID_JSON has ``policy_decision="n/a"`` and the audit fields are still present."""
+    rc, j, _ = run_cli("not-json", policy_mode="allowlist")
+    assert j["status"] == "COMMAND_INVALID_JSON"
+    assert j["policy_mode"] == "allowlist"
+    assert j["policy_decision"] == "n/a"
+    assert j["policy_rule_id"] is None
+    assert j["sanitized_env_applied"] is False
+    assert j["blocked_env_keys"] == []
+
+
+# ---------------------------------------------------------------------------
+# Compatibility mode: legacy-denylist preserves V1 behavior
+# ---------------------------------------------------------------------------
+
+
+def test_legacy_denylist_mode_allows_python_c_which_v1_allowed():
+    """V1 allowed ``python -c``; legacy-denylist must preserve that.
+
+    Use ``python3`` because the legacy-denylist tests on this
+    image only have ``python3`` in PATH (the V1 test used
+    ``python`` which is the same fragile assumption).
+    """
+    rc, j, _ = run_cli(
+        '["python3", "-c", "print(\'ok\')"]',
+        policy_mode="legacy-denylist",
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["policy_mode"] == "legacy-denylist"
+    assert j["policy_decision"] == "allow"
+    # V1 had no stable rule id; we emit BC-POL-000 in legacy mode.
+    assert j["policy_rule_id"] == "BC-POL-000"
+
+
+def test_legacy_denylist_mode_still_blocks_admin_flag():
+    """V1 blocked ``--admin``; legacy-denylist must preserve that."""
+    rc, j, _ = run_cli(
+        '["gh", "pr", "merge", "1", "--admin"]',
+        policy_mode="legacy-denylist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    # V1 rule BC-POL-101 fires in legacy-denylist mode.
+    assert j["policy_rule_id"] == "BC-POL-101"
+
+
+def test_legacy_denylist_mode_still_blocks_hermes_kanban():
+    """V1 blocked ``hermes kanban ...``; legacy-denylist must preserve that."""
+    rc, j, _ = run_cli(
+        '["hermes", "kanban", "move", "123"]',
+        policy_mode="legacy-denylist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_rule_id"] == "BC-POL-147"
+
+
+def test_legacy_denylist_mode_still_blocks_shell_wrapper():
+    """V1 blocked ``bash -c``; legacy-denylist must preserve that."""
+    rc, j, _ = run_cli(
+        '["bash", "-c", "echo danger"]',
+        policy_mode="legacy-denylist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_rule_id"] == "BC-POL-190"
+
+
+# ---------------------------------------------------------------------------
+# _norm drift fix
+# ---------------------------------------------------------------------------
+
+
+def test_norm_drift_fix_normalizes_whitespace_padded_deny_token():
+    """Audit fix: ``_norm`` is now used in the denylist. A whitespace-
+    padded ``-- admin`` should still be denied. (Not a normal use
+    case, but the audit flagged the drift.)
+    """
+    rc, j, _ = run_cli(
+        '["gh", "pr", "merge", "1", " ", "--admin"]',
+        policy_mode="legacy-denylist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+
+
+# ---------------------------------------------------------------------------
+# Sanity: status names are stable
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("status", [
+    "COMMAND_SUCCEEDED",
+    "COMMAND_FAILED",
+    "COMMAND_TIMEOUT",
+    "COMMAND_POLICY_DENIED",
+    "COMMAND_INVALID_JSON",
+    "COMMAND_UNKNOWN_ERROR",
+])
+def test_status_name_set_is_stable(status):
+    """The six V1 status names are still produced by the runner."""
+    # We don't try to trigger every path here — that would require
+    # real subprocess timeouts and command failures. This test simply
+    # asserts the names appear in the codebase so a future refactor
+    # cannot accidentally rename them without breaking this test.
+    source = SCRIPT.read_text()
+    assert f'"{status}"' in source or f"'{status}'" in source, \
+        f"Status {status} not found in source"
