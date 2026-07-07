@@ -5503,21 +5503,51 @@ class TestCheckpointV8HardLinkCollision(unittest.TestCase):
     def test_hard_link_checkpoint_output_json_rejected(self) -> None:
         """``--checkpoint-json`` and ``--output-json`` share an inode via hard link → reject.
 
-        Without V8 the collision check only compares resolved path
-        strings, which differ here. The hard link means ``write_text``
-        on ``--output-json`` would still truncate the checkpoint
-        file — the read-only invariant V7 promises. The fix must
-        detect the shared inode and reject the invocation BEFORE
-        any write.
+        Codex finding 3532859638 (P3, V9): pass two DIFFERENT path
+        strings that resolve to the same inode. The V7 resolved-string
+        equality check would not catch this — the strings differ — so
+        the rejection MUST come from the V8 ``_same_file_identity()``
+        / ``Path.samefile()`` path. If V8 were removed, this test
+        would fail because the CLI would proceed past the collision
+        check, load the checkpoint, and ``write_text()`` on
+        ``--output-json`` would truncate the shared inode.
+
+        Layout in the tempdir:
+
+        * ``real_checkpoint.json`` — the checkpoint file (contains the
+          stub payload).
+        * ``out.json`` — hard-linked alias of ``real_checkpoint.json``
+          (same inode, distinct path string).
+
+        We pass ``real_checkpoint.json`` as ``--checkpoint-json`` and
+        ``out.json`` as ``--output-json``. The path strings differ, so
+        V7's string-compare cannot fire; the rejection can only come
+        from V8's same-inode detection. We assert that
+        ``--output-json`` path exists BEFORE the call (so ``samefile``
+        has something to compare against), and that the checkpoint's
+        contents are unchanged AFTER the call (so the read-only
+        invariant held).
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             link_path, real_checkpoint = self._create_checkpoint_with_hard_link_target(
                 tmpdir, link_name="out.json"
             )
+            # Pre-conditions: two distinct path strings, one inode.
+            # If these ever break (e.g. someone refactors the helper to
+            # return ``real_checkpoint`` as the link path), the test
+            # would silently stop exercising V8.
+            self.assertNotEqual(str(real_checkpoint), link_path)
+            self.assertTrue(Path(real_checkpoint).samefile(link_path))
+            # The output side must exist so ``samefile()`` has a real
+            # target to compare against — otherwise V8 would fall back
+            # to the V7 string rule and miss the collision (which would
+            # be the wrong code path for this test to exercise).
+            self.assertTrue(Path(link_path).exists())
             rc, _, err = _run_cli(
                 self._hard_link_argv(
-                    checkpoint_path=link_path,
-                    output_json=link_path,  # distinct string but same inode
+                    # Two distinct path strings pointing at one inode.
+                    checkpoint_path=str(real_checkpoint),
+                    output_json=link_path,
                     output_md=str(Path(tmpdir) / "plan.md"),
                 )
             )
@@ -5531,16 +5561,28 @@ class TestCheckpointV8HardLinkCollision(unittest.TestCase):
             self.assertEqual(real_checkpoint.read_text(), '{"stub": true}')
 
     def test_hard_link_checkpoint_output_md_rejected(self) -> None:
-        """``--checkpoint-json`` and ``--output-md`` share an inode via hard link → reject."""
+        """``--checkpoint-json`` and ``--output-md`` share an inode via hard link → reject.
+
+        Codex finding 3532859638 (P3, V9): same shape as the JSON test
+        but with the hard-linked alias used as ``--output-md``. Distinct
+        path strings, shared inode, V8 samefile() must catch the
+        collision because V7's resolved-string check sees two
+        different strings.
+        """
         with tempfile.TemporaryDirectory() as tmpdir:
             link_path, real_checkpoint = self._create_checkpoint_with_hard_link_target(
                 tmpdir, link_name="plan.md"
             )
+            # Pre-conditions: distinct strings, same inode.
+            self.assertNotEqual(str(real_checkpoint), link_path)
+            self.assertTrue(Path(real_checkpoint).samefile(link_path))
+            self.assertTrue(Path(link_path).exists())
             rc, _, err = _run_cli(
                 self._hard_link_argv(
-                    checkpoint_path=link_path,
+                    checkpoint_path=str(real_checkpoint),
                     output_json=str(Path(tmpdir) / "plan.json"),
-                    output_md=link_path,  # distinct string but same inode
+                    # Two distinct path strings pointing at one inode.
+                    output_md=link_path,
                 )
             )
             self.assertEqual(rc, 2)
@@ -5548,6 +5590,46 @@ class TestCheckpointV8HardLinkCollision(unittest.TestCase):
             self.assertIn("checkpoint-json", joined)
             self.assertIn("output-md", joined)
             self.assertEqual(real_checkpoint.read_text(), '{"stub": true}')
+
+    def test_hard_link_rejection_requires_samefile_not_string_equality(self) -> None:
+        """Sanity proof: the V8 hard-link rejection truly depends on inode detection.
+
+        Codex finding 3532859638 (P3) flagged that the prior tests passed
+        the same path string to both sides, so V7's resolved-string
+        check (which already existed before V8) was sufficient and the
+        tests gave a false sense of coverage. This test makes the
+        distinction explicit: pass the two distinct strings as
+        argv values, prove they are different AND that
+        ``Path.samefile`` says they're the same file. If a future
+        refactor accidentally regresses the V8 samefile() path, this
+        test will fail loudly with the negative-control message.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link_path, real_checkpoint = self._create_checkpoint_with_hard_link_target(
+                tmpdir, link_name="alias.json"
+            )
+            # The two strings MUST differ for this test to genuinely
+            # exercise V8. If they ever become equal the assertion
+            # below fires immediately.
+            self.assertNotEqual(str(real_checkpoint), link_path)
+            # They MUST share an inode for the rejection to make sense
+            # — otherwise V7's string rule would also pass and there
+            # would be nothing for V8 to detect.
+            self.assertTrue(Path(real_checkpoint).samefile(link_path))
+            # Belt-and-braces: confirm via raw ``os.stat`` that they
+            # really are two directory entries pointing at one inode.
+            # This catches any future filesystem quirk where
+            # ``Path.samefile`` lies (it shouldn't, but a separate
+            # signal keeps the test honest).
+            self.assertEqual(
+                Path(real_checkpoint).stat().st_ino,
+                Path(link_path).stat().st_ino,
+            )
+            self.assertGreaterEqual(
+                Path(real_checkpoint).stat().st_nlink, 2,
+                "Hard link count must be >= 2 — if this fails, the "
+                "fixture didn't actually create a hard link.",
+            )
 
     def test_distinct_files_same_dir_pass_collision_check(self) -> None:
         """Two distinct files in the same directory (no shared inode) → collision check passes.
