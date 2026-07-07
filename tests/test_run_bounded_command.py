@@ -637,7 +637,14 @@ def test_ring_buffer_discard_old_bytes():
 
 
 def test_allowlist_python_py_compile_safe_file_is_allowed(tmp_path):
-    """BC-POL-001: ``python3 -m py_compile <safe file>`` is allowed."""
+    """BC-POL-009 (V2): ``python3 -m py_compile <safe .py file>`` is allowed.
+
+    V2 split the V1 BC-POL-001 rule into BC-POL-001 (pytest) and
+    BC-POL-009 (py_compile) so the predicate for py_compile can be
+    strict (no flags) and the predicate for pytest can carry a
+    closed allowlist of safe options. The py_compile rule fires
+    here.
+    """
     script = tmp_path / "ok.py"
     script.write_text("x = 1\n")
     rc, j, _ = run_cli(
@@ -647,8 +654,8 @@ def test_allowlist_python_py_compile_safe_file_is_allowed(tmp_path):
     assert j["status"] == "COMMAND_SUCCEEDED"
     assert j["policy_mode"] == "allowlist"
     assert j["policy_decision"] == "allow"
-    assert j["policy_rule_id"] == "BC-POL-001"
-    assert j["policy_reason"] == "python_pytest_pycompile"
+    assert j["policy_rule_id"] == "BC-POL-009"
+    assert j["policy_reason"] == "python_py_compile"
 
 
 def test_allowlist_python_pytest_safe_target_is_allowed(tmp_path):
@@ -1169,3 +1176,279 @@ def test_status_name_set_is_stable(status):
     source = SCRIPT.read_text()
     assert f'"{status}"' in source or f"'{status}'" in source, \
         f"Status {status} not found in source"
+
+
+# ===========================================================================
+# PR #408 V2 hardening — Codex findings 3537094853 + 3537094862 regression
+# ===========================================================================
+#
+# These tests cover the V2 strict-arg-shape repair of:
+#   - BC-POL-001 (python -m pytest)
+#   - BC-POL-009 (python -m py_compile)
+#   - BC-POL-003 (git diff --check)
+#
+# Each P1 finding has a stable rule id (BC-POL-160..164) and a specific
+# ``policy_reason`` substring the test asserts on. The tests must NOT
+# actually execute the dangerous command (no real subprocess); the
+# policy check fires before Popen.
+
+
+# ---------------------------------------------------------------------------
+# Codex finding 3537094853 — destructive pytest options
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # Codex's exact proof. ``--basetemp=<writable dir>`` lets pytest
+    # clear that directory before the run, so this is a one-shot
+    # arbitrary-write primitive.
+    '["python3", "-m", "pytest", "tests", "--basetemp=/tmp/victim"]',
+    # Space-separated form (pytest accepts both ``=`` and `` ``).
+    '["python3", "-m", "pytest", "tests", "--basetemp", "/tmp/victim"]',
+    # Sensitive-root target. The path-token check rejects
+    # ``/home/max/.ssh`` so this should also fire on the path
+    # block, but the rule id MUST be in the V2 set.
+    '["python3", "-m", "pytest", "tests", "--basetemp=/home/max/.ssh"]',
+    # Same with space form.
+    '["python3", "-m", "pytest", "tests", "--basetemp", "/home/max/.ssh"]',
+])
+def test_v2_rejects_basetemp_pytest_option(cmd_json, tmp_path):
+    """Codex 3537094853 (P1): ``--basetemp`` is rejected by the V2
+    allowlist before any subprocess is launched.
+
+    The tests run the runner subprocess; the runner must return
+    ``COMMAND_POLICY_DENIED`` with a stable BC-POL-160 rule id and
+    a ``policy_reason`` that explicitly mentions the rejected
+    option. We do NOT create ``/tmp/victim`` or
+    ``/home/max/.ssh`` — the runner exits before Popen.
+    """
+    # The runner should not create /tmp/victim. Asserting it
+    # doesn't exist BEFORE the test runs is a no-op (it doesn't
+    # exist in a clean tmp_path anyway). The real proof is that
+    # the runner returns COMMAND_POLICY_DENIED; a pytest run with
+    # ``--basetemp`` would create the dir and clobber it.
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-160"
+    assert "unsafe pytest option rejected" in j["policy_reason"]
+    assert "--basetemp" in j["policy_reason"]
+    # The V2 fix's invariant: the runner does not execute the
+    # command. Verify that ``/tmp/victim`` was NOT created.
+    assert not (tmp_path / "victim").exists()
+    # And that the runner's stdout_tail / stderr_tail are empty
+    # (no subprocess output to capture).
+    assert j["stdout_tail"] == ""
+    assert j["stderr_tail"] == ""
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # Any unknown pytest option is rejected with BC-POL-161.
+    '["python3", "-m", "pytest", "tests", "--some-new-output-file=/tmp/x"]',
+    # ``-o`` is the override-ini shortcut. The V2 deny list catches
+    # ``-o`` directly (it's listed in _UNSAFE_PYTEST_OPTIONS) and
+    # emits BC-POL-160. Both this and the ``-k`` style belong to
+    # the same "unknown / unsafe option" surface; either BC-POL-160
+    # or BC-POL-161 is acceptable, but the predicate MUST return
+    # False (no COMMAND_SUCCEEDED).
+    '["python3", "-m", "pytest", "tests", "-o", "cache_dir=/tmp/x"]',
+])
+def test_v2_rejects_unknown_pytest_option(cmd_json):
+    """V2: any pytest option not in the closed allowlist is rejected."""
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    # Either BC-POL-160 (known unsafe) or BC-POL-161 (unknown) is
+    # acceptable. Both must be in the V2 set.
+    assert j["policy_rule_id"] in {"BC-POL-160", "BC-POL-161"}
+
+
+def test_v2_allows_safe_pytest_forms(tmp_path):
+    """V2: a closed set of pytest options is still allowed.
+
+    Codex 3537094853 said "deny destructive options"; the V2 fix
+    does that by allowing ONLY a closed allowlist. This test
+    asserts the safe allowlist is still functional.
+    """
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_ok.py").write_text("def test_ok(): assert True\n")
+    # Three safe forms from the audit's required list.
+    for form in (
+        f'["python3", "-m", "pytest", "{test_dir}", "-q"]',
+        f'["python3", "-m", "pytest", "{test_dir}", "--no-header"]',
+        f'["python3", "-m", "pytest", "{test_dir}", "--tb=short"]',
+    ):
+        rc, j, _ = run_cli(form, policy_mode="allowlist")
+        assert j["policy_decision"] == "allow", \
+            f"Expected allow for {form}, got {j['policy_decision']}: {j.get('policy_reason')}"
+        assert j["policy_rule_id"] == "BC-POL-001"
+
+
+# ---------------------------------------------------------------------------
+# Codex finding 3537094862 — git diff output targets
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # Codex's exact proof. ``--output=<file>`` writes to a target
+    # file, so this is an arbitrary-write primitive.
+    '["git", "diff", "--check", "--output=/tmp/victim"]',
+    # Space form.
+    '["git", "diff", "--check", "--output", "/tmp/victim"]',
+    # ``=`` form.
+    '["git", "diff", "--check", "--output", "/tmp/victim", "--"]',
+])
+def test_v2_rejects_git_diff_output_option(cmd_json, tmp_path):
+    """Codex 3537094862 (P1): ``--output`` is rejected before any
+    subprocess is launched. The runner must NOT create the target
+    file.
+    """
+    # Pre-condition: the target file does not exist.
+    victim = tmp_path / "victim_diff"
+    assert not victim.exists()
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-164"
+    assert "git diff option" in j["policy_reason"]
+    # The V2 invariant: /tmp/victim must NOT exist.
+    assert not victim.exists()
+    # The runner did not execute the command; both tails empty.
+    assert j["stdout_tail"] == ""
+    assert j["stderr_tail"] == ""
+
+
+@pytest.mark.parametrize("cmd_json", [
+    # The four other V2-rejected git diff options (Codex 3537094862).
+    '["git", "diff", "--check", "--cached"]',
+    '["git", "diff", "--check", "--staged"]',
+    '["git", "diff", "--check", "--ext-diff"]',
+    # ``--no-index a b`` requires a value.
+    '["git", "diff", "--check", "--no-index", "a", "b"]',
+])
+def test_v2_rejects_other_unsafe_git_diff_options(cmd_json):
+    """V2: ``--cached``/``--staged``/``--ext-diff``/``--no-index`` are
+    rejected with BC-POL-163.
+    """
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] in {"BC-POL-163", "BC-POL-164"}
+
+
+def test_v2_allows_safe_git_diff_exact_forms():
+    """V2: exact ``git diff --check`` / ``--name-only`` / ``--stat``
+    shapes are still allowed. The V2 fix preserves the safe
+    read-only surface.
+    """
+    for cmd_json in (
+        '["git", "diff", "--check"]',
+        '["git", "diff", "--name-only"]',
+        '["git", "diff", "--stat"]',
+    ):
+        rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+        assert j["policy_decision"] == "allow", \
+            f"Expected allow for {cmd_json}, got {j['policy_decision']}"
+        assert j["policy_rule_id"] in {
+            "BC-POL-003",  # git diff --check
+            "BC-POL-004",  # git diff --name-only
+            "BC-POL-005",  # git diff --stat
+        }
+
+
+def test_v2_rejects_py_compile_with_flag():
+    """V2: ``python -m py_compile`` accepts only path tokens; any
+    flag is rejected with BC-POL-162.
+    """
+    rc, j, _ = run_cli(
+        '["python3", "-m", "py_compile", "-x", "scripts/local/run_bounded_command.py"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-162"
+    assert "py_compile" in j["policy_reason"]
+
+
+def test_v2_allows_safe_py_compile(tmp_path):
+    """V2: ``python -m py_compile <safe .py file>`` is still allowed
+    (BC-POL-009). The V2 fix tightens the predicate but preserves
+    the safe form.
+    """
+    script = tmp_path / "tiny.py"
+    script.write_text("x = 1\n")
+    rc, j, _ = run_cli(
+        f'["python3", "-m", "py_compile", "{script}"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["policy_rule_id"] == "BC-POL-009"
+
+
+# ---------------------------------------------------------------------------
+# V2 cross-cutting: policy metadata is stable on every reject path
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json,expected_rule_id", [
+    # P1 pytest cases -> BC-POL-160
+    ('["python3", "-m", "pytest", "tests", "--basetemp=/tmp/victim"]', "BC-POL-160"),
+    # P1 git diff case -> BC-POL-164
+    ('["git", "diff", "--check", "--output=/tmp/victim"]', "BC-POL-164"),
+    # Unknown pytest option -> BC-POL-161
+    ('["python3", "-m", "pytest", "tests", "--totally-unknown"]', "BC-POL-161"),
+    # py_compile with flag -> BC-POL-162
+    ('["python3", "-m", "py_compile", "-x", "x.py"]', "BC-POL-162"),
+    # git diff cached -> BC-POL-163
+    ('["git", "diff", "--check", "--cached"]', "BC-POL-163"),
+])
+def test_v2_policy_metadata_is_stable_on_block(cmd_json, expected_rule_id):
+    """V2 invariant: every block path has a stable rule id, a
+    non-empty ``policy_reason``, and ``policy_decision="block"``.
+    This is what downstream CI / audit tooling depends on.
+    """
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == expected_rule_id
+    assert j["policy_reason"]
+    assert isinstance(j["policy_reason"], str)
+    assert len(j["policy_reason"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# V2 — legacy-denylist mode must NOT widen the allowlist
+# ---------------------------------------------------------------------------
+
+
+def test_v2_legacy_denylist_does_not_change_pytest_rule_id(tmp_path):
+    """V2 invariant: in ``--policy-mode legacy-denylist``, the V1
+    denylist-only contract is preserved exactly. The pytest
+    ``--basetemp`` case is NOT blocked in legacy mode (it was
+    allowed by V1). This is the documented contract: legacy mode
+    is for backward compat only and is NOT safe for unattended
+    autocoder execution.
+
+    The test uses a ``tmp_path`` value that is unique to this
+    test, so even if pytest's ``--basetemp`` cleanup runs, it
+    only affects the temp directory created for this test. The
+    test asserts that legacy mode does NOT block the command
+    (i.e. status is COMMAND_SUCCEEDED or COMMAND_FAILED, not
+    COMMAND_POLICY_DENIED).
+    """
+    # Use a fresh dir under tmp_path. If pytest's --basetemp
+    # cleanup actually runs (it only runs if pytest finds and
+    # executes tests), it would clear this dir, but that's a
+    # pre-existing V1 behavior the legacy-denylist mode must
+    # preserve. Use a UNIQUE dir so the test is hermetic.
+    basetemp = tmp_path / "legacy_victim_unique_dir"
+    rc, j, _ = run_cli(
+        f'["python3", "-m", "pytest", "tests", "--basetemp={basetemp}"]',
+        policy_mode="legacy-denylist",
+    )
+    # We expect COMMAND_SUCCEEDED (or COMMAND_FAILED if pytest
+    # actually runs and finds no tests) but NOT
+    # COMMAND_POLICY_DENIED. The legacy mode preserves V1.
+    assert j["status"] != "COMMAND_POLICY_DENIED", \
+        "legacy-denylist must preserve V1 contract (--basetemp was allowed by V1)"

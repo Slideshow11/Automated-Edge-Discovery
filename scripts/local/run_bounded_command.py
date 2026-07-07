@@ -296,17 +296,37 @@ def _check_policy(command: list[str], allow_gh_api_mutation: bool) -> list[str]:
 
 # Allowlist rule ids. Each tuple is (rule_id, family, predicate).
 # A command is ALLOWED iff at least one predicate returns True.
+#
+# V2 hardening (PR #408 repair, Codex findings 3537094853 + 3537094862):
+#   - BC-POL-001 split into BC-POL-001 (pytest) and BC-POL-009 (py_compile)
+#     with strict per-option allowlists. The previous single rule treated
+#     every post-module arg as a safe path token, which let
+#     ``--basetemp=/home/max/.ssh`` (Codex 3537094853) through.
+#   - BC-POL-003 (git diff --check) tightened to exact shape
+#     ``git diff --check`` or ``git diff --check -- <safe path>...``. The
+#     previous rule let ``--output=<file>`` (Codex 3537094862) through.
+#   - BC-POL-160..164 are explicit denylist-style rule ids emitted
+#     when an allowlist predicate fails on a specific dangerous arg.
+#     Stable ids so CI can switch on them.
 ALLOWLIST_RULES: list[tuple[str, str, callable]] = [
-    # ---- python / pytest / py_compile (read-only) ----
+    # ---- python -m pytest (read-only) ----
+    # BC-POL-001. The args after ``-m pytest`` are interpreted as a
+    # strict, allowlisted option/path list. Any unknown option is
+    # blocked with BC-POL-161. Dangerous options (--basetemp,
+    # --junitxml, --cov, --html, --log-file, --override-ini, etc.) are
+    # blocked with BC-POL-160.
     (
         "BC-POL-001",
-        "python_pytest_pycompile",
-        lambda args: len(args) >= 1
-        and args[0] in ("python", "python3")
-        and len(args) >= 3
-        and args[1] == "-m"
-        and args[2] in ("pytest", "py_compile")
-        and all(_is_safe_path_token(a) for a in args[3:]),
+        "python_pytest",
+        lambda args: _check_python_pytest(args),
+    ),
+    # ---- python -m py_compile (no flags) ----
+    # BC-POL-009. Strict: only safe .py path tokens; no flags at all.
+    # Block any token starting with ``-`` with BC-POL-162.
+    (
+        "BC-POL-009",
+        "python_py_compile",
+        lambda args: _check_python_py_compile(args),
     ),
     # ---- git read-only / local-status operations ----
     (
@@ -317,30 +337,24 @@ ALLOWLIST_RULES: list[tuple[str, str, callable]] = [
         and args[1] == "status"
         and all(a in ("--short", "--porcelain", "--branch", "-b", "-s", "-sb") for a in args[2:]),
     ),
+    # BC-POL-003. Strict exact shape. Codex 3537094862: previously
+    # accepted ``--output=<file>`` which writes to arbitrary paths.
+    # Now the only safe shapes are exactly ``git diff --check`` or
+    # ``git diff --check -- <safe relative path>...``.
     (
         "BC-POL-003",
         "git_diff_check",
-        lambda args: len(args) >= 2
-        and args[0] == "git"
-        and args[1] == "diff"
-        and "--check" in args
-        and not any(a in ("--cached", "--staged") for a in args),
+        lambda args: _check_git_diff_check(args),
     ),
     (
         "BC-POL-004",
         "git_diff_name_only",
-        lambda args: len(args) == 3
-        and args[0] == "git"
-        and args[1] == "diff"
-        and args[2] == "--name-only",
+        lambda args: _check_git_diff_simple(args, "--name-only"),
     ),
     (
         "BC-POL-005",
         "git_diff_stat",
-        lambda args: len(args) == 3
-        and args[0] == "git"
-        and args[1] == "diff"
-        and args[2] == "--stat",
+        lambda args: _check_git_diff_simple(args, "--stat"),
     ),
     (
         "BC-POL-006",
@@ -361,6 +375,306 @@ ALLOWLIST_RULES: list[tuple[str, str, callable]] = [
         lambda args: args == ["git", "worktree", "list"],
     ),
 ]
+
+
+# PR #408 V2 — strict pytest option allowlist. Each value is a token
+# that the V2 hardened allowlist rule BC-POL-001 accepts verbatim. Any
+# token outside this set causes the predicate to return False, which the
+# V2 dispatcher maps to BC-POL-160 (known unsafe) or BC-POL-161
+# (unknown / not in allowlist).
+_SAFE_PYTEST_BARE_OPTIONS: frozenset[str] = frozenset({
+    "-q",
+    "-v",
+    "-vv",
+    "-x",
+    "--no-header",
+    "--tb=short",
+    "--tb=auto",
+    "--disable-warnings",
+})
+
+# Known-unsafe pytest options (PR #408 V2 hardening). Codex
+# finding 3537094853: these options can write/delete/truncate files
+# outside the test's expected output paths. Rejecting by name (not by
+# substring) so a future option that does NOT match a known-unsafe
+# token still hits the unknown-option rule (BC-POL-161) and is also
+# blocked.
+_SAFE_PYTEST_WITH_VALUE_OPTIONS: frozenset[str] = frozenset({
+    "--maxfail",
+    "-k",  # -k <expr>
+    "-m",  # -m <marker>
+})
+
+_UNSAFE_PYTEST_OPTIONS: frozenset[str] = frozenset({
+    "--basetemp",
+    "--rootdir",
+    "--confcutdir",
+    "--cache-clear",
+    "--junitxml",
+    "--html",
+    "--self-contained-html",
+    "--cov",
+    "--cov-report",
+    "--log-file",
+    "-o",  # pytest --override-ini
+    "--override-ini",
+    "--capture",  # --capture=tee-sys can write files
+})
+
+
+def _is_safe_pytest_value(token: str) -> bool:
+    """A pytest option value is safe iff it is a plain single token
+    with no shell metacharacters, no ``=``, and no leading ``-``.
+
+    Examples of safe values: ``"test_foo"``, ``"smoke"``, ``"not slow"``,
+    ``"3"`` (for --maxfail=N).
+
+    Examples of unsafe values: ``"/etc/passwd"`` (rejected by
+    _is_safe_path_token's sensitive-roots check), ``"a;b"``
+    (shell metachar), ``"-rf"`` (leading dash), ``"a=b"`` (equals
+    sign suggests an option-style value).
+    """
+    if not token or not isinstance(token, str):
+        return False
+    if "=" in token:
+        # Reject ``-k=foo`` / ``--maxfail=3`` style values. Equal
+        # signs in pytest values are not normal — they suggest
+        # option-style sneakery or shell-escape bypasses.
+        return False
+    if token.startswith("-"):
+        return False
+    # Reuse the path-token safety check (no shell metacharacters;
+    # not a sensitive absolute path).
+    return _is_safe_path_token(token)
+
+
+def _check_python_pytest(args: list[str]) -> bool:
+    """Strict predicate for ``python3 -m pytest ...``.
+
+    Accepts only a closed allowlist of pytest options, plus safe path
+    tokens. The predicate returns False for any token it cannot
+    classify. The dispatch logic in ``_check_allowlist`` then emits
+    BC-POL-160 (known unsafe) or BC-POL-161 (unknown / not in
+    allowlist) so downstream tooling can switch on the id.
+
+    Allowed arg shapes (after ``-m pytest``):
+
+    * Zero or more bare options from ``_SAFE_PYTEST_BARE_OPTIONS``
+    * Zero or more ``-k <value>`` / ``-m <value>`` /
+      ``--maxfail <value>`` triplets
+    * Zero or more safe path tokens (test files / directories)
+    * The options and paths may be interleaved in any order
+
+    Rejecting by predicate returning False (not by raising) is
+    intentional: the dispatcher in ``_check_allowlist`` records the
+    specific reason via the per-rule allow-rules iteration.
+    """
+    if not (
+        len(args) >= 1
+        and args[0] in ("python", "python3")
+        and len(args) >= 3
+        and args[1] == "-m"
+        and args[2] == "pytest"
+    ):
+        return False
+    # Strip the head; only post-pytest tokens remain.
+    tail = list(args[3:])
+    i = 0
+    while i < len(tail):
+        tok = tail[i]
+        if tok in _SAFE_PYTEST_BARE_OPTIONS:
+            i += 1
+            continue
+        if tok in _SAFE_PYTEST_WITH_VALUE_OPTIONS:
+            # These options require a value as the next token.
+            if i + 1 >= len(tail):
+                return False
+            value = tail[i + 1]
+            if not _is_safe_pytest_value(value):
+                return False
+            i += 2
+            continue
+        # Block any option that starts with ``-`` (unknown flag).
+        if tok.startswith("-"):
+            return False
+        # Otherwise treat as a path token.
+        if not _is_safe_path_token(tok):
+            return False
+        i += 1
+    return True
+
+
+def _check_python_py_compile(args: list[str]) -> bool:
+    """Strict predicate for ``python3 -m py_compile ...``.
+
+    Accepts only safe ``.py`` path tokens. Rejects any token starting
+    with ``-`` (no flags allowed). The dispatcher emits BC-POL-162
+    when this predicate returns False on a leading-dash token.
+    """
+    if not (
+        len(args) >= 1
+        and args[0] in ("python", "python3")
+        and len(args) >= 3
+        and args[1] == "-m"
+        and args[2] == "py_compile"
+    ):
+        return False
+    tail = list(args[3:])
+    if not tail:
+        # ``python -m py_compile`` with no file argument is a no-op;
+        # disallow so the operator has to think.
+        return False
+    for tok in tail:
+        if not isinstance(tok, str) or not tok:
+            return False
+        if tok.startswith("-"):
+            return False
+        if not _is_safe_path_token(tok):
+            return False
+    return True
+
+
+def _check_git_diff_simple(args: list[str], flag: str) -> bool:
+    """Strict predicate for ``git diff --<flag>`` (name-only / stat).
+
+    Accepts only the exact shape ``git diff --<flag>`` or
+    ``git diff --<flag> -- <safe relative path>...``.
+    """
+    if not (
+        len(args) >= 3
+        and args[0] == "git"
+        and args[1] == "diff"
+        and args[2] == flag
+    ):
+        return False
+    if len(args) == 3:
+        return True
+    # The only allowed continuation is ``-- <safe relative path>...``.
+    if args[3] != "--":
+        return False
+    for tok in args[4:]:
+        if not isinstance(tok, str) or not tok:
+            return False
+        if tok.startswith("-"):
+            return False
+        if not _is_safe_path_token(tok):
+            return False
+    return True
+
+
+def _check_git_diff_check(args: list[str]) -> bool:
+    """Strict predicate for ``git diff --check``.
+
+    Codex finding 3537094862 (PR #408 V2): the previous predicate
+    accepted ``--output=<file>`` which writes to arbitrary paths.
+    The V2 predicate only accepts the exact shape
+    ``git diff --check`` or ``git diff --check -- <safe relative
+    path>...``. No flags, no option, no value.
+    """
+    if not (
+        len(args) >= 3
+        and args[0] == "git"
+        and args[1] == "diff"
+        and args[2] == "--check"
+    ):
+        return False
+    if len(args) == 3:
+        return True
+    if args[3] != "--":
+        return False
+    for tok in args[4:]:
+        if not isinstance(tok, str) or not tok:
+            return False
+        if tok.startswith("-"):
+            return False
+        if not _is_safe_path_token(tok):
+            return False
+    return True
+
+
+def _classify_pytest_arg_failure(tail: list[str]) -> tuple[str, str]:
+    """Given a pytest tail (args after ``-m pytest``) that the strict
+    allowlist rejected, return (rule_id, reason).
+
+    - BC-POL-160: a known-unsafe option was used.
+    - BC-POL-161: an unknown option was used.
+    - BC-POL-099 fallback: no specific reason.
+    """
+    for tok in tail:
+        if not isinstance(tok, str):
+            continue
+        # Strip leading dashes for matching against the known-unsafe
+        # set (so ``-x``, ``--x``, and ``--xy`` are all checked).
+        bare = tok.lstrip("-")
+        for unsafe in _UNSAFE_PYTEST_OPTIONS:
+            if bare == unsafe.lstrip("-") or bare.startswith(unsafe.lstrip("-") + "="):
+                return (
+                    "BC-POL-160",
+                    f"unsafe pytest option rejected: {tok!r}",
+                )
+        if tok.startswith("-"):
+            return (
+                "BC-POL-161",
+                f"unknown pytest option rejected (not in V2 allowlist): {tok!r}",
+            )
+    return ("BC-POL-099", "pytest invocation does not match the V2 allowlist")
+
+
+def _classify_py_compile_arg_failure(tail: list[str]) -> tuple[str, str]:
+    """Given a py_compile tail that the strict allowlist rejected,
+    return (rule_id, reason). Currently only one rule: BC-POL-162
+    when a flag-style token is present.
+    """
+    for tok in tail:
+        if isinstance(tok, str) and tok.startswith("-"):
+            return (
+                "BC-POL-162",
+                f"unsafe py_compile arg rejected: flags are not allowed: {tok!r}",
+            )
+    return ("BC-POL-099", "py_compile invocation does not match the V2 allowlist")
+
+
+def _classify_git_diff_check_failure(args: list[str]) -> tuple[str, str]:
+    """Given a ``git diff --check`` argv that the strict allowlist
+    rejected, return (rule_id, reason).
+    """
+    if len(args) >= 4 and args[3] != "--":
+        bad = args[3]
+        if bad.startswith("-"):
+            # Special-case a few common output-mutation options that
+            # Codex 3537094862 called out specifically. These are
+            # explicit BC-POL-163 / BC-POL-164 / etc. ids so CI can
+            # switch on them.
+            if bad == "--output" or bad.startswith("--output="):
+                return (
+                    "BC-POL-164",
+                    f"unsafe git diff option rejected: {bad!r} writes to arbitrary files",
+                )
+            if bad in (
+                "--ext-diff",
+                "--no-index",
+                "--cached",
+                "--staged",
+                "--word-diff",
+            ):
+                return (
+                    "BC-POL-163",
+                    f"unsafe git diff option rejected: {bad!r}",
+                )
+            return (
+                "BC-POL-163",
+                f"unsafe git diff option rejected (unknown flag): {bad!r}",
+            )
+    return ("BC-POL-099", "git diff --check invocation does not match the V2 allowlist")
+
+
+# Map from a rejected-allowlist predicate to a (rule_id, reason)
+# so the dispatcher can emit a stable id even when the predicate
+# returns False. This is the V2 hardening companion to the per-rule
+# predicate table.
+_PYTEST_ALLOW_RULE_ID = "BC-POL-001"
+_PYCOMPILE_ALLOW_RULE_ID = "BC-POL-009"
+_GIT_DIFF_CHECK_ALLOW_RULE_ID = "BC-POL-003"
 
 
 def _is_safe_path_token(token: str) -> bool:
@@ -408,6 +722,13 @@ def _is_safe_git_ref(token: str) -> bool:
 def _check_allowlist(command: list[str]) -> tuple[bool, str | None, str | None]:
     """Return (allowed, rule_id, reason). If allowed, rule_id is the
     id of the allowlist rule that matched and reason is its family name.
+
+    V2 hardening (PR #408 repair): when a command looks like
+    ``python -m pytest ...`` or ``python -m py_compile ...`` or
+    ``git diff --check ...`` but is rejected by the strict predicate,
+    the dispatcher maps the rejection to a more specific rule id
+    (BC-POL-160..164) so CI can switch on it. For all other
+    rejections, BC-POL-099 is the fallback.
     """
     args = list(command)
     for rule_id, family, predicate in ALLOWLIST_RULES:
@@ -417,6 +738,32 @@ def _check_allowlist(command: list[str]) -> tuple[bool, str | None, str | None]:
         except Exception:
             # Defensive: a buggy predicate must not allow a command.
             continue
+    # Predicate rejected every rule. Try to emit a more specific
+    # rule id by inspecting the argv shape.
+    if (
+        len(args) >= 3
+        and args[0] in ("python", "python3")
+        and args[1] == "-m"
+        and args[2] == "pytest"
+    ):
+        specific_id, specific_reason = _classify_pytest_arg_failure(list(args[3:]))
+        return False, specific_id, specific_reason
+    if (
+        len(args) >= 3
+        and args[0] in ("python", "python3")
+        and args[1] == "-m"
+        and args[2] == "py_compile"
+    ):
+        specific_id, specific_reason = _classify_py_compile_arg_failure(list(args[3:]))
+        return False, specific_id, specific_reason
+    if (
+        len(args) >= 3
+        and args[0] == "git"
+        and args[1] == "diff"
+        and args[2] == "--check"
+    ):
+        specific_id, specific_reason = _classify_git_diff_check_failure(args)
+        return False, specific_id, specific_reason
     return False, "BC-POL-099", (
         "command does not match any allowlist rule (deny by default). "
         "Pass --policy-mode legacy-denylist to use the previous "
