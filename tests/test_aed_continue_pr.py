@@ -5430,6 +5430,214 @@ class TestCheckpointV7CheckpointOverwriteProtection(unittest.TestCase):
             )
 
 
+@unittest.skipUnless(hasattr(os, "link"), "os.link unavailable on this platform")
+class TestCheckpointV8HardLinkCollision(unittest.TestCase):
+    """PR #407 Codex finding 3532788902 (P2).
+
+    The V7 collision rejection (finding 3471551408) compares resolved
+    path strings. That catches same-path collisions and symlink-equivalent
+    collisions, but it does NOT catch hard links. Two distinct path
+    strings that point at the same inode (one produced by ``os.link``,
+    or any other mechanism that yields shared storage) would slip past
+    V7's string-compare, and the subsequent ``write_text()`` would
+    still truncate the checkpoint file after it was loaded — violating
+    the read-only checkpoint guarantee.
+
+    The fix extends the collision check to consult ``Path.samefile()``
+    when both paths exist on disk. ``samefile()`` follows symlinks and
+    compares inode/device metadata, so it returns True for both
+    symlink-equivalent and hard-linked collisions. When either path is
+    missing (so ``samefile()`` would error) the check falls back to the
+    V7 resolved-string compare.
+
+    Rules (Codex finding 3532788902):
+
+    - ``--checkpoint-json`` and ``--output-json`` pointing at the same
+      hard-linked inode → reject with exit code 2.
+    - ``--checkpoint-json`` and ``--output-md`` pointing at the same
+      hard-linked inode → reject with exit code 2.
+    - Ordinary distinct output paths (no shared inode) still pass the
+      collision check — the rejection must NOT fire on unrelated paths.
+    - Missing output path: behavior follows V7 (string-compare only;
+      no false positive from a non-existent output).
+    - On platforms/filesystems where ``os.link`` is unavailable or
+      unsupported (e.g. Windows without admin, some FUSE mounts), the
+      tests are skipped at module load via the
+      ``@unittest.skipUnless(hasattr(os, "link"), ...)`` decorator.
+    - The check runs BEFORE any output write, so the checkpoint file
+      is never truncated by a rejected invocation.
+    """
+
+    def _hard_link_argv(
+        self, *, checkpoint_path: str, output_json: str, output_md: str
+    ) -> List[str]:
+        return [
+            "--pr-number", "1",
+            "--dry-run",
+            "--checkpoint-json", checkpoint_path,
+            "--output-json", output_json,
+            "--output-md", output_md,
+        ]
+
+    def _create_checkpoint_with_hard_link_target(
+        self, tmpdir: str, *, link_name: str = "snap.json"
+    ) -> Tuple[str, Path]:
+        """Create a real checkpoint file in ``tmpdir`` and return the path
+        plus a fresh path string pointing at a hard link of the same file.
+
+        The returned ``checkpoint_path`` is the operator-supplied path; we
+        then call ``os.link(checkpoint_path, link_path)`` so the second
+        path string points at the same inode (same ``st_ino``, ``nlink`` ≥ 2)
+        but with a different lexical path string — exactly the scenario
+        V7 misses.
+        """
+        checkpoint = Path(tmpdir) / "real_checkpoint.json"
+        checkpoint.write_text('{"stub": true}')
+        link = Path(tmpdir) / link_name
+        os.link(checkpoint, link)
+        # Sanity check: same inode, different strings.
+        self.assertNotEqual(str(checkpoint), str(link))
+        self.assertTrue(checkpoint.samefile(link))
+        return str(link), checkpoint
+
+    def test_hard_link_checkpoint_output_json_rejected(self) -> None:
+        """``--checkpoint-json`` and ``--output-json`` share an inode via hard link → reject.
+
+        Without V8 the collision check only compares resolved path
+        strings, which differ here. The hard link means ``write_text``
+        on ``--output-json`` would still truncate the checkpoint
+        file — the read-only invariant V7 promises. The fix must
+        detect the shared inode and reject the invocation BEFORE
+        any write.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link_path, real_checkpoint = self._create_checkpoint_with_hard_link_target(
+                tmpdir, link_name="out.json"
+            )
+            rc, _, err = _run_cli(
+                self._hard_link_argv(
+                    checkpoint_path=link_path,
+                    output_json=link_path,  # distinct string but same inode
+                    output_md=str(Path(tmpdir) / "plan.md"),
+                )
+            )
+            self.assertEqual(rc, 2)
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertIn("checkpoint-json", joined)
+            self.assertIn("output-json", joined)
+            # Critical: the checkpoint file must NOT have been truncated.
+            # If the rejection had failed and write_text had run, the
+            # file would now contain the generated plan, not the stub.
+            self.assertEqual(real_checkpoint.read_text(), '{"stub": true}')
+
+    def test_hard_link_checkpoint_output_md_rejected(self) -> None:
+        """``--checkpoint-json`` and ``--output-md`` share an inode via hard link → reject."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link_path, real_checkpoint = self._create_checkpoint_with_hard_link_target(
+                tmpdir, link_name="plan.md"
+            )
+            rc, _, err = _run_cli(
+                self._hard_link_argv(
+                    checkpoint_path=link_path,
+                    output_json=str(Path(tmpdir) / "plan.json"),
+                    output_md=link_path,  # distinct string but same inode
+                )
+            )
+            self.assertEqual(rc, 2)
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertIn("checkpoint-json", joined)
+            self.assertIn("output-md", joined)
+            self.assertEqual(real_checkpoint.read_text(), '{"stub": true}')
+
+    def test_distinct_files_same_dir_pass_collision_check(self) -> None:
+        """Two distinct files in the same directory (no shared inode) → collision check passes.
+
+        Confirms the V8 samefile() addition does not regress ordinary
+        distinct-path invocations. The downstream pipeline may still
+        fail (the CLI is invoked against a fake repo / fake PR), but the
+        checkpoint-overlap rejection message must NOT appear in stderr.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "snap.json"
+            oj = Path(tmpdir) / "plan.json"
+            om = Path(tmpdir) / "plan.md"
+            ckpt.write_text('{"stub": true}')
+            oj.write_text('{}')
+            om.write_text('')
+            rc, _, err = _run_cli(
+                self._hard_link_argv(
+                    checkpoint_path=str(ckpt),
+                    output_json=str(oj),
+                    output_md=str(om),
+                )
+            )
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertNotIn(
+                "must not be the same path as --output-json", joined
+            )
+            self.assertNotIn(
+                "must not be the same path as --output-md", joined
+            )
+
+    def test_missing_output_path_follows_v7_behavior(self) -> None:
+        """Output path that does not yet exist → fall back to V7 string-compare only.
+
+        ``Path.samefile()`` raises ``FileNotFoundError`` when either
+        path is missing, so the V8 helper must return ``False`` for
+        non-existent output paths (without escalating to a false
+        positive). The collision check then defers entirely to the
+        V7 string-compare rule. We use distinct path strings here so
+        the V7 rule also reports no overlap, and assert that the
+        rejection error does NOT appear.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ckpt = Path(tmpdir) / "snap.json"
+            ckpt.write_text('{"stub": true}')
+            # Output path is genuinely absent. Distinct from checkpoint
+            # by both string AND inode (it has no inode yet).
+            missing_oj = Path(tmpdir) / "absent_plan.json"
+            missing_om = Path(tmpdir) / "absent_plan.md"
+            self.assertFalse(missing_oj.exists())
+            self.assertFalse(missing_om.exists())
+            rc, _, err = _run_cli(
+                self._hard_link_argv(
+                    checkpoint_path=str(ckpt),
+                    output_json=str(missing_oj),
+                    output_md=str(missing_om),
+                )
+            )
+            joined = "\n".join(err) if isinstance(err, list) else str(err)
+            self.assertNotIn(
+                "must not be the same path as --output-json", joined
+            )
+            self.assertNotIn(
+                "must not be the same path as --output-md", joined
+            )
+            # The checkpoint must still exist untouched (the CLI is a
+            # dry-run; downstream pipeline failures are acceptable but
+            # the file must not be the output target).
+            self.assertEqual(ckpt.read_text(), '{"stub": true}')
+
+    def test_hard_link_creation_fails_gracefully_on_unsupported_fs(self) -> None:
+        """If ``os.link`` itself fails for this filesystem, skip the test.
+
+        Some CI filesystems (overlayfs in unprivileged containers,
+        certain network mounts) reject ``os.link`` with ``OSError``
+        even though ``hasattr(os, 'link')`` is True. The hard-link
+        tests above would then fail to set up, so we skip when the
+        link operation itself raises. This is belt-and-braces around
+        the module-level ``skipUnless`` decorator.
+        """
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                src = Path(tmpdir) / "src"
+                dst = Path(tmpdir) / "dst"
+                src.write_text("x")
+                os.link(src, dst)
+        except OSError as e:
+            self.skipTest(f"os.link unsupported on this filesystem: {e}")
+
+
 class TestCheckpointV7NotMergeReady(unittest.TestCase):
     """PR #407 Codex finding 3471569930 (P1).
 

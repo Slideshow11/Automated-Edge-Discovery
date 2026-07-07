@@ -3052,6 +3052,69 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _same_file_identity(path_a: Path, path_b: Path) -> bool:
+    """Return ``True`` iff ``path_a`` and ``path_b`` refer to the same file/inode.
+
+    Codex finding 3532788902 (P2) requires the
+    ``--checkpoint-json``/``--output-json``/``--output-md`` collision
+    check to reject hard-linked paths. Two distinct path strings that
+    point at the same inode (``os.link(a, b)`` or any mechanism that
+    produces shared storage) would slip past a pure resolved-string
+    compare because ``Path.resolve()`` only canonicalizes the path
+    *string* — it does not consult inode metadata — and a subsequent
+    ``write_text()`` would still truncate the checkpoint after load.
+
+    Semantics:
+
+    * If both paths exist on disk, ``Path.samefile()`` is consulted.
+      It follows symlinks and compares inode/device, so it returns
+      ``True`` for both symlink-equivalent and hard-linked collisions.
+    * If either path does NOT exist (e.g. the operator picked an
+      output path that hasn't been created yet), ``samefile()`` would
+      raise ``FileNotFoundError``. We fall back to the V7 resolved-
+      string comparison so the prior protection is preserved —
+      ``Path.resolve()`` on a missing target is safe and yields the
+      absolute, normalized form of the path string.
+    * If ``samefile()`` raises any ``OSError`` (permission denied,
+      stat failure, broken symlink, etc.) we fall back to the V7
+      resolved-string comparison. Belt-and-braces: never let an
+      inode probe widen the false-positive surface beyond V7.
+    * The function never creates files, never writes to disk, and
+      never modifies the filesystem. It is a pure read-only probe
+      used by ``parse_args`` BEFORE any ``write_text()`` call.
+
+    Returning ``True`` here is a necessary-but-not-sufficient signal:
+    the caller still ALSO checks the V7 resolved-string equality,
+    so the strict path-string rule continues to fire even on
+    filesystems where ``samefile()`` behaves unexpectedly.
+    """
+    # V7 string-comparison fallback. We compare canonical strings
+    # BEFORE attempting samefile() so the cheap V7 rule still applies
+    # even if samefile() would error out on a missing target. When
+    # strings match we short-circuit True without touching the FS.
+    try:
+        a_resolved = path_a.resolve()
+        b_resolved = path_b.resolve()
+    except OSError:
+        a_resolved = path_a
+        b_resolved = path_b
+    if str(a_resolved) == str(b_resolved):
+        return True
+    # Both paths must exist for samefile() to be meaningful. If either
+    # is missing, the V7 string check above is the only signal we have.
+    if not a_resolved.exists() or not b_resolved.exists():
+        return False
+    try:
+        return Path(path_a).samefile(Path(path_b))
+    except OSError:
+        # Permission denied, stat failure, broken symlink, etc. The
+        # V7 string-compare above already ran; preserve its verdict
+        # (i.e. do not introduce a new false positive) by reporting
+        # ``False`` here. The V7 path-string rule remains the
+        # authoritative check.
+        return False
+
+
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     # Pre-parse: reject forbidden flags early with a clear error.
     raw = list(sys.argv[1:] if argv is None else argv)
@@ -3116,7 +3179,26 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         except OSError:
             _om_resolved = args.output_md
         _ckpt_str = str(_ckpt_resolved)
-        if _ckpt_str == str(_oj_resolved):
+        # Codex finding 3532788902 (P2): extend the collision check to
+        # catch hard-linked paths. Two distinct path strings that point
+        # at the same inode (one created via ``os.link`` or by any other
+        # mechanism that produces shared storage) would slip past a
+        # pure resolved-string compare — ``Path.resolve()`` only
+        # canonicalizes the path string itself, not the underlying
+        # filesystem object — and ``write_text()`` would still truncate
+        # the checkpoint after load. ``Path.samefile()`` consults inode
+        # metadata (and follows symlinks) so it returns True for both
+        # symlink-equivalent and hard-linked collisions. It requires the
+        # file to exist, so we fall back to the V7 resolved-string
+        # compare when either path is missing — preserving V7 behavior
+        # for output paths that don't yet exist. ``samefile()`` may
+        # also raise ``OSError`` on permission/stat failures; those
+        # cases fall back to the resolved-string compare too. The
+        # check still runs BEFORE any output write, never creates
+        # files, and does not weaken the V7 string-based protection.
+        if _ckpt_str == str(_oj_resolved) or _same_file_identity(
+            args.checkpoint_json, args.output_json
+        ):
             print(
                 "ERROR: --checkpoint-json must not be the same path as "
                 "--output-json (the checkpoint file is read-only and would "
@@ -3124,7 +3206,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                 file=sys.stderr,
             )
             sys.exit(2)
-        if _ckpt_str == str(_om_resolved):
+        if _ckpt_str == str(_om_resolved) or _same_file_identity(
+            args.checkpoint_json, args.output_md
+        ):
             print(
                 "ERROR: --checkpoint-json must not be the same path as "
                 "--output-md (the checkpoint file is read-only and would "
