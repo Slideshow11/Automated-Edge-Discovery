@@ -507,9 +507,13 @@ def _check_python_pytest(args: list[str]) -> bool:
 def _check_python_py_compile(args: list[str]) -> bool:
     """Strict predicate for ``python3 -m py_compile ...``.
 
-    Accepts only safe ``.py`` path tokens. Rejects any token starting
-    with ``-`` (no flags allowed). The dispatcher emits BC-POL-162
-    when this predicate returns False on a leading-dash token.
+    V3 (Codex 3538934786): accepts only safe ``.py`` path tokens.
+    Rejects any token starting with ``-`` (no flags allowed),
+    any token not ending in ``.py`` (the source-file suffix
+    py_compile actually compiles), and any path that fails the
+    existing safe-path checks. The dispatcher emits BC-POL-162
+    for a flag token, BC-POL-165 for a non-``.py`` suffix, and
+    BC-POL-099 as a generic fallback.
     """
     if not (
         len(args) >= 1
@@ -530,6 +534,12 @@ def _check_python_py_compile(args: list[str]) -> bool:
         if tok.startswith("-"):
             return False
         if not _is_safe_path_token(tok):
+            return False
+        # V3: require the source suffix. py_compile documents
+        # that it accepts Python source files; extensionless
+        # files compile to .pyc under __pycache__ and are an
+        # output-writing primitive outside the V3 contract.
+        if not tok.endswith(".py"):
             return False
     return True
 
@@ -622,16 +632,30 @@ def _classify_pytest_arg_failure(tail: list[str]) -> tuple[str, str]:
 
 def _classify_py_compile_arg_failure(tail: list[str]) -> tuple[str, str]:
     """Given a py_compile tail that the strict allowlist rejected,
-    return (rule_id, reason). Currently only one rule: BC-POL-162
-    when a flag-style token is present.
+    return (rule_id, reason). V3 (Codex 3538934786) extends the
+    classifier to emit a stable id for non-``.py`` suffix tokens.
+
+    - BC-POL-162: a flag-style token (``-x``, ``--foo``) is present.
+    - BC-POL-165: a token is present that is not ``-``-prefixed but
+      also does not end in ``.py`` (e.g. ``/tmp/noext``,
+      ``/tmp/file.txt``). The V3 contract is that py_compile is
+      allowed only for safe ``.py`` source paths.
+    - BC-POL-099: generic fallback (no specific reason matched).
     """
     for tok in tail:
-        if isinstance(tok, str) and tok.startswith("-"):
+        if not isinstance(tok, str):
+            continue
+        if tok.startswith("-"):
             return (
                 "BC-POL-162",
                 f"unsafe py_compile arg rejected: flags are not allowed: {tok!r}",
             )
-    return ("BC-POL-099", "py_compile invocation does not match the V2 allowlist")
+        if not tok.endswith(".py"):
+            return (
+                "BC-POL-165",
+                f"unsafe py_compile arg rejected: source path must end in .py: {tok!r}",
+            )
+    return ("BC-POL-099", "py_compile invocation does not match the V3 allowlist")
 
 
 def _classify_git_diff_check_failure(args: list[str]) -> tuple[str, str]:
@@ -980,6 +1004,17 @@ ENV_STRIP_PREFIXES: tuple[str, ...] = (
     "EMAIL_",
     "HASS_",
     "GH_",
+    # PR #408 V3 (Codex 3538934780): strip pytest-controlled env
+    # variables. Pytest reads options from a number of PYTEST_*
+    # env vars at startup (notably PYTEST_ADDOPTS, PYTEST_PLUGINS,
+    # PYTEST_DEBUG, PYTEST_CURRENT_TEST). The V2 allowlist only
+    # inspected argv, so a caller could set
+    # ``PYTEST_ADDOPTS=--basetemp=/tmp/victim`` in the parent
+    # environment and bypass the V2 argv predicate. The V3 fix
+    # strips the entire ``PYTEST_`` prefix so pytest options are
+    # never inherited from the parent. The runner then runs
+    # pytest with only its own argv options.
+    "PYTEST_",
 )
 
 # Exact names: these are always stripped regardless of prefix.

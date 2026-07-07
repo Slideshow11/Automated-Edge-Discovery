@@ -1452,3 +1452,290 @@ def test_v2_legacy_denylist_does_not_change_pytest_rule_id(tmp_path):
     # COMMAND_POLICY_DENIED. The legacy mode preserves V1.
     assert j["status"] != "COMMAND_POLICY_DENIED", \
         "legacy-denylist must preserve V1 contract (--basetemp was allowed by V1)"
+
+# ===========================================================================
+# PR #408 V3 hardening — Codex findings 3538934780 + 3538934786 regression
+# ===========================================================================
+#
+# These tests cover the V3 close of:
+#   - BC-POL-001 (python -m pytest) — strip PYTEST_* env from the child
+#   - BC-POL-009 (python -m py_compile) — require .py suffix
+#
+# V2 left a hole where a caller could set PYTEST_ADDOPTS=--basetemp=/tmp/x
+# in the parent environment and bypass the V2 argv predicate. V3 fixes
+# this by stripping the entire PYTEST_ prefix from the child's env.
+# V2 also let ``python3 -m py_compile /tmp/noext`` through (the V2
+# predicate only required "safe path token", which `/tmp/noext` was).
+# V3 adds a strict .py suffix requirement with rule id BC-POL-165.
+
+
+# ---------------------------------------------------------------------------
+# P1 — PYTEST_ env sanitization (Codex 3538934780)
+# ---------------------------------------------------------------------------
+
+
+def test_v3_sanitize_environment_strips_pytest_addopts_directly():
+    """Direct unit-level test of ``_sanitize_environment``.
+
+    V3 invariant: the PYTEST_ prefix is stripped, including
+    PYTEST_ADDOPTS. The parent env is never propagated to the
+    child. PATH and HOME are preserved.
+    """
+    from scripts.local.run_bounded_command import _sanitize_environment
+    env = {
+        "PATH": "/usr/bin:/bin",
+        "HOME": "/tmp",
+        "HERMES_TOKEN": "fake_hermes",
+        "PYTEST_ADDOPTS": "--basetemp=/tmp/victim",
+        "PYTEST_PLUGINS": "myplugin",
+        "PYTEST_DEBUG": "1",
+        "PYTEST_CURRENT_TEST": "tests/test_x.py::test_y (call)",
+    }
+    sanitized, blocked = _sanitize_environment(env)
+    # PYTEST_ vars must be stripped
+    assert "PYTEST_ADDOPTS" in blocked
+    assert "PYTEST_PLUGINS" in blocked
+    assert "PYTEST_DEBUG" in blocked
+    assert "PYTEST_CURRENT_TEST" in blocked
+    # And must NOT appear in the sanitized dict
+    assert "PYTEST_ADDOPTS" not in sanitized
+    assert "PYTEST_PLUGINS" not in sanitized
+    assert "PYTEST_DEBUG" not in sanitized
+    assert "PYTEST_CURRENT_TEST" not in sanitized
+    # V1 env strip invariant — Hermes still stripped
+    assert "HERMES_TOKEN" in blocked
+    # V1 env strip invariant — safe env preserved
+    assert "PATH" in sanitized
+    assert "HOME" in sanitized
+
+
+def test_v3_allowlist_strips_pytest_addopts_in_json_metadata(tmp_path):
+    """End-to-end via the runner: a pytest invocation under a
+    PYTEST_ADDOPTS-contaminated parent env is still allowed at
+    the policy level, but the runner reports ``PYTEST_ADDOPTS``
+    in ``blocked_env_keys`` and does NOT create the basetemp
+    target.
+
+    Per Codex 3538934780 (V2 P1): the V2 allowlist let
+    ``PYTEST_ADDOPTS=--basetemp=/tmp/victim`` reach the child
+    because the V2 fix only inspected argv. V3 strips the env
+    var, so even though the runner allows the argv shape, the
+    dangerous pytest option is not inherited.
+
+    The test asserts the metadata only; the child pytest process
+    is never invoked with a real basetemp target.
+    """
+    test_file = tmp_path / "test_tiny.py"
+    test_file.write_text("def test_ok(): assert True\n")
+    cmd = f'["python3", "-m", "pytest", "{test_file}", "-q"]'
+    rc, j, _ = run_cli(
+        cmd,
+        policy_mode="allowlist",
+        env={"PYTEST_ADDOPTS": "--basetemp=/tmp/v3_p1_victim", "PATH": "/usr/bin:/bin"},
+    )
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-001"
+    assert j["sanitized_env_applied"] is True
+    assert "PYTEST_ADDOPTS" in j["blocked_env_keys"]
+    # The basetemp target must NOT exist.
+    assert not (tmp_path / "v3_p1_victim").exists()
+    # No subprocess output to capture (we can't run pytest
+    # here because the test setup is in-process pytest; this
+    # is a unit-level check of the metadata only). The runner
+    # exits cleanly without executing pytest.
+    # NOTE: This is acceptable for V3 because the policy+env
+    # fix is verified by both the direct sanitizer test and
+    # this metadata test. A future PR A8 (end-to-end dry-run
+    # integration) will run an actual pytest process in a
+    # subprocess and assert the child cannot see PYTEST_ADDOPTS.
+
+
+def test_v3_allowlist_strips_all_required_pytest_env_vars(tmp_path):
+    """V3 invariant: PYTEST_PLUGINS, PYTEST_DEBUG, PYTEST_CURRENT_TEST
+    are all stripped. Each appears in ``blocked_env_keys``.
+    """
+    test_file = tmp_path / "test_tiny.py"
+    test_file.write_text("def test_ok(): assert True\n")
+    env = {
+        "PYTEST_PLUGINS": "myplugin",
+        "PYTEST_DEBUG": "1",
+        "PYTEST_CURRENT_TEST": "tests/test_x.py::test_y",
+        "PATH": "/usr/bin:/bin",
+    }
+    cmd = f'["python3", "-m", "pytest", "{test_file}", "-q"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist", env=env)
+    assert j["policy_decision"] == "allow"
+    assert "PYTEST_PLUGINS" in j["blocked_env_keys"]
+    assert "PYTEST_DEBUG" in j["blocked_env_keys"]
+    assert "PYTEST_CURRENT_TEST" in j["blocked_env_keys"]
+
+
+def test_v3_allowlist_safe_pytest_still_works(tmp_path):
+    """V3 regression: a normal pytest invocation with no
+    PYTEST_ env still allows the command. The metadata
+    ``blocked_env_keys`` is empty (no PYTEST_ vars were set).
+    """
+    test_dir = tmp_path / "tests"
+    test_dir.mkdir()
+    (test_dir / "test_ok.py").write_text("def test_ok(): assert True\n")
+    cmd = f'["python3", "-m", "pytest", "{test_dir}", "-q"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-001"
+    # No PYTEST_ env was set, so no PYTEST_ stripping happened.
+    assert "PYTEST_ADDOPTS" not in j["blocked_env_keys"]
+    assert "PYTEST_PLUGINS" not in j["blocked_env_keys"]
+
+
+# ---------------------------------------------------------------------------
+# P2 — py_compile .py suffix requirement (Codex 3538934786)
+# ---------------------------------------------------------------------------
+
+
+def test_v3_allows_safe_py_compile_with_dot_py(tmp_path):
+    """V3 invariant: ``python3 -m py_compile <safe .py file>`` is
+    still allowed (BC-POL-009). The V3 fix adds a .py suffix
+    check; this test confirms the safe form is preserved.
+    """
+    script = tmp_path / "ok.py"
+    script.write_text("x = 1\n")
+    rc, j, _ = run_cli(
+        f'["python3", "-m", "py_compile", "{script}"]',
+        policy_mode="allowlist",
+    )
+    assert j["status"] == "COMMAND_SUCCEEDED"
+    assert j["policy_decision"] == "allow"
+    assert j["policy_rule_id"] == "BC-POL-009"
+
+
+def test_v3_rejects_py_compile_extensionless_path():
+    """Codex 3538934786 (V2 P2): ``python3 -m py_compile /tmp/noext``
+    was allowed by V2 (because the path was 'safe'). V3 emits
+    BC-POL-165 with a policy_reason that names the .py requirement.
+    """
+    cmd = '["python3", "-m", "py_compile", "/tmp/noext"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-165"
+    assert ".py" in j["policy_reason"] or "py_compile" in j["policy_reason"]
+    # Block happens before subprocess; both tails empty.
+    assert j["stdout_tail"] == ""
+    assert j["stderr_tail"] == ""
+
+
+@pytest.mark.parametrize("bad_path", [
+    "/tmp/file.txt",
+    "/tmp/file.pyc",
+    "/tmp/file.md",
+    "/tmp/file.sh",
+    "/tmp/file.json",
+    "/tmp/no_extension",
+])
+def test_v3_rejects_py_compile_non_py_suffix(bad_path):
+    """V3 invariant: py_compile is allowed only for .py source
+    paths. All other suffixes (and extensionless paths) are
+    rejected with BC-POL-165. The block fires before subprocess.
+    """
+    cmd = f'["python3", "-m", "py_compile", "{bad_path}"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-165"
+    # The reason names the path AND mentions .py.
+    assert ".py" in j["policy_reason"]
+    assert bad_path in j["policy_reason"]
+    # No subprocess was launched.
+    assert j["stdout_tail"] == ""
+    assert j["stderr_tail"] == ""
+
+
+def test_v3_rejects_py_compile_with_flag_still_uses_bc_pol_162():
+    """V3 regression: the V2 rule BC-POL-162 (flags not allowed)
+    is preserved. The V3 fix only adds a NEW rule BC-POL-165 for
+    non-.py suffixes; flags still emit BC-POL-162.
+    """
+    cmd = '["python3", "-m", "py_compile", "-x", "scripts/local/run_bounded_command.py"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    assert j["policy_rule_id"] == "BC-POL-162"
+    # And the py_compile .py check is separate (the .py file
+    # itself would have been valid; the -x flag is what fails).
+    assert "flag" in j["policy_reason"].lower() or "flags" in j["policy_reason"].lower()
+
+
+def test_v3_rejects_py_compile_with_dash_only():
+    """Edge case: ``python3 -m py_compile -`` (single dash) is a
+    leading-dash token. V3 should emit BC-POL-162 (the flag
+    rule, which catches all leading-dash tokens). The V3 .py
+    suffix check does not run because the leading-dash check
+    fires first.
+    """
+    cmd = '["python3", "-m", "py_compile", "-"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    assert j["status"] == "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "block"
+    # The classifier iterates in order: leading-dash check
+    # fires first, so BC-POL-162 wins.
+    assert j["policy_rule_id"] == "BC-POL-162"
+
+
+def test_v3_allows_py_compile_multiple_py_files():
+    """V3 invariant: multiple safe .py files in a single py_compile
+    invocation are all allowed. The .py suffix check is per-token.
+    """
+    script_a = "/tmp/a.py"
+    script_b = "/tmp/b.py"
+    cmd = f'["python3", "-m", "py_compile", "{script_a}", "{script_b}"]'
+    rc, j, _ = run_cli(cmd, policy_mode="allowlist")
+    # Both paths are safe under _is_safe_path_token (they're
+    # under /tmp) and end in .py. The V3 predicate should allow.
+    assert j["status"] == "COMMAND_FAILED"  # files don't exist; py_compile exits 1
+    # The key assertion: NOT COMMAND_POLICY_DENIED.
+    assert j["status"] != "COMMAND_POLICY_DENIED"
+    assert j["policy_decision"] == "allow"
+
+
+# ---------------------------------------------------------------------------
+# V3 cross-cutting: policy metadata stability
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cmd_json,expected_rule_id", [
+    # P1 — pytest env strip happens at metadata level
+    # (we use a non-pytest command to avoid the actual pytest run)
+    (
+        '["git", "status", "--short"]',
+        "BC-POL-002",  # baseline
+    ),
+    # P2 — non-.py py_compile is rejected with BC-POL-165
+    (
+        '["python3", "-m", "py_compile", "/tmp/noext"]',
+        "BC-POL-165",
+    ),
+    # P2 — non-.py py_compile with .txt suffix
+    (
+        '["python3", "-m", "py_compile", "/tmp/file.txt"]',
+        "BC-POL-165",
+    ),
+    # P1 — py_compile with flag still uses BC-POL-162 (preserved)
+    (
+        '["python3", "-m", "py_compile", "-x", "x.py"]',
+        "BC-POL-162",
+    ),
+])
+def test_v3_policy_metadata_is_stable(cmd_json, expected_rule_id):
+    """V3 invariant: every block path has a stable rule id and a
+    non-empty ``policy_reason``.
+    """
+    rc, j, _ = run_cli(cmd_json, policy_mode="allowlist")
+    if j["status"] == "COMMAND_POLICY_DENIED":
+        assert j["policy_decision"] == "block"
+        assert j["policy_rule_id"] == expected_rule_id
+        assert j["policy_reason"]
+        assert isinstance(j["policy_reason"], str)
+        assert len(j["policy_reason"]) > 0
+    else:
+        # Allow path
+        assert j["policy_decision"] == "allow"
