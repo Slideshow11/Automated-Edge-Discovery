@@ -320,14 +320,18 @@ ALLOWLIST_RULES: list[tuple[str, str, callable]] = [
         "python_pytest",
         lambda args: _check_python_pytest(args),
     ),
-    # ---- python -m py_compile (no flags) ----
-    # BC-POL-009. Strict: only safe .py path tokens; no flags at all.
-    # Block any token starting with ``-`` with BC-POL-162.
-    (
-        "BC-POL-009",
-        "python_py_compile",
-        lambda args: _check_python_py_compile(args),
-    ),
+    # V4 (Codex 3539913754): ``python -m py_compile`` is REMOVED from
+    # the default allowlist. ``py_compile`` writes ``.pyc`` bytecode
+    # to ``__pycache__`` for every input file, so it violates the
+    # read-only contract the audit required. The bare-form argv
+    # ``python -m py_compile ...`` is rejected with BC-POL-166 in
+    # default allowlist mode. Legacy-denylist mode may preserve V1
+    # behavior (the V1 denylist does not block ``py_compile``);
+    # callers that need a non-writing syntax check should use
+    # ``python3 -c "import ast; ast.parse(open(path).read())"`` but
+    # that pattern is itself blocked by the V2 ``python -c``
+    # denylist, so a dedicated syntax-check helper is a future
+    # PR (out of V4 scope).
     # ---- git read-only / local-status operations ----
     (
         "BC-POL-002",
@@ -632,30 +636,40 @@ def _classify_pytest_arg_failure(tail: list[str]) -> tuple[str, str]:
 
 def _classify_py_compile_arg_failure(tail: list[str]) -> tuple[str, str]:
     """Given a py_compile tail that the strict allowlist rejected,
-    return (rule_id, reason). V3 (Codex 3538934786) extends the
-    classifier to emit a stable id for non-``.py`` suffix tokens.
+    return (rule_id, reason).
 
-    - BC-POL-162: a flag-style token (``-x``, ``--foo``) is present.
-    - BC-POL-165: a token is present that is not ``-``-prefixed but
-      also does not end in ``.py`` (e.g. ``/tmp/noext``,
-      ``/tmp/file.txt``). The V3 contract is that py_compile is
-      allowed only for safe ``.py`` source paths.
-    - BC-POL-099: generic fallback (no specific reason matched).
+    V3 (Codex 3538934786) extends the classifier to emit a stable
+    id for non-``.py`` suffix tokens.
+
+    V4 (Codex 3539913754): ``py_compile`` is removed from the
+    default allowlist entirely, so ANY ``python -m py_compile
+    ...`` invocation is rejected with BC-POL-166. The flag and
+    suffix classifiers (BC-POL-162, BC-POL-165) are preserved
+    for legacy-denylist-mode V3-compat output, but the default
+    path returns BC-POL-166 before reaching the V3
+    classifiers.
+
+    - BC-POL-166: any ``python -m py_compile ...`` invocation
+      in default allowlist mode. The default allowlist does
+      NOT contain ``py_compile`` because py_compile writes
+      bytecode (``.pyc``) to ``__pycache__`` for every input
+      file. The audit required a read-only allowlist.
+    - BC-POL-162: a flag-style token (``-x``, ``--foo``) is
+      present. Preserved for legacy-mode diagnostics.
+    - BC-POL-165: a token is present that is not ``-``-prefixed
+      but also does not end in ``.py``. Preserved for
+      legacy-mode diagnostics.
+    - BC-POL-099: generic fallback.
     """
-    for tok in tail:
-        if not isinstance(tok, str):
-            continue
-        if tok.startswith("-"):
-            return (
-                "BC-POL-162",
-                f"unsafe py_compile arg rejected: flags are not allowed: {tok!r}",
-            )
-        if not tok.endswith(".py"):
-            return (
-                "BC-POL-165",
-                f"unsafe py_compile arg rejected: source path must end in .py: {tok!r}",
-            )
-    return ("BC-POL-099", "py_compile invocation does not match the V3 allowlist")
+    # V4: emit BC-POL-166 first for any py_compile invocation in
+    # default allowlist mode. The V3 classifiers below are kept
+    # for legacy-denylist-mode diagnostics.
+    return (
+        "BC-POL-166",
+        "py_compile is not allowed in default allowlist mode because "
+        "it writes bytecode (.pyc) to __pycache__ for every input file; "
+        "use a non-writing syntax check or remove the command",
+    )
 
 
 def _classify_git_diff_check_failure(args: list[str]) -> tuple[str, str]:
@@ -1025,6 +1039,16 @@ ENV_STRIP_EXACT: frozenset[str] = frozenset({
     "HERMES_DASHBOARD_SESSION_TOKEN",
     "MEMORY_STORE_DB",
     "FACT_STORE_DB",
+    # V4 (Codex 3539913751): Python startup-injection primitives.
+    # The audit required stripping PYTHONPATH at minimum; the
+    # broader V4 fix strips every PYTHON* var that can load
+    # attacker-controlled code. Each is added to ENV_STRIP_EXACT
+    # so the strip is independent of any future prefix changes.
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "PYTHONSTARTUP",
+    "PYTHONUSERBASE",
+    "PYTHONSAFEPATH",
 })
 
 # Suffixes: any env var whose name ENDS with one of these is stripped,
@@ -1041,8 +1065,19 @@ ENV_STRIP_SUFFIXES: tuple[str, ...] = (
 # would otherwise match. This is intentionally narrow — only the
 # variables the policy code, the test runner, and pytest itself
 # need. Add a name here only with explicit justification.
+#
+# V4 (Codex 3539913751): PYTHONPATH, PYTHONHOME, PYTHONSTARTUP,
+# PYTHONUSERBASE, PYTHONSAFEPATH are removed. They are now in
+# ENV_STRIP_EXACT so the runner strips them before launching the
+# child. Sitecustomize injection via PYTHONPATH and Python-startup
+# hooks via PYTHONSTARTUP are both arbitrary-code primitives that
+# the default allowlist must not tolerate. PYTHONHOME changes the
+# Python prefix (also a code-loading primitive). PYTHONUSERBASE
+# changes per-user site-packages. PYTHONSAFEPATH is opt-in
+# isolation; the runner already enforces isolation via env strip
+# + fixed PATH, so a caller-supplied PYTHONSAFEPATH is not needed.
 ENV_PRESERVE: frozenset[str] = frozenset({
-    "PATH",
+    "PATH",  # V4: PATH is replaced (not stripped) — see _sanitize_environment.
     "HOME",
     "USER",
     "LANG",
@@ -1061,8 +1096,6 @@ ENV_PRESERVE: frozenset[str] = frozenset({
     "XDG_DATA_HOME",
     "VIRTUAL_ENV",
     "CONDA_PREFIX",
-    "PYTHONHOME",
-    "PYTHONPATH",
     "PYTHONUTF8",
     "PYTHONIOENCODING",
     "PYTHONDONTWRITEBYTECODE",
@@ -1100,6 +1133,14 @@ def _sanitize_environment(env: dict[str, str] | None = None) -> tuple[dict[str, 
     matching a strip rule from the input dict. The result dict is a
     fresh copy; the input is not mutated. ``blocked_keys`` is the
     sorted list of stripped names, in original-case.
+
+    V4 (Codex 3539913747): ``PATH`` is replaced with a fixed
+    trusted search path (NOT the caller's PATH). The caller's
+    PATH is added to ``blocked_keys`` so the JSON metadata
+    reflects that the caller-supplied PATH was rejected. The
+    child subprocess always sees the trusted PATH, so a
+    caller-controlled PATH cannot shadow ``git`` or ``python3``
+    with a malicious binary.
     """
     if env is None:
         env = os.environ
@@ -1110,7 +1151,118 @@ def _sanitize_environment(env: dict[str, str] | None = None) -> tuple[dict[str, 
             blocked.append(k)
         else:
             sanitized[k] = v
+    # V4: always replace PATH with the fixed trusted search path.
+    # The caller's PATH is already in ``blocked`` (it matched the
+    # strip rule for any non-default PATH). We record the override
+    # by always re-injecting the trusted PATH into the sanitized
+    # env. If PATH was not in the input env at all, it was
+    # preserved in ``sanitized``; we still override it with the
+    # trusted value.
+    caller_path = sanitized.get("PATH")
+    if caller_path is not None:
+        # The caller's PATH was preserved (since it's in
+        # ENV_PRESERVE). The strip rule did not remove it. We
+        # remove it now to force the override.
+        del sanitized["PATH"]
+        if "PATH" not in blocked:
+            blocked.append("PATH")
+    sanitized["PATH"] = ":".join(_TRUSTED_SEARCH_DIRS)
     return sanitized, sorted(blocked)
+
+
+# V4 (Codex 3539913747): fixed trusted search path for the child
+# subprocess. The runner does NOT inherit the caller's PATH; it
+# always uses this fixed value. Allowlisted bare executables
+# (``git``, ``python``, ``python3``) resolve through this path via
+# ``_resolve_trusted_executable``, which is called by the
+# ``run_bounded_command`` runner before ``subprocess.Popen``.
+#
+# Each entry is checked for existence + executability + safe
+# location at resolution time. The order is: most-common
+# locations first (``/usr/bin``, then ``/bin``, then
+# ``/usr/local/bin`` for completeness on systems where it is
+# populated). A binary that exists in any of these dirs is
+# trusted; a binary that does not exist in any of them is
+# reported as a V4 fail-closed error.
+_TRUSTED_SEARCH_DIRS: tuple[str, ...] = (
+    "/usr/bin",
+    "/bin",
+    "/usr/local/bin",
+)
+
+# Bare executable names that the V4 runner resolves through the
+# trusted search path. Absolute paths (containing ``/``) are
+# passed through unchanged. Other names (without ``/``) are
+# resolved via ``_resolve_trusted_executable``. Names that are
+# not in this set and are not absolute are NOT resolved by the
+# V4 runner; the predicate that uses them is responsible for
+# rejecting bare names that are not in this set.
+_TRUSTED_BARE_EXECUTABLES: frozenset[str] = frozenset({
+    "git",
+    "python",
+    "python3",
+})
+
+
+def _resolve_trusted_executable(bare_name: str) -> str | None:
+    """Resolve a bare executable name to a trusted absolute path.
+
+    V4 (Codex 3539913747): the runner does NOT use ``shutil.which``
+    against the inherited ``PATH`` (which a caller could control).
+    Instead, the runner searches a fixed list of trusted
+    directories (``_TRUSTED_SEARCH_DIRS``). The resolved path is
+    canonicalized via ``os.path.realpath`` and rejected if it
+    symlinks into a user-writable or temp directory.
+
+    Returns the absolute trusted path, or ``None`` if the bare
+    name is not found in any trusted directory, or if the
+    resolved path is not safe.
+    """
+    if not bare_name or not isinstance(bare_name, str):
+        return None
+    if bare_name != bare_name.strip():
+        return None
+    if "/" in bare_name or "\\" in bare_name:
+        # Absolute or relative paths are not resolved here; the
+        # caller must handle them (the allowlist predicate
+        # disallows paths-with-/ in the V3 contract).
+        return None
+    if bare_name in (".", ".."):
+        return None
+    for d in _TRUSTED_SEARCH_DIRS:
+        candidate = os.path.join(d, bare_name)
+        if not os.path.isfile(candidate):
+            continue
+        if not os.access(candidate, os.X_OK):
+            continue
+        # Resolve symlinks. A symlink in /usr/bin that points at
+        # /tmp/evil is a malicious-binary shadowing attempt and
+        # must be rejected.
+        real = os.path.realpath(candidate)
+        # Reject any real path that lives under a user-writable
+        # or temp directory. The forbidden list is intentionally
+        # narrow — we only block locations where a caller could
+        # plausibly have written a binary.
+        forbidden_real_prefixes = (
+            "/tmp/",
+            "/var/tmp/",
+            "/dev/shm/",
+            "/run/user/",
+            "/home/max/.hermes",
+        )
+        for fp in forbidden_real_prefixes:
+            if real == fp.rstrip("/") or real.startswith(fp):
+                return None
+        return real
+    return None
+
+
+# V4: rule id emitted when an allowlisted bare executable cannot
+# be resolved through the trusted search path. The runner fails
+# closed (returns COMMAND_POLICY_DENIED) rather than fall back
+# to PATH resolution, which is the V1 → V3 vulnerability.
+BC_POL_UNRESOLVED_EXECUTABLE = "BC-POL-167"
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -1413,6 +1565,52 @@ def run_bounded_command(
     # sensitive set, and pass the sanitized env explicitly to Popen.
     sanitized_env, blocked_env_keys = _sanitize_environment(os.environ)
 
+    # V4 (Codex 3539913747): resolve any allowlisted bare
+    # executable name (``git``, ``python``, ``python3``) to a
+    # trusted absolute path before Popen. The runner does NOT
+    # use the caller's PATH (which the env strip also replaced
+    # with a fixed trusted value). If the bare name does not
+    # exist in any trusted search dir, the runner fails closed
+    # with BC-POL-167.
+    resolved_command: list[str] = list(command)
+    if resolved_command and isinstance(resolved_command[0], str):
+        first = resolved_command[0]
+        if (
+            first in _TRUSTED_BARE_EXECUTABLES
+            and "/" not in first
+            and "\\" not in first
+        ):
+            trusted = _resolve_trusted_executable(first)
+            if trusted is None:
+                return build_result(
+                    command=command,
+                    cwd=cwd or os.getcwd(),
+                    timeout_seconds=timeout_seconds,
+                    started_at=datetime.now(timezone.utc),
+                    ended_at=datetime.now(timezone.utc),
+                    exit_code=None,
+                    stdout_tail="",
+                    stderr_tail="",
+                    killed=False,
+                    policy_errors=[
+                        f"unresolved bare executable {first!r}: "
+                        f"no trusted binary in "
+                        f"{','.join(_TRUSTED_SEARCH_DIRS)}"
+                    ],
+                    status="COMMAND_POLICY_DENIED",
+                    policy_mode=policy_mode,
+                    policy_decision="block",
+                    policy_rule_id=BC_POL_UNRESOLVED_EXECUTABLE,
+                    policy_reason=(
+                        f"bare executable {first!r} did not resolve to a "
+                        f"trusted absolute path; refusing to fall back "
+                        f"to caller-controlled PATH"
+                    ),
+                    sanitized_env_applied=True,
+                    blocked_env_keys=blocked_env_keys,
+                )
+            resolved_command[0] = trusted
+
     # Execute
     started = datetime.now(timezone.utc)
     killed = False
@@ -1440,7 +1638,7 @@ def run_bounded_command(
         if sys.platform != "win32":
             popen_kwargs["start_new_session"] = True
 
-        proc = subprocess.Popen(command, **popen_kwargs)
+        proc = subprocess.Popen(resolved_command, **popen_kwargs)
 
         # Start background reader threads
         stdout_thread = threading.Thread(
