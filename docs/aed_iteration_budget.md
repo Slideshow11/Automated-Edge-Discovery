@@ -31,9 +31,21 @@ agent code.
 
 There are three layers, in priority order (highest wins):
 
-1. **CLI argument** (not currently exposed for `max_turns`, but the underlying class accepts it).
+1. **CLI argument** (Hermes CLI exposes `max_turns` internally, but the installed
+   command-line wrapper may not surface a `--max-turns` flag; check `hermes --help`
+   before relying on a CLI override).
 2. **`HERMES_MAX_ITERATIONS` environment variable** (supported in `cli.py:3856-3862`).
 3. **`agent.max_turns` in `~/.hermes/config.yaml`** (line 14).
+
+### CLI caveat for `max_turns`
+
+The installed Hermes command-line wrapper may not expose a
+`--max-turns` flag, even though the underlying agent class
+accepts `max_turns` as a constructor argument. Before relying on
+a CLI flag, check `hermes --help` to confirm the exact flag name
+on your installation. If the flag is not present, use
+`HERMES_MAX_ITERATIONS` or the config-file value instead — do not
+assume a `--max-turns` override will be honored.
 
 ### Normal mode (default)
 
@@ -79,28 +91,47 @@ agent:
 
 ## 3. Validation
 
-After raising the budget, verify the change took effect:
+After raising the budget, verify the change took effect using
+**safe, bounded checks only**. Never launch a real Hermes worker
+with a huge iteration value (e.g. `999999`) for validation —
+`head`/`tail` only limit displayed output, not the upstream
+process, and the run can keep billing model calls.
+
+### Preferred: inspect the resolved config value
+
+The cheapest validation does not run Hermes at all. Read the
+value that will actually be passed to the agent:
 
 ```bash
-HERMES_MAX_ITERATIONS=200 hermes run --task "test the budget" --max-turns 1 --verbose
+grep -E 'max_turns|max_iterations' ~/.hermes/config.yaml
+printenv HERMES_MAX_ITERATIONS
 ```
 
-The agent's startup banner or the `/status` slash command should
-report the new limit. The 90/90 message should not appear before
-200 iterations.
+This confirms the precedence layer you intend (env var, config
+file, or hardcoded fallback of 90) is the one that will win.
 
-To confirm the hardcoded fallback is NOT what you want:
+### Bounded live check (only if Hermes supports a no-op task)
 
 ```bash
-HERMES_MAX_ITERATIONS=999999 hermes run --task "..." 2>&1 | head -20
-# Should NOT print "Iteration budget reached (999999/999999)"
-# Should print "Iteration budget reached (<actual_count>/999999)"
+HERMES_MAX_ITERATIONS=200 hermes run --task "print the resolved max iteration budget and exit"
 ```
 
-The actual count is bounded by your model provider's TPM/RPM, not
-by the Hermes config. Setting a very high `HERMES_MAX_ITERATIONS`
-is safe in the sense that the loop terminates, but it does not
-override the provider rate limit.
+Use this **only if** your Hermes build supports a task that
+exits immediately without making real model calls. Otherwise
+treat it as an operator manual check, not an automated CI step.
+Always pair live checks with a wall-clock timeout
+(e.g. `timeout 30s hermes run ...`) so a stuck run cannot keep
+billing.
+
+### What NOT to do
+
+- Do **not** validate by setting `HERMES_MAX_ITERATIONS=999999`
+  and piping to `head -20`. The upstream Hermes process keeps
+  running; only the displayed output is truncated.
+- Do **not** disable the iteration cap. Hermes always enforces
+  at least the hardcoded fallback (90).
+- Do **not** run heavy-mode (`HERMES_MAX_ITERATIONS=200`)
+  without a wall-clock timeout for unattended runs.
 
 ## 4. Hard caps and safety
 
