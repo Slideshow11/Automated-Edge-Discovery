@@ -6841,5 +6841,275 @@ class TestCheckpointV9LiveBaseEvidenceMissing(unittest.TestCase):
         self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
 
 
+# ---------------------------------------------------------------------------
+# V10 — PR #407 Codex findings 3563138732 (P2) and 3563138735 (P3)
+# Exact-head review 4676465971 on V9 head 832ca5d2558da4e70a4b77629c629d56c1ba234c.
+# ---------------------------------------------------------------------------
+
+
+def _make_envelope_with_status_skip(
+    *,
+    terminal_state: str = "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+) -> Dict[str, Any]:
+    """Build a loaded, validated envelope whose ``cross_reference.status``
+    is ``"skipped"`` so ``assemble_plan``'s fallback re-cross-reference
+    path will fire.
+
+    Mirrors the helper the production code path uses: the envelope
+    starts at the canonical "loaded + clean" cross-reference state but
+    has NOT yet been cross-referenced against live data (status is the
+    early-exit sentinel ``"skipped"``). When the fallback at
+    ``assemble_plan`` runs, it invokes ``_cross_reference_checkpoint``
+    using ``pr.get("base_sha")`` as live-main-sha (V10 fix).
+    """
+    payload = _make_checkpoint_payload(
+        terminal_state=terminal_state,
+        current_head="abcdef1234567890abcdef1234567890abcdef12",
+        last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+        last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+    )
+    envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+    acp._validate_checkpoint_payload(envelope)
+    # Force cross_reference into the "skipped" sentinel so the fallback
+    # path inside assemble_plan re-runs cross-reference using
+    # ``pr.get("base_sha")``. (Pre-cross-reference envelopes have this
+    # shape; the production main() also writes the final values after
+    # running cross-reference, but the fallback path in assemble_plan
+    # is what fires when the envelope arrived without a final
+    # cross-reference pass.)
+    envelope["cross_reference"]["status"] = "skipped"
+    envelope["cross_reference"]["blockers"] = []
+    envelope["cross_reference"]["warnings"] = []
+    envelope["combination"]["merge_ready_both_sides"] = False
+    envelope["combination"]["live_state_agrees"] = True
+    envelope["combination"]["blockers"] = []
+    envelope["combination"]["warnings"] = []
+    return envelope
+
+
+class TestCheckpointV10FallbackBaseEvidence(unittest.TestCase):
+    """PR #407 Codex finding 3563138732 (P2, V10).
+
+    The fallback re-cross-reference path inside ``assemble_plan``
+    (entered when ``cross_reference.status == "skipped"`` for a
+    loaded/present envelope) previously forwarded an undefined
+    ``live_main_sha`` local. After V10, it forwards
+    ``pr.get("base_sha")``. This must:
+
+    - allow clean cross-reference when ``pr["base_sha"]`` is present;
+    - preserve the V9 ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING``
+      fail-closed behavior when ``pr["base_sha"]`` is missing or blank;
+    - never mask truly missing live-base evidence.
+    """
+
+    def _pr_with_base_sha(self, base_sha: Optional[str]) -> Dict[str, Any]:
+        pr = _make_pr_response(state="OPEN", draft=False)
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = base_sha
+        return pr
+
+    def _plan_for_envelope(self, envelope: Dict[str, Any], pr: Dict[str, Any]) -> Any:
+        return acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "issue_comment_xxx"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-07-11T05:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+
+    def test_fallback_with_nonblank_base_sha_no_live_base_evidence_blocker(self) -> None:
+        """Nonblank ``pr["base_sha"]`` + merge-ready checkpoint → fallback
+        cross-reference must use it, so no CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING
+        blocker is emitted and ``merge_ready_both_sides`` is True."""
+        pr = self._pr_with_base_sha("c720b6810b2e5216c170eb55734af1df5df4704b")
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        # The cross-reference envelope itself must also be clean.
+        self.assertEqual(envelope["cross_reference"]["status"], "clean")
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_with_missing_base_sha_still_emits_blocker(self) -> None:
+        """``pr["base_sha"]`` missing (None) → V9 fail-closed guard fires
+        even from the fallback path."""
+        pr = self._pr_with_base_sha(None)
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_with_blank_base_sha_still_emits_blocker(self) -> None:
+        """``pr["base_sha"]`` empty string is treated as missing → V9 guard fires."""
+        pr = self._pr_with_base_sha("")
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_with_whitespace_base_sha_still_emits_blocker(self) -> None:
+        """``pr["base_sha"]`` whitespace-only is treated as missing → V9 guard fires."""
+        pr = self._pr_with_base_sha("   ")
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_non_merge_ready_terminal_no_false_blocker(self) -> None:
+        """A non-merge-ready terminal state with no base_sha must not
+        spuriously emit ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` (V9
+        scoped the new blocker to merge-ready terminals only)."""
+        pr = self._pr_with_base_sha(None)
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="HOLD_OPERATOR_REQUIRED",
+        )
+        plan = self._plan_for_envelope(envelope, pr)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+
+class TestCheckpointV10SuppressMisleadingNotMergeReady(unittest.TestCase):
+    """PR #407 Codex finding 3563138735 (P3, V10).
+
+    ``CHECKPOINT_NOT_MERGE_READY`` was firing on top of V9's
+    ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` whenever a checkpoint
+    recorded the merge-authorizing terminal state
+    ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` but
+    ``merge_ready_both_sides`` was forced to False by a real
+    cross-reference blocker. The misleading duplicate made the
+    operator see "terminal_state=… is not a merge-ready authorization
+    state" for a checkpoint that IS the merge-ready authorization
+    state.
+
+    V10 fix: suppress ``CHECKPOINT_NOT_MERGE_READY`` when
+    ``ckpt_terminal_for_block == MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``.
+    Non-authorizing terminal states still fire the blocker as before.
+    """
+
+    def _pr_clean_open(self) -> Dict[str, Any]:
+        pr = _make_pr_response(state="OPEN", draft=False)
+        pr["merge_state_status"] = "CLEAN"
+        return pr
+
+    def _plan_with_loaded_envelope(
+        self, envelope: Dict[str, Any], pr: Dict[str, Any]
+    ) -> Any:
+        return acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "issue_comment_xxx"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-07-11T05:00:00Z",
+            checkpoint_envelope=envelope,
+        )
+
+    def test_merge_ready_terminal_with_real_blocker_suppresses_misleading(self) -> None:
+        """``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` + V9 live-base blocker:
+        real blocker remains, ``CHECKPOINT_NOT_MERGE_READY`` is NOT appended.
+        """
+        pr = self._pr_clean_open()
+        # Force base_sha to None to provoke V9 CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING.
+        pr["base_sha"] = None
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(envelope, pr, live_main_sha=pr.get("base_sha"))
+        # Sanity precondition: real blocker is present.
+        kinds_xref = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds_xref)
+
+        plan = self._plan_with_loaded_envelope(envelope, pr)
+        kinds_plan = [b["kind"] for b in plan.blockers_for_merge]
+        # Real blocker must remain.
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds_plan)
+        # Misleading generic blocker must NOT be appended for the
+        # merge-authorizing terminal state.
+        self.assertNotIn("CHECKPOINT_NOT_MERGE_READY", kinds_plan)
+        # Merge readiness remains False.
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_non_authorizing_terminal_still_emits_not_merge_ready(self) -> None:
+        """Non-authorizing terminal states (``HOLD_OPERATOR_REQUIRED``,
+        ``FAILED``, ``PR_MERGED_AND_CLOSED_OUT`` etc.) keep the
+        ``CHECKPOINT_NOT_MERGE_READY`` behavior — V10 does NOT
+        suppress for those.
+        """
+        pr = self._pr_clean_open()
+        # Even with a valid base_sha, a non-authorizing terminal
+        # state + clean cross-reference produces
+        # ``merge_ready_both_sides=False`` and the plan must surface
+        # ``CHECKPOINT_NOT_MERGE_READY``.
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        payload = _make_checkpoint_payload(
+            terminal_state="HOLD_OPERATOR_REQUIRED",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(
+            envelope, pr, live_main_sha=pr.get("base_sha")
+        )
+        # Sanity: cross-reference is clean (no real blocker), but
+        # ``merge_ready_both_sides`` is False because terminal state
+        # is non-authorizing.
+        kinds_xref = [b["kind"] for b in envelope["cross_reference"]["blockers"]]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds_xref)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+        plan = self._plan_with_loaded_envelope(envelope, pr)
+        kinds_plan = [b["kind"] for b in plan.blockers_for_merge]
+        # Generic blocker must still fire for non-authorizing terminal.
+        self.assertIn("CHECKPOINT_NOT_MERGE_READY", kinds_plan)
+
+    def test_merge_ready_terminal_with_clean_cross_reference_no_blockers(self) -> None:
+        """``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` + valid base_sha +
+        clean cross-reference → no blockers at all, ``merge_ready_both_sides=True``.
+        This is the canonical happy-path preserved by V10 (no behavior change
+        for the clean case).
+        """
+        pr = self._pr_clean_open()
+        pr["base_sha"] = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        payload = _make_checkpoint_payload(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+            current_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_pr_head="abcdef1234567890abcdef1234567890abcdef12",
+            last_verified_primary_head="c720b6810b2e5216c170eb55734af1df5df4704b",
+        )
+        envelope = acp._load_checkpoint_payload(_write_checkpoint_tmp(None, payload))
+        acp._validate_checkpoint_payload(envelope)
+        acp._cross_reference_checkpoint(
+            envelope, pr, live_main_sha=pr.get("base_sha")
+        )
+        plan = self._plan_with_loaded_envelope(envelope, pr)
+        kinds_plan = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_NOT_MERGE_READY", kinds_plan)
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds_plan)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+
 if __name__ == "__main__":
     unittest.main()

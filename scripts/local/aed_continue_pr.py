@@ -2530,10 +2530,23 @@ def assemble_plan(
     if checkpoint_envelope.get("cross_reference", {}).get("status") == "skipped" \
             and checkpoint_envelope.get("present") \
             and checkpoint_envelope.get("load_status") == "loaded":
+        # Codex finding 3563138732 (P2, V10): when ``assemble_plan`` is
+        # entered via the fallback re-cross-reference path (envelope
+        # arrived with ``cross_reference.status == "skipped"``), the
+        # caller ``main()`` did NOT forward ``live_main_sha`` to us, and
+        # this function has no ``live_main_sha`` parameter — so passing
+        # the bare name would have raised ``NameError``. The minimal
+        # safe fix is to use ``pr.get("base_sha")`` as the live-base
+        # evidence, mirroring what ``main()`` already passes to the
+        # first ``_cross_reference_checkpoint`` call (line ~3497). When
+        # ``pr["base_sha"]`` is missing/blank, ``_cross_reference_checkpoint``
+        # still receives a falsy value and V9's
+        # ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` guard fires — the
+        # fail-closed behavior is preserved.
         _cross_reference_checkpoint(
             checkpoint_envelope,
             pr,
-            live_main_sha=live_main_sha,
+            live_main_sha=pr.get("base_sha"),
             live_repo=live_repo,
         )
     # Surface checkpoint load and validation errors as blockers. This
@@ -2619,6 +2632,28 @@ def assemble_plan(
             and validation_status == "clean"
             and not merge_ready_both_sides
             and ckpt_terminal_for_block is not None
+            # Codex finding 3563138735 (P3, V10): suppress the
+            # generic ``CHECKPOINT_NOT_MERGE_READY`` blocker when
+            # the checkpoint's recorded terminal state is the
+            # merge-authorizing state
+            # (``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``). In
+            # that case ``merge_ready_both_sides=False`` is caused
+            # by a real cross-reference blocker (e.g. V9's
+            # ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING``), and
+            # appending the generic "not merge-ready" blocker on
+            # top would misclassify the actionable blocker — the
+            # operator would see "terminal_state=…is not a
+            # merge-ready authorization state" for a checkpoint
+            # that IS the merge-ready authorization state. The
+            # real cross-reference blocker(s) above remain
+            # surfaced, fail-closed behavior is preserved, and
+            # ``merge_ready_both_sides`` remains false. For
+            # non-authorizing terminal states
+            # (``HOLD_OPERATOR_REQUIRED``, ``FAILED``,
+            # ``PR_MERGED_AND_CLOSED_OUT``, etc.) the generic
+            # blocker continues to fire as before.
+            and ckpt_terminal_for_block
+            != "MERGE_READY_AWAITING_HUMAN_AUTHORIZATION"
         ):
             blockers_for_merge.append(
                 {
