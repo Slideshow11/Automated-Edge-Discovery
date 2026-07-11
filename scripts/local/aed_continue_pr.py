@@ -2530,23 +2530,31 @@ def assemble_plan(
     if checkpoint_envelope.get("cross_reference", {}).get("status") == "skipped" \
             and checkpoint_envelope.get("present") \
             and checkpoint_envelope.get("load_status") == "loaded":
-        # Codex finding 3563138732 (P2, V10): when ``assemble_plan`` is
-        # entered via the fallback re-cross-reference path (envelope
-        # arrived with ``cross_reference.status == "skipped"``), the
-        # caller ``main()`` did NOT forward ``live_main_sha`` to us, and
-        # this function has no ``live_main_sha`` parameter — so passing
-        # the bare name would have raised ``NameError``. The minimal
-        # safe fix is to use ``pr.get("base_sha")`` as the live-base
-        # evidence, mirroring what ``main()`` already passes to the
-        # first ``_cross_reference_checkpoint`` call (line ~3497). When
-        # ``pr["base_sha"]`` is missing/blank, ``_cross_reference_checkpoint``
-        # still receives a falsy value and V9's
-        # ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` guard fires — the
-        # fail-closed behavior is preserved.
+        # Codex finding 3563138732 (P2, V10) + finding 3563217941
+        # (P2, V11): when ``assemble_plan`` is entered via the
+        # fallback re-cross-reference path (envelope arrived with
+        # ``cross_reference.status == "skipped"``), the caller may
+        # have supplied an explicit ``live_main_sha`` value (this
+        # function DOES accept a ``live_main_sha`` parameter — see
+        # the signature at line 2503). The V10 fix used
+        # ``pr.get("base_sha")`` only, which discarded any explicit
+        # value the caller passed. The V11 fix prefers the explicit
+        # value (treating blank/whitespace-only as absent, matching
+        # the canonical ``live_main_sha_present`` check inside
+        # ``_cross_reference_checkpoint``) and only falls back to
+        # ``pr.get("base_sha")`` when the explicit value is absent or
+        # blank. When both are absent, ``_cross_reference_checkpoint``
+        # still receives ``None`` and V9's
+        # ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` guard fires —
+        # the fail-closed behavior is preserved.
         _cross_reference_checkpoint(
             checkpoint_envelope,
             pr,
-            live_main_sha=pr.get("base_sha"),
+            live_main_sha=(
+                live_main_sha
+                if isinstance(live_main_sha, str) and live_main_sha.strip()
+                else pr.get("base_sha")
+            ),
             live_repo=live_repo,
         )
     # Surface checkpoint load and validation errors as blockers. This

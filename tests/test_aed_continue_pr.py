@@ -7111,5 +7111,197 @@ class TestCheckpointV10SuppressMisleadingNotMergeReady(unittest.TestCase):
         self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
 
 
+# ---------------------------------------------------------------------------
+# V11 — PR #407 Codex finding 3563217941 (P2)
+# Exact-head review 4676562477 on V10 head 797846f43f7545e932560ddd06d6f72474c7b866.
+# ---------------------------------------------------------------------------
+
+
+class TestCheckpointV11PreferExplicitLiveMainSha(unittest.TestCase):
+    """PR #407 Codex finding 3563217941 (P2, V11).
+
+    V10 changed the fallback ``_cross_reference_checkpoint`` call to
+    use ``live_main_sha=pr.get("base_sha")`` directly, which discarded
+    the explicit ``live_main_sha`` parameter that ``assemble_plan``
+    accepts (line 2503). An in-process caller supplying a valid
+    ``live_main_sha`` but a PR dict without ``base_sha`` would still
+    get ``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`` and a blocked merge.
+
+    V11 fix: ``live_main_sha=live_main_sha or pr.get("base_sha")`` —
+    prefer the explicit value, fall back to ``pr["base_sha"]`` when
+    explicit value is absent/blank, and let the V9 guard fire when
+    both are absent.
+
+    These tests prove the explicit-over-fallback semantics while
+    preserving all V10 fall-back coverage.
+    """
+
+    def _pr_with_base_sha(self, base_sha: Optional[str]) -> Dict[str, Any]:
+        pr = _make_pr_response(state="OPEN", draft=False)
+        pr["merge_state_status"] = "CLEAN"
+        pr["base_sha"] = base_sha
+        return pr
+
+    def _plan_for_envelope(
+        self,
+        envelope: Dict[str, Any],
+        pr: Dict[str, Any],
+        *,
+        live_main_sha: Optional[str] = None,
+    ) -> Any:
+        return acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "issue_comment_xxx"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-07-11T05:30:00Z",
+            checkpoint_envelope=envelope,
+            live_main_sha=live_main_sha,
+        )
+
+    def test_explicit_live_main_sha_used_when_pr_base_sha_missing(self) -> None:
+        """Explicit ``live_main_sha`` is preferred over missing
+        ``pr["base_sha"]`` — V11's primary fix.
+
+        With V10 this case was wrongly blocked (because the fallback
+        used ``pr.get("base_sha")`` = ``None`` and discarded the
+        explicit value). V11 makes the explicit value win.
+        """
+        pr = self._pr_with_base_sha(None)  # No base_sha in PR dict.
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        explicit = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha=explicit)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        # V11: explicit value is used; no V9 blocker is fired.
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        # Cross-reference completes cleanly.
+        self.assertEqual(envelope["cross_reference"]["status"], "clean")
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_explicit_live_main_sha_used_when_pr_base_sha_present(self) -> None:
+        """When BOTH ``live_main_sha`` and ``pr["base_sha"]`` are present,
+        the explicit ``live_main_sha`` is preferred.
+        """
+        pr = self._pr_with_base_sha(
+            "1111111111111111111111111111111111111111"
+        )  # Different SHA from explicit.
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        explicit = "c720b6810b2e5216c170eb55734af1df5df4704b"
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha=explicit)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+        # The explicit SHA was forwarded to cross-reference; the
+        # checkpoint's ``last_verified_primary_head`` matches the
+        # explicit value (not ``pr["base_sha"]``), so no head-mismatch
+        # blocker fires either.
+        cross_ref_blockers = [
+            b["kind"] for b in envelope["cross_reference"]["blockers"]
+        ]
+        self.assertNotIn("CHECKPOINT_HEAD_MISMATCH", cross_ref_blockers)
+
+    def test_fallback_to_pr_base_sha_when_explicit_live_main_sha_is_none(self) -> None:
+        """``live_main_sha=None`` → fall back to ``pr["base_sha"]``
+        (V10 behavior preserved)."""
+        pr = self._pr_with_base_sha(
+            "c720b6810b2e5216c170eb55734af1df5df4704b"
+        )
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha=None)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_to_pr_base_sha_when_explicit_live_main_sha_is_blank(self) -> None:
+        """``live_main_sha=""`` (explicit blank) → fall back to
+        ``pr["base_sha"]`` (the ``or`` short-circuit treats ``""``
+        as absent)."""
+        pr = self._pr_with_base_sha(
+            "c720b6810b2e5216c170eb55734af1df5df4704b"
+        )
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha="")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_fallback_to_pr_base_sha_when_explicit_live_main_sha_is_whitespace(self) -> None:
+        """``live_main_sha="   "`` (explicit whitespace-only) → fall
+        back to ``pr["base_sha"]``. Whitespace-only is falsy under
+        the ``or`` short-circuit."""
+        pr = self._pr_with_base_sha(
+            "c720b6810b2e5216c170eb55734af1df5df4704b"
+        )
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha="   ")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_both_missing_still_emits_v9_blocker(self) -> None:
+        """Both ``live_main_sha`` and ``pr["base_sha"]`` absent → V9
+        fail-closed guard fires. V11 must NOT mask missing evidence
+        by always passing a value."""
+        pr = self._pr_with_base_sha(None)
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha=None)
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_both_blank_still_emits_v9_blocker(self) -> None:
+        """``live_main_sha=""`` and ``pr["base_sha"]=""`` → both fall
+        through to V9 fail-closed guard."""
+        pr = self._pr_with_base_sha("")
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        plan = self._plan_for_envelope(envelope, pr, live_main_sha="")
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertFalse(envelope["combination"]["merge_ready_both_sides"])
+
+    def test_no_explicit_kwarg_default_none_still_uses_pr_base_sha(self) -> None:
+        """If the caller does NOT pass ``live_main_sha`` at all
+        (relies on the default ``None``), the fallback path still
+        uses ``pr["base_sha"]`` — the V10 fallback semantics are
+        preserved for the production ``main()`` flow which does
+        not forward ``live_main_sha`` to ``assemble_plan``."""
+        pr = self._pr_with_base_sha(
+            "c720b6810b2e5216c170eb55734af1df5df4704b"
+        )
+        envelope = _make_envelope_with_status_skip(
+            terminal_state="MERGE_READY_AWAITING_HUMAN_AUTHORIZATION",
+        )
+        # No live_main_sha kwarg at all — relies on the default.
+        plan = acp.assemble_plan(
+            pr=pr,
+            lifecycle={"current_state": "READY_FOR_FINAL_PREFLIGHT"},
+            checks={"all_required_green": True, "per_check_status": {}},
+            gate={"status": "REVIEW_COMMENTS_CLEAN", "blockers": 0, "current_unresolved_threads": 0},
+            codex={"verdict": "clean", "source": "issue_comment_xxx"},
+            branch_protection=_make_protection_normalized(),
+            generated_at="2026-07-11T05:30:00Z",
+            checkpoint_envelope=envelope,
+        )
+        kinds = [b["kind"] for b in plan.blockers_for_merge]
+        self.assertNotIn("CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING", kinds)
+        self.assertTrue(envelope["combination"]["merge_ready_both_sides"])
+
+
 if __name__ == "__main__":
     unittest.main()
