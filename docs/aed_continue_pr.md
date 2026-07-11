@@ -447,3 +447,74 @@ The fix mirrors the same raw-validation-before-coercion pattern used for
 
 The structural error is recorded in `envelope["validation"]["raw_pr_number_errors"]`
 and rendered in the markdown `## Checkpoint` section.
+
+## V9 changes (PR #407 round 9)
+
+V9 addresses two Codex findings raised on exact head
+`6aa29b131f27508c10d5509baf47471556ff597e` (the post-branch-update
+head). Both fixes are additive on top of the V1–V8 hardening; no
+prior validation behavior is loosened.
+
+### 1. Require live base evidence before checkpoint merge-ready (Codex 3562681189, P1)
+
+When `--checkpoint-json` was supplied but `pr['base_sha']` was
+missing, `main()` forwarded `live_main_sha=None` to
+`_cross_reference_checkpoint`, which in turn called
+`validate_resume_observations(state, observed_pr_head=..., observed_primary_head="")`.
+The canonical helper deliberately treats an empty observed primary
+head as "skip this check", so a checkpoint parked at
+`MERGE_READY_AWAITING_HUMAN_AUTHORIZATION` could still set
+`merge_ready_both_sides=true` even though it was never
+cross-checked against a real primary/base SHA.
+
+The V9 fix:
+
+- Forces `merge_ready_both_sides` to `false` whenever the supplied
+  `live_main_sha` is `None` or empty and the checkpoint is at a
+  merge-ready terminal state.
+- Emits a distinct fail-closed blocker,
+  `CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING`, so the operator can
+  distinguish this case ("live primary evidence is missing") from
+  the older `CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE`
+  ("the checkpoint recorded `terminal_state` but no
+  `last_verified_primary_head`").
+- Non-merge-ready terminal states (e.g.
+  `HOLD_OPERATOR_REQUIRED`) combined with missing `live_main_sha`
+  do NOT trigger this new kind (no false positive); the existing
+  `CHECKPOINT_NOT_MERGE_READY` (V7) blocker handles those cases.
+
+| Checkpoint terminal state | `live_main_sha` | `merge_ready_both_sides` | New blocker |
+|---|---|---|---|
+| merge-ready | `None` / `""` / `"   "` | **false** | `CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING` |
+| merge-ready | valid non-empty SHA | true (existing pass-through) | (none) |
+| non-merge-ready | `None` / empty | false (existing rules) | (none — V7 `CHECKPOINT_NOT_MERGE_READY` may fire) |
+
+### 2. Reject blank checkpoint `phase` before coercion (Codex 3562681190, P2)
+
+V4's `_validate_raw_phase` rejected non-string non-`None` values
+(`[]`, `{}`, `42`, etc.) but silently accepted a *present-but-blank*
+string (`""`, `"   "`, `"\t"`, `"\n\n"`). The next step
+(`_coerce_optional_str`) would normalize the blank string to
+`None`, hiding the malformed value. With otherwise merge-ready
+evidence, the present-but-blank `phase` would cross-reference as
+clean instead of producing a fail-closed
+`CHECKPOINT_VALIDATION_INVALID` blocker.
+
+The V9 fix extends `_validate_raw_phase` to fail-closed on blank
+strings — mirroring the V3 blank-`next_action` and V8
+blank-`terminal_state` validators — so `phase` is now consistent
+with the rest of the V3-V8 raw-validation policy.
+
+| `phase` value | Result |
+|---|---|
+| `""` | fail closed: `validation.raw_phase_errors` + `CHECKPOINT_VALIDATION_INVALID` |
+| `"   "` (whitespace only) | fail closed |
+| `"\n\t"` (mixed whitespace) | fail closed |
+| Valid non-blank string | accepted (canonical validator decides whether known) |
+| `None` | no error (existing optional policy) |
+| Absent | no error (existing optional policy) |
+| Non-string non-`None` (e.g. `[]`, `42`) | fail closed (V4 behavior, preserved) |
+
+The structural error is recorded in
+`envelope["validation"]["raw_phase_errors"]` and rendered in the
+markdown `## Checkpoint` section.

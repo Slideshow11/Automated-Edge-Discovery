@@ -1596,16 +1596,45 @@ def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
     non-``None`` ``phase`` as a fail-closed structural
     error.
 
+    Codex finding 3562681190 (P2, V9): the V4 validator
+    above still accepts a *present-but-blank string*
+    (``""``, ``"   "``, ``"\\t"``, ``"\\n\\n"``) as a valid
+    string, after which ``_coerce_optional_str`` (and the
+    downstream ``CheckpointState.phase`` coercion) treats
+    it as ``None``. With otherwise merge-ready checkpoint
+    and live evidence, the malformed present-but-blank
+    ``phase`` therefore crosses the cross-reference gate as
+    if absent, instead of producing a fail-closed
+    ``CHECKPOINT_VALIDATION_INVALID``/not-ready blocker. We
+    extend this validator to fail-closed on blank strings,
+    matching the V3 ``next_action`` validator and the V8
+    ``terminal_state`` validator, so ``phase`` is now
+    consistent with the rest of the V3-V8 raw-validation
+    policy. The validator's behavior remains identical to
+    the V4 validator for absent / explicit-``None`` /
+    non-string ``phase`` values.
+
     Rules (mirroring ``CheckpointState.phase`` typing):
 
     - Field is **absent from payload** → no error (``phase``
       is documented as optional; missing is the "fresh,
       pre-phase checkpoint" case).
     - Field is **explicitly** ``None`` → no error.
-    - Field is a **string** → no error here. The canonical
+    - Field is a **string** with at least one
+      non-whitespace character → no error here. The
+      canonical
       ``aed_lifecycle.checkpoint.validate_checkpoint`` may
-      still reject placeholder strings, but the type itself
-      is valid.
+      still reject placeholder strings, but the raw
+      content is non-blank.
+    - Field is a **present-but-blank string** (``""``,
+      ``"   "``, ``"\\t"``, ``"\\n\\n"``) → error. Silent
+      coercion to ``None`` is forbidden because a blank
+      ``phase`` is a structural defect, not a missing one —
+      the operator (or an upstream automation) wrote the
+      field and meant it, even if what they wrote is
+      syntactically blank. ``str.strip()`` collapses all
+      whitespace-only strings to the empty string, which is
+      the canonical "no content" sentinel.
     - Field is any **other type** (list, dict, int, bool,
       float, tuple, etc.) → error. Silent coercion to
       ``None`` is forbidden because it would mask the
@@ -1621,6 +1650,18 @@ def _validate_raw_phase(payload: Dict[str, Any]) -> List[str]:
     if value is None:
         return errors
     if isinstance(value, str):
+        # Codex finding 3562681190 (P2, V9): blank-or-whitespace-only
+        # ``phase`` strings now fail closed. A non-blank string is
+        # accepted (the canonical validator decides whether it is
+        # a *known* phase); this validator's only job is the
+        # blank-check, not the whitelist check.
+        if value.strip():
+            return errors
+        errors.append(
+            f"checkpoint field 'phase' must be a non-blank "
+            f"string, None, or omitted entirely (got blank string "
+            f"{value!r})"
+        )
         return errors
     errors.append(
         f"checkpoint field 'phase' must be a string or None, "
@@ -2383,11 +2424,69 @@ def _cross_reference_checkpoint(
         and not live_pr_draft
         and live_merge_state_norm == "clean"
     )
+    # Codex finding 3562681189 (P1, V9): the live primary / base
+    # evidence MUST be present and non-empty before
+    # ``merge_ready_both_sides`` can be ``True`` for a merge-ready
+    # checkpoint. The previous behavior passed an empty string
+    # (``live_main_sha or ""``) into ``validate_resume_observations``
+    # whenever ``live_main_sha`` was ``None``, which the canonical
+    # helper deliberately treats as "skip the comparison" — the
+    # result was a merge-ready checkpoint that passed the resume
+    # observations check without ever being cross-checked against a
+    # real primary/base SHA. We now emit an explicit fail-closed
+    # blocker (``CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING``) and refuse
+    # to mark the envelope as merge-ready until the caller supplies
+    # a non-empty ``live_main_sha``. The blocker is named distinctly
+    # from the existing ``CHECKPOINT_MERGE_READY_MISSING_PRIMARY_EVIDENCE``
+    # kind (which covers the OTHER failure mode — the checkpoint
+    # itself was recorded without ``last_verified_primary_head``) so
+    # the operator can tell which side is missing evidence: this
+    # one fires when the LIVE side is missing a SHA; the older
+    # one fires when the CHECKPOINT side is missing a recorded
+    # primary head.
+    #
+    # IMPORTANT ORDERING: this branch MUST run BEFORE the
+    # ``envelope["combination"][...]`` writes below because those
+    # writes snapshot ``blockers`` into the envelope. The V7-era
+    # code (lines 2411-2414 above) writes the envelope BEFORE the
+    # merge-ready computation, but we now append to ``blockers``
+    # here, so the writes below must re-snapshot the list. We
+    # therefore rewrite the envelope AFTER this new check.
+    live_main_sha_present = bool(
+        isinstance(live_main_sha, str) and live_main_sha.strip()
+    )
+    if not live_main_sha_present and terminal in MERGE_READY_TERMINAL_STATES:
+        blockers.append(
+            {
+                "kind": "CHECKPOINT_LIVE_BASE_EVIDENCE_MISSING",
+                "detail": (
+                    f"checkpoint terminal_state="
+                    f"{terminal!r} is merge-ready, but live_main_sha "
+                    f"is missing/empty (the CLI was called without a "
+                    f"real ``pr['base_sha']`` from GitHub). Without a "
+                    f"live primary/base SHA to compare against the "
+                    f"checkpoint's ``last_verified_primary_head``, "
+                    f"``merge_ready_both_sides`` cannot be True; "
+                    f"this is the fail-closed guard so a merge "
+                    f"recommendation is never emitted without live "
+                    f"primary/base cross-check evidence"
+                ),
+            }
+        )
     envelope["combination"]["merge_ready_both_sides"] = (
         live_clean
         and not blockers
+        and live_main_sha_present
         and terminal in MERGE_READY_TERMINAL_STATES
     )
+    envelope["combination"]["live_state_agrees"] = not blockers
+    envelope["combination"]["blockers"] = list(blockers)
+    envelope["combination"]["warnings"] = list(warnings)
+    envelope["cross_reference"]["status"] = (
+        "clean" if not blockers else "disagreement"
+    )
+    envelope["cross_reference"]["blockers"] = list(blockers)
+    envelope["cross_reference"]["warnings"] = list(warnings)
     return blockers, warnings
 
 
