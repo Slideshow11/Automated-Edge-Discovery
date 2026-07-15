@@ -268,7 +268,6 @@ exactly.
 
 ---
 
-*Historical note:* `scripts/local/audit_claude_invocation.py`, a previous
-post-run audit helper, was retired by #410. The check is no longer required
-because the surviving PMG comparison and merge-step verifiers cover the
-ground it used to provide.
+Historical note: scripts/local/audit_claude_invocation.py, a previous
+post-run audit helper, was retired by #410. Its dedicated audit step is
+no longer part of the current live-smoke procedure.
