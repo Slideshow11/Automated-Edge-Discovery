@@ -95,13 +95,18 @@ This diagnosis is consistent with the existing
 
 **Merge authority is the guarded flow, never the worker.** The merge
 step requires three things to all be true:
-1. `run_guarded_pr_flow.py` produced `READY_TO_MERGE_CANDIDATE`.
-2. The authorization phrase includes the exact full 40-char SHA.
-3. The merge command uses `--match-head-commit <sha>` so GitHub
+1. The machine-checked final gate ran and returned a `MERGE_READY`
+   recommendation (via `scripts/local/aed_final_gate.py`).
+2. `scripts/local/merge_pr_safely.py` produced the exact safe merge
+   command (`gh pr merge <PR> --repo <repo> --squash --delete-branch
+   --match-head-commit <sha>`) and `--admin` is never present.
+3. The operator's authorization phrase includes the exact full 40-char SHA,
+   and the executed merge command uses `--match-head-commit <sha>` so GitHub
    rejects the merge if the head has moved.
 
 The worker never runs `gh pr merge`. The worker never runs
 `gh pr create` in autonomous mode. The worker never pushes.
+The merge executor is always the human operator.
 
 ---
 
@@ -155,9 +160,9 @@ The current intended role assignment:
 | **Long-running implementation worker** | Claude Code | **Only inside harness, only when 12+10+22 readiness gate is fully implemented** |
 | **Long-running implementation worker (alt)** | Open-weight model (e.g. Llama 3 70B) | **Only inside harness, only when ExecutionBackend contract supports it** |
 | **Auditor** | M3 (MiniMax-M3) | Read-only analysis, evidence generation, gate evaluation |
-| **Gate runner** | Humphry / M3 | Executes `run_guarded_pr_flow.py`, `wait_for_pr_ready.py`, scope_guard, PMG |
+| **Gate runner** | Humphry / M3 | Runs `aed_final_gate.py` (machine-checked final gate), `wait_for_pr_ready.py`, `scope_guard`, PMG, then `merge_pr_safely.py` to emit the safe merge command |
 | **PR controller** | Humphry / M3 | Watches PR state, runs deterministic checks, emits gate state |
-| **Merge authority** | Guarded flow | `run_guarded_pr_flow.py` + `check_merge_authorization.py` + human phrase + `--match-head-commit` |
+| **Merge authority** | Guarded flow | `aed_final_gate.py` (machine-checked MERGE_READY) + `merge_pr_safely.py` (safe merge-command emitter) + `check_merge_authorization.py` + human phrase + `--match-head-commit` |
 | **Merge executor** | Human (operator) | Runs `gh pr merge` after gate authorizes |
 
 **Model output is never trusted without deterministic checks.** Every

@@ -35,7 +35,7 @@ All Wave 1/2/3 Codex remediation candidates are closed:
 | Subprocess calls | `aed_final_gate.py`, `apply_temp_worktree_patch_to_branch.py` | returncode handling, broad exception handling |
 | Hermes mutation risk | `autocoder_run_controller.py`, `build_merge_ready_packet.py` | forbidden patterns, safety invariants |
 | Path construction | `_smoke_shared.py`, `aed_executor_packet.py` | Path()/mkdir/write_text in low-level helpers |
-| Mock/test patterns | `audit_claude_invocation.py` | mock-only detection, MOCK_ONLY_RUN_DETECTED |
+| Mock/test patterns | `audit_claude_invocation.py` (Historical note: this tool was retired by #410.) | mock-only detection, MOCK_ONLY_RUN_DETECTED |
 | Gate status | `final_gate_status.py`, `wait_for_pr_ready.py` | READY_TO_MERGE, HOLD_UNKNOWN, review comment gate |
 
 ---
@@ -45,8 +45,8 @@ All Wave 1/2/3 Codex remediation candidates are closed:
 - `shell=True` — no occurrences in production scripts (protected via design)
 - `subprocess.returncode` handling — present in aed_final_gate.py, apply_temp_worktree_patch_to_branch.py, wait_for_pr_ready.py; well-structured with explicit exit-code checks
 - `except Exception` — present in waiter (lines 157, 336, 376, 425, 466, 639, 750); review-comment gate; PMG runner
-- `HOLD_UNKNOWN` — used as sentinel in wait_for_pr_ready.py; used in audit_claude_invocation.py
-- `TEST_MODE` / `mock` patterns — abundant in test files; audit_claude_invocation.py uses mock vs real detection
+- `HOLD_UNKNOWN` — used as sentinel in wait_for_pr_ready.py; used in audit_claude_invocation.py (Historical note: this tool was retired by #410.)
+- `TEST_MODE` / `mock` patterns — abundant in test files; audit_claude_invocation.py (Historical note: this tool was retired by #410.) uses mock vs real detection
 - Hermes mutation (skill_manage, memory, fact_store, profile) — documented as forbidden in executor packet design; not called in production scripts
 - `dict.get()` with defaults — abundant across all scripts; not a bug by itself but a code-volume observation
 - Path construction (Path, mkdir, write_text) — in `_smoke_shared.py` (low risk), `aed_executor_packet.py` (packet generation), `apply_temp_worktree_patch_to_branch.py` (output writing)
