@@ -338,7 +338,6 @@ def validate_live_smoke_packet_constraints(packet: dict) -> tuple[bool, str]:
             "scripts/local/run_temp_worktree_execution.py, "
             "scripts/local/check_real_executor_readiness.py, "
             "scripts/local/check_real_claude_env_preflight.py, "
-            "scripts/local/audit_claude_invocation.py, "
             "/home/max/.hermes/, audit/, boards/, memory/, profile/"
         )
 

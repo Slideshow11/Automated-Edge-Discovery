@@ -70,7 +70,7 @@ if `live_smoke_scratch.md` is not desirable.
       "scripts/local/run_temp_worktree_execution.py",
       "scripts/local/check_real_executor_readiness.py",
       "scripts/local/check_real_claude_env_preflight.py",
-      "scripts/local/audit_claude_invocation.py",
+      "scripts/local/audit_claude_invocation.py (Historical note: this tool was retired by #410.)",
       "scripts/local/run_plan_preview.py",
       "scripts/local/plan_preview_eval_status.py",
       "~/.hermes/",
@@ -198,7 +198,7 @@ After the live run completes (regardless of outcome):
 - [ ] Inspect `claude_stdout.txt` — confirm Claude produced output
 - [ ] Inspect `claude_stderr.txt` — check for warnings or errors
 - [ ] Inspect `claude_transcript.md` — review full execution transcript
-- [ ] Run `python3 scripts/local/audit_claude_invocation.py` on the output directory
+- [ ] Run `python3 scripts/local/audit_claude_invocation.py (Historical note: this tool was retired by #410.)` on the output directory
 - [ ] Run `python3 scripts/local/check_persistent_mutation_guard.py compare --root ~/.hermes --before <snapshot> --output-json <compare.json> --output-md <compare.md>`
 - [ ] Confirm main repo `git status --short` is clean after worktree cleanup
 - [ ] Do **not** apply the patch automatically
@@ -243,7 +243,7 @@ Run these locally before opening a PR (design-only branch, no live execution):
 ```bash
 # Tests
 pytest tests/test_run_temp_worktree_execution.py -q
-pytest tests/test_audit_claude_invocation.py -q
+pytest tests/test_audit_claude_invocation.py (Historical note: this tool was retired by #410.) -q
 pytest tests/test_check_real_executor_readiness.py tests/test_check_real_claude_env_preflight.py -q
 
 # Compile check
