@@ -309,10 +309,10 @@ def expected_merge_authorization_phrase(state: AEDRunState) -> str:
 
     The format is the live canonical phrase produced by both
     ``scripts/local/verify_final_head_merge_command.py``
-    (``build_authorization_phrase``) and
-    ``scripts/local/aed_final_gate.py``
-    (``build_authorization_phrase``), with character-for-character
-    alignment::
+    (``build_authorization_phrase``) and the canonical AED PR
+    controller ``scripts/local/aed_pr.py``
+    (via ``aed_pr_lib.build_authorization_phrase``), with
+    character-for-character alignment::
 
         I confirm merge PR #<pr_number> at <40-hex expected_head_sha>
         using final-head reviewed clean state.
@@ -321,10 +321,10 @@ def expected_merge_authorization_phrase(state: AEDRunState) -> str:
     ``clean state``, and the head SHA must be a full 40-character
     hex string. Earlier policy-engine drafts used a different
     ``I authorize guarded squash merge of PR #<n> at exact head <sha>.``
-    form, but the live final gate and merge-command verifier
-    both produce the form above; aligning the policy engine
-    with the live producers is required for the skeleton to be
-    consistent with the live canonical phrase.
+    form, but the merge-command verifier and the canonical
+    controller both produce the form above; aligning the policy
+    engine with the live producers is required for the skeleton
+    to be consistent with the live canonical phrase.
     """
     return (
         f"I confirm merge PR #{state.pr_number} at {state.expected_head_sha} "
@@ -350,11 +350,12 @@ def has_exact_merge_authorization(state: AEDRunState) -> bool:
     - phrase must equal the canonical phrase exactly, with no
       leading/trailing whitespace allowed, no double spaces
       allowed, no embedded newlines allowed
-    - the phrase is the LIVE form produced by both
-      ``scripts/local/verify_final_head_merge_command.py`` and
-      ``scripts/local/aed_final_gate.py``: the old
-      ``I authorize guarded squash merge of PR #<n> at exact
-      head <sha>.`` policy-only form is no longer accepted.
+    The phrase is the LIVE form produced by both
+    ``scripts/local/verify_final_head_merge_command.py`` and the
+    canonical controller ``scripts/local/aed_pr.py`` (via
+    ``aed_pr_lib.build_authorization_phrase``): the old
+    ``I authorize guarded squash merge of PR #<n> at exact
+    head <sha>.`` policy-only form is no longer accepted.
     """
     if not state.explicit_authorization_phrase:
         return False
