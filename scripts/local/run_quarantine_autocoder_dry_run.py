@@ -1271,7 +1271,6 @@ def collect_local_gate_preview(source_repo: str) -> dict:
                     "tests/test_pr_gate_controller_live_smoke.py "
                     "tests/test_pr_gate_controller.py "
                     "tests/test_check_pr_scope.py "
-                    "tests/test_merge_authorization_guard.py "
                     "tests/test_pr_gate_merge_ready_notify.py "
                     "tests/test_validate_ci_workflow_invariants.py -q"
                 ),

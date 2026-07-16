@@ -130,3 +130,58 @@ The canonical controller has its own focused test module:
 Existing tests for the surviving tools (notably
 `tests/test_merge_pr_safely.py`) remain authoritative for the
 verified-by-CI tools they cover.
+
+## Historical policy migrations
+
+The policy content that previously lived in the operator-path and
+cookbook docs has been collapsed into the canonical guide under the
+sections below. Operators reading the historical pointers can
+follow these references to the canonical surface.
+
+### `HOLD_MAIN_HEAD_MISMATCH` evidence contract
+
+The canonical `HOLD_MAIN_HEAD_MISMATCH` state (see
+`schemas/aed_lifecycle_states_v1.json`) covers two surfaces: the
+`origin/main` HEAD mismatch and the primary worktree mismatch
+surface (dirty status, wrong branch, wrong HEAD). The evidence
+tokens required to reconcile either surface are:
+
+  - `expected_head_sha`
+  - `observed_origin_main_sha`
+  - `primary_worktree_path`
+  - `primary_status_porcelain`
+  - `primary_branch`
+  - `primary_expected_head_sha`
+  - `primary_observed_head_sha`
+
+The primary worktree is intentionally left stale after merge; the
+post-closeout anchor pattern uses the temp worktree as the verified
+reference. Read-only verification commands (status `--porcelain`,
+`rev-parse HEAD`, `branch --show-current`) confirm the protected
+state without mutating it. The `worktree_update` mutation token is
+explicitly forbidden on this state and requires explicit human
+operator authorization.
+
+### Primary worktree sync policy (codified 2026-06-10)
+
+The primary worktree is intentionally left stale; the temp worktree
+holds the verified anchor. To reconcile, operators must run only the
+read-only verification commands (`status --porcelain`,
+`rev-parse HEAD`, `branch --show-current`) on the primary worktree
+and confirm the `HOLD_MAIN_HEAD_MISMATCH` evidence tokens listed
+above. Any `worktree_update` requires explicit human operator
+authorization.
+
+### Lessons from PR #394
+
+PR #394 first surfaced the lifecycle-state vocabulary collapsing
+problem; the canonical 6-state vocabulary in the Lifecycle states
+section above is the resolved form. Future contributions must not
+re-introduce per-wrapper HOLD_* names.
+
+### Where next work belongs
+
+Future lifecycle extensions belong in `docs/aed_lifecycle_states_v1.md`
+plus the canonical operator guide above. Do not re-introduce
+per-wrapper workflow docs without an explicit decision recorded in a
+PR description.
