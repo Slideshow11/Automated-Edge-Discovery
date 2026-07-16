@@ -89,6 +89,18 @@ _COORDINATION_PATTERNS = (
     # by ``--ignore-users``, so this only fires for human
     # comments that mention @codex.
     "@codex",
+    # Initial Codex-review request comments posted by the PR
+    # author (e.g. the canonical body that begins with
+    # ``Codex automated review request for PR #N``). These are
+    # coordination messages that name the SHA to be reviewed and
+    # the scope to inspect; they are NOT findings. Without this
+    # entry, the gate treats every such request as an
+    # ``UNSPECIFIED_BLOCKING`` current-head blocker because the
+    # body includes meta-vocabulary like ``stale`` / ``malformed``
+    # far past the leading 100 chars. The match is exact-prefix,
+    # so a Codex finding that incidentally contains the phrase
+    # in the middle of its body is unaffected.
+    "codex automated review request",
 )
 
 

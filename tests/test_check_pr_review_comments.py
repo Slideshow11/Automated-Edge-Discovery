@@ -156,6 +156,55 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Nudge to @codex — please re-review."
         ))
 
+    def test_is_coordination_comment_detects_codex_automated_review_request(self):
+        """Regression: the initial Codex-review request posted
+        by the PR author begins with the exact phrase
+        ``Codex automated review request`` and must be
+        recognized as a coordination message, not a finding."""
+        self.assertTrue(crc.is_coordination_comment(
+            "Codex automated review request for PR #411.\n\n"
+            "Repository: Slideshow11/Automated-Edge-Discovery\n"
+            "PR: #411\n"
+            "Branch: reduction/pr-lifecycle-collapse-v1\n"
+            "Exact head SHA: 0413708ea63b5dcb13743eeb718f53ca3c45a456\n"
+        ))
+
+    def test_human_codex_request_issue_comment_not_classified(self):
+        """The exact blocker from PR #411 on a1c7322: a human
+        issue comment by the PR author issuing a fresh Codex
+        review request must not produce a finding."""
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": (
+                "Codex automated review request for PR #411.\n\n"
+                "Repository: Slideshow11/Automated-Edge-Discovery\n"
+                "PR: #411\n"
+                "Branch: reduction/pr-lifecycle-collapse-v1\n"
+                "Exact head SHA: 0413708ea63b5dcb13743eeb718f53ca3c45a456\n"
+                "\n"
+                "SCOPE\n"
+                "=====\n"
+                "Additions (net new code):\n"
+                "  + scripts/local/aed_pr.py\n"
+                "\n"
+                "THE KNOWN REGRESSION THAT REQUIRES YOUR ATTENTION\n"
+                "=================================================\n"
+                "The current aed_pr.py merge command is a stub.\n"
+                "Changed-file scope is missing. Stale Codex threads\n"
+                "from the previous round remain. No malformed\n"
+                "evidence was skipped.\n"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Codex automated review request...' issue "
+            "comment must not be classified as a finding even "
+            "when its body contains 'stale' / 'malformed' / "
+            "'missing' / 'skip' past the leading 100 chars."
+        )
+
     def test_is_coordination_comment_case_insensitive(self):
         self.assertTrue(crc.is_coordination_comment(
             "RE-REQUESTING codex review."
