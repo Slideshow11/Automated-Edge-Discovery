@@ -297,15 +297,17 @@ class TestF2RealRequiredCheckInspection:
 
 class TestF3TrustedScopeAuthority:
     def setup_method(self):
+        # Tests inject a tempdir as the canonical scope root via the
+        # module-level constant ``_CANONICAL_SCOPE_ROOT``. The
+        # previous round-3 ``HERMES_AED_SCOPE_DIR`` env-var seam was
+        # removed in round-4 because a hostile caller could point
+        # the production merge path at a permissive directory.
         self._tmp = tempfile.TemporaryDirectory()
-        self._saved_env = os.environ.get(ctrl.TRUSTED_SCOPE_ENV_VAR)
-        os.environ[ctrl.TRUSTED_SCOPE_ENV_VAR] = self._tmp.name
+        self._saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        ctrl._CANONICAL_SCOPE_ROOT = Path(self._tmp.name)
 
     def teardown_method(self):
-        if self._saved_env is None:
-            os.environ.pop(ctrl.TRUSTED_SCOPE_ENV_VAR, None)
-        else:
-            os.environ[ctrl.TRUSTED_SCOPE_ENV_VAR] = self._saved_env
+        ctrl._CANONICAL_SCOPE_ROOT = self._saved_root
         self._tmp.cleanup()
 
     def _write(self, head=DEFAULT_HEAD, allowed=PASSING_SCOPE, forbidden=()):

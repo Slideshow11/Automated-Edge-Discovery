@@ -856,20 +856,23 @@ class TestControllerMergeInProcess:
                 "review_decision": "APPROVED",
             }
 
-        # Round-3 fix: write the trusted scope file via the controller's
-        # ``write_trusted_scope`` helper. The controller reads it via
-        # HERMES_AED_SCOPE_DIR; merge refuses CLI scope overrides.
+        # Round-3 fix: write the trusted scope file via the
+        # controller's ``write_trusted_scope`` helper. The merge
+        # path reads from ``_CANONICAL_SCOPE_ROOT``, which tests
+        # monkey-patch here so the merge path operates on a
+        # tempdir. Production callers NEVER supply ``scope_root``
+        # and are NEVER redirected by an env-var override.
         import tempfile
         from scripts.local import aed_pr as ctrl_module
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.environ["HERMES_AED_SCOPE_DIR"] = tmpdir
-            ctrl_module.write_trusted_scope(
-                ctrl_module.DEFAULT_REPO, 411, "a" * 40,
-                DEFAULT_TEST_ALLOWED_FILES,
-            )
-            with mock.patch.dict(
-                os.environ, {"HERMES_AED_SCOPE_DIR": tmpdir}, clear=False
-            ):
+            tmp_path = Path(tmpdir)
+            saved_root = ctrl_module._CANONICAL_SCOPE_ROOT
+            ctrl_module._CANONICAL_SCOPE_ROOT = tmp_path
+            try:
+                ctrl_module.write_trusted_scope(
+                    ctrl_module.DEFAULT_REPO, 411, "a" * 40,
+                    DEFAULT_TEST_ALLOWED_FILES,
+                )
                 with mock.patch.object(subprocess, "run", side_effect=_fake_run), \
                      mock.patch.object(ctrl.CODEX, "classify", side_effect=_fake_codex):
                     old_argv = sys.argv
@@ -888,6 +891,8 @@ class TestControllerMergeInProcess:
                     finally:
                         sys.stdout, sys.stderr = old_out, old_err
                         sys.argv = old_argv
+            finally:
+                ctrl_module._CANONICAL_SCOPE_ROOT = saved_root
 
         assert len(merged_argv) == 1, (
             f"safe merge must invoke exactly one gh pr merge; got {merged_argv}"

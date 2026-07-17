@@ -551,6 +551,69 @@ _RECOGNIZED_BOT_LOGINS = frozenset({
 })
 
 
+# Round-4 fix #2: anchor source list. The reviewer-comment commit
+# anchor must be one of these concrete fields, in order of preference.
+# ``outdated``, timestamps, line numbers, and thread order are NOT
+# considered anchors. The live
+# ``scripts/local/audit_codex_response_for_pr.py`` packet SHOULD
+# populate ``original_commit_sha`` from the top-level review comment;
+# the helpers below normalize that input.
+_ANCHOR_FIELDS = ("original_commit_sha", "comment_sha", "head_sha")
+
+
+def _extract_thread_anchor(thread: Dict[str, Any]) -> Optional[str]:
+    """Extract a canonical commit SHA anchor from a review thread.
+
+    Returns the first non-empty field from :data:`_ANCHOR_FIELDS` that
+    is a canonical 40-lowercase-hex SHA. Returns ``None`` when none of
+    the fields hold a canonical SHA. The result is suitable as a
+    ``comment_sha``-equivalent for the eligibility check.
+    """
+    if not isinstance(thread, dict):
+        return None
+    for key in _ANCHOR_FIELDS:
+        value = thread.get(key)
+        if isinstance(value, str) and is_canonical_head_sha(value):
+            return value
+    return None
+
+
+def normalize_thread_anchor(
+    thread: Dict[str, Any],
+    *,
+    fallback_head_sha: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a copy of ``thread`` with the anchor populated.
+
+    Reads ``original_commit_sha``, ``comment_sha``, or ``head_sha``
+    (in that order). When none of the fields hold a canonical SHA,
+    copies the thread unchanged so the caller can detect the missing
+    anchor via :func:`_extract_thread_anchor` returning ``None``.
+    """
+    if not isinstance(thread, dict):
+        return dict(thread) if hasattr(thread, "items") else {}
+    out = dict(thread)
+    anchor = _extract_thread_anchor(out)
+    if anchor is None:
+        # Annotate the thread with the canonical field name so the
+        # controller's classification report can surface the missing
+        # anchor explicitly. The original fields are NOT modified.
+        out.setdefault("_missing_anchor_fields", [])
+        if not isinstance(out["_missing_anchor_fields"], list):
+            out["_missing_anchor_fields"] = []
+        for key in _ANCHOR_FIELDS:
+            value = out.get(key)
+            if not (isinstance(value, str) and is_canonical_head_sha(value)):
+                if key not in out["_missing_anchor_fields"]:
+                    out["_missing_anchor_fields"].append(key)
+        return out
+    # Promote the discovered anchor to the canonical field.
+    out["original_commit_sha"] = anchor
+    out["comment_sha"] = anchor
+    out.pop("_missing_anchor_fields", None)
+    return out
+
+
 def is_eligible_for_bot_resolution(
     thread: Dict[str, Any],
     *,
@@ -561,12 +624,13 @@ def is_eligible_for_bot_resolution(
 ) -> Tuple[bool, str]:
     """Return ``(eligible, reason)`` for a single review thread.
 
-    See the module-level comment above for the deterministic eligibility
-    contract. Any uncertainty produces ``eligible=False`` with a
-    specific reason code (one of ``actor_not_bot``, ``human_reply``,
-    ``unknown_actor_in_thread``, ``not_outdated``, ``no_later_commit``,
-    ``current_head_finding``, ``head_unknown``, ``codex_not_clean``,
-    ``codex_head_mismatch``).
+    The eligibility contract is documented in the module-level
+    comment above. Any uncertainty produces ``eligible=False`` with a
+    specific reason code. Round-4 fix #2 adds ``missing_commit_anchor``
+    and ``malformed_commit_anchor`` to the reason vocabulary; both
+    fire when the thread lacks a canonical 40-hex SHA anchor that
+    GitHub's review-thread API supplied (or a normalizer promoted
+    into ``original_commit_sha``/``comment_sha``/``head_sha``).
     """
     if not isinstance(thread, dict):
         return False, "actor_not_bot"
@@ -606,31 +670,33 @@ def is_eligible_for_bot_resolution(
         if author.lower() not in _RECOGNIZED_BOT_LOGINS:
             return False, "human_reply"
 
-    # Condition 4: the underlying finding was addressed by a later
-    # commit than the thread's anchor. The thread's anchor is the SHA
-    # recorded on the top-level comment (``comment_sha``) or, if not
-    # recorded, the ``head_sha`` carried in the thread dict.
-    anchor_sha = thread.get("comment_sha") or thread.get("head_sha")
-    if (
-        isinstance(anchor_sha, str)
-        and isinstance(head_sha, str)
-        and head_sha
-        and anchor_sha
-        and anchor_sha != head_sha
-    ):
-        # Anchor is some other SHA; the live head is later. Eligible.
-        pass
-    elif anchor_sha == head_sha:
+    # Condition 4: the underlying finding must have been addressed
+    # by a later commit. The anchor must be a canonical 40-hex SHA
+    # GitHub's review-thread API supplied (or that a normalizer
+    # populated). Missing or malformed anchors fail closed - the
+    # brief is explicit: do not infer the anchor from outdated,
+    # timestamps, line numbers, or thread order.
+    anchor_sha = _extract_thread_anchor(thread)
+    if anchor_sha is None:
+        # Distinguish between "no anchor field at all" and "anchor
+        # field present but malformed". Both fail closed; the reason
+        # is reported as ``missing_commit_anchor`` so the controller
+        # can surface the diagnostic to the operator.
+        if any(
+            thread.get(key)
+            for key in _ANCHOR_FIELDS
+        ):
+            return False, "malformed_commit_anchor"
+        return False, "missing_commit_anchor"
+    if not isinstance(head_sha, str) or not head_sha:
+        return False, "head_unknown"
+    if anchor_sha == head_sha:
         # The thread is anchored to the current head - not a stale
         # finding. Refuse.
         return False, "no_later_commit"
-    # If anchor_sha is absent or non-string, the eligibility checker
-    # is uncertain and refuses.
 
     # Condition 5/6: exact-head Codex evidence must be clean and the
     # reviewed SHA must match the live head.
-    if not isinstance(head_sha, str) or not head_sha:
-        return False, "head_unknown"
     if codex_reviewed_sha is not None and isinstance(codex_reviewed_sha, str):
         if codex_reviewed_sha != head_sha:
             return False, "codex_head_mismatch"

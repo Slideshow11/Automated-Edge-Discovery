@@ -393,7 +393,13 @@ def gh_graphql_review_threads(
         "id isResolved isOutdated",
         "comments(first:50) {",
         "pageInfo { hasNextPage endCursor }",
+        # ``originalCommit`` is the commit the comment was posted
+        # against (the review-thread anchor). Round-4 fix #2 requires
+        # the thread's eligibility check to be tied to this
+        # canonical SHA so a finding can be auto-resolved only when
+        # there is evidence that a later commit addressed it.
         "nodes { databaseId url body path line "
+        "originalCommit { oid } "
         "author { login } }",
         "}",
         "}",
@@ -520,6 +526,20 @@ def gh_graphql_review_threads(
                 "body": comment.get("body") or "",
                 "path": comment.get("path") or "",
                 "line": comment.get("line"),
+                # Round-4 fix #2: canonical commit SHA the comment
+                # was posted against. Surfaced so the eligibility
+                # check can verify a later commit addressed the
+                # finding. The ``originalCommit`` GraphQL field
+                # returns ``{oid}`` which is the canonical commit
+                # SHA. When ``originalCommit`` is null/absent the
+                # thread is flagged with ``original_commit_sha=null``
+                # so the controller's normalizer can record
+                # ``missing_commit_anchor``.
+                "original_commit_sha": (
+                    (comment.get("originalCommit") or {}).get("oid")
+                    if isinstance(comment.get("originalCommit"), dict)
+                    else None
+                ),
                 # True iff the parent thread's nested
                 # `comments.pageInfo.hasNextPage=true`. The
                 # markdown renderer surfaces this flag so

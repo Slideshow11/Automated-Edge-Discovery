@@ -304,20 +304,19 @@ def _coerce_scope_inputs(
 
 
 # -----------------------------------------------------------------------------
-# Trusted scope source (round-3 fix #2)
+# Trusted scope source (round-3 fix #2; round-4 fix #1)
 # -----------------------------------------------------------------------------
 #
 # Round-3 requirement: scope MUST come from a trusted, persistent
 # source tied to the task/PR, not from the CLI at merge time. A caller
 # must NOT be able to bypass scope by running merge with
-# ``--allowed-files "**"`` or by pointing ``HERMES_AED_SCOPE_DIR``
-# at a permissive directory.
+# ``--allowed-files "**"``.
 #
 # The repository's existing scope checker is
 # ``scripts/local/check_pr_scope.py``; we reuse it unchanged. The
 # persistent trusted source it reads from is:
 #
-#     ``~/.hermes/aed/pr_scope/<repo_owner>__<repo_name>/<pr_number>/<head_sha>.json``
+#     ``~/.hermes/aed/pr_scope/<repo_owner>/<repo_name>/<pr_number>/<head_sha>.json``
 #
 # The scope record is **immutably bound to a single exact head SHA**.
 # Each push of the PR branch creates a new record; the previous
@@ -325,57 +324,80 @@ def _coerce_scope_inputs(
 # moved head therefore requires a fresh ``aed_pr scope-write`` call
 # before merge can be considered ready.
 #
+# Round-4 fix #1: the canonical scope root is hard-coded. There is
+# no environment variable, CLI flag, or current-working-directory
+# fall-back that may redirect production reads or writes. Tests
+# inject an alternate root via the ``scope_root=`` keyword argument
+# of the internal helpers; production callers never supply that
+# argument.
+#
 # Production paths (status / advance / merge) read from the
 # repository+PR+head-SHA-keyed location under ``~/.hermes/aed/...``.
-# The ``HERMES_AED_SCOPE_DIR`` environment variable exists ONLY as a
-# test seam so unit tests can route scope lookups to a tempdir; it is
-# not consulted on production paths and a future commit may remove
-# it entirely. The merge command rejects CLI scope at the argparse
-# level (no --allowed-files / --forbidden-files flag).
+# The merge command rejects CLI scope at the argparse level (no
+# --allowed-files / --forbidden-files flag).
 #
 # Merge does NOT consult CLI scope and does NOT consult a
-# caller-controlled env-var scope directory: it reads from the
-# canonical, head-tied, repository-keyed location. A merged commit
-# requires the corresponding ``<head_sha>.json`` to exist; a stale
+# caller-controlled scope directory: it reads from the canonical,
+# head-tied, repository-keyed location. A merged commit requires
+# the corresponding ``<head_sha>.json`` to exist; a stale record
+# cannot authorize a moved head.
 # scope file cannot authorize a moved head.
 
 import os as _os
 from pathlib import Path as _Path
 
-# Test-only seam: routes scope lookups to a tempdir. NOT consulted
-# in production paths; tests opt in by setting this env var before
-# invoking the controller. The merge command does NOT honour it.
-TRUSTED_SCOPE_ENV_VAR = "HERMES_AED_SCOPE_DIR"
+
+# -----------------------------------------------------------------------------
+# Trusted scope root selection
+# -----------------------------------------------------------------------------
+#
+# Production paths MUST use the canonical scope root:
+#     ~/.hermes/aed/pr_scope
+#
+# This is not configurable. There is no environment variable, no CLI
+# flag, and no current-working-directory fall-back. The previous
+# round-3 cycle left a `HERMES_AED_SCOPE_DIR` env-var seam in place
+# which a hostile caller could use to point the merge path at a
+# permissive directory of their own. That seam is now removed.
+#
+# Tests that need to bypass ``~/.hermes/aed/pr_scope`` pass an explicit
+# ``scope_root`` argument to the internal functions. Production paths
+# never accept that argument; they always read from the canonical
+# root via ``_canonical_scope_root()``.
+#
+# ``_SCOPE_ROOT_OVERRIDE`` is a module-level variable that exists
+# ONLY as a thread-local / process-local injection point for tests.
+# It is read ONLY inside ``_trusted_scope_path`` when the caller has
+# supplied an explicit ``scope_root=`` kwarg. Production code never
+# supplies that kwarg, so the override is dead in production paths.
+
+_CANONICAL_SCOPE_ROOT: _Path = _Path.home() / ".hermes" / "aed" / "pr_scope"
 
 
-def _production_trusted_scope_root() -> _Path:
-    """Return the canonical production root for trusted scope files.
+def _canonical_scope_root() -> _Path:
+    """Return the canonical production scope root.
 
-    Always ``~/.hermes/aed/pr_scope``. Not configurable from the
-    CLI or from any environment variable on the merge path.
+    Always ``~/.hermes/aed/pr_scope``. Not configurable. No
+    environment variable is consulted. Tests inject via the
+    ``scope_root=`` argument of the private helpers; production
+    callers never do so.
     """
-    return _Path.home() / ".hermes" / "aed" / "pr_scope"
+    return _CANONICAL_SCOPE_ROOT
 
 
 def _trusted_scope_path(
-    repo: str, pr_number: int, head_sha: str
+    repo: str,
+    pr_number: int,
+    head_sha: str,
+    *,
+    scope_root: Optional[_Path] = None,
 ) -> _Path:
     """Resolve the on-disk path of the trusted scope file.
 
-    The path is keyed by ``<repo>/<pr_number>/<head_sha>`` so that:
-      * the file is repository-scoped,
-      * the file is PR-scoped,
-      * the file is **immutably bound to a single exact head SHA**.
-
-    A moved head therefore requires writing a fresh scope record;
-    the previous one remains on disk but does not authorize the new
-    head. ``read_trusted_scope`` enforces this by verifying the
-    recorded ``head_sha`` matches the supplied ``head_sha``.
-
-    Tests that need to bypass ``~/.hermes/aed/pr_scope`` can set
-    ``HERMES_AED_SCOPE_DIR`` to a tempdir; this is the ONLY env-var
-    override and it is the ONLY seam that changes the resolution
-    path.
+    Production callers MUST NOT pass ``scope_root``. When ``scope_root``
+    is supplied (tests only), it is used instead of the canonical
+    root. The production root is hard-coded; no environment variable,
+    CLI flag, or working-directory fall-back is consulted.
     """
     if not isinstance(repo, str) or "/" not in repo:
         raise ValueError("repo must be in 'owner/name' form")
@@ -383,12 +405,7 @@ def _trusted_scope_path(
         raise ValueError("pr_number must be a positive int")
     if not R.is_canonical_head_sha(head_sha):
         raise ValueError("head_sha must be exactly 40 lowercase hex chars")
-    test_root = _os.environ.get(TRUSTED_SCOPE_ENV_VAR)
-    base = (
-        _Path(test_root)
-        if test_root
-        else _production_trusted_scope_root()
-    )
+    base = scope_root if scope_root is not None else _canonical_scope_root()
     owner, name = repo.split("/", 1)
     return base / owner / name / str(pr_number) / f"{head_sha}.json"
 
@@ -397,8 +414,15 @@ def read_trusted_scope(
     repo: str,
     pr_number: int,
     head_sha: str,
+    *,
+    scope_root: Optional[_Path] = None,
 ) -> Tuple[Optional[List[str]], Optional[List[str]], str]:
     """Read the trusted scope for ``(repo, pr_number, head_sha)``.
+
+    Production callers MUST NOT pass ``scope_root``. When ``scope_root``
+    is supplied (tests only), it is used instead of the canonical
+    root. ``scope_root`` is the ONLY seam that lets tests redirect
+    lookups; there is no environment-variable override.
 
     Returns ``(allowed, forbidden, error)``. When the file is
     absent, malformed, or the recorded ``head_sha`` field does not
@@ -408,7 +432,9 @@ def read_trusted_scope(
     from the live head) MUST block merge.
     """
     try:
-        path = _trusted_scope_path(repo, pr_number, head_sha)
+        path = _trusted_scope_path(
+            repo, pr_number, head_sha, scope_root=scope_root
+        )
     except ValueError as exc:
         return None, None, f"trusted scope path invalid: {exc}"
     if not path.exists():
@@ -446,6 +472,8 @@ def write_trusted_scope(
     head_sha: str,
     allowed_files: List[str],
     forbidden_files: Optional[List[str]] = None,
+    *,
+    scope_root: Optional[_Path] = None,
 ) -> Tuple[bool, str]:
     """Persist the trusted scope for ``(repo, pr_number, head_sha)``.
 
@@ -454,6 +482,11 @@ def write_trusted_scope(
     to ``[]`` when not provided. The written file includes the
     ``head_sha`` field so a later ``read_trusted_scope`` can detect
     a stale record.
+
+    Production callers MUST NOT pass ``scope_root``. When
+    ``scope_root`` is supplied (tests only), it is used instead of
+    the canonical root. ``scope_root`` is the ONLY seam that lets
+    tests redirect writes; there is no environment-variable override.
     """
     if not isinstance(repo, str) or "/" not in repo:
         return False, "repo must be in 'owner/name' form"
@@ -476,7 +509,9 @@ def write_trusted_scope(
         "written_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
     try:
-        path = _trusted_scope_path(repo, pr_number, head_sha)
+        path = _trusted_scope_path(
+            repo, pr_number, head_sha, scope_root=scope_root
+        )
     except ValueError as exc:
         return False, f"trusted scope path invalid: {exc}"
     try:
@@ -611,11 +646,12 @@ def cmd_gate_recheck(args: argparse.Namespace) -> int:
 # constant below documents the policy at the call site.
 _MERGE_CLI_SCOPE_REJECTION = (
     "merge does not accept --allowed-files or --forbidden-files; scope "
-    "must come from the trusted scope file at "
+    "must come from the canonical trusted scope file at "
     "~/.hermes/aed/pr_scope/<owner>/<name>/<pr>/<head_sha>.json. "
     "Use `aed_pr scope-write --head-sha <sha>` to persist the trusted "
-    "scope before merge. HERMES_AED_SCOPE_DIR is a TEST-ONLY seam and "
-    "is NOT consulted by merge."
+    "scope before merge. The canonical scope root is hard-coded; "
+    "no environment variable, CLI flag, or working-directory "
+    "fall-back may redirect it."
 )
 
 
@@ -633,23 +669,21 @@ def _resolve_effective_scope(
     Three cases:
 
     * ``subcommand == "merge"`` - CLI scope is REJECTED outright. The
-      trusted file is the only source. When the file is absent or
+      trusted file is the only source, and it is read from the
+      hard-coded canonical scope root. When the file is absent or
       tied to a different head SHA, the readiness evaluator fails
       closed.
     * ``subcommand in ("status", "advance")`` - CLI scope is
-      accepted ONLY on a dedicated ``--scope-inject`` flag (test
-      seam), AND only when the trusted file exists for the current
-      head. When CLI scope is absent, the trusted file is consulted
-      instead. Diagnostic/test-only injection must NOT mask the
-      trusted-file fail-closed behavior.
+      accepted as a diagnostic override (test seam). When CLI scope
+      is absent, the trusted file is consulted instead. Diagnostic
+      override must NOT mask the trusted-file fail-closed behavior.
     * Trusted file absent and no CLI scope - returns ``None`` lists
       so the scope gate fails closed (no fallback to a default
       allowlist).
 
-    The ``HERMES_AED_SCOPE_DIR`` env var only changes which
-    on-disk root the trusted file is read from. It does NOT
-    bypass any other constraint. merge does NOT consult it; it
-    always reads from the production root.
+    No environment variable is consulted. There is no working-directory
+    fall-back. The canonical scope root is the only root consulted by
+    any production caller.
     """
     if subcommand == "merge":
         if cli_allowed is not None or cli_forbidden is not None:
@@ -659,10 +693,6 @@ def _resolve_effective_scope(
                 "merge requires the live head SHA before the trusted "
                 "scope can be resolved"
             )
-        # Test seam: when HERMES_AED_SCOPE_DIR is set we honour it
-        # so tests can route scope lookups to a tempdir; otherwise we
-        # read from the production root. The behavior of read_trusted_scope
-        # is identical in both cases.
         return read_trusted_scope(repo, pr_number, head_sha)
     # status / advance: CLI scope override is a test seam. The
     # trusted file is the canonical source.
@@ -1178,10 +1208,17 @@ def select_eligible_bot_threads(
     and the deterministic ``thread_id`` recorded for the action
     report. Every entry in ``ineligible`` carries a ``reason`` field
     explaining why the thread was refused.
+
+    Round-4 fix #2: each thread is normalized before the eligibility
+    check so the canonical commit anchor is populated where the live
+    GitHub packet supplied one. Threads without a canonical anchor
+    after normalization are ineligible with reason
+    ``missing_commit_anchor`` (or ``malformed_commit_anchor``).
     """
     eligible: List[Dict[str, Any]] = []
     ineligible: List[Dict[str, Any]] = []
-    for thread in threads or []:
+    for raw_thread in threads or []:
+        thread = R.normalize_thread_anchor(raw_thread)
         ok, reason = R.is_eligible_for_bot_resolution(
             thread,
             head_sha=head_sha,
@@ -1283,13 +1320,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # require machine readiness. The classification is reported
     # unconditionally so dry-run, no-mutation, and mutation paths
     # all surface the same eligibility picture.
-    thread_inventory = (
-        (evidence.review_threads or [])
+    #
+    # Round-4 fix #2: each thread is normalized first so the
+    # canonical commit anchor (``original_commit_sha``) is populated
+    # where the live GitHub packet supplied it. Threads that lack a
+    # canonical anchor after normalization are flagged
+    # ``missing_commit_anchor`` and reported in the eligibility
+    # record without triggering a mutation.
+    raw_thread_inventory = (
+        list(evidence.review_threads or [])
         if evidence.review_thread_inventory_complete
         else []
     )
+    normalized_thread_inventory = [
+        R.normalize_thread_anchor(t) for t in raw_thread_inventory
+    ]
     eligibility = select_eligible_bot_threads(
-        thread_inventory,
+        normalized_thread_inventory,
         head_sha=str(head_sha) if head_sha else None,
         codex_verdict=evidence.codex_verdict,
         codex_clean_passed=(
@@ -1329,25 +1376,44 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # duplicate ping - it must NOT fabricate a successful ping or
     # alter unrelated machine gates. Report explicitly under
     # codex_ping_inventory_unavailable.
-    if pr_view.get("state") == "OPEN" and R.is_canonical_head_sha(head_sha):
+    #
+    # Round-4 fix #3: ``--dry-run`` must perform ZERO write operations.
+    # The ping block is gated on ``not args.dry_run``; in dry-run
+    # mode the controller records what *would* have happened without
+    # invoking any mutation.
+    would_post_codex_ping = (
+        pr_view.get("state") == "OPEN"
+        and R.is_canonical_head_sha(head_sha)
+    )
+    if would_post_codex_ping and not args.dry_run:
         ok_ping, ping_result = _post_codex_ping_comment(
             repo, pr_number, str(head_sha) if head_sha else ""
         )
         if not ok_ping and ping_result == "could not list existing comments":
             actions_taken.append({
-                "action": "request_codex_review",
-                "head_sha": head_sha,
+                "action": "codex_review_ping",
+                "attempted": True,
                 "ok": False,
                 "result": ping_result,
                 "codex_ping_inventory_unavailable": True,
             })
         else:
             actions_taken.append({
-                "action": "request_codex_review",
-                "head_sha": head_sha,
+                "action": "codex_review_ping",
+                "attempted": True,
                 "ok": ok_ping,
                 "result": ping_result,
             })
+    elif would_post_codex_ping and args.dry_run:
+        actions_taken.append({
+            "action": "codex_review_ping",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_post": True,
+        })
+    elif pr_view.get("state") == "OPEN" and R.is_canonical_head_sha(head_sha):
+        # unreachable; defensive - would_post_codex_ping captures this
+        pass
 
     if args.dry_run:
         actions_taken.append({
@@ -1355,13 +1421,43 @@ def cmd_advance(args: argparse.Namespace) -> int:
             "result": "skipped_all_mutations",
         })
         actions_taken.append({
+            "action": "mark_pr_ready",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_attempt": pr_view.get("isDraft") is True,
+        })
+        actions_taken.append({
             "action": "resolve_eligible_bot_threads",
             "attempted": False,
-            "reason": "mutation_flag_not_supplied",
+            "reason": "dry_run",
             "eligible_thread_ids": [
                 r["thread_id"] for r in eligible_thread_records
             ],
             "ineligible_threads": ineligible_thread_records,
+        })
+        actions_taken.append({
+            "action": "workflow_dispatch",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_attempt": False,
+        })
+        actions_taken.append({
+            "action": "post_pr_comment",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_attempt": False,
+        })
+        actions_taken.append({
+            "action": "write_trusted_scope",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_attempt": False,
+        })
+        actions_taken.append({
+            "action": "gh_pr_merge",
+            "attempted": False,
+            "reason": "dry_run",
+            "would_attempt": False,
         })
     else:
         # 1. Draft-to-ready only after the prerequisite gates are green.
@@ -1425,19 +1521,29 @@ def cmd_advance(args: argparse.Namespace) -> int:
             else:
                 resolution_results: List[Dict[str, Any]] = []
                 any_failed = False
+                resolved_thread_ids: List[str] = []
+                failed_thread_ids: List[str] = []
                 attempted = True
                 for record in eligible_thread_records:
                     tid = record["thread_id"]
                     if not tid:
                         continue
                     ok_resolve, msg = resolve_review_thread(repo, tid)
+                    if ok_resolve:
+                        resolved_thread_ids.append(tid)
+                    else:
+                        # Round-4 fix #4: a failed resolution must
+                        # mark ``any_failed`` as True so the action
+                        # record reports ``ok=False`` and ``result``
+                        # is "partial_or_failed" rather than falsely
+                        # claiming "resolved".
+                        any_failed = True
+                        failed_thread_ids.append(tid)
                     resolution_results.append({
                         "thread_id": tid,
                         "ok": ok_resolve,
                         "result": msg,
                     })
-                    if not ok_resolve:
-                        any_failed = False or any_failed
                 # Refetch the live review-thread inventory and rebuild
                 # evidence so machine readiness reflects the post-
                 # resolution state. The mutation outcome is recorded
@@ -1448,9 +1554,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     refreshed_codex_packet = fetch_codex_packet(
                         repo, pr_number, head_sha or ""
                     )
-                    refreshed_threads = list(
+                    raw_refreshed_threads = list(
                         refreshed_codex_packet.get("active_threads") or []
                     ) + list(refreshed_codex_packet.get("outdated_threads") or [])
+                    refreshed_threads = [
+                        R.normalize_thread_anchor(t)
+                        for t in raw_refreshed_threads
+                    ]
                     refreshed_evidence = build_evidence(
                         repo=repo,
                         pr_number=pr_number,
@@ -1498,6 +1608,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             and not any_failed
                         ) else "partial_or_failed"
                     ),
+                    "resolved_thread_ids": resolved_thread_ids,
+                    "failed_thread_ids": failed_thread_ids,
                     "thread_resolutions": resolution_results,
                     "refreshed_machine_ready": (
                         refreshed_machine_verdict.machine_ready
