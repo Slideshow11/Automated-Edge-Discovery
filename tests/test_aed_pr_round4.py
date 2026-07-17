@@ -29,6 +29,8 @@ import pytest
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
 
+import datetime as _dt  # used by mock fixtures for "now" timestamps
+
 from scripts.local import aed_pr_lib as L  # noqa: E402
 from scripts.local import aed_pr_readiness as R  # noqa: E402
 from scripts.local import aed_pr as ctrl  # noqa: E402
@@ -442,6 +444,653 @@ class TestRound4Finding2ThreadAnchor:
         assert '"comments":' in classify_src, (
             "classify()'s entry rebuild must preserve the 'comments' "
             "participant list"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-5 Codex findings (review 4724164893 on a1f4fe7)
+# ---------------------------------------------------------------------------
+
+
+class TestRound5Finding1ScopeWriteRepoArg:
+    def test_scope_write_parser_has_repo_arg(self):
+        """``scope-write`` must register ``--repo`` so ``cmd_scope_write``
+        can access ``args.repo`` without ``AttributeError``. Round-5
+        Codex finding 3604451966."""
+        parser = ctrl.build_parser()
+        ns = parser.parse_args([
+            "scope-write",
+            "--pr-number", "411",
+            "--repo", "owner/name",
+            "--head-sha", "a" * 40,
+            "--allowed-files", "**",
+        ])
+        assert ns.repo == "owner/name"
+
+    def test_scope_write_parser_repo_defaults(self):
+        """``scope-write`` accepts ``--repo`` with a default."""
+        parser = ctrl.build_parser()
+        ns = parser.parse_args([
+            "scope-write",
+            "--pr-number", "411",
+            "--head-sha", "a" * 40,
+            "--allowed-files", "**",
+        ])
+        assert ns.repo == ctrl.DEFAULT_REPO
+
+    def test_scope_write_parses_without_repo_kwarg(self):
+        """End-to-end: scope-write parses successfully WITHOUT an
+        explicit ``--repo`` and uses the default."""
+        parser = ctrl.build_parser()
+        ns = parser.parse_args([
+            "scope-write",
+            "--pr-number", "411",
+            "--head-sha", "a" * 40,
+            "--allowed-files", "scripts/local/aed_pr.py",
+        ])
+        assert hasattr(ns, "repo"), (
+            "scope-write must register --repo so cmd_scope_write "
+            "can access args.repo"
+        )
+        assert ns.repo == ctrl.DEFAULT_REPO
+
+    def test_scope_read_parser_has_repo_arg(self):
+        parser = ctrl.build_parser()
+        ns = parser.parse_args([
+            "scope-read",
+            "--pr-number", "411",
+            "--repo", "owner/name",
+            "--head-sha", "a" * 40,
+        ])
+        assert ns.repo == "owner/name"
+
+    def test_scope_read_parser_repo_defaults(self):
+        parser = ctrl.build_parser()
+        ns = parser.parse_args([
+            "scope-read",
+            "--pr-number", "411",
+            "--head-sha", "a" * 40,
+        ])
+        assert ns.repo == ctrl.DEFAULT_REPO
+
+    def test_scope_write_command_does_not_attribute_error(self):
+        """End-to-end: ``cmd_scope_write`` does NOT raise
+        ``AttributeError`` for ``args.repo`` when the user did NOT
+        supply ``--repo``."""
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_root = ctrl._CANONICAL_SCOPE_ROOT
+            ctrl._CANONICAL_SCOPE_ROOT = Path(tmpdir)
+            try:
+                ns = mock.Mock()
+                ns.pr_number = 411
+                ns.head_sha = "a" * 40
+                ns.repo = ctrl.DEFAULT_REPO  # default value from parser
+                ns.allowed_files = "scripts/local/aed_pr.py"
+                ns.forbidden_files = None
+                # cmd_scope_write would try to write to the real home
+                # directory if scope_root were the production value;
+                # monkey-patch _CANONICAL_SCOPE_ROOT above prevents
+                # that. Verify the command reaches the write step
+                # without raising AttributeError.
+                from scripts.local import aed_pr as ctrl_module
+                code = ctrl_module.cmd_scope_write(ns)
+                assert code == 0, (
+                    f"cmd_scope_write returned {code}; expected 0"
+                )
+            finally:
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+    def test_scope_read_command_does_not_attribute_error(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmpdir:
+            saved_root = ctrl._CANONICAL_SCOPE_ROOT
+            ctrl._CANONICAL_SCOPE_ROOT = Path(tmpdir)
+            try:
+                ctrl.write_trusted_scope(
+                    ctrl.DEFAULT_REPO, 411, "a" * 40,
+                    ["scripts/local/aed_pr.py"],
+                )
+                ns = mock.Mock()
+                ns.pr_number = 411
+                ns.head_sha = "a" * 40
+                ns.repo = ctrl.DEFAULT_REPO
+                from scripts.local import aed_pr as ctrl_module
+                code = ctrl_module.cmd_scope_read(ns)
+                assert code == 0
+            finally:
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+    def test_malformed_repo_rejected_before_filesystem_mutation(self):
+        """Malformed ``--repo`` values (without ``/``) are rejected
+        BEFORE any filesystem mutation."""
+        # ``write_trusted_scope`` returns ``(False, err)`` without
+        # mutating the filesystem.
+        ok, err = ctrl.write_trusted_scope(
+            "no-slash", 411, "a" * 40,
+            ["scripts/local/aed_pr.py"],
+        )
+        assert ok is False
+        assert "repo" in err.lower()
+        # ``read_trusted_scope`` returns ``(None, None, err)``
+        # without reading from the filesystem.
+        allowed, forbidden, read_err = ctrl.read_trusted_scope(
+            "no-slash", 411, "a" * 40,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert "repo" in read_err.lower() or "invalid" in read_err.lower()
+
+
+class TestRound5Finding2GateRecheckDispatchesCI:
+    def test_gate_recheck_invokes_workflow_run_with_ref(self):
+        """``gate-recheck`` MUST invoke ``gh workflow run ci.yml``
+        with ``--ref <live PR head branch>`` so the run is bound
+        to the PR branch and not the repository default.
+
+        Round-5 Codex finding 3604451971.
+        """
+        from unittest import mock
+        dispatch_invocations = []
+        list_invocations = []
+        view_invocations = []
+
+        def fake_dispatch(cmd, *a, **kw):
+            dispatch_invocations.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_list(cmd, *a, **kw):
+            list_invocations.append(list(cmd))
+            # Return one matching run with ``createdAt`` set to
+            # "now" so it qualifies as "at or after dispatched_at".
+            import datetime as _dt
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 29593005015, "name": "CI",
+                    "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "status": "completed", "conclusion": "success",
+                    "createdAt": _dt.datetime.now(
+                        _dt.timezone.utc
+                    ).isoformat(),
+                    "url": "https://example/runs/29593005015",
+                    "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+                }]),
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            view_invocations.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "success",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        ctrl.cmd_gate_recheck(ns)
+
+        assert dispatch_invocations, (
+            "gate-recheck must dispatch the CI workflow"
+        )
+        argv = dispatch_invocations[0]
+        assert argv[0:3] == ["gh", "workflow", "run"]
+        assert "ci.yml" in argv
+        # CRITICAL: --ref must bind to the live PR branch, not main.
+        assert "--ref" in argv, (
+            "dispatch must include --ref to bind to the PR branch"
+        )
+        ref_idx = argv.index("--ref")
+        assert argv[ref_idx + 1] == "reduction/pr-lifecycle-collapse-v1", (
+            f"--ref must be the live PR branch; got {argv[ref_idx + 1]!r}"
+        )
+        assert "main" not in [
+            a for a in argv[ref_idx:] if isinstance(a, str)
+        ], "main must not appear as the dispatch ref"
+        # pr_number and head_sha inputs are passed.
+        assert any("411" in str(x) for x in argv)
+        assert any(DEFAULT_HEAD in str(x) for x in argv)
+
+    def test_gate_recheck_dispatch_failure_skips_run_list(self):
+        """When dispatch fails, the run-list and run-view steps
+        MUST NOT be invoked. The controller returns INCONCLUSIVE."""
+        from unittest import mock
+        list_invocations = []
+        view_invocations = []
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=1, stdout="", stderr="err")
+
+        def fake_list(cmd, *a, **kw):
+            list_invocations.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="[]", stderr="")
+
+        def fake_view(cmd, *a, **kw):
+            view_invocations.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": []}),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2  # INCONCLUSIVE
+        assert not list_invocations, (
+            "run list must not run when dispatch fails"
+        )
+        assert not view_invocations, (
+            "run view must not run when dispatch fails"
+        )
+
+    def test_gate_recheck_rejects_run_on_main(self):
+        """A workflow run tied to ``main`` is rejected because it
+        is not bound to the exact PR head."""
+        from unittest import mock
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        # Run on main instead of the PR branch
+        main_run = {
+            "databaseId": 1, "name": "CI",
+            "event": "workflow_dispatch",
+            "headBranch": "main",
+            "headSha": DEFAULT_HEAD,
+            "status": "completed", "conclusion": "success",
+            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "url": "https://example/runs/1",
+            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+        }
+
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([main_run]),
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "success",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2, (
+            f"a main-branch run must NOT be selected; got {result}"
+        )
+
+    def test_gate_recheck_rejects_run_on_other_sha(self):
+        """A run whose head_sha does not match the live PR head is
+        rejected."""
+        from unittest import mock
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        wrong_sha_run = {
+            "databaseId": 2, "name": "CI",
+            "event": "workflow_dispatch",
+            "headBranch": "reduction/pr-lifecycle-collapse-v1",
+            "headSha": "f" * 40,  # wrong head SHA
+            "status": "completed", "conclusion": "success",
+            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "url": "https://example/runs/2",
+            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+        }
+
+        def fake_list(cmd, *a, **kw):
+            run = dict(wrong_sha_run)
+            run["createdAt"] = _dt.datetime.now(
+                _dt.timezone.utc
+            ).isoformat()
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([run]),
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "success",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2, (
+            f"a wrong-SHA run must NOT be selected; got {result}"
+        )
+
+    def test_gate_recheck_rejects_older_run(self):
+        """A run that pre-dates the dispatch attempt is rejected.
+
+        The controller records ``dispatched_at`` immediately
+        before the ``gh workflow run`` call; any run with
+        ``createdAt`` BEFORE ``dispatched_at`` is from a previous
+        dispatch and must NOT be selected."""
+        from unittest import mock
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        # Run created one hour BEFORE the dispatch attempt would
+        # be considered by the strict matcher.
+        older_run = {
+            "databaseId": 3, "name": "CI",
+            "event": "workflow_dispatch",
+            "headBranch": "reduction/pr-lifecycle-collapse-v1",
+            "headSha": DEFAULT_HEAD,
+            "status": "completed", "conclusion": "success",
+            "createdAt": "2026-07-17T10:00:00Z",  # older than dispatch
+            "url": "https://example/runs/3",
+            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+        }
+
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([older_run]),
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "success",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2, (
+            f"an older run must NOT be selected; got {result}"
+        )
+
+    def test_gate_recheck_local_check_does_not_substitute_for_ci_run(self):
+        """The local ``check_pr_review_comments.py`` script result
+        must NOT be treated as a GitHub Actions required-check
+        result. A local CLEAN with no matching dispatched run
+        returns INCONCLUSIVE, NOT 0."""
+        from unittest import mock
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([]),  # no dispatched run
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "success",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        # A clean local check alone cannot make gate-recheck return 0
+        # when there is no matching GitHub Actions run.
+        assert result != 0, (
+            f"a local clean without a matching run must NOT return 0; "
+            f"got {result}"
+        )
+        assert result == 2, (
+            f"a missing dispatched run must return INCONCLUSIVE; got {result}"
+        )
+
+    def test_gate_recheck_terminal_blocking_returns_blocking(self):
+        """When the dispatched gate's conclusion is ``failure``,
+        return 1 (exact-head blocking)."""
+        from unittest import mock
+
+        def fake_dispatch(cmd, *a, **kw):
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        matching_run = {
+            "databaseId": 4, "name": "CI",
+            "event": "workflow_dispatch",
+            "headBranch": "reduction/pr-lifecycle-collapse-v1",
+            "headSha": DEFAULT_HEAD,
+            "status": "completed", "conclusion": "failure",
+            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "url": "https://example/runs/4",
+            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+        }
+
+        def fake_list(cmd, *a, **kw):
+            # Generate the run's createdAt AT call time so it is
+            # always >= the dispatched_at the controller records.
+            run = dict(matching_run)
+            run["createdAt"] = _dt.datetime.now(
+                _dt.timezone.utc
+            ).isoformat()
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([run]),
+                stderr="",
+            )
+
+        def fake_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": [{
+                    "name": "review-comment-gate",
+                    "status": "completed",
+                    "conclusion": "failure",
+                }]}),
+                stderr="",
+            )
+
+        def fake_pr_view(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "number": 411, "title": "t", "state": "OPEN",
+                    "isDraft": False, "mergeable": True,
+                    "headRefOid": DEFAULT_HEAD,
+                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
+                    "baseRefOid": "b" * 40, "baseRefName": "main",
+                    "additions": 0, "deletions": 0, "changedFiles": 0,
+                    "url": "u", "files": [],
+                }),
+                stderr="",
+            )
+
+        ns = mock.Mock()
+        ns.repo = DEFAULT_REPO
+        ns.pr_number = 411
+        ns.head_sha = DEFAULT_HEAD
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
+        ns.dispatch_runner = fake_dispatch
+        ns.list_runner = fake_list
+        ns.view_runner = fake_view
+        ns.pr_view_runner = fake_pr_view
+
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 1, (
+            f"exact-head blocking must return 1; got {result}"
         )
 
 

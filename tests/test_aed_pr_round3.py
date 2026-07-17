@@ -629,52 +629,188 @@ class TestF4Eligibility:
 # ---------------------------------------------------------------------------
 
 
+def _pr_view_payload(head_sha=DEFAULT_HEAD, head_branch="reduction/pr-lifecycle-collapse-v1"):
+    return {
+        "number": 411, "title": "t", "state": "OPEN",
+        "isDraft": False, "mergeable": True,
+        "headRefOid": head_sha, "headRefName": head_branch,
+        "baseRefOid": "b" * 40, "baseRefName": "main",
+        "additions": 0, "deletions": 0, "changedFiles": 0,
+        "url": "u", "files": [],
+    }
+
+
+def _build_run(
+    *,
+    head_sha=DEFAULT_HEAD,
+    head_branch="reduction/pr-lifecycle-collapse-v1",
+    databaseId=29593005015,
+    name="CI",
+    event="workflow_dispatch",
+    status="completed",
+    conclusion="success",
+    createdAt=None,
+    workflows=None,
+):
+    if createdAt is None:
+        # Default to "now" so the run always qualifies as
+        # "at or after dispatched_at" when the controller
+        # records ``dispatched_at`` immediately before the
+        # ``gh workflow run`` call. Tests that want a
+        # specific historical timestamp can override.
+        import datetime as _dt
+        createdAt = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    return {
+        "databaseId": databaseId, "name": name, "event": event,
+        "headBranch": head_branch, "headSha": head_sha,
+        "status": status, "conclusion": conclusion,
+        "createdAt": createdAt, "url": f"https://example/runs/{databaseId}",
+        "workflows": workflows or [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+    }
+
+
+def _now_iso():
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _gate_ns(
+    head_sha=DEFAULT_HEAD,
+    *,
+    dispatch_runs=None,
+    job_conclusion="success",
+    job_status="completed",
+    head_branch="reduction/pr-lifecycle-collapse-v1",
+    head_mismatch=False,
+    dispatch_failure=False,
+    dispatch_run=None,
+    match_misses=False,
+    identify_err="",
+    timeout=False,
+    wait_timeout_seconds=30,
+    wait_poll_seconds=1,
+):
+    """Build a Namespace mock for ``cmd_gate_recheck``.
+
+    ``dispatch_runs`` is the list of runs returned by the run-list
+    call. ``job_conclusion`` is what the run-view call returns for
+    the ``review-comment-gate`` job. ``timeout`` short-circuits the
+    polling loop so the test does not actually wait.
+    """
+    ns = mock.Mock()
+    ns.repo = DEFAULT_REPO
+    ns.pr_number = 411
+    ns.head_sha = head_sha
+    ns.wait_timeout_seconds = wait_timeout_seconds
+    ns.wait_poll_seconds = wait_poll_seconds
+
+    live = dict(_pr_view_payload(head_sha=head_sha, head_branch=head_branch))
+    if head_mismatch:
+        live["headRefOid"] = "f" * 40  # != requested head
+    ns.pr_view_runner = lambda *a, **kw: mock.Mock(
+        returncode=0,
+        stdout=json.dumps(live),
+        stderr="",
+    )
+
+    if dispatch_failure:
+        ns.dispatch_runner = lambda *a, **kw: mock.Mock(
+            returncode=1, stdout="", stderr="dispatch failed"
+        )
+    else:
+        ns.dispatch_runner = lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="", stderr=""
+        )
+
+    if dispatch_runs is None:
+        # Default: a factory that produces one matching run
+        # AT call time, so the createdAt timestamp is later
+        # than the dispatched_at the controller recorded.
+        if match_misses:
+            dispatch_runs_factory = lambda: []
+        elif identify_err:
+            dispatch_runs_factory = lambda: []
+        else:
+            dispatch_runs_factory = lambda: [_build_run()]
+    elif isinstance(dispatch_runs, str) and dispatch_runs == "__FACTORY__":
+        dispatch_runs_factory = lambda: [_build_run()]
+    else:
+        dispatch_runs_factory = lambda: dispatch_runs
+    ns.list_runner = lambda *a, **kw: mock.Mock(
+        returncode=0,
+        stdout=json.dumps(dispatch_runs_factory()),
+        stderr="",
+    )
+
+    if timeout:
+        # job view never reaches completed
+        ns.view_runner = lambda *a, **kw: mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"jobs": []}),
+            stderr="",
+        )
+    else:
+        job_payload = {
+            "jobs": [{
+                "name": "review-comment-gate",
+                "status": job_status,
+                "conclusion": job_conclusion,
+            }]
+        }
+        ns.view_runner = lambda *a, **kw: mock.Mock(
+            returncode=0,
+            stdout=json.dumps(job_payload),
+            stderr="",
+        )
+
+    # The dispatch-run identification step uses list_runner for the
+    # run list and view_runner for the run view.
+    return ns
+
+
 class TestGateRecheckMechanism:
     def test_forwards_clean(self):
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.runner = lambda *a, **kw: mock.Mock(
-            returncode=0, stdout="{}", stderr=""
-        )
-        assert ctrl.cmd_gate_recheck(ns) == 0
+        """Terminal success returns 0 (exact-head SUCCESS)."""
+        assert ctrl.cmd_gate_recheck(_gate_ns()) == 0
 
     def test_forwards_blocked(self):
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.runner = lambda *a, **kw: mock.Mock(
-            returncode=1, stdout="", stderr=""
-        )
-        assert ctrl.cmd_gate_recheck(ns) == 1
+        """Terminal blocking failure returns 1 (exact-head BLOCKED)."""
+        assert ctrl.cmd_gate_recheck(
+            _gate_ns(job_conclusion="failure", job_status="completed")
+        ) == 1
 
     def test_forwards_inconclusive(self):
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.runner = lambda *a, **kw: mock.Mock(
-            returncode=2, stdout="", stderr=""
-        )
-        # INCONCLUSIVE must be reported as 2, NOT masked to 0.
-        assert ctrl.cmd_gate_recheck(ns) == 2
+        """Anything else (cancelled, neutral, etc.) is INCONCLUSIVE (2)."""
+        assert ctrl.cmd_gate_recheck(
+            _gate_ns(job_conclusion="cancelled", job_status="completed")
+        ) == 2
 
     def test_rejects_non_canonical_head_sha(self):
         ns = mock.Mock()
         ns.repo = DEFAULT_REPO
         ns.pr_number = 411
         ns.head_sha = "not-a-sha"
-        ns.runner = mock.Mock()
+        ns.wait_timeout_seconds = 30
+        ns.wait_poll_seconds = 1
         assert ctrl.cmd_gate_recheck(ns) == 2
 
-    def test_runner_failure_returns_inconclusive(self):
-        def boom(*a, **kw):
-            raise OSError("runner unavailable")
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.runner = boom
+    def test_dispatch_failure_returns_inconclusive(self):
+        """When ``gh workflow run`` fails, gate-recheck returns 2."""
+        ns = _gate_ns(dispatch_failure=True)
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_head_mismatch_blocks_before_dispatch(self):
+        """Requested head_sha != live PR head blocks before dispatch."""
+        ns = _gate_ns(head_mismatch=True)
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_unidentified_run_returns_inconclusive(self):
+        """When no matching run can be identified, return 2."""
+        ns = _gate_ns(match_misses=True)
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_timeout_returns_inconclusive(self):
+        """When the gate never reaches terminal within the bounded
+        timeout, return 2."""
+        ns = _gate_ns(timeout=True, wait_timeout_seconds=1)
         assert ctrl.cmd_gate_recheck(ns) == 2

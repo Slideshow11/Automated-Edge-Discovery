@@ -48,6 +48,7 @@ import datetime as dt
 import json
 import os
 import subprocess
+import time
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -122,15 +123,50 @@ def _run_json_or_none(
 # Live-state fetchers
 # -----------------------------------------------------------------------------
 
-def fetch_pr_state(repo: str, pr_number: int) -> Dict[str, Any]:
-    """Fetch live PR state via gh; re-fetched at the top of every command."""
+def fetch_pr_state(
+    repo: str, pr_number: int, *, runner: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Fetch live PR state via gh; re-fetched at the top of every command.
+
+    The returned dict includes the PR's ``headRefName`` (the branch
+    name), ``headRefOid`` (the commit SHA), and ``headRepository``
+    (the repository the head branch lives in). The
+    ``headRefName`` is required by ``cmd_gate_recheck`` so the
+    ``gh workflow run`` dispatch can be bound to the exact PR
+    branch instead of the repository's default branch.
+
+    ``runner`` (default ``subprocess.run``) is an injectable test
+    seam so unit tests can avoid the live network. ``_run_json``
+    is the only consumer; passing ``runner`` replaces
+    ``subprocess.run`` for this single call.
+    """
     return _run_json([
         "gh", "pr", "view", str(pr_number),
         "--repo", repo,
         "--json",
-        "number,title,state,isDraft,mergeable,headRefOid,baseRefOid,"
-        "additions,deletions,changedFiles,url,files",
-    ])
+        "number,title,state,isDraft,mergeable,headRefOid,headRefName,"
+        "baseRefOid,baseRefName,additions,deletions,changedFiles,url,"
+        "files,headRepository",
+    ], runner=runner)
+
+
+def _run_json(
+    cmd: List[str], timeout: int = 30, *, runner: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Run a gh command, parse JSON, return dict. Raise on failure.
+
+    ``runner`` (default ``subprocess.run``) is an injectable test
+    seam so unit tests can avoid the live network.
+    """
+    if runner is None:
+        runner = subprocess.run
+    proc = runner(cmd, capture_output=True, text=True, timeout=timeout)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed (rc={proc.returncode}): {' '.join(cmd)}\n"
+            f"stderr: {proc.stderr.strip()}"
+        )
+    return json.loads(proc.stdout)
 
 
 def fetch_changed_files(
@@ -590,23 +626,235 @@ def cmd_scope_read(args: argparse.Namespace) -> int:
     return 0
 
 
+def _find_dispatch_run(
+    repo: str,
+    workflow_file: str,
+    *,
+    head_sha: str,
+    head_branch: str,
+    pr_number: int,
+    dispatched_at: dt.datetime,
+    list_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Identify the workflow_dispatch run created by ``cmd_gate_recheck``.
+
+    Lists workflow runs whose ``event`` is ``workflow_dispatch``,
+    whose ``head_branch`` equals the live PR branch, whose
+    ``head_sha`` equals the requested exact PR head, whose
+    ``workflow.name`` matches ``workflow_file`` (or whose path
+    matches ``.github/workflows/<filename>``), and whose
+    ``created_at`` is at or after the supplied ``dispatched_at``.
+
+    Returns ``(run, error)``. ``run`` is the matching run dict (or
+    ``None`` when no run matches). ``error`` is non-empty when the
+    listing itself failed.
+
+    The function uses ``list_runner`` (default ``subprocess.run``)
+    so tests can mock the GitHub API call deterministically.
+
+    The check is deliberately strict: a run tied to ``main``, another
+    branch, another SHA, another PR, or an earlier dispatch is
+    rejected. The first matching run (chronologically) wins; ties
+    are broken by ``created_at`` then ``id``.
+    """
+    if list_runner is None:
+        list_runner = subprocess.run
+    cmd = [
+        "gh", "run", "list",
+        "--repo", repo,
+        "--workflow", workflow_file,
+        "--event", "workflow_dispatch",
+        "--limit", "30",
+        "--json", "databaseId,name,event,headBranch,headSha,status,"
+        "conclusion,createdAt,url,displayTitle,workflows",
+    ]
+    try:
+        proc = list_runner(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"run list failed: {exc}"
+    if proc.returncode != 0:
+        return None, (
+            f"run list returned {proc.returncode}: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    try:
+        runs = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return None, f"invalid run list JSON: {exc}"
+    if not isinstance(runs, list):
+        return None, "run list payload is not a list"
+    matching: List[Dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if run.get("event") != "workflow_dispatch":
+            continue
+        if run.get("headBranch") != head_branch:
+            continue
+        if run.get("headSha") != head_sha:
+            continue
+        # Match the supplied workflow_file against the workflow
+        # name OR the workflow path. ``workflows`` may contain
+        # ``{"name": ..., "path": ...}`` entries.
+        workflow_names = [
+            w.get("name") if isinstance(w, dict) else None
+            for w in (run.get("workflows") or [])
+        ]
+        workflow_paths = [
+            w.get("path") if isinstance(w, dict) else None
+            for w in (run.get("workflows") or [])
+        ]
+        name_ok = workflow_file in workflow_names
+        path_ok = any(
+            p and p.endswith(workflow_file) for p in workflow_paths
+        )
+        run_name = run.get("name", "")
+        if not (name_ok or path_ok or run_name == workflow_file):
+            continue
+        # created_at >= dispatched_at (string comparison of
+        # ISO-8601 timestamps is monotonic).
+        created_at = run.get("createdAt") or ""
+        if created_at < dispatched_at.isoformat():
+            continue
+        matching.append(run)
+    if not matching:
+        return None, (
+            "no workflow_dispatch run found for "
+            f"branch={head_branch!r} head={head_sha!r} "
+            f"workflow={workflow_file!r} after {dispatched_at.isoformat()}"
+        )
+    # Sort by created_at then by databaseId.
+    matching.sort(key=lambda r: (r.get("createdAt") or "", r.get("databaseId") or 0))
+    return matching[0], ""
+
+
+def _wait_for_gate_job(
+    repo: str,
+    run_id: int,
+    *,
+    timeout_seconds: int = 600,
+    poll_seconds: int = 10,
+    list_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Wait for the ``review-comment-gate`` job of a workflow run
+    to reach a terminal state.
+
+    Returns ``(job, error)``. ``job`` is the matching job dict (or
+    ``None`` when the gate does not reach a terminal state within
+    ``timeout_seconds``). ``error`` is non-empty when the listing
+    itself failed or the gate never reported a terminal conclusion.
+
+    The function uses bounded polling. ``poll_seconds`` defaults to
+    10; ``timeout_seconds`` defaults to 600. The cumulative wait is
+    bounded by ``timeout_seconds``. No daemon or scheduler is added.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        jobs, err = _list_run_jobs(repo, run_id, list_runner=list_runner)
+        if err:
+            last_error = err
+            time.sleep(poll_seconds)
+            continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            if job.get("name") != "review-comment-gate":
+                continue
+            status = job.get("status")
+            if status == "completed":
+                return job, ""
+            break  # one match per run
+        time.sleep(poll_seconds)
+    return None, (
+        f"review-comment-gate did not complete within "
+        f"{timeout_seconds}s (last_error={last_error!r})"
+    )
+
+
+def _list_run_jobs(
+    repo: str,
+    run_id: int,
+    *,
+    list_runner: Optional[Any] = None,
+) -> Tuple[List[Dict[str, Any]], str]:
+    """List the jobs of a workflow run via ``gh run view``."""
+    if list_runner is None:
+        list_runner = subprocess.run
+    cmd = [
+        "gh", "run", "view", str(run_id),
+        "--repo", repo,
+        "--json", "jobs",
+    ]
+    try:
+        proc = list_runner(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return [], f"run view failed: {exc}"
+    if proc.returncode != 0:
+        return [], (
+            f"run view returned {proc.returncode}: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return [], f"invalid run view JSON: {exc}"
+    if not isinstance(payload, dict):
+        return [], "run view payload is not a dict"
+    jobs = payload.get("jobs")
+    if not isinstance(jobs, list):
+        return [], "run view jobs is not a list"
+    return jobs, ""
+
+
 def cmd_gate_recheck(args: argparse.Namespace) -> int:
-    """Re-run ``check_pr_review_comments.py`` against the live head.
+    """Re-run the exact-head ``review-comment-gate`` via workflow
+    dispatch, bound to the live PR head.
 
-    Round-3 requirement: the review-comment-gate must reach a final
-    terminal result after a new-head Codex response arrives. The
-    GitHub Actions workflow that owns this gate fires on
-    ``pull_request`` events; ``workflow_dispatch`` re-runs the same
-    job against a supplied head SHA. This subcommand is the manually
-    dispatchable existing command that re-evaluates the gate against
-    the exact head and produces a final terminal result.
+    Round-5 fix #3 (Codex review 4724164893 on ``a1f4fe7``): the
+    earlier round-5 dispatch implementation called ``gh workflow
+    run ci.yml`` without ``--ref``, which targets the repository's
+    default branch (``main``) instead of the PR branch. Such a
+    dispatch does NOT create a check attached to the PR head. The
+    authoritative required-check result for ``cmd_merge`` therefore
+    must come from a workflow run whose ``head_branch`` equals the
+    live PR branch and whose ``head_sha`` equals the requested exact
+    PR head.
 
-    The check is read-only: it invokes
-    ``scripts/local/check_pr_review_comments.py`` via subprocess and
-    forwards its exit code (0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE).
-    A new ``--runner`` override is provided for tests; the default
-    is ``subprocess.run``. INCONCLUSIVE is forwarded as exit code 2;
-    it must NEVER be masked as success.
+    The new flow:
+
+    1. Refetch the live PR state and reject the request when
+       ``args.head_sha`` does not byte-exactly equal
+       ``pr_view.headRefOid``.
+    2. Dispatch ``ci.yml`` with ``--ref <live-head-branch>``,
+       ``-f pr_number=<pr>``, ``-f head_sha=<exact-head-sha>``,
+       ``-f gate=review-comment-gate``.
+    3. Record ``dispatched_at``.
+    4. List recent ``workflow_dispatch`` runs and identify the
+       unique run whose ``head_branch`` and ``head_sha`` match the
+       live PR and whose ``createdAt`` is at or after
+       ``dispatched_at``. Reject runs on ``main``, runs on another
+       SHA, runs on another PR, and earlier dispatches.
+    5. Wait (bounded) for the ``review-comment-gate`` job of that
+       run to reach a terminal state.
+    6. Return ``0`` only when the exact-head dispatched gate is
+       ``completed`` with ``conclusion=success``; ``1`` when
+       ``conclusion=failure``; ``2`` (INCONCLUSIVE) when the
+       dispatch fails, the exact run cannot be identified, the
+       gate does not reach a terminal state within the bounded
+       timeout, or the run/head binding is uncertain.
+
+    The local ``check_pr_review_comments.py`` invocation remains
+    ONLY as diagnostic / preflight evidence. It is NOT the
+    authoritative required-check result. The authoritative result
+    is the workflow-dispatch check attached to the exact PR head
+    and visible through exact-head check inspection
+    (``fetch_ci_conclusions``).
+
+    Tests inject ``dispatch_runner``, ``pr_view_runner``,
+    ``list_runner``, ``view_runner`` so the GitHub surface is
+    exercised deterministically. The default runner is
+    ``subprocess.run``.
     """
     repo = args.repo
     pr_number = args.pr_number
@@ -616,30 +864,128 @@ def cmd_gate_recheck(args: argparse.Namespace) -> int:
             "gate-recheck: --head-sha must be exactly 40 lowercase hex chars\n"
         )
         return 2
-    cmd = [
-        sys.executable,
-        os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "check_pr_review_comments.py",
-        ),
-        "--repo", repo,
-        "--pr-number", str(pr_number),
-        "--reported-head-sha", head_sha,
-    ]
-    runner = getattr(args, "runner", None) or subprocess.run
+
+    # Step 1: refetch the live PR state. The exact head SHA and
+    # head branch must come from the live PR view; we do NOT trust
+    # arguments alone.
+    pr_view_runner = getattr(args, "pr_view_runner", None)
     try:
-        proc = runner(cmd, capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        sys.stderr.write(f"gate-recheck failed: {exc}\n")
+        pr_view = fetch_pr_state(repo, pr_number, runner=pr_view_runner)
+    except Exception as exc:
+        sys.stderr.write(f"gate-recheck: pr view failed: {exc}\n")
         return 2
-    if proc.stdout:
-        sys.stdout.write(proc.stdout)
-    if proc.stderr:
-        sys.stderr.write(proc.stderr)
-    # Forward the underlying gate's exit code; 0/1/2 are valid.
-    # Anything else is treated as INCONCLUSIVE so CI never marks
-    # the gate as success by accident.
-    return proc.returncode if proc.returncode in (0, 1, 2) else 2
+    live_head_sha = pr_view.get("headRefOid") or ""
+    live_head_branch = pr_view.get("headRefName") or ""
+    if not R.is_canonical_head_sha(live_head_sha):
+        sys.stderr.write(
+            "gate-recheck: live pr view head SHA is not canonical: "
+            f"{live_head_sha!r}\n"
+        )
+        return 2
+    if head_sha != live_head_sha:
+        sys.stderr.write(
+            "gate-recheck: requested head_sha does not match live PR head: "
+            f"requested={head_sha!r} live={live_head_sha!r}\n"
+        )
+        return 2
+    if not live_head_branch:
+        sys.stderr.write(
+            "gate-recheck: live PR view has no headRefName; cannot bind dispatch\n"
+        )
+        return 2
+
+    # Step 2: dispatch the CI workflow bound to the live PR branch.
+    # The ``--ref <live-head-branch>`` is the critical binding: a
+    # ``gh workflow run`` without ``--ref`` would target the
+    # repository's default branch (``main``) and not create a check
+    # attached to the PR head.
+    dispatched_at = dt.datetime.now(dt.timezone.utc)
+    dispatch_runner = getattr(args, "dispatch_runner", None) or subprocess.run
+    dispatch_cmd = [
+        "gh", "workflow", "run", "ci.yml",
+        "--repo", repo,
+        "--ref", live_head_branch,
+        "-f", f"pr_number={pr_number}",
+        "-f", f"head_sha={head_sha}",
+        "-f", "gate=review-comment-gate",
+    ]
+    try:
+        dispatch_proc = dispatch_runner(
+            dispatch_cmd, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write(f"gate-recheck dispatch failed: {exc}\n")
+        return 2
+    if dispatch_proc.returncode != 0:
+        sys.stderr.write(
+            f"gate-recheck dispatch returned {dispatch_proc.returncode}: "
+            f"{dispatch_proc.stderr.strip()[:300]}\n"
+        )
+        return 2
+
+    # Step 3: identify the unique workflow_dispatch run we just
+    # created. Reject runs on ``main``, on another branch, on
+    # another SHA, on another PR, or on an earlier dispatch. This
+    # is what proves the dispatched gate is the one attached to the
+    # exact PR head.
+    list_runner = getattr(args, "list_runner", None) or subprocess.run
+    view_runner = getattr(args, "view_runner", None) or list_runner
+    run, err = _find_dispatch_run(
+        repo,
+        "ci.yml",
+        head_sha=head_sha,
+        head_branch=live_head_branch,
+        pr_number=pr_number,
+        dispatched_at=dispatched_at,
+        list_runner=list_runner,
+    )
+    if err or run is None:
+        sys.stderr.write(f"gate-recheck: cannot identify dispatch run: {err}\n")
+        return 2
+    run_id = run.get("databaseId")
+    if not isinstance(run_id, int):
+        sys.stderr.write(
+            "gate-recheck: dispatch run has no databaseId; refusing\n"
+        )
+        return 2
+    sys.stdout.write(
+        json.dumps({
+            "tool": "aed_pr.gate_recheck",
+            "dispatched_run": {
+                "databaseId": run_id,
+                "name": run.get("name"),
+                "headBranch": run.get("headBranch"),
+                "headSha": run.get("headSha"),
+                "event": run.get("event"),
+                "createdAt": run.get("createdAt"),
+                "url": run.get("url"),
+            },
+        }, indent=2)
+    )
+    sys.stdout.write("\n")
+
+    # Step 4: bounded wait for the ``review-comment-gate`` job.
+    timeout_seconds = int(getattr(args, "wait_timeout_seconds", 600) or 600)
+    poll_seconds = int(getattr(args, "wait_poll_seconds", 10) or 10)
+    job, wait_err = _wait_for_gate_job(
+        repo, run_id,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        list_runner=view_runner,
+    )
+    if job is None:
+        sys.stderr.write(
+            f"gate-recheck: review-comment-gate did not complete: {wait_err}\n"
+        )
+        return 2
+    conclusion = (job.get("conclusion") or "").lower()
+    if conclusion == "success":
+        return 0
+    if conclusion == "failure":
+        return 1
+    # Anything else (cancelled, skipped, neutral, empty) is
+    # INCONCLUSIVE - the merge path treats this as blocking.
+    return 2
 
 
 # The merge command REJECTS CLI scope at the argparse level. The
@@ -1873,6 +2219,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scope_write.add_argument("--pr-number", type=int, required=True)
     p_scope_write.add_argument(
+        "--repo", default=DEFAULT_REPO,
+        help=(
+            "Repository in 'owner/name' form. Defaults to "
+            f"{DEFAULT_REPO}."
+        ),
+    )
+    p_scope_write.add_argument(
         "--head-sha", required=True,
         help=(
             "Exact head SHA to bind the scope record to. The scope is "
@@ -1904,6 +2257,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_scope_read.add_argument("--pr-number", type=int, required=True)
     p_scope_read.add_argument(
+        "--repo", default=DEFAULT_REPO,
+        help=(
+            "Repository in 'owner/name' form. Defaults to "
+            f"{DEFAULT_REPO}."
+        ),
+    )
+    p_scope_read.add_argument(
         "--head-sha", required=True,
         help="Exact head SHA to read the trusted scope for.",
     )
@@ -1912,15 +2272,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate_recheck = sub.add_parser(
         "gate-recheck",
         help=(
-            "Re-run check_pr_review_comments.py against the live PR head "
-            "and forward its exit code (0=CLEAN, 1=BLOCKED, 2=INCONCLUSIVE). "
-            "Used to obtain a final terminal result after a new-head "
-            "Codex response has landed."
+            "Dispatch the CI workflow bound to the live PR head and "
+            "wait for the review-comment-gate to reach a terminal "
+            "state. Returns 0 on exact-head success, 1 on exact-head "
+            "blocking failure, 2 on dispatch failure or "
+            "INCONCLUSIVE. Used to obtain a final terminal result "
+            "after a new-head Codex response has landed."
         ),
     )
     p_gate_recheck.add_argument("--pr-number", type=int, required=True)
     p_gate_recheck.add_argument("--repo", default=DEFAULT_REPO)
     p_gate_recheck.add_argument("--head-sha", required=True)
+    p_gate_recheck.add_argument(
+        "--wait-timeout-seconds", type=int, default=600,
+        help="Maximum time to wait for the dispatched gate to complete.",
+    )
+    p_gate_recheck.add_argument(
+        "--wait-poll-seconds", type=int, default=10,
+        help="Polling interval when waiting for the dispatched gate.",
+    )
     p_gate_recheck.set_defaults(func=cmd_gate_recheck)
 
     return parser
