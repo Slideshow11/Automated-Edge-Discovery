@@ -403,6 +403,22 @@ class TestRound4Finding2ThreadAnchor:
         assert "originalCommit" in src
         assert "oid" in src
 
+    def test_classify_rebuild_propagates_anchor_to_entry(self):
+        """Round-4 follow-up: the rebuilt ``entry`` dict in
+        ``classify()``'s review-thread inventory loop must copy
+        ``original_commit_sha`` from the underlying thread. Without
+        this the controller's ``normalize_thread_anchor`` sees an
+        anchorless entry and reports ``missing_commit_anchor`` for
+        every otherwise eligible outdated Codex thread.
+
+        Verified by static inspection: ``classify``'s source must
+        contain ``"original_commit_sha":`` inside the entry rebuild.
+        """
+        from scripts.local import audit_codex_response_for_pr as AC
+        import inspect
+        src = inspect.getsource(AC.classify)
+        assert '"original_commit_sha":' in src
+
 
 # ---------------------------------------------------------------------------
 # Finding 3 — dry-run performs zero mutations

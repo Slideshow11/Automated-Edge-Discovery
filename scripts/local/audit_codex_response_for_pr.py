@@ -1289,6 +1289,26 @@ def classify(
                 "is_resolved": bool(t.get("is_resolved", False)),
                 "is_outdated": bool(t.get("is_outdated", False)),
                 "body": (t.get("body", "") or "")[:500],
+                # Round-4 fix (Codex review 4724016076 on
+                # ``67d68ec``): carry the canonical commit anchor
+                # into the rebuilt ``entry`` dict so downstream
+                # consumers (``classify()``'s callers, the
+                # controller's ``normalize_thread_anchor``) can
+                # see the SHA GitHub's review-thread API supplied.
+                # Without this field, every live entry arrives
+                # anchorless and the eligibility check reports
+                # ``missing_commit_anchor`` for every otherwise
+                # eligible outdated Codex thread.
+                "original_commit_sha": (
+                    t.get("original_commit_sha")
+                    if isinstance(t.get("original_commit_sha"), str)
+                    and len(t.get("original_commit_sha")) == 40
+                    and all(
+                        c in "0123456789abcdef"
+                        for c in t.get("original_commit_sha")
+                    )
+                    else None
+                ),
                 # True iff the parent thread's nested
                 # comments pageInfo hasNextPage=true.
                 # Surfaced in markdown and packet so
