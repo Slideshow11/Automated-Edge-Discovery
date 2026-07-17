@@ -650,7 +650,7 @@ def _build_run(
     status="completed",
     conclusion="success",
     createdAt=None,
-    workflows=None,
+    workflow_name="ci.yml",
 ):
     if createdAt is None:
         # Default to "now" so the run always qualifies as
@@ -665,7 +665,11 @@ def _build_run(
         "headBranch": head_branch, "headSha": head_sha,
         "status": status, "conclusion": conclusion,
         "createdAt": createdAt, "url": f"https://example/runs/{databaseId}",
-        "workflows": workflows or [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+        # ``gh run list`` exposes the workflow filename as the
+        # flat ``workflowName`` field; the nested ``workflows``
+        # array does not exist on this CLI version.
+        "workflowName": workflow_name,
+        "workflowDatabaseId": 263541549,
     }
 
 

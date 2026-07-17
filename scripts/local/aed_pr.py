@@ -666,7 +666,8 @@ def _find_dispatch_run(
         "--event", "workflow_dispatch",
         "--limit", "30",
         "--json", "databaseId,name,event,headBranch,headSha,status,"
-        "conclusion,createdAt,url,displayTitle,workflows",
+        "conclusion,createdAt,url,displayTitle,workflowName,"
+        "workflowDatabaseId",
     ]
     try:
         proc = list_runner(cmd, capture_output=True, text=True, timeout=60)
@@ -694,22 +695,23 @@ def _find_dispatch_run(
         if run.get("headSha") != head_sha:
             continue
         # Match the supplied workflow_file against the workflow
-        # name OR the workflow path. ``workflows`` may contain
-        # ``{"name": ..., "path": ...}`` entries.
-        workflow_names = [
-            w.get("name") if isinstance(w, dict) else None
-            for w in (run.get("workflows") or [])
-        ]
-        workflow_paths = [
-            w.get("path") if isinstance(w, dict) else None
-            for w in (run.get("workflows") or [])
-        ]
-        name_ok = workflow_file in workflow_names
-        path_ok = any(
-            p and p.endswith(workflow_file) for p in workflow_paths
-        )
+        # name. ``gh run list`` exposes ``workflowName`` as a flat
+        # string (not a nested ``workflows`` array) on this CLI
+        # version, so we compare against it directly. We also accept
+        # the run's ``name`` for runs whose workflow file matches
+        # the supplied name (e.g. ``CI`` for ``.github/workflows/ci.yml``).
+        run_workflow_name = run.get("workflowName") or ""
         run_name = run.get("name", "")
-        if not (name_ok or path_ok or run_name == workflow_file):
+        # Strip the ``.yml`` / ``.yaml`` suffix when comparing the
+        # run's workflow name (e.g. ``ci.yml``) against the supplied
+        # ``workflow_file`` (e.g. ``ci.yml``).
+        workflow_base = workflow_file.rsplit(".", 1)[0]
+        run_workflow_base = run_workflow_name.rsplit(".", 1)[0]
+        name_ok = (
+            workflow_file in (run_workflow_name, run_name)
+            or workflow_base in (run_workflow_base, run_name)
+        )
+        if not name_ok:
             continue
         # created_at >= dispatched_at (string comparison of
         # ISO-8601 timestamps is monotonic).

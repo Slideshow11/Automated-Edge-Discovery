@@ -616,7 +616,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
                         _dt.timezone.utc
                     ).isoformat(),
                     "url": "https://example/runs/29593005015",
-                    "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+                    "workflowName": "ci.yml",
+                    "workflowDatabaseId": 263541549,
                 }]),
                 stderr="",
             )
@@ -756,7 +757,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/1",
-            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            "workflowName": "ci.yml",
+            "workflowDatabaseId": 263541549,
         }
 
         def fake_list(cmd, *a, **kw):
@@ -824,7 +826,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/2",
-            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            "workflowName": "ci.yml",
+            "workflowDatabaseId": 263541549,
         }
 
         def fake_list(cmd, *a, **kw):
@@ -902,7 +905,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": "2026-07-17T10:00:00Z",  # older than dispatch
             "url": "https://example/runs/3",
-            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            "workflowName": "ci.yml",
+            "workflowDatabaseId": 263541549,
         }
 
         def fake_list(cmd, *a, **kw):
@@ -1035,7 +1039,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "failure",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/4",
-            "workflows": [{"name": "CI", "path": ".github/workflows/ci.yml"}],
+            "workflowName": "ci.yml",
+            "workflowDatabaseId": 263541549,
         }
 
         def fake_list(cmd, *a, **kw):
