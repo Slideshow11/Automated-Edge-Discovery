@@ -509,6 +509,30 @@ def gh_graphql_review_threads(
         # `ok=False` below) and refuses to emit clean-pass /
         # merge-ready states — incomplete nested comments are
         # never trusted as a complete inventory.
+        # Round-4 follow-up (Codex review 4724091490 on ``a8ccd9b``):
+        # Build a per-thread participant list by iterating
+        # ``comments.nodes`` and collecting each comment's author
+        # login + databaseId. The participant list is then
+        # attached to every entry that shares the same ``thread_id``
+        # so the eligibility check can verify "every reply in the
+        # thread is bot-authored" rather than looking at a single
+        # comment in isolation. Without this aggregation a human
+        # reply inside the same review thread would not be detected
+        # and ``--resolve-eligible-bot-threads`` would resolve a
+        # thread with human participation.
+        thread_participants: Dict[str, List[Dict[str, Any]]] = {}
+        for comment in (comments_obj.get("nodes") or []):
+            if not isinstance(comment, dict):
+                continue
+            entry = thread_participants.setdefault(thread_id, [])
+            entry.append({
+                "author": (
+                    (comment.get("author") or {}).get("login", "")
+                    if isinstance(comment.get("author"), dict)
+                    else ""
+                ),
+                "database_id": comment.get("databaseId"),
+            })
         for comment in (comments_obj.get("nodes") or []):
             if not isinstance(comment, dict):
                 continue
@@ -526,6 +550,11 @@ def gh_graphql_review_threads(
                 "body": comment.get("body") or "",
                 "path": comment.get("path") or "",
                 "line": comment.get("line"),
+                # Per-thread participant list (every comment in the
+                # thread, including replies). The eligibility check
+                # iterates this list to verify no human authored
+                # any reply.
+                "comments": thread_participants.get(thread_id, []),
                 # Round-4 fix #2: canonical commit SHA the comment
                 # was posted against. Surfaced so the eligibility
                 # check can verify a later commit addressed the
@@ -1289,6 +1318,13 @@ def classify(
                 "is_resolved": bool(t.get("is_resolved", False)),
                 "is_outdated": bool(t.get("is_outdated", False)),
                 "body": (t.get("body", "") or "")[:500],
+                # Round-4 follow-up (Codex review 4724091490 on
+                # ``a8ccd9b``): carry the per-thread participant
+                # list into the rebuilt ``entry`` dict. Without this
+                # field the eligibility check sees ``comments=[]``
+                # and reports every reply as bot-authored even when
+                # a human reply is present in the same thread.
+                "comments": list(t.get("comments") or []),
                 # Round-4 fix (Codex review 4724016076 on
                 # ``67d68ec``): carry the canonical commit anchor
                 # into the rebuilt ``entry`` dict so downstream

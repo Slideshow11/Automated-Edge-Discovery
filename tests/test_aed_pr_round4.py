@@ -419,6 +419,31 @@ class TestRound4Finding2ThreadAnchor:
         src = inspect.getsource(AC.classify)
         assert '"original_commit_sha":' in src
 
+    def test_packet_preserves_participant_list(self):
+        """Round-4 follow-up (Codex review 4724091490 on
+        ``a8ccd9b``): the rebuilt ``entry`` dict must carry the
+        ``comments`` participant list so the eligibility check can
+        verify every reply in the thread is bot-authored. Without
+        this field a human reply in the same review thread would
+        not be detected and ``--resolve-eligible-bot-threads`` would
+        resolve a thread with human participation.
+
+        Verified by static inspection of both the GraphQL fetcher
+        and the ``classify`` rebuild loop.
+        """
+        from scripts.local import audit_codex_response_for_pr as AC
+        import inspect
+        fetcher_src = inspect.getsource(AC.gh_graphql_review_threads)
+        classify_src = inspect.getsource(AC.classify)
+        assert '"comments":' in fetcher_src, (
+            "gh_graphql_review_threads must attach a 'comments' "
+            "participant list to each entry"
+        )
+        assert '"comments":' in classify_src, (
+            "classify()'s entry rebuild must preserve the 'comments' "
+            "participant list"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Finding 3 — dry-run performs zero mutations
