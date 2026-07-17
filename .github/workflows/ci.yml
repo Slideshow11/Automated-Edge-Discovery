@@ -5,6 +5,21 @@ on:
     branches: [ main, 'fix/*', 'feat/*' ]
   pull_request:
     branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "PR number to evaluate (review-comment-gate re-trigger)"
+        required: false
+        type: string
+      head_sha:
+        description: "Exact head SHA to evaluate against (review-comment-gate re-trigger)"
+        required: false
+        type: string
+      gate:
+        description: "Optional gate to re-run; leave empty to run all"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   pull-requests: read
@@ -116,14 +131,18 @@ jobs:
         run: bash scripts/ci/validate_governance_manifests.sh
 
   review-comment-gate:
-    if: github.event_name == 'pull_request'
+    # Round-3 fix: this gate runs on pull_request events AND on
+    # workflow_dispatch. The dispatch path is the minimal mechanism
+    # that lets the operator (or ``aed_pr gate-recheck``) re-evaluate
+    # the gate against the exact head AFTER a new Codex response
+    # arrives. INCONCLUSIVE never counts as success on either path;
+    # the underlying script exits with the correct code (0/1/2)
+    # and the step is failed when the script returns non-zero.
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' &&
+       (inputs.gate == '' || inputs.gate == 'review-comment-gate'))
     runs-on: ubuntu-latest
-    # Runs only on pull_request events targeting main.
-    # Skipped on push events (branches like feat/*, fix/*) where
-    # github.event.pull_request is absent and PR_NUMBER/HEAD_SHA
-    # would be empty, causing check_pr_review_comments.py to fail.
-    # Uses gh CLI authenticated via GITHUB_TOKEN.
-    # No live Claude, no Hermes mutations.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -136,11 +155,19 @@ jobs:
       - name: Run review-comment gate
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Refuse to run if the required inputs are missing; this
+          # prevents the gate from silently running on an empty
+          # head SHA, which would let the operator mask INCONCLUSIVE
+          # as success.
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_SHA" ]; then
+            echo "::error::review-comment-gate requires PR_NUMBER and HEAD_SHA"
+            exit 2
+          fi
           mkdir -p /tmp/review_comment_gate
           python scripts/local/check_pr_review_comments.py \
             --repo "$REPO" \
@@ -151,8 +178,10 @@ jobs:
           echo "=== REVIEW COMMENT GATE OUTPUT ==="
           cat /tmp/review_comment_gate/status.json
           echo ""
-          # Exit code 0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE
-          # The script itself exits with the correct code — no wrapper needed.
+          # Exit code 0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE.
+          # The script itself exits with the correct code; do NOT
+          # mask a non-zero exit code as success. INCONCLUSIVE (2)
+          # fails the gate.
 
       - name: Upload gate artifact
         if: always()

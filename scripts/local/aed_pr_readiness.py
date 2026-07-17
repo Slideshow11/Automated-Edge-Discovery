@@ -21,12 +21,39 @@ checked only phrase + state + draft + mergeable. This module replaces
 all three with one strict gate list so the three subcommands cannot
 disagree about what is and is not ready.
 
+Machine readiness vs human authorization
+----------------------------------------
+
+Two distinct evaluations are exposed:
+
+* :func:`evaluate_machine_readiness` - checks the 11 non-phrase gates
+  on the supplied evidence. This is what ``status`` always calls so the
+  controller can emit ``READY_FOR_MERGE_AUTHORIZATION`` (i.e. "every
+  machine gate passes; speak the canonical phrase and run merge")
+  without the operator having to supply a phrase first.
+* :func:`evaluate_authorization` - byte-exactly compares a supplied
+  phrase to the canonical phrase for the live head. The status
+  command never calls this; the merge command always does.
+
+A composite :class:`ReadinessVerdict` carries both, exposing:
+
+* ``machine_ready`` - all 11 non-phrase gates passed
+* ``authorization_required`` - True iff machine_ready is True and a
+  phrase must be supplied to proceed
+* ``authorization_valid`` - True iff a supplied phrase byte-matches the
+  canonical phrase for the live head. None when no phrase was supplied.
+* ``merge_ready`` - True iff machine_ready AND authorization_valid
+
+This separation resolves the round-2 Codex finding that ``status``
+always supplied ``authorization_phrase=None``, causing the authorization
+gate to fail before ``status`` could emit the canonical phrase.
+
 Gates enforced (all 12)
 ------------------------
 
 Every gate is checked on the exact authorized head, freshly fetched at
 the moment of evaluation. A single failure flips the verdict to
-``READY=False`` and emits a :class:`ReadinessReason`. ``aed_pr merge``
+``READY=False`` and emits a :class:`ReadinessReason``. ``aed_pr merge``
 must not call ``gh pr merge`` unless every gate passed on the live head
 that the operator's authorization phrase names.
 
@@ -45,6 +72,10 @@ that the operator's authorization phrase names.
 12. No required evidence was missing, skipped, stale, malformed, or
     treated as passing by default
 
+Gates 1-3 and 5-12 belong to the machine-readiness evaluation. Gate 4
+is the authorization evaluation. ``status`` always evaluates machine
+readiness; only ``merge`` evaluates authorization.
+
 The evaluator never falls back to "treat missing as passing". A
 missing required field, a stale Codex artifact, a failed CI run, an
 unresolved thread, or an inventory-fetch error all block merge with
@@ -58,7 +89,7 @@ owns the I/O. The module is pure-Python and stdlib-only.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # -----------------------------------------------------------------------------
@@ -232,6 +263,10 @@ class ReadinessEvidence:
     ci_pending: Optional[List[str]] = None           # required and running
     ci_failed: Optional[List[str]] = None            # required and failed
 
+    # Round-2 fix: explicit signal that the operator supplied an
+    # allowed_files list. When False, the scope gate fails closed.
+    allowed_files_supplied: bool = False
+
     codex_verdict: Optional[str] = None              # "CODEX_CLEAN_PASS" | ...
     codex_source: Optional[str] = None               # "issue_comment" | "review" | ...
     codex_reviewed_sha: Optional[str] = None         # SHA the artifact actually reviewed
@@ -276,14 +311,57 @@ class ReadinessReason:
 
 @dataclass
 class ReadinessVerdict:
+    """Composite readiness verdict consumed by status/advance/merge.
+
+    The ``ready`` field is preserved for backward compatibility and is
+    equivalent to ``merge_ready`` (i.e. machine_ready AND
+    authorization_valid). New code should consult the four explicit
+    fields below:
+
+    * ``machine_ready`` - all 11 non-phrase gates passed
+    * ``authorization_required`` - True iff machine_ready is True and a
+      phrase must be supplied to proceed
+    * ``authorization_valid`` - True iff a supplied phrase byte-matches
+      the canonical phrase for the live head. None when no phrase was
+      supplied.
+    * ``merge_ready`` - True iff machine_ready AND authorization_valid
+
+    The :attr:`reasons` list combines machine-readiness and
+    authorization reasons (in that order). When only the phrase is
+    missing, ``reasons`` contains exactly one entry with code
+    :data:`REASON_PHRASE_MISMATCH`.
+    """
+
     ready: bool
     reasons: List[ReadinessReason]
     gates_passed: List[str]
     gates_failed: List[str]
+    # Round-2 additions: split machine vs authorization.
+    machine_ready: bool = False
+    authorization_required: bool = False
+    authorization_valid: Optional[bool] = None
+
+    @property
+    def merge_ready(self) -> bool:
+        """True iff machine gates passed and a phrase (when supplied) validates.
+
+        When no phrase was supplied (the ``status`` path), this is True
+        iff ``machine_ready`` is True - the canonical phrase remains
+        for the operator to speak before running ``merge``.
+        """
+        if not self.machine_ready:
+            return False
+        if self.authorization_valid is None:
+            return True
+        return bool(self.authorization_valid)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "ready": self.ready,
+            "machine_ready": self.machine_ready,
+            "authorization_required": self.authorization_required,
+            "authorization_valid": self.authorization_valid,
+            "merge_ready": self.merge_ready,
             "reasons": [r.to_dict() for r in self.reasons],
             "gates_passed": list(self.gates_passed),
             "gates_failed": list(self.gates_failed),
@@ -312,6 +390,27 @@ ALL_GATES = (
     GATE_PR_NON_DRAFT,
     GATE_PR_MERGEABLE,
     GATE_AUTHORIZATION_PHRASE,
+    GATE_CHANGED_FILES_FETCHED,
+    GATE_SCOPE_CLEAN,
+    GATE_CI_PRESENT,
+    GATE_CODEX_EVIDENCE,
+    GATE_REVIEWS_AND_COMMENTS,
+    GATE_THREAD_INVENTORY,
+    GATE_UNRESOLVED_THREADS,
+    GATE_NO_MISSING_EVIDENCE,
+)
+
+
+# Gates that participate in machine readiness (gates 1-3 and 5-12).
+# Gate 4 (authorization phrase) is the single human-supplied gate and
+# is NOT part of machine readiness. This separation is the round-2
+# fix: ``status`` evaluates MACHINE_GATES so it can emit
+# ``READY_FOR_MERGE_AUTHORIZATION`` without requiring the operator to
+# have already spoken the canonical phrase.
+MACHINE_GATES = (
+    GATE_PR_OPEN,
+    GATE_PR_NON_DRAFT,
+    GATE_PR_MERGEABLE,
     GATE_CHANGED_FILES_FETCHED,
     GATE_SCOPE_CLEAN,
     GATE_CI_PRESENT,
@@ -414,6 +513,135 @@ def partition_unresolved_threads(
     }
 
 
+# Round-2 fix: deterministic thread-eligibility check for auto-resolution.
+#
+# A thread may be eligible for bounded auto-resolution only when EVERY
+# condition below is true. Any uncertainty must make the thread
+# ineligible. This is the safety boundary between "stale bot finding
+# from a previous round" (auto-resolvable) and "current-bot finding
+# on this head" or "human finding" (NEVER auto-resolvable).
+#
+# Conditions:
+#
+#  1. The top-level author is the recognized Codex bot (or another
+#     recognized bot - the actor classification helper covers both).
+#  2. Every comment and reply in the thread is bot-authored (no human
+#     reply anywhere in the thread).
+#  3. The thread is reported by GitHub as outdated.
+#  4. The underlying finding was addressed by a later commit than
+#     the thread's commit anchor. The thread's ``comment_sha`` is
+#     the SHA on which the top-level comment was posted.
+#  5. Exact-head Codex evidence on the live head is clean (no current
+#     Codex finding supersedes or repeats the outdated one).
+#  6. The thread's bot actor appears in the recognized-bot set
+#     explicitly (defence against unknown-bot false positives).
+#
+# The function returns (eligible: bool, reason: str). When ``eligible``
+# is False, ``reason`` is one of the documented ineligibility reasons
+# and is safe to surface in the controller's action report.
+
+# Recognized bot authors eligible for bounded auto-resolution. Keep in
+# sync with aed_pr.classify_thread_actor / partition_unresolved_threads.
+_RECOGNIZED_BOT_LOGINS = frozenset({
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
+    "github-actions[bot]",
+    "dependabot[bot]",
+    "renovate[bot]",
+})
+
+
+def is_eligible_for_bot_resolution(
+    thread: Dict[str, Any],
+    *,
+    head_sha: Optional[str],
+    codex_verdict: Optional[str],
+    codex_clean_passed: Optional[bool],
+    codex_reviewed_sha: Optional[str] = None,
+) -> Tuple[bool, str]:
+    """Return ``(eligible, reason)`` for a single review thread.
+
+    See the module-level comment above for the deterministic eligibility
+    contract. Any uncertainty produces ``eligible=False`` with a
+    specific reason code (one of ``actor_not_bot``, ``human_reply``,
+    ``unknown_actor_in_thread``, ``not_outdated``, ``no_later_commit``,
+    ``current_head_finding``, ``head_unknown``, ``codex_not_clean``,
+    ``codex_head_mismatch``).
+    """
+    if not isinstance(thread, dict):
+        return False, "actor_not_bot"
+
+    # Idempotency: a thread GitHub already reports as resolved must
+    # never be re-resolved. Even if it is otherwise eligible, the
+    # mutation would be a no-op on the live side; the controller
+    # treats it as ineligible so re-running advance does not issue
+    # redundant resolveReviewThread calls.
+    if bool(thread.get("isResolved") or thread.get("is_resolved")):
+        return False, "already_resolved"
+
+    # Condition 3: thread must be outdated.
+    is_outdated = bool(thread.get("isOutdated") or thread.get("is_outdated"))
+    if not is_outdated:
+        return False, "not_outdated"
+
+    # Condition 1: top-level author must be a recognized bot.
+    top_actor_login = thread.get("author") or thread.get("author_login")
+    if not isinstance(top_actor_login, str) or not top_actor_login:
+        return False, "actor_not_bot"
+    if top_actor_login.lower() not in _RECOGNIZED_BOT_LOGINS:
+        return False, "actor_not_bot"
+
+    # Condition 2: every comment in the thread must be bot-authored.
+    comments = thread.get("comments") or thread.get("comment_list") or []
+    if not isinstance(comments, list):
+        # If the inventory does not contain a comment list, we cannot
+        # prove condition 2. Refuse to be eligible.
+        return False, "unknown_actor_in_thread"
+    for c in comments:
+        if not isinstance(c, dict):
+            return False, "unknown_actor_in_thread"
+        author = c.get("author") or c.get("author_login") or c.get("user")
+        if not isinstance(author, str) or not author:
+            return False, "unknown_actor_in_thread"
+        if author.lower() not in _RECOGNIZED_BOT_LOGINS:
+            return False, "human_reply"
+
+    # Condition 4: the underlying finding was addressed by a later
+    # commit than the thread's anchor. The thread's anchor is the SHA
+    # recorded on the top-level comment (``comment_sha``) or, if not
+    # recorded, the ``head_sha`` carried in the thread dict.
+    anchor_sha = thread.get("comment_sha") or thread.get("head_sha")
+    if (
+        isinstance(anchor_sha, str)
+        and isinstance(head_sha, str)
+        and head_sha
+        and anchor_sha
+        and anchor_sha != head_sha
+    ):
+        # Anchor is some other SHA; the live head is later. Eligible.
+        pass
+    elif anchor_sha == head_sha:
+        # The thread is anchored to the current head - not a stale
+        # finding. Refuse.
+        return False, "no_later_commit"
+    # If anchor_sha is absent or non-string, the eligibility checker
+    # is uncertain and refuses.
+
+    # Condition 5/6: exact-head Codex evidence must be clean and the
+    # reviewed SHA must match the live head.
+    if not isinstance(head_sha, str) or not head_sha:
+        return False, "head_unknown"
+    if codex_reviewed_sha is not None and isinstance(codex_reviewed_sha, str):
+        if codex_reviewed_sha != head_sha:
+            return False, "codex_head_mismatch"
+    if codex_clean_passed is not True:
+        return False, "codex_not_clean"
+    if not is_codex_clean_verdict(codex_verdict):
+        return False, "codex_not_clean"
+
+    return True, "eligible"
+
+
 def is_canonical_head_sha(sha: Optional[str]) -> bool:
     """True iff sha is exactly 40 lowercase hex characters."""
     if not isinstance(sha, str) or len(sha) != 40:
@@ -425,33 +653,24 @@ def is_canonical_head_sha(sha: Optional[str]) -> bool:
 # Evaluator
 # -----------------------------------------------------------------------------
 
-def evaluate_readiness(
+def _evaluate_machine_gates(
     evidence: ReadinessEvidence,
-    expected_canonical_phrase: Optional[str] = None,
-) -> ReadinessVerdict:
-    """Evaluate the 12-gate readiness verdict on the supplied evidence.
+) -> Tuple[List[ReadinessReason], List[str], List[str]]:
+    """Evaluate the 11 non-phrase gates on the supplied evidence.
 
-    ``expected_canonical_phrase`` is the phrase the operator spoke;
-    if not supplied, ``evidence.authorization_phrase`` is used. The
-    evaluator never accepts a phrase whose embedded SHA does not
-    byte-exactly match ``evidence.head_sha``. A phrase is required to
-    pass gate 4; if no phrase is present the gate fails closed.
+    Returns ``(reasons, passed, failed)``. Caller owns the assembly of
+    the composite verdict. Each gate's logic mirrors what was in
+    :func:`evaluate_readiness`; this helper exists so :func:`evaluate_readiness`
+    can be expressed as ``machine + authorization`` without duplication.
+
+    The returned ``passed`` / ``failed`` lists contain only
+    :data:`MACHINE_GATES`. Gate 4 (authorization phrase) is intentionally
+    excluded here.
     """
     reasons: List[ReadinessReason] = []
     passed: List[str] = []
     failed: List[str] = []
-
     head_sha = evidence.head_sha
-    if not is_canonical_head_sha(head_sha):
-        # Without a canonical 40-hex head SHA no gate can be evaluated
-        # against the exact authorized head. Every downstream gate fails.
-        reasons.append(ReadinessReason(
-            code=REASON_EVIDENCE_MISSING,
-            detail=f"head_sha must be exactly 40 lowercase hex chars; got {head_sha!r}",
-            gate=GATE_NO_MISSING_EVIDENCE,
-        ))
-        failed.extend(ALL_GATES)
-        return ReadinessVerdict(False, reasons, passed, failed)
 
     # 1. PR is open
     if evidence.pr_state == "OPEN":
@@ -498,28 +717,6 @@ def evaluate_readiness(
             gate=GATE_PR_MERGEABLE,
         ))
 
-    # 4. Authorization phrase byte-exact against current head
-    phrase = evidence.authorization_phrase or expected_canonical_phrase
-    expected = (
-        "I confirm merge PR #"
-        + "?"  # placeholder, replaced below
-    )
-    # We rely on the caller to have already built the canonical phrase;
-    # the evaluator only compares byte equality.
-    canonical_phrase = _build_canonical_phrase(evidence)
-    if phrase and isinstance(phrase, str) and phrase == canonical_phrase:
-        passed.append(GATE_AUTHORIZATION_PHRASE)
-    else:
-        failed.append(GATE_AUTHORIZATION_PHRASE)
-        reasons.append(ReadinessReason(
-            code=REASON_PHRASE_MISMATCH,
-            detail=(
-                "authorization phrase does NOT byte-match the canonical "
-                "phrase for the current head SHA"
-            ),
-            gate=GATE_AUTHORIZATION_PHRASE,
-        ))
-
     # 5. Changed-file paths were successfully fetched
     if evidence.changed_files_fetched and isinstance(evidence.changed_files, list):
         passed.append(GATE_CHANGED_FILES_FETCHED)
@@ -531,8 +728,23 @@ def evaluate_readiness(
             gate=GATE_CHANGED_FILES_FETCHED,
         ))
 
-    # 6. Changed-file scope exists and is clean
-    if evidence.scope_clean is True:
+    # 6. Changed-file scope exists and is clean.
+    # The controller MUST have supplied an explicit allowed_files list.
+    # When allowed_files_supplied is False, the gate fails closed even
+    # if scope_clean happens to be True (a defensive belt-and-braces
+    # check that prevents the controller from silently treating a PR
+    # as in-scope just because the scope check returned no violations).
+    if not evidence.allowed_files_supplied and evidence.changed_files_fetched:
+        failed.append(GATE_SCOPE_CLEAN)
+        reasons.append(ReadinessReason(
+            code=REASON_SCOPE_UNKNOWN,
+            detail=(
+                "operator did not supply an allowed_files list; the scope "
+                "gate fails closed"
+            ),
+            gate=GATE_SCOPE_CLEAN,
+        ))
+    elif evidence.scope_clean is True:
         passed.append(GATE_SCOPE_CLEAN)
     elif evidence.scope_clean is False:
         failed.append(GATE_SCOPE_CLEAN)
@@ -737,8 +949,151 @@ def evaluate_readiness(
             gate=GATE_NO_MISSING_EVIDENCE,
         ))
 
-    ready = len(failed) == 0
-    return ReadinessVerdict(ready, reasons, passed, failed)
+    return reasons, passed, failed
+
+
+def evaluate_machine_readiness(
+    evidence: ReadinessEvidence,
+) -> ReadinessVerdict:
+    """Evaluate ONLY the 11 non-phrase machine gates.
+
+    The canonical phrase (gate 4) is deliberately not evaluated here;
+    it is the operator's responsibility and is checked separately by
+    :func:`evaluate_authorization`. ``status`` always calls this
+    function so the controller can emit ``READY_FOR_MERGE_AUTHORIZATION``
+    when every machine gate passes.
+
+    Returns a :class:`ReadinessVerdict` with
+    ``machine_ready=True`` and ``authorization_valid=None``. The
+    ``authorization_required`` field is set to ``True`` iff
+    ``machine_ready`` is True (i.e. the operator's next action is to
+    speak the canonical phrase and run ``merge``).
+    """
+    if not is_canonical_head_sha(evidence.head_sha):
+        # Without a canonical 40-hex head SHA no machine gate can be
+        # evaluated against the exact authorized head. Every machine
+        # gate fails closed.
+        return ReadinessVerdict(
+            ready=False,
+            reasons=[ReadinessReason(
+                code=REASON_EVIDENCE_MISSING,
+                detail=f"head_sha must be exactly 40 lowercase hex chars; got {evidence.head_sha!r}",
+                gate=GATE_NO_MISSING_EVIDENCE,
+            )],
+            passed=[],
+            failed=list(MACHINE_GATES),
+            machine_ready=False,
+            authorization_required=False,
+            authorization_valid=None,
+        )
+
+    reasons, passed, failed = _evaluate_machine_gates(evidence)
+    machine_ready = not failed
+    return ReadinessVerdict(
+        # For backward compatibility, ``ready`` mirrors ``machine_ready``
+        # when no phrase has been supplied. ``merge_ready`` (the new
+        # canonical field) follows the same logic.
+        ready=machine_ready,
+        reasons=reasons,
+        gates_passed=passed,
+        gates_failed=failed,
+        machine_ready=machine_ready,
+        authorization_required=machine_ready,
+        authorization_valid=None,
+    )
+
+
+def evaluate_authorization(
+    evidence: ReadinessEvidence,
+    supplied_phrase: Optional[str],
+) -> Tuple[Optional[ReadinessReason], List[str]]:
+    """Evaluate the authorization phrase gate (gate 4).
+
+    Returns ``(reason, gates_failed)`` where ``reason`` is None on a
+    pass and a :class:`ReadinessReason` on a fail; ``gates_failed``
+    contains ``[GATE_AUTHORIZATION_PHRASE]`` on a fail and ``[]`` on a
+    pass. A ``None`` or empty supplied_phrase always fails closed - the
+    merge command MUST refuse to merge without an exact authorization
+    phrase.
+    """
+    canonical_phrase = _build_canonical_phrase(evidence)
+    if (
+        supplied_phrase
+        and isinstance(supplied_phrase, str)
+        and canonical_phrase is not None
+        and supplied_phrase == canonical_phrase
+    ):
+        return None, []
+    reason = ReadinessReason(
+        code=REASON_PHRASE_MISMATCH,
+        detail=(
+            "authorization phrase does NOT byte-match the canonical "
+            "phrase for the current head SHA"
+        ),
+        gate=GATE_AUTHORIZATION_PHRASE,
+    )
+    return reason, [GATE_AUTHORIZATION_PHRASE]
+
+
+def evaluate_readiness(
+    evidence: ReadinessEvidence,
+    expected_canonical_phrase: Optional[str] = None,
+) -> ReadinessVerdict:
+    """Evaluate the full 12-gate readiness verdict on the supplied evidence.
+
+    ``expected_canonical_phrase`` is the phrase the operator spoke;
+    if not supplied, ``evidence.authorization_phrase`` is used.
+
+    This function is the canonical composite evaluator. It runs:
+
+    1. :func:`evaluate_machine_readiness` (gates 1-3, 5-12)
+    2. :func:`evaluate_authorization` (gate 4) using the supplied
+       phrase. When no phrase is supplied (the ``status`` path),
+       ``authorization_valid`` is set to ``None`` and the only
+       authorization-related output is the
+       :data:`REASON_PHRASE_MISMATCH` reason code.
+
+    The returned verdict has explicit ``machine_ready``,
+    ``authorization_required``, ``authorization_valid``, and
+    ``merge_ready`` fields. The historical ``ready`` field is preserved
+    for backward compatibility and equals ``merge_ready``.
+    """
+    machine = evaluate_machine_readiness(evidence)
+    phrase = evidence.authorization_phrase or expected_canonical_phrase
+    auth_reason, auth_failed = evaluate_authorization(evidence, phrase)
+
+    reasons = list(machine.reasons)
+    passed = list(machine.gates_passed)
+    failed = list(machine.gates_failed)
+    if auth_reason is not None:
+        reasons.append(auth_reason)
+        failed.extend(auth_failed)
+    else:
+        # Authorization gate (gate 4) is part of ALL_GATES so it must
+        # appear in ``passed`` when the supplied phrase matches the
+        # canonical phrase for the live head.
+        passed.append(GATE_AUTHORIZATION_PHRASE)
+
+    # ``authorization_valid`` reflects whether the supplied phrase
+    # matched the canonical phrase for the live head. The brief's
+    # contract: ``missing phrase`` (None/empty) is False, not None -
+    # because the merge command refuses merge on a missing phrase.
+    if phrase is None:
+        authorization_valid = False
+    else:
+        authorization_valid = auth_reason is None
+
+    merge_ready = machine.machine_ready and bool(authorization_valid)
+
+    return ReadinessVerdict(
+        ready=merge_ready,
+        reasons=reasons,
+        gates_passed=passed,
+        gates_failed=failed,
+        machine_ready=machine.machine_ready,
+        authorization_required=machine.machine_ready,
+        authorization_valid=authorization_valid,
+    )
 
 
 def _build_canonical_phrase(evidence: ReadinessEvidence) -> Optional[str]:
@@ -810,9 +1165,14 @@ __all__ = [
     "GATE_UNRESOLVED_THREADS",
     "GATE_NO_MISSING_EVIDENCE",
     "ALL_GATES",
+    "MACHINE_GATES",
     "evaluate_readiness",
+    "evaluate_machine_readiness",
+    "evaluate_authorization",
     "is_codex_clean_verdict",
     "classify_thread_actor",
     "partition_unresolved_threads",
+    "is_eligible_for_bot_resolution",
     "is_canonical_head_sha",
+    "normalize_mergeable",
 ]

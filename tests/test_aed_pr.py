@@ -48,6 +48,9 @@ sys.path.insert(0, str(REPO))
 from scripts.local import aed_pr_lib as L  # noqa: E402
 from scripts.local import aed_pr_readiness as R  # noqa: E402
 from scripts.local import audit_codex_response_for_pr as CODEX  # noqa: E402
+from scripts.local import aed_pr as ctrl_module  # noqa: E402
+
+REQUIRED_CHECK_NAMES = ctrl_module.REQUIRED_CHECK_NAMES
 
 
 # -----------------------------------------------------------------------------
@@ -139,6 +142,12 @@ def _run_aed_pr(argv):
     return code, buf_out.getvalue(), buf_err.getvalue(), invoked_argv
 
 
+# Round-2 fix: the in-process controller requires explicit scope via
+# the new ``--allowed-files`` flag. Tests that exercise the merge path
+# must therefore pass a scope policy through this constant.
+DEFAULT_TEST_ALLOWED_FILES = ["scripts/local/aed_pr*.py", "tests/test_aed_pr*.py", "docs/aed_pr*.md"]
+
+
 # -----------------------------------------------------------------------------
 # Helpers: build a passing evidence bundle
 # -----------------------------------------------------------------------------
@@ -163,11 +172,13 @@ def _passing_evidence(head_sha="a" * 40, phrase=None, pr_number=411):
         out_of_scope_files=[],
         forbidden_files_touched=[],
         scope_blockers=[],
-        required_ci_names=list(["test", "validator", "governance-validators", "pr-gate-live-smoke"]),
+        allowed_files_supplied=True,
+        required_ci_names=list(REQUIRED_CHECK_NAMES),
         ci_conclusions={
-            "test": "SUCCESS", "validator": "SUCCESS",
+            "test (3.11)": "SUCCESS", "validator": "SUCCESS",
             "governance-validators": "SUCCESS",
             "pr-gate-live-smoke": "SUCCESS",
+            "review-comment-gate": "SUCCESS",
         },
         ci_missing=[],
         ci_pending=[],
@@ -343,17 +354,22 @@ class TestReadinessAllPass:
         v = R.evaluate_readiness(ev)
         assert v.ready is True
         assert v.gates_failed == []
+        # All MACHINE_GATES pass; the authorization gate (gate 4) is also
+        # recorded in gates_passed because a valid phrase was supplied.
         assert set(v.gates_passed) == set(R.ALL_GATES)
         assert v.reasons == []
+        assert v.machine_ready is True
+        assert v.authorization_valid is True
+        assert v.merge_ready is True
 
 
 class TestGateCIRequired:
     def test_missing_ci_blocks_merge(self):
         ev = _passing_evidence()
-        ev.ci_missing = ["test"]
+        ev.ci_missing = ["test (3.11)"]
         ev.ci_conclusions = {
             "validator": "SUCCESS", "governance-validators": "SUCCESS",
-            "pr-gate-live-smoke": "SUCCESS",
+            "pr-gate-live-smoke": "SUCCESS", "review-comment-gate": "SUCCESS",
         }
         v = R.evaluate_readiness(ev)
         assert v.ready is False
@@ -370,10 +386,10 @@ class TestGateCIRequired:
 
     def test_pending_ci_blocks_merge(self):
         ev = _passing_evidence()
-        ev.ci_pending = ["test"]
+        ev.ci_pending = ["test (3.11)"]
         ev.ci_conclusions = {
             "validator": "SUCCESS", "governance-validators": "SUCCESS",
-            "pr-gate-live-smoke": "SUCCESS",
+            "pr-gate-live-smoke": "SUCCESS", "review-comment-gate": "SUCCESS",
         }
         v = R.evaluate_readiness(ev)
         assert v.ready is False
@@ -797,18 +813,17 @@ class TestControllerMergeInProcess:
                     "files": [{"path": "scripts/local/aed_pr.py"}],
                 }
                 return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
-            if cmd[:3] == ["gh", "run", "list"]:
+            # Round-2 fix: gh pr checks (check names, not workflow names).
+            if cmd[:3] == ["gh", "pr", "checks"]:
                 return mock.Mock(returncode=0, stdout=json.dumps([
-                    {"workflowName": "test", "conclusion": "SUCCESS",
-                     "status": "COMPLETED", "headSha": "a" * 40},
-                    {"workflowName": "validator", "conclusion": "SUCCESS",
-                     "status": "COMPLETED", "headSha": "a" * 40},
-                    {"workflowName": "governance-validators",
-                     "conclusion": "SUCCESS", "status": "COMPLETED",
-                     "headSha": "a" * 40},
-                    {"workflowName": "pr-gate-live-smoke",
-                     "conclusion": "SUCCESS", "status": "COMPLETED",
-                     "headSha": "a" * 40},
+                    {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "governance-validators", "state": "SUCCESS",
+                     "workflow": "CI"},
+                    {"name": "pr-gate-live-smoke", "state": "SUCCESS",
+                     "workflow": "CI"},
+                    {"name": "review-comment-gate", "state": "SUCCESS",
+                     "workflow": "CI"},
                 ]), stderr="")
             return mock.Mock(returncode=0, stdout="{}", stderr="")
 
@@ -841,30 +856,38 @@ class TestControllerMergeInProcess:
                 "review_decision": "APPROVED",
             }
 
-        # Patch the controller's import alias directly (the test file
-        # imports CODEX via ``scripts.local.audit_codex_response_for_pr``
-        # but the controller imports via ``audit_codex_response_for_pr``
-        # after sys.path manipulation — they are distinct module
-        # objects, so patching ``CODEX`` alone does not affect the
-        # controller's call site).
-        with mock.patch.object(subprocess, "run", side_effect=_fake_run), \
-             mock.patch.object(ctrl.CODEX, "classify", side_effect=_fake_codex):
-            old_argv = sys.argv
-            sys.argv = ["aed_pr.py", "merge", "--pr-number", "411",
-                        "--authorization-phrase",
-                        "I confirm merge PR #411 at " + "a" * 40
-                        + " using final-head reviewed clean state."]
-            buf_out, buf_err = io.StringIO(), io.StringIO()
-            old_out, old_err = sys.stdout, sys.stderr
-            sys.stdout, sys.stderr = buf_out, buf_err
-            try:
-                try:
-                    ctrl.main(sys.argv[1:])
-                except SystemExit as exc:
-                    pass
-            finally:
-                sys.stdout, sys.stderr = old_out, old_err
-                sys.argv = old_argv
+        # Round-3 fix: write the trusted scope file via the controller's
+        # ``write_trusted_scope`` helper. The controller reads it via
+        # HERMES_AED_SCOPE_DIR; merge refuses CLI scope overrides.
+        import tempfile
+        from scripts.local import aed_pr as ctrl_module
+        with tempfile.TemporaryDirectory() as tmpdir:
+            os.environ["HERMES_AED_SCOPE_DIR"] = tmpdir
+            ctrl_module.write_trusted_scope(
+                ctrl_module.DEFAULT_REPO, 411, "a" * 40,
+                DEFAULT_TEST_ALLOWED_FILES,
+            )
+            with mock.patch.dict(
+                os.environ, {"HERMES_AED_SCOPE_DIR": tmpdir}, clear=False
+            ):
+                with mock.patch.object(subprocess, "run", side_effect=_fake_run), \
+                     mock.patch.object(ctrl.CODEX, "classify", side_effect=_fake_codex):
+                    old_argv = sys.argv
+                    sys.argv = ["aed_pr.py", "merge", "--pr-number", "411",
+                                "--authorization-phrase",
+                                "I confirm merge PR #411 at " + "a" * 40
+                                + " using final-head reviewed clean state."]
+                    buf_out, buf_err = io.StringIO(), io.StringIO()
+                    old_out, old_err = sys.stdout, sys.stderr
+                    sys.stdout, sys.stderr = buf_out, buf_err
+                    try:
+                        try:
+                            ctrl.main(sys.argv[1:])
+                        except SystemExit:
+                            pass
+                    finally:
+                        sys.stdout, sys.stderr = old_out, old_err
+                        sys.argv = old_argv
 
         assert len(merged_argv) == 1, (
             f"safe merge must invoke exactly one gh pr merge; got {merged_argv}"
@@ -1052,6 +1075,7 @@ class TestCodexFindingReadyStatusEmission:
             out_of_scope_files=[],
             forbidden_files_touched=[],
             scope_blockers=[],
+            allowed_files_supplied=True,
             required_ci_names=["test", "validator"],
             ci_conclusions={"test": "SUCCESS", "validator": "SUCCESS"},
             ci_missing=[],
@@ -1083,6 +1107,7 @@ class TestCodexFindingReadyStatusEmission:
                 "codex_audit": "fetched",
                 "reviews_inventory": "fetched",
                 "review_thread_inventory": "fetched",
+                "pr_number": "fetched",
             },
         )
 
@@ -1097,7 +1122,9 @@ class TestCodexFindingReadyStatusEmission:
             "title": "t",
             "mergeable": True,
         }
-        verdict = R.evaluate_readiness(ev)
+        # The status path uses evaluate_machine_readiness so the
+        # canonical phrase is emitted even when no phrase is supplied.
+        verdict = R.evaluate_machine_readiness(ev)
         state = ctrl.derive_lifecycle_state(verdict, pr_view)
         assert state == "READY_FOR_MERGE_AUTHORIZATION", (
             f"expected READY_FOR_MERGE_AUTHORIZATION, got {state!r}"
@@ -1114,7 +1141,7 @@ class TestCodexFindingReadyStatusEmission:
             "title": "t",
             "mergeable": "MERGEABLE",
         }
-        verdict = R.evaluate_readiness(ev)
+        verdict = R.evaluate_machine_readiness(ev)
         state = ctrl.derive_lifecycle_state(verdict, pr_view)
         assert state == "READY_FOR_MERGE_AUTHORIZATION", (
             f"expected READY_FOR_MERGE_AUTHORIZATION, got {state!r}"
