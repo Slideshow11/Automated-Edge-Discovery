@@ -88,6 +88,7 @@ owns the I/O. The module is pure-Python and stdlib-only.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -262,6 +263,12 @@ class ReadinessEvidence:
     ci_missing: Optional[List[str]] = None           # required but no run
     ci_pending: Optional[List[str]] = None           # required and running
     ci_failed: Optional[List[str]] = None            # required and failed
+    # Round-6 follow-up: required-check duplicates block the gate.
+    # A ``ci_duplicated`` entry means ``gh pr checks`` returned the
+    # same required name more than once (typically an old/new SHA
+    # pair after a force-push or re-run). The gate cannot pick a
+    # winner because the payload does not include a head SHA.
+    ci_duplicated: Optional[List[str]] = None       # required, ambiguous
 
     # Round-2 fix: explicit signal that the operator supplied an
     # allowed_files list. When False, the scope gate fails closed.
@@ -659,8 +666,7 @@ def verify_anchor_ancestry(
     anchor to be considered an ancestor.
     """
     if runner is None:
-        import subprocess as _subprocess
-        runner = _subprocess.run
+        runner = subprocess.run
     if not isinstance(repo, str) or "/" not in repo:
         return False, "ancestry_unavailable"
     if not isinstance(anchor_sha, str) or not anchor_sha:
@@ -682,7 +688,14 @@ def verify_anchor_ancestry(
         proc = runner(
             cmd, capture_output=True, text=True, timeout=30
         )
-    except (OSError, TimeoutError) as exc:
+    except (OSError, TimeoutError, subprocess.TimeoutExpired) as exc:
+        # Round-6 follow-up: ``subprocess.run(timeout=...)`` raises
+        # ``subprocess.TimeoutExpired`` (NOT ``TimeoutError``). The
+        # previous exception clause caught ``TimeoutError`` only,
+        # which let ``TimeoutExpired`` escape and abort the
+        # eligibility classifier before it could return the
+        # promised ``ancestry_unavailable`` fail-closed result.
+        # Catch it explicitly so the verifier never raises.
         return False, "ancestry_unavailable"
     if proc.returncode != 0:
         return False, "ancestry_unavailable"
@@ -955,6 +968,14 @@ def _evaluate_machine_gates(
         and not (evidence.ci_missing or [])
         and not (evidence.ci_pending or [])
         and not (evidence.ci_failed or [])
+        # Round-6 follow-up: required-check duplicates block the gate.
+        # ``gh pr checks`` can return duplicate names from old/new
+        # SHA runs after a force-push or a re-run. The payload does
+        # not include a head SHA, so the controller cannot infer
+        # which duplicate belongs to the current head from list
+        # ordering. Any duplicate required check name fails the
+        # gate closed.
+        and not (evidence.ci_duplicated or [])
     ):
         passed.append(GATE_CI_PRESENT)
     else:
@@ -971,6 +992,17 @@ def _evaluate_machine_gates(
                 code=REASON_CI_PENDING,
                 detail="pending required CI runs: "
                        + ",".join(evidence.ci_pending),
+                gate=GATE_CI_PRESENT,
+            ))
+        # Round-6 follow-up: duplicated required-check names block.
+        if evidence.ci_duplicated:
+            reasons.append(ReadinessReason(
+                code=REASON_CI_MISSING,
+                detail="duplicated required CI runs (gh pr checks "
+                       "returned the same required name more than "
+                       "once; the controller cannot pick a winner "
+                       "without a head SHA in the payload): "
+                       + ",".join(evidence.ci_duplicated),
                 gate=GATE_CI_PRESENT,
             ))
         if evidence.ci_failed:

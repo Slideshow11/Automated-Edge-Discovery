@@ -937,6 +937,552 @@ class TestRound5FollowUpWorkflowRunMatching:
         assert err
         assert run is None
 
+
+# ---------------------------------------------------------------------------
+# Round-6 follow-up: fetch_ci_conclusions duplicate-check handling
+# ---------------------------------------------------------------------------
+
+
+class TestRound6DuplicateCIChecks:
+    """Round-6 follow-up (Codex comment 3609075636 on c229be82):
+
+    fetch_ci_conclusions fails closed when a required check name
+    appears more than once in the gh pr checks payload.
+    """
+
+    def _make_check(self, name, state):
+        return {"name": name, "state": state, "workflow": "CI"}
+
+    def _run(self, payload, required=("test (3.11)",)):
+        runner = lambda *a, **kw: mock.Mock(
+            returncode=0,
+            stdout=json.dumps(payload),
+            stderr="",
+        )
+        return ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(required),
+            runner=runner,
+        )
+
+    def test_old_success_followed_by_current_failure_blocks(self):
+        # Old success comes first; current failure second. The old
+        # success must NOT pass the gate.
+        payload = [
+            self._make_check("test (3.11)", "SUCCESS"),
+            self._make_check("test (3.11)", "FAILURE"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert err == ""
+        assert duplicated == ["test (3.11)"]
+        assert "test (3.11)" not in conclusions
+
+    def test_current_failure_followed_by_old_success_blocks(self):
+        # Order reversed; duplicate must still block.
+        payload = [
+            self._make_check("test (3.11)", "FAILURE"),
+            self._make_check("test (3.11)", "SUCCESS"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert duplicated == ["test (3.11)"]
+
+    def test_success_plus_pending_blocks(self):
+        payload = [
+            self._make_check("test (3.11)", "SUCCESS"),
+            self._make_check("test (3.11)", "PENDING"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert duplicated == ["test (3.11)"]
+
+    def test_two_successes_same_required_name_blocks_as_ambiguous(self):
+        # Two successes for the same required name still block -
+        # the controller cannot tell which is the current head.
+        payload = [
+            self._make_check("test (3.11)", "SUCCESS"),
+            self._make_check("test (3.11)", "SUCCESS"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert duplicated == ["test (3.11)"]
+
+    def test_one_unique_successful_required_check_passes(self):
+        # Single SUCCESS for the required name passes; no duplicate
+        # signal is emitted.
+        payload = [
+            self._make_check("test (3.11)", "SUCCESS"),
+            self._make_check("validator", "SUCCESS"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert conclusions == {"test (3.11)": "SUCCESS"}
+        assert duplicated == []
+
+    def test_duplicate_unrelated_checks_do_not_replace_missing_required(self):
+        # The required name is absent; two unrelated duplicates must
+        # not be confused for required-check evidence.
+        payload = [
+            self._make_check("other-check", "SUCCESS"),
+            self._make_check("other-check", "SUCCESS"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert missing == ["test (3.11)"]
+        # The unrelated duplicates appear in the duplicated list
+        # for diagnostic purposes but the required-check evidence
+        # is still missing.
+        assert "other-check" in duplicated
+
+    def test_duplicate_names_included_in_structured_output(self):
+        # ``duplicated`` is the 6th tuple element and lists every
+        # duplicated check name (required + unrelated).
+        payload = [
+            self._make_check("test (3.11)", "SUCCESS"),
+            self._make_check("test (3.11)", "FAILURE"),
+            self._make_check("validator", "SUCCESS"),
+            self._make_check("validator", "PENDING"),
+        ]
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = self._run(payload)
+        assert sorted(set(duplicated)) == ["test (3.11)", "validator"]
+
+
+# ---------------------------------------------------------------------------
+# Round-6 follow-up: resolveReviewThread nested-input mutation
+# ---------------------------------------------------------------------------
+
+
+class TestRound6ResolveReviewThreadInput:
+    """Round-6 follow-up (Codex comment 3609075638 on c229be82):
+
+    the GraphQL mutation must use ResolveReviewThreadInput.
+    """
+
+    def _capture(self, stdout_payload="{}", **kwargs):
+        calls = []
+        def fake_runner(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return mock.Mock(returncode=0, stdout=stdout_payload, stderr="")
+        ok, msg = ctrl.resolve_review_thread(
+            "owner/repo", "T-NEW", runner=fake_runner
+        )
+        return ok, msg, calls
+
+    def test_argv_contains_correct_input_object(self):
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": True}
+                }}
+            })
+        )
+        assert ok is True
+        argv = calls[0]
+        input_idx = argv.index("--input")
+        payload = json.loads(argv[input_idx + 1])
+        assert payload == {"input": {"threadId": "T-NEW"}}
+
+    def test_thread_id_not_embedded_in_query_string(self):
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": True}
+                }}
+            })
+        )
+        argv = calls[0]
+        # The query must contain ``ResolveReviewThreadInput`` and the
+        # ``$input`` variable; the thread ID must NOT appear as a
+        # top-level literal.
+        query_idx = argv.index("--raw-field")
+        query = argv[query_idx + 1]
+        assert "ResolveReviewThreadInput" in query
+        assert "$input" in query
+        # Thread ID is supplied via --input, not embedded in the
+        # query text.
+        assert "T-NEW" not in query
+
+    def test_successful_is_resolved_true_returns_success(self):
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": True}
+                }}
+            })
+        )
+        assert ok is True
+        assert msg == "resolved"
+
+    def test_missing_thread_payload_fails(self):
+        # ``{"data": {"resolveReviewThread": null}}`` - the payload
+        # does not contain a thread.
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": None}
+            })
+        )
+        assert ok is False
+        assert "thread" in msg or "resolveReviewThread" in msg
+
+    def test_is_resolved_false_fails(self):
+        # GitHub returned the thread but ``isResolved`` is False.
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": False}
+                }}
+            })
+        )
+        assert ok is False
+        assert "not resolved" in msg.lower()
+
+    def test_graphql_error_fails(self):
+        # ``{"errors": [...]}`` indicates a top-level GraphQL error.
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "errors": [{"message": "Could not resolve"}]
+            })
+        )
+        assert ok is False
+        assert "errors" in msg.lower()
+
+    def test_nonzero_exit_fails(self):
+        calls = []
+        def fake_runner(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return mock.Mock(returncode=1, stdout="", stderr="bad")
+        ok, msg = ctrl.resolve_review_thread(
+            "owner/repo", "T-NEW", runner=fake_runner
+        )
+        assert ok is False
+        assert "bad" in msg
+
+    def test_timeout_fails(self):
+        def fake_runner(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+        ok, msg = ctrl.resolve_review_thread(
+            "owner/repo", "T-NEW", runner=fake_runner
+        )
+        assert ok is False
+        assert "failed" in msg.lower() or "timeout" in msg.lower()
+
+
+# ---------------------------------------------------------------------------
+# Round-6 follow-up: subprocess.TimeoutExpired caught by verify_anchor_ancestry
+# ---------------------------------------------------------------------------
+
+
+class TestRound6AncestryTimeoutExpired:
+    """Round-6 follow-up (Codex comment 3609075639 on c229be82):
+
+    verify_anchor_ancestry must catch subprocess.TimeoutExpired.
+    """
+
+    def test_real_subprocess_timeout_expired_is_caught(self):
+        def fake_runner(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=fake_runner,
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_mocked_timeout_returns_ancestry_unavailable(self):
+        runner = mock.Mock(side_effect=subprocess.TimeoutExpired("gh", 30))
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=runner,
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_cmd_advance_emits_ineligible_report_instead_of_raising(self):
+        """When ancestry verification times out, ``cmd_advance``
+        must NOT raise; it must emit an ineligible record with
+        reason ``ancestry_unavailable``."""
+        # The controller emits an eligibility report; we assert it
+        # contains no Python exception trace.
+        runner = mock.Mock(side_effect=subprocess.TimeoutExpired("gh", 30))
+        thread = _bot_thread(anchor=OTHER_HEAD)
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=runner),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_resolver_not_invoked_after_timeout(self):
+        """The eligibility classifier returns False on timeout;
+        ``cmd_advance`` would not invoke ``resolveReviewThread``
+        because the thread is ineligible with reason
+        ``ancestry_unavailable``. The downstream resolver's
+        ``any_failed`` accumulator is set to False (no mutation),
+        and the elapsed work is limited to the eligibility
+        classifier's return value."""
+        runner = mock.Mock(side_effect=subprocess.TimeoutExpired("gh", 30))
+        thread = _bot_thread(anchor=OTHER_HEAD)
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=runner),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+        # The classifier did not raise; no resolver invocation was
+        # attempted. The runner was invoked at most once.
+        assert runner.call_count <= 1
+
+
+# ---------------------------------------------------------------------------
+# Round-6 follow-up: live gate-recheck discovery race
+# ---------------------------------------------------------------------------
+
+
+class TestRound6DispatchRunDiscovery:
+    """Round-6 follow-up: ``_wait_for_dispatch_run`` polls
+    ``_find_dispatch_run`` until the exact dispatched run appears
+    or the bounded discovery timeout expires. The dispatch is
+    issued exactly once (caller responsibility); the discovery
+    loop only re-queries the run list.
+    """
+
+    def test_first_list_empty_second_list_finds_run(self):
+        # Poll 1: empty list. Poll 2: exact run appears.
+        state = {"count": 0}
+        def fake_list(cmd, *a, **kw):
+            state["count"] += 1
+            if state["count"] == 1:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps([]),
+                    stderr="",
+                )
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 999, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": dt.datetime.now(
+                        dt.timezone.utc
+                    ).isoformat(),
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/999",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=10,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert err == ""
+        assert run is not None
+        assert run["databaseId"] == 999
+        # List was queried at least twice: the initial empty poll
+        # and the discovery-poll that found the run.
+        assert state["count"] >= 2
+
+    def test_transient_list_error_followed_by_run_succeeds(self):
+        state = {"count": 0}
+        def fake_list(cmd, *a, **kw):
+            state["count"] += 1
+            if state["count"] == 1:
+                return mock.Mock(
+                    returncode=1, stdout="", stderr="transient",
+                )
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1001, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": dt.datetime.now(
+                        dt.timezone.utc
+                    ).isoformat(),
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1001",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=10,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert err == ""
+        assert run["databaseId"] == 1001
+
+    def test_only_one_dispatch_occurs(self):
+        # ``_wait_for_dispatch_run`` does NOT invoke ``gh workflow
+        # run``. The dispatch is the caller's responsibility. We
+        # assert the runner only sees ``gh run list``.
+        dispatch_calls = []
+        def fake_dispatch(cmd, *a, **kw):
+            dispatch_calls.append(list(cmd))
+            return mock.Mock(returncode=0, stdout="", stderr="")
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0, stdout=json.dumps([]), stderr=""
+            )
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=1,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        # No ``gh workflow run`` calls observed during discovery.
+        assert not any(
+            "workflow" in str(arg) and "run" in str(arg)
+            for call in dispatch_calls
+            for arg in call
+        )
+
+    def test_discovery_timeout_returns_inconclusive(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0, stdout=json.dumps([]), stderr=""
+            )
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=1,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+        assert "did not appear" in err
+
+    def test_old_run_rejected_by_discovery(self):
+        # The only run is older than dispatched_at; discovery fails
+        # closed.
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 2, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T09:00:00Z",  # older
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/2",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=1,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
+    def test_wrong_branch_and_sha_rejected_by_discovery(self):
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([
+                    {
+                        "databaseId": 3, "event": "workflow_dispatch",
+                        "headBranch": "main",
+                        "headSha": DEFAULT_HEAD,
+                        "createdAt": dt.datetime.now(
+                            dt.timezone.utc
+                        ).isoformat(),
+                        "status": "completed", "conclusion": "success",
+                        "url": "https://example/runs/3",
+                        "workflowName": "CI",
+                    },
+                    {
+                        "databaseId": 4, "event": "workflow_dispatch",
+                        "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                        "headSha": "f" * 40,
+                        "createdAt": dt.datetime.now(
+                            dt.timezone.utc
+                        ).isoformat(),
+                        "status": "completed", "conclusion": "success",
+                        "url": "https://example/runs/4",
+                        "workflowName": "CI",
+                    },
+                ]),
+                stderr="",
+            )
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=1,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
+    def test_malformed_createdAt_rejected(self):
+        # The run has a non-ISO ``createdAt`` string.
+        dispatched_at = dt.datetime.now(dt.timezone.utc)
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 5, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "not-a-timestamp",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/5",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=1,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
     def test_normalize_thread_anchor_populates_canonical_field(self):
         # When the packet supplies ``comment_sha`` but not
         # ``original_commit_sha``, the normalizer promotes the
@@ -1229,6 +1775,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1285,6 +1833,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1374,6 +1924,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1447,6 +1999,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1522,6 +2076,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1581,6 +2137,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view
@@ -1662,6 +2220,8 @@ class TestRound5Finding2GateRecheckDispatchesCI:
         ns.head_sha = DEFAULT_HEAD
         ns.wait_timeout_seconds = 30
         ns.wait_poll_seconds = 1
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.dispatch_runner = fake_dispatch
         ns.list_runner = fake_list
         ns.view_runner = fake_view

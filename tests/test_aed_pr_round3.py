@@ -603,13 +603,38 @@ class TestF4Eligibility:
         runner_calls = []
         def fake_runner(cmd, *args, **kwargs):
             runner_calls.append(list(cmd))
-            return mock.Mock(returncode=0, stdout="{}", stderr="")
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({
+                    "data": {
+                        "resolveReviewThread": {
+                            "thread": {
+                                "id": "T-X",
+                                "isResolved": True,
+                            }
+                        }
+                    }
+                }),
+                stderr="",
+            )
         ok, msg = ctrl.resolve_review_thread(
             "owner/repo", "T-X", runner=fake_runner
         )
         assert ok is True and msg == "resolved"
         assert runner_calls[0][:3] == ["gh", "api", "graphql"]
-        assert "resolveReviewThread" in " ".join(runner_calls[0])
+        # The thread ID must be supplied as data, not interpolated.
+        argv = runner_calls[0]
+        # Look for --input <json> with threadId
+        input_idx = argv.index("--input")
+        payload = json.loads(argv[input_idx + 1])
+        assert payload == {"input": {"threadId": "T-X"}}
+        # The query uses ResolveReviewThreadInput, not the old
+        # top-level threadId argument.
+        query_idx = argv.index("--raw-field")
+        assert query_idx == 3  # gh, api, graphql, --raw-field, query=...
+        query = argv[query_idx + 1].removeprefix("query=")
+        assert "ResolveReviewThreadInput" in query
+        assert "resolveReviewThread(input: $input)" in query
 
     def test_resolve_review_thread_records_failure(self):
         def fake_runner(cmd, *args, **kwargs):
@@ -719,6 +744,11 @@ def _gate_ns(
     ns.head_sha = head_sha
     ns.wait_timeout_seconds = wait_timeout_seconds
     ns.wait_poll_seconds = wait_poll_seconds
+    # Round-6 follow-up: bounded discovery wait. Default to short
+    # timeouts so tests do not actually sleep when the discovery
+    # succeeds on the first poll.
+    ns.discovery_timeout_seconds = 5
+    ns.discovery_poll_seconds = 1
 
     live = dict(_pr_view_payload(head_sha=head_sha, head_branch=head_branch))
     if head_mismatch:
@@ -807,6 +837,8 @@ class TestGateRecheckMechanism:
         ns.pr_number = 411
         ns.head_sha = "not-a-sha"
         ns.wait_timeout_seconds = 30
+        ns.discovery_timeout_seconds = 5
+        ns.discovery_poll_seconds = 1
         ns.wait_poll_seconds = 1
         assert ctrl.cmd_gate_recheck(ns) == 2
 

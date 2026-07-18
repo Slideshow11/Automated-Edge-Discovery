@@ -217,8 +217,13 @@ def fetch_changed_files(
 
 
 def fetch_ci_conclusions(
-    repo: str, pr_number: int, required_check_names: List[str]
-) -> Tuple[bool, Dict[str, str], List[str], List[str], List[str], str]:
+    repo: str, pr_number: int, required_check_names: List[str],
+    *,
+    runner: Optional[Any] = None,
+) -> Tuple[
+    bool, Dict[str, str], List[str], List[str], List[str],
+    List[str], str,
+]:
     """Fetch CI check conclusions for the current PR head.
 
     Uses ``gh pr checks --json name,state,workflow`` so the result
@@ -228,10 +233,40 @@ def fetch_ci_conclusions(
     single workflow named ``CI`` to four required job names and
     therefore always reported every required check as missing.
 
-    Returns (ok, name->state dict, missing, pending, failed, err).
-    ``ok=False`` means the check list could not be fetched; in that case
-    every required check is reported as missing so the gate fails
-    closed.
+    Round-6 follow-up (Codex comment ``3609075636`` on
+    ``c229be82``): ``gh pr checks`` can emit duplicate names from
+    old/new SHA runs after a force-push or a re-run. The previous
+    implementation used ``by_name.setdefault(name, check)`` which
+    silently kept whichever duplicate appeared first in the list;
+    if the first duplicate was an old successful required check
+    and the current-head check was pending or failed, the CI gate
+    could pass on stale evidence. The current implementation
+    fails closed whenever a *required* check name appears more
+    than once.
+
+    Returns ``(ok, conclusions, missing, pending, failed,
+    duplicated_required, error)``:
+
+    * ``ok=False`` means the check list could not be fetched; in
+      that case every required check is reported as missing so
+      the gate fails closed.
+    * ``conclusions`` maps each required check name to its state
+      string (``SUCCESS``, ``FAILURE``, ``PENDING``, ...). When
+      a required check has duplicates, ``conclusions`` is not
+      populated for that name (the duplicate is reported under
+      ``duplicated_required`` instead).
+    * ``missing`` lists required check names that did not appear
+      in the payload at all.
+    * ``pending`` lists required check names with an in-flight
+      state (``PENDING``, ``QUEUED``, ``IN_PROGRESS``, ``WAITING``,
+      ``REQUESTED``, ``EXPECTED``).
+    * ``failed`` lists required check names with a terminal
+      non-success state (``FAILURE``, ``CANCELLED``, ``SKIPPED``,
+      ``NEUTRAL``, ``STALE``, ``ERROR``, or any unrecognized state).
+    * ``duplicated_required`` lists required check names that
+      appeared more than once in the payload; the gate treats
+      them as blocking.
+    * ``error`` is non-empty only when ``ok=False``.
 
     State vocabulary (from gh pr checks):
 
@@ -255,29 +290,71 @@ def fetch_ci_conclusions(
         "--json", "name,state,workflow",
         "--limit", "100",
     ]
-    ok, payload, err = _run_json_or_none(cmd, timeout=45)
+    if runner is None:
+        ok, payload, err = _run_json_or_none(cmd, timeout=45)
+    else:
+        proc = runner(
+            cmd, capture_output=True, text=True, timeout=45
+        )
+        if proc.returncode != 0:
+            missing = list(required_check_names)
+            return (
+                False, {}, missing, [], missing, [],
+                (proc.stderr or "").strip()[:300] or "gh returned non-zero",
+            )
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            missing = list(required_check_names)
+            return (
+                False, {}, missing, [], missing, [],
+                f"invalid JSON: {exc}",
+            )
+        ok, err = True, ""
     if not ok or not isinstance(payload, list):
         missing = list(required_check_names)
-        return False, {}, missing, [], missing, err
+        return False, {}, missing, [], missing, [], err
 
-    by_name: Dict[str, Dict[str, Any]] = {}
+    # Collect every record by name; detect duplicates BEFORE
+    # deciding which one is canonical. ``gh pr checks`` does NOT
+    # surface a head SHA in the payload, so the controller cannot
+    # infer which duplicate belongs to the current head from list
+    # ordering.
+    by_name: Dict[str, List[Dict[str, Any]]] = {}
     for check in payload:
         if not isinstance(check, dict):
             continue
         name = check.get("name")
         if not isinstance(name, str) or not name:
             continue
-        by_name.setdefault(name, check)
+        by_name.setdefault(name, []).append(check)
+
+    # Unrelated (non-required) duplicates are reported as a
+    # diagnostic only. They MUST NOT replace evidence for any
+    # required check.
+    unrelated_duplicated = sorted(
+        n for n, records in by_name.items() if len(records) > 1
+        and n not in required_check_names
+    )
 
     conclusions: Dict[str, str] = {}
     missing: List[str] = []
     pending: List[str] = []
     failed: List[str] = []
+    duplicated_required: List[str] = []
     for name in required_check_names:
-        check = by_name.get(name)
-        if check is None:
+        records = by_name.get(name) or []
+        if not records:
             missing.append(name)
             continue
+        if len(records) > 1:
+            # Round-6 follow-up: required-check duplicates fail
+            # closed. ``conclusions`` is NOT populated for the
+            # duplicated name so downstream code cannot pick a
+            # winner by accident.
+            duplicated_required.append(name)
+            continue
+        check = records[0]
         state = (check.get("state") or "").upper()
         conclusions[name] = state or "UNKNOWN"
         # Terminal states: SUCCESS passes; everything else blocks merge.
@@ -292,7 +369,15 @@ def fetch_ci_conclusions(
             # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE, ERROR, and any
             # unrecognized terminal state all count as failed.
             failed.append(name)
-    return True, conclusions, missing, pending, failed, ""
+    # Round-6 follow-up: include both required and unrelated
+    # duplicated check names in the structured output. The merge
+    # path reports these as blocking.
+    duplicated_required = sorted(set(duplicated_required))
+    return (
+        True, conclusions, missing, pending, failed,
+        duplicated_required + unrelated_duplicated,
+        "",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -725,10 +810,23 @@ def _find_dispatch_run(
         run_workflow_name = run.get("workflowName") or ""
         if run_workflow_name != expected_workflow_name:
             continue
-        # created_at >= dispatched_at (string comparison of
-        # ISO-8601 timestamps is monotonic).
-        created_at = run.get("createdAt") or ""
-        if not created_at or created_at < dispatched_at.isoformat():
+        # Round-6 follow-up: parse createdAt as a real timezone-aware
+        # datetime rather than comparing timestamp strings.
+        created_at_str = run.get("createdAt") or ""
+        if not created_at_str:
+            continue
+        try:
+            created_at = dt.datetime.fromisoformat(
+                created_at_str.replace("Z", "+00:00")
+            )
+            if created_at.tzinfo is None:
+                # Naive timestamps from the API are treated as UTC
+                # for comparison purposes.
+                created_at = created_at.replace(tzinfo=dt.timezone.utc)
+        except (TypeError, ValueError):
+            # Malformed createdAt fails closed.
+            continue
+        if created_at < dispatched_at:
             continue
         # databaseId must be present and an integer.
         if not isinstance(run.get("databaseId"), int):
@@ -751,6 +849,69 @@ def _find_dispatch_run(
         reverse=True,
     )
     return matching[0], ""
+
+
+def _wait_for_dispatch_run(
+    repo: str,
+    workflow_file: str,
+    *,
+    head_sha: str,
+    head_branch: str,
+    pr_number: int,
+    dispatched_at: "dt.datetime",
+    timeout_seconds: int = 60,
+    poll_seconds: int = 2,
+    list_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Wait for the dispatched ``workflow_dispatch`` run to appear.
+
+    Round-6 follow-up (live gate-recheck defect on
+    ``c229be82``): GitHub Actions may accept the dispatch before
+    ``gh run list`` exposes the new run. The previous
+    implementation called ``_find_dispatch_run`` once and
+    immediately returned INCONCLUSIVE when no run was visible,
+    even though the run had been queued and would appear a few
+    seconds later.
+
+    This function polls ``_find_dispatch_run`` until the exact
+    run appears or the bounded discovery timeout expires. It
+    does NOT issue a second workflow dispatch during polling
+    (the dispatch has already been issued; the controller
+    simply waits for the API to expose it). Transient list
+    errors and empty lists are retried. ``createdAt`` is parsed
+    as a real timezone-aware datetime so timestamp parsing
+    matches ``dispatched_at`` precisely.
+
+    Returns ``(run, error)``. ``run`` is the matching run dict
+    (or ``None`` when the discovery timeout expires). ``error``
+    is non-empty on timeout or persistent failure.
+
+    The default ``timeout_seconds`` is 60; the default
+    ``poll_seconds`` is 2. No daemon or scheduler is added.
+    """
+    if list_runner is None:
+        list_runner = subprocess.run
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        run, err = _find_dispatch_run(
+            repo,
+            workflow_file,
+            head_sha=head_sha,
+            head_branch=head_branch,
+            pr_number=pr_number,
+            dispatched_at=dispatched_at,
+            list_runner=list_runner,
+        )
+        if run is not None:
+            return run, ""
+        if err:
+            last_error = err
+        time.sleep(poll_seconds)
+    return None, (
+        f"dispatched run did not appear within {timeout_seconds}s "
+        f"(last_error={last_error!r})"
+    )
 
 
 def _wait_for_gate_job(
@@ -948,20 +1109,29 @@ def cmd_gate_recheck(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Step 3: identify the unique workflow_dispatch run we just
-    # created. Reject runs on ``main``, on another branch, on
-    # another SHA, on another PR, or on an earlier dispatch. This
-    # is what proves the dispatched gate is the one attached to the
-    # exact PR head.
+    # Step 3: bounded wait for the dispatched workflow_dispatch run
+    # to appear in the GitHub Actions API. GitHub may accept the
+    # dispatch a few hundred milliseconds before ``gh run list``
+    # exposes the new run; the previous implementation polled
+    # exactly once and returned INCONCLUSIVE on that race. We now
+    # poll bounded. The dispatch is NOT re-issued during polling.
     list_runner = getattr(args, "list_runner", None) or subprocess.run
     view_runner = getattr(args, "view_runner", None) or list_runner
-    run, err = _find_dispatch_run(
+    discovery_timeout_seconds = int(
+        getattr(args, "discovery_timeout_seconds", 60) or 60
+    )
+    discovery_poll_seconds = int(
+        getattr(args, "discovery_poll_seconds", 2) or 2
+    )
+    run, err = _wait_for_dispatch_run(
         repo,
         "ci.yml",
         head_sha=head_sha,
         head_branch=live_head_branch,
         pr_number=pr_number,
         dispatched_at=dispatched_at,
+        timeout_seconds=discovery_timeout_seconds,
+        poll_seconds=discovery_poll_seconds,
         list_runner=list_runner,
     )
     if err or run is None:
@@ -1135,8 +1305,16 @@ def build_evidence(
         scope_blockers = ["changed_files_not_fetched"]
 
     # ---- CI audit ------------------------------------------------------------
-    ci_ok, ci_conclusions, ci_missing, ci_pending, ci_failed, ci_err = (
-        fetch_ci_conclusions(repo, int(pr_number), list(REQUIRED_CHECK_NAMES))
+    (
+        ci_ok, ci_conclusions, ci_missing, ci_pending, ci_failed,
+        ci_duplicated, ci_err,
+    ) = fetch_ci_conclusions(
+        repo, int(pr_number), list(REQUIRED_CHECK_NAMES)
+    )
+    # Round-6 follow-up: required-check duplicates block the gate.
+    ci_duplicated_required = (
+        [n for n in (ci_duplicated or [])
+         if n in set(REQUIRED_CHECK_NAMES)]
     )
 
     # ---- Codex / reviews / threads ------------------------------------------
@@ -1245,6 +1423,8 @@ def build_evidence(
         ci_missing=ci_missing,
         ci_pending=ci_pending,
         ci_failed=ci_failed,
+        # Round-6 follow-up: required-check duplicates block the gate.
+        ci_duplicated=list(ci_duplicated_required or []),
         codex_verdict=codex_verdict,
         codex_source=codex_packet.get("latest_codex_response_type"),
         codex_reviewed_sha=codex_reviewed_sha,
@@ -1781,15 +1961,45 @@ def resolve_review_thread(
     resolution. Calling it with a thread ID that did not pass
     ``is_eligible_for_bot_resolution`` would still work, but the
     controller's advance path always checks eligibility first.
+
+    Round-6 follow-up (Codex comment ``3609075638`` on
+    ``c229be82``): the previous implementation interpolated the
+    thread ID into a top-level ``resolveReviewThread(threadId: ...)``
+    GraphQL argument. GitHub's schema requires the thread ID to be
+    supplied as the ``threadId`` field of a ``ResolveReviewThreadInput``
+    object passed to the ``input`` argument. The current
+    implementation uses the supported nested-input form:
+
+        mutation($input: ResolveReviewThreadInput!) {
+          resolveReviewThread(input: $input) {
+            thread { id isResolved }
+          }
+        }
+
+    The thread ID is supplied as data via ``--input`` so it is
+    never embedded in the query text.
     """
     if not isinstance(thread_id, str) or not thread_id:
         return False, "thread_id required"
     if "/" not in repo:
         return False, "repo must be in 'owner/name' form"
-
+    # The thread ID must be supplied as data, not interpolated into
+    # the query. ``--input`` passes a JSON object as the GraphQL
+    # ``$input`` variable.
+    query = (
+        "mutation($input: ResolveReviewThreadInput!) {"
+        " resolveReviewThread(input: $input) {"
+        " thread { id isResolved }"
+        " }"
+        " }"
+    )
+    payload = json.dumps({
+        "input": {"threadId": thread_id},
+    })
     cmd = [
-        "gh", "api", "graphql", "--raw-field",
-        "query=mutation { resolveReviewThread(threadId:\"" + thread_id.replace('"', '\\"') + "\") { thread { isResolved } } }",
+        "gh", "api", "graphql",
+        "--raw-field", f"query={query}",
+        "--input", payload,
     ]
     run = runner if runner is not None else subprocess.run
     try:
@@ -1797,7 +2007,37 @@ def resolve_review_thread(
     except (OSError, subprocess.TimeoutExpired) as exc:
         return False, f"gh graphql invocation failed: {exc}"
     if proc.returncode != 0:
-        return False, f"gh graphql returned {proc.returncode}: {proc.stderr.strip()[:300]}"
+        return False, (
+            f"gh graphql returned {proc.returncode}: "
+            f"{proc.stderr.strip()[:300]}"
+        )
+    # Validate the response payload: GitHub returns
+    # ``{"data": {"resolveReviewThread": {"thread": {"id": ..., "isResolved": true/false}}}}``
+    # for success, or ``{"errors": [...]}`` for failure.
+    try:
+        body = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        return False, f"invalid GraphQL response: {exc}"
+    if not isinstance(body, dict):
+        return False, "GraphQL response is not a JSON object"
+    if body.get("errors"):
+        return False, (
+            "GraphQL errors: "
+            + json.dumps(body.get("errors"))[:300]
+        )
+    data_obj = body.get("data")
+    if not isinstance(data_obj, dict):
+        return False, "GraphQL response missing data object"
+    payload_obj = data_obj.get("resolveReviewThread")
+    if not isinstance(payload_obj, dict):
+        return False, "GraphQL response missing resolveReviewThread"
+    thread_obj = payload_obj.get("thread")
+    if not isinstance(thread_obj, dict):
+        return False, (
+            "GraphQL response missing resolveReviewThread.thread"
+        )
+    if not thread_obj.get("isResolved"):
+        return False, "GraphQL response thread is not resolved"
     return True, "resolved"
 
 
@@ -2548,6 +2788,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate_recheck.add_argument(
         "--wait-poll-seconds", type=int, default=10,
         help="Polling interval when waiting for the dispatched gate.",
+    )
+    p_gate_recheck.add_argument(
+        "--discovery-timeout-seconds", type=int, default=60,
+        help=(
+            "Maximum time to wait for the dispatched workflow_dispatch "
+            "run to appear in the GitHub Actions API. The dispatch "
+            "is issued exactly once; this timeout only bounds the "
+            "subsequent run-list polling."
+        ),
+    )
+    p_gate_recheck.add_argument(
+        "--discovery-poll-seconds", type=int, default=2,
+        help="Polling interval while waiting for the dispatched run to appear.",
     )
     p_gate_recheck.set_defaults(func=cmd_gate_recheck)
 
