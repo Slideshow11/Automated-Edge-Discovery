@@ -624,15 +624,20 @@ class TestF4Eligibility:
         assert runner_calls[0][:3] == ["gh", "api", "graphql"]
         # The thread ID must be supplied as data, not interpolated.
         argv = runner_calls[0]
-        # Look for --input <json> with threadId
-        input_idx = argv.index("--input")
-        payload = json.loads(argv[input_idx + 1])
-        assert payload == {"input": {"threadId": "T-X"}}
-        # The query uses ResolveReviewThreadInput, not the old
-        # top-level threadId argument.
-        query_idx = argv.index("--raw-field")
-        assert query_idx == 3  # gh, api, graphql, --raw-field, query=...
-        query = argv[query_idx + 1].removeprefix("query=")
+        # ``--input`` must NOT be used (gh treats it as a filename).
+        assert "--input" not in argv
+        # The thread ID is supplied via ``input[threadId]=...``.
+        thread_argv = [
+            a for a in argv
+            if a.startswith("input[threadId]=")
+        ]
+        assert thread_argv == ["input[threadId]=T-X"]
+        # The query uses ResolveReviewThreadInput and ``$input``.
+        query_argv = [
+            a for a in argv if a.startswith("query=")
+        ]
+        assert len(query_argv) == 1
+        query = query_argv[0].removeprefix("query=")
         assert "ResolveReviewThreadInput" in query
         assert "resolveReviewThread(input: $input)" in query
 

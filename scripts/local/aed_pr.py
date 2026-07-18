@@ -288,7 +288,6 @@ def fetch_ci_conclusions(
         "gh", "pr", "checks", str(pr_number),
         "--repo", repo,
         "--json", "name,state,workflow",
-        "--limit", "100",
     ]
     if runner is None:
         ok, payload, err = _run_json_or_none(cmd, timeout=45)
@@ -1967,25 +1966,29 @@ def resolve_review_thread(
     thread ID into a top-level ``resolveReviewThread(threadId: ...)``
     GraphQL argument. GitHub's schema requires the thread ID to be
     supplied as the ``threadId`` field of a ``ResolveReviewThreadInput``
-    object passed to the ``input`` argument. The current
-    implementation uses the supported nested-input form:
+    object passed to the ``input`` argument. The original fix used
+    ``--input`` with an inline JSON string; that was incorrect
+    because the ``gh`` ``--input`` option treats its argument as a
+    filename. The current implementation uses the supported
+    nested-variable form via repeated ``-f`` fields:
 
-        mutation($input: ResolveReviewThreadInput!) {
-          resolveReviewThread(input: $input) {
-            thread { id isResolved }
-          }
-        }
+        gh api graphql \
+          -f 'query=mutation($input: ResolveReviewThreadInput!) { resolveReviewThread(input: $input) { thread { id isResolved } } }' \
+          -f 'input[threadId]=<GRAPHQL_THREAD_ID>'
 
-    The thread ID is supplied as data via ``--input`` so it is
-    never embedded in the query text.
+    The thread ID is supplied as data via ``-f 'input[threadId]=...'``
+    so it is never embedded in the query text and the runner does
+    not need to read from disk.
     """
     if not isinstance(thread_id, str) or not thread_id:
         return False, "thread_id required"
     if "/" not in repo:
         return False, "repo must be in 'owner/name' form"
     # The thread ID must be supplied as data, not interpolated into
-    # the query. ``--input`` passes a JSON object as the GraphQL
-    # ``$input`` variable.
+    # the query. The ``gh`` ``-f`` flag accepts ``KEY=VALUE`` pairs
+    # and supports nested-object syntax via ``KEY[subkey]=VALUE``,
+    # which becomes ``{"KEY": {"subkey": "VALUE"}}`` in the request
+    # body.
     query = (
         "mutation($input: ResolveReviewThreadInput!) {"
         " resolveReviewThread(input: $input) {"
@@ -1993,13 +1996,10 @@ def resolve_review_thread(
         " }"
         " }"
     )
-    payload = json.dumps({
-        "input": {"threadId": thread_id},
-    })
     cmd = [
         "gh", "api", "graphql",
-        "--raw-field", f"query={query}",
-        "--input", payload,
+        "-f", f"query={query}",
+        "-f", f"input[threadId]={thread_id}",
     ]
     run = runner if runner is not None else subprocess.run
     try:
@@ -2038,6 +2038,16 @@ def resolve_review_thread(
         )
     if not thread_obj.get("isResolved"):
         return False, "GraphQL response thread is not resolved"
+    # Validate that the returned thread ID matches the request.
+    # GitHub always echoes the thread's node ID; a mismatch would
+    # indicate the resolver acted on a different thread than
+    # requested, so we refuse the result.
+    returned_id = thread_obj.get("id")
+    if returned_id is not None and returned_id != thread_id:
+        return False, (
+            "GraphQL response thread.id does not match requested "
+            f"thread_id (requested={thread_id!r} got={returned_id!r})"
+        )
     return True, "resolved"
 
 

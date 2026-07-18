@@ -1057,19 +1057,28 @@ class TestRound6ResolveReviewThreadInput:
     """Round-6 follow-up (Codex comment 3609075638 on c229be82):
 
     the GraphQL mutation must use ResolveReviewThreadInput.
+
+    Round-7 follow-up: the original round-6 fix used
+    ``--input <inline-json>``. The ``gh`` CLI's ``--input`` flag
+    treats its argument as a filename, so the resolver must use
+    repeated ``-f`` flags with nested-object syntax (``-f
+    'input[threadId]=...'``) instead.
     """
 
-    def _capture(self, stdout_payload="{}", **kwargs):
+    def _capture(self, stdout_payload="{}", thread_id="T-NEW", **kwargs):
         calls = []
         def fake_runner(cmd, *a, **kw):
             calls.append(list(cmd))
             return mock.Mock(returncode=0, stdout=stdout_payload, stderr="")
         ok, msg = ctrl.resolve_review_thread(
-            "owner/repo", "T-NEW", runner=fake_runner
+            "owner/repo", thread_id, runner=fake_runner
         )
         return ok, msg, calls
 
-    def test_argv_contains_correct_input_object(self):
+    def test_no_input_flag_in_argv(self):
+        """``--input`` is a filename flag in ``gh``; the resolver
+        MUST use repeated ``-f`` flags with nested-object syntax
+        instead."""
         ok, msg, calls = self._capture(
             stdout_payload=json.dumps({
                 "data": {"resolveReviewThread": {
@@ -1077,11 +1086,40 @@ class TestRound6ResolveReviewThreadInput:
                 }}
             })
         )
-        assert ok is True
         argv = calls[0]
-        input_idx = argv.index("--input")
-        payload = json.loads(argv[input_idx + 1])
-        assert payload == {"input": {"threadId": "T-NEW"}}
+        assert "--input" not in argv
+
+    def test_argv_contains_input_thread_id_field(self):
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": True}
+                }}
+            })
+        )
+        argv = calls[0]
+        # The thread ID is supplied as a nested-variable
+        # ``-f 'input[threadId]=<id>'`` field.
+        thread_fields = [
+            a for a in argv
+            if a.startswith("input[threadId]=")
+        ]
+        assert thread_fields == ["input[threadId]=T-NEW"]
+
+    def test_query_uses_ResolveReviewThreadInput(self):
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-NEW", "isResolved": True}
+                }}
+            })
+        )
+        argv = calls[0]
+        query_fields = [a for a in argv if a.startswith("query=")]
+        assert len(query_fields) == 1
+        query = query_fields[0].removeprefix("query=")
+        assert "ResolveReviewThreadInput" in query
+        assert "resolveReviewThread(input: $input)" in query
 
     def test_thread_id_not_embedded_in_query_string(self):
         ok, msg, calls = self._capture(
@@ -1092,18 +1130,13 @@ class TestRound6ResolveReviewThreadInput:
             })
         )
         argv = calls[0]
-        # The query must contain ``ResolveReviewThreadInput`` and the
-        # ``$input`` variable; the thread ID must NOT appear as a
-        # top-level literal.
-        query_idx = argv.index("--raw-field")
-        query = argv[query_idx + 1]
-        assert "ResolveReviewThreadInput" in query
-        assert "$input" in query
-        # Thread ID is supplied via --input, not embedded in the
-        # query text.
+        query_fields = [a for a in argv if a.startswith("query=")]
+        query = query_fields[0]
+        # The thread ID is supplied via ``-f 'input[threadId]=...'``,
+        # never embedded in the query text.
         assert "T-NEW" not in query
 
-    def test_successful_is_resolved_true_returns_success(self):
+    def test_matching_id_and_is_resolved_true_succeeds(self):
         ok, msg, calls = self._capture(
             stdout_payload=json.dumps({
                 "data": {"resolveReviewThread": {
@@ -1114,9 +1147,21 @@ class TestRound6ResolveReviewThreadInput:
         assert ok is True
         assert msg == "resolved"
 
+    def test_mismatched_thread_id_fails(self):
+        """A response whose ``thread.id`` does not match the
+        requested thread ID is refused. This catches a resolver
+        that acted on a different thread than requested."""
+        ok, msg, calls = self._capture(
+            stdout_payload=json.dumps({
+                "data": {"resolveReviewThread": {
+                    "thread": {"id": "T-OTHER", "isResolved": True}
+                }}
+            })
+        )
+        assert ok is False
+        assert "does not match" in msg.lower()
+
     def test_missing_thread_payload_fails(self):
-        # ``{"data": {"resolveReviewThread": null}}`` - the payload
-        # does not contain a thread.
         ok, msg, calls = self._capture(
             stdout_payload=json.dumps({
                 "data": {"resolveReviewThread": None}
@@ -1126,7 +1171,6 @@ class TestRound6ResolveReviewThreadInput:
         assert "thread" in msg or "resolveReviewThread" in msg
 
     def test_is_resolved_false_fails(self):
-        # GitHub returned the thread but ``isResolved`` is False.
         ok, msg, calls = self._capture(
             stdout_payload=json.dumps({
                 "data": {"resolveReviewThread": {
@@ -1138,7 +1182,6 @@ class TestRound6ResolveReviewThreadInput:
         assert "not resolved" in msg.lower()
 
     def test_graphql_error_fails(self):
-        # ``{"errors": [...]}`` indicates a top-level GraphQL error.
         ok, msg, calls = self._capture(
             stdout_payload=json.dumps({
                 "errors": [{"message": "Could not resolve"}]
@@ -1158,7 +1201,7 @@ class TestRound6ResolveReviewThreadInput:
         assert ok is False
         assert "bad" in msg
 
-    def test_timeout_fails(self):
+    def test_timeout_expired_fails(self):
         def fake_runner(cmd, *a, **kw):
             raise subprocess.TimeoutExpired(cmd, 30)
         ok, msg = ctrl.resolve_review_thread(
@@ -1166,6 +1209,98 @@ class TestRound6ResolveReviewThreadInput:
         )
         assert ok is False
         assert "failed" in msg.lower() or "timeout" in msg.lower()
+
+
+class TestRound7GhPrChecksNoLimit:
+    """Round-7 follow-up (Codex comment on c229be82):
+
+    the installed ``gh pr checks`` does not accept ``--limit``;
+    remove the unsupported flag.
+    """
+
+    def _capture_argv(self, payload=None):
+        if payload is None:
+            payload = [{
+                "name": "test (3.11)",
+                "state": "SUCCESS",
+                "workflow": "CI",
+            }]
+        calls = []
+        def fake_runner(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+        ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["test (3.11)"],
+            runner=fake_runner,
+        )
+        return calls[0]
+
+    def test_argv_contains_no_limit(self):
+        argv = self._capture_argv()
+        assert "--limit" not in argv
+
+    def test_argv_still_contains_json_name_state_workflow(self):
+        argv = self._capture_argv()
+        assert "--json" in argv
+        idx = argv.index("--json")
+        assert argv[idx + 1] == "name,state,workflow"
+
+    def test_unique_successful_required_check_passes(self):
+        argv = self._capture_argv(payload=[{
+            "name": "test (3.11)",
+            "state": "SUCCESS",
+            "workflow": "CI",
+        }])
+        # No ``--limit`` and the call returned successfully.
+        assert "--limit" not in argv
+        assert argv[:3] == ["gh", "pr", "checks"]
+        assert "411" in argv
+
+    def test_duplicate_required_checks_remain_blocking(self):
+        # Two duplicates of the required check. Even though
+        # ``--limit`` is removed, the duplicate-protection behavior
+        # from round-6 must still fail closed.
+        calls = []
+        def fake_runner(cmd, *a, **kw):
+            calls.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([
+                    {"name": "test (3.11)", "state": "SUCCESS",
+                     "workflow": "CI"},
+                    {"name": "test (3.11)", "state": "FAILURE",
+                     "workflow": "CI"},
+                ]),
+                stderr="",
+            )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["test (3.11)"],
+            runner=fake_runner,
+        )
+        assert err == ""
+        assert duplicated == ["test (3.11)"]
+        assert "test (3.11)" not in conclusions
+
+    def test_command_failure_remains_fail_closed(self):
+        # ``gh pr checks`` returns nonzero; the controller must
+        # report every required check as missing and return ok=False.
+        def fake_runner(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=1, stdout="", stderr="error",
+            )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["test (3.11)"],
+            runner=fake_runner,
+        )
+        assert ok is False
+        assert missing == ["test (3.11)"]
+        assert err
 
 
 # ---------------------------------------------------------------------------
