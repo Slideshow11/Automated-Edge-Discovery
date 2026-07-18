@@ -614,6 +614,86 @@ def normalize_thread_anchor(
     return out
 
 
+def verify_anchor_ancestry(
+    repo: str,
+    anchor_sha: str,
+    head_sha: str,
+    *,
+    runner: Optional[Any] = None,
+) -> Tuple[bool, str]:
+    """Verify that ``head_sha`` descends from ``anchor_sha``.
+
+    Round-5 follow-up (Codex review 4724989281 on ``301ef32``): the
+    previous eligibility check treated ``anchor_sha != head_sha`` as
+    proof that a later commit addressed the finding. This is wrong
+    on a rebase or force-push: the anchor can be unrelated to the
+    current branch's history. The controller must call GitHub's
+    ``compare`` API and require ``status="ahead"`` to prove the
+    ancestry.
+
+    Args:
+        repo: ``owner/name`` repository string.
+        anchor_sha: the thread's commit anchor (40-hex canonical).
+        head_sha: the live PR head SHA (40-hex canonical).
+        runner: optional ``subprocess.run`` replacement for tests.
+            When ``None``, ``subprocess.run`` is used. The runner
+            must accept ``(cmd, capture_output, text, timeout)``
+            and return an object with ``returncode``, ``stdout``,
+            ``stderr`` attributes.
+
+    Returns:
+        ``(is_ancestor, reason)``. ``reason`` is one of:
+
+        - ``anchor_is_ancestor`` when ancestry is proven;
+        - ``anchor_equals_head`` when both SHAs are identical;
+        - ``missing_commit_anchor`` when ``anchor_sha`` is empty;
+        - ``malformed_commit_anchor`` when either SHA is not
+          canonical;
+        - ``ancestry_unavailable`` when the comparison API call
+          fails, returns malformed JSON, or returns an unexpected
+          ``status`` value.
+
+    The function never infers ancestry from outdated status,
+    timestamps, thread order, or SHA inequality. The comparison
+    response must explicitly state ``status == "ahead"`` for the
+    anchor to be considered an ancestor.
+    """
+    if runner is None:
+        import subprocess as _subprocess
+        runner = _subprocess.run
+    if not isinstance(repo, str) or "/" not in repo:
+        return False, "ancestry_unavailable"
+    if not isinstance(anchor_sha, str) or not anchor_sha:
+        return False, "missing_commit_anchor"
+    if not isinstance(head_sha, str) or not head_sha:
+        return False, "ancestry_unavailable"
+    if not is_canonical_head_sha(anchor_sha):
+        return False, "malformed_commit_anchor"
+    if not is_canonical_head_sha(head_sha):
+        return False, "ancestry_unavailable"
+    if anchor_sha == head_sha:
+        return False, "anchor_equals_head"
+    cmd = [
+        "gh", "api",
+        f"repos/{repo}/compare/{anchor_sha}...{head_sha}",
+        "--jq", ".status",
+    ]
+    try:
+        proc = runner(
+            cmd, capture_output=True, text=True, timeout=30
+        )
+    except (OSError, TimeoutError) as exc:
+        return False, "ancestry_unavailable"
+    if proc.returncode != 0:
+        return False, "ancestry_unavailable"
+    status = (proc.stdout or "").strip()
+    if status == "ahead":
+        return True, "anchor_is_ancestor"
+    # Identical handled above; diverged, behind, missing or
+    # unexpected statuses all block.
+    return False, "ancestry_unavailable"
+
+
 def is_eligible_for_bot_resolution(
     thread: Dict[str, Any],
     *,
@@ -621,6 +701,8 @@ def is_eligible_for_bot_resolution(
     codex_verdict: Optional[str],
     codex_clean_passed: Optional[bool],
     codex_reviewed_sha: Optional[str] = None,
+    repo: Optional[str] = None,
+    ancestry_runner: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     """Return ``(eligible, reason)`` for a single review thread.
 
@@ -694,6 +776,24 @@ def is_eligible_for_bot_resolution(
         # The thread is anchored to the current head - not a stale
         # finding. Refuse.
         return False, "no_later_commit"
+
+    # Round-5 follow-up: require VERIFIED ancestry via the GitHub
+    # compare API. ``anchor_sha != head_sha`` alone is NOT proof of
+    # a later commit; on a rebase or force-push the anchor can be
+    # unrelated to the current branch's history. ``verify_anchor_
+    # ancestry`` returns the precise reason on failure.
+    if not isinstance(repo, str) or not repo:
+        # No repo supplied -> refuse with a precise reason. The
+        # controller's caller MUST supply ``repo`` so the verifier
+        # can run.
+        return False, "ancestry_unavailable"
+    is_ancestor, ancestry_reason = verify_anchor_ancestry(
+        repo, anchor_sha, head_sha, runner=ancestry_runner,
+    )
+    if not is_ancestor:
+        if ancestry_reason == "anchor_equals_head":
+            return False, "no_later_commit"
+        return False, ancestry_reason
 
     # Condition 5/6: exact-head Codex evidence must be clean and the
     # reviewed SHA must match the live head.

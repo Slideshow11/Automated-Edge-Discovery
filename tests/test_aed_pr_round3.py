@@ -511,6 +511,15 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "codex_verdict": "CODEX_CLEAN_PASS",
         "codex_clean_passed": True,
         "codex_reviewed_sha": head,
+        # Round-5: pass repo + an ancestry_runner that always
+        # reports ``status="ahead"`` so the existing F4 tests
+        # retain their intent (eligible vs ineligible based on
+        # anchor shape and codex state) without each test
+        # constructing a verifier mock.
+        "repo": "Slideshow11/Automated-Edge-Discovery",
+        "ancestry_runner": lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="ahead", stderr=""
+        ),
     }
     base.update(overrides)
     return base
@@ -650,7 +659,7 @@ def _build_run(
     status="completed",
     conclusion="success",
     createdAt=None,
-    workflow_name="ci.yml",
+    workflow_name=None,
 ):
     if createdAt is None:
         # Default to "now" so the run always qualifies as
@@ -660,16 +669,19 @@ def _build_run(
         # specific historical timestamp can override.
         import datetime as _dt
         createdAt = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    if workflow_name is None:
+        # ``gh run list --workflow ci.yml`` returns workflowName
+        # equal to the workflow's display name (e.g. ``CI``) on
+        # this repository. Match the controller's expectation.
+        workflow_name = (
+            ctrl.EXPECTED_WORKFLOW_NAME.get("ci.yml", "ci.yml")
+        )
     return {
         "databaseId": databaseId, "name": name, "event": event,
         "headBranch": head_branch, "headSha": head_sha,
         "status": status, "conclusion": conclusion,
         "createdAt": createdAt, "url": f"https://example/runs/{databaseId}",
-        # ``gh run list`` exposes the workflow filename as the
-        # flat ``workflowName`` field; the nested ``workflows``
-        # array does not exist on this CLI version.
         "workflowName": workflow_name,
-        "workflowDatabaseId": 263541549,
     }
 
 

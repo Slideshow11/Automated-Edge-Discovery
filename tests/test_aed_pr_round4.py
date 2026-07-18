@@ -31,6 +31,8 @@ sys.path.insert(0, str(REPO))
 
 import datetime as _dt  # used by mock fixtures for "now" timestamps
 
+import datetime as dt  # used by new tests for dispatched_at construction
+
 from scripts.local import aed_pr_lib as L  # noqa: E402
 from scripts.local import aed_pr_readiness as R  # noqa: E402
 from scripts.local import aed_pr as ctrl  # noqa: E402
@@ -161,6 +163,17 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "codex_verdict": "CODEX_CLEAN_PASS",
         "codex_clean_passed": True,
         "codex_reviewed_sha": head,
+        # Round-5: pass repo + an ancestry_runner that always
+        # reports ``status="ahead"`` so the existing F4 tests
+        # retain their intent (eligible vs ineligible based on
+        # anchor shape and codex state) without each test
+        # constructing a verifier mock. Tests that want a
+        # different ancestry result can override
+        # ``ancestry_runner``.
+        "repo": "Slideshow11/Automated-Edge-Discovery",
+        "ancestry_runner": lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="ahead", stderr=""
+        ),
     }
     base.update(overrides)
     return base
@@ -338,30 +351,591 @@ class TestRound4Finding2ThreadAnchor:
         assert reason == "no_later_commit"
 
     def test_non_ancestor_anchor_is_ineligible(self):
+        """A non-ancestor anchor must fail closed with
+        ``ancestry_unavailable``. ``OTHER_HEAD`` is not a real
+        ancestor of ``DEFAULT_HEAD``; the compare API returns
+        ``status="diverged"`` and the verifier reports failure."""
         thread = _bot_thread(anchor=OTHER_HEAD)
-        ok, reason = R.is_eligible_for_bot_resolution(
-            thread, **_eligibility_kwargs()
+        ancestry_runner = lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="diverged", stderr=""
         )
-        # anchor != head, but anchor validity alone does not prove
-        # ancestry. ``R.is_eligible_for_bot_resolution`` does not
-        # itself do graph-walk ancestry; it requires the controller
-        # to verify ancestry separately. Until that is integrated
-        # the brief allows a verified-anchor-but-not-ancestor case
-        # to remain eligible at the eligibility-check level; the
-        # ancestry gate is enforced by the controller. Here we
-        # exercise the anchor-shape check only.
-        assert ok is True or reason in {"codex_head_mismatch", "codex_not_clean"}
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
 
     def test_valid_anchor_plus_clean_exact_head_codex_is_eligible(self):
+        """A verified ancestor anchor plus a clean exact-head
+        Codex review is eligible."""
         thread = _bot_thread(anchor=OTHER_HEAD)
-        ok, reason = R.is_eligible_for_bot_resolution(
-            thread, **_eligibility_kwargs()
+        ancestry_runner = lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="ahead", stderr=""
         )
-        # An anchor that differs from the live head combined with a
-        # clean exact-head Codex review is eligible. The ancestry
-        # check is enforced separately by the controller.
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
         assert ok is True
         assert reason == "eligible"
+
+
+# ---------------------------------------------------------------------------
+# Round-5 follow-up: verify_anchor_ancestry
+# ---------------------------------------------------------------------------
+
+
+class TestRound5FollowUpAncestryVerifier:
+    """Round-5 follow-up (Codex review 4724989281 on ``301ef32``):
+
+    the eligibility check now requires a verified ancestry call to
+    GitHub's compare API; the previous ``anchor_sha != head_sha``
+    shortcut is gone.
+    """
+
+    def test_ahead_passes_ancestry_condition(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="ahead", stderr=""
+            ),
+        )
+        assert ok is True
+        assert reason == "anchor_is_ancestor"
+
+    def test_identical_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", DEFAULT_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="identical", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "anchor_equals_head"
+
+    def test_diverged_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="diverged", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_behind_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="behind", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_missing_status_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_malformed_response_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="invalid_response", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_command_failure_blocks(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", OTHER_HEAD, DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=1, stdout="", stderr="404 Not Found"
+            ),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_malformed_sha_blocks_before_command(self):
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", "not-a-sha", DEFAULT_HEAD,
+            runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="ahead", stderr=""
+            ),
+        )
+        assert ok is False
+        assert reason == "malformed_commit_anchor"
+
+    def test_equal_sha_blocks_before_command(self):
+        # Caller is expected to skip the verifier when anchor ==
+        # head; the verifier itself enforces this.
+        runner = mock.Mock()
+        runner.return_value = mock.Mock(
+            returncode=0, stdout="ahead", stderr=""
+        )
+        ok, reason = R.verify_anchor_ancestry(
+            "owner/name", DEFAULT_HEAD, DEFAULT_HEAD,
+            runner=runner,
+        )
+        assert ok is False
+        assert reason == "anchor_equals_head"
+        runner.assert_not_called()
+
+    def test_unverified_ancestry_invokes_no_resolution(self):
+        """When ancestry is not verified, the eligibility check
+        returns ``ancestry_unavailable`` and ``is_eligible=False``;
+        the controller's resolver would never call
+        ``resolveReviewThread`` for an ineligible thread."""
+        thread = _bot_thread(anchor=OTHER_HEAD)
+        ancestry_runner = lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="diverged", stderr=""
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
+        assert ok is False
+        assert reason == "ancestry_unavailable"
+
+    def test_verified_ancestry_cannot_override_failed_safety(self):
+        """Even with verified ancestry, an outdated-required or
+        actor-required failure still blocks the thread."""
+        # ``is_outdated=False`` -> reason "not_outdated".
+        thread = _bot_thread(anchor=OTHER_HEAD, is_outdated=False)
+        ancestry_runner = lambda *a, **kw: mock.Mock(
+            returncode=0, stdout="ahead", stderr=""
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
+        assert ok is False
+        assert reason == "not_outdated"
+
+
+# ---------------------------------------------------------------------------
+# Round-5 follow-up: deduplicate_thread_records
+# ---------------------------------------------------------------------------
+
+
+class TestRound5FollowUpDeduplicateThreadRecords:
+    """Round-5 follow-up (Codex review 4724907717 on ``bc70403``):
+
+    the audit packet emits one entry per comment; resolveReviewThread
+    must be invoked at most once per unique thread_id per advance
+    execution.
+    """
+
+    def _thread(self, thread_id, author="chatgpt-codex-connector[bot]",
+               anchor=OTHER_HEAD, comments=None, **kw):
+        record = {
+            "thread_id": thread_id,
+            "author": author,
+            "isOutdated": kw.get("is_outdated", True),
+            "original_commit_sha": anchor,
+            "comments": comments if comments is not None else [
+                {"author": author, "database_id": thread_id + "-c1"},
+            ],
+            "isResolved": kw.get("is_resolved", False),
+        }
+        return record
+
+    def test_two_duplicate_eligible_records_produce_one_canonical(self):
+        a = self._thread("T-A", anchor=OTHER_HEAD)
+        b = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c2"},
+        ])
+        canonical, err = ctrl.deduplicate_thread_records([a, b])
+        assert err == ""
+        assert len(canonical) == 1
+        assert canonical[0]["thread_id"] == "T-A"
+
+    def test_three_duplicate_records_produce_one_canonical(self):
+        a = self._thread("T-A", anchor=OTHER_HEAD)
+        b = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c2"},
+        ])
+        c = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c3"},
+        ])
+        canonical, err = ctrl.deduplicate_thread_records([a, b, c])
+        assert err == ""
+        assert len(canonical) == 1
+        assert canonical[0]["thread_id"] == "T-A"
+
+    def test_unique_and_duplicate_produce_one_per_unique(self):
+        canonical, err = ctrl.deduplicate_thread_records([
+            self._thread("T-A", anchor=OTHER_HEAD),
+            self._thread("T-A", anchor=OTHER_HEAD, comments=[
+                {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c2"},
+            ]),
+            self._thread("T-B", anchor="c" * 40),
+        ])
+        assert err == ""
+        assert len(canonical) == 2
+        tids = {c["thread_id"] for c in canonical}
+        assert tids == {"T-A", "T-B"}
+
+    def test_participant_lists_are_combined_safely(self):
+        a = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c1"},
+        ])
+        b = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c2"},
+        ])
+        canonical, err = ctrl.deduplicate_thread_records([a, b])
+        assert err == ""
+        merged = canonical[0]["comments"]
+        keys = [c.get("database_id") for c in merged]
+        assert keys == ["T-A-c1", "T-A-c2"]
+
+    def test_human_reply_in_any_duplicate_blocks_thread(self):
+        a = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "chatgpt-codex-connector[bot]", "database_id": "T-A-c1"},
+        ])
+        b = self._thread("T-A", anchor=OTHER_HEAD, comments=[
+            {"author": "human-reviewer", "database_id": "T-A-c2"},
+        ])
+        canonical, err = ctrl.deduplicate_thread_records([a, b])
+        assert err == ""
+        assert canonical == []
+
+    def test_conflicting_anchors_block(self):
+        a = self._thread("T-A", anchor=OTHER_HEAD)
+        b = self._thread("T-A", anchor="c" * 40)
+        canonical, err = ctrl.deduplicate_thread_records([a, b])
+        assert err == "conflicting_duplicate_thread_records"
+        assert canonical == []
+
+    def test_missing_thread_id_blocks(self):
+        record = {"author": "chatgpt-codex-connector[bot]",
+                  "isOutdated": True,
+                  "comments": [{"author": "chatgpt-codex-connector[bot]"}]}
+        canonical, err = ctrl.deduplicate_thread_records([record])
+        # Records without a thread_id are dropped silently; the
+        # eligibility check treats them as ineligible.
+        assert canonical == []
+
+    def test_ordering_is_deterministic(self):
+        records = [
+            self._thread(f"T-{i}", anchor="c" * 40, comments=[
+                {"author": "chatgpt-codex-connector[bot]",
+                 "database_id": f"T-{i}-c1"},
+            ])
+            for i in range(5)
+        ]
+        # Reverse and re-run: ordering should follow first-seen.
+        canonical, err = ctrl.deduplicate_thread_records(
+            list(reversed(records))
+        )
+        tids = [c["thread_id"] for c in canonical]
+        assert tids == ["T-4", "T-3", "T-2", "T-1", "T-0"]
+
+    def test_already_resolved_threads_pass_through(self):
+        # ``is_resolved`` is preserved on the canonical record; the
+        # resolver's idempotency check (``already_resolved``) handles
+        # it after dedup.
+        a = self._thread("T-A", anchor=OTHER_HEAD, is_resolved=False)
+        b = self._thread("T-A", anchor=OTHER_HEAD, is_resolved=False,
+                          comments=[
+                              {"author": "chatgpt-codex-connector[bot]",
+                               "database_id": "T-A-c2"},
+                          ])
+        canonical, err = ctrl.deduplicate_thread_records([a, b])
+        assert err == ""
+        assert canonical[0]["isResolved"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-5 follow-up: workflow-run matching (ci.yml vs "CI")
+# ---------------------------------------------------------------------------
+
+
+class TestRound5FollowUpWorkflowRunMatching:
+    """Round-5 follow-up (Codex review 4724907717 on ``bc70403``):
+    ``gh run list`` exposes ``workflowName`` as the human-readable
+    display name (e.g. ``CI``), not the file basename. The query
+    must be scoped to ``--workflow ci.yml`` and ``--branch
+    <live-head-branch>``, and the matching ``workflowName`` must
+    match exactly. The unused ``workflows`` JSON field is no
+    longer requested.
+    """
+
+    def test_command_includes_workflow_ci_yml(self):
+        # Run a fake list, capture the argv, verify the shape.
+        invocations = []
+
+        def fake_list(cmd, *a, **kw):
+            invocations.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T15:30:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err == ""
+        argv = invocations[0]
+        # Scope to workflow file.
+        assert "--workflow" in argv
+        assert "ci.yml" in argv
+        # Scope to branch.
+        assert "--branch" in argv
+        assert "reduction/pr-lifecycle-collapse-v1" in argv
+        # Scope to event.
+        assert "workflow_dispatch" in argv
+        # Unused fields are no longer requested.
+        joined = " ".join(str(x) for x in argv)
+        # The CLI does NOT accept ``--json workflows``. Defensively
+        # verify the requested field list contains no entry named
+        # exactly ``workflows`` (which is the field that triggered
+        # ``Unknown JSON field: "workflows"`` on round-5 commits).
+        json_idx = argv.index("--json")
+        json_field_list = argv[json_idx + 1]
+        requested_fields = [f.strip() for f in json_field_list.split(",")]
+        assert "workflows" not in requested_fields
+        # The list does include the flat ``workflowName``.
+        assert "workflowName" in requested_fields
+
+    def test_workflow_name_CI_passes(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T15:30:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err == ""
+        assert run["workflowName"] == "CI"
+
+    def test_another_workflow_name_fails(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T15:30:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "OTHER",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err
+        assert run is None
+
+    def test_wrong_branch_fails(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "main",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T15:30:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err
+        assert run is None
+
+    def test_wrong_sha_fails(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": "f" * 40,
+                    "createdAt": "2026-07-17T15:30:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err
+        assert run is None
+
+    def test_old_run_fails(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T09:00:00Z",  # older
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err
+        assert run is None
+
+    def test_newest_uniquely_matching_run_is_selected(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([
+                    {
+                        "databaseId": 100, "event": "workflow_dispatch",
+                        "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                        "headSha": DEFAULT_HEAD,
+                        "createdAt": "2026-07-17T10:05:00Z",
+                        "status": "completed", "conclusion": "success",
+                        "url": "https://example/runs/100",
+                        "workflowName": "CI",
+                    },
+                    {
+                        "databaseId": 50, "event": "workflow_dispatch",
+                        "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                        "headSha": DEFAULT_HEAD,
+                        "createdAt": "2026-07-17T10:01:00Z",
+                        "status": "completed", "conclusion": "success",
+                        "url": "https://example/runs/50",
+                        "workflowName": "CI",
+                    },
+                ]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err == ""
+        assert run["databaseId"] == 100
+
+    def test_malformed_run_data_returns_inconclusive(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": None,  # missing id
+                    "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-17T10:05:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+
+        run, err = ctrl._find_dispatch_run(
+            DEFAULT_REPO, "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 17, 10, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert err
+        assert run is None
 
     def test_normalize_thread_anchor_populates_canonical_field(self):
         # When the packet supplies ``comment_sha`` but not
@@ -616,7 +1190,7 @@ class TestRound5Finding2GateRecheckDispatchesCI:
                         _dt.timezone.utc
                     ).isoformat(),
                     "url": "https://example/runs/29593005015",
-                    "workflowName": "ci.yml",
+                    "workflowName": "CI",
                     "workflowDatabaseId": 263541549,
                 }]),
                 stderr="",
@@ -757,7 +1331,7 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/1",
-            "workflowName": "ci.yml",
+            "workflowName": "CI",
             "workflowDatabaseId": 263541549,
         }
 
@@ -826,7 +1400,7 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/2",
-            "workflowName": "ci.yml",
+            "workflowName": "CI",
             "workflowDatabaseId": 263541549,
         }
 
@@ -905,7 +1479,7 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "success",
             "createdAt": "2026-07-17T10:00:00Z",  # older than dispatch
             "url": "https://example/runs/3",
-            "workflowName": "ci.yml",
+            "workflowName": "CI",
             "workflowDatabaseId": 263541549,
         }
 
@@ -1039,7 +1613,7 @@ class TestRound5Finding2GateRecheckDispatchesCI:
             "status": "completed", "conclusion": "failure",
             "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
             "url": "https://example/runs/4",
-            "workflowName": "ci.yml",
+            "workflowName": "CI",
             "workflowDatabaseId": 263541549,
         }
 

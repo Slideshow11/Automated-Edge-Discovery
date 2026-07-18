@@ -52,6 +52,16 @@ import time
 import sys
 from typing import Any, Dict, List, Optional, Tuple
 
+# Maps ``.github/workflows/<file>`` → the workflow's human-readable
+# display name returned by ``gh run list --json workflowName``.
+# ``.github/workflows/ci.yml`` is named ``CI`` in this repository;
+# other workflows are mapped here so the strict match succeeds
+# without loose substring matching.
+EXPECTED_WORKFLOW_NAME: Dict[str, str] = {
+    "ci.yml": "CI",
+    "review-comment-gate-recheck.yml": "review-comment-gate-recheck",
+}
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
@@ -662,12 +672,20 @@ def _find_dispatch_run(
     cmd = [
         "gh", "run", "list",
         "--repo", repo,
+        # Scope the query to the exact workflow file. ``gh run
+        # list --workflow <file>`` filters at the API level, so the
+        # returned runs are guaranteed to belong to that workflow.
         "--workflow", workflow_file,
+        # Scope the query to the live PR branch so the API never
+        # returns main-branch runs in the first place.
+        "--branch", head_branch,
         "--event", "workflow_dispatch",
         "--limit", "30",
-        "--json", "databaseId,name,event,headBranch,headSha,status,"
-        "conclusion,createdAt,url,displayTitle,workflowName,"
-        "workflowDatabaseId",
+        # ``workflowName`` (flat string) is the canonical name of
+        # the workflow (e.g. ``CI``). The nested ``workflows`` array
+        # is NOT exposed on this CLI version.
+        "--json", "databaseId,event,headBranch,headSha,createdAt,"
+        "status,conclusion,url,workflowName",
     ]
     try:
         proc = list_runner(cmd, capture_output=True, text=True, timeout=60)
@@ -694,29 +712,29 @@ def _find_dispatch_run(
             continue
         if run.get("headSha") != head_sha:
             continue
-        # Match the supplied workflow_file against the workflow
-        # name. ``gh run list`` exposes ``workflowName`` as a flat
-        # string (not a nested ``workflows`` array) on this CLI
-        # version, so we compare against it directly. We also accept
-        # the run's ``name`` for runs whose workflow file matches
-        # the supplied name (e.g. ``CI`` for ``.github/workflows/ci.yml``).
-        run_workflow_name = run.get("workflowName") or ""
-        run_name = run.get("name", "")
-        # Strip the ``.yml`` / ``.yaml`` suffix when comparing the
-        # run's workflow name (e.g. ``ci.yml``) against the supplied
-        # ``workflow_file`` (e.g. ``ci.yml``).
-        workflow_base = workflow_file.rsplit(".", 1)[0]
-        run_workflow_base = run_workflow_name.rsplit(".", 1)[0]
-        name_ok = (
-            workflow_file in (run_workflow_name, run_name)
-            or workflow_base in (run_workflow_base, run_name)
+        # ``gh run list --workflow <file>`` should already filter to
+        # the requested workflow file. Defensively verify
+        # ``workflowName`` against the expected workflow display
+        # name. The CLI maps ``.github/workflows/ci.yml`` to the
+        # human-readable name ``CI``; we accept only the exact match
+        # so an unrelated workflow with a similar basename cannot
+        # be picked up.
+        expected_workflow_name = EXPECTED_WORKFLOW_NAME.get(
+            workflow_file, workflow_file
         )
-        if not name_ok:
+        run_workflow_name = run.get("workflowName") or ""
+        if run_workflow_name != expected_workflow_name:
             continue
         # created_at >= dispatched_at (string comparison of
         # ISO-8601 timestamps is monotonic).
         created_at = run.get("createdAt") or ""
-        if created_at < dispatched_at.isoformat():
+        if not created_at or created_at < dispatched_at.isoformat():
+            continue
+        # databaseId must be present and an integer.
+        if not isinstance(run.get("databaseId"), int):
+            continue
+        # URL must be present.
+        if not (run.get("url") or ""):
             continue
         matching.append(run)
     if not matching:
@@ -725,8 +743,13 @@ def _find_dispatch_run(
             f"branch={head_branch!r} head={head_sha!r} "
             f"workflow={workflow_file!r} after {dispatched_at.isoformat()}"
         )
-    # Sort by created_at then by databaseId.
-    matching.sort(key=lambda r: (r.get("createdAt") or "", r.get("databaseId") or 0))
+    # Sort by created_at descending then databaseId descending.
+    # Newest matching run wins so a stale earlier dispatch does not
+    # block a fresh one.
+    matching.sort(
+        key=lambda r: (r.get("createdAt") or "", r.get("databaseId") or 0),
+        reverse=True,
+    )
     return matching[0], ""
 
 
@@ -1541,6 +1564,154 @@ def _mark_pr_ready_for_review(repo: str, pr_number: int) -> Tuple[bool, str]:
 # invocation on PR #411 is explicitly deferred until later
 # authorization.
 
+def deduplicate_thread_records(
+    threads: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], str]:
+    """Group duplicate review-thread records by ``thread_id``.
+
+    The audit packet built by ``audit_codex_response_for_pr`` emits
+    one inventory entry per comment in a thread, while preserving
+    the same ``thread_id``. ``select_eligible_bot_threads`` (and the
+    downstream resolver) must therefore evaluate each unique
+    thread at most once, regardless of how many comment records
+    the packet carries.
+
+    For each unique ``thread_id`` this function:
+
+    - merges the ``comments`` list (deduplicated by ``database_id``
+      or author, preserving first-seen order);
+    - takes the **first** occurrence as the canonical record;
+    - validates that all duplicates agree on
+      ``is_outdated``/``is_resolved`` and on the canonical anchor
+      (``original_commit_sha``/``comment_sha``/``head_sha``); when
+      they disagree the function fails closed by returning
+      ``([], "conflicting_duplicate_thread_records")``;
+    - validates the participant list is non-empty;
+    - fails closed when any duplicate record contains a non-bot
+      author (a human reply somewhere in the thread blocks the
+      whole thread);
+    - skips records whose ``thread_id`` is missing (those are
+      ineligible individually; the dedup function does not surface
+      them as new canonical records).
+
+    Returns ``(canonical_records, error)``. ``canonical_records`` is
+    the deduplicated list, in deterministic first-seen order.
+    ``error`` is non-empty when the function failed closed; the
+    caller should treat the deduplication result as
+    ineligible-with-reason ``conflicting_duplicate_thread_records``.
+    """
+    if not threads:
+        return [], ""
+    seen: Dict[str, Dict[str, Any]] = {}
+    first_seen_order: List[str] = []
+    for record in threads or []:
+        if not isinstance(record, dict):
+            continue
+        tid = record.get("thread_id") or record.get("id") or ""
+        if not isinstance(tid, str) or not tid:
+            # Records without a thread_id are kept out of the
+            # canonical set; the eligibility checker treats them
+            # as ineligible individually. We still record that
+            # the dedup saw a missing-id record so the caller can
+            # detect "incomplete participant evidence" later.
+            continue
+        # Pull the per-record evidence we need to validate.
+        rec_outdated = bool(
+            record.get("isOutdated", record.get("is_outdated"))
+        )
+        rec_resolved = bool(
+            record.get("isResolved", record.get("is_resolved"))
+        )
+        rec_anchor = R._extract_thread_anchor(record)
+        rec_comments = record.get("comments") or []
+        rec_top_author = (
+            record.get("author") or record.get("author_login") or ""
+        )
+        if tid not in seen:
+            seen[tid] = {
+                "thread_id": tid,
+                "first_record": dict(record),
+                "anchors": [rec_anchor] if rec_anchor else [],
+                "outdated": rec_outdated,
+                "resolved": rec_resolved,
+                "comments_merged": list(rec_comments),
+                "comment_keys": set(),
+                "top_authors": {rec_top_author} if rec_top_author else set(),
+                "human_involvement": False,
+            }
+            for c in rec_comments:
+                if isinstance(c, dict):
+                    key = c.get("database_id") or (
+                        c.get("author") or c.get("databaseId")
+                    )
+                    seen[tid]["comment_keys"].add(key)
+            first_seen_order.append(tid)
+            continue
+        existing = seen[tid]
+        # Validate agreement on state.
+        if existing["outdated"] != rec_outdated:
+            return [], "conflicting_duplicate_thread_records"
+        if existing["resolved"] != rec_resolved:
+            return [], "conflicting_duplicate_thread_records"
+        # Validate agreement on anchor. Two non-empty anchors that
+        # disagree are a hard conflict (failed closed).
+        if rec_anchor:
+            if existing["anchors"] and rec_anchor not in existing["anchors"]:
+                return [], "conflicting_duplicate_thread_records"
+            existing["anchors"].append(rec_anchor)
+        # Validate participant list non-empty.
+        if not rec_comments:
+            return [], "conflicting_duplicate_thread_records"
+        # Validate top-level author agreement.
+        if rec_top_author:
+            existing["top_authors"].add(rec_top_author)
+        if len(existing["top_authors"]) > 1:
+            return [], "conflicting_duplicate_thread_records"
+        # Merge comments (dedupe by database_id or author+body).
+        for c in rec_comments:
+            if not isinstance(c, dict):
+                continue
+            key = c.get("database_id") or (
+                c.get("author") or c.get("databaseId")
+            )
+            if key in existing["comment_keys"]:
+                continue
+            existing["comment_keys"].add(key)
+            existing["comments_merged"].append(c)
+            author = c.get("author") or c.get("author_login") or ""
+            if author and not _is_known_bot_login(author):
+                existing["human_involvement"] = True
+    # Build canonical records.
+    canonical: List[Dict[str, Any]] = []
+    for tid in first_seen_order:
+        entry = seen[tid]
+        if entry["human_involvement"]:
+            # Human involvement present in any duplicate record
+            # blocks the whole thread; do not surface it as a
+            # canonical record eligible for resolution.
+            continue
+        # Build the canonical record from the first occurrence,
+        # with the merged comments list and the most specific
+        # canonical anchor.
+        canonical_record = dict(entry["first_record"])
+        canonical_record["comments"] = entry["comments_merged"]
+        # Pick a single canonical anchor (first non-empty).
+        anchor = next(
+            (a for a in entry["anchors"] if a), None
+        )
+        if anchor:
+            canonical_record["original_commit_sha"] = anchor
+            canonical_record["comment_sha"] = anchor
+        canonical.append(canonical_record)
+    return canonical, ""
+
+
+def _is_known_bot_login(login: str) -> bool:
+    if not isinstance(login, str):
+        return False
+    return login.lower() in R._RECOGNIZED_BOT_LOGINS
+
+
 def select_eligible_bot_threads(
     threads: List[Dict[str, Any]],
     *,
@@ -1548,6 +1719,8 @@ def select_eligible_bot_threads(
     codex_verdict: Optional[str],
     codex_clean_passed: Optional[bool],
     codex_reviewed_sha: Optional[str] = None,
+    repo: Optional[str] = None,
+    ancestry_runner: Optional[Any] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run the eligibility checker over a thread inventory.
 
@@ -1573,6 +1746,8 @@ def select_eligible_bot_threads(
             codex_verdict=codex_verdict,
             codex_clean_passed=codex_clean_passed,
             codex_reviewed_sha=codex_reviewed_sha,
+            repo=repo,
+            ancestry_runner=ancestry_runner,
         )
         annotated = dict(thread)
         annotated["reason"] = reason
@@ -1683,14 +1858,95 @@ def cmd_advance(args: argparse.Namespace) -> int:
     normalized_thread_inventory = [
         R.normalize_thread_anchor(t) for t in raw_thread_inventory
     ]
+    # Round-5 fix: deduplicate thread records before eligibility
+    # classification. The audit packet emits one entry per comment,
+    # so a thread with N comments produces N records sharing one
+    # thread_id. Without dedup the eligibility loop would evaluate
+    # the same thread N times and the resolver would call
+    # resolveReviewThread N times for one thread.
+    deduplicated_inventory, dedup_err = deduplicate_thread_records(
+        normalized_thread_inventory
+    )
+    if dedup_err:
+        # Fail closed: surface the dedup failure in the action
+        # report and proceed with an empty inventory (every thread
+        # is blocked). The eligibility loop below cannot run with
+        # a conflicting duplicate record set.
+        actions_taken.append({
+            "action": "thread_deduplication_report",
+            "ok": False,
+            "result": "deduplication_failed_closed",
+            "error": dedup_err,
+        })
+        actions_taken.append({
+            "action": "thread_eligibility_report",
+            "eligible_count": 0,
+            "ineligible_count": 0,
+            "eligible_thread_ids": [],
+            "ineligible_thread_ids": [],
+            "ineligible_details": [],
+        })
+        if not args.dry_run:
+            actions_taken.append({
+                "action": "dry_run",
+                "result": "skipped_all_mutations",
+            })
+        elif args.dry_run:
+            actions_taken.append({
+                "action": "dry_run",
+                "result": "skipped_all_mutations",
+            })
+        # Emit the report and return.
+        canonical_phrase = (
+            L.build_authorization_phrase(pr_number, str(head_sha))
+            if machine_verdict.machine_ready
+            and R.is_canonical_head_sha(head_sha)
+            else None
+        )
+        out = {
+            "tool": "aed_pr.advance",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "lifecycle_state": state,
+            "scope_source": (
+                "cli_override" if cli_override else "trusted_file"
+            ),
+            "machine_ready": machine_verdict.machine_ready,
+            "authorization_required": machine_verdict.authorization_required,
+            "authorization_valid": machine_verdict.authorization_valid,
+            "merge_ready": machine_verdict.merge_ready,
+            "ready": machine_verdict.merge_ready,
+            "reason_codes": [r.code for r in machine_verdict.reasons],
+            "reasons": [r.to_dict() for r in machine_verdict.reasons],
+            "actions_taken": actions_taken,
+            "safe_merge_command_if_ready": (
+                L.build_safe_merge_command(pr_number, repo, head_sha)
+                if machine_verdict.machine_ready else None
+            ),
+            "required_authorization_phrase_if_ready": canonical_phrase,
+            "next_human_action": _next_human_action(state),
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+    actions_taken.append({
+        "action": "thread_deduplication_report",
+        "ok": True,
+        "input_count": len(normalized_thread_inventory),
+        "output_count": len(deduplicated_inventory),
+    })
     eligibility = select_eligible_bot_threads(
-        normalized_thread_inventory,
+        deduplicated_inventory,
         head_sha=str(head_sha) if head_sha else None,
         codex_verdict=evidence.codex_verdict,
         codex_clean_passed=(
             True if evidence.codex_clean_passed is True else None
         ),
         codex_reviewed_sha=evidence.codex_reviewed_sha,
+        repo=repo,
+        ancestry_runner=getattr(args, "ancestry_runner", None),
     )
     eligible_thread_records = [
         {
