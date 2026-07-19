@@ -407,10 +407,168 @@ def fetch_changed_files(
     return True, paths, ""
 
 
+def _find_exact_head_pull_request_run_id(
+    repo: str,
+    head_sha: str,
+    *,
+    runner: Optional[Any] = None,
+) -> Optional[int]:
+    """Return the integer ``databaseId`` of the exact-head
+    ``pull_request`` CI run, or ``None``.
+
+    Round-12 helper. Used to disambiguate a
+    ``review-comment-gate`` required-check duplicate where
+    one record is a push-triggered run (skipped success)
+    and the other is the exact-head pull_request run
+    (authoritative). The function filters ``gh run list``
+    to the exact head SHA and event ``pull_request``.
+    """
+    if runner is None:
+        cmd = [
+            "gh", "run", "list",
+            "--repo", repo,
+            "--workflow", "ci.yml",
+            "--event", "pull_request",
+            "--commit", head_sha,
+            "--limit", "10",
+            "--json", "databaseId,event,headBranch,headSha,"
+            "workflowName",
+        ]
+        ok, payload, _err = _run_json_or_none(cmd, timeout=45)
+        if not ok or not isinstance(payload, list):
+            return None
+    else:
+        cmd = [
+            "gh", "run", "list",
+            "--repo", repo,
+            "--workflow", "ci.yml",
+            "--event", "pull_request",
+            "--commit", head_sha,
+            "--limit", "10",
+            "--json", "databaseId,event,headBranch,headSha,"
+            "workflowName",
+        ]
+        try:
+            proc = runner(cmd, capture_output=True, text=True, timeout=45)
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            payload = json.loads(proc.stdout or "")
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, list):
+            return None
+    candidates: List[Dict[str, Any]] = []
+    for run in payload:
+        if not isinstance(run, dict):
+            continue
+        if (run.get("workflowName") or "") != "CI":
+            continue
+        if (run.get("event") or "") != "pull_request":
+            continue
+        if run.get("headSha") != head_sha:
+            continue
+        if not isinstance(run.get("databaseId"), int):
+            continue
+        candidates.append(run)
+    if not candidates:
+        return None
+    return candidates[0]["databaseId"]
+
+
+def _run_jobs_for_run(
+    repo: str,
+    run_id: int,
+    *,
+    runner: Optional[Any] = None,
+) -> Tuple[Dict[str, str], List[str], List[int]]:
+    """Return ``({job_name: conclusion}, [job_names], [job_ids])`` for a run.
+
+    Round-12 helper used to derive authoritative per-job
+    evidence directly from a specific ``pull_request`` run
+    when ``gh pr checks`` reports duplicates. Uses ``gh run
+    view --json jobs`` and returns the latest attempt's
+    job list (filtering by ``jobs[].databaseId``).
+    """
+    if runner is None:
+        jobs, _err = _list_run_jobs(repo, run_id)
+    else:
+        jobs, _err = _list_run_jobs(
+            repo, run_id, list_runner=runner,
+        )
+    if not jobs:
+        return {}, [], []
+    # ``_list_run_jobs`` already returns the most recent
+    # attempt's jobs; trust that.
+    by_name: Dict[str, str] = {}
+    name_id_pairs: List[Tuple[str, int]] = []
+    job_names: List[str] = []
+    job_ids: List[int] = []
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        name = j.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        status = (j.get("status") or "").upper()
+        conclusion = (j.get("conclusion") or "").upper()
+        dbid = j.get("databaseId")
+        # Map to ``gh pr checks`` vocabulary:
+        # status="completed" + conclusion="success" => SUCCESS
+        # status="completed" + any other conclusion => FAILURE
+        # otherwise => PENDING/IN_FLIGHT
+        if status != "COMPLETED":
+            mapped = "PENDING"
+        elif conclusion == "SUCCESS":
+            mapped = "SUCCESS"
+        else:
+            mapped = conclusion or "FAILURE"
+        by_name[name] = mapped
+        if isinstance(dbid, int):
+            job_ids.append(dbid)
+            name_id_pairs.append((name, dbid))
+        job_names.append(name)
+    return by_name, job_names, job_ids
+
+
+def _fetch_gh_pr_checks_payload(
+    repo: str,
+    pr_number: int,
+    *,
+    runner: Optional[Any] = None,
+) -> Tuple[bool, Any, str]:
+    """Wrap ``gh pr checks --json ...`` invocation for tests."""
+    cmd = [
+        "gh", "pr", "checks", str(pr_number),
+        "--repo", repo,
+        "--json", "name,state,workflow",
+    ]
+    if runner is None:
+        return _run_json_or_none(cmd, timeout=45)
+    try:
+        proc = runner(cmd, capture_output=True, text=True, timeout=45)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, None, f"gh invocation failed: {exc}"
+    if proc.returncode != 0:
+        return (
+            False, None,
+            (proc.stderr or "").strip()[:300] or "gh returned non-zero",
+        )
+    if not (proc.stdout or "").strip():
+        return False, None, "gh returned empty stdout"
+    try:
+        return True, json.loads(proc.stdout), ""
+    except json.JSONDecodeError as exc:
+        return False, None, f"invalid JSON: {exc}"
+
+
 def fetch_ci_conclusions(
     repo: str, pr_number: int, required_check_names: List[str],
     *,
     runner: Optional[Any] = None,
+    head_sha: Optional[str] = None,
 ) -> Tuple[
     bool, Dict[str, str], List[str], List[str], List[str],
     List[str], str,
@@ -435,6 +593,46 @@ def fetch_ci_conclusions(
     fails closed whenever a *required* check name appears more
     than once.
 
+    Round-12 follow-up (Codex comment ``3610952756`` on
+    ``48e1a33``): the round-11 ``if: github.event_name ==
+    'pull_request'`` guard on ``review-comment-gate`` causes the
+    gate to be skipped on push events. ``gh pr checks`` reports
+    that skipped job as ``SUCCESS`` on the same head SHA, so a
+    PR branch matching a push pattern (``feat/*``,
+    ``fix/*``) ends up with TWO records for the same required
+    check name:
+
+    - the push-triggered run's skipped success (not
+      authoritative), and
+    - the exact-head ``pull_request`` run's actual result
+      (authoritative).
+
+    The round-6 duplicate-detection logic would block this as
+    ambiguous evidence. The current implementation:
+
+    1. Identifies the exact-head ``pull_request`` CI run via
+       ``gh run list --workflow ci.yml --event pull_request
+       --commit <head_sha>`` (when ``head_sha`` is supplied).
+    2. Reads that run's jobs via ``gh run view --json jobs``.
+    3. For each duplicated required-check name, prefers
+       the authoritative job evidence from the exact-head
+       pull_request run.
+    4. Falls back to the existing duplicate-fails-closed
+       path when the authoritative run cannot be identified
+       or when the duplicate is from another PR-run
+       (genuinely ambiguous).
+
+    Other guarantees preserved:
+
+    - the merge path never trusts stale, rerun, or unrelated
+      workflow evidence;
+    - non-``pull_request`` duplicate events (e.g.
+      ``workflow_run`` or ``workflow_dispatch``) do not
+      bypass the round-6 protection;
+    - when ``head_sha`` is not supplied, the round-6
+      duplicate-fails-closed behavior is preserved
+      unchanged.
+
     Returns ``(ok, conclusions, missing, pending, failed,
     duplicated_required, error)``:
 
@@ -458,49 +656,10 @@ def fetch_ci_conclusions(
       appeared more than once in the payload; the gate treats
       them as blocking.
     * ``error`` is non-empty only when ``ok=False``.
-
-    State vocabulary (from gh pr checks):
-
-    * ``SUCCESS`` - terminal success
-    * ``FAILURE`` - terminal failure (includes failure, action_required,
-      timed_out, startup_failure, stale per the GraphQL enum)
-    * ``CANCELLED`` - cancelled before completion
-    * ``SKIPPED`` - skipped (counted as not-ready; AED rule: required
-      checks must actually run)
-    * ``NEUTRAL`` - ran but produced a neutral conclusion (counted as
-      not-ready; AED rule: required checks must produce SUCCESS)
-    * ``PENDING`` / ``QUEUED`` / ``IN_PROGRESS`` / ``WAITING`` /
-      ``REQUESTED`` - in flight, not ready
-    * ``STALE`` - superseded; counted as not-ready
-    * ``ERROR`` - could not run; counted as not-ready
-    * any other state value - counted as not-ready (fail closed)
     """
-    cmd = [
-        "gh", "pr", "checks", str(pr_number),
-        "--repo", repo,
-        "--json", "name,state,workflow",
-    ]
-    if runner is None:
-        ok, payload, err = _run_json_or_none(cmd, timeout=45)
-    else:
-        proc = runner(
-            cmd, capture_output=True, text=True, timeout=45
-        )
-        if proc.returncode != 0:
-            missing = list(required_check_names)
-            return (
-                False, {}, missing, [], missing, [],
-                (proc.stderr or "").strip()[:300] or "gh returned non-zero",
-            )
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            missing = list(required_check_names)
-            return (
-                False, {}, missing, [], missing, [],
-                f"invalid JSON: {exc}",
-            )
-        ok, err = True, ""
+    ok, payload, err = _fetch_gh_pr_checks_payload(
+        repo, pr_number, runner=runner,
+    )
     if not ok or not isinstance(payload, list):
         missing = list(required_check_names)
         return False, {}, missing, [], missing, [], err
@@ -527,6 +686,29 @@ def fetch_ci_conclusions(
         and n not in required_check_names
     )
 
+    # Round-12: identify the authoritative exact-head
+    # pull_request run when duplicates are present and
+    # ``head_sha`` was supplied. This lets us ignore the known
+    # push-skipped-success duplicate and accept the real
+    # pull_request result.
+    authoritative_jobs: Dict[str, str] = {}
+    authoritative_run_id: Optional[int] = None
+    if (
+        head_sha
+        and R.is_canonical_head_sha(head_sha)
+        and any(
+            len(by_name.get(n, [])) > 1
+            for n in required_check_names
+        )
+    ):
+        authoritative_run_id = _find_exact_head_pull_request_run_id(
+            repo, head_sha, runner=runner,
+        )
+        if authoritative_run_id is not None:
+            authoritative_jobs, _names, _ids = _run_jobs_for_run(
+                repo, authoritative_run_id, runner=runner,
+            )
+
     conclusions: Dict[str, str] = {}
     missing: List[str] = []
     pending: List[str] = []
@@ -538,8 +720,33 @@ def fetch_ci_conclusions(
             missing.append(name)
             continue
         if len(records) > 1:
+            # Round-12 follow-up: when the authoritative
+            # pull_request run is identified AND that run
+            # exposes a job with this exact name, prefer
+            # that job's evidence over the duplicate
+            # ``gh pr checks`` records. This is the
+            # "ignore the known push-skipped duplicate"
+            # case.
+            if name in authoritative_jobs:
+                mapped = authoritative_jobs[name]
+                conclusions[name] = mapped
+                if mapped == "SUCCESS":
+                    continue
+                if mapped in {
+                    "PENDING", "QUEUED", "IN_PROGRESS", "WAITING",
+                    "REQUESTED", "EXPECTED",
+                }:
+                    pending.append(name)
+                    continue
+                # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE,
+                # ERROR, or any unrecognized terminal state all
+                # block merge.
+                failed.append(name)
+                continue
             # Round-6 follow-up: required-check duplicates fail
-            # closed. ``conclusions`` is NOT populated for the
+            # closed when the authoritative pull_request run
+            # cannot supply a single source of truth. The
+            # ``conclusions`` map is NOT populated for the
             # duplicated name so downstream code cannot pick a
             # winner by accident.
             duplicated_required.append(name)
@@ -549,16 +756,16 @@ def fetch_ci_conclusions(
         conclusions[name] = state or "UNKNOWN"
         # Terminal states: SUCCESS passes; everything else blocks merge.
         if state == "SUCCESS":
-            pass
-        elif state in {
+            continue
+        if state in {
             "PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED",
             "EXPECTED",
         }:
             pending.append(name)
-        else:
-            # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE, ERROR, and any
-            # unrecognized terminal state all count as failed.
-            failed.append(name)
+            continue
+        # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE, ERROR, and any
+        # unrecognized terminal state all count as failed.
+        failed.append(name)
     # Round-6 follow-up: include both required and unrelated
     # duplicated check names in the structured output. The merge
     # path reports these as blocking.
@@ -1803,7 +2010,8 @@ def build_evidence(
         ci_ok, ci_conclusions, ci_missing, ci_pending, ci_failed,
         ci_duplicated, ci_err,
     ) = fetch_ci_conclusions(
-        repo, int(pr_number), list(REQUIRED_CHECK_NAMES)
+        repo, int(pr_number), list(REQUIRED_CHECK_NAMES),
+        head_sha=str(head_sha) if head_sha else None,
     )
     # Round-6 follow-up: required-check duplicates block the gate.
     ci_duplicated_required = (

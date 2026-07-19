@@ -3565,3 +3565,364 @@ class TestRound9MergeReadyRequiresAuthorization:
         assert d["authorization_valid"] is None
         assert d["merge_ready"] is False
         assert d["ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-12 follow-up: filter push-run duplicates before failing CI evidence
+# ---------------------------------------------------------------------------
+
+
+class TestRound12PushRunDuplicateFilter:
+    """Round-12 follow-up (Codex comment 3610952756 on ``48e1a33``):
+
+    the round-11 ``if: github.event_name == 'pull_request'``
+    guard on ``review-comment-gate`` causes the gate to be
+    skipped on push events. ``gh pr checks`` reports that
+    skipped job as ``SUCCESS`` on the same head SHA, so a
+    PR branch matching a push pattern (``feat/*``,
+    ``fix/*``) ends up with TWO records for the same
+    required check name on the same head:
+
+    - the push-triggered run's skipped success (not
+      authoritative), and
+    - the exact-head ``pull_request`` run's actual result
+      (authoritative).
+
+    The controller MUST prefer the authoritative
+    ``pull_request`` job evidence over the duplicated
+    ``gh pr checks`` record so the merge gate does not
+    see duplicate blocking evidence.
+
+    Genuine duplicate pull_request runs (two distinct
+    PR-run check records on the same head) MUST still
+    fail closed.
+    """
+
+    PR_RUN_ID = 29694702047
+    HEAD = "48e1a33c511bc05676f43ac4b34b28add6bda4c2"
+    REQUIRED = ["review-comment-gate"]
+
+    def _runner_factory(self, *, pr_checks_records,
+                        pr_runs=None, pr_jobs=None,
+                        list_invocation_log=None):
+        """Build a runner that dispatches by ``gh`` subcommand.
+
+        Returns a runner callable suitable for ``runner=``
+        injection, plus a list to record all command argv
+        invocations.
+        """
+        log = []
+        pr_runs = list(pr_runs if pr_runs is not None else [
+            {
+                "databaseId": self.PR_RUN_ID,
+                "event": "pull_request",
+                "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+            },
+        ])
+        pr_jobs = list(pr_jobs if pr_jobs is not None else [])
+        def runner(cmd, *a, **kw):
+            log.append(list(cmd))
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_checks_records),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "list"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_runs),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "view"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"jobs": pr_jobs}),
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        if list_invocation_log is not None:
+            list_invocation_log.extend(log)
+        return runner, log
+
+    def test_push_skipped_success_plus_pr_success_accepted(self):
+        """push-triggered skipped-SUCCESS duplicate + PR
+        SUCCESS is accepted; the authoritative PR run
+        supplies the evidence."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # push-skipped success
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # exact-head PR success
+        ]
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert duplicated == [], (
+            f"push-skipped duplicate must be ignored; "
+            f"got duplicated={duplicated!r}"
+        )
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert pending == []
+        assert failed == []
+
+    def test_push_skipped_success_plus_pr_failure_blocks(self):
+        """push-triggered skipped-SUCCESS duplicate + PR
+        FAILURE is recorded as a failed required check;
+        the controller does NOT trust the push duplicate."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # push-skipped success
+            {"name": "review-comment-gate", "state": "FAILURE",
+             "workflow": "CI"},  # exact-head PR failure
+        ]
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "failure"},
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert duplicated == []
+        assert conclusions["review-comment-gate"] == "FAILURE"
+        assert failed == ["review-comment-gate"]
+
+    def test_push_skipped_success_plus_pr_pending_is_pending(self):
+        """push-triggered skipped-SUCCESS duplicate + PR
+        PENDING is recorded as pending; the controller does
+        NOT report success based on the push duplicate."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # push-skipped success
+            {"name": "review-comment-gate", "state": "PENDING",
+             "workflow": "CI"},  # exact-head PR pending
+        ]
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "in_progress", "conclusion": None},
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert duplicated == []
+        # ``gh run view`` maps non-COMPLETED status to PENDING.
+        assert conclusions["review-comment-gate"] == "PENDING"
+        assert pending == ["review-comment-gate"]
+
+    def test_two_qualifying_pr_run_duplicates_fail_closed(self):
+        """TWO exact-head pull_request records on the same
+        head (no push duplicate) still fail closed because
+        the controller cannot pick a winner."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # PR run A success
+            {"name": "review-comment-gate", "state": "FAILURE",
+             "workflow": "CI"},  # PR run B failure
+        ]
+        # Authoritative run is identified but its job record
+        # is missing the gate name (e.g. an old PR run with
+        # no review-comment-gate job at all).
+        pr_jobs = [
+            {"name": "test", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert "review-comment-gate" in duplicated
+        # The PR-run authoritative job does NOT contain the
+        # gate name, so the duplicate must remain blocking.
+        assert "review-comment-gate" not in conclusions
+
+    def test_old_head_run_evidence_rejected(self):
+        """A run from a different head SHA is rejected by
+        the ``_find_exact_head_pull_request_run_id`` filter
+        and the duplicate fails closed."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        # The pull_request run is for an OLD head; the
+        # authoritative-run helper filters by exact SHA.
+        old_head = "f" * 40
+        pr_runs = [
+            {
+                "databaseId": 999,
+                "event": "pull_request",
+                "headBranch": "feat/old",
+                "headSha": old_head,
+                "workflowName": "CI",
+            },
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_runs=pr_runs,
+        )
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        # No authoritative run matches the exact head, so
+        # the controller falls back to fail-closed.
+        assert ok is True
+        assert "review-comment-gate" in duplicated
+
+    def test_unrelated_run_evidence_rejected(self):
+        """A run from a different workflow name is rejected
+        by the workflowName filter and the duplicate fails
+        closed."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        pr_runs = [
+            {
+                "databaseId": 999,
+                "event": "pull_request",
+                "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                "headSha": self.HEAD,
+                "workflowName": "OTHER",
+            },
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_runs=pr_runs,
+        )
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert "review-comment-gate" in duplicated
+
+    def test_existing_round6_duplicate_protection_still_valid(self):
+        """The round-6 duplicate-fails-closed path remains
+        intact when ``head_sha`` is NOT supplied."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        def runner(cmd, *a, **kw):
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(records),
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+        )
+        # Without head_sha the round-12 disambiguation is
+        # not invoked; the duplicate fails closed.
+        assert ok is True
+        assert "review-comment-gate" in duplicated
+
+    def test_no_duplicate_unaffected_by_round12(self):
+        """When there is only ONE record for a required
+        check, the round-12 path is bypassed entirely
+        and the standard single-record logic applies."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        runner, _log = self._runner_factory(
+            pr_checks_records=records, pr_jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert duplicated == []
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert pending == []
+        assert failed == []
+
+    def test_round12_lookup_failure_falls_back_to_fail_closed(self):
+        """When the authoritative run lookup itself fails
+        (network error, malformed payload, etc.), the
+        duplicate must fall back to fail-closed instead
+        of accepting evidence from unknown sources."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        def runner(cmd, *a, **kw):
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(records),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "list"]:
+                # Network error: empty stderr, nonzero
+                # returncode.
+                return mock.Mock(
+                    returncode=1,
+                    stdout="",
+                    stderr="network error",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD,
+        )
+        # The duplicate must NOT be silently accepted as
+        # a success.
+        assert ok is True
+        assert "review-comment-gate" in duplicated
