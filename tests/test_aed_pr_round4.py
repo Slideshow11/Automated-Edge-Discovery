@@ -2750,344 +2750,320 @@ class TestRound8CodexOnlyAutoResolution:
 # ---------------------------------------------------------------------------
 
 
-class TestRound8EmptyChangedFileInventory:
-    """Round-8 follow-up (Codex comment 3609202696 on 1e9867e):
+class TestRound11PaginatedChangedFileInventory:
+    """Round-11 follow-up (Codex comment 3610828220 on ``83e3f24``):
 
-    fetch_changed_files returns ok=True ONLY when at least one
-    valid path was extracted. An empty / malformed inventory is a
-    fetch failure that fails closed.
+    fetch_changed_files uses the paginated REST
+    ``/repos/<owner>/<repo>/pulls/<n>/files`` endpoint so
+    PRs with more than 100 changed files return a complete
+    inventory. The function rejects empty, malformed,
+    duplicate and count-mismatched evidence as fail-closed.
     """
 
-    def _patch_json_or_none(self, payload):
-        return mock.patch.object(
-            ctrl, "_run_json_or_none",
-            side_effect=lambda cmd, **kw: (True, payload, ""),
-        )
+    @staticmethod
+    def _pages(paths):
+        # Split ``paths`` into a single paginated slurped
+        # payload (one outer list with one inner page).
+        page = [{"filename": p} for p in paths]
+        return [page]
 
-    def test_normal_nonempty_dedicated_inventory_succeeds(self):
-        payload = {
-            "files": [
-                {"path": "scripts/local/aed_pr.py"},
-                {"path": "tests/test_aed_pr.py"},
-            ]
-        }
-        with self._patch_json_or_none(payload):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411
+    @staticmethod
+    def _runner(payload):
+        def runner(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
             )
-        assert ok is True
-        assert paths == [
-            "scripts/local/aed_pr.py", "tests/test_aed_pr.py"
+        return runner
+
+    def test_normal_nonempty_paginated_inventory_succeeds(self):
+        paths = [
+            "scripts/local/aed_pr.py",
+            "tests/test_aed_pr.py",
         ]
+        runner = self._runner(self._pages(paths))
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": len(paths)},
+            runner=runner,
+        )
+        assert ok is True
+        assert out == paths
         assert err == ""
 
-    def test_empty_dedicated_list_plus_valid_fallback_succeeds(self):
-        # Dedicated list is empty; the fallback (pr_view['files'])
-        # supplies valid paths.
-        with self._patch_json_or_none({"files": []}):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411,
-                pr_view={
-                    "files": [
-                        {"path": "scripts/local/aed_pr.py"},
-                    ]
-                },
+    def test_paginated_payload_uses_correct_argv(self):
+        paths = ["scripts/local/aed_pr.py"]
+        captured = []
+        def runner(cmd, *a, **kw):
+            captured.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(self._pages(paths)),
+                stderr="",
             )
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": len(paths)},
+            runner=runner,
+        )
         assert ok is True
-        assert paths == ["scripts/local/aed_pr.py"]
+        argv = captured[0]
+        assert argv[:3] == ["gh", "api", "graphql" + ""] or argv[:2] == ["gh", "api"]
+        assert "repos/owner/repo/pulls/411/files?per_page=100" in argv
+        assert "--paginate" in argv
+        assert "--slurp" in argv
+
+    def test_empty_paginated_inventory_fails(self):
+        runner = self._runner([[]])
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert out == []
+        assert err == "empty_changed_file_inventory"
+
+    def test_malformed_paginated_payload_fails(self):
+        # Not a list at the top level.
+        runner = self._runner({})
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("changed_file_inventory_fetch_failed")
+
+    def test_malformed_page_fails(self):
+        # ``pages[0]`` is a dict, not a list.
+        runner = self._runner([{"not": "a list"}])
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("malformed_changed_file_inventory")
+
+    def test_malformed_record_fails(self):
+        # ``pages[0][0]`` is a string, not a dict.
+        runner = self._runner([["not-a-dict"]])
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("malformed_changed_file_inventory")
+
+    def test_missing_filename_fails(self):
+        # Record has no ``filename``.
+        runner = self._runner([[{"raw_url": "x"}]])
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("malformed_changed_file_inventory")
+
+    def test_empty_filename_fails(self):
+        runner = self._runner([[{"filename": ""}]])
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("malformed_changed_file_inventory")
+
+    def test_duplicate_filename_fails(self):
+        # Same filename appears twice.
+        runner = self._runner(self._pages([
+            "scripts/local/aed_pr.py",
+            "scripts/local/aed_pr.py",
+        ]))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 2},
+            runner=runner,
+        )
+        assert ok is False
+        assert "duplicate" in err.lower()
+
+    def test_changed_files_count_mismatch_blocks(self):
+        # ``changedFiles`` says 100, paginated returns only 2.
+        paths = ["a.py", "b.py"]
+        runner = self._runner(self._pages(paths))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 100},
+            runner=runner,
+        )
+        assert ok is False
+        assert "changed_file_count_mismatch" in err
+
+    def test_missing_changed_files_count_fails(self):
+        paths = ["a.py"]
+        runner = self._runner(self._pages(paths))
+        # No ``changedFiles`` key in pr_view at all.
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"state": "OPEN"},
+            runner=runner,
+        )
+        assert ok is False
+        assert err == "missing_changed_file_count"
+
+    def test_zero_changed_files_count_fails(self):
+        paths = ["a.py"]
+        runner = self._runner(self._pages(paths))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 0},
+            runner=runner,
+        )
+        assert ok is False
+        assert err == "missing_changed_file_count"
+
+    def test_non_integer_changed_files_count_fails(self):
+        paths = ["a.py"]
+        runner = self._runner(self._pages(paths))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": "100"},
+            runner=runner,
+        )
+        assert ok is False
+        assert err == "missing_changed_file_count"
+
+    def test_missing_pr_view_fails(self):
+        paths = ["a.py"]
+        runner = self._runner(self._pages(paths))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view=None,
+            runner=runner,
+        )
+        assert ok is False
+        assert err == "missing_changed_file_count"
+
+    def test_paginated_inventory_succeeds_with_count_match(self):
+        paths = [
+            "scripts/local/aed_pr.py",
+            "scripts/local/aed_pr_readiness.py",
+            "tests/test_aed_pr.py",
+        ]
+        runner = self._runner(self._pages(paths))
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 3},
+            runner=runner,
+        )
+        assert ok is True
+        assert out == paths
         assert err == ""
 
-    def test_all_malformed_dedicated_list_plus_valid_fallback_succeeds(self):
-        with self._patch_json_or_none({
-            "files": [
-                {"no_path": True},
-                "not-a-dict",
-                {"path": ""},
-                {"path": None},
-            ]
-        }):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411,
-                pr_view={
-                    "files": [
-                        {"path": "scripts/local/aed_pr.py"},
-                    ]
-                },
+    def test_runner_nonzero_exit_fails(self):
+        def runner(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=1,
+                stdout="",
+                stderr="rate limit",
             )
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("changed_file_inventory_fetch_failed")
+
+    def test_runner_timeout_fails(self):
+        def runner(cmd, *a, **kw):
+            raise subprocess.TimeoutExpired(cmd, 120)
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("changed_file_inventory_fetch_failed")
+
+    def test_runner_invalid_json_fails(self):
+        def runner(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout="not json",
+                stderr="",
+            )
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert err.startswith("changed_file_inventory_fetch_failed")
+
+    def test_multiple_pages_count_match_succeeds(self):
+        # Two pages each with 2 records; ``changedFiles`` = 4.
+        runner = self._runner([
+            [{"filename": "a.py"}, {"filename": "b.py"}],
+            [{"filename": "c.py"}, {"filename": "d.py"}],
+        ])
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 4},
+            runner=runner,
+        )
         assert ok is True
-        assert paths == ["scripts/local/aed_pr.py"]
-
-    def test_empty_dedicated_and_empty_fallback_fail(self):
-        with self._patch_json_or_none({"files": []}):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411,
-                pr_view={"files": []},
-            )
-        assert ok is False
-        assert paths == []
-        assert err == "empty_changed_file_inventory"
-
-    def test_all_malformed_dedicated_and_missing_fallback_fail(self):
-        with self._patch_json_or_none({
-            "files": [
-                {"no_path": True},
-                {"path": ""},
-            ]
-        }):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411,
-                pr_view={},
-            )
-        assert ok is False
-        assert paths == []
-        assert err == "empty_changed_file_inventory"
-
-    def test_successful_command_with_no_valid_paths_fails_closed(self):
-        # The dedicated call succeeded but every ``path`` slot is
-        # empty/missing - the controller MUST NOT report ok=True.
-        with self._patch_json_or_none({
-            "files": [
-                {"path": ""},
-                {"no_path": True},
-            ]
-        }):
-            ok, paths, err = ctrl.fetch_changed_files("owner/repo", 411)
-        assert ok is False
-        assert paths == []
-        assert err == "empty_changed_file_inventory"
-
-    def test_build_evidence_reports_changed_files_missing(self):
-        # When ``fetch_changed_files`` reports ok=False with the
-        # empty-inventory marker, ``build_evidence`` must treat
-        # the evidence as missing. The function itself returns
-        # ``(False, [], "empty_changed_file_inventory")``; the
-        # caller (``build_evidence``) propagates that into
-        # ``changed_files_fetched=False``.
-        with self._patch_json_or_none({"files": []}):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411, pr_view={"files": []},
-            )
-        assert ok is False
-        assert err == "empty_changed_file_inventory"
-
-    def test_no_allowed_scope_can_make_empty_inventory_pass(self):
-        # Even with an explicit allowed scope, an empty inventory
-        # must not pass the scope gate. We verify the inventory is
-        # rejected at fetch time; build_evidence propagates
-        # ``changed_files_fetched=False`` and the scope check
-        # fails closed.
-        with self._patch_json_or_none({"files": []}):
-            ok, paths, err = ctrl.fetch_changed_files(
-                "owner/repo", 411, pr_view={"files": []},
-            )
-        assert ok is False
-        assert paths == []
-        # build_evidence would set changed_files_fetched=False
-        # and the scope gate would fail closed with
-        # ``changed_files_not_fetched``.
-        assert err == "empty_changed_file_inventory"
+        assert out == ["a.py", "b.py", "c.py", "d.py"]
 
 
-# ---------------------------------------------------------------------------
-# Round-8 follow-up: dispatch timestamp precision skew
-# ---------------------------------------------------------------------------
+class TestRound11ReviewCommentGatePullRequestGuard:
+    """Round-11 follow-up (Codex comment 3610828222 on ``83e3f24``):
 
-
-class TestRound8DispatchPrecisionSkew:
-    """Round-8 follow-up (Codex comment 3609202698 on 1e9867e):
-
-    GitHub Actions ``createdAt`` is whole-second; ``dispatched_at``
-    has fractional seconds. The runner must floor ``dispatched_at``
-    to whole-second precision before comparing so a dispatch at
-    12:00:00.900000Z against a run at 12:00:00Z is accepted. Runs
-    from an earlier second are still rejected.
+    the ``review-comment-gate`` job must skip on
+    ``push`` triggers. The other ordinary jobs continue
+    to run on push as before.
     """
 
-    def _run(self, *, created_at, dispatched_at):
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 1, "event": "workflow_dispatch",
-                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
-                    "headSha": DEFAULT_HEAD,
-                    "createdAt": created_at,
-                    "status": "completed", "conclusion": "success",
-                    "url": "https://example/runs/1",
-                    "workflowName": "CI",
-                }]),
-                stderr="",
+    def _load_workflow(self):
+        import yaml
+        path = (
+            Path(__file__).resolve().parent.parent
+            / ".github" / "workflows" / "ci.yml"
+        )
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def test_review_comment_gate_has_pull_request_guard(self):
+        wf = self._load_workflow()
+        job = wf["jobs"]["review-comment-gate"]
+        assert "if" in job, (
+            "review-comment-gate must carry a pull_request "
+            "guard so the script does not exit 2 on push"
+        )
+        guard = job["if"]
+        assert "github.event_name == 'pull_request'" in guard, (
+            f"review-comment-gate guard is wrong: {guard!r}"
+        )
+
+    def test_other_ordinary_jobs_unchanged(self):
+        # The four ordinary jobs must still run on push.
+        wf = self._load_workflow()
+        jobs = wf["jobs"]
+        for name in ("test", "validator",
+                     "governance-validators", "pr-gate-live-smoke"):
+            guard = jobs[name].get("if", "")
+            # The round-9 gate-only guard was already removed
+            # in round-10; that absence is still required.
+            assert "inputs.gate" not in guard, (
+                f"job {name!r} must not carry a gate-input "
+                f"guard; the gate-dispatch route was removed"
             )
-        return ctrl._find_dispatch_run(
-            "owner/repo", "ci.yml",
-            head_sha=DEFAULT_HEAD,
-            head_branch="reduction/pr-lifecycle-collapse-v1",
-            pr_number=411,
-            dispatched_at=dispatched_at,
-            list_runner=fake_list,
-        )
 
-    def test_fractional_dispatch_at_accepts_whole_second_run(self):
-        run, err = self._run(
-            created_at="2026-07-18T12:00:00Z",
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
-            ),
-        )
-        assert err == ""
-        assert run is not None
-        assert run["databaseId"] == 1
-
-    def test_run_before_dispatch_second_rejected(self):
-        run, err = self._run(
-            created_at="2026-07-18T11:59:59Z",
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
-            ),
-        )
-        assert run is None
-        assert err
-
-    def test_run_after_dispatch_second_accepted(self):
-        run, err = self._run(
-            created_at="2026-07-18T12:00:05Z",
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
-            ),
-        )
-        assert err == ""
-        assert run is not None
-
-    def test_malformed_createdAt_rejected(self):
-        run, err = self._run(
-            created_at="not-a-timestamp",
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, 0, tzinfo=dt.timezone.utc
-            ),
-        )
-        assert run is None
-        assert err
-
-    def test_wrong_branch_rejected(self):
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 2, "event": "workflow_dispatch",
-                    "headBranch": "main",
-                    "headSha": DEFAULT_HEAD,
-                    "createdAt": "2026-07-18T12:00:00Z",
-                    "status": "completed", "conclusion": "success",
-                    "url": "https://example/runs/2",
-                    "workflowName": "CI",
-                }]),
-                stderr="",
-            )
-        run, err = ctrl._find_dispatch_run(
-            "owner/repo", "ci.yml",
-            head_sha=DEFAULT_HEAD,
-            head_branch="reduction/pr-lifecycle-collapse-v1",
-            pr_number=411,
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
-            ),
-            list_runner=fake_list,
-        )
-        assert run is None
-        assert err
-
-    def test_wrong_sha_rejected(self):
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 3, "event": "workflow_dispatch",
-                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
-                    "headSha": "f" * 40,
-                    "createdAt": "2026-07-18T12:00:00Z",
-                    "status": "completed", "conclusion": "success",
-                    "url": "https://example/runs/3",
-                    "workflowName": "CI",
-                }]),
-                stderr="",
-            )
-        run, err = ctrl._find_dispatch_run(
-            "owner/repo", "ci.yml",
-            head_sha=DEFAULT_HEAD,
-            head_branch="reduction/pr-lifecycle-collapse-v1",
-            pr_number=411,
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
-            ),
-            list_runner=fake_list,
-        )
-        assert run is None
-        assert err
-
-    def test_wrong_workflow_name_rejected(self):
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 4, "event": "workflow_dispatch",
-                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
-                    "headSha": DEFAULT_HEAD,
-                    "createdAt": "2026-07-18T12:00:00Z",
-                    "status": "completed", "conclusion": "success",
-                    "url": "https://example/runs/4",
-                    "workflowName": "OTHER",
-                }]),
-                stderr="",
-            )
-        run, err = ctrl._find_dispatch_run(
-            "owner/repo", "ci.yml",
-            head_sha=DEFAULT_HEAD,
-            head_branch="reduction/pr-lifecycle-collapse-v1",
-            pr_number=411,
-            dispatched_at=dt.datetime(
-                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
-            ),
-            list_runner=fake_list,
-        )
-        assert run is None
-        assert err
-
-    def test_discovery_polling_remains_intact(self):
-        # ``_wait_for_dispatch_run`` continues to work with the new
-        # whole-second boundary; the run is found on the first
-        # poll.
-        state = {"count": 0}
-        def fake_list(cmd, *a, **kw):
-            state["count"] += 1
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 7, "event": "workflow_dispatch",
-                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
-                    "headSha": DEFAULT_HEAD,
-                    "createdAt": "2026-07-18T12:00:00Z",
-                    "status": "completed", "conclusion": "success",
-                    "url": "https://example/runs/7",
-                    "workflowName": "CI",
-                }]),
-                stderr="",
-            )
-        dispatched_at = dt.datetime(
-            2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
-        )
-        run, err = ctrl._wait_for_dispatch_run(
-            "owner/repo", "ci.yml",
-            head_sha=DEFAULT_HEAD,
-            head_branch="reduction/pr-lifecycle-collapse-v1",
-            pr_number=411,
-            dispatched_at=dispatched_at,
-            timeout_seconds=10,
-            poll_seconds=1,
-            list_runner=fake_list,
-        )
-        assert err == ""
-        assert run is not None
-        assert run["databaseId"] == 7
 
 
 # ---------------------------------------------------------------------------

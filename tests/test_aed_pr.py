@@ -813,6 +813,17 @@ class TestControllerMergeInProcess:
                     "files": [{"path": "scripts/local/aed_pr.py"}],
                 }
                 return mock.Mock(returncode=0, stdout=json.dumps(payload), stderr="")
+            # Round-11 follow-up: paginated REST endpoint for
+            # changed files.
+            if cmd[:2] == ["gh", "api"] and "/files" in cmd_str:
+                # Slurped pages format: one outer list with one
+                # inner page of file records.
+                pages = [[{"filename": "scripts/local/aed_pr.py"}]]
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pages),
+                    stderr="",
+                )
             # Round-2 fix: gh pr checks (check names, not workflow names).
             if cmd[:3] == ["gh", "pr", "checks"]:
                 return mock.Mock(returncode=0, stdout=json.dumps([

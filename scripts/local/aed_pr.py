@@ -185,67 +185,226 @@ def _extract_valid_paths(files: Any) -> List[str]:
     Round-8 follow-up (Codex comment 3609202696 on ``1e9867e``):
     helper used to detect empty / malformed inventories; an empty
     result signals fetch failure, not a clean inventory.
+
+    Round-11 follow-up (Codex comment 3610828220 on ``83e3f24``):
+    also reject duplicate filenames as ambiguous evidence; a
+    PR's REST files endpoint can return duplicate paths if
+    a file is touched more than once.
     """
     if not isinstance(files, list):
         return []
     out: List[str] = []
+    seen = set()
     for f in files:
         if not isinstance(f, dict):
             continue
         path = f.get("path")
         if isinstance(path, str) and path:
+            if path in seen:
+                # Duplicate paths in the source are ambiguous
+                # evidence; treat as malformed so the
+                # controller fails closed rather than masking
+                # out-of-scope changes.
+                raise ValueError(
+                    f"duplicate changed-file path {path!r} in "
+                    f"inventory; refusing to treat the source as "
+                    f"authoritative scope evidence"
+                )
+            seen.add(path)
             out.append(path)
     return out
 
 
-def fetch_changed_files(
-    repo: str, pr_number: int, pr_view: Optional[Dict[str, Any]] = None
-) -> Tuple[bool, List[str], str]:
-    """Fetch the actual changed file paths for the PR.
+def _extract_paginated_filenames(
+    pages: Any,
+) -> List[str]:
+    """Extract ``filename`` (REST) paths from a slurped paginated
+    payload.
 
-    Returns (ok, paths, error). When ok=False the controller must
-    treat the evidence as missing; it must NEVER treat an empty
-    list as clean=True (a PR with zero changed files is
+    Round-11 helper: ``gh api /repos/<owner>/<repo>/pulls/<n>/files``
+    returns the REST ``filename`` field (not ``path``). The
+    ``--paginate --slurp`` flag wraps each page in an outer
+    list, so the slurped payload is ``[page1, page2, ...]`` where
+    each ``page`` is a list of file records.
+
+    Returns the deduplicated list of nonempty filenames. Raises
+    ``ValueError`` on:
+
+    - malformed page (not a list of file records);
+    - file record not a dict;
+    - missing or empty ``filename``;
+    - duplicate filenames in the paginated inventory.
+    """
+    if not isinstance(pages, list):
+        raise ValueError(
+            f"paginated payload is not a list: {type(pages).__name__}"
+        )
+    out: List[str] = []
+    seen = set()
+    for page_idx, page in enumerate(pages):
+        if not isinstance(page, list):
+            raise ValueError(
+                f"page {page_idx} is not a list: {type(page).__name__}"
+            )
+        for rec_idx, rec in enumerate(page):
+            if not isinstance(rec, dict):
+                raise ValueError(
+                    f"page {page_idx} record {rec_idx} is not a "
+                    f"dict: {type(rec).__name__}"
+                )
+            fn = rec.get("filename")
+            if not isinstance(fn, str) or not fn:
+                raise ValueError(
+                    f"page {page_idx} record {rec_idx} has no "
+                    f"nonempty ``filename``"
+                )
+            if fn in seen:
+                raise ValueError(
+                    f"duplicate paginated filename {fn!r}; "
+                    f"refusing to treat the inventory as authoritative"
+                )
+            seen.add(fn)
+            out.append(fn)
+    return out
+
+
+def fetch_changed_files(
+    repo: str, pr_number: int, pr_view: Optional[Dict[str, Any]] = None,
+    *,
+    runner: Optional[Any] = None,
+) -> Tuple[bool, List[str], str]:
+    """Fetch the complete changed file paths for the PR.
+
+    Returns (ok, paths, error). When ok=False the controller
+    must treat the evidence as missing; it must NEVER treat an
+    empty list as clean=True (a PR with zero changed files is
     impossible, and an empty result here is a fetch failure).
 
     Round-8 follow-up (Codex comment 3609202696): the dedicated
     ``gh pr view --json files`` call may succeed but return an
-    empty list, a list of entries with no valid ``path`` strings,
-    or a malformed payload from which no valid paths can be
-    extracted. The previous implementation treated any of these
-    as ``ok=True, paths=[]``, allowing the scope gate to pass
-    against an empty inventory. The current implementation:
+    empty list, a list of entries with no valid ``path``
+    strings, or a malformed payload from which no valid paths
+    can be extracted. The current implementation rejects all
+    of these and falls through to the paginated REST endpoint.
 
-    1. Prefers the dedicated files query.
-    2. Accepts that result ONLY when at least one valid
-       nonempty path was extracted.
-    3. Falls back to the inline ``files`` field on the broader
-       pr_view payload when the dedicated result is empty or
-       malformed.
-    4. Accepts the fallback ONLY when at least one valid path
-       was extracted.
-    5. When neither source supplies a valid path, returns
-       ``(False, [], "empty_changed_file_inventory")`` so
-       ``build_evidence`` sets ``changed_files_fetched=False``
-       and the scope gate fails closed.
+    Round-11 follow-up (Codex comment 3610828220): the
+    ``gh pr view --json files`` inventory is capped at 100
+    entries, so a PR with more than 100 changed files would
+    produce a partial inventory. The controller now uses the
+    paginated ``/repos/<owner>/<repo>/pulls/<n>/files``
+    REST endpoint via ``gh api --paginate --slurp``. The
+    function also requires:
+
+    - ``changedFiles`` to be an integer greater than zero;
+    - the unique paginated filenames to exactly equal
+      ``changedFiles`` in count;
+    - duplicate filenames to be rejected as ambiguous
+      evidence;
+    - malformed pages or records to fail closed;
+    - the capped ``gh pr view --json files`` field NOT to be
+      used as authoritative fallback.
+
+    Distinct failure reasons:
+
+    - ``changed_file_inventory_fetch_failed`` — the paginated
+      call could not be completed;
+    - ``malformed_changed_file_inventory`` — pages or records
+      were malformed, or a filename was missing/empty;
+    - ``empty_changed_file_inventory`` — zero unique
+      filenames after a successful fetch;
+    - ``duplicate_changed_file_paths`` — same filename
+      appeared more than once across the paginated inventory;
+    - ``missing_changed_file_count`` — the PR's
+      ``changedFiles`` field is missing, zero, or not an
+      integer;
+    - ``changed_file_count_mismatch`` — the number of unique
+      paginated filenames does not match ``changedFiles``.
     """
-    # 1. Dedicated ``gh pr view --json files`` call.
-    cmd = ["gh", "pr", "view", str(pr_number), "--repo", repo,
-           "--json", "files"]
-    ok, payload, err = _run_json_or_none(cmd)
-    if ok and isinstance(payload, dict):
-        paths = _extract_valid_paths(payload.get("files"))
-        if paths:
-            return True, paths, ""
-    # 2. Fallback to the inline ``files`` field on the broader
-    # ``pr_view`` payload. Used when the dedicated call succeeded
-    # but returned no valid paths, OR when the dedicated call
-    # itself failed.
+    # 1. Pull the PR's reported ``changedFiles`` count from
+    # ``pr_view`` so we can verify the paginated count later.
+    expected_count: Optional[int] = None
     if isinstance(pr_view, dict):
-        paths = _extract_valid_paths(pr_view.get("files"))
-        if paths:
-            return True, paths, ""
-    return False, [], err or "empty_changed_file_inventory"
+        raw_count = pr_view.get("changedFiles")
+        if isinstance(raw_count, int) and raw_count > 0:
+            expected_count = raw_count
+        elif "changedFiles" in pr_view:
+            # The field was present but malformed. Refuse
+            # immediately so a partial inventory cannot be
+            # accepted under a missing count.
+            return (
+                False, [],
+                "missing_changed_file_count",
+            )
+    else:
+        return (
+            False, [],
+            "missing_changed_file_count",
+        )
+
+    # 3. Paginated REST endpoint with explicit
+    # ``per_page=100`` and ``--paginate --slurp``.
+    cmd = [
+        "gh", "api",
+        f"repos/{repo}/pulls/{pr_number}/files?per_page=100",
+        "--paginate", "--slurp",
+    ]
+    if runner is None:
+        ok, payload, err = _run_json_or_none(cmd, timeout=120)
+    else:
+        try:
+            proc = runner(
+                cmd, capture_output=True, text=True, timeout=120
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return (
+                False, [],
+                f"changed_file_inventory_fetch_failed: {exc}",
+            )
+        if proc.returncode != 0:
+            return (
+                False, [],
+                f"changed_file_inventory_fetch_failed: "
+                f"{(proc.stderr or '').strip()[:300]}",
+            )
+        try:
+            payload = json.loads(proc.stdout or "")
+            ok = True
+            err = ""
+        except json.JSONDecodeError as exc:
+            return (
+                False, [],
+                f"changed_file_inventory_fetch_failed: {exc}",
+            )
+    if not ok or not isinstance(payload, list):
+        return (
+            False, [],
+            f"changed_file_inventory_fetch_failed: {err or ''}",
+        )
+
+    # 4. Extract filenames from the slurped pages.
+    try:
+        paths = _extract_paginated_filenames(payload)
+    except ValueError as exc:
+        return False, [], f"malformed_changed_file_inventory: {exc}"
+
+    # 5. Empty inventory after a successful fetch is impossible.
+    if not paths:
+        return False, [], "empty_changed_file_inventory"
+
+    # 6. The unique paginated count must match the PR's
+    # reported ``changedFiles`` count. Any mismatch is a
+    # partial inventory that the controller must not accept
+    # as authoritative scope evidence.
+    if expected_count is None:
+        return False, [], "missing_changed_file_count"
+    if len(paths) != expected_count:
+        return (
+            False, [],
+            f"changed_file_count_mismatch: paginated={len(paths)} "
+            f"changedFiles={expected_count}",
+        )
+
+    return True, paths, ""
 
 
 def fetch_ci_conclusions(

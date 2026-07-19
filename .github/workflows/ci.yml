@@ -124,6 +124,15 @@ jobs:
     # counts as success; the underlying script exits with the
     # correct code (0/1/2) and the step is failed when the script
     # returns non-zero.
+    #
+    # Round-11 follow-up (Codex comment 3610828222 on
+    # ``83e3f24``): the gate reads ``github.event.pull_request.*``
+    # directly. On ``push`` triggers those fields are empty,
+    # so the script exits 2 (INCONCLUSIVE) and the gate would
+    # spuriously fail the workflow. The ``if:`` guard below
+    # skips the gate on non-pull_request events; the other
+    # ordinary jobs continue to run on push as before.
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
