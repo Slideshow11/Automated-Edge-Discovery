@@ -795,12 +795,40 @@ def is_eligible_for_bot_resolution(
         return False, "actor_not_codex"
 
     # Condition 2: every comment in the thread must be bot-authored.
-    comments = thread.get("comments") or thread.get("comment_list") or []
-    if not isinstance(comments, list):
-        # If the inventory does not contain a comment list, we cannot
-        # prove condition 2. Refuse to be eligible.
+    # Round-14 follow-up (Codex comment ``PRRT_kwDOSHFpYM6SGhXY``
+    # on ``2acdb1c``): the previous implementation used
+    # ``thread.get("comments") or thread.get("comment_list") or []``
+    # which collapses missing AND empty AND empty-after-fallback
+    # into the same empty list. The loop then iterated over zero
+    # entries and reported "every comment is a recognized bot"
+    # WITHOUT proving who actually participated.
+    #
+    # The new contract:
+    #
+    # - at least one of ``comments`` / ``comment_list`` MUST exist;
+    # - the selected value MUST be a ``list``;
+    # - the list MUST be nonempty;
+    # - every entry MUST be a ``dict``;
+    # - every entry MUST carry a known author identity;
+    # - every participant MUST be a recognized bot.
+    #
+    # Any missing, empty, or malformed inventory blocks with
+    # ``unknown_actor_in_thread`` so the controller cannot
+    # accidentally treat a thread with no participants as
+    # eligible.
+    if "comments" in thread:
+        raw_comments = thread["comments"]
+    elif "comment_list" in thread:
+        raw_comments = thread["comment_list"]
+    else:
         return False, "unknown_actor_in_thread"
-    for c in comments:
+    if raw_comments is None:
+        return False, "unknown_actor_in_thread"
+    if not isinstance(raw_comments, list):
+        return False, "unknown_actor_in_thread"
+    if len(raw_comments) == 0:
+        return False, "unknown_actor_in_thread"
+    for c in raw_comments:
         if not isinstance(c, dict):
             return False, "unknown_actor_in_thread"
         author = c.get("author") or c.get("author_login") or c.get("user")

@@ -672,92 +672,93 @@ def fetch_ci_conclusions(
     *,
     runner: Optional[Any] = None,
     head_sha: Optional[str] = None,
+    head_branch: Optional[str] = None,
 ) -> Tuple[
     bool, Dict[str, str], List[str], List[str], List[str],
     List[str], str,
 ]:
     """Fetch CI check conclusions for the current PR head.
 
-    Uses ``gh pr checks --json name,state,workflow`` so the result
-    contains actual check (job) names, not workflow names. This is
-    the round-2 Codex fix: the prior implementation indexed ``gh run
-    list --json workflowName`` by workflow name, which mapped a
-    single workflow named ``CI`` to four required job names and
-    therefore always reported every required check as missing.
+    Uses ``gh pr checks --json name,state,workflow`` for
+    diagnostics only. The authoritative source of
+    required-check evidence is the unique exact-head
+    ``pull_request`` CI run's job inventory; ``gh pr checks``
+    records are NEVER trusted directly for required checks
+    when a canonical ``head_sha`` AND ``head_branch`` are
+    supplied.
+
+    Round-2 Codex fix: the prior implementation indexed
+    ``gh run list --json workflowName`` by workflow name,
+    which mapped a single workflow named ``CI`` to four
+    required job names and therefore always reported every
+    required check as missing. The current implementation
+    uses the per-job name from ``gh run view --json jobs``.
 
     Round-6 follow-up (Codex comment ``3609075636`` on
-    ``c229be82``): ``gh pr checks`` can emit duplicate names from
-    old/new SHA runs after a force-push or a re-run. The previous
-    implementation used ``by_name.setdefault(name, check)`` which
-    silently kept whichever duplicate appeared first in the list;
-    if the first duplicate was an old successful required check
-    and the current-head check was pending or failed, the CI gate
-    could pass on stale evidence. The current implementation
-    fails closed whenever a *required* check name appears more
-    than once.
+    ``c229be82``): the round-6 logic refused to silently
+    collapse duplicate ``gh pr checks`` records.
 
     Round-12 follow-up (Codex comment ``3610952756`` on
-    ``48e1a33``): the round-11 ``if: github.event_name ==
-    'pull_request'`` guard on ``review-comment-gate`` causes the
-    gate to be skipped on push events. ``gh pr checks`` reports
-    that skipped job as ``SUCCESS`` on the same head SHA, so a
-    PR branch matching a push pattern (``feat/*``,
-    ``fix/*``) ends up with TWO records for the same required
-    check name:
+    ``48e1a33``): with the round-11
+    ``if: github.event_name == 'pull_request'`` guard on
+    ``review-comment-gate``, the gate is skipped on push
+    events; ``gh pr checks`` reports that skipped job as
+    ``SUCCESS``. The round-12 code began preferring the
+    authoritative ``pull_request`` run's job evidence when
+    a duplicate existed.
 
-    - the push-triggered run's skipped success (not
-      authoritative), and
-    - the exact-head ``pull_request`` run's actual result
-      (authoritative).
+    Round-14 follow-up (Codex comment ``PRRT_kwDOSHFpYM6SGhXX``
+    on ``2acdb1c``): the round-12 lookup was triggered ONLY
+    when ``gh pr checks`` already contained a duplicate. The
+    current implementation removes that trigger condition:
 
-    The round-6 duplicate-detection logic would block this as
-    ambiguous evidence. The current implementation:
-
-    1. Identifies the exact-head ``pull_request`` CI run via
-       ``gh run list --workflow ci.yml --event pull_request
-       --commit <head_sha>`` (when ``head_sha`` is supplied).
-    2. Reads that run's jobs via ``gh run view --json jobs``.
-    3. For each duplicated required-check name, prefers
-       the authoritative job evidence from the exact-head
-       pull_request run.
-    4. Falls back to the existing duplicate-fails-closed
-       path when the authoritative run cannot be identified
-       or when the duplicate is from another PR-run
-       (genuinely ambiguous).
-
-    Other guarantees preserved:
-
-    - the merge path never trusts stale, rerun, or unrelated
-      workflow evidence;
-    - non-``pull_request`` duplicate events (e.g.
-      ``workflow_run`` or ``workflow_dispatch``) do not
-      bypass the round-6 protection;
-    - when ``head_sha`` is not supplied, the round-6
-      duplicate-fails-closed behavior is preserved
-      unchanged.
+    1. When ``head_sha`` is canonical AND ``head_branch``
+       is supplied, the controller always identifies the
+       exact-head ``pull_request`` CI run via
+       ``_find_exact_head_pull_request_run_id``.
+    2. The authoritative run's job inventory supplies every
+       required-check evidence. Push-triggered records in
+       ``gh pr checks`` are NEVER used as authoritative.
+    3. Failure modes:
+       - missing exact-head ``pull_request`` run → all
+         required checks reported as ``missing`` (the
+         authoritative source is not available);
+       - multiple matching exact-head ``pull_request``
+         runs → every required check reported as
+         ``missing`` and the run ID is recorded in the
+         structured diagnostic;
+       - malformed authoritative run / missing /
+         duplicate / malformed authoritative jobs → the
+         affected required check is reported as
+         ``failed`` with a structured reason.
+    4. When ``head_sha`` is not supplied, the previous
+       generic duplicate-required-check fail-closed
+       behavior is preserved.
 
     Returns ``(ok, conclusions, missing, pending, failed,
     duplicated_required, error)``:
 
-    * ``ok=False`` means the check list could not be fetched; in
-      that case every required check is reported as missing so
-      the gate fails closed.
-    * ``conclusions`` maps each required check name to its state
-      string (``SUCCESS``, ``FAILURE``, ``PENDING``, ...). When
-      a required check has duplicates, ``conclusions`` is not
-      populated for that name (the duplicate is reported under
-      ``duplicated_required`` instead).
-    * ``missing`` lists required check names that did not appear
-      in the payload at all.
-    * ``pending`` lists required check names with an in-flight
-      state (``PENDING``, ``QUEUED``, ``IN_PROGRESS``, ``WAITING``,
-      ``REQUESTED``, ``EXPECTED``).
+    * ``ok=False`` means the ``gh pr checks`` query could
+      not be completed; in that case every required check
+      is reported as missing so the gate fails closed.
+    * ``conclusions`` maps each required check name to its
+      state string (``SUCCESS``, ``FAILURE``, ``PENDING``,
+      ...).
+    * ``missing`` lists required check names that did not
+      appear in the authoritative source at all.
+    * ``pending`` lists required check names with an
+      in-flight state (``PENDING``, ``QUEUED``,
+      ``IN_PROGRESS``, ``WAITING``, ``REQUESTED``,
+      ``EXPECTED``).
     * ``failed`` lists required check names with a terminal
-      non-success state (``FAILURE``, ``CANCELLED``, ``SKIPPED``,
-      ``NEUTRAL``, ``STALE``, ``ERROR``, or any unrecognized state).
-    * ``duplicated_required`` lists required check names that
-      appeared more than once in the payload; the gate treats
-      them as blocking.
+      non-success state (``FAILURE``, ``CANCELLED``,
+      ``SKIPPED``, ``NEUTRAL``, ``STALE``, ``ERROR``, or any
+      unrecognized state).
+    * ``duplicated_required`` lists required check names
+      that appeared more than once in ``gh pr checks`` when
+      the controller falls back to the legacy path; on the
+      authoritative path this is empty because the
+      authoritative run exposes each job exactly once.
     * ``error`` is non-empty only when ``ok=False``.
     """
     ok, payload, err = _fetch_gh_pr_checks_payload(
@@ -767,11 +768,8 @@ def fetch_ci_conclusions(
         missing = list(required_check_names)
         return False, {}, missing, [], missing, [], err
 
-    # Collect every record by name; detect duplicates BEFORE
-    # deciding which one is canonical. ``gh pr checks`` does NOT
-    # surface a head SHA in the payload, so the controller cannot
-    # infer which duplicate belongs to the current head from list
-    # ordering.
+    # Collect every record by name; ``gh pr checks`` is
+    # used for diagnostics only.
     by_name: Dict[str, List[Dict[str, Any]]] = {}
     for check in payload:
         if not isinstance(check, dict):
@@ -789,113 +787,129 @@ def fetch_ci_conclusions(
         and n not in required_check_names
     )
 
-    # Round-12: identify the authoritative exact-head
-    # pull_request run when duplicates are present and
-    # ``head_sha`` was supplied. This lets us ignore the known
-    # push-skipped-success duplicate and accept the real
-    # pull_request result.
     authoritative_jobs: Dict[str, str] = {}
-    authoritative_run_id: Optional[int] = None
-    if (
+    authoritative_status: str = ""
+    authoritative_run: Optional[Dict[str, Any]] = None
+
+    use_authoritative = bool(
         head_sha
+        and head_branch
         and R.is_canonical_head_sha(head_sha)
-        and any(
-            len(by_name.get(n, [])) > 1
-            for n in required_check_names
-        )
-    ):
+    )
+
+    if use_authoritative:
+        # ``head_sha`` and ``head_branch`` are guaranteed
+        # truthy / canonical at this point because
+        # ``use_authoritative`` is True.
+        assert head_sha is not None and head_branch is not None
         authoritative_run = _find_exact_head_pull_request_run_id(
             repo, head_sha, runner=runner,
+            expected_head_branch=head_branch,
         )
         if authoritative_run.get("ok") is True:
             authoritative_jobs_payload = _run_jobs_for_run(
                 repo, authoritative_run["databaseId"],
                 runner=runner,
-                required_job_names=list(
-                    n for n in required_check_names
-                    if len(by_name.get(n, [])) > 1
-                ),
+                required_job_names=list(required_check_names),
             )
             if authoritative_jobs_payload.get("ok") is True:
                 authoritative_jobs = authoritative_jobs_payload["jobs"]
+                authoritative_status = "ok"
             else:
                 # Authoritative run was identified but its
                 # job inventory is malformed / missing /
-                # duplicated. Fall through to the
-                # duplicate-fails-closed path below.
+                # duplicated. Fail closed by leaving
+                # ``authoritative_jobs`` empty AND reporting
+                # the structured reason.
                 authoritative_jobs = {}
+                authoritative_status = authoritative_jobs_payload.get(
+                    "reason", "malformed_authoritative_job"
+                )
         else:
-            # Round-13: the lookup returned a structured
-            # reason (``exact_head_pr_run_missing``,
-            # ``multiple_exact_head_pr_runs``, or
-            # ``malformed_exact_head_pr_run``); in every
-            # case the controller MUST NOT silently fall
-            # back to accepting the ``gh pr checks``
-            # duplicate records. ``authoritative_jobs``
-            # stays empty so the duplicate-fails-closed
-            # path below applies.
-            authoritative_jobs = {}
+            authoritative_status = authoritative_run.get(
+                "reason", "exact_head_pr_run_missing"
+            )
 
-    conclusions: Dict[str, str] = {}
-    missing: List[str] = []
-    pending: List[str] = []
-    failed: List[str] = []
-    duplicated_required: List[str] = []
+    if use_authoritative:
+        # Build the entire required-check inventory from the
+        # authoritative source. ``gh pr checks`` records are
+        # diagnostic only.
+        conclusions: Dict[str, str] = {}
+        missing: List[str] = []
+        pending: List[str] = []
+        failed: List[str] = []
+        if authoritative_status != "ok":
+            # No authoritative inventory available; every
+            # required check is reported as missing AND
+            # failed so the gate fails closed without
+            # trusting any push-run duplicate in
+            # ``gh pr checks``.
+            missing = list(required_check_names)
+            failed = list(required_check_names)
+            duplicated_required: List[str] = []
+            return (
+                True, conclusions, missing, pending, failed,
+                duplicated_required, "",
+            )
+        for name in required_check_names:
+            mapped = authoritative_jobs.get(name)
+            if mapped is None:
+                missing.append(name)
+                failed.append(name)
+                continue
+            conclusions[name] = mapped
+            if mapped == "SUCCESS":
+                continue
+            if mapped in {
+                "PENDING", "QUEUED", "IN_PROGRESS", "WAITING",
+                "REQUESTED", "EXPECTED",
+            }:
+                pending.append(name)
+                continue
+            # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE,
+            # ERROR, or any unrecognized terminal state all
+            # block merge.
+            failed.append(name)
+        # Required-check duplicates in ``gh pr checks`` are
+        # diagnostic only on the authoritative path because
+        # the authoritative source is the single source of
+        # truth. The unrelated-duplicates list still
+        # surfaces so the operator can audit the push
+        # duplicates.
+        duplicated_required: List[str] = []
+        return (
+            True, conclusions, missing, pending, failed,
+            duplicated_required + unrelated_duplicated,
+            "",
+        )
+
+    # No authoritative binding: fall back to the round-6
+    # generic ``gh pr checks`` duplicate-fails-closed path.
+    conclusions = {}
+    missing = []
+    pending = []
+    failed = []
+    duplicated_required = []
     for name in required_check_names:
         records = by_name.get(name) or []
         if not records:
             missing.append(name)
             continue
         if len(records) > 1:
-            # Round-12 follow-up: when the authoritative
-            # pull_request run is identified AND that run
-            # exposes a job with this exact name, prefer
-            # that job's evidence over the duplicate
-            # ``gh pr checks`` records. This is the
-            # "ignore the known push-skipped duplicate"
-            # case.
-            if name in authoritative_jobs:
-                mapped = authoritative_jobs[name]
-                conclusions[name] = mapped
-                if mapped == "SUCCESS":
-                    continue
-                if mapped in {
-                    "PENDING", "QUEUED", "IN_PROGRESS", "WAITING",
-                    "REQUESTED", "EXPECTED",
-                }:
-                    pending.append(name)
-                    continue
-                # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE,
-                # ERROR, or any unrecognized terminal state all
-                # block merge.
-                failed.append(name)
-                continue
-            # Round-6 follow-up: required-check duplicates fail
-            # closed when the authoritative pull_request run
-            # cannot supply a single source of truth. The
-            # ``conclusions`` map is NOT populated for the
-            # duplicated name so downstream code cannot pick a
-            # winner by accident.
             duplicated_required.append(name)
             continue
         check = records[0]
         state = (check.get("state") or "").upper()
         conclusions[name] = state or "UNKNOWN"
-        # Terminal states: SUCCESS passes; everything else blocks merge.
         if state == "SUCCESS":
             continue
         if state in {
-            "PENDING", "QUEUED", "IN_PROGRESS", "WAITING", "REQUESTED",
-            "EXPECTED",
+            "PENDING", "QUEUED", "IN_PROGRESS", "WAITING",
+            "REQUESTED", "EXPECTED",
         }:
             pending.append(name)
             continue
-        # FAILURE, CANCELLED, SKIPPED, NEUTRAL, STALE, ERROR, and any
-        # unrecognized terminal state all count as failed.
         failed.append(name)
-    # Round-6 follow-up: include both required and unrelated
-    # duplicated check names in the structured output. The merge
-    # path reports these as blocking.
     duplicated_required = sorted(set(duplicated_required))
     return (
         True, conclusions, missing, pending, failed,
@@ -2105,6 +2119,7 @@ def build_evidence(
     controller-only path allowlist.)
     """
     head_sha = pr_view.get("headRefOid")
+    head_branch = pr_view.get("headRefName")
 
     # ---- Scope check ---------------------------------------------------------
     # The scope check is allowed ONLY when the operator supplied an
@@ -2139,6 +2154,7 @@ def build_evidence(
     ) = fetch_ci_conclusions(
         repo, int(pr_number), list(REQUIRED_CHECK_NAMES),
         head_sha=str(head_sha) if head_sha else None,
+        head_branch=str(head_branch) if head_branch else None,
     )
     # Round-6 follow-up: required-check duplicates block the gate.
     ci_duplicated_required = (

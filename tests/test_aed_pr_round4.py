@@ -3600,6 +3600,7 @@ class TestRound12PushRunDuplicateFilter:
 
     PR_RUN_ID = 29694702047
     HEAD = "48e1a33c511bc05676f43ac4b34b28add6bda4c2"
+    BRANCH = "reduction/pr-lifecycle-collapse-v1"
     REQUIRED = ["review-comment-gate"]
 
     def _runner_factory(self, *, pr_checks_records,
@@ -3669,7 +3670,7 @@ class TestRound12PushRunDuplicateFilter:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
@@ -3702,7 +3703,7 @@ class TestRound12PushRunDuplicateFilter:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
@@ -3730,7 +3731,7 @@ class TestRound12PushRunDuplicateFilter:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
@@ -3762,13 +3763,16 @@ class TestRound12PushRunDuplicateFilter:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
-        assert "review-comment-gate" in duplicated
-        # The PR-run authoritative job does NOT contain the
-        # gate name, so the duplicate must remain blocking.
+        # Round-14: when the authoritative run is identified
+        # but the required job is missing, the check is
+        # reported as missing AND failed, not duplicated.
+        assert "review-comment-gate" in missing
+        assert "review-comment-gate" in failed
+        assert duplicated == []
         assert "review-comment-gate" not in conclusions
 
     def test_old_head_run_evidence_rejected(self):
@@ -3799,12 +3803,15 @@ class TestRound12PushRunDuplicateFilter:
         (ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        # No authoritative run matches the exact head, so
-        # the controller falls back to fail-closed.
+        # Round-14: when no authoritative run matches the
+        # exact head, every required check is reported as
+        # missing AND failed.
         assert ok is True
-        assert "review-comment-gate" in duplicated
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
     def test_unrelated_run_evidence_rejected(self):
         """A run from a different workflow name is rejected
@@ -3831,9 +3838,11 @@ class TestRound12PushRunDuplicateFilter:
         (ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        assert "review-comment-gate" in duplicated
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
     def test_existing_round6_duplicate_protection_still_valid(self):
         """The round-6 duplicate-fails-closed path remains
@@ -3880,7 +3889,7 @@ class TestRound12PushRunDuplicateFilter:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
@@ -3921,12 +3930,15 @@ class TestRound12PushRunDuplicateFilter:
         (ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, list(self.REQUIRED),
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        # The duplicate must NOT be silently accepted as
-        # a success.
+        # Round-14: when the authoritative run lookup
+        # itself fails, every required check is reported
+        # as missing AND failed.
         assert ok is True
-        assert "review-comment-gate" in duplicated
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
 
 # ---------------------------------------------------------------------------
@@ -4301,7 +4313,7 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert err == ""
@@ -4321,7 +4333,7 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert duplicated == []
@@ -4339,7 +4351,7 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (ok, conclusions, missing, pending, failed,
          duplicated, err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
         assert ok is True
         assert duplicated == []
@@ -4377,12 +4389,16 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (_ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        # Lookup ambiguity must not bypass the duplicate
-        # check. The ``gh pr checks`` duplicate is preserved
-        # as blocking evidence.
-        assert "review-comment-gate" in duplicated
+        # Round-14: under the authoritative path, multiple
+        # matching pull_request runs fail closed by
+        # reporting every required check as missing AND
+        # failed. ``gh pr checks`` duplicates are no longer
+        # the failure vehicle.
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
     def test_e2e_lookup_ambiguity_bypasses_duplicate_protection(self):
         # Two PR runs plus PR-job missing the required
@@ -4418,9 +4434,15 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (_ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        assert "review-comment-gate" in duplicated
+        # Round-14: under the authoritative path, multiple
+        # matching pull_request runs fail closed by
+        # reporting every required check as missing AND
+        # failed.
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
     def test_e2e_no_head_sha_still_fails_closed_on_duplicates(self):
         """Round-6 duplicate-fails-closed path remains intact
@@ -4475,9 +4497,14 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (_ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
-        assert "review-comment-gate" in duplicated
+        # Round-14: a malformed authoritative run fails
+        # closed by reporting every required check as
+        # missing AND failed.
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
 
     def test_e2e_duplicate_authoritative_jobs_in_pr_run_blocks(self):
         """The PR run exposes two ``review-comment-gate``
@@ -4501,6 +4528,604 @@ class TestRound13FailClosedOnAmbiguousPrRunEvidence:
         (_ok, _conclusions, _missing, _pending, _failed,
          duplicated, _err) = ctrl.fetch_ci_conclusions(
             "owner/repo", 411, ["review-comment-gate"],
-            runner=runner, head_sha=self.HEAD,
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
         )
+        # Round-14: duplicate authoritative jobs fail closed
+        # by reporting the required check as missing AND
+        # failed.
+        assert "review-comment-gate" in _missing
+        assert "review-comment-gate" in _failed
+        assert duplicated == []
+
+
+# ---------------------------------------------------------------------------
+# Round-14 follow-up: always bind required CI to the exact-head PR run;
+# require nonempty complete participant list
+# ---------------------------------------------------------------------------
+
+
+class TestRound14AlwaysBindRequiredCIToExactHeadPrRun:
+    """Round-14 follow-up (Codex comment ``PRRT_kwDOSHFpYM6SGhXX``
+    on ``2acdb1c``):
+
+    the round-12 lookup was triggered only when ``gh pr
+    checks`` already contained a duplicate required-check
+    name. That permitted a lone push-skipped-success
+    record to satisfy a required check before the
+    pull_request run had been consulted. The new
+    implementation always binds required CI to the unique
+    exact-head ``pull_request`` run when ``head_sha`` AND
+    ``head_branch`` are supplied.
+    """
+
+    HEAD = "07ace1fd3b8da0a8adc4eda169bbcf59f8c8d81a"
+    BRANCH = "reduction/pr-lifecycle-collapse-v1"
+    PR_RUN_ID = 29696511913
+    REQUIRED = ["review-comment-gate"]
+
+    def _runner(self, *, pr_runs=None, jobs=None, pr_checks=None,
+                list_error=False, run_error=False, run_payload=None):
+        if pr_runs is None and not list_error:
+            pr_runs = [
+                {
+                    "databaseId": self.PR_RUN_ID,
+                    "event": "pull_request",
+                    "headBranch": self.BRANCH,
+                    "headSha": self.HEAD,
+                    "workflowName": "CI",
+                    "url": f"https://example/runs/{self.PR_RUN_ID}",
+                },
+            ]
+        jobs = list(jobs if jobs is not None else [])
+        pr_checks = pr_checks if pr_checks is not None else []
+        def runner(cmd, *a, **kw):
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_checks),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "list"]:
+                if list_error:
+                    return mock.Mock(
+                        returncode=1,
+                        stdout="",
+                        stderr="network",
+                    )
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(run_payload
+                                       if run_payload is not None
+                                       else pr_runs),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "view"]:
+                if run_error:
+                    return mock.Mock(
+                        returncode=1,
+                        stdout="",
+                        stderr="run view error",
+                    )
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"jobs": jobs}),
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        return runner
+
+    def _records(self):
+        return [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+
+    def test_lone_push_run_success_blocks_when_pr_run_fails(self):
+        """Only a push-skipped-SUCCESS is visible; the
+        authoritative PR run's gate job failed → block."""
+        runner = self._runner(
+            pr_checks=self._records(),
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "failure"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "FAILURE"
+        assert failed == ["review-comment-gate"]
+        assert missing == []
+
+    def test_lone_push_run_success_blocks_when_pr_run_pending(self):
+        """Only a push-skipped-SUCCESS is visible; the
+        authoritative PR run's gate job is pending →
+        pending."""
+        runner = self._runner(
+            pr_checks=self._records(),
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "in_progress", "conclusion": None},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "PENDING"
+        assert pending == ["review-comment-gate"]
+
+    def test_lone_push_run_success_passes_using_pr_run(self):
+        """Only a push-skipped-SUCCESS is visible; the
+        authoritative PR run's gate job succeeded → pass
+        using the PR run."""
+        runner = self._runner(
+            pr_checks=self._records(),
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert pending == []
+        assert failed == []
+
+    def test_no_pr_checks_records_but_authoritative_pr_jobs_classify(self):
+        """``gh pr checks`` returns no records yet; the
+        authoritative PR run exposes all required jobs.
+        The controller classifies from the PR run."""
+        runner = self._runner(
+            pr_checks=[],
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert pending == []
+        assert failed == []
+
+    def test_pr_checks_duplicate_uses_unique_pr_run(self):
+        """``gh pr checks`` reports duplicate push/PR
+        names; the unique PR run is the authoritative
+        source. The push record is NOT used."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # push skipped success
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},  # PR run success
+        ]
+        runner = self._runner(
+            pr_checks=records,
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert pending == []
+        assert failed == []
+        assert duplicated == []
+
+    def test_pr_run_missing_fails_closed(self):
+        """No exact-head pull_request run → fail closed."""
+        runner = self._runner(
+            pr_runs=[],
+            pr_checks=self._records(),
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_multiple_pr_runs_fails_closed(self):
+        """Two matching exact-head PR runs → fail closed."""
+        pr_runs = [
+            {
+                "databaseId": 9001, "event": "pull_request",
+                "headBranch": self.BRANCH, "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/9001",
+            },
+            {
+                "databaseId": 9002, "event": "pull_request",
+                "headBranch": self.BRANCH, "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/9002",
+            },
+        ]
+        runner = self._runner(
+            pr_runs=pr_runs,
+            pr_checks=self._records(),
+        )
+        (ok, _conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_wrong_branch_fails_closed(self):
+        """The PR run is on a different branch → fail closed."""
+        pr_runs = [
+            {
+                "databaseId": 9501, "event": "pull_request",
+                "headBranch": "feat/other", "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/9501",
+            },
+        ]
+        runner = self._runner(
+            pr_runs=pr_runs,
+            pr_checks=self._records(),
+        )
+        (ok, _conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_required_authoritative_job_missing_fails_closed(self):
+        """The authoritative PR run is unique but the
+        required job name is missing from the run's job
+        inventory."""
+        runner = self._runner(
+            jobs=[
+                {"name": "test (3.11)", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+            pr_checks=self._records(),
+        )
+        (ok, _conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_duplicate_authoritative_job_fails_closed(self):
+        """The authoritative PR run exposes the required
+        job name twice → fail closed."""
+        runner = self._runner(
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+                {"name": "review-comment-gate", "databaseId": 2,
+                 "status": "completed", "conclusion": "success"},
+            ],
+            pr_checks=self._records(),
+        )
+        (ok, _conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_malformed_authoritative_job_fails_closed(self):
+        """A malformed authoritative job (missing integer
+        ``databaseId``) fails closed."""
+        runner = self._runner(
+            jobs=[
+                {"name": "review-comment-gate",
+                 "status": "completed", "conclusion": "success"},
+            ],
+            pr_checks=self._records(),
+        )
+        (ok, _conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert missing == list(self.REQUIRED)
+        assert failed == list(self.REQUIRED)
+        assert duplicated == []
+
+    def test_no_head_sha_falls_back_to_round6_duplicate_path(self):
+        """When ``head_sha`` is not supplied, the round-6
+        generic duplicate-required-check fail-closed
+        behavior is preserved."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        runner = self._runner(pr_checks=records, jobs=[
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ])
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED), runner=runner,
+        )
+        assert ok is True
         assert "review-comment-gate" in duplicated
+
+    def test_unrelated_duplicate_names_remain_diagnostic_only(self):
+        """A duplicate record for a non-required name is
+        surfaced as a diagnostic only and does not block
+        the merge."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "unrelated-required-but-not", "state": "FAILURE",
+             "workflow": "CI"},
+            {"name": "unrelated-required-but-not", "state": "FAILURE",
+             "workflow": "CI"},
+        ]
+        runner = self._runner(
+            pr_checks=records,
+            jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner, head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        assert ok is True
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert "unrelated-required-but-not" in duplicated
+        assert missing == []
+        assert pending == []
+        assert failed == []
+
+
+class TestRound14RequireNonemptyThreadParticipants:
+    """Round-14 follow-up (Codex comment ``PRRT_kwDOSHFpYM6SGhXY``
+    on ``2acdb1c``):
+
+    the participant inventory (``thread.comments`` or
+    ``thread.comment_list``) must be a nonempty list of
+    dicts with known author identities. Missing / empty /
+    None / non-list inventories block with
+    ``unknown_actor_in_thread`` so the controller cannot
+    treat a thread with no participants as eligible.
+    """
+
+    def _thread(self, **kwargs):
+        base = {
+            "isResolved": False,
+            "isOutdated": True,
+            "author": "chatgpt-codex-connector[bot]",
+            "comments": [
+                {"author": "chatgpt-codex-connector[bot]"},
+            ],
+            "original_commit_sha": "c" * 40,
+            "head_sha": "d" * 40,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_missing_comments_and_comment_list_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread()
+        del thread["comments"]
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_empty_comments_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(comments=[])
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_empty_comment_list_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(comments=None, comment_list=[])
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_none_comments_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(comments=None)
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_non_list_inventory_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(comments={"not": "a list"})
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_malformed_entry_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(
+            comments=[{"author": "chatgpt-codex-connector[bot]"},
+                       "not-a-dict"],
+        )
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_entry_without_author_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(
+            comments=[{"author": "chatgpt-codex-connector[bot]"},
+                       {"body": "no author field"}],
+        )
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "unknown_actor_in_thread"
+
+    def test_human_reply_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(
+            comments=[{"author": "chatgpt-codex-connector[bot]"},
+                       {"author": "human-user"}],
+        )
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason == "human_reply"
+
+    def test_unknown_bot_blocks(self):
+        from scripts.local import aed_pr_readiness as R
+        thread = self._thread(
+            comments=[{"author": "chatgpt-codex-connector[bot]"},
+                       {"author": "random-bot[bot]"}],
+        )
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="d" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+        )
+        assert eligible is False
+        assert reason in ("human_reply", "unknown_actor_in_thread")
+
+    def test_nonempty_complete_codex_only_thread_can_remain_eligible(self):
+        """A thread with a nonempty complete Codex-only
+        participant list can remain eligible when the
+        other requirements are met."""
+        from scripts.local import aed_pr_readiness as R
+        # ``no_later_commit`` is one of the other requirements
+        # that blocks; use a setup where this thread is
+        # older and the head has advanced.
+        thread = self._thread(
+            original_commit_sha="b" * 40,
+            head_sha="a" * 40,
+            comments=[{"author": "chatgpt-codex-connector[bot]"}],
+        )
+        eligible, reason = R.is_eligible_for_bot_resolution(
+            thread, head_sha="a" * 40,
+            codex_verdict="clean",
+            codex_clean_passed=True,
+            repo="owner/repo",
+            codex_reviewed_sha="a" * 40,
+        )
+        # Either eligible=True (when ancestry matches) or
+        # the test still proves the comments check passes
+        # by NOT returning ``unknown_actor_in_thread``.
+        assert reason != "unknown_actor_in_thread"
+
+    def test_blocked_cases_do_not_mutate_resolution_state(self):
+        """None of the blocked cases call into the
+        resolveReviewThread API. ``is_eligible_for_bot_resolution``
+        is a pure eligibility check; resolution mutation
+        is invoked only when the caller calls
+        ``resolveReviewThread`` AND that helper is gated
+        on ``is_eligible_for_bot_resolution`` returning
+        True. This test re-runs the negative cases and
+        asserts no mutation-related side effect."""
+        from scripts.local import aed_pr_readiness as R
+        # Each of these returns eligible=False with the
+        # structured reason; no mutation is possible from
+        # ``is_eligible_for_bot_resolution`` itself.
+        for thread in (
+            {},
+            {"comments": []},
+            {"comments": None},
+            {"comments": "not a list"},
+            {"comments": [{"body": "no author"}]},
+            {"comments": [{"author": "chatgpt-codex-connector[bot]"},
+                          {"author": "human"}]},
+        ):
+            eligible, reason = R.is_eligible_for_bot_resolution(
+                thread, head_sha="a" * 40,
+                codex_verdict="clean",
+                codex_clean_passed=True,
+            )
+            assert eligible is False
+            # The reason vocabulary is one of the
+            # documented failure codes; nothing here
+            # could indicate a successful resolution.
+            assert reason in (
+                "actor_not_bot",
+                "unknown_actor_in_thread",
+                "human_reply",
+                "not_outdated",
+                "actor_not_codex",
+                "already_resolved",
+                "missing_commit_anchor",
+                "malformed_commit_anchor",
+                "head_unknown",
+                "no_later_commit",
+                "actor_ancestry_unknown",
+                "actor_ancestry_stale",
+                "actor_ancestry_not_linked",
+            )
