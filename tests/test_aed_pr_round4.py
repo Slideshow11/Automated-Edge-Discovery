@@ -3021,6 +3021,175 @@ class TestRound11PaginatedChangedFileInventory:
         assert ok is True
         assert out == ["a.py", "b.py", "c.py", "d.py"]
 
+    def test_exactly_100_files_succeeds_when_count_matches(self):
+        """100 paginated files with ``changedFiles=100``
+        succeeds; the controller handles the per_page
+        boundary without truncating."""
+        paths = [f"dir/file_{i:03d}.py" for i in range(100)]
+        runner = self._runner(self._pages(paths))
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 100},
+            runner=runner,
+        )
+        assert ok is True
+        assert out == paths
+        assert err == ""
+
+    def test_101_files_split_across_two_pages_succeeds(self):
+        """101 files split across two pages (100 + 1)
+        succeeds when ``changedFiles=101``; this proves
+        pagination is actually multi-page and the
+        controller flattens correctly."""
+        paths = [f"src/file_{i:04d}.py" for i in range(101)]
+        # Two pages: 100 records + 1 record.
+        pages = [
+            [{"filename": p} for p in paths[:100]],
+            [{"filename": paths[100]}],
+        ]
+        runner = self._runner(pages)
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 101},
+            runner=runner,
+        )
+        assert ok is True
+        assert out == paths
+        assert err == ""
+
+    def test_forbidden_path_on_later_page_detected(self):
+        """A forbidden (out-of-scope) path appearing on a
+        later page must appear in the returned paths so
+        the scope gate can detect it."""
+        paths = [
+            "scripts/local/aed_pr.py",
+            "scripts/local/aed_pr_readiness.py",
+        ] + [f"unrelated_{i}.py" for i in range(99)]
+        paths.append("scripts/local/banned.py")
+        pages = [
+            [{"filename": p} for p in paths[:100]],
+            [{"filename": p} for p in paths[100:]],
+        ]
+        runner = self._runner(pages)
+        ok, out, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": len(paths)},
+            runner=runner,
+        )
+        assert ok is True
+        assert "scripts/local/banned.py" in out
+        # The scope gate consumes these paths; if
+        # ``scripts/local/banned.py`` is in the out list,
+        # the gate CAN detect it. The opposite (missing
+        # the path) would mask the violation.
+        assert err == ""
+
+    def test_partial_inventory_100_of_101_fails(self):
+        """When the paginated inventory returns only 100
+        records but ``changedFiles`` reports 101, the
+        count mismatch must fail closed. The controller
+        MUST NOT accept the partial 100-record inventory
+        as authoritative scope evidence."""
+        paths = [f"file_{i:04d}.py" for i in range(100)]
+        pages = [
+            [{"filename": p} for p in paths],
+        ]
+        runner = self._runner(pages)
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 101},
+            runner=runner,
+        )
+        assert ok is False
+        assert "changed_file_count_mismatch" in err
+
+    def test_returned_count_greater_than_changed_files_fails(self):
+        """When the paginated inventory returns MORE
+        records than ``changedFiles`` reports, the count
+        mismatch must fail closed."""
+        paths = [f"file_{i:04d}.py" for i in range(5)]
+        runner = self._runner(self._pages(paths))
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 3},
+            runner=runner,
+        )
+        assert ok is False
+        assert "changed_file_count_mismatch" in err
+
+    def test_duplicate_paths_across_pages_fail(self):
+        """A filename that appears once on page 1 and
+        again on page 2 is rejected as ambiguous
+        evidence."""
+        pages = [
+            [{"filename": "a.py"}, {"filename": "b.py"}],
+            [{"filename": "b.py"}, {"filename": "c.py"}],
+        ]
+        runner = self._runner(pages)
+        ok, _, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 3},
+            runner=runner,
+        )
+        assert ok is False
+        assert "duplicate" in err.lower()
+
+    def test_old_capped_gh_pr_view_files_command_not_used(self):
+        """The new implementation MUST NOT invoke
+        ``gh pr view --json files`` as the authoritative
+        files query."""
+        captured = []
+        def runner(cmd, *a, **kw):
+            captured.append(list(cmd))
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(self._pages(["a.py"])),
+                stderr="",
+            )
+        ok, _, _ = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is True
+        argv = captured[0]
+        # The argv does NOT contain the old
+        # ``gh pr view --json files`` shape.
+        joined = " ".join(str(x) for x in argv)
+        assert "gh pr view" not in joined
+        assert "--json files" not in joined
+        # It DOES use the paginated REST endpoint.
+        assert "gh" in argv and "api" in argv
+        assert "/files" in joined
+        assert "--paginate" in argv
+        assert "--slurp" in argv
+
+    def test_build_evidence_marks_inventory_missing_on_incomplete_result(self):
+        """``build_evidence`` is invoked indirectly by
+        callers; here we verify that an incomplete
+        inventory result is reflected in ``changed_files_fetched=False``
+        via the documented error reason. The downstream
+        consumer (``build_evidence``) inspects
+        ``fetch_changed_files``'s ``(ok, paths, err)``
+        tuple; when ``ok=False``, it sets
+        ``changed_files_fetched=False``."""
+        # Empty inventory with changedFiles>0 must fail
+        # closed at the fetch layer.
+        runner = self._runner([[]])
+        ok, paths, err = ctrl.fetch_changed_files(
+            "owner/repo", 411,
+            pr_view={"changedFiles": 1},
+            runner=runner,
+        )
+        assert ok is False
+        assert paths == []
+        # The contract: callers translate ok=False to
+        # ``changed_files_fetched=False``; the
+        # controller's error message is propagated so the
+        # reason code (e.g. ``empty_changed_file_inventory``)
+        # surfaces in the readiness evidence.
+        assert err == "empty_changed_file_inventory"
+
 
 class TestRound11ReviewCommentGatePullRequestGuard:
     """Round-11 follow-up (Codex comment 3610828222 on ``83e3f24``):
