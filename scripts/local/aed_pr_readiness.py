@@ -549,12 +549,28 @@ def partition_unresolved_threads(
 
 # Recognized bot authors eligible for bounded auto-resolution. Keep in
 # sync with aed_pr.classify_thread_actor / partition_unresolved_threads.
+# A broad membership here only proves "all participants are bots";
+# the TOP-level author must additionally match the Codex
+# auto-resolution allowlist below for the thread to be eligible.
 _RECOGNIZED_BOT_LOGINS = frozenset({
     "chatgpt-codex-connector",
     "chatgpt-codex-connector[bot]",
     "github-actions[bot]",
     "dependabot[bot]",
     "renovate[bot]",
+})
+
+
+# Round-8 follow-up (Codex comment 3609202695 on ``1e9867e``):
+# a separate, exact allowlist governs which TOP-level authors may
+# be auto-resolved. Only the actual Codex review identities are
+# eligible; ``github-actions[bot]``, ``dependabot[bot]``,
+# ``renovate[bot]``, unknown bots, and humans are NEVER eligible
+# for automatic resolution, even when the recognized-bots check
+# passes for the participant set.
+_CODEX_AUTO_RESOLVE_LOGINS = frozenset({
+    "chatgpt-codex-connector",
+    "chatgpt-codex-connector[bot]",
 })
 
 
@@ -749,6 +765,17 @@ def is_eligible_for_bot_resolution(
         return False, "actor_not_bot"
     if top_actor_login.lower() not in _RECOGNIZED_BOT_LOGINS:
         return False, "actor_not_bot"
+
+    # Round-8 follow-up (Codex comment 3609202695): the top-level
+    # author must additionally match the exact Codex
+    # auto-resolution allowlist. ``github-actions[bot]``,
+    # ``dependabot[bot]``, ``renovate[bot]``, unknown bots, and
+    # humans are NEVER eligible for automatic resolution. The
+    # recognized-bots check above only proves "all participants
+    # are bots"; it does NOT confer auto-resolve authority on
+    # non-Codex bots.
+    if top_actor_login.lower() not in _CODEX_AUTO_RESOLVE_LOGINS:
+        return False, "actor_not_codex"
 
     # Condition 2: every comment in the thread must be bot-authored.
     comments = thread.get("comments") or thread.get("comment_list") or []

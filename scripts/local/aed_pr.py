@@ -179,41 +179,73 @@ def _run_json(
     return json.loads(proc.stdout)
 
 
+def _extract_valid_paths(files: Any) -> List[str]:
+    """Return the list of nonempty path strings from a ``files`` payload.
+
+    Round-8 follow-up (Codex comment 3609202696 on ``1e9867e``):
+    helper used to detect empty / malformed inventories; an empty
+    result signals fetch failure, not a clean inventory.
+    """
+    if not isinstance(files, list):
+        return []
+    out: List[str] = []
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        path = f.get("path")
+        if isinstance(path, str) and path:
+            out.append(path)
+    return out
+
+
 def fetch_changed_files(
     repo: str, pr_number: int, pr_view: Optional[Dict[str, Any]] = None
 ) -> Tuple[bool, List[str], str]:
     """Fetch the actual changed file paths for the PR.
 
-    Returns (ok, paths, error). When ok=False the controller must treat
-    the evidence as missing; it must NEVER treat an empty list as
-    clean=True (a PR with zero changed files is impossible, and an
-    empty result here is a fetch failure).
+    Returns (ok, paths, error). When ok=False the controller must
+    treat the evidence as missing; it must NEVER treat an empty
+    list as clean=True (a PR with zero changed files is
+    impossible, and an empty result here is a fetch failure).
+
+    Round-8 follow-up (Codex comment 3609202696): the dedicated
+    ``gh pr view --json files`` call may succeed but return an
+    empty list, a list of entries with no valid ``path`` strings,
+    or a malformed payload from which no valid paths can be
+    extracted. The previous implementation treated any of these
+    as ``ok=True, paths=[]``, allowing the scope gate to pass
+    against an empty inventory. The current implementation:
+
+    1. Prefers the dedicated files query.
+    2. Accepts that result ONLY when at least one valid
+       nonempty path was extracted.
+    3. Falls back to the inline ``files`` field on the broader
+       pr_view payload when the dedicated result is empty or
+       malformed.
+    4. Accepts the fallback ONLY when at least one valid path
+       was extracted.
+    5. When neither source supplies a valid path, returns
+       ``(False, [], "empty_changed_file_inventory")`` so
+       ``build_evidence`` sets ``changed_files_fetched=False``
+       and the scope gate fails closed.
     """
-    # Prefer the dedicated --json files call (deterministic shape).
+    # 1. Dedicated ``gh pr view --json files`` call.
     cmd = ["gh", "pr", "view", str(pr_number), "--repo", repo,
            "--json", "files"]
     ok, payload, err = _run_json_or_none(cmd)
     if ok and isinstance(payload, dict):
-        files = payload.get("files")
-        if isinstance(files, list):
-            paths = [
-                (f.get("path") if isinstance(f, dict) else None)
-                for f in files
-            ]
-            paths = [p for p in paths if isinstance(p, str) and p]
+        paths = _extract_valid_paths(payload.get("files"))
+        if paths:
             return True, paths, ""
-    # Fallback to the inline `files` field on the broader view payload.
+    # 2. Fallback to the inline ``files`` field on the broader
+    # ``pr_view`` payload. Used when the dedicated call succeeded
+    # but returned no valid paths, OR when the dedicated call
+    # itself failed.
     if isinstance(pr_view, dict):
-        files = pr_view.get("files")
-        if isinstance(files, list):
-            paths = [
-                (f.get("path") if isinstance(f, dict) else None)
-                for f in files
-            ]
-            paths = [p for p in paths if isinstance(p, str) and p]
-            if paths:
-                return True, paths, ""
-    return False, [], err or "could not fetch changed files"
+        paths = _extract_valid_paths(pr_view.get("files"))
+        if paths:
+            return True, paths, ""
+    return False, [], err or "empty_changed_file_inventory"
 
 
 def fetch_ci_conclusions(
@@ -825,7 +857,23 @@ def _find_dispatch_run(
         except (TypeError, ValueError):
             # Malformed createdAt fails closed.
             continue
-        if created_at < dispatched_at:
+        # Round-8 follow-up (Codex comment 3609202698): GitHub
+        # Actions ``createdAt`` commonly has whole-second precision
+        # while ``dispatched_at`` includes fractional seconds. Floor
+        # ``dispatched_at`` to whole-second precision before
+        # comparing so a dispatch at 12:00:00.900000Z against a run
+        # at 12:00:00Z is correctly accepted. Runs from an earlier
+        # second are still rejected.
+        try:
+            dispatch_boundary = dispatched_at.astimezone(
+                dt.timezone.utc
+            ).replace(microsecond=0)
+        except (AttributeError, TypeError, ValueError):
+            # Naive or non-pickleable ``dispatched_at``: treat as UTC.
+            dispatch_boundary = dispatched_at.replace(
+                tzinfo=dt.timezone.utc, microsecond=0
+            )
+        if created_at < dispatch_boundary:
             continue
         # databaseId must be present and an integer.
         if not isinstance(run.get("databaseId"), int):

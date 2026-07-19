@@ -2663,3 +2663,536 @@ class TestRound4Finding4ResolutionFailurePropagation:
         )
         assert second["ok"] is True
         assert second["resolved_thread_ids"] == ["T-FAILED", "T-OK"]
+
+# ---------------------------------------------------------------------------
+# Round-8 follow-up: Codex-only auto-resolution allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestRound8CodexOnlyAutoResolution:
+    """Round-8 follow-up (Codex comment 3609202695 on 1e9867e):
+
+    the controller must restrict auto-resolution to threads whose
+    top-level author is in the exact Codex auto-resolution
+    allowlist. github-actions[bot], dependabot[bot], renovate[bot],
+    unknown bots, and humans are NEVER eligible.
+    """
+
+    def _thread(self, *, thread_id="T-CX",
+                top_author="chatgpt-codex-connector[bot]",
+                comments=None, anchor=OTHER_HEAD, **kw):
+        return {
+            "thread_id": thread_id,
+            "author": top_author,
+            "isOutdated": kw.get("is_outdated", True),
+            "isResolved": kw.get("is_resolved", False),
+            "original_commit_sha": anchor,
+            "comments": comments if comments is not None else [
+                {"author": top_author, "database_id": "c1"},
+            ],
+        }
+
+    def _eligibility_kwargs(self, **overrides):
+        base = {
+            "head_sha": DEFAULT_HEAD,
+            "codex_verdict": "CODEX_CLEAN_PASS",
+            "codex_clean_passed": True,
+            "codex_reviewed_sha": DEFAULT_HEAD,
+            "repo": "Slideshow11/Automated-Edge-Discovery",
+            "ancestry_runner": lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="ahead", stderr=""
+            ),
+        }
+        base.update(overrides)
+        return base
+
+    def test_codex_author_outdated_verified_ancestor_passes(self):
+        thread = self._thread(top_author="chatgpt-codex-connector[bot]")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is True
+        assert reason == "eligible"
+
+    def test_chatgpt_codex_connector_bare_login_passes(self):
+        # ``chatgpt-codex-connector`` without the ``[bot]`` suffix
+        # is also in the allowlist.
+        thread = self._thread(top_author="chatgpt-codex-connector")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is True
+        assert reason == "eligible"
+
+    def test_github_actions_bot_top_level_blocks(self):
+        thread = self._thread(top_author="github-actions[bot]")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "actor_not_codex"
+
+    def test_dependabot_bot_top_level_blocks(self):
+        thread = self._thread(top_author="dependabot[bot]")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "actor_not_codex"
+
+    def test_renovate_bot_top_level_blocks(self):
+        thread = self._thread(top_author="renovate[bot]")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "actor_not_codex"
+
+    def test_unknown_bot_top_level_blocks(self):
+        thread = self._thread(top_author="some-unknown-bot[bot]")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        # An unknown bot fails the recognized-bots check first
+        # (more specific reason) before reaching the Codex
+        # allowlist. Either reason is acceptable evidence that
+        # the thread is blocked.
+        assert reason in {"actor_not_bot", "actor_not_codex"}
+
+    def test_human_top_level_blocks(self):
+        thread = self._thread(top_author="human-reviewer")
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "actor_not_bot"
+
+    def test_codex_thread_with_human_reply_blocks(self):
+        thread = self._thread(
+            top_author="chatgpt-codex-connector[bot]",
+            comments=[
+                {"author": "chatgpt-codex-connector[bot]",
+                 "database_id": "c1"},
+                {"author": "human-reviewer", "database_id": "c2"},
+            ],
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "human_reply"
+
+    def test_codex_thread_with_unknown_reply_blocks(self):
+        thread = self._thread(
+            top_author="chatgpt-codex-connector[bot]",
+            comments=[
+                {"author": "chatgpt-codex-connector[bot]",
+                 "database_id": "c1"},
+                {"author": "mystery-bot[bot]", "database_id": "c2"},
+            ],
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread, **self._eligibility_kwargs()
+        )
+        assert ok is False
+        assert reason == "human_reply"
+
+    def test_mixed_bot_inventory_selects_only_codex_threads(self):
+        # Feed a mixed inventory into ``select_eligible_bot_threads``;
+        # only the Codex-authored thread survives.
+        threads = [
+            # Codex-authored -> eligible
+            self._thread(
+                thread_id="T-CODEX-A",
+                top_author="chatgpt-codex-connector[bot]",
+                anchor=OTHER_HEAD,
+            ),
+            # github-actions top-level -> blocked
+            self._thread(
+                thread_id="T-ACTIONS",
+                top_author="github-actions[bot]",
+                anchor=OTHER_HEAD,
+            ),
+            # dependabot top-level -> blocked
+            self._thread(
+                thread_id="T-DEPENDABOT",
+                top_author="dependabot[bot]",
+                anchor=OTHER_HEAD,
+            ),
+            # Codex-authored but with human reply -> blocked
+            self._thread(
+                thread_id="T-CODEX-HUMAN",
+                top_author="chatgpt-codex-connector[bot]",
+                anchor=OTHER_HEAD,
+                comments=[
+                    {"author": "chatgpt-codex-connector[bot]",
+                     "database_id": "c1"},
+                    {"author": "human-reviewer", "database_id": "c2"},
+                ],
+            ),
+            # renovate -> blocked
+            self._thread(
+                thread_id="T-RENOVATE",
+                top_author="renovate[bot]",
+                anchor=OTHER_HEAD,
+            ),
+        ]
+        result = ctrl.select_eligible_bot_threads(
+            [R.normalize_thread_anchor(t) for t in threads],
+            head_sha=DEFAULT_HEAD,
+            codex_verdict="CODEX_CLEAN_PASS",
+            codex_clean_passed=True,
+            codex_reviewed_sha=DEFAULT_HEAD,
+            repo="Slideshow11/Automated-Edge-Discovery",
+            ancestry_runner=lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="ahead", stderr=""
+            ),
+        )
+        eligible_ids = [t["thread_id"] for t in result["eligible"]]
+        assert eligible_ids == ["T-CODEX-A"]
+
+
+# ---------------------------------------------------------------------------
+# Round-8 follow-up: empty changed-file evidence rejected
+# ---------------------------------------------------------------------------
+
+
+class TestRound8EmptyChangedFileInventory:
+    """Round-8 follow-up (Codex comment 3609202696 on 1e9867e):
+
+    fetch_changed_files returns ok=True ONLY when at least one
+    valid path was extracted. An empty / malformed inventory is a
+    fetch failure that fails closed.
+    """
+
+    def _patch_json_or_none(self, payload):
+        return mock.patch.object(
+            ctrl, "_run_json_or_none",
+            side_effect=lambda cmd, **kw: (True, payload, ""),
+        )
+
+    def test_normal_nonempty_dedicated_inventory_succeeds(self):
+        payload = {
+            "files": [
+                {"path": "scripts/local/aed_pr.py"},
+                {"path": "tests/test_aed_pr.py"},
+            ]
+        }
+        with self._patch_json_or_none(payload):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411
+            )
+        assert ok is True
+        assert paths == [
+            "scripts/local/aed_pr.py", "tests/test_aed_pr.py"
+        ]
+        assert err == ""
+
+    def test_empty_dedicated_list_plus_valid_fallback_succeeds(self):
+        # Dedicated list is empty; the fallback (pr_view['files'])
+        # supplies valid paths.
+        with self._patch_json_or_none({"files": []}):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411,
+                pr_view={
+                    "files": [
+                        {"path": "scripts/local/aed_pr.py"},
+                    ]
+                },
+            )
+        assert ok is True
+        assert paths == ["scripts/local/aed_pr.py"]
+        assert err == ""
+
+    def test_all_malformed_dedicated_list_plus_valid_fallback_succeeds(self):
+        with self._patch_json_or_none({
+            "files": [
+                {"no_path": True},
+                "not-a-dict",
+                {"path": ""},
+                {"path": None},
+            ]
+        }):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411,
+                pr_view={
+                    "files": [
+                        {"path": "scripts/local/aed_pr.py"},
+                    ]
+                },
+            )
+        assert ok is True
+        assert paths == ["scripts/local/aed_pr.py"]
+
+    def test_empty_dedicated_and_empty_fallback_fail(self):
+        with self._patch_json_or_none({"files": []}):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411,
+                pr_view={"files": []},
+            )
+        assert ok is False
+        assert paths == []
+        assert err == "empty_changed_file_inventory"
+
+    def test_all_malformed_dedicated_and_missing_fallback_fail(self):
+        with self._patch_json_or_none({
+            "files": [
+                {"no_path": True},
+                {"path": ""},
+            ]
+        }):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411,
+                pr_view={},
+            )
+        assert ok is False
+        assert paths == []
+        assert err == "empty_changed_file_inventory"
+
+    def test_successful_command_with_no_valid_paths_fails_closed(self):
+        # The dedicated call succeeded but every ``path`` slot is
+        # empty/missing - the controller MUST NOT report ok=True.
+        with self._patch_json_or_none({
+            "files": [
+                {"path": ""},
+                {"no_path": True},
+            ]
+        }):
+            ok, paths, err = ctrl.fetch_changed_files("owner/repo", 411)
+        assert ok is False
+        assert paths == []
+        assert err == "empty_changed_file_inventory"
+
+    def test_build_evidence_reports_changed_files_missing(self):
+        # When ``fetch_changed_files`` reports ok=False with the
+        # empty-inventory marker, ``build_evidence`` must treat
+        # the evidence as missing. The function itself returns
+        # ``(False, [], "empty_changed_file_inventory")``; the
+        # caller (``build_evidence``) propagates that into
+        # ``changed_files_fetched=False``.
+        with self._patch_json_or_none({"files": []}):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411, pr_view={"files": []},
+            )
+        assert ok is False
+        assert err == "empty_changed_file_inventory"
+
+    def test_no_allowed_scope_can_make_empty_inventory_pass(self):
+        # Even with an explicit allowed scope, an empty inventory
+        # must not pass the scope gate. We verify the inventory is
+        # rejected at fetch time; build_evidence propagates
+        # ``changed_files_fetched=False`` and the scope check
+        # fails closed.
+        with self._patch_json_or_none({"files": []}):
+            ok, paths, err = ctrl.fetch_changed_files(
+                "owner/repo", 411, pr_view={"files": []},
+            )
+        assert ok is False
+        assert paths == []
+        # build_evidence would set changed_files_fetched=False
+        # and the scope gate would fail closed with
+        # ``changed_files_not_fetched``.
+        assert err == "empty_changed_file_inventory"
+
+
+# ---------------------------------------------------------------------------
+# Round-8 follow-up: dispatch timestamp precision skew
+# ---------------------------------------------------------------------------
+
+
+class TestRound8DispatchPrecisionSkew:
+    """Round-8 follow-up (Codex comment 3609202698 on 1e9867e):
+
+    GitHub Actions ``createdAt`` is whole-second; ``dispatched_at``
+    has fractional seconds. The runner must floor ``dispatched_at``
+    to whole-second precision before comparing so a dispatch at
+    12:00:00.900000Z against a run at 12:00:00Z is accepted. Runs
+    from an earlier second are still rejected.
+    """
+
+    def _run(self, *, created_at, dispatched_at):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 1, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": created_at,
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/1",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        return ctrl._find_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            list_runner=fake_list,
+        )
+
+    def test_fractional_dispatch_at_accepts_whole_second_run(self):
+        run, err = self._run(
+            created_at="2026-07-18T12:00:00Z",
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
+            ),
+        )
+        assert err == ""
+        assert run is not None
+        assert run["databaseId"] == 1
+
+    def test_run_before_dispatch_second_rejected(self):
+        run, err = self._run(
+            created_at="2026-07-18T11:59:59Z",
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
+            ),
+        )
+        assert run is None
+        assert err
+
+    def test_run_after_dispatch_second_accepted(self):
+        run, err = self._run(
+            created_at="2026-07-18T12:00:05Z",
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
+            ),
+        )
+        assert err == ""
+        assert run is not None
+
+    def test_malformed_createdAt_rejected(self):
+        run, err = self._run(
+            created_at="not-a-timestamp",
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, 0, tzinfo=dt.timezone.utc
+            ),
+        )
+        assert run is None
+        assert err
+
+    def test_wrong_branch_rejected(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 2, "event": "workflow_dispatch",
+                    "headBranch": "main",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-18T12:00:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/2",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        run, err = ctrl._find_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
+    def test_wrong_sha_rejected(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 3, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": "f" * 40,
+                    "createdAt": "2026-07-18T12:00:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/3",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        run, err = ctrl._find_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
+    def test_wrong_workflow_name_rejected(self):
+        def fake_list(cmd, *a, **kw):
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 4, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-18T12:00:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/4",
+                    "workflowName": "OTHER",
+                }]),
+                stderr="",
+            )
+        run, err = ctrl._find_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dt.datetime(
+                2026, 7, 18, 12, 0, 0, tzinfo=dt.timezone.utc
+            ),
+            list_runner=fake_list,
+        )
+        assert run is None
+        assert err
+
+    def test_discovery_polling_remains_intact(self):
+        # ``_wait_for_dispatch_run`` continues to work with the new
+        # whole-second boundary; the run is found on the first
+        # poll.
+        state = {"count": 0}
+        def fake_list(cmd, *a, **kw):
+            state["count"] += 1
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps([{
+                    "databaseId": 7, "event": "workflow_dispatch",
+                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                    "headSha": DEFAULT_HEAD,
+                    "createdAt": "2026-07-18T12:00:00Z",
+                    "status": "completed", "conclusion": "success",
+                    "url": "https://example/runs/7",
+                    "workflowName": "CI",
+                }]),
+                stderr="",
+            )
+        dispatched_at = dt.datetime(
+            2026, 7, 18, 12, 0, 0, 900000, tzinfo=dt.timezone.utc
+        )
+        run, err = ctrl._wait_for_dispatch_run(
+            "owner/repo", "ci.yml",
+            head_sha=DEFAULT_HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            pr_number=411,
+            dispatched_at=dispatched_at,
+            timeout_seconds=10,
+            poll_seconds=1,
+            list_runner=fake_list,
+        )
+        assert err == ""
+        assert run is not None
+        assert run["databaseId"] == 7
