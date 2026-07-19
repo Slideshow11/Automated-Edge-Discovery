@@ -685,18 +685,14 @@ def _build_run(
     head_branch="reduction/pr-lifecycle-collapse-v1",
     databaseId=29593005015,
     name="CI",
-    event="workflow_dispatch",
+    event="pull_request",
     status="completed",
     conclusion="success",
     createdAt=None,
     workflow_name=None,
 ):
     if createdAt is None:
-        # Default to "now" so the run always qualifies as
-        # "at or after dispatched_at" when the controller
-        # records ``dispatched_at`` immediately before the
-        # ``gh workflow run`` call. Tests that want a
-        # specific historical timestamp can override.
+        # Default to "now" so the run is the newest.
         import datetime as _dt
         createdAt = _dt.datetime.now(_dt.timezone.utc).isoformat()
     if workflow_name is None:
@@ -723,25 +719,30 @@ def _now_iso():
 def _gate_ns(
     head_sha=DEFAULT_HEAD,
     *,
-    dispatch_runs=None,
+    pull_request_runs=None,
     job_conclusion="success",
     job_status="completed",
     head_branch="reduction/pr-lifecycle-collapse-v1",
     head_mismatch=False,
-    dispatch_failure=False,
-    dispatch_run=None,
+    rerun_failure=False,
     match_misses=False,
     identify_err="",
     timeout=False,
-    wait_timeout_seconds=30,
+    rerun_attempts=None,
+    pre_rerun_attempt=1,
+    wait_timeout_seconds=3,
     wait_poll_seconds=1,
+    job_payload_override=None,
 ):
     """Build a Namespace mock for ``cmd_gate_recheck``.
 
-    ``dispatch_runs`` is the list of runs returned by the run-list
-    call. ``job_conclusion`` is what the run-view call returns for
-    the ``review-comment-gate`` job. ``timeout`` short-circuits the
-    polling loop so the test does not actually wait.
+    ``pull_request_runs`` is the list of runs returned by the
+    run-list call. ``job_conclusion`` is what the run-view call
+    returns for the ``review-comment-gate`` job. ``timeout``
+    short-circuits the polling loop so the test does not
+    actually wait. ``rerun_attempts`` is a list of integers
+    returned by the attempt-count reads; the loop returns the
+    first value strictly greater than ``pre_rerun_attempt``.
     """
     ns = mock.Mock()
     ns.repo = DEFAULT_REPO
@@ -749,11 +750,7 @@ def _gate_ns(
     ns.head_sha = head_sha
     ns.wait_timeout_seconds = wait_timeout_seconds
     ns.wait_poll_seconds = wait_poll_seconds
-    # Round-6 follow-up: bounded discovery wait. Default to short
-    # timeouts so tests do not actually sleep when the discovery
-    # succeeds on the first poll.
-    ns.discovery_timeout_seconds = 5
-    ns.discovery_poll_seconds = 1
+    ns.dry_run = False
 
     live = dict(_pr_view_payload(head_sha=head_sha, head_branch=head_branch))
     if head_mismatch:
@@ -764,77 +761,111 @@ def _gate_ns(
         stderr="",
     )
 
-    if dispatch_failure:
-        ns.dispatch_runner = lambda *a, **kw: mock.Mock(
-            returncode=1, stdout="", stderr="dispatch failed"
+    if rerun_failure:
+        ns.rerun_runner = lambda *a, **kw: mock.Mock(
+            returncode=1, stdout="", stderr="rerun failed"
         )
     else:
-        ns.dispatch_runner = lambda *a, **kw: mock.Mock(
+        ns.rerun_runner = lambda *a, **kw: mock.Mock(
             returncode=0, stdout="", stderr=""
         )
 
-    if dispatch_runs is None:
-        # Default: a factory that produces one matching run
-        # AT call time, so the createdAt timestamp is later
-        # than the dispatched_at the controller recorded.
-        if match_misses:
-            dispatch_runs_factory = lambda: []
-        elif identify_err:
-            dispatch_runs_factory = lambda: []
+    if pull_request_runs is None:
+        if match_misses or identify_err:
+            pr_runs_factory = lambda: []
         else:
-            dispatch_runs_factory = lambda: [_build_run()]
-    elif isinstance(dispatch_runs, str) and dispatch_runs == "__FACTORY__":
-        dispatch_runs_factory = lambda: [_build_run()]
+            pr_runs_factory = lambda: [_build_run()]
+    elif isinstance(pull_request_runs, str) and \
+            pull_request_runs == "__FACTORY__":
+        pr_runs_factory = lambda: [_build_run()]
     else:
-        dispatch_runs_factory = lambda: dispatch_runs
+        pr_runs_factory = lambda: pull_request_runs
     ns.list_runner = lambda *a, **kw: mock.Mock(
         returncode=0,
-        stdout=json.dumps(dispatch_runs_factory()),
+        stdout=json.dumps(pr_runs_factory()),
         stderr="",
     )
 
-    if timeout:
-        # job view never reaches completed
-        ns.view_runner = lambda *a, **kw: mock.Mock(
-            returncode=0,
-            stdout=json.dumps({"jobs": []}),
-            stderr="",
-        )
-    else:
+    # The attempt-count read returns a sequence of values.
+    # The first attempt read MUST match ``pre_rerun_attempt``;
+    # subsequent reads return the values from
+    # ``rerun_attempts``. The first read strictly greater
+    # than ``pre_rerun_attempt`` triggers the run-view job
+    # poll. The job payload is then returned in the run-view
+    # call.
+    attempt_state = {"attempt_calls": 0, "rerun_attempts": rerun_attempts or []}
+    def _attempt_runner(cmd, *a, **kw):
+        # ``gh run view <id> --json attempt``
+        if "--json" in cmd and "attempt" in cmd[cmd.index("--json") + 1]:
+            idx = attempt_state["attempt_calls"]
+            attempt_state["attempt_calls"] += 1
+            if idx == 0:
+                # First call: return pre_rerun_attempt so the
+                # controller records it as the bound.
+                value = pre_rerun_attempt
+            elif idx - 1 < len(attempt_state["rerun_attempts"]):
+                # Subsequent calls: return the user's sequence.
+                value = attempt_state["rerun_attempts"][idx - 1]
+            else:
+                value = pre_rerun_attempt
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"attempt": value}),
+                stderr="",
+            )
+        # ``gh run view <id> --json jobs``
+        if timeout:
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps({"jobs": []}),
+                stderr="",
+            )
+        if job_payload_override is not None:
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(job_payload_override),
+                stderr="",
+            )
         job_payload = {
             "jobs": [{
                 "name": "review-comment-gate",
+                "databaseId": 29593005099,
                 "status": job_status,
                 "conclusion": job_conclusion,
             }]
         }
-        ns.view_runner = lambda *a, **kw: mock.Mock(
+        return mock.Mock(
             returncode=0,
             stdout=json.dumps(job_payload),
             stderr="",
         )
 
-    # The dispatch-run identification step uses list_runner for the
-    # run list and view_runner for the run view.
+    ns.view_runner = _attempt_runner
+
     return ns
 
 
 class TestGateRecheckMechanism:
     def test_forwards_clean(self):
         """Terminal success returns 0 (exact-head SUCCESS)."""
-        assert ctrl.cmd_gate_recheck(_gate_ns()) == 0
+        ns = _gate_ns(rerun_attempts=[2])
+        assert ctrl.cmd_gate_recheck(ns) == 0
 
     def test_forwards_blocked(self):
         """Terminal blocking failure returns 1 (exact-head BLOCKED)."""
-        assert ctrl.cmd_gate_recheck(
-            _gate_ns(job_conclusion="failure", job_status="completed")
-        ) == 1
+        ns = _gate_ns(
+            job_conclusion="failure", job_status="completed",
+            rerun_attempts=[2],
+        )
+        assert ctrl.cmd_gate_recheck(ns) == 1
 
     def test_forwards_inconclusive(self):
         """Anything else (cancelled, neutral, etc.) is INCONCLUSIVE (2)."""
-        assert ctrl.cmd_gate_recheck(
-            _gate_ns(job_conclusion="cancelled", job_status="completed")
-        ) == 2
+        ns = _gate_ns(
+            job_conclusion="cancelled", job_status="completed",
+            rerun_attempts=[2],
+        )
+        assert ctrl.cmd_gate_recheck(ns) == 2
 
     def test_rejects_non_canonical_head_sha(self):
         ns = mock.Mock()
@@ -842,18 +873,17 @@ class TestGateRecheckMechanism:
         ns.pr_number = 411
         ns.head_sha = "not-a-sha"
         ns.wait_timeout_seconds = 30
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
         ns.wait_poll_seconds = 1
+        ns.dry_run = False
         assert ctrl.cmd_gate_recheck(ns) == 2
 
-    def test_dispatch_failure_returns_inconclusive(self):
-        """When ``gh workflow run`` fails, gate-recheck returns 2."""
-        ns = _gate_ns(dispatch_failure=True)
+    def test_rerun_failure_returns_inconclusive(self):
+        """When ``gh run rerun`` fails, gate-recheck returns 2."""
+        ns = _gate_ns(rerun_failure=True, rerun_attempts=[2])
         assert ctrl.cmd_gate_recheck(ns) == 2
 
-    def test_head_mismatch_blocks_before_dispatch(self):
-        """Requested head_sha != live PR head blocks before dispatch."""
+    def test_head_mismatch_blocks_before_rerun(self):
+        """Requested head_sha != live PR head blocks before rerun."""
         ns = _gate_ns(head_mismatch=True)
         assert ctrl.cmd_gate_recheck(ns) == 2
 
@@ -865,5 +895,8 @@ class TestGateRecheckMechanism:
     def test_timeout_returns_inconclusive(self):
         """When the gate never reaches terminal within the bounded
         timeout, return 2."""
-        ns = _gate_ns(timeout=True, wait_timeout_seconds=1)
+        ns = _gate_ns(
+            timeout=True, wait_timeout_seconds=1,
+            rerun_attempts=[2],
+        )
         assert ctrl.cmd_gate_recheck(ns) == 2

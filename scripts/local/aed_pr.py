@@ -1040,54 +1040,296 @@ def _list_run_jobs(
     return jobs, ""
 
 
+def _find_exact_head_pull_request_run(
+    repo: str,
+    *,
+    head_sha: str,
+    head_branch: str,
+    list_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Find the unique ``pull_request`` CI run for the exact head.
+
+    Round-10 helper: enumerates ``workflow_file=ci.yml`` runs with
+    ``event=pull_request`` on the exact head branch, narrows the
+    candidates to those whose ``headSha`` matches the requested
+    exact SHA, and selects the newest run whose binding fields
+    all match.
+
+    Returns ``(run, error)``. ``run`` is the matching run dict
+    (or ``None`` when no run qualifies). ``error`` is non-empty
+    when the search fails or more than one run cannot be
+    deterministically distinguished.
+
+    The function is bound by:
+
+    - ``workflowName`` exactly ``CI``;
+    - ``event`` exactly ``pull_request``;
+    - exact head branch;
+    - exact head SHA;
+    - valid integer ``databaseId``;
+    - nonempty ``url``.
+
+    Any workflow_dispatch or rerun run on the same head is
+    rejected; only the pull_request trigger run is acceptable.
+    """
+    if list_runner is None:
+        list_runner = subprocess.run
+    cmd = [
+        "gh", "run", "list",
+        "--repo", repo,
+        "--workflow", "ci.yml",
+        "--event", "pull_request",
+        "--branch", head_branch,
+        "--commit", head_sha,
+        "--limit", "30",
+        "--json",
+        "databaseId,event,headBranch,headSha,status,conclusion,"
+        "url,workflowName,createdAt,name",
+    ]
+    try:
+        proc = list_runner(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"run list failed: {exc}"
+    if proc.returncode != 0:
+        return None, (
+            f"run list returned {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:300]}"
+        )
+    try:
+        runs = json.loads(proc.stdout or "")
+    except json.JSONDecodeError as exc:
+        return None, f"invalid run list JSON: {exc}"
+    if not isinstance(runs, list):
+        return None, "run list payload is not a list"
+    matching: List[Dict[str, Any]] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if (run.get("workflowName") or "") != "CI":
+            continue
+        if (run.get("event") or "") != "pull_request":
+            continue
+        if run.get("headBranch") != head_branch:
+            continue
+        if run.get("headSha") != head_sha:
+            continue
+        if not isinstance(run.get("databaseId"), int):
+            continue
+        if not (run.get("url") or ""):
+            continue
+        matching.append(run)
+    if not matching:
+        return None, (
+            f"no exact-head pull_request CI run for "
+            f"branch={head_branch!r} head={head_sha!r} workflow='ci.yml'"
+        )
+    if len(matching) > 1:
+        # Pick the newest by createdAt descending; require all
+        # matching candidates agree on databaseId/int and url.
+        matching.sort(
+            key=lambda r: (r.get("createdAt") or "", r.get("databaseId") or 0),
+            reverse=True,
+        )
+    return matching[0], ""
+
+
+def _read_run_attempt_count(
+    repo: str,
+    run_id: int,
+    *,
+    view_runner: Optional[Any] = None,
+) -> Optional[int]:
+    """Read the current ``attempt`` count of a workflow run.
+
+    Round-10 helper. Returns ``None`` when the count cannot be
+    fetched or parsed. ``view_runner`` is an injectable
+    subprocess.run replacement.
+    """
+    if view_runner is None:
+        view_runner = subprocess.run
+    cmd = [
+        "gh", "run", "view", str(run_id),
+        "--repo", repo,
+        "--json", "attempt",
+    ]
+    try:
+        proc = view_runner(cmd, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout or "")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    attempt = payload.get("attempt")
+    if isinstance(attempt, int):
+        return attempt
+    return None
+
+
+def _find_target_gate_job(
+    repo: str,
+    run_id: int,
+    *,
+    view_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """Find the unique ``review-comment-gate`` job in a run.
+
+    Round-10 helper. Rejects:
+
+    - jobs whose list cannot be fetched;
+    - runs without a ``review-comment-gate`` job;
+    - runs with more than one job named ``review-comment-gate``;
+    - jobs whose ``databaseId`` is not an integer.
+
+    Returns ``(job, error)``. ``job`` is the matching job dict.
+    """
+    jobs, err = _list_run_jobs(
+        repo, run_id, list_runner=view_runner,
+    )
+    if err or not isinstance(jobs, list):
+        return None, err or "job inventory is not a list"
+    matching: List[Dict[str, Any]] = []
+    for j in jobs:
+        if not isinstance(j, dict):
+            continue
+        if j.get("name") == "review-comment-gate":
+            matching.append(j)
+    if not matching:
+        return None, "no review-comment-gate job in run"
+    if len(matching) > 1:
+        return None, (
+            f"duplicate review-comment-gate jobs ({len(matching)})"
+        )
+    job = matching[0]
+    if not isinstance(job.get("databaseId"), int):
+        return None, "target job has no integer databaseId"
+    return job, ""
+
+
+def _wait_for_rerun_attempt(
+    repo: str,
+    run_id: int,
+    *,
+    pre_rerun_attempt: int,
+    target_job_name: str,
+    timeout_seconds: int,
+    poll_seconds: int,
+    view_runner: Optional[Any] = None,
+) -> Tuple[Optional[Dict[str, Any]], str, Optional[int]]:
+    """Wait for the rerun attempt and a terminal ``target_job_name``.
+
+    Round-10 helper. Boundedly polls ``gh run view`` for the
+    same run, requiring:
+
+    1. The attempt count to strictly exceed ``pre_rerun_attempt``.
+    2. A ``target_job_name`` job present in the new attempt.
+    3. The target job in a terminal state with a valid
+       ``conclusion``.
+
+    Returns ``(job, error, attempt)``; ``job`` is the matching
+    job dict in the new attempt, ``error`` is non-empty when
+    the bound expired or evidence is malformed.
+    """
+    if view_runner is None:
+        view_runner = subprocess.run
+    deadline = time.monotonic() + timeout_seconds
+    last_error = ""
+    while time.monotonic() < deadline:
+        attempt = _read_run_attempt_count(
+            repo, run_id, view_runner=view_runner,
+        )
+        if attempt is not None and attempt > pre_rerun_attempt:
+            jobs, err = _list_run_jobs(
+                repo, run_id, list_runner=view_runner,
+            )
+            if err:
+                last_error = err
+            else:
+                for j in jobs:
+                    if (
+                        isinstance(j, dict)
+                        and j.get("name") == target_job_name
+                    ):
+                        status = (j.get("status") or "").lower()
+                        conclusion = (j.get("conclusion") or "")
+                        if status == "completed" and conclusion:
+                            return j, "", attempt
+                        if status in {"queued", "in_progress", "waiting",
+                                       "pending", "requested"}:
+                            last_error = (
+                                f"target job still {status!r}"
+                            )
+                        else:
+                            # Anything else is a non-terminal,
+                            # non-pending state - treat as a
+                            # soft error and keep polling.
+                            last_error = (
+                                f"target job in unexpected state "
+                                f"{status!r}"
+                            )
+        time.sleep(poll_seconds)
+    return None, (
+        f"rerun attempt did not appear within {timeout_seconds}s "
+        f"(last_error={last_error!r})"
+    ), None
+
+
 def cmd_gate_recheck(args: argparse.Namespace) -> int:
-    """Re-run the exact-head ``review-comment-gate`` via workflow
-    dispatch, bound to the live PR head.
+    """Rerun the exact-head ``review-comment-gate`` job from the
+    existing pull_request CI run for the live PR head.
 
-    Round-5 fix #3 (Codex review 4724164893 on ``a1f4fe7``): the
-    earlier round-5 dispatch implementation called ``gh workflow
-    run ci.yml`` without ``--ref``, which targets the repository's
-    default branch (``main``) instead of the PR branch. Such a
-    dispatch does NOT create a check attached to the PR head. The
-    authoritative required-check result for ``cmd_merge`` therefore
-    must come from a workflow run whose ``head_branch`` equals the
-    live PR branch and whose ``head_sha`` equals the requested exact
-    PR head.
+    Round-10 follow-up (Codex review on ``f3c8c06``): the
+    previous gate-only ``workflow_dispatch`` flow issued
+    ``gh workflow run ci.yml`` with ``-f
+    gate=review-comment-gate`` and used conditional ``if:``
+    guards to skip the four ordinary jobs. GitHub may report
+    conditionally-skipped jobs as successful checks, which
+    could let the merge gate see green CI on a run that did
+    not actually run the required jobs.
 
-    The new flow:
+    The new flow reruns the existing
+    ``review-comment-gate`` job from the existing exact-head
+    ``pull_request`` CI run via ``gh run rerun --job <id>``.
+    No ``workflow_dispatch`` is issued. No ordinary CI jobs
+    are rerun. The bound is enforced at the controller layer
+    rather than the workflow layer:
 
     1. Refetch the live PR state and reject the request when
        ``args.head_sha`` does not byte-exactly equal
        ``pr_view.headRefOid``.
-    2. Dispatch ``ci.yml`` with ``--ref <live-head-branch>``,
-       ``-f pr_number=<pr>``, ``-f head_sha=<exact-head-sha>``,
-       ``-f gate=review-comment-gate``.
-    3. Record ``dispatched_at``.
-    4. List recent ``workflow_dispatch`` runs and identify the
-       unique run whose ``head_branch`` and ``head_sha`` match the
-       live PR and whose ``createdAt`` is at or after
-       ``dispatched_at``. Reject runs on ``main``, runs on another
-       SHA, runs on another PR, and earlier dispatches.
-    5. Wait (bounded) for the ``review-comment-gate`` job of that
-       run to reach a terminal state.
-    6. Return ``0`` only when the exact-head dispatched gate is
-       ``completed`` with ``conclusion=success``; ``1`` when
-       ``conclusion=failure``; ``2`` (INCONCLUSIVE) when the
-       dispatch fails, the exact run cannot be identified, the
-       gate does not reach a terminal state within the bounded
-       timeout, or the run/head binding is uncertain.
+    2. List the ``pull_request`` CI runs for the live head.
+       Reject runs on the wrong branch, the wrong SHA, the
+       wrong workflow name, or the wrong event. Select the
+       newest unique run whose binding fields all match.
+    3. Fetch the run's jobs. Reject a run whose job list
+       cannot be fetched, whose ``review-comment-gate`` is
+       missing, or whose ``review-comment-gate`` is
+       duplicated. Reject a job without an integer
+       ``databaseId``.
+    4. Record the run's current ``attempt`` count, the run's
+       ``databaseId``, and the target job's pre-rerun
+       ``status`` and ``conclusion``.
+    5. Invoke ``gh run rerun <run-id> --repo <repo> --job
+       <job-database-id>`` exactly once.
+    6. Boundedly poll the same run under a timeout until the
+       attempt count is strictly greater than the pre-rerun
+       attempt, the ``review-comment-gate`` is present in the
+       new attempt, and the gate has reached a terminal state.
+    7. Return ``0`` only when the rerun attempt's terminal
+       conclusion is ``success``; ``1`` when it is ``failure``;
+       ``2`` (INCONCLUSIVE) on missing, duplicate, malformed,
+       stale, uncertain or timed-out evidence.
 
-    The local ``check_pr_review_comments.py`` invocation remains
-    ONLY as diagnostic / preflight evidence. It is NOT the
-    authoritative required-check result. The authoritative result
-    is the workflow-dispatch check attached to the exact PR head
-    and visible through exact-head check inspection
-    (``fetch_ci_conclusions``).
-
-    Tests inject ``dispatch_runner``, ``pr_view_runner``,
+    Tests inject ``rerun_runner``, ``pr_view_runner``,
     ``list_runner``, ``view_runner`` so the GitHub surface is
     exercised deterministically. The default runner is
-    ``subprocess.run``.
+    ``subprocess.run``. ``dry-run`` is honored: when set,
+    rerun_runner is NOT invoked and the report records
+    ``would_rerun=True`` without mutation.
     """
     repo = args.repo
     pr_number = args.pr_number
@@ -1123,110 +1365,156 @@ def cmd_gate_recheck(args: argparse.Namespace) -> int:
         return 2
     if not live_head_branch:
         sys.stderr.write(
-            "gate-recheck: live PR view has no headRefName; cannot bind dispatch\n"
+            "gate-recheck: live PR view has no headRefName; cannot bind rerun\n"
         )
         return 2
 
-    # Step 2: dispatch the CI workflow bound to the live PR branch.
-    # The ``--ref <live-head-branch>`` is the critical binding: a
-    # ``gh workflow run`` without ``--ref`` would target the
-    # repository's default branch (``main``) and not create a check
-    # attached to the PR head.
-    dispatched_at = dt.datetime.now(dt.timezone.utc)
-    dispatch_runner = getattr(args, "dispatch_runner", None) or subprocess.run
-    dispatch_cmd = [
-        "gh", "workflow", "run", "ci.yml",
-        "--repo", repo,
-        "--ref", live_head_branch,
-        "-f", f"pr_number={pr_number}",
-        "-f", f"head_sha={head_sha}",
-        "-f", "gate=review-comment-gate",
-    ]
-    try:
-        dispatch_proc = dispatch_runner(
-            dispatch_cmd, capture_output=True, text=True, timeout=60
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        sys.stderr.write(f"gate-recheck dispatch failed: {exc}\n")
-        return 2
-    if dispatch_proc.returncode != 0:
-        sys.stderr.write(
-            f"gate-recheck dispatch returned {dispatch_proc.returncode}: "
-            f"{dispatch_proc.stderr.strip()[:300]}\n"
-        )
-        return 2
-
-    # Step 3: bounded wait for the dispatched workflow_dispatch run
-    # to appear in the GitHub Actions API. GitHub may accept the
-    # dispatch a few hundred milliseconds before ``gh run list``
-    # exposes the new run; the previous implementation polled
-    # exactly once and returned INCONCLUSIVE on that race. We now
-    # poll bounded. The dispatch is NOT re-issued during polling.
     list_runner = getattr(args, "list_runner", None) or subprocess.run
     view_runner = getattr(args, "view_runner", None) or list_runner
-    discovery_timeout_seconds = int(
-        getattr(args, "discovery_timeout_seconds", 60) or 60
-    )
-    discovery_poll_seconds = int(
-        getattr(args, "discovery_poll_seconds", 2) or 2
-    )
-    run, err = _wait_for_dispatch_run(
-        repo,
-        "ci.yml",
+    rerun_runner = getattr(args, "rerun_runner", None) or subprocess.run
+    dry_run = bool(getattr(args, "dry_run", False))
+
+    # Step 2: find the existing exact-head pull_request run.
+    run, err = _find_exact_head_pull_request_run(
+        repo=repo,
         head_sha=head_sha,
         head_branch=live_head_branch,
-        pr_number=pr_number,
-        dispatched_at=dispatched_at,
-        timeout_seconds=discovery_timeout_seconds,
-        poll_seconds=discovery_poll_seconds,
         list_runner=list_runner,
     )
     if err or run is None:
-        sys.stderr.write(f"gate-recheck: cannot identify dispatch run: {err}\n")
+        sys.stderr.write(f"gate-recheck: cannot identify pull_request run: {err}\n")
         return 2
     run_id = run.get("databaseId")
     if not isinstance(run_id, int):
         sys.stderr.write(
-            "gate-recheck: dispatch run has no databaseId; refusing\n"
+            "gate-recheck: pull_request run has no databaseId; refusing\n"
         )
         return 2
+    pre_attempt = _read_run_attempt_count(
+        repo, run_id, view_runner=view_runner,
+    )
+    if pre_attempt is None:
+        sys.stderr.write(
+            "gate-recheck: pull_request run has no attempt count; refusing\n"
+        )
+        return 2
+    if not (run.get("url") or ""):
+        sys.stderr.write(
+            "gate-recheck: pull_request run has no url; refusing\n"
+        )
+        return 2
+
+    # Step 3: fetch the run's jobs, find review-comment-gate.
+    target_job, target_err = _find_target_gate_job(
+        repo, run_id, view_runner=view_runner,
+    )
+    if target_err or target_job is None:
+        sys.stderr.write(
+            f"gate-recheck: cannot identify review-comment-gate job: "
+            f"{target_err}\n"
+        )
+        return 2
+    target_job_id = target_job.get("databaseId")
+    if not isinstance(target_job_id, int):
+        sys.stderr.write(
+            "gate-recheck: target job has no integer databaseId; refusing\n"
+        )
+        return 2
+
+    # Step 4: report pre-rerun state.
     sys.stdout.write(
         json.dumps({
             "tool": "aed_pr.gate_recheck",
-            "dispatched_run": {
+            "exact_head_pull_request_run": {
                 "databaseId": run_id,
                 "name": run.get("name"),
                 "headBranch": run.get("headBranch"),
                 "headSha": run.get("headSha"),
                 "event": run.get("event"),
-                "createdAt": run.get("createdAt"),
+                "workflowName": run.get("workflowName"),
                 "url": run.get("url"),
+                "pre_rerun_attempt": pre_attempt,
+            },
+            "target_job": {
+                "databaseId": target_job_id,
+                "name": target_job.get("name"),
+                "pre_status": target_job.get("status"),
+                "pre_conclusion": target_job.get("conclusion"),
             },
         }, indent=2)
     )
     sys.stdout.write("\n")
 
-    # Step 4: bounded wait for the ``review-comment-gate`` job.
-    timeout_seconds = int(getattr(args, "wait_timeout_seconds", 600) or 600)
-    poll_seconds = int(getattr(args, "wait_poll_seconds", 10) or 10)
-    job, wait_err = _wait_for_gate_job(
-        repo, run_id,
-        timeout_seconds=timeout_seconds,
-        poll_seconds=poll_seconds,
-        list_runner=view_runner,
-    )
-    if job is None:
+    if dry_run:
+        sys.stdout.write(
+            json.dumps({
+                "tool": "aed_pr.gate_recheck",
+                "would_rerun": True,
+                "rerun_argv": [
+                    "gh", "run", "rerun", str(run_id),
+                    "--repo", repo, "--job", str(target_job_id),
+                ],
+            }, indent=2)
+        )
+        sys.stdout.write("\n")
+        return 0
+
+    # Step 5: invoke ``gh run rerun --job <id>`` exactly once.
+    rerun_cmd = [
+        "gh", "run", "rerun", str(run_id),
+        "--repo", repo, "--job", str(target_job_id),
+    ]
+    try:
+        rerun_proc = rerun_runner(
+            rerun_cmd, capture_output=True, text=True, timeout=60
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        sys.stderr.write(f"gate-recheck rerun failed: {exc}\n")
+        return 2
+    if rerun_proc.returncode != 0:
         sys.stderr.write(
-            f"gate-recheck: review-comment-gate did not complete: {wait_err}\n"
+            f"gate-recheck rerun returned {rerun_proc.returncode}: "
+            f"{(rerun_proc.stderr or '').strip()[:300]}\n"
         )
         return 2
-    conclusion = (job.get("conclusion") or "").lower()
+
+    # Step 6: bounded wait for the new attempt.
+    timeout_seconds = int(getattr(args, "wait_timeout_seconds", 600) or 600)
+    poll_seconds = int(getattr(args, "wait_poll_seconds", 10) or 10)
+    final_job, final_err, final_attempt = _wait_for_rerun_attempt(
+        repo=repo,
+        run_id=run_id,
+        pre_rerun_attempt=pre_attempt,
+        target_job_name="review-comment-gate",
+        timeout_seconds=timeout_seconds,
+        poll_seconds=poll_seconds,
+        view_runner=view_runner,
+    )
+    if final_job is None or final_attempt is None:
+        sys.stderr.write(
+            f"gate-recheck: rerun attempt did not appear: {final_err}\n"
+        )
+        return 2
+    conclusion = (final_job.get("conclusion") or "").lower()
+    sys.stdout.write(
+        json.dumps({
+            "tool": "aed_pr.gate_recheck",
+            "rerun_attempt": {
+                "databaseId": run_id,
+                "attempt": final_attempt,
+                "job_name": final_job.get("name"),
+                "job_id": final_job.get("databaseId"),
+                "status": final_job.get("status"),
+                "conclusion": final_job.get("conclusion"),
+                "url": final_job.get("url") or run.get("url"),
+            },
+        }, indent=2)
+    )
+    sys.stdout.write("\n")
     if conclusion == "success":
         return 0
     if conclusion == "failure":
         return 1
-    # Anything else (cancelled, skipped, neutral, empty) is
-    # INCONCLUSIVE - the merge path treats this as blocking.
     return 2
 
 
@@ -2930,24 +3218,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_gate_recheck.add_argument("--head-sha", required=True)
     p_gate_recheck.add_argument(
         "--wait-timeout-seconds", type=int, default=600,
-        help="Maximum time to wait for the dispatched gate to complete.",
+        help="Maximum time to wait for the rerun attempt to terminal.",
     )
     p_gate_recheck.add_argument(
         "--wait-poll-seconds", type=int, default=10,
-        help="Polling interval when waiting for the dispatched gate.",
+        help="Polling interval when waiting for the rerun attempt.",
     )
     p_gate_recheck.add_argument(
-        "--discovery-timeout-seconds", type=int, default=60,
+        "--dry-run", action="store_true",
         help=(
-            "Maximum time to wait for the dispatched workflow_dispatch "
-            "run to appear in the GitHub Actions API. The dispatch "
-            "is issued exactly once; this timeout only bounds the "
-            "subsequent run-list polling."
+            "Identify the exact-head pull_request CI run and the "
+            "review-comment-gate job without invoking ``gh run "
+            "rerun``."
         ),
-    )
-    p_gate_recheck.add_argument(
-        "--discovery-poll-seconds", type=int, default=2,
-        help="Polling interval while waiting for the dispatched run to appear.",
     )
     p_gate_recheck.set_defaults(func=cmd_gate_recheck)
 

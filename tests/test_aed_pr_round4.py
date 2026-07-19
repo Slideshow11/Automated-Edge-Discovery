@@ -1837,535 +1837,427 @@ class TestRound5Finding1ScopeWriteRepoArg:
         assert "repo" in read_err.lower() or "invalid" in read_err.lower()
 
 
-class TestRound5Finding2GateRecheckDispatchesCI:
-    def test_gate_recheck_invokes_workflow_run_with_ref(self):
-        """``gate-recheck`` MUST invoke ``gh workflow run ci.yml``
-        with ``--ref <live PR head branch>`` so the run is bound
-        to the PR branch and not the repository default.
+class TestRound10GateRecheckRerunsExactHeadGate:
+    """Round-10 follow-up (Codex review on ``f3c8c06``):
 
-        Round-5 Codex finding 3604451971.
-        """
-        from unittest import mock
-        dispatch_invocations = []
-        list_invocations = []
-        view_invocations = []
+    gate-recheck no longer dispatches ``ci.yml`` with
+    ``gate=review-comment-gate`` (which used conditional ``if:``
+    guards that let GitHub report skipped jobs as successful
+    checks). Instead, it finds the existing exact-head
+    ``pull_request`` CI run and reruns its
+    ``review-comment-gate`` job via ``gh run rerun --job <id>``.
 
-        def fake_dispatch(cmd, *a, **kw):
-            dispatch_invocations.append(list(cmd))
-            return mock.Mock(returncode=0, stdout="", stderr="")
+    The new tests prove the rerun-based flow is correct, the
+    rerun argv uses the integer ``databaseId``, only the gate
+    job is rerun, and ordinary jobs are not affected.
+    """
 
-        def fake_list(cmd, *a, **kw):
-            list_invocations.append(list(cmd))
-            # Return one matching run with ``createdAt`` set to
-            # "now" so it qualifies as "at or after dispatched_at".
-            import datetime as _dt
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([{
-                    "databaseId": 29593005015, "name": "CI",
-                    "event": "workflow_dispatch",
-                    "headBranch": "reduction/pr-lifecycle-collapse-v1",
-                    "headSha": DEFAULT_HEAD,
-                    "status": "completed", "conclusion": "success",
-                    "createdAt": _dt.datetime.now(
-                        _dt.timezone.utc
-                    ).isoformat(),
-                    "url": "https://example/runs/29593005015",
-                    "workflowName": "CI",
-                    "workflowDatabaseId": 263541549,
-                }]),
-                stderr="",
-            )
+    @staticmethod
+    def _live_view():
+        return {
+            "number": 411, "title": "t", "state": "OPEN",
+            "isDraft": False, "mergeable": True,
+            "headRefOid": DEFAULT_HEAD,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "b" * 40, "baseRefName": "main",
+            "additions": 0, "deletions": 0, "changedFiles": 0,
+            "url": "u", "files": [],
+        }
 
-        def fake_view(cmd, *a, **kw):
-            view_invocations.append(list(cmd))
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]}),
-                stderr="",
-            )
+    @staticmethod
+    def _pr_view_runner():
+        return lambda *a, **kw: mock.Mock(
+            returncode=0,
+            stdout=json.dumps(
+                TestRound10GateRecheckRerunsExactHeadGate._live_view()
+            ),
+            stderr="",
+        )
 
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
+    @staticmethod
+    def _make_run(*, event="pull_request", workflow_name="CI",
+                  head_sha=DEFAULT_HEAD,
+                  head_branch="reduction/pr-lifecycle-collapse-v1",
+                  databaseId=29689308922, name="CI",
+                  status="completed", conclusion="success",
+                  url=None):
+        if url is None:
+            url = f"https://example/runs/{databaseId}"
+        import datetime as _dt
+        return {
+            "databaseId": databaseId, "name": name, "event": event,
+            "headBranch": head_branch, "headSha": head_sha,
+            "status": status, "conclusion": conclusion,
+            "createdAt": _dt.datetime.now(
+                _dt.timezone.utc
+            ).isoformat(),
+            "url": url,
+            "workflowName": workflow_name,
+        }
 
+    @staticmethod
+    def _ns(*, list_payload=None, attempt_returns=None,
+            job_payload=None, rerun_failure=False,
+            head_mismatch=False):
         ns = mock.Mock()
         ns.repo = DEFAULT_REPO
         ns.pr_number = 411
         ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
+        ns.wait_timeout_seconds = 3
         ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        ctrl.cmd_gate_recheck(ns)
-
-        assert dispatch_invocations, (
-            "gate-recheck must dispatch the CI workflow"
+        ns.dry_run = False
+        live = dict(
+            TestRound10GateRecheckRerunsExactHeadGate._live_view()
         )
-        argv = dispatch_invocations[0]
-        assert argv[0:3] == ["gh", "workflow", "run"]
-        assert "ci.yml" in argv
-        # CRITICAL: --ref must bind to the live PR branch, not main.
-        assert "--ref" in argv, (
-            "dispatch must include --ref to bind to the PR branch"
+        if head_mismatch:
+            live["headRefOid"] = "f" * 40
+        ns.pr_view_runner = TestRound10GateRecheckRerunsExactHeadGate._pr_view_runner()
+        ns.rerun_runner = (
+            (lambda *a, **kw: mock.Mock(
+                returncode=1, stdout="", stderr="rerun failed"
+            ))
+            if rerun_failure
+            else (lambda *a, **kw: mock.Mock(
+                returncode=0, stdout="", stderr=""
+            ))
         )
-        ref_idx = argv.index("--ref")
-        assert argv[ref_idx + 1] == "reduction/pr-lifecycle-collapse-v1", (
-            f"--ref must be the live PR branch; got {argv[ref_idx + 1]!r}"
+        ns.list_runner = (
+            lambda *a, **kw: mock.Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    list_payload if list_payload is not None
+                    else [
+                        TestRound10GateRecheckRerunsExactHeadGate._make_run()
+                    ]
+                ),
+                stderr="",
+            )
         )
-        assert "main" not in [
-            a for a in argv[ref_idx:] if isinstance(a, str)
-        ], "main must not appear as the dispatch ref"
-        # pr_number and head_sha inputs are passed.
-        assert any("411" in str(x) for x in argv)
-        assert any(DEFAULT_HEAD in str(x) for x in argv)
+        # Default attempt returns: first call returns pre
+        # (default 1), second call returns 2 (post-rerun).
+        if attempt_returns is None:
+            attempt_returns = [2]
+        attempt_state = {"attempt_calls": 0, "values": list(attempt_returns)}
+        # Capture via default arg to avoid Python's
+        # UnboundLocalError when the closure reads
+        # ``job_payload``.
+        jp = job_payload
+        def _view(cmd, *a, **kw):
+            if "--json" in cmd and "attempt" in cmd[cmd.index("--json") + 1]:
+                idx = attempt_state["attempt_calls"]
+                attempt_state["attempt_calls"] += 1
+                if idx == 0:
+                    value = 1
+                else:
+                    value = (
+                        attempt_state["values"][idx - 1]
+                        if idx - 1 < len(attempt_state["values"])
+                        else attempt_state["values"][-1]
+                    )
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"attempt": value}),
+                    stderr="",
+                )
+            payload = jp
+            if payload is None:
+                payload = {
+                    "jobs": [{
+                        "name": "review-comment-gate",
+                        "databaseId": 29689308922,
+                        "status": "completed",
+                        "conclusion": "success",
+                    }]
+                }
+            return mock.Mock(
+                returncode=0,
+                stdout=json.dumps(payload),
+                stderr="",
+            )
+        ns.view_runner = _view
+        return ns
 
-    def test_gate_recheck_dispatch_failure_skips_run_list(self):
-        """When dispatch fails, the run-list and run-view steps
-        MUST NOT be invoked. The controller returns INCONCLUSIVE."""
-        from unittest import mock
-        list_invocations = []
-        view_invocations = []
+    def test_exact_head_pull_request_run_is_selected(self):
+        """The run-list query is scoped to the exact head
+        branch and commit; only ``event=pull_request`` runs
+        are accepted."""
+        seen = []
+        list_payload = [self._make_run()]
+        ns = self._ns(list_payload=list_payload)
+        orig_list = ns.list_runner
+        def _spy(cmd, *a, **kw):
+            seen.append(list(cmd))
+            return orig_list(cmd, *a, **kw)
+        ns.list_runner = _spy
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 0
+        assert len(seen) == 1
+        argv = seen[0]
+        assert "--workflow" in argv and "ci.yml" in argv
+        assert "--event" in argv and "pull_request" in argv
+        assert "--branch" in argv
+        assert "reduction/pr-lifecycle-collapse-v1" in argv
+        assert "--commit" in argv
+        assert DEFAULT_HEAD in argv
 
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=1, stdout="", stderr="err")
+    def test_workflow_dispatch_run_is_rejected(self):
+        """A ``workflow_dispatch`` run on the same head is
+        REJECTED; only ``event=pull_request`` runs are
+        acceptable."""
+        list_payload = [self._make_run(event="workflow_dispatch")]
+        ns = self._ns(list_payload=list_payload)
+        # The dispatch run is not even attempted for rerun.
+        ns.rerun_runner = mock.Mock()
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2
+        ns.rerun_runner.assert_not_called()
 
-        def fake_list(cmd, *a, **kw):
-            list_invocations.append(list(cmd))
-            return mock.Mock(returncode=0, stdout="[]", stderr="")
+    def test_wrong_head_is_rejected(self):
+        """A run on a different head SHA is rejected."""
+        list_payload = [self._make_run(head_sha="f" * 40)]
+        ns = self._ns(list_payload=list_payload)
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2
 
-        def fake_view(cmd, *a, **kw):
-            view_invocations.append(list(cmd))
+    def test_wrong_branch_is_rejected(self):
+        """A run on the right SHA but wrong branch is
+        rejected."""
+        list_payload = [
+            self._make_run(head_branch="some-other-branch"),
+        ]
+        ns = self._ns(list_payload=list_payload)
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2
+
+    def test_wrong_workflow_name_is_rejected(self):
+        """A run on the right head+branch but wrong workflow
+        name is rejected."""
+        list_payload = [self._make_run(workflow_name="OTHER")]
+        ns = self._ns(list_payload=list_payload)
+        result = ctrl.cmd_gate_recheck(ns)
+        assert result == 2
+
+    def test_missing_run_id_fails(self):
+        """A matching run without an integer ``databaseId``
+        is rejected (the run is dropped from candidates)."""
+        # Two runs: one with no dbId (dropped), one with dbId.
+        list_payload = [
+            {"event": "pull_request", "headBranch":
+             "reduction/pr-lifecycle-collapse-v1",
+             "headSha": DEFAULT_HEAD, "workflowName": "CI",
+             "url": "https://example/runs/1"},
+            self._make_run(databaseId=29689308922),
+        ]
+        ns = self._ns(list_payload=list_payload)
+        assert ctrl.cmd_gate_recheck(ns) == 0
+
+    def test_missing_review_comment_gate_fails(self):
+        """A run without a ``review-comment-gate`` job is
+        rejected."""
+        job_payload = {"jobs": [{
+            "name": "test",
+            "databaseId": 123,
+            "status": "completed",
+            "conclusion": "success",
+        }]}
+        ns = self._ns(job_payload=job_payload)
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_duplicate_review_comment_gate_fails(self):
+        """A run with two ``review-comment-gate`` jobs is
+        rejected; rerun cannot deterministically pick one."""
+        job_payload = {"jobs": [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+            {"name": "review-comment-gate", "databaseId": 2,
+             "status": "completed", "conclusion": "success"},
+        ]}
+        ns = self._ns(job_payload=job_payload)
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_job_database_id_is_used_in_rerun(self):
+        """The rerun argv MUST use the integer
+        ``databaseId`` from the ``review-comment-gate``
+        job."""
+        seen_rerun = []
+        job_id = 29689308999
+        job_payload = {"jobs": [{
+            "name": "review-comment-gate",
+            "databaseId": job_id,
+            "status": "completed", "conclusion": "success",
+        }]}
+        ns = self._ns(job_payload=job_payload)
+        orig = ns.rerun_runner
+        def _spy(cmd, *a, **kw):
+            seen_rerun.append(list(cmd))
+            return orig(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        assert len(seen_rerun) == 1
+        argv = seen_rerun[0]
+        assert argv[:3] == ["gh", "run", "rerun"]
+        # The job databaseId is the last argument (after --job).
+        assert "--job" in argv
+        idx = argv.index("--job")
+        assert argv[idx + 1] == str(job_id)
+
+    def test_only_one_rerun_mutation_occurs(self):
+        """The controller MUST invoke the rerun runner
+        exactly once, even if polling continues for the new
+        attempt."""
+        ns = self._ns()
+        orig = ns.rerun_runner
+        calls = []
+        def _spy(cmd, *a, **kw):
+            calls.append(cmd)
+            return orig(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        assert len(calls) == 1
+
+    def test_first_poll_shows_old_attempt_later_new_attempt(self):
+        """When the first attempt-count read returns the
+        pre-rerun value, polling continues; the next read
+        returns the new value and the gate terminalizes."""
+        # attempt_returns is consumed in order: 1, 1, 2.
+        ns = self._ns(attempt_returns=[1, 1, 2])
+        assert ctrl.cmd_gate_recheck(ns) == 0
+
+    def test_successful_target_job_passes(self):
+        """A terminal success on the rerun attempt returns 0."""
+        ns = self._ns()
+        assert ctrl.cmd_gate_recheck(ns) == 0
+
+    def test_failed_target_job_blocks(self):
+        """A terminal failure on the rerun attempt returns 1."""
+        job_payload = {"jobs": [{
+            "name": "review-comment-gate",
+            "databaseId": 29689308999,
+            "status": "completed", "conclusion": "failure",
+        }]}
+        ns = self._ns(job_payload=job_payload)
+        assert ctrl.cmd_gate_recheck(ns) == 1
+
+    def test_pending_target_job_times_out(self):
+        """When the attempt count never exceeds
+        ``pre_rerun_attempt``, gate-recheck times out (2)."""
+        # attempt_returns stays at 1 forever.
+        ns = self._ns(attempt_returns=[1])
+        assert ctrl.cmd_gate_recheck(ns) == 2
+
+    def test_malformed_attempt_data_fails(self):
+        """When ``gh run view --json attempt`` returns a
+        malformed payload, gate-recheck refuses."""
+        def _view(cmd, *a, **kw):
+            if "--json" in cmd and "attempt" in cmd[
+                cmd.index("--json") + 1
+            ]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout="not json",
+                    stderr="",
+                )
             return mock.Mock(
                 returncode=0,
                 stdout=json.dumps({"jobs": []}),
                 stderr="",
             )
+        ns = self._ns()
+        ns.view_runner = _view
+        assert ctrl.cmd_gate_recheck(ns) == 2
 
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
+    def test_ordinary_jobs_are_not_rerun(self):
+        """The rerun MUST target only the
+        ``review-comment-gate`` job. The controller never
+        invokes a separate workflow dispatch; the rerun
+        argv contains a single ``--job <id>`` reference."""
+        seen_rerun = []
+        ns = self._ns()
+        orig = ns.rerun_runner
+        def _spy(cmd, *a, **kw):
+            seen_rerun.append(list(cmd))
+            return orig(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        argv = seen_rerun[0]
+        # Exactly one --job flag.
+        assert argv.count("--job") == 1
+        # The argv does NOT contain ``gh workflow run``.
+        assert "workflow" not in argv or "run" not in argv
 
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-        ns.pr_view_runner = fake_pr_view
+    def test_no_skipped_job_satisfies_required_check(self):
+        """No ordinary CI job is skipped by the rerun-based
+        flow. The rerun argv targets one job; the
+        underlying CI workflow's run is unchanged otherwise.
+        """
+        # The run's job list contains all five ordinary jobs;
+        # only review-comment-gate is rerun.
+        job_payload = {"jobs": [
+            {"name": "review-comment-gate", "databaseId": 29689308999,
+             "status": "completed", "conclusion": "success"},
+            {"name": "test", "databaseId": 29689309000,
+             "status": "completed", "conclusion": "success"},
+            {"name": "validator", "databaseId": 29689309001,
+             "status": "completed", "conclusion": "success"},
+        ]}
+        ns = self._ns(job_payload=job_payload)
+        seen_rerun = []
+        orig = ns.rerun_runner
+        def _spy(cmd, *a, **kw):
+            seen_rerun.append(list(cmd))
+            return orig(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        argv = seen_rerun[0]
+        # The rerun argv's --job arg points at the
+        # review-comment-gate databaseId only.
+        idx = argv.index("--job")
+        assert argv[idx + 1] == "29689308999"
 
-        result = ctrl.cmd_gate_recheck(ns)
-        assert result == 2  # INCONCLUSIVE
-        assert not list_invocations, (
-            "run list must not run when dispatch fails"
-        )
-        assert not view_invocations, (
-            "run view must not run when dispatch fails"
-        )
+    def test_dry_run_does_not_invoke_rerun(self):
+        """``--dry-run`` records ``would_rerun=True`` without
+        invoking the rerun runner."""
+        ns = self._ns()
+        ns.dry_run = True
+        seen_rerun = []
+        orig = ns.rerun_runner
+        def _spy(cmd, *a, **kw):
+            seen_rerun.append(cmd)
+            return orig(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        assert seen_rerun == []
 
-    def test_gate_recheck_rejects_run_on_main(self):
-        """A workflow run tied to ``main`` is rejected because it
-        is not bound to the exact PR head."""
-        from unittest import mock
-
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        # Run on main instead of the PR branch
-        main_run = {
-            "databaseId": 1, "name": "CI",
-            "event": "workflow_dispatch",
-            "headBranch": "main",
-            "headSha": DEFAULT_HEAD,
-            "status": "completed", "conclusion": "success",
-            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "url": "https://example/runs/1",
-            "workflowName": "CI",
-            "workflowDatabaseId": 263541549,
-        }
-
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([main_run]),
-                stderr="",
-            )
-
-        def fake_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]}),
-                stderr="",
-            )
-
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        result = ctrl.cmd_gate_recheck(ns)
-        assert result == 2, (
-            f"a main-branch run must NOT be selected; got {result}"
-        )
-
-    def test_gate_recheck_rejects_run_on_other_sha(self):
-        """A run whose head_sha does not match the live PR head is
-        rejected."""
-        from unittest import mock
-
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        wrong_sha_run = {
-            "databaseId": 2, "name": "CI",
-            "event": "workflow_dispatch",
-            "headBranch": "reduction/pr-lifecycle-collapse-v1",
-            "headSha": "f" * 40,  # wrong head SHA
-            "status": "completed", "conclusion": "success",
-            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "url": "https://example/runs/2",
-            "workflowName": "CI",
-            "workflowDatabaseId": 263541549,
-        }
-
-        def fake_list(cmd, *a, **kw):
-            run = dict(wrong_sha_run)
-            run["createdAt"] = _dt.datetime.now(
-                _dt.timezone.utc
-            ).isoformat()
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([run]),
-                stderr="",
-            )
-
-        def fake_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]}),
-                stderr="",
-            )
-
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        result = ctrl.cmd_gate_recheck(ns)
-        assert result == 2, (
-            f"a wrong-SHA run must NOT be selected; got {result}"
-        )
-
-    def test_gate_recheck_rejects_older_run(self):
-        """A run that pre-dates the dispatch attempt is rejected.
-
-        The controller records ``dispatched_at`` immediately
-        before the ``gh workflow run`` call; any run with
-        ``createdAt`` BEFORE ``dispatched_at`` is from a previous
-        dispatch and must NOT be selected."""
-        from unittest import mock
-
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        # Run created one hour BEFORE the dispatch attempt would
-        # be considered by the strict matcher.
-        older_run = {
-            "databaseId": 3, "name": "CI",
-            "event": "workflow_dispatch",
-            "headBranch": "reduction/pr-lifecycle-collapse-v1",
-            "headSha": DEFAULT_HEAD,
-            "status": "completed", "conclusion": "success",
-            "createdAt": "2026-07-17T10:00:00Z",  # older than dispatch
-            "url": "https://example/runs/3",
-            "workflowName": "CI",
-            "workflowDatabaseId": 263541549,
-        }
-
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([older_run]),
-                stderr="",
-            )
-
-        def fake_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]}),
-                stderr="",
-            )
-
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        result = ctrl.cmd_gate_recheck(ns)
-        assert result == 2, (
-            f"an older run must NOT be selected; got {result}"
-        )
-
-    def test_gate_recheck_local_check_does_not_substitute_for_ci_run(self):
-        """The local ``check_pr_review_comments.py`` script result
-        must NOT be treated as a GitHub Actions required-check
-        result. A local CLEAN with no matching dispatched run
-        returns INCONCLUSIVE, NOT 0."""
-        from unittest import mock
-
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        def fake_list(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([]),  # no dispatched run
-                stderr="",
-            )
-
-        def fake_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "success",
-                }]}),
-                stderr="",
-            )
-
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        result = ctrl.cmd_gate_recheck(ns)
-        # A clean local check alone cannot make gate-recheck return 0
-        # when there is no matching GitHub Actions run.
-        assert result != 0, (
-            f"a local clean without a matching run must NOT return 0; "
-            f"got {result}"
-        )
-        assert result == 2, (
-            f"a missing dispatched run must return INCONCLUSIVE; got {result}"
-        )
-
-    def test_gate_recheck_terminal_blocking_returns_blocking(self):
-        """When the dispatched gate's conclusion is ``failure``,
-        return 1 (exact-head blocking)."""
-        from unittest import mock
-
-        def fake_dispatch(cmd, *a, **kw):
-            return mock.Mock(returncode=0, stdout="", stderr="")
-
-        matching_run = {
-            "databaseId": 4, "name": "CI",
-            "event": "workflow_dispatch",
-            "headBranch": "reduction/pr-lifecycle-collapse-v1",
-            "headSha": DEFAULT_HEAD,
-            "status": "completed", "conclusion": "failure",
-            "createdAt": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "url": "https://example/runs/4",
-            "workflowName": "CI",
-            "workflowDatabaseId": 263541549,
-        }
-
-        def fake_list(cmd, *a, **kw):
-            # Generate the run's createdAt AT call time so it is
-            # always >= the dispatched_at the controller records.
-            run = dict(matching_run)
-            run["createdAt"] = _dt.datetime.now(
-                _dt.timezone.utc
-            ).isoformat()
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps([run]),
-                stderr="",
-            )
-
-        def fake_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({"jobs": [{
-                    "name": "review-comment-gate",
-                    "status": "completed",
-                    "conclusion": "failure",
-                }]}),
-                stderr="",
-            )
-
-        def fake_pr_view(cmd, *a, **kw):
-            return mock.Mock(
-                returncode=0,
-                stdout=json.dumps({
-                    "number": 411, "title": "t", "state": "OPEN",
-                    "isDraft": False, "mergeable": True,
-                    "headRefOid": DEFAULT_HEAD,
-                    "headRefName": "reduction/pr-lifecycle-collapse-v1",
-                    "baseRefOid": "b" * 40, "baseRefName": "main",
-                    "additions": 0, "deletions": 0, "changedFiles": 0,
-                    "url": "u", "files": [],
-                }),
-                stderr="",
-            )
-
-        ns = mock.Mock()
-        ns.repo = DEFAULT_REPO
-        ns.pr_number = 411
-        ns.head_sha = DEFAULT_HEAD
-        ns.wait_timeout_seconds = 30
-        ns.wait_poll_seconds = 1
-        ns.discovery_timeout_seconds = 5
-        ns.discovery_poll_seconds = 1
-        ns.dispatch_runner = fake_dispatch
-        ns.list_runner = fake_list
-        ns.view_runner = fake_view
-        ns.pr_view_runner = fake_pr_view
-
-        result = ctrl.cmd_gate_recheck(ns)
-        assert result == 1, (
-            f"exact-head blocking must return 1; got {result}"
-        )
+    def test_dispatching_ci_yml_with_gate_input_is_not_invoked(self):
+        """The new flow NEVER invokes ``gh workflow run``;
+        it only invokes ``gh run rerun --job <id>`` against
+        an existing exact-head pull_request run."""
+        ns = self._ns()
+        seen_cmds = []
+        orig_rerun = ns.rerun_runner
+        def _spy(cmd, *a, **kw):
+            seen_cmds.append(list(cmd))
+            return orig_rerun(cmd, *a, **kw)
+        ns.rerun_runner = _spy
+        # Also spy on list_runner (which would receive the
+        # ``--commit <sha>`` query) and view_runner to
+        # capture the new command shape.
+        seen_lists = []
+        orig_list = ns.list_runner
+        def _list_spy(cmd, *a, **kw):
+            seen_lists.append(list(cmd))
+            return orig_list(cmd, *a, **kw)
+        ns.list_runner = _list_spy
+        assert ctrl.cmd_gate_recheck(ns) == 0
+        # The list query uses --commit <sha> + --event pull_request.
+        list_argv = seen_lists[0]
+        assert "--commit" in list_argv
+        assert "pull_request" in list_argv
+        # The rerun query does NOT use ``workflow run``.
+        rerun_argv = seen_cmds[0]
+        assert "workflow" not in rerun_argv
+        assert "run" != rerun_argv[2]
+        assert rerun_argv[2] == "rerun"
 
 
 # ---------------------------------------------------------------------------
@@ -3347,10 +3239,11 @@ class TestRound9CodexPingActualTrigger:
 
 
 class TestRound9GateOnlyDispatchWorkflowContract:
-    """Round-9 follow-up (Codex comment 3609867546 on 62f20b6):
-
-    a workflow_dispatch with gate=review-comment-gate must NOT
-    run the ordinary CI jobs. Only review-comment-gate runs.
+    """Round-10 follow-up: the round-9 gate-only workflow_dispatch
+    guards have been removed entirely. Gate-only dispatch no
+    longer exists; gate-recheck now uses ``gh run rerun --job``
+    against the existing exact-head pull_request CI run, so
+    none of the ordinary jobs need to be skipped.
     """
 
     def _load_workflow(self):
@@ -3365,34 +3258,70 @@ class TestRound9GateOnlyDispatchWorkflowContract:
         assert name in jobs, f"job {name!r} not in workflow"
         return jobs[name]
 
-    def test_all_four_ordinary_jobs_have_gate_only_guard(self):
+    def test_workflow_dispatch_block_was_removed(self):
+        """The round-9 ``workflow_dispatch`` block was removed; the
+        operator-facing rerun path now uses ``gh run rerun
+        --job <id>`` against the existing pull_request run."""
+        wf = self._load_workflow()
+        on = wf.get(True) or wf.get("on") or {}
+        # YAML's ``on`` key is parsed as the boolean ``True``.
+        assert "workflow_dispatch" not in on, (
+            "workflow_dispatch block must be removed; the "
+            "controller uses ``gh run rerun`` instead"
+        )
+
+    def test_ordinary_jobs_have_no_gate_only_guard(self):
+        """The four ordinary jobs must NOT carry the
+        ``inputs.gate != 'review-comment-gate'`` guard any more.
+        That guard was the round-9 mechanism and was
+        removed in round-10 because it caused GitHub to
+        report conditionally-skipped jobs as successful
+        checks."""
         wf = self._load_workflow()
         jobs = wf["jobs"]
         for name in ("test", "validator",
                      "governance-validators", "pr-gate-live-smoke"):
             job = self._job(jobs, name)
-            assert "if" in job, (
-                f"job {name!r} must have an ``if`` guard"
-            )
-            guard = job["if"]
-            assert "github.event_name != 'workflow_dispatch'" in guard, (
-                f"job {name!r} guard does not mention "
-                f"workflow_dispatch"
-            )
-            assert "inputs.gate != 'review-comment-gate'" in guard, (
-                f"job {name!r} guard does not mention gate"
+            guard = job.get("if", "")
+            assert "inputs.gate" not in guard, (
+                f"job {name!r} must not carry a gate-input "
+                f"guard; the gate-dispatch route was removed"
             )
 
-    def test_review_comment_gate_remains_enabled(self):
+    def test_review_comment_gate_remains_intact(self):
+        """The pull_request review-comment-gate job remains
+        intact: it still runs on every PR push, exits 0/1/2
+        per the underlying script, and uploads its
+        artifact."""
         wf = self._load_workflow()
         job = self._job(wf["jobs"], "review-comment-gate")
-        assert "if" in job, "review-comment-gate must keep its guard"
-        guard = job["if"]
-        # The job must run on workflow_dispatch when gate is
-        # empty OR review-comment-gate.
-        assert "github.event_name == 'workflow_dispatch'" in guard
-        assert "inputs.gate == ''" in guard
-        assert "inputs.gate == 'review-comment-gate'" in guard
+        steps = job.get("steps") or []
+        run_step = next(
+            (s for s in steps
+             if s.get("name") == "Run review-comment gate"),
+            None,
+        )
+        assert run_step is not None, (
+            "review-comment-gate must keep its 'Run review-comment "
+            "gate' step"
+        )
+        env = run_step.get("env") or {}
+        # The PR_NUMBER / HEAD_SHA env vars must be set from
+        # the pull_request event directly.
+        assert (
+            env.get("PR_NUMBER")
+            == "${{ github.event.pull_request.number }}"
+        ), (
+            "review-comment-gate must read PR_NUMBER from "
+            "github.event.pull_request.number"
+        )
+        assert (
+            env.get("HEAD_SHA")
+            == "${{ github.event.pull_request.head.sha }}"
+        ), (
+            "review-comment-gate must read HEAD_SHA from "
+            "github.event.pull_request.head.sha"
+        )
 
 
 # ---------------------------------------------------------------------------

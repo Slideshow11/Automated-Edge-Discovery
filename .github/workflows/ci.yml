@@ -5,21 +5,6 @@ on:
     branches: [ main, 'fix/*', 'feat/*' ]
   pull_request:
     branches: [ main ]
-  workflow_dispatch:
-    inputs:
-      pr_number:
-        description: "PR number to evaluate (review-comment-gate re-trigger)"
-        required: false
-        type: string
-      head_sha:
-        description: "Exact head SHA to evaluate against (review-comment-gate re-trigger)"
-        required: false
-        type: string
-      gate:
-        description: "Optional gate to re-run; leave empty to run all"
-        required: false
-        type: string
-        default: ""
 
 permissions:
   pull-requests: read
@@ -31,17 +16,6 @@ concurrency:
 
 jobs:
   test:
-    # Round-9 follow-up: gate-only workflow_dispatch dispatches
-    # must NOT run this job. The operator-facing dispatch path is
-    # ``aed_pr gate-recheck --head-sha <sha>`` which sets
-    # ``gate=review-comment-gate``. The other three ordinary jobs
-    # (validator, governance-validators, pr-gate-live-smoke)
-    # carry the same guard. ``review-comment-gate`` runs on the
-    # full pull_request path AND on workflow_dispatch regardless
-    # of the gate input.
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.gate != 'review-comment-gate'
     runs-on: ubuntu-latest
     env:
       HERMES_HOME: /tmp/aed-hermes-home
@@ -108,10 +82,6 @@ jobs:
           path: /tmp/test_eval_artifacts
 
   validator:
-    # Round-9 follow-up: gate-only dispatch guard (see ``test``).
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.gate != 'review-comment-gate'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -129,10 +99,6 @@ jobs:
         run: bash scripts/ci/validate_event_options_contract.sh
 
   governance-validators:
-    # Round-9 follow-up: gate-only dispatch guard (see ``test``).
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.gate != 'review-comment-gate'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -150,17 +116,14 @@ jobs:
         run: bash scripts/ci/validate_governance_manifests.sh
 
   review-comment-gate:
-    # Round-3 fix: this gate runs on pull_request events AND on
-    # workflow_dispatch. The dispatch path is the minimal mechanism
-    # that lets the operator (or ``aed_pr gate-recheck``) re-evaluate
-    # the gate against the exact head AFTER a new Codex response
-    # arrives. INCONCLUSIVE never counts as success on either path;
-    # the underlying script exits with the correct code (0/1/2)
-    # and the step is failed when the script returns non-zero.
-    if: >-
-      github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' &&
-       (inputs.gate == '' || inputs.gate == 'review-comment-gate'))
+    # Round-3 fix: this gate runs on pull_request events. The
+    # operator-facing rerun path is ``aed_pr gate-recheck
+    # --head-sha <sha>`` which uses ``gh run rerun --job <id>``
+    # to rerun THIS job from the existing exact-head pull_request
+    # CI run; no workflow_dispatch is issued. INCONCLUSIVE never
+    # counts as success; the underlying script exits with the
+    # correct code (0/1/2) and the step is failed when the script
+    # returns non-zero.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -174,8 +137,8 @@ jobs:
       - name: Run review-comment gate
         env:
           GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
@@ -210,18 +173,7 @@ jobs:
           path: /tmp/review_comment_gate/
 
   pr-gate-live-smoke:
-    # Round-9 follow-up: gate-only dispatch guard (see ``test``).
-    # ``needs: [test]`` is preserved because the smoke harness
-    # depends on the test job having produced its coverage
-    # artifact on the full pull_request path. When ``test`` is
-    # skipped on a gate-only dispatch, GitHub Actions treats
-    # this job's unmet dependency as a failure; the explicit
-    # ``if: skip`` makes the skip visible in the run summary.
     needs: [test]
-    if: >-
-      always() &&
-      (github.event_name != 'workflow_dispatch' ||
-       inputs.gate != 'review-comment-gate')
     runs-on: ubuntu-latest
     # Runs on all PRs to main (pull_request trigger is broad).
     # The smoke harness is read-only (no kanban create, no dispatch,
