@@ -3619,6 +3619,7 @@ class TestRound12PushRunDuplicateFilter:
                 "headBranch": "reduction/pr-lifecycle-collapse-v1",
                 "headSha": self.HEAD,
                 "workflowName": "CI",
+                "url": f"https://example/runs/{self.PR_RUN_ID}",
             },
         ])
         pr_jobs = list(pr_jobs if pr_jobs is not None else [])
@@ -3925,4 +3926,581 @@ class TestRound12PushRunDuplicateFilter:
         # The duplicate must NOT be silently accepted as
         # a success.
         assert ok is True
+        assert "review-comment-gate" in duplicated
+
+
+# ---------------------------------------------------------------------------
+# Round-13 follow-up: fail closed on ambiguous PR-run evidence
+# ---------------------------------------------------------------------------
+
+
+class TestRound13FailClosedOnAmbiguousPrRunEvidence:
+    """Round-13 follow-up:
+
+    ``_find_exact_head_pull_request_run_id`` and
+    ``_run_jobs_for_run`` MUST return structured evidence
+    or a structured reason. Two matching exact-head
+    pull_request runs fail closed; zero matching runs
+    fail closed; missing/malformed records fail closed.
+    """
+
+    HEAD = "07ace1fd3b8da0a8adc4eda169bbcf59f8c8d81a"
+    BRANCH = "reduction/pr-lifecycle-collapse-v1"
+    PR_RUN_ID = 29696511913
+
+    def _runner(self, *, pr_runs=None, jobs=None, pr_checks=None,
+                default_run_url=None):
+        pr_runs = list(pr_runs if pr_runs is not None else [
+            {
+                "databaseId": self.PR_RUN_ID,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": (default_run_url
+                        if default_run_url is not None
+                        else f"https://example/runs/{self.PR_RUN_ID}"),
+            },
+        ])
+        jobs = list(jobs if jobs is not None else [])
+        pr_checks = pr_checks if pr_checks is not None else []
+        def runner(cmd, *a, **kw):
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_checks),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "list"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_runs),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "view"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"jobs": jobs}),
+                    stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        return runner
+
+    # ---- _find_exact_head_pull_request_run_id -----------------------
+
+    def test_unique_exact_head_run_returns_structured_evidence(self):
+        runner = self._runner()
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is True
+        assert out["databaseId"] == self.PR_RUN_ID
+        assert out["workflowName"] == "CI"
+        assert out["headSha"] == self.HEAD
+        assert out["url"].startswith("https://example/runs/")
+        assert out["headBranch"] == self.BRANCH
+
+    def test_two_matching_exact_head_pr_runs_fail_closed(self):
+        # Two distinct exact-head pull_request runs on the
+        # same head MUST NOT collapse to one. The structured
+        # result reports ``multiple_exact_head_pr_runs``.
+        pr_runs = [
+            {
+                "databaseId": 1001,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/1001",
+            },
+            {
+                "databaseId": 1002,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/1002",
+            },
+        ]
+        runner = self._runner(pr_runs=pr_runs)
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "multiple_exact_head_pr_runs"
+        assert out["candidate_count"] == 2
+
+    def test_zero_matching_runs_returns_exact_head_pr_run_missing(self):
+        runner = self._runner(pr_runs=[])
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "exact_head_pr_run_missing"
+
+    def test_wrong_branch_fails_when_expected_branch_supplied(self):
+        # When ``expected_head_branch`` is supplied, runs on
+        # a different branch are filtered out and a
+        # zero-match outcome is returned (fail closed).
+        pr_runs = [
+            {
+                "databaseId": 2001,
+                "event": "pull_request",
+                "headBranch": "feat/other",
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/2001",
+            },
+        ]
+        runner = self._runner(pr_runs=pr_runs)
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+            expected_head_branch=self.BRANCH,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "exact_head_pr_run_missing"
+
+    def test_expected_branch_match_succeeds(self):
+        runner = self._runner()
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+            expected_head_branch=self.BRANCH,
+        )
+        assert out["ok"] is True
+        assert out["databaseId"] == self.PR_RUN_ID
+
+    def test_empty_url_fails_closed(self):
+        # The URL field is empty, so the run fails closed.
+        runner = self._runner(default_run_url="")
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_exact_head_pr_run"
+
+    def test_missing_url_field_fails_closed(self):
+        # The URL field is missing entirely.
+        pr_runs = [
+            {
+                "databaseId": 3001,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+            },
+        ]
+        runner = self._runner(pr_runs=pr_runs)
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_exact_head_pr_run"
+
+    def test_non_integer_database_id_fails_closed(self):
+        pr_runs = [
+            {
+                "databaseId": "12345",
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/12345",
+            },
+        ]
+        runner = self._runner(pr_runs=pr_runs)
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_exact_head_pr_run"
+
+    def test_missing_head_branch_fails_closed(self):
+        pr_runs = [
+            {
+                "databaseId": 4001,
+                "event": "pull_request",
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/4001",
+            },
+        ]
+        runner = self._runner(pr_runs=pr_runs)
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_exact_head_pr_run"
+
+    def test_non_dict_payload_records_fails_closed(self):
+        # A string record inside the payload list fails
+        # closed.
+        runner = self._runner(pr_runs=["not-a-dict"])
+        out = ctrl._find_exact_head_pull_request_run_id(
+            "owner/repo", self.HEAD, runner=runner,
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_exact_head_pr_run"
+
+    # ---- _run_jobs_for_run -------------------------------------------
+
+    def test_unique_required_jobs_returns_structured_evidence(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+            {"name": "test (3.11)", "databaseId": 2,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is True
+        assert out["jobs"]["review-comment-gate"] == "SUCCESS"
+        assert out["job_ids"]["review-comment-gate"] == 1
+
+    def test_duplicate_authoritative_job_names_fail_closed(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+            {"name": "review-comment-gate", "databaseId": 2,
+             "status": "completed", "conclusion": "failure"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "duplicate_authoritative_job_names"
+        assert "review-comment-gate" in out["duplicates"]
+
+    def test_missing_authoritative_required_job_fails_closed(self):
+        jobs = [
+            {"name": "test", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "missing_authoritative_required_job"
+        assert out["missing"] == ["review-comment-gate"]
+
+    def test_malformed_job_record_fails_closed(self):
+        # Job record missing integer ``databaseId``.
+        jobs = [
+            {"name": "review-comment-gate",
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_authoritative_job"
+
+    def test_malformed_job_name_fails_closed(self):
+        jobs = [
+            {"name": "", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "malformed_authoritative_job"
+
+    def test_pending_required_job_remains_pending(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "in_progress", "conclusion": None},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is True
+        assert out["jobs"]["review-comment-gate"] == "PENDING"
+
+    def test_skipped_required_job_blocks(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "skipped"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is True
+        assert out["jobs"]["review-comment-gate"] == "SKIPPED"
+
+    def test_cancelled_required_job_blocks(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "cancelled"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is True
+        assert out["jobs"]["review-comment-gate"] == "CANCELLED"
+
+    def test_stale_required_job_blocks(self):
+        jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "stale"},
+        ]
+        runner = self._runner(jobs=jobs)
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is True
+        assert out["jobs"]["review-comment-gate"] == "STALE"
+
+    def test_empty_job_inventory_with_required_fails_closed(self):
+        runner = self._runner(jobs=[])
+        out = ctrl._run_jobs_for_run(
+            "owner/repo", self.PR_RUN_ID, runner=runner,
+            required_job_names=["review-comment-gate"],
+        )
+        assert out["ok"] is False
+        assert out["reason"] == "missing_authoritative_required_job"
+
+    # ---- end-to-end fetch_ci_conclusions scenarios -------------------
+
+    def _records(self):
+        # ``gh pr checks`` payload: a push duplicate
+        # (skipped-success) plus a pull_request entry.
+        return [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+
+    def test_e2e_push_duplicate_plus_pr_success_passes(self):
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(
+            pr_checks=self._records(), jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert err == ""
+        assert duplicated == []
+        assert conclusions["review-comment-gate"] == "SUCCESS"
+        assert missing == []
+        assert failed == []
+
+    def test_e2e_push_duplicate_plus_pr_failure_blocks(self):
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "failure"},
+        ]
+        runner = self._runner(
+            pr_checks=self._records(), jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert duplicated == []
+        assert conclusions["review-comment-gate"] == "FAILURE"
+        assert failed == ["review-comment-gate"]
+
+    def test_e2e_push_duplicate_plus_pr_pending_remains_pending(self):
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "in_progress", "conclusion": None},
+        ]
+        runner = self._runner(
+            pr_checks=self._records(), jobs=pr_jobs,
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert ok is True
+        assert duplicated == []
+        assert conclusions["review-comment-gate"] == "PENDING"
+        assert pending == ["review-comment-gate"]
+
+    def test_e2e_two_matching_pr_runs_fail_closed(self):
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        pr_runs = [
+            {
+                "databaseId": 5001,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/5001",
+            },
+            {
+                "databaseId": 5002,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/5002",
+            },
+        ]
+        runner = self._runner(
+            pr_checks=self._records(),
+            pr_runs=pr_runs,
+            jobs=pr_jobs,
+        )
+        (_ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        # Lookup ambiguity must not bypass the duplicate
+        # check. The ``gh pr checks`` duplicate is preserved
+        # as blocking evidence.
+        assert "review-comment-gate" in duplicated
+
+    def test_e2e_lookup_ambiguity_bypasses_duplicate_protection(self):
+        # Two PR runs plus PR-job missing the required
+        # name: the duplicate MUST remain blocking because
+        # we cannot pick a single authoritative source.
+        pr_jobs = [
+            {"name": "test", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ]
+        pr_runs = [
+            {
+                "databaseId": 6001,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/6001",
+            },
+            {
+                "databaseId": 6002,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/runs/6002",
+            },
+        ]
+        runner = self._runner(
+            pr_checks=self._records(),
+            pr_runs=pr_runs,
+            jobs=pr_jobs,
+        )
+        (_ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert "review-comment-gate" in duplicated
+
+    def test_e2e_no_head_sha_still_fails_closed_on_duplicates(self):
+        """Round-6 duplicate-fails-closed path remains intact
+        when ``head_sha`` is not supplied. The controller
+        cannot reach the round-13 lookup path."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        runner = self._runner(pr_checks=records, jobs=[
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ])
+        (ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner,
+        )
+        assert ok is True
+        # Round-6 path still fails closed on duplicate
+        # records when no head_sha is supplied.
+        assert "review-comment-gate" in duplicated
+
+    def test_e2e_malformed_authoritative_run_blocks(self):
+        """A malformed authoritative run (missing URL)
+        prevents the duplicate from being silently
+        accepted."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        pr_runs = [
+            {
+                "databaseId": 7001,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                # Missing URL field.
+            },
+        ]
+        runner = self._runner(
+            pr_checks=records,
+            pr_runs=pr_runs,
+            jobs=[{"name": "review-comment-gate", "databaseId": 1,
+                   "status": "completed", "conclusion": "success"}],
+        )
+        (_ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
+        assert "review-comment-gate" in duplicated
+
+    def test_e2e_duplicate_authoritative_jobs_in_pr_run_blocks(self):
+        """The PR run exposes two ``review-comment-gate``
+        jobs (genuine duplicate jobs); the duplicate
+        ``gh pr checks`` record set MUST remain blocking."""
+        records = [
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+            {"name": "review-comment-gate", "state": "SUCCESS",
+             "workflow": "CI"},
+        ]
+        pr_jobs = [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+            {"name": "review-comment-gate", "databaseId": 2,
+             "status": "completed", "conclusion": "success"},
+        ]
+        runner = self._runner(
+            pr_checks=records, jobs=pr_jobs,
+        )
+        (_ok, _conclusions, _missing, _pending, _failed,
+         duplicated, _err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, ["review-comment-gate"],
+            runner=runner, head_sha=self.HEAD,
+        )
         assert "review-comment-gate" in duplicated

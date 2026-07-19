@@ -412,70 +412,121 @@ def _find_exact_head_pull_request_run_id(
     head_sha: str,
     *,
     runner: Optional[Any] = None,
-) -> Optional[int]:
-    """Return the integer ``databaseId`` of the exact-head
-    ``pull_request`` CI run, or ``None``.
+    expected_head_branch: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return structured evidence for the exact-head
+    ``pull_request`` CI run.
 
-    Round-12 helper. Used to disambiguate a
-    ``review-comment-gate`` required-check duplicate where
-    one record is a push-triggered run (skipped success)
-    and the other is the exact-head pull_request run
-    (authoritative). The function filters ``gh run list``
-    to the exact head SHA and event ``pull_request``.
+    Round-13 helper. The function is called when ``gh pr
+    checks`` reports duplicate required-check names that
+    need authoritative disambiguation. It MUST return one
+    of three success/failure structures; callers MUST NOT
+    have to inspect undocumented list ordering to choose a
+    run.
+
+    Returns a dict with one of three shapes:
+
+    - ``{"ok": True, "databaseId": <int>, "url": <str>,
+       "headBranch": <str>, "workflowName": <str>,
+       "headSha": <str>}`` on a unique exact-head match;
+    - ``{"ok": False, "reason": "exact_head_pr_run_missing"}``
+       when no matching run exists;
+    - ``{"ok": False, "reason": "multiple_exact_head_pr_runs",
+       "candidate_count": <int>}`` when more than one run
+       matches and the controller cannot pick a winner;
+    - ``{"ok": False, "reason": "malformed_exact_head_pr_run"}``
+       when a matching run record is malformed (missing
+       branch, missing URL, missing or non-integer
+       ``databaseId``, etc.).
+
+    Required binding fields:
+
+    - ``workflowName`` exactly ``CI``;
+    - ``event`` exactly ``pull_request``;
+    - ``headSha`` byte-exactly equals the requested
+      ``head_sha``;
+    - ``headBranch`` byte-exactly equals
+      ``expected_head_branch`` when supplied;
+    - integer ``databaseId``;
+    - nonempty ``url``;
+    - record is a ``dict`` (other types fail closed).
+
+    The function does NOT tolerate more than one candidate
+    even when both have all binding fields. Two matching
+    pull_request runs on the same head is treated as
+    genuinely ambiguous evidence.
     """
+    cmd = [
+        "gh", "run", "list",
+        "--repo", repo,
+        "--workflow", "ci.yml",
+        "--event", "pull_request",
+        "--commit", head_sha,
+        "--limit", "10",
+        "--json", "databaseId,event,headBranch,headSha,"
+        "workflowName,url",
+    ]
     if runner is None:
-        cmd = [
-            "gh", "run", "list",
-            "--repo", repo,
-            "--workflow", "ci.yml",
-            "--event", "pull_request",
-            "--commit", head_sha,
-            "--limit", "10",
-            "--json", "databaseId,event,headBranch,headSha,"
-            "workflowName",
-        ]
         ok, payload, _err = _run_json_or_none(cmd, timeout=45)
         if not ok or not isinstance(payload, list):
-            return None
+            return {"ok": False, "reason": "exact_head_pr_run_missing"}
     else:
-        cmd = [
-            "gh", "run", "list",
-            "--repo", repo,
-            "--workflow", "ci.yml",
-            "--event", "pull_request",
-            "--commit", head_sha,
-            "--limit", "10",
-            "--json", "databaseId,event,headBranch,headSha,"
-            "workflowName",
-        ]
         try:
             proc = runner(cmd, capture_output=True, text=True, timeout=45)
         except (OSError, subprocess.TimeoutExpired):
-            return None
+            return {"ok": False, "reason": "exact_head_pr_run_missing"}
         if proc.returncode != 0:
-            return None
+            return {"ok": False, "reason": "exact_head_pr_run_missing"}
         try:
             payload = json.loads(proc.stdout or "")
         except json.JSONDecodeError:
-            return None
+            return {"ok": False, "reason": "exact_head_pr_run_missing"}
         if not isinstance(payload, list):
-            return None
+            return {"ok": False, "reason": "exact_head_pr_run_missing"}
     candidates: List[Dict[str, Any]] = []
+    malformed = False
     for run in payload:
         if not isinstance(run, dict):
-            continue
+            malformed = True
+            break
         if (run.get("workflowName") or "") != "CI":
             continue
         if (run.get("event") or "") != "pull_request":
             continue
         if run.get("headSha") != head_sha:
             continue
+        if expected_head_branch is not None:
+            if run.get("headBranch") != expected_head_branch:
+                continue
         if not isinstance(run.get("databaseId"), int):
-            continue
+            malformed = True
+            break
+        if not isinstance(run.get("url"), str) or not run.get("url"):
+            malformed = True
+            break
+        if not isinstance(run.get("headBranch"), str) or not run.get("headBranch"):
+            malformed = True
+            break
         candidates.append(run)
-    if not candidates:
-        return None
-    return candidates[0]["databaseId"]
+    if malformed:
+        return {"ok": False, "reason": "malformed_exact_head_pr_run"}
+    if len(candidates) == 0:
+        return {"ok": False, "reason": "exact_head_pr_run_missing"}
+    if len(candidates) > 1:
+        return {
+            "ok": False,
+            "reason": "multiple_exact_head_pr_runs",
+            "candidate_count": len(candidates),
+        }
+    picked = candidates[0]
+    return {
+        "ok": True,
+        "databaseId": picked["databaseId"],
+        "url": picked.get("url"),
+        "headBranch": picked.get("headBranch"),
+        "workflowName": picked.get("workflowName"),
+        "headSha": picked.get("headSha"),
+    }
 
 
 def _run_jobs_for_run(
@@ -483,14 +534,40 @@ def _run_jobs_for_run(
     run_id: int,
     *,
     runner: Optional[Any] = None,
-) -> Tuple[Dict[str, str], List[str], List[int]]:
-    """Return ``({job_name: conclusion}, [job_names], [job_ids])`` for a run.
+    required_job_names: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Return structured job evidence for a workflow run.
 
-    Round-12 helper used to derive authoritative per-job
-    evidence directly from a specific ``pull_request`` run
-    when ``gh pr checks`` reports duplicates. Uses ``gh run
-    view --json jobs`` and returns the latest attempt's
-    job list (filtering by ``jobs[].databaseId``).
+    Round-13 helper. Returns a dict with one of three
+    shapes:
+
+    - ``{"ok": True, "jobs": {<name>: <conclusion>},
+       "job_ids": {<name>: <int>}}`` on a clean read;
+    - ``{"ok": False, "reason": "duplicate_authoritative_job_names",
+       "duplicates": [<name>...]}`` when more than one job
+       in the run shares the same ``name``;
+    - ``{"ok": False, "reason": "missing_authoritative_required_job",
+       "missing": [<name>...]}`` when ``required_job_names``
+       is supplied and any name is absent;
+    - ``{"ok": False, "reason": "malformed_authoritative_job"}``
+       when a job record is missing ``name``, missing a
+       valid integer ``databaseId``, or otherwise malformed.
+
+    Conclusions are mapped to the ``gh pr checks`` vocabulary:
+
+    - ``status="completed"`` + ``conclusion="success"``
+      → ``SUCCESS``;
+    - ``status="completed"`` + any other ``conclusion``
+      → mapped to the conclusion
+      (``FAILURE``/``CANCELLED``/``SKIPPED``/``NEUTRAL``
+      /``STALE``/``ERROR``);
+    - any other ``status`` (queued, in_progress, pending,
+      waiting, requested, expected) → ``PENDING``.
+
+    Required jobs (when ``required_job_names`` is supplied)
+    must appear exactly once. Duplicate required job
+    names fail closed; missing required jobs fail closed;
+    malformed required-job records fail closed.
     """
     if runner is None:
         jobs, _err = _list_run_jobs(repo, run_id)
@@ -499,26 +576,40 @@ def _run_jobs_for_run(
             repo, run_id, list_runner=runner,
         )
     if not jobs:
-        return {}, [], []
-    # ``_list_run_jobs`` already returns the most recent
-    # attempt's jobs; trust that.
+        if required_job_names:
+            return {
+                "ok": False,
+                "reason": "missing_authoritative_required_job",
+                "missing": list(required_job_names),
+            }
+        return {"ok": False, "reason": "malformed_authoritative_job"}
     by_name: Dict[str, str] = {}
-    name_id_pairs: List[Tuple[str, int]] = []
-    job_names: List[str] = []
-    job_ids: List[int] = []
+    job_ids: Dict[str, int] = {}
+    seen_names: List[str] = []
+    duplicates: List[str] = []
     for j in jobs:
         if not isinstance(j, dict):
-            continue
+            return {
+                "ok": False,
+                "reason": "malformed_authoritative_job",
+            }
         name = j.get("name")
         if not isinstance(name, str) or not name:
+            return {
+                "ok": False,
+                "reason": "malformed_authoritative_job",
+            }
+        dbid = j.get("databaseId")
+        if not isinstance(dbid, int):
+            return {
+                "ok": False,
+                "reason": "malformed_authoritative_job",
+            }
+        if name in by_name:
+            duplicates.append(name)
             continue
         status = (j.get("status") or "").upper()
         conclusion = (j.get("conclusion") or "").upper()
-        dbid = j.get("databaseId")
-        # Map to ``gh pr checks`` vocabulary:
-        # status="completed" + conclusion="success" => SUCCESS
-        # status="completed" + any other conclusion => FAILURE
-        # otherwise => PENDING/IN_FLIGHT
         if status != "COMPLETED":
             mapped = "PENDING"
         elif conclusion == "SUCCESS":
@@ -526,11 +617,23 @@ def _run_jobs_for_run(
         else:
             mapped = conclusion or "FAILURE"
         by_name[name] = mapped
-        if isinstance(dbid, int):
-            job_ids.append(dbid)
-            name_id_pairs.append((name, dbid))
-        job_names.append(name)
-    return by_name, job_names, job_ids
+        job_ids[name] = dbid
+        seen_names.append(name)
+    if duplicates:
+        return {
+            "ok": False,
+            "reason": "duplicate_authoritative_job_names",
+            "duplicates": sorted(set(duplicates)),
+        }
+    if required_job_names:
+        missing = [n for n in required_job_names if n not in by_name]
+        if missing:
+            return {
+                "ok": False,
+                "reason": "missing_authoritative_required_job",
+                "missing": missing,
+            }
+    return {"ok": True, "jobs": by_name, "job_ids": job_ids}
 
 
 def _fetch_gh_pr_checks_payload(
@@ -701,13 +804,37 @@ def fetch_ci_conclusions(
             for n in required_check_names
         )
     ):
-        authoritative_run_id = _find_exact_head_pull_request_run_id(
+        authoritative_run = _find_exact_head_pull_request_run_id(
             repo, head_sha, runner=runner,
         )
-        if authoritative_run_id is not None:
-            authoritative_jobs, _names, _ids = _run_jobs_for_run(
-                repo, authoritative_run_id, runner=runner,
+        if authoritative_run.get("ok") is True:
+            authoritative_jobs_payload = _run_jobs_for_run(
+                repo, authoritative_run["databaseId"],
+                runner=runner,
+                required_job_names=list(
+                    n for n in required_check_names
+                    if len(by_name.get(n, [])) > 1
+                ),
             )
+            if authoritative_jobs_payload.get("ok") is True:
+                authoritative_jobs = authoritative_jobs_payload["jobs"]
+            else:
+                # Authoritative run was identified but its
+                # job inventory is malformed / missing /
+                # duplicated. Fall through to the
+                # duplicate-fails-closed path below.
+                authoritative_jobs = {}
+        else:
+            # Round-13: the lookup returned a structured
+            # reason (``exact_head_pr_run_missing``,
+            # ``multiple_exact_head_pr_runs``, or
+            # ``malformed_exact_head_pr_run``); in every
+            # case the controller MUST NOT silently fall
+            # back to accepting the ``gh pr checks``
+            # duplicate records. ``authoritative_jobs``
+            # stays empty so the duplicate-fails-closed
+            # path below applies.
+            authoritative_jobs = {}
 
     conclusions: Dict[str, str] = {}
     missing: List[str] = []
