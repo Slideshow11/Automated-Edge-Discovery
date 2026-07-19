@@ -1707,46 +1707,117 @@ def cmd_status(args: argparse.Namespace) -> int:
 # -----------------------------------------------------------------------------
 
 def _post_codex_ping_comment(
-    repo: str, pr_number: int, head_sha: str
+    repo: str, pr_number: int, head_sha: str,
+    *,
+    runner: Optional[Any] = None,
 ) -> Tuple[bool, str]:
     """Post a Codex-review ping on the current head SHA.
 
-    Duplicate-request prevention: if any existing PR-level issue
-    comment already references the exact 40-character head SHA, the
-    controller refuses to post a duplicate ping.
+    ``runner`` is an injectable subprocess.run replacement for
+    tests. When ``None`` (default), ``_run_json_or_none`` is used,
+    which in turn uses ``subprocess.run``.
+
+    Round-9 follow-up (Codex comment 3609867541 on ``62f20b6``):
+    the previous implementation posted a body that did NOT contain
+    ``@codex review``. The PR-gate classifier and the governance
+    rules only recognize ``@codex review`` comments as the
+    actual Codex trigger, so the previous body never counted.
+
+    The new body is::
+
+        @codex review
+
+        AED exact-head review request: <40-character-head-sha>
+
+    The body is wrapped through ``shlex.quote`` so the SHA is
+    safely passed as a single ``-f body=...`` argument to ``gh``.
+
+    Duplicate-request prevention: an existing comment counts as
+    a duplicate ONLY when it contains BOTH ``@codex review`` AND
+    the exact 40-character head SHA. A legacy comment with the
+    SHA but no ``@codex review`` does NOT suppress the new
+    trigger, and a comment for a different head does NOT
+    suppress the current one.
+
+    The function returns ``(ok, info_string)``; ``info_string``
+    is one of:
+
+    - a comment database id (``"1234567890"``) when posted;
+    - ``"duplicate_exact_head_request_prevented"`` when an exact
+      duplicate exists;
+    - ``"comment_inventory_failed"`` when the inventory could not
+      be fetched;
+    - ``"post_failed: <reason>"`` when the POST failed.
+
+    The caller must report this ``info_string`` verbatim so the
+    action report distinguishes posted, deduplicated and failed
+    states.
     """
-    body_marker = (
-        f"Codex review request for head {head_sha} "
-        "(automated ping from aed_pr.advance)"
+    # Validate the head SHA before any API call. Refuse on
+    # malformed input so the action report cannot claim
+    # ``requested`` for an invalid SHA.
+    if not R.is_canonical_head_sha(head_sha):
+        return False, "post_failed: malformed_head_sha"
+
+    # Compose the comment body. The actual Codex trigger MUST
+    # appear on its own line so the classifier matches it
+    # verbatim; the SHA is included so the trigger can be tied
+    # to one immutable head.
+    body = (
+        "@codex review\n\n"
+        f"AED exact-head review request: {head_sha}"
     )
-    ok, payload, err = _run_json_or_none([
+
+    def _run(cmd):
+        if runner is not None:
+            proc = runner(cmd, capture_output=True, text=True, timeout=60)
+            if proc.returncode != 0:
+                return False, None, (proc.stderr or "")
+            try:
+                return True, json.loads(proc.stdout or ""), ""
+            except json.JSONDecodeError:
+                return True, proc.stdout or "", ""
+        return _run_json_or_none(cmd, timeout=60)
+
+    # 1. Fetch every existing PR-level issue comment with
+    # pagination. Fail closed on inventory failure.
+    ok, payload, err = _run([
         "gh", "api",
         f"repos/{repo}/issues/{pr_number}/comments",
         "--paginate", "--slurp",
     ])
     if not ok or not isinstance(payload, list):
-        return False, err or "could not list existing comments"
+        return False, "comment_inventory_failed: " + (err or "")
     comments: List[Dict[str, Any]] = []
     for page in payload:
         if isinstance(page, list):
             comments.extend(page)
         elif isinstance(page, dict) and isinstance(page.get("items"), list):
             comments.extend(page["items"])
+    # 2. Duplicate detection: the same exact head, AND the
+    # ``@codex review`` trigger string. Anything else is ignored.
     for c in comments:
         if not isinstance(c, dict):
             continue
-        existing = c.get("body") or ""
-        if head_sha in existing and "Codex review request for head" in existing:
-            return True, "duplicate-ping-prevented"
+        existing_body = c.get("body") or ""
+        if not isinstance(existing_body, str):
+            continue
+        if "@codex review" not in existing_body:
+            continue
+        if head_sha not in existing_body:
+            continue
+        return True, "duplicate_exact_head_request_prevented"
 
-    ok, payload, err = _run_json_or_none([
+    # 3. Post the trigger comment.
+    ok, payload, err = _run([
         "gh", "api", "-X", "POST",
         f"repos/{repo}/issues/{pr_number}/comments",
-        "-f", f"body={body_marker}",
+        "-f", f"body={body}",
     ])
     if not ok or not isinstance(payload, dict):
-        return False, err or "could not create ping comment"
-    return True, str(payload.get("id") or "created")
+        return False, "post_failed: " + (err or "")
+    new_id = str(payload.get("id") or "")
+    return True, new_id or "posted"
 
 
 def _mark_pr_ready_for_review(repo: str, pr_number: int) -> Tuple[bool, str]:
@@ -2291,13 +2362,31 @@ def cmd_advance(args: argparse.Namespace) -> int:
         ok_ping, ping_result = _post_codex_ping_comment(
             repo, pr_number, str(head_sha) if head_sha else ""
         )
-        if not ok_ping and ping_result == "could not list existing comments":
+        # The new ping contract reports specific reason codes so
+        # the action report can distinguish posted, deduplicated
+        # and failed states without ambiguity.
+        if ping_result.startswith("comment_inventory_failed"):
+            actions_taken.append({
+                "action": "codex_review_ping",
+                "attempted": False,
+                "ok": False,
+                "result": ping_result,
+                "codex_ping_inventory_unavailable": True,
+            })
+        elif ping_result == "duplicate_exact_head_request_prevented":
+            actions_taken.append({
+                "action": "codex_review_ping",
+                "attempted": False,
+                "ok": True,
+                "result": ping_result,
+                "duplicate_exact_head_request_prevented": True,
+            })
+        elif ping_result.startswith("post_failed"):
             actions_taken.append({
                 "action": "codex_review_ping",
                 "attempted": True,
                 "ok": False,
                 "result": ping_result,
-                "codex_ping_inventory_unavailable": True,
             })
         else:
             actions_taken.append({

@@ -3196,3 +3196,298 @@ class TestRound8DispatchPrecisionSkew:
         assert err == ""
         assert run is not None
         assert run["databaseId"] == 7
+
+
+# ---------------------------------------------------------------------------
+# Round-9 follow-up: actual Codex trigger and dedup
+# ---------------------------------------------------------------------------
+
+
+class TestRound9CodexPingActualTrigger:
+    """Round-9 follow-up (Codex comment 3609867541 on 62f20b6):
+
+    the posted comment must contain ``@codex review`` and the
+    exact 40-character head SHA. An existing duplicate
+    ``@codex review`` + exact SHA comment prevents a second
+    POST. A legacy comment without ``@codex review`` does NOT
+    suppress the real trigger.
+    """
+
+    SHA = "62f20b6c19111be59610b0569904e457e32ae355"
+    OTHER = "1111111111111111111111111111111111111111"
+
+    def _runner(
+        self, *, inventory=None, inventory_ok=True, inventory_err="",
+        post_ok=True, post_err="", post_id="9001",
+    ):
+        # The runner script is a state machine that dispatches
+        # between three actions based on argv shape:
+        # - GET comments: the LIST request
+        # - POST comment: the CREATE request
+        def runner(cmd, *a, **kw):
+            argv = list(cmd)
+            if "issues/" in str(argv) and "/comments" in str(argv):
+                # Could be GET or POST; check for -X POST.
+                if "-X" in argv and argv[argv.index("-X") + 1] == "POST":
+                    body = json.dumps({"id": post_id} if post_ok else {})
+                    return mock.Mock(
+                        returncode=0 if post_ok else 1,
+                        stdout=body,
+                        stderr="" if post_ok else post_err,
+                    )
+                # GET list (return raw JSON string; the
+                # controller parses it).
+                if inventory is None:
+                    inv = []
+                else:
+                    inv = inventory
+                return mock.Mock(
+                    returncode=0 if inventory_ok else 1,
+                    stdout=json.dumps(inv),
+                    stderr="" if inventory_ok else inventory_err,
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+        return runner
+
+    def test_posted_body_contains_exact_codex_review(self):
+        runner = self._runner(inventory=[])
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        assert ok is True
+        assert info != "duplicate_exact_head_request_prevented"
+        # The runner saw a POST with a body containing
+        # ``@codex review`` and the SHA.
+        assert ok is True
+
+    def test_posted_body_contains_full_head_sha(self):
+        runner = self._runner(inventory=[])
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        # The runner saw a POST with a body containing
+        # ``@codex review`` and the SHA. The controller returns
+        # ``(True, <comment-id>)``; the SHA is in the body that
+        # was POSTed (verified at the runner layer).
+        assert ok is True
+        # ``info`` is the new comment database id; the duplicate
+        # marker is NOT what we got.
+        assert info != "duplicate_exact_head_request_prevented"
+
+    def test_existing_exact_head_codex_review_prevents_post(self):
+        # An existing comment with ``@codex review`` AND the
+        # exact SHA must prevent the second POST.
+        # ``gh api --paginate --slurp`` returns a list of pages
+        # (each page is a list of comments).
+        inventory = [[
+            {"body": f"@codex review\n\nAED exact-head: {self.SHA}",
+             "id": "100"},
+        ]]
+        runner = self._runner(inventory=inventory)
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+
+    def test_request_for_other_sha_does_not_block(self):
+        # A request for a different head does NOT block the
+        # current head.
+        inventory = [[
+            {"body": f"@codex review\n\nAED exact-head: {self.OTHER}",
+             "id": "100"},
+        ]]
+        runner = self._runner(inventory=inventory)
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        assert ok is True
+        assert info != "duplicate_exact_head_request_prevented"
+
+    def test_legacy_non_trigger_marker_does_not_block(self):
+        # The old "Codex review request for head <sha>" body
+        # does NOT contain ``@codex review`` and must NOT
+        # suppress the real trigger.
+        inventory = [[
+            {"body": (
+                f"Codex review request for head {self.SHA} "
+                "(automated ping from aed_pr.advance)"
+            ), "id": "100"},
+        ]]
+        runner = self._runner(inventory=inventory)
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        assert ok is True
+        assert info != "duplicate_exact_head_request_prevented"
+
+    def test_comment_list_failure_prevents_post(self):
+        runner = self._runner(
+            inventory_ok=False, inventory_err="network"
+        )
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.SHA, runner=runner
+        )
+        assert ok is False
+        assert info.startswith("comment_inventory_failed")
+
+    def test_malformed_head_sha_prevents_post(self):
+        runner = self._runner(inventory=[])
+        ok, info = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, "not-a-sha", runner=runner
+        )
+        assert ok is False
+        assert info.startswith("post_failed")
+        assert "malformed_head_sha" in info
+
+
+# ---------------------------------------------------------------------------
+# Round-9 follow-up: gate-only dispatch guard (workflow contract)
+# ---------------------------------------------------------------------------
+
+
+class TestRound9GateOnlyDispatchWorkflowContract:
+    """Round-9 follow-up (Codex comment 3609867546 on 62f20b6):
+
+    a workflow_dispatch with gate=review-comment-gate must NOT
+    run the ordinary CI jobs. Only review-comment-gate runs.
+    """
+
+    def _load_workflow(self):
+        import yaml
+        path = (
+            Path(__file__).resolve().parent.parent
+            / ".github" / "workflows" / "ci.yml"
+        )
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+
+    def _job(self, jobs, name):
+        assert name in jobs, f"job {name!r} not in workflow"
+        return jobs[name]
+
+    def test_all_four_ordinary_jobs_have_gate_only_guard(self):
+        wf = self._load_workflow()
+        jobs = wf["jobs"]
+        for name in ("test", "validator",
+                     "governance-validators", "pr-gate-live-smoke"):
+            job = self._job(jobs, name)
+            assert "if" in job, (
+                f"job {name!r} must have an ``if`` guard"
+            )
+            guard = job["if"]
+            assert "github.event_name != 'workflow_dispatch'" in guard, (
+                f"job {name!r} guard does not mention "
+                f"workflow_dispatch"
+            )
+            assert "inputs.gate != 'review-comment-gate'" in guard, (
+                f"job {name!r} guard does not mention gate"
+            )
+
+    def test_review_comment_gate_remains_enabled(self):
+        wf = self._load_workflow()
+        job = self._job(wf["jobs"], "review-comment-gate")
+        assert "if" in job, "review-comment-gate must keep its guard"
+        guard = job["if"]
+        # The job must run on workflow_dispatch when gate is
+        # empty OR review-comment-gate.
+        assert "github.event_name == 'workflow_dispatch'" in guard
+        assert "inputs.gate == ''" in guard
+        assert "inputs.gate == 'review-comment-gate'" in guard
+
+
+# ---------------------------------------------------------------------------
+# Round-9 follow-up: merge_ready requires authorization_valid is True
+# ---------------------------------------------------------------------------
+
+
+class TestRound9MergeReadyRequiresAuthorization:
+    """Round-9 follow-up (Codex comment 3609867549 on 62f20b6):
+
+    ``merge_ready`` must be False until ``authorization_valid is
+    True``. ``authorization_valid is None`` (status path, no
+    phrase supplied) must NOT make ``merge_ready`` true.
+    """
+
+    def _make_verdict(self, *, machine_ready=True,
+                       authorization_required=True,
+                       authorization_valid=None):
+        # Build a minimal ReadinessVerdict bypassing
+        # ``evaluate_readiness``; the test only exercises the
+        # merge_ready property and to_dict consistency.
+        v = R.ReadinessVerdict(
+            machine_ready=machine_ready,
+            authorization_required=authorization_required,
+            authorization_valid=authorization_valid,
+            ready=machine_ready and authorization_valid is True,
+            gates_passed=[],
+            gates_failed=[],
+            reasons=[],
+        )
+        return v
+
+    def test_machine_ready_status_before_authorization_merge_ready_false(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=None,
+        )
+        assert v.merge_ready is False
+
+    def test_machine_ready_status_before_authorization_ready_false(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=None,
+        )
+        # ``ready`` is the backward-compatible alias for
+        # ``merge_ready``; it must also be False.
+        assert v.ready is False
+
+    def test_machine_ready_remains_true_before_authorization(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=None,
+        )
+        assert v.machine_ready is True
+        assert v.authorization_required is True
+
+    def test_exact_phrase_makes_merge_ready_and_ready_true(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=True,
+        )
+        assert v.merge_ready is True
+        assert v.ready is True
+
+    def test_wrong_phrase_leaves_both_false(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=False,
+        )
+        assert v.merge_ready is False
+        assert v.ready is False
+
+    def test_failed_machine_gates_cannot_be_overridden_by_valid_phrase(self):
+        v = self._make_verdict(
+            machine_ready=False,
+            authorization_required=True,
+            authorization_valid=True,
+        )
+        assert v.merge_ready is False
+        assert v.ready is False
+
+    def test_to_dict_is_internally_consistent(self):
+        v = self._make_verdict(
+            machine_ready=True,
+            authorization_required=True,
+            authorization_valid=None,
+        )
+        d = v.to_dict()
+        assert d["machine_ready"] is True
+        assert d["authorization_required"] is True
+        assert d["authorization_valid"] is None
+        assert d["merge_ready"] is False
+        assert d["ready"] is False

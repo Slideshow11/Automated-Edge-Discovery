@@ -350,17 +350,34 @@ class ReadinessVerdict:
 
     @property
     def merge_ready(self) -> bool:
-        """True iff machine gates passed and a phrase (when supplied) validates.
+        """True iff machine gates passed AND authorization is valid.
 
-        When no phrase was supplied (the ``status`` path), this is True
-        iff ``machine_ready`` is True - the canonical phrase remains
-        for the operator to speak before running ``merge``.
+        Round-9 follow-up (Codex comment 3609867549 on ``62f20b6``):
+        the previous implementation returned ``True`` whenever
+        ``authorization_valid`` was ``None`` (the status/advance
+        path before the operator supplied a phrase). That allowed
+        the JSON report to emit ``merge_ready``/``ready`` as
+        ``True`` even though ``authorization_required`` was still
+        ``True`` and the operator had not yet supplied the phrase.
+        Any automation consuming the explicit ``merge_ready``
+        field could therefore treat the PR as mergeable before
+        the authorization gate had passed.
+
+        The contract now requires ``authorization_valid is True``:
+
+        - ``authorization_valid is None`` (no phrase supplied) ->
+          ``merge_ready=False`` even when machine gates pass;
+        - ``authorization_valid is True`` (exact phrase) ->
+          ``merge_ready=True`` iff machine gates pass;
+        - ``authorization_valid is False`` (wrong or missing
+          phrase in the merge evaluation) -> ``merge_ready=False``.
+
+        Pre-authorization consumers must use ``machine_ready``
+        instead.
         """
         if not self.machine_ready:
             return False
-        if self.authorization_valid is None:
-            return True
-        return bool(self.authorization_valid)
+        return self.authorization_valid is True
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -1215,10 +1232,15 @@ def evaluate_machine_readiness(
     reasons, passed, failed = _evaluate_machine_gates(evidence)
     machine_ready = not failed
     return ReadinessVerdict(
-        # For backward compatibility, ``ready`` mirrors ``machine_ready``
-        # when no phrase has been supplied. ``merge_ready`` (the new
-        # canonical field) follows the same logic.
-        ready=machine_ready,
+        # Round-9 follow-up (Codex comment 3609867549): the
+        # stored ``ready`` field MUST agree with ``merge_ready``.
+        # ``merge_ready`` requires ``authorization_valid is True``;
+        # the status/advance path here does not supply a phrase,
+        # so ``authorization_valid is None`` and ``merge_ready``
+        # is False. ``ready`` is the backward-compatible alias and
+        # must mirror ``merge_ready`` (not ``machine_ready``) so
+        # the JSON report is internally consistent.
+        ready=False,
         reasons=reasons,
         gates_passed=passed,
         gates_failed=failed,
