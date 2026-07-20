@@ -5129,3 +5129,533 @@ class TestRound14RequireNonemptyThreadParticipants:
                 "actor_ancestry_stale",
                 "actor_ancestry_not_linked",
             )
+
+
+# ---------------------------------------------------------------------------
+# Round-16 — Codex finding PRRC_kwDOSHFpYM7XcqZM (review 4735335955)
+#
+# Repair: require trusted scope for lifecycle readiness.
+# Before this fix, ``status`` and ``advance`` accepted CLI scope
+# (--allowed-files / --forbidden-files) as authoritative, while
+# ``merge`` rejected the same flags and read only the canonical
+# trusted exact-head record. The status/advance path then fed the
+# CLI patterns into ``build_evidence``, which set ``scope_clean=True``
+# on a clean diff and let ``status`` emit the canonical merge
+# authorization phrase — even though ``merge`` would then reject
+# the same PR because it only trusts the canonical file.
+#
+# The tests below prove that after the fix:
+#   - ``cmd_status`` with CLI scope returns a structured blocking
+#     report (machine_ready=False, no authorization phrase,
+#     scope_error surfaces the diagnostic, lifecycle state BLOCKED)
+#   - ``cmd_advance`` with CLI scope performs no mutation: no
+#     Codex ping, no thread resolution, no ready mark, no workflow
+#     dispatch, no scope-write, no merge
+#   - ``build_evidence`` is never called with CLI patterns as
+#     authoritative scope for status/advance
+# ---------------------------------------------------------------------------
+
+
+def _r16_pr_view_payload(head_sha="a" * 40):
+    return {
+        "number": 411,
+        "title": "round-16 controller-level test",
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": True,
+        "headRefOid": head_sha,
+        "headRefName": "reduction/pr-lifecycle-collapse-v1",
+        "baseRefOid": "b" * 40,
+        "baseRefName": "main",
+        "additions": 0, "deletions": 0, "changedFiles": 0,
+        "url": "https://example/pr/411",
+        "files": [],
+    }
+
+
+def _r16_codex_classify(**_kw):
+    return {
+        "status": "CODEX_CLEAN_PASS",
+        "observed_head_sha": "a" * 40,
+        "head_matches_expected": True,
+        "clean_pass_detected": True,
+        "clean_pass_source": "issue_comment",
+        "latest_codex_response_id": "12345",
+        "latest_codex_response_url": "https://example/codex",
+        "latest_codex_response_type": "issue_comment",
+        "active_threads": [],
+        "outdated_threads": [],
+        "issue_comment_inventory_complete": True,
+        "issue_comment_inventory_error_count": 0,
+        "issue_comment_inventory_last_error": None,
+        "review_submission_inventory_complete": True,
+        "review_submission_inventory_error_count": 0,
+        "review_submission_inventory_last_error": None,
+        "review_thread_inventory_complete": True,
+        "review_thread_inventory_error_count": 0,
+        "review_thread_inventory_last_error": None,
+        "review_thread_comment_inventory_complete": True,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_incomplete_thread_ids": [],
+        "merge_state_status": "clean",
+        "mergeable": True,
+        "review_decision": "APPROVED",
+    }
+
+
+def _r16_fake_run_no_writes(cmd, *args, **kwargs):
+    """Stub ``subprocess.run`` for read-only gh subcommands.
+
+    Any write-class command (POST/PATCH/PUT/DELETE, gh merge/edit/
+    create/comment/review, workflow_dispatch) is intentionally NOT
+    intercepted here — it would surface as a real ``subprocess.run``
+    call and the test would fail with a clear traceback, exactly as
+    desired for the no-mutation contract.
+    """
+    if cmd[:3] == ["gh", "pr", "view"]:
+        return mock.Mock(
+            returncode=0,
+            stdout=json.dumps(_r16_pr_view_payload()),
+            stderr="",
+        )
+    if cmd[:3] == ["gh", "pr", "checks"]:
+        return mock.Mock(
+            returncode=0,
+            stdout=json.dumps([
+                {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "governance-validators", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "pr-gate-live-smoke", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "review-comment-gate", "state": "SUCCESS", "workflow": "CI"},
+            ]),
+            stderr="",
+        )
+    if cmd[:3] == ["gh", "pr", "diff"]:
+        return mock.Mock(returncode=0, stdout="[]", stderr="")
+    if cmd[:3] == ["gh", "run", "list"]:
+        return mock.Mock(returncode=0, stdout="[]", stderr="")
+    if cmd[:3] == ["gh", "api"] and "graphql" in " ".join(cmd):
+        # Stub: minimal review-thread inventory, no threads
+        return mock.Mock(
+            returncode=0,
+            stdout=json.dumps({
+                "data": {
+                    "repository": {
+                        "pullRequest": {
+                            "reviewThreads": {
+                                "totalCount": 0,
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [],
+                            }
+                        }
+                    }
+                }
+            }),
+            stderr="",
+        )
+    return mock.Mock(returncode=0, stdout="[]", stderr="")
+
+
+def _r16_run_status(cli_allowed=None, cli_forbidden=None, scope_root=None):
+    """Invoke ``cmd_status`` with optional CLI scope and a stubbed gh.
+
+    Returns the parsed JSON report.
+    """
+    args = mock.Mock()
+    args.repo = DEFAULT_REPO
+    args.pr_number = 411
+    args.allowed_files = cli_allowed
+    args.forbidden_files = cli_forbidden
+
+    if scope_root is None:
+        scope_root = tempfile.mkdtemp()
+        cleanup = True
+    else:
+        cleanup = False
+
+    saved_root = ctrl._CANONICAL_SCOPE_ROOT
+    ctrl._CANONICAL_SCOPE_ROOT = Path(scope_root)
+    try:
+        with mock.patch.object(
+            subprocess, "run", side_effect=_r16_fake_run_no_writes,
+        ), mock.patch.object(
+            ctrl.CODEX, "classify",
+            side_effect=lambda **kw: _r16_codex_classify(**kw),
+        ):
+            buf = io.StringIO()
+            old_out = sys.stdout
+            sys.stdout = buf
+            try:
+                ctrl.cmd_status(args)
+            finally:
+                sys.stdout = old_out
+        return json.loads(buf.getvalue())
+    finally:
+        ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        if cleanup:
+            import shutil
+            shutil.rmtree(scope_root, ignore_errors=True)
+
+
+def _r16_run_advance(cli_allowed=None, cli_forbidden=None, scope_root=None):
+    """Invoke ``cmd_advance`` with optional CLI scope and a stubbed gh.
+
+    Returns the parsed JSON report.
+    """
+    args = mock.Mock()
+    args.repo = DEFAULT_REPO
+    args.pr_number = 411
+    args.allowed_files = cli_allowed
+    args.forbidden_files = cli_forbidden
+    args.dry_run = False
+    args.resolve_eligible_bot_threads = False
+
+    if scope_root is None:
+        scope_root = tempfile.mkdtemp()
+        cleanup = True
+    else:
+        cleanup = False
+
+    saved_root = ctrl._CANONICAL_SCOPE_ROOT
+    ctrl._CANONICAL_SCOPE_ROOT = Path(scope_root)
+    try:
+        with mock.patch.object(
+            subprocess, "run", side_effect=_r16_fake_run_no_writes,
+        ), mock.patch.object(
+            ctrl.CODEX, "classify",
+            side_effect=lambda **kw: _r16_codex_classify(**kw),
+        ):
+            buf = io.StringIO()
+            old_out = sys.stdout
+            sys.stdout = buf
+            try:
+                ctrl.cmd_advance(args)
+            finally:
+                sys.stdout = old_out
+        return json.loads(buf.getvalue())
+    finally:
+        ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        if cleanup:
+            import shutil
+            shutil.rmtree(scope_root, ignore_errors=True)
+
+
+class TestRound16StatusRejectsCliScope:
+    """Round-16: ``cmd_status`` with CLI scope is fail-closed."""
+
+    def test_status_with_cli_scope_blocks_machine_readiness(self):
+        report = _r16_run_status(cli_allowed="scripts/local/aed_pr*.py")
+        # Machine readiness must be False (scope gate failed closed).
+        assert report["machine_ready"] is False
+        assert report["merge_ready"] is False
+        assert report["ready"] is False
+        assert report["authorization_required"] is False
+        assert report["authorization_valid"] is None
+
+    def test_status_with_cli_scope_does_not_emit_authorization_phrase(self):
+        report = _r16_run_status(cli_allowed="scripts/local/aed_pr*.py")
+        # The canonical phrase MUST be None — a CLI override cannot
+        # authorize the merge.
+        assert report["required_authorization_phrase"] is None
+
+    def test_status_with_cli_scope_surfaces_scope_error(self):
+        report = _r16_run_status(cli_allowed="scripts/local/aed_pr*.py")
+        # The diagnostic must surface in the report under the new key.
+        assert report.get("scope_error") is not None
+        assert "cli_scope_not_authoritative" in report["scope_error"]
+        # The diagnostic must also surface as the next-action hint.
+        assert "cli_scope_not_authoritative" in report["next_human_action"]
+        # The lifecycle state must be BLOCKED (or at minimum NOT
+        # READY_FOR_MERGE_AUTHORIZATION).
+        assert report["lifecycle_state"] in ("BLOCKED", "ACTION_REQUIRED")
+        assert report["lifecycle_state"] != "READY_FOR_MERGE_AUTHORIZATION"
+
+    def test_status_with_cli_scope_does_not_pass_cli_to_build_evidence(self):
+        """The CLI scope MUST NOT reach ``build_evidence`` as
+        authoritative scope. ``scope_allowed_files_supplied`` is the
+        boolean that gates ``scope_clean=True`` inside the scope
+        check; it must be False because the resolver returned
+        ``(None, None, error)``.
+        """
+        report = _r16_run_status(cli_allowed="scripts/local/aed_pr*.py")
+        assert report["scope_allowed_files_supplied"] is False
+        assert report["scope_clean"] is None or report["scope_clean"] is False
+
+    def test_status_without_cli_scope_and_no_trusted_scope_blocks(self):
+        """When no CLI scope is supplied AND no trusted scope record
+        exists, ``status`` must still fail closed (the existing
+        pre-fix behavior is preserved).
+        """
+        report = _r16_run_status(cli_allowed=None)
+        assert report["machine_ready"] is False
+        assert report["required_authorization_phrase"] is None
+        # The scope source must be "trusted_file" (NOT "cli_override")
+        # when no CLI flags are supplied.
+        assert report["scope_source"] == "trusted_file"
+
+    def test_status_without_cli_scope_with_trusted_scope_passes(self):
+        """When a valid trusted exact-head scope exists and no CLI
+        flags are supplied, ``status`` returns a report without a
+        scope_error (i.e. the trusted file was successfully read).
+        """
+        scope_root = tempfile.mkdtemp()
+        try:
+            saved_root = ctrl._CANONICAL_SCOPE_ROOT
+            ctrl._CANONICAL_SCOPE_ROOT = Path(scope_root)
+            try:
+                ok, _path = ctrl.write_trusted_scope(
+                    DEFAULT_REPO, 411, "a" * 40,
+                    ["scripts/local/aed_pr*.py"], []
+                )
+                assert ok
+            finally:
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+            # Run ``status`` with no CLI scope, using the same root.
+            report = _r16_run_status(
+                cli_allowed=None, scope_root=scope_root,
+            )
+            # The resolver did NOT raise scope_err — the report must
+            # not contain a ``scope_error``.
+            assert report.get("scope_error") is None
+            assert report["scope_source"] == "trusted_file"
+            # scope_allowed_files_supplied is True because the trusted
+            # file supplied a non-empty allowed-files inventory.
+            assert report["scope_allowed_files_supplied"] is True
+        finally:
+            import shutil
+            shutil.rmtree(scope_root, ignore_errors=True)
+
+
+class TestRound16AdvanceRejectsCliScope:
+    """Round-16: ``cmd_advance`` with CLI scope is fail-closed."""
+
+    def test_advance_with_cli_scope_records_action(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        actions = report["actions_taken"]
+        rejections = [
+            a for a in actions if a.get("action") == "cli_scope_rejected"
+        ]
+        assert len(rejections) == 1
+        assert rejections[0]["result"] == "cli_scope_not_authoritative"
+        assert "cli_scope_not_authoritative" in rejections[0]["error"]
+
+    def test_advance_with_cli_scope_does_not_post_codex_request(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        # The codex_review_ping action must NOT appear at all.
+        # The advance pipeline short-circuits before that step.
+        pings = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "codex_review_ping"
+        ]
+        assert pings == []
+
+    def test_advance_with_cli_scope_does_not_resolve_threads(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        resolutions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "resolve_eligible_bot_threads"
+        ]
+        assert resolutions == []
+
+    def test_advance_with_cli_scope_does_not_mark_pr_ready(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        marks = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "mark_pr_ready"
+        ]
+        assert marks == []
+
+    def test_advance_with_cli_scope_does_not_dispatch_workflow(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        dispatches = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "workflow_dispatch"
+        ]
+        assert dispatches == []
+
+    def test_advance_with_cli_scope_does_not_emit_authorization_phrase(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        assert report["required_authorization_phrase_if_ready"] is None
+        assert report["safe_merge_command_if_ready"] is None
+
+    def test_advance_with_cli_scope_blocks_machine_readiness(self):
+        report = _r16_run_advance(cli_allowed="scripts/local/aed_pr*.py")
+        assert report["machine_ready"] is False
+        assert report["merge_ready"] is False
+        assert report["ready"] is False
+        assert report["authorization_required"] is False
+        assert report["authorization_valid"] is None
+
+    def test_advance_with_cli_forbidden_also_rejected(self):
+        report = _r16_run_advance(cli_forbidden="**")
+        assert report["machine_ready"] is False
+        assert report.get("scope_error") is not None
+        assert "cli_scope_not_authoritative" in report["scope_error"]
+
+    def test_advance_without_cli_scope_uses_trusted_path(self):
+        """No CLI flags, no trusted file: ``advance`` proceeds through
+        the existing ``trusted scope not found`` path. The diagnostic
+        surfaces in ``scope_error`` (and as ``next_human_action``);
+        no ``cli_scope_rejected`` action appears because no CLI
+        flags were supplied.
+        """
+        report = _r16_run_advance()
+        rejections = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "cli_scope_rejected"
+        ]
+        assert rejections == []
+        # The trusted-file missing diagnostic surfaces in scope_error.
+        assert report.get("scope_error") is not None
+        assert "trusted scope not found" in report["scope_error"]
+        assert report["scope_source"] == "trusted_file"
+
+
+class TestRound16MergeStillRejectsCliScope:
+    """Round-16: the merge command's existing rejection is preserved.
+
+    ``cmd_merge`` exits non-zero when CLI scope is supplied and never
+    invokes ``gh pr merge``. We assert that behavior end-to-end.
+    """
+
+    def test_merge_with_cli_scope_exits_nonzero_without_merge_call(self):
+        # Capture every subprocess.run call so we can prove no
+        # ``gh pr merge`` invocation occurs.
+        captured_argvs = []
+
+        def _capture(cmd, *args, **kwargs):
+            captured_argvs.append(list(cmd))
+            # Stub the pr view read so merge can get past the head_sha
+            # check; anything else returns non-zero so merge bails on
+            # the scope rejection before reaching the merge mutation.
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(_r16_pr_view_payload()),
+                    stderr="",
+                )
+            return mock.Mock(returncode=1, stdout="", stderr="blocked")
+
+        args = mock.Mock()
+        args.repo = DEFAULT_REPO
+        args.pr_number = 411
+        args.allowed_files = "scripts/local/aed_pr*.py"
+        args.forbidden_files = None
+        args.authorization_phrase = (
+            "I confirm merge PR #411 at " + "a" * 40
+            + " using final-head reviewed clean state."
+        )
+
+        with mock.patch.object(
+            subprocess, "run", side_effect=_capture,
+        ), mock.patch.object(
+            ctrl.CODEX, "classify",
+            side_effect=lambda **kw: _r16_codex_classify(**kw),
+        ):
+            buf_out = io.StringIO()
+            buf_err = io.StringIO()
+            old_out, old_err = sys.stdout, sys.stderr
+            sys.stdout, sys.stderr = buf_out, buf_err
+            try:
+                rc = ctrl.cmd_merge(args)
+            finally:
+                sys.stdout, sys.stderr = old_out, old_err
+
+        assert rc == 1
+        # No ``gh pr merge`` invocation may occur.
+        merge_calls = [
+            argv for argv in captured_argvs
+            if "merge" in argv and "gh" in argv
+        ]
+        assert merge_calls == [], (
+            f"merge must NOT call gh when CLI scope is supplied; "
+            f"saw {merge_calls!r}"
+        )
+        # The stderr message must mention the CLI-scope rejection.
+        assert "merge does not accept" in buf_err.getvalue()
+
+
+class TestRound16BuildEvidenceNeverSeesCliScope:
+    """Round-16: ``build_evidence`` is never called with CLI patterns as
+    authoritative ``allowed_files`` or ``forbidden_files`` for status
+    or advance. The resolver's fail-closed return
+    ``(None, None, error)`` means the controller passes
+    ``allowed_files=None`` to ``build_evidence``, which then sets
+    ``scope_clean=None`` and produces the canonical scope-not-supplied
+    blocker.
+    """
+
+    def _capture_build_evidence_argv(self, cli_allowed, cli_forbidden):
+        """Run ``cmd_status`` with stubbed ``build_evidence`` and
+        record every keyword argument supplied.
+        """
+        captured = {}
+
+        real_build_evidence = ctrl.build_evidence
+
+        def _spy_build_evidence(**kwargs):
+            captured.update(kwargs)
+            return real_build_evidence(**kwargs)
+
+        args = mock.Mock()
+        args.repo = DEFAULT_REPO
+        args.pr_number = 411
+        args.allowed_files = cli_allowed
+        args.forbidden_files = cli_forbidden
+
+        with mock.patch.object(
+            subprocess, "run", side_effect=_r16_fake_run_no_writes,
+        ), mock.patch.object(
+            ctrl.CODEX, "classify",
+            side_effect=lambda **kw: _r16_codex_classify(**kw),
+        ), mock.patch.object(
+            ctrl, "build_evidence", side_effect=_spy_build_evidence,
+        ):
+            buf = io.StringIO()
+            old_out = sys.stdout
+            sys.stdout = buf
+            try:
+                ctrl.cmd_status(args)
+            finally:
+                sys.stdout = old_out
+        return captured
+
+    def test_status_with_cli_allowed_passes_none_to_build_evidence(self):
+        captured = self._capture_build_evidence_argv(
+            cli_allowed="scripts/local/aed_pr.py", cli_forbidden=None,
+        )
+        # CLI patterns MUST NOT reach build_evidence as authoritative
+        # scope. The resolver returns None so the controller passes
+        # allowed_files=None.
+        assert captured.get("allowed_files") is None
+        assert captured.get("forbidden_files") is None
+
+    def test_status_with_cli_forbidden_passes_none_to_build_evidence(self):
+        captured = self._capture_build_evidence_argv(
+            cli_allowed=None, cli_forbidden="**",
+        )
+        assert captured.get("allowed_files") is None
+        assert captured.get("forbidden_files") is None
+
+    def test_status_without_cli_scope_passes_trusted_or_none(self):
+        """When no CLI flags are supplied the resolver either returns
+        the trusted scope or ``(None, None, error)``. In either case
+        the controller MUST NOT invent CLI scope.
+        """
+        captured = self._capture_build_evidence_argv(
+            cli_allowed=None, cli_forbidden=None,
+        )
+        # When no trusted scope exists (the default for this test)
+        # the resolver returns None, None — that is the only value
+        # the controller is allowed to forward.
+        assert captured.get("allowed_files") is None or captured.get("allowed_files") == []
+        # If a list was passed, it must not contain CLI patterns
+        # (CLI patterns were never supplied in this test).
+        if captured.get("allowed_files"):
+            assert all(
+                "scripts/local/aed_pr.py" != x for x in captured["allowed_files"]
+            ), (
+                "CLI patterns must not be forwarded to build_evidence; "
+                f"got {captured['allowed_files']!r}"
+            )

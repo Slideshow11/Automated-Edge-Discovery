@@ -441,14 +441,183 @@ class TestF3TrustedScopeAuthority:
         )
         assert "head_sha mismatch" in err
 
-    def test_status_accepts_cli_override(self):
-        allowed, _, err = ctrl._resolve_effective_scope(
+    def test_status_rejects_cli_scope(self):
+        """Round-16 fix: CLI ``--allowed-files`` / ``--forbidden-files``
+        on ``status`` must NOT be authoritative. The resolver returns
+        ``(None, None, error)`` so the scope gate fails closed and
+        ``cmd_status`` cannot emit an authorization phrase on a
+        untrusted CLI override.
+        """
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
             subcommand="status",
             repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
             cli_allowed=["scripts/local/aed_pr.py"], cli_forbidden=None,
         )
-        assert err == ""
-        assert allowed == ["scripts/local/aed_pr.py"]
+        assert err
+        assert "cli_scope_not_authoritative" in err
+        assert allowed is None
+        assert forbidden is None
+
+    def test_status_rejects_cli_forbidden(self):
+        """Round-16: CLI ``--forbidden-files`` on ``status`` is also
+        rejected with the same diagnostic.
+        """
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand="status",
+            repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+            cli_allowed=None, cli_forbidden=["scripts/local/aed_pr.py"],
+        )
+        assert err
+        assert "cli_scope_not_authoritative" in err
+        assert allowed is None
+        assert forbidden is None
+
+    def test_advance_rejects_cli_scope(self):
+        """Round-16: CLI scope on ``advance`` is also rejected (the
+        same diagnostic as ``status``).
+        """
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand="advance",
+            repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+            cli_allowed=["scripts/local/aed_pr.py"], cli_forbidden=None,
+        )
+        assert err
+        assert "cli_scope_not_authoritative" in err
+        assert allowed is None
+        assert forbidden is None
+
+    def test_merge_continues_to_reject_cli_scope(self):
+        """Round-16: the merge command's existing rejection is
+        unchanged.
+        """
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand="merge",
+            repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+            cli_allowed=["**"], cli_forbidden=None,
+        )
+        assert err
+        assert "merge does not accept" in err
+        assert allowed is None
+        assert forbidden is None
+
+    def test_trusted_file_is_returned_for_all_three_lifecycle_commands(self):
+        """Round-16: when no CLI override is supplied and the canonical
+        trusted file exists, every lifecycle command reads the same
+        authoritative scope.
+        """
+        self._write()
+        for sub in ("status", "advance", "merge"):
+            allowed, _, err = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=None, cli_forbidden=None,
+            )
+            assert err == "", f"{sub}: expected no error, got {err!r}"
+            assert allowed == PASSING_SCOPE, (
+                f"{sub}: expected PASSING_SCOPE; got {allowed!r}"
+            )
+
+    def test_trusted_file_absent_blocks_all_three_lifecycle_commands(self):
+        """Round-16: a missing trusted scope record must fail closed
+        on every lifecycle command. None of the three may silently
+        invent a scope.
+        """
+        for sub in ("status", "advance", "merge"):
+            allowed, forbidden, err = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=None, cli_forbidden=None,
+            )
+            assert err, f"{sub}: expected error; got err=''"
+            assert "trusted scope not found" in err, (
+                f"{sub}: unexpected error {err!r}"
+            )
+            assert allowed is None
+            assert forbidden is None
+
+    def test_stale_head_trusted_scope_blocks_all_three(self):
+        """Round-16: a trusted scope recorded against a different head
+        SHA must block every lifecycle command.
+        """
+        path = ctrl._trusted_scope_path(
+            DEFAULT_REPO, 411, DEFAULT_HEAD
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "pr_number": 411,
+            "repo": DEFAULT_REPO,
+            "head_sha": "b" * 40,  # recorded head != live head
+            "allowed_files": PASSING_SCOPE,
+            "forbidden_files": [],
+            "written_at": "2026-07-16T00:00:00Z",
+        }), encoding="utf-8")
+        for sub in ("status", "advance", "merge"):
+            allowed, forbidden, err = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=None, cli_forbidden=None,
+            )
+            assert err, f"{sub}: expected error; got err=''"
+            assert "head_sha mismatch" in err, (
+                f"{sub}: unexpected error {err!r}"
+            )
+            assert allowed is None
+            assert forbidden is None
+
+    def test_conflicting_cli_flags_do_not_override_trusted_scope(self):
+        """Round-16: even when a valid trusted scope exists, supplying
+        CLI ``--allowed-files`` must NOT cause the CLI patterns to
+        replace or be merged with the trusted scope. Both status and
+        advance return ``cli_scope_not_authoritative`` with empty
+        lists so the trusted file is the only authoritative source.
+        """
+        self._write()
+        # CLI scope with patterns that DIFFER from the trusted scope.
+        # The resolver must reject the CLI patterns entirely rather
+        # than merging them with the trusted file.
+        for sub in ("status", "advance"):
+            allowed, _, err = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=["SOME/OTHER/PATH.py"],
+                cli_forbidden=None,
+            )
+            assert err, f"{sub}: expected rejection"
+            assert "cli_scope_not_authoritative" in err
+            assert allowed is None
+        # When the trusted file is consulted WITHOUT CLI override it
+        # is still returned verbatim, so a subsequent non-CLI call
+        # succeeds.
+        for sub in ("status", "advance", "merge"):
+            allowed, _, err = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=None, cli_forbidden=None,
+            )
+            assert err == ""
+            assert allowed == PASSING_SCOPE
+
+    def test_scope_write_still_creates_exact_head_record(self):
+        """Round-16: ``scope-write`` (the only command that persists
+        the trusted record) must continue to work for an exact head.
+        """
+        ok, result = ctrl.write_trusted_scope(
+            DEFAULT_REPO, 411, DEFAULT_HEAD, list(PASSING_SCOPE), []
+        )
+        assert ok
+        # ``write_trusted_scope`` returns the canonical path as the
+        # informational second value on success.
+        assert result and "Automated-Edge-Discovery" in result
+        # The written record is then readable by all three lifecycle
+        # commands.
+        for sub in ("status", "advance", "merge"):
+            allowed, _, rerr = ctrl._resolve_effective_scope(
+                subcommand=sub,
+                repo=DEFAULT_REPO, pr_number=411, head_sha=DEFAULT_HEAD,
+                cli_allowed=None, cli_forbidden=None,
+            )
+            assert rerr == ""
+            assert allowed == PASSING_SCOPE
 
 
 class TestMergeArgparseRejectsScopeOverride:

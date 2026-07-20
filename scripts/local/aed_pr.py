@@ -2038,6 +2038,38 @@ _MERGE_CLI_SCOPE_REJECTION = (
 )
 
 
+# Round-16 — Codex finding PRRC_kwDOSHFpYM7XcqZM (review 4735335955,
+# comment 3614615116, thread PRRT_kwDOSHFpYM6SQa5E, line 2085):
+# ``status`` and ``advance`` previously accepted CLI-supplied
+# ``--allowed-files`` / ``--forbidden-files`` patterns as authoritative
+# scope, while ``merge`` rejected the same flags and read only the
+# canonical trusted scope file. The status/advance path then fed the
+# CLI patterns into ``build_evidence``, which set ``scope_clean=True``
+# on a clean diff and let ``status`` emit the canonical merge
+# authorization phrase — even though ``merge`` would then reject the
+# same PR because it only trusts the canonical file. The controller's
+# status/advance/merge contract diverged and operators could see a
+# false ready signal from an untrusted CLI override.
+#
+# Round-16 policy: the only authoritative scope source for ANY
+# lifecycle readiness command (status, advance, merge) is the canonical
+# trusted exact-head record. CLI scope on status/advance is rejected
+# with a structured, explicit diagnostic. ``scope-write`` is the only
+# command that persists the trusted record. This constant documents
+# the rejection at the call site.
+_STATUS_ADVANCE_CLI_SCOPE_REJECTION = (
+    "cli_scope_not_authoritative: --allowed-files and --forbidden-files "
+    "are NOT authoritative for status or advance. Lifecycle readiness "
+    "requires the canonical trusted scope record at "
+    "~/.hermes/aed/pr_scope/<owner>/<name>/<pr>/<head_sha>.json. "
+    "Persist the trusted exact-head scope with "
+    "`aed_pr scope-write --head-sha <sha>` and rerun without the CLI "
+    "scope flags. The canonical scope root is hard-coded; no "
+    "environment variable, CLI flag, or working-directory fall-back may "
+    "redirect it."
+)
+
+
 def _resolve_effective_scope(
     *,
     subcommand: str,
@@ -2057,9 +2089,14 @@ def _resolve_effective_scope(
       tied to a different head SHA, the readiness evaluator fails
       closed.
     * ``subcommand in ("status", "advance")`` - CLI scope is
-      accepted as a diagnostic override (test seam). When CLI scope
-      is absent, the trusted file is consulted instead. Diagnostic
-      override must NOT mask the trusted-file fail-closed behavior.
+      REJECTED with a structured diagnostic. Lifecycle readiness for
+      ``status`` and ``advance`` must come from the canonical trusted
+      exact-head record, the same source ``merge`` reads. CLI scope
+      on ``status``/``advance`` is silently ignored BEFORE the round-16
+      fix; it is now an explicit ``cli_scope_not_authoritative``
+      failure so ``status`` cannot emit an authorization phrase on a
+      untrusted CLI override and ``advance`` cannot perform any
+      lifecycle mutation.
     * Trusted file absent and no CLI scope - returns ``None`` lists
       so the scope gate fails closed (no fallback to a default
       allowlist).
@@ -2077,14 +2114,11 @@ def _resolve_effective_scope(
                 "scope can be resolved"
             )
         return read_trusted_scope(repo, pr_number, head_sha)
-    # status / advance: CLI scope override is a test seam. The
-    # trusted file is the canonical source.
+    # status / advance: CLI scope is rejected with an explicit
+    # diagnostic. Lifecycle readiness for both commands comes from
+    # the canonical trusted exact-head record, NOT from CLI patterns.
     if cli_allowed is not None or cli_forbidden is not None:
-        return (
-            [a for a in (cli_allowed or []) if isinstance(a, str) and a],
-            [a for a in (cli_forbidden or []) if isinstance(a, str) and a],
-            "",
-        )
+        return None, None, _STATUS_ADVANCE_CLI_SCOPE_REJECTION
     if not head_sha or not R.is_canonical_head_sha(head_sha):
         # No head_sha means status/advance is inspecting a PR whose
         # head we have not yet fetched (defensive). The trusted file
@@ -2402,7 +2436,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     # three: repo, pr_number, head_sha.
     pr_view = fetch_pr_state(repo, pr_number)
     head_sha = pr_view.get("headRefOid")
-    allowed_files, forbidden_files, _ = _resolve_effective_scope(
+    allowed_files, forbidden_files, scope_err = _resolve_effective_scope(
         subcommand="status",
         repo=repo,
         pr_number=pr_number,
@@ -2428,9 +2462,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = derive_lifecycle_state(verdict, pr_view)
     safe_cmd = L.build_safe_merge_command(pr_number, repo, head_sha)
     # The canonical phrase is emitted ONLY when machine readiness
-    # converged on the live head. It is the operator's job to speak
-    # it back to ``aed_pr merge``; the controller does not invent or
-    # pre-supply a phrase.
+    # converged on the live head from the canonical trusted scope.
+    # It is the operator's job to speak it back to ``aed_pr merge``;
+    # the controller does not invent or pre-supply a phrase.
     canonical_phrase = (
         L.build_authorization_phrase(pr_number, str(head_sha))
         if verdict.machine_ready and R.is_canonical_head_sha(head_sha) else None
@@ -2458,6 +2492,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         ),
         "out_of_scope_files": evidence.out_of_scope_files,
         "forbidden_files_touched": evidence.forbidden_files_touched,
+        "scope_error": scope_err or None,
         "required_ci_names": list(REQUIRED_CHECK_NAMES),
         "ci_conclusions": evidence.ci_conclusions,
         "ci_missing": evidence.ci_missing,
@@ -2492,7 +2527,12 @@ def cmd_status(args: argparse.Namespace) -> int:
         "reasons": [r.to_dict() for r in verdict.reasons],
         "safe_merge_command_preview": safe_cmd,
         "required_authorization_phrase": canonical_phrase,
-        "next_human_action": _next_human_action(state),
+        # Round-16 fix: when the scope resolver rejected CLI flags,
+        # surface the explicit diagnostic as the next-action hint
+        # so the operator sees the scope-write instruction.
+        "next_human_action": (
+            scope_err if scope_err else _next_human_action(state)
+        ),
     }
 
     json.dump(report, sys.stdout, indent=2)
@@ -2979,7 +3019,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # the live head SHA.
     pr_view = fetch_pr_state(repo, pr_number)
     head_sha = pr_view.get("headRefOid")
-    allowed_files, forbidden_files, _ = _resolve_effective_scope(
+    allowed_files, forbidden_files, scope_err = _resolve_effective_scope(
         subcommand="advance",
         repo=repo,
         pr_number=pr_number,
@@ -3004,6 +3044,53 @@ def cmd_advance(args: argparse.Namespace) -> int:
     state = derive_lifecycle_state(machine_verdict, pr_view)
 
     actions_taken: List[Dict[str, Any]] = []
+    # Round-16 fix: when the scope resolver rejected CLI flags, the
+    # entire advance pipeline is fail-closed. We emit the diagnostic,
+    # skip every mutation (codex-ping, thread resolution, ready
+    # mark, workflow dispatch, scope-write, gh pr merge) and return.
+    # The eligibility classifier is also skipped because machine
+    # readiness is False by construction (``scope_clean=None``),
+    # so no per-thread resolution can be authorized.
+    #
+    # Only the CLI-scope rejection is treated as a hard short-circuit
+    # here. The "trusted scope not found" / "live head SHA required"
+    # diagnostics flow through the existing path so existing tests
+    # that observe the eligibility classifier running on those inputs
+    # remain valid.
+    if scope_err and "cli_scope_not_authoritative" in scope_err:
+        actions_taken.append({
+            "action": "cli_scope_rejected",
+            "ok": False,
+            "result": "cli_scope_not_authoritative",
+            "error": scope_err,
+        })
+        out = {
+            "tool": "aed_pr.advance",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "lifecycle_state": state,
+            "scope_source": (
+                "cli_override" if cli_override else "trusted_file"
+            ),
+            "scope_error": scope_err,
+            "machine_ready": machine_verdict.machine_ready,
+            "authorization_required": machine_verdict.authorization_required,
+            "authorization_valid": machine_verdict.authorization_valid,
+            "merge_ready": machine_verdict.merge_ready,
+            "ready": machine_verdict.merge_ready,
+            "reason_codes": [r.code for r in machine_verdict.reasons],
+            "reasons": [r.to_dict() for r in machine_verdict.reasons],
+            "actions_taken": actions_taken,
+            "safe_merge_command_if_ready": None,
+            "required_authorization_phrase_if_ready": None,
+            "next_human_action": scope_err,
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
     # Step 1: classify every thread as eligible or ineligible. The
     # eligibility check is deterministic (R.is_eligible_for_bot_resolution)
     # and operates on the current inventory snapshot; it does NOT
@@ -3080,6 +3167,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             "scope_source": (
                 "cli_override" if cli_override else "trusted_file"
             ),
+            "scope_error": scope_err or None,
             "machine_ready": machine_verdict.machine_ready,
             "authorization_required": machine_verdict.authorization_required,
             "authorization_valid": machine_verdict.authorization_valid,
@@ -3435,6 +3523,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         "scope_source": (
             "cli_override" if cli_override else "trusted_file"
         ),
+        "scope_error": scope_err or None,
         # Round-2 split.
         "machine_ready": machine_verdict.machine_ready,
         "authorization_required": machine_verdict.authorization_required,
