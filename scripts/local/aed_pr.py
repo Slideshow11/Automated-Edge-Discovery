@@ -642,29 +642,86 @@ def _fetch_gh_pr_checks_payload(
     *,
     runner: Optional[Any] = None,
 ) -> Tuple[bool, Any, str]:
-    """Wrap ``gh pr checks --json ...`` invocation for tests."""
+    """Wrap ``gh pr checks --json ...`` invocation for tests.
+
+    ``gh pr checks`` uses **status-oriented** exit codes (per the
+    GitHub CLI manual at https://cli.github.com/manual/gh_pr_checks):
+
+    * ``0`` — all checks passed
+    * ``1`` — one or more checks failed
+    * ``8`` — one or more checks are pending
+
+    All three codes may still produce valid JSON through
+    ``--json``. The check states in that JSON are the
+    authoritative per-check signal; the exit code is a
+    *summary* of those states, not a transport signal.
+
+    Acceptance contract:
+
+    * ``returncode in (0, 1, 8)`` AND non-empty stdout AND valid
+      JSON list  → ``ok=True``, parsed payload, empty error.
+    * Empty stdout, malformed JSON, or any other return code is
+      rejected with a bounded diagnostic so the operator can
+      distinguish a transport / cancellation / auth failure from
+      a status exit.
+
+    The actual check states (``SUCCESS``, ``FAILURE``,
+    ``PENDING``, ...) in the payload remain authoritative.
+    Return codes ``1`` and ``8`` are **not** converted into a
+    successful check conclusion: ``fetch_ci_conclusions`` still
+    classifies each record on its own state.
+    """
     cmd = [
         "gh", "pr", "checks", str(pr_number),
         "--repo", repo,
         "--json", "name,state,workflow",
     ]
+    # Codes for which ``gh pr checks`` is documented to emit
+    # valid JSON. ``fetch_ci_conclusions`` decides what each
+    # individual check state means; this helper only decides
+    # whether the JSON query itself succeeded.
+    _GH_PR_CHECKS_ACCEPTED_RETURN_CODES = frozenset({0, 1, 8})
+
+    def _invoke_and_parse(invoker):
+        try:
+            proc = invoker(cmd, capture_output=True, text=True, timeout=45)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, None, f"gh invocation failed: {exc}"
+        # Process-launch or transport failure on the default
+        # ``subprocess.run`` path can surface as ``returncode is
+        # None`` with ``proc.stdout``/``proc.stderr`` empty or
+        # unset. Treat that as a launch failure too.
+        rc = getattr(proc, "returncode", None)
+        stdout = getattr(proc, "stdout", "") or ""
+        stderr = getattr(proc, "stderr", "") or ""
+        if rc is None:
+            bounded = (stderr or "").strip()[:300] or "gh returned no exit code"
+            return False, None, f"gh invocation incomplete: {bounded}"
+        if not stdout.strip():
+            return False, None, "gh returned empty stdout"
+        try:
+            payload = json.loads(stdout)
+        except json.JSONDecodeError as exc:
+            return False, None, f"invalid JSON: {exc}"
+        if rc not in _GH_PR_CHECKS_ACCEPTED_RETURN_CODES:
+            bounded = (stderr or "").strip()[:300]
+            return (
+                False, None,
+                f"unexpected gh exit code {rc}: {bounded}" if bounded
+                else f"unexpected gh exit code {rc}",
+            )
+        return True, payload, ""
+
     if runner is None:
-        return _run_json_or_none(cmd, timeout=45)
-    try:
-        proc = runner(cmd, capture_output=True, text=True, timeout=45)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, None, f"gh invocation failed: {exc}"
-    if proc.returncode != 0:
-        return (
-            False, None,
-            (proc.stderr or "").strip()[:300] or "gh returned non-zero",
-        )
-    if not (proc.stdout or "").strip():
-        return False, None, "gh returned empty stdout"
-    try:
-        return True, json.loads(proc.stdout), ""
-    except json.JSONDecodeError as exc:
-        return False, None, f"invalid JSON: {exc}"
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=45
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return False, None, f"gh invocation failed: {exc}"
+        return _invoke_and_parse(lambda *a, **kw: proc)
+
+    return _invoke_and_parse(runner)
 
 
 def fetch_ci_conclusions(
