@@ -3484,17 +3484,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 # honestly: any_failed=True means at least one mutation
                 # failed; the controller does NOT falsely mark
                 # ``ok=True``.
+                #
+                # Round-18 fix: ``build_evidence`` already calls
+                # ``fetch_codex_packet`` exactly once and populates
+                # every Codex/thread field from that single packet.
+                # The previous implementation performed a redundant
+                # ``fetch_codex_packet`` here AND a hidden second
+                # fetch inside ``build_evidence``, then overwrote
+                # ``review_threads`` on the resulting evidence with
+                # a snapshot taken from the first packet while the
+                # partition fields came from the second packet.
+                # That mixing allowed a still-unresolved refreshed
+                # thread to be reported as machine-ready if the
+                # second packet's partition happened to be empty.
+                # The repair: call ``build_evidence`` exactly once
+                # and let it produce a coherent post-resolution
+                # snapshot.
+                refreshed_evidence: Optional[R.ReadinessEvidence] = None
+                refreshed_machine_verdict: Optional[R.ReadinessVerdict] = None
                 try:
-                    refreshed_codex_packet = fetch_codex_packet(
-                        repo, pr_number, head_sha or ""
-                    )
-                    raw_refreshed_threads = list(
-                        refreshed_codex_packet.get("active_threads") or []
-                    ) + list(refreshed_codex_packet.get("outdated_threads") or [])
-                    refreshed_threads = [
-                        R.normalize_thread_anchor(t)
-                        for t in raw_refreshed_threads
-                    ]
                     refreshed_evidence = build_evidence(
                         repo=repo,
                         pr_number=pr_number,
@@ -3510,11 +3518,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         allowed_files=allowed_files,
                         forbidden_files=forbidden_files,
                     )
-                    # Override the inventory with the freshly fetched one.
-                    refreshed_evidence.review_threads = refreshed_threads
-                    refreshed_evidence.unresolved_thread_count = (
-                        len(refreshed_evidence.unresolved_thread_ids)
-                    )
                     refreshed_machine_verdict = (
                         R.evaluate_machine_readiness(refreshed_evidence)
                     )
@@ -3527,7 +3530,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         "error": repr(exc),
                         "thread_resolutions": resolution_results,
                     })
-                    refreshed_machine_verdict = None
                 actions_taken.append({
                     "action": "resolve_eligible_bot_threads",
                     "attempted": attempted,
@@ -3552,6 +3554,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     ),
                 })
                 if refreshed_machine_verdict is not None:
+                    # Round-18 fix: replace the pre-resolution
+                    # ``evidence`` and ``machine_verdict`` with
+                    # the coherent refreshed snapshot so every
+                    # later use (including the report fields and
+                    # canonical authorization phrase) reflects the
+                    # post-resolution state. The previous
+                    # implementation only updated
+                    # ``machine_verdict`` here, leaving the old
+                    # ``evidence`` reachable for any code path
+                    # that consulted it before the report was
+                    # assembled.
+                    evidence = refreshed_evidence
                     machine_verdict = refreshed_machine_verdict
                     state = derive_lifecycle_state(machine_verdict, pr_view)
         else:
