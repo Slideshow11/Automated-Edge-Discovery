@@ -2577,6 +2577,55 @@ def derive_lifecycle_state(verdict: R.ReadinessVerdict, pr_view: Dict[str, Any])
     # READY_FOR_MERGE_AUTHORIZATION on a fully-green PR.
     if not verdict.machine_ready:
         codes = {r.code for r in verdict.reasons}
+        # Round-23 fix: reason codes that mean "evidence must be
+        # re-fetched and re-checked before the operator is allowed
+        # to retry" map to the canonical ``WAITING`` state. The
+        # exported ``LIFECYCLE_STATES`` enum and
+        # ``_next_human_action`` define ``WAITING`` for exactly
+        # this case; without this branch, ordinary CI / Codex
+        # convergence (e.g. ``REQUIRED_CI_PENDING``,
+        # ``CODEX_EVIDENCE_MISSING``) would surface as ``BLOCKED``
+        # and route the operator down a deterministic repair path
+        # while checks are still running.
+        #
+        # ``WAITING`` fires ONLY when every non-PHRASE reason is
+        # a transient evidence-freshness or fetch-failure code.
+        # Deterministic policy reasons (scope, forbidden file,
+        # PR-not-open, scope-unknown, ...) keep the state at
+        # ``BLOCKED`` even when transient codes also appear.
+        waiting_codes = frozenset({
+            R.REASON_CI_PENDING,
+            R.REASON_CODEX_MISSING,
+            R.REASON_CODEX_STALE,
+            R.REASON_CODEX_FAILED,
+            R.REASON_CODEX_CLEAN_MISSING,
+            R.REASON_REVIEWS_INCOMPLETE,
+            R.REASON_THREAD_INVENTORY_FAILED,
+            R.REASON_CHANGED_FILES_MISSING,
+            R.REASON_EVIDENCE_MISSING,
+        })
+        # Deterministic reasons that always surface as a hard
+        # block. If ANY of these is present, the lifecycle state
+        # is NOT ``WAITING`` even when transient codes coexist.
+        deterministic_codes = frozenset({
+            R.REASON_PR_IS_DRAFT,
+            R.REASON_UNRESOLVED_THREAD,
+            R.REASON_SCOPE_UNKNOWN,
+            R.REASON_SCOPE_VIOLATION,
+            R.REASON_FORBIDDEN_FILE_TOUCHED,
+            R.REASON_PR_NOT_OPEN,
+            R.REASON_PR_NOT_MERGEABLE,
+            R.REASON_CI_FAILED,
+            R.REASON_CI_MISSING,
+            R.REASON_PHRASE_MISMATCH,
+        })
+        has_deterministic = bool(codes & deterministic_codes)
+        has_only_waiting = (
+            bool(codes)
+            and codes <= waiting_codes
+        )
+        if has_only_waiting and not has_deterministic:
+            return "WAITING"
         human_codes = {
             R.REASON_PR_IS_DRAFT,
             R.REASON_UNRESOLVED_THREAD,
@@ -3786,19 +3835,29 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # while a new Codex review is in flight.
         effective_machine_ready = False
         effective_merge_ready = False
-        # Override the lifecycle state to ``WAITING_FOR_REVIEW``
-        # so an operator or automation cannot read
-        # ``READY_FOR_MERGE_AUTHORIZATION`` while a fresh review
-        # is pending. ``next_human_action`` is rewritten to a
-        # hint that names the wait, not the merge.
-        state = "WAITING_FOR_REVIEW"
+        # Round-23 fix: use the canonical ``WAITING`` state (in
+        # ``LIFECYCLE_STATES`` and ``_next_human_action``) so
+        # downstream consumers validating ``lifecycle_state``
+        # against the exported enum still recognise the state.
+        # Round-22 introduced ``WAITING_FOR_REVIEW`` which was
+        # not part of the exported vocabulary; that path is
+        # collapsed into ``WAITING``.
+        state = "WAITING"
         next_human_action = (
             "A new @codex review request was posted in this run; "
             "wait for the response before re-running status."
         )
+        # Round-23 fix: also clear ``authorization_required`` so
+        # the report does not tell automation to ask the operator
+        # for merge authorization while the same report withholds
+        # the phrase and says to wait for review.
+        effective_authorization_required = False
     else:
         effective_machine_ready = machine_verdict.machine_ready
         effective_merge_ready = machine_verdict.merge_ready
+        effective_authorization_required = (
+            machine_verdict.authorization_required
+        )
         next_human_action = _next_human_action(state)
 
     out: Dict[str, Any] = {
@@ -3814,7 +3873,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
         "scope_error": scope_err or None,
         # Round-2 split.
         "machine_ready": effective_machine_ready,
-        "authorization_required": machine_verdict.authorization_required,
+        "authorization_required": effective_authorization_required,
         "authorization_valid": machine_verdict.authorization_valid,
         "merge_ready": effective_merge_ready,
         "ready": effective_merge_ready,

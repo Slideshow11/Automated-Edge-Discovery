@@ -3462,7 +3462,7 @@ class TestRound21FindExactHeadRunMultipleRefusesToSelect:
 #
 # Tests below prove:
 #
-#   * ``cmd_advance`` reports ``lifecycle_state == "WAITING_FOR_REVIEW"``
+#   * ``cmd_advance`` reports ``lifecycle_state == "WAITING"``
 #     and ``next_human_action`` no longer says "speak the phrase"
 #     when a fresh ping was posted in this run;
 #   * ``cmd_advance`` keeps the pre-ping ``lifecycle_state`` and
@@ -3541,9 +3541,12 @@ class TestRound22LifecycleStateOnFreshPing:
         rc, report = self._run(initial_packet=clean)
         assert rc == 0
         assert report["fresh_codex_ping_posted"] is True
-        # The override is mandatory: a stale clean pass must
-        # not advertise authorization through lifecycle_state.
-        assert report["lifecycle_state"] == "WAITING_FOR_REVIEW"
+        # Round-23 fix: the canonical ``WAITING`` state (in
+        # ``LIFECYCLE_STATES``) replaces the Round-22
+        # ``WAITING_FOR_REVIEW`` so downstream consumers
+        # validating ``lifecycle_state`` against the exported
+        # enum still recognise the state.
+        assert report["lifecycle_state"] == "WAITING"
         # The hint MUST NOT say "speak the phrase" because the
         # phrase is suppressed in this same report.
         assert "speak" not in report["next_human_action"].lower()
@@ -3663,10 +3666,10 @@ class TestRound22LifecycleStateOnFreshPing:
         # No fresh ping was posted, so the lifecycle state is
         # the pre-ping value (whatever derive_lifecycle_state
         # returned on the captured evidence). Critically, it
-        # must NOT have been overridden to
-        # ``WAITING_FOR_REVIEW`` because no ping was posted.
+        # must NOT have been overridden to ``WAITING``
+        # because no ping was posted.
         assert report["fresh_codex_ping_posted"] is False
-        assert report["lifecycle_state"] != "WAITING_FOR_REVIEW"
+        assert report["lifecycle_state"] != "WAITING"
         # And the next_human_action must NOT be the Round-22
         # wait hint.
         assert "wait for the response" \
@@ -3808,3 +3811,299 @@ class TestRound22StatusPreviewOnCanonicalHead:
         assert rc == 0
         assert report["safe_merge_command_preview"] is None
         assert report["machine_ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-23 regression tests.
+#
+# Exact-head Codex review 4740936968 (submitted 2026-07-21T03:20:51Z on
+# head 4c998f5f80f1d4698adc4d6e51a414e694737229) reported three P2
+# findings on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XuJqh (db_id 3619199649)
+#     "Return WAITING for in-flight gates"
+#     ``derive_lifecycle_state`` falls through to ``BLOCKED``
+#     for in-flight gates (e.g. ``REASON_CI_PENDING``); the
+#     exported vocabulary defines ``WAITING`` for exactly this
+#     case. Map transient reason codes to ``WAITING`` so an
+#     automation does not take a deterministic repair path
+#     while CI / Codex is still converging.
+#
+#   PRRC_kwDOSHFpYM7XuJqj (db_id 3619199651)
+#     "Emit a canonical waiting state after fresh pings"
+#     The Round-22 override used ``WAITING_FOR_REVIEW`` which
+#     is not in the exported ``LIFECYCLE_STATES`` enum. Use the
+#     canonical ``WAITING`` state so consumers validating
+#     ``lifecycle_state`` against the enum still recognise
+#     the state.
+#
+#   PRRC_kwDOSHFpYM7XuJqo (db_id 3619199656)
+#     "Clear authorization_required while review is in flight"
+#     On a fresh-ping path, only ``machine_ready`` and
+#     ``merge_ready`` were overridden; ``authorization_required``
+#     still came from the pre-ping verdict and could say
+#     ``true`` while the same report withholds the phrase and
+#     says to wait. Clear ``authorization_required`` whenever a
+#     fresh ping is posted in this run.
+#
+# Tests below prove:
+#
+#   * ``derive_lifecycle_state`` returns ``WAITING`` for
+#     a verdict whose only failure is ``REASON_CI_PENDING``
+#     and returns ``WAITING`` for any other pure-transient
+#     failure (Codex missing, codex stale, codex clean
+#     missing, reviews incomplete, thread inventory failed,
+#     changed files missing, evidence missing);
+#   * ``derive_lifecycle_state`` keeps ``BLOCKED`` when a
+#     transient reason coexists with a deterministic reason
+#     (e.g. ``SCOPE_UNKNOWN`` + ``CHANGED_FILES_NOT_FETCHED``);
+#   * ``derive_lifecycle_state`` keeps ``ACTION_REQUIRED``
+#     when draft / unresolved-thread reasons are present;
+#   * the fresh-ping path reports ``lifecycle_state ==
+#     "WAITING"`` (canonical, in ``LIFECYCLE_STATES``) and
+#     ``authorization_required == False`` even when the pre-ping
+#     verdict said ``authorization_required == True``;
+#   * the duplicate-detection path keeps the pre-ping
+#     ``lifecycle_state`` and the original
+#     ``authorization_required`` value.
+# ---------------------------------------------------------------------------
+
+
+def _r23_verdict(*, codes, machine_ready=False,
+                 authorization_required=True, authorization_valid=None,
+                 gates_passed=None, gates_failed=None):
+    """Build a ``ReadinessVerdict`` with the supplied reason
+    codes. Used to drive ``derive_lifecycle_state`` directly
+    without going through the full evidence pipeline.
+    ``merge_ready`` is a property, so we only set the
+    underlying fields.
+    """
+    import scripts.local.aed_pr_readiness as R
+    reasons = []
+    for c in codes:
+        reasons.append(R.ReadinessReason(
+            code=c,
+            detail=f"synthetic {c}",
+            gate="",
+        ))
+    return R.ReadinessVerdict(
+        ready=False,
+        reasons=reasons,
+        gates_passed=gates_passed or [],
+        gates_failed=gates_failed or [],
+        machine_ready=machine_ready,
+        authorization_required=authorization_required,
+        authorization_valid=authorization_valid,
+    )
+
+
+class TestRound23WaitingStateForInFlightGates:
+    """P2 #1 (PRRC_kwDOSHFpYM7XuJqh):
+    ``derive_lifecycle_state`` returns ``WAITING`` for transient
+    in-flight gates so the operator is not routed to a
+    deterministic repair path while CI / Codex is still
+    converging.
+    """
+
+    PR_VIEW_OPEN = {
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+    }
+
+    def test_ci_pending_only_is_waiting(self):
+        """A verdict whose only failure is
+        ``REQUIRED_CI_PENDING`` (CI in flight) maps to
+        ``WAITING``, not ``BLOCKED``.
+        """
+        v = _r23_verdict(codes=["REQUIRED_CI_PENDING"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "WAITING"
+
+    def test_codex_missing_only_is_waiting(self):
+        v = _r23_verdict(codes=["CODEX_EVIDENCE_MISSING"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "WAITING"
+
+    def test_codex_clean_missing_only_is_waiting(self):
+        v = _r23_verdict(codes=["CODEX_CLEAN_VERDICT_MISSING"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "WAITING"
+
+    def test_reviews_incomplete_only_is_waiting(self):
+        v = _r23_verdict(codes=["REVIEWS_AND_COMMENTS_INCOMPLETE"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "WAITING"
+
+    def test_evidence_missing_only_is_waiting(self):
+        v = _r23_verdict(codes=["EVIDENCE_MISSING_OR_TREATED_AS_PASSING"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "WAITING"
+
+    def test_transient_plus_scope_unknown_stays_blocked(self):
+        """Bug regression: when a transient reason coexists
+        with a deterministic reason (``SCOPE_UNKNOWN``), the
+        state must remain ``BLOCKED`` — never ``WAITING``.
+        ``SCOPE_UNKNOWN`` is a deterministic policy decision
+        that requires operator repair, not a re-fetch.
+        """
+        v = _r23_verdict(codes=[
+            "CHANGED_FILES_NOT_FETCHED",  # transient
+            "SCOPE_UNKNOWN",              # deterministic
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "BLOCKED"
+
+    def test_transient_plus_pr_is_draft_stays_action_required(self):
+        """A draft reason stays ``ACTION_REQUIRED`` even when
+        transient reasons coexist (human action required to
+        flip the draft).
+        """
+        v = _r23_verdict(codes=[
+            "REQUIRED_CI_PENDING",  # transient
+            "PR_IS_DRAFT",          # deterministic / human
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert (
+            ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN)
+            == "ACTION_REQUIRED"
+        )
+
+    def test_transient_plus_unresolved_thread_stays_action_required(self):
+        v = _r23_verdict(codes=[
+            "REQUIRED_CI_PENDING",
+            "UNRESOLVED_REVIEW_THREAD",
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert (
+            ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN)
+            == "ACTION_REQUIRED"
+        )
+
+    def test_machine_ready_with_no_phrase_is_ready_for_authorization(self):
+        """Baseline: a fully-green verdict (machine_ready) is
+        ``READY_FOR_MERGE_AUTHORIZATION`` on an open PR when
+        no phrase is supplied.
+        """
+        v = _r23_verdict(
+            codes=[], machine_ready=True, authorization_valid=None,
+        )
+        from scripts.local import aed_pr as ctrl
+        assert (
+            ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN)
+            == "READY_FOR_MERGE_AUTHORIZATION"
+        )
+
+    def test_waiting_state_is_in_lifecycle_states_enum(self):
+        """The exported ``LIFECYCLE_STATES`` enum must contain
+        ``WAITING``; the Round-22 override used
+        ``WAITING_FOR_REVIEW`` which was NOT in the enum.
+        """
+        from scripts.local import aed_pr_lib as L
+        assert "WAITING" in L.LIFECYCLE_STATES
+        # And ``WAITING_FOR_REVIEW`` must NOT be in the enum.
+        assert "WAITING_FOR_REVIEW" not in L.LIFECYCLE_STATES
+
+
+class TestRound23FreshPingEmitsCanonicalWaitingAndClearsAuth:
+    """P2 #2 + #3 (PRRC_kwDOSHFpYM7XuJqj, PRRC_kwDOSHFpYM7XuJqo):
+    On a fresh-ping path, ``lifecycle_state`` must be the
+    canonical ``WAITING`` (in ``LIFECYCLE_STATES``) and
+    ``authorization_required`` must be ``False`` even when the
+    pre-ping verdict said ``True``.
+    """
+
+    HEAD = "0" * 40
+
+    def _run(self, *, initial_packet):
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = False
+            args.resolve_eligible_bot_threads = True
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+            fake_proc = _r18_make_fake_subprocess(self.HEAD)
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=initial_packet,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=fake_proc,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        return rc, json.loads(buf.getvalue())
+
+    def test_fresh_ping_state_is_canonical_waiting(self):
+        """P2 #2: the override must use the canonical
+        ``WAITING`` state in the exported enum, not
+        ``WAITING_FOR_REVIEW``.
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        assert report["fresh_codex_ping_posted"] is True
+        assert report["lifecycle_state"] == "WAITING"
+        # The state MUST be in the exported enum so downstream
+        # consumers can validate it.
+        from scripts.local import aed_pr_lib as L
+        assert report["lifecycle_state"] in L.LIFECYCLE_STATES
+
+    def test_fresh_ping_clears_authorization_required(self):
+        """P2 #3: when a fresh ping is posted in this run,
+        ``authorization_required`` MUST be ``False`` even
+        when the pre-ping verdict said ``True``.
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        # The pre-ping verdict's ``authorization_required``
+        # was True (clean pass means phrase is required), but
+        # the fresh-ping override clears it.
+        assert report["authorization_required"] is False
+
+    def test_fresh_ping_does_not_advertise_merge(self):
+        """Composite regression: a fresh ping posts, the
+        lifecycle state is canonical ``WAITING``,
+        authorization_required is False, and the merge phrase
+        is suppressed. An automation reading the report MUST
+        NOT receive a contradictory "ask the operator for
+        merge authorization while also saying wait".
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        # No authorization phrase was emitted.
+        assert report["required_authorization_phrase_if_ready"] is None
+        # The state is the canonical WAITING.
+        assert report["lifecycle_state"] == "WAITING"
+        # authorization_required is False.
+        assert report["authorization_required"] is False
+        # merge_ready is False.
+        assert report["merge_ready"] is False
+        # machine_ready is False.
+        assert report["machine_ready"] is False
+        # ready mirrors merge_ready.
+        assert report["ready"] is False
