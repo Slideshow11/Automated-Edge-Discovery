@@ -2401,6 +2401,8 @@ class TestRound19ReadTrustedScopeHead:
 
     def test_canonical_record_accepted(self, tmp_path):
         self._write_raw(tmp_path, {
+            "repo": REPO,
+            "pr_number": 411,
             "head_sha": self.LIVE_HEAD,
             "allowed_files": ["scripts/local/aed_pr*.py"],
             "forbidden_files": [],
@@ -2414,6 +2416,8 @@ class TestRound19ReadTrustedScopeHead:
 
     def test_missing_head_sha_rejected(self, tmp_path):
         self._write_raw(tmp_path, {
+            "repo": REPO,
+            "pr_number": 411,
             "allowed_files": ["scripts/local/aed_pr*.py"],
         })
         allowed, forbidden, err = ctrl.read_trusted_scope(
@@ -2446,6 +2450,8 @@ class TestRound19ReadTrustedScopeHead:
     ])
     def test_malformed_stored_head_rejected(self, tmp_path, bad_value):
         self._write_raw(tmp_path, {
+            "repo": REPO,
+            "pr_number": 411,
             "head_sha": bad_value,
             "allowed_files": ["scripts/local/aed_pr*.py"],
         })
@@ -2460,6 +2466,8 @@ class TestRound19ReadTrustedScopeHead:
 
     def test_different_canonical_head_rejected(self, tmp_path):
         self._write_raw(tmp_path, {
+            "repo": REPO,
+            "pr_number": 411,
             "head_sha": self.OTHER_HEAD,
             "allowed_files": ["scripts/local/aed_pr*.py"],
         })
@@ -2585,7 +2593,11 @@ class TestRound19LifecycleFailClosed:
         )
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
-            json.dumps({"allowed_files": ["scripts/local/aed_pr*.py"]}),
+            json.dumps({
+                "repo": REPO,
+                "pr_number": 411,
+                "allowed_files": ["scripts/local/aed_pr*.py"],
+            }),
             encoding="utf-8",
         )
         allowed, forbidden, err = ctrl._resolve_effective_scope(
@@ -2634,6 +2646,8 @@ class TestRound19LifecycleFailClosed:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps({
+                "repo": REPO,
+                "pr_number": 411,
                 "head_sha": self.LIVE_HEAD.upper(),
                 "allowed_files": ["scripts/local/aed_pr*.py"],
             }),
@@ -2650,3 +2664,319 @@ class TestRound19LifecycleFailClosed:
         assert allowed is None
         assert forbidden is None
         assert err
+
+
+# ---------------------------------------------------------------------------
+# Round-20 regression tests.
+#
+# Exact-head Codex review 4740272185 (submitted 2026-07-21T01:03:02Z on
+# head 45986012ae311dda387af1731ee4a1b408c133a5) reported one P2 finding
+# on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XsMLN (db_id 3618685645)
+#     "Validate trusted scope record identity"
+#     A record from another PR or repository that happens to share
+#     the same head SHA must not be accepted as authoritative.
+#
+# Tests below prove:
+#
+#   * a record with mismatched stored ``repo`` is rejected;
+#   * a record with mismatched stored ``pr_number`` is rejected;
+#   * a record with missing or non-string ``repo`` is rejected;
+#   * a record with missing or non-int ``pr_number`` is rejected;
+#   * a record with malformed stored ``repo`` is rejected;
+#   * allowed_files and forbidden_files remain unavailable on every
+#     rejected record;
+#   * a fresh scope-write round-trips through scope-read;
+#   * status / advance / merge fail closed when the stored identity
+#     does not match.
+# ---------------------------------------------------------------------------
+
+
+class TestRound20StoredRepoBinding:
+    """``read_trusted_scope`` requires the stored ``repo`` field to
+    match the requested repo byte-exactly, after path-safe
+    validation. A record from another repo with the same head SHA
+    must NOT be accepted as authoritative.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"  # 40 lowercase hex
+    OTHER_REPO = "OtherOrg/OtherRepo"
+    MALFORMED_REPO_VALUES = [
+        None,
+        True,
+        False,
+        12345,
+        [],
+        ["repo"],
+        {},
+        "",
+        "owner",
+        "owner/../../tmp/a",
+        "/name",
+        "owner//tmp/a",
+        "owner/.\\name",
+        "owner/name\n",
+        "owner/\x00name",
+        " owner/name",
+        "owner/name ",
+    ]
+
+    def _write_raw(self, tmp_path, body):
+        import json
+        path = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def _canonical_body(self, **overrides):
+        body = {
+            "repo": REPO,
+            "pr_number": 411,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+            "forbidden_files": [],
+        }
+        body.update(overrides)
+        return body
+
+    def test_matching_record_accepted(self, tmp_path):
+        self._write_raw(tmp_path, self._canonical_body())
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == []
+
+    def test_other_repo_rejected(self, tmp_path):
+        # A record from a different repo with the same head SHA
+        # must NOT be accepted.
+        self._write_raw(tmp_path, self._canonical_body(
+            repo=self.OTHER_REPO,
+        ))
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "repo" in err
+        assert self.OTHER_REPO in err
+        assert REPO in err
+
+    @pytest.mark.parametrize("bad_repo", MALFORMED_REPO_VALUES)
+    def test_malformed_stored_repo_rejected(self, tmp_path, bad_repo):
+        self._write_raw(tmp_path, self._canonical_body(repo=bad_repo))
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "repo" in err
+
+    def test_missing_stored_repo_rejected(self, tmp_path):
+        self._write_raw(tmp_path, {
+            "pr_number": 411,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "repo" in err
+
+
+class TestRound20StoredPrNumberBinding:
+    """``read_trusted_scope`` requires the stored ``pr_number`` field
+    to match the requested PR number byte-exactly. A record from
+    another PR with the same head SHA must NOT be accepted.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"  # 40 lowercase hex
+    OTHER_PR = 999
+
+    def _write_raw(self, tmp_path, body):
+        import json
+        path = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def _canonical_body(self, **overrides):
+        body = {
+            "repo": REPO,
+            "pr_number": 411,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+            "forbidden_files": [],
+        }
+        body.update(overrides)
+        return body
+
+    def test_other_pr_rejected(self, tmp_path):
+        self._write_raw(tmp_path, self._canonical_body(
+            pr_number=self.OTHER_PR,
+        ))
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "pr_number" in err
+        assert str(self.OTHER_PR) in err
+
+    @pytest.mark.parametrize("bad_pr", [
+        None,
+        True,
+        False,
+        "411",
+        411.0,
+        [],
+        ["411"],
+        {},
+        {"pr": 411},
+        0,
+        -1,
+    ])
+    def test_malformed_stored_pr_rejected(self, tmp_path, bad_pr):
+        self._write_raw(tmp_path, self._canonical_body(
+            pr_number=bad_pr,
+        ))
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "pr_number" in err
+
+    def test_missing_stored_pr_rejected(self, tmp_path):
+        self._write_raw(tmp_path, {
+            "repo": REPO,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "pr_number" in err
+
+
+class TestRound20ScopeWriteReadRoundTrip:
+    """``write_trusted_scope`` writes a record with ``repo`` and
+    ``pr_number``; ``read_trusted_scope`` then accepts it on the
+    same exact head. This is the canonical happy path.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"  # 40 lowercase hex
+
+    def test_round_trip(self, tmp_path):
+        ok, _ = ctrl.write_trusted_scope(
+            REPO, 411, self.LIVE_HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+            scope_root=tmp_path,
+        )
+        assert ok is True
+        # Inspect the on-disk record: it MUST include repo and
+        # pr_number.
+        import json
+        path = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        body = json.loads(path.read_text(encoding="utf-8"))
+        assert body["repo"] == REPO
+        assert body["pr_number"] == 411
+        assert body["head_sha"] == self.LIVE_HEAD
+        # And it round-trips through read_trusted_scope.
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == []
+
+
+class TestRound20LifecycleFailClosedIdentity:
+    """``_resolve_effective_scope`` for status/advance/merge must
+    fail closed when the stored identity does not match.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"  # 40 lowercase hex
+    OTHER_REPO = "OtherOrg/OtherRepo"
+    OTHER_PR = 999
+
+    def _write_raw(self, tmp_path, body):
+        import json
+        path = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_other_repo_record_fails_closed(
+        self, sub, tmp_path, monkeypatch,
+    ):
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        self._write_raw(tmp_path, {
+            "repo": self.OTHER_REPO,
+            "pr_number": 411,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo=REPO,
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "repo" in err
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_other_pr_record_fails_closed(
+        self, sub, tmp_path, monkeypatch,
+    ):
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        self._write_raw(tmp_path, {
+            "repo": REPO,
+            "pr_number": self.OTHER_PR,
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo=REPO,
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "pr_number" in err

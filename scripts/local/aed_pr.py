@@ -1276,6 +1276,47 @@ def read_trusted_scope(
             f"trusted scope head_sha mismatch: recorded "
             f"{recorded_head!r} != live {head_sha!r}"
         )
+    # Round-20 hardening: ``repo`` and ``pr_number`` are REQUIRED
+    # on every trusted record. A record copied from another PR or
+    # another repository that happens to share the same head SHA
+    # MUST NOT be silently accepted. The stored identity must
+    # byte-exactly match the requested (repo, pr_number).
+    recorded_repo = data.get("repo")
+    if not isinstance(recorded_repo, str):
+        return None, None, (
+            "trusted scope repo missing or not a string"
+        )
+    # Validate the stored repo through the same path-safe
+    # contract; a malformed stored value must also fail closed
+    # so a hostile or corrupted record cannot reach the path
+    # constructor.
+    try:
+        recorded_owner, recorded_name = _validate_repo_components(
+            recorded_repo
+        )
+    except ValueError as exc:
+        return None, None, (
+            f"trusted scope repo malformed: {exc}"
+        )
+    requested_owner, requested_name = _validate_repo_components(repo)
+    canonical_recorded_repo = f"{recorded_owner}/{recorded_name}"
+    canonical_requested_repo = f"{requested_owner}/{requested_name}"
+    if canonical_recorded_repo != canonical_requested_repo:
+        return None, None, (
+            f"trusted scope repo mismatch: recorded "
+            f"{canonical_recorded_repo!r} != live "
+            f"{canonical_requested_repo!r}"
+        )
+    recorded_pr = data.get("pr_number")
+    if not isinstance(recorded_pr, int) or isinstance(recorded_pr, bool):
+        return None, None, (
+            "trusted scope pr_number missing or not an int"
+        )
+    if recorded_pr != pr_number:
+        return None, None, (
+            f"trusted scope pr_number mismatch: recorded "
+            f"{recorded_pr!r} != live {pr_number!r}"
+        )
     allowed_raw = data.get("allowed_files")
     forbidden_raw = data.get("forbidden_files")
     allowed = (
