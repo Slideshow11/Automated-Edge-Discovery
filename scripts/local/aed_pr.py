@@ -1824,17 +1824,31 @@ def _find_exact_head_pull_request_run(
         if not (run.get("url") or ""):
             continue
         matching.append(run)
-    if not matching:
+    if len(matching) == 0:
         return None, (
             f"no exact-head pull_request CI run for "
             f"branch={head_branch!r} head={head_sha!r} workflow='ci.yml'"
         )
     if len(matching) > 1:
-        # Pick the newest by createdAt descending; require all
-        # matching candidates agree on databaseId/int and url.
+        # Round-21 fix: when two or more pull_request CI runs
+        # match the exact head, the required-check evidence is
+        # ambiguous. The readiness path treats this same case as
+        # ``multiple_exact_head_pr_runs`` and refuses to authorise
+        # a head with non-deterministic evidence. ``gate-recheck``
+        # MUST apply the same rule: silently picking one run would
+        # let the operator see a false successful recheck signal
+        # even though the readiness evaluator would refuse the
+        # same head. Return INCONCLUSIVE so the caller exits
+        # non-zero and refuses to rerun any job.
         matching.sort(
             key=lambda r: (r.get("createdAt") or "", r.get("databaseId") or 0),
             reverse=True,
+        )
+        return None, (
+            f"multiple_exact_head_pr_runs: "
+            f"{len(matching)} matching pull_request CI runs for "
+            f"branch={head_branch!r} head={head_sha!r}; refusing to "
+            f"select one"
         )
     return matching[0], ""
 
@@ -3443,6 +3457,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
         pr_view.get("state") == "OPEN"
         and R.is_canonical_head_sha(head_sha)
     )
+    # Round-21 fix: a freshly posted ``@codex review`` ping must
+    # suppress the canonical authorization phrase for this run.
+    # The classifier was called BEFORE the ping, so a stale
+    # ``codex_clean_passed=True`` evidence is no longer
+    # authoritative once a new review is in flight. Without this
+    # guard the report can advertise
+    # ``required_authorization_phrase_if_ready`` while the new
+    # review is still pending, allowing ``merge_ready`` to flip
+    # True on the back of an in-flight review.
+    fresh_codex_ping_posted = False
     if would_post_codex_ping and not args.dry_run:
         ok_ping, ping_result = _post_codex_ping_comment(
             repo, pr_number, str(head_sha) if head_sha else ""
@@ -3480,6 +3504,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 "ok": ok_ping,
                 "result": ping_result,
             })
+            # A non-empty non-duplicate result means a fresh
+            # trigger was posted in THIS run. The existing
+            # evidence is therefore stale for authorization.
+            fresh_codex_ping_posted = True
     elif would_post_codex_ping and args.dry_run:
         actions_taken.append({
             "action": "codex_review_ping",
@@ -3723,8 +3751,28 @@ def cmd_advance(args: argparse.Namespace) -> int:
 
     canonical_phrase = (
         L.build_authorization_phrase(pr_number, str(head_sha))
-        if machine_verdict.machine_ready and R.is_canonical_head_sha(head_sha) else None
+        if (
+            machine_verdict.machine_ready
+            and R.is_canonical_head_sha(head_sha)
+            and not fresh_codex_ping_posted
+        ) else None
     )
+
+    # Round-21 fix: a fresh ``@codex review`` ping posted in
+    # THIS run invalidates the pre-ping ``codex_clean_passed``
+    # evidence. ``merge_ready`` and ``safe_merge_command_if_ready``
+    # must be suppressed until the new review lands so an
+    # operator cannot advertise merge authorization on the back
+    # of a stale clean pass.
+    if fresh_codex_ping_posted:
+        # Re-derive the readiness fields the operator-facing
+        # report exposes so they cannot advertise authorization
+        # while a new Codex review is in flight.
+        effective_machine_ready = False
+        effective_merge_ready = False
+    else:
+        effective_machine_ready = machine_verdict.machine_ready
+        effective_merge_ready = machine_verdict.merge_ready
 
     out: Dict[str, Any] = {
         "tool": "aed_pr.advance",
@@ -3738,20 +3786,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
         ),
         "scope_error": scope_err or None,
         # Round-2 split.
-        "machine_ready": machine_verdict.machine_ready,
+        "machine_ready": effective_machine_ready,
         "authorization_required": machine_verdict.authorization_required,
         "authorization_valid": machine_verdict.authorization_valid,
-        "merge_ready": machine_verdict.merge_ready,
-        "ready": machine_verdict.merge_ready,
+        "merge_ready": effective_merge_ready,
+        "ready": effective_merge_ready,
         "reason_codes": [r.code for r in machine_verdict.reasons],
         "reasons": [r.to_dict() for r in machine_verdict.reasons],
         "actions_taken": actions_taken,
         "safe_merge_command_if_ready": (
             L.build_safe_merge_command(pr_number, repo, head_sha)
-            if machine_verdict.machine_ready else None
+            if effective_machine_ready else None
         ),
         "required_authorization_phrase_if_ready": canonical_phrase,
         "next_human_action": _next_human_action(state),
+        "fresh_codex_ping_posted": fresh_codex_ping_posted,
     }
     json.dump(out, sys.stdout, indent=2)
     sys.stdout.write("\n")

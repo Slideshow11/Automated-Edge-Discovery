@@ -2980,3 +2980,457 @@ class TestRound20LifecycleFailClosedIdentity:
         assert forbidden is None
         assert err
         assert "pr_number" in err
+
+
+# ---------------------------------------------------------------------------
+# Round-21 regression tests.
+#
+# Exact-head Codex review 4740468145 (submitted 2026-07-21T01:30:28Z on
+# head 4029f2d9dd789b33d46dc315a00177930004e31a) reported two findings
+# on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XssA7 (db_id 3618816059, P1)
+#     "Don't authorize after posting a new Codex request"
+#     When ``cmd_advance`` posts a fresh ``@codex review`` ping in
+#     this run, the canonical authorization phrase must be
+#     suppressed even if the captured pre-ping evidence showed
+#     ``codex_clean_passed=True``. A stale clean pass is no longer
+#     authoritative once a new review is in flight.
+#
+#   PRRC_kwDOSHFpYM7XssBA (db_id 3618816064, P2)
+#     "Fail closed on duplicate exact-head CI runs"
+#     ``_find_exact_head_pull_request_run`` (used by
+#     ``cmd_gate_recheck``) must return INCONCLUSIVE rather than
+#     silently selecting the newest run when two or more matching
+#     ``pull_request`` CI runs exist on the same head.
+#
+# Tests below prove:
+#
+#   * ``cmd_advance`` does NOT expose ``required_authorization_phrase``
+#     and reports ``machine_ready=False`` / ``merge_ready=False``
+#     when a fresh ``@codex review`` ping is posted in this run;
+#   * ``cmd_advance`` reports ``fresh_codex_ping_posted=True`` in
+#     the action report;
+#   * ``cmd_advance`` does NOT post a ping under
+#     ``--dry-run`` (so the suppression flag stays False);
+#   * duplicate-prevention path keeps the suppression flag False
+#     (no fresh ping was posted, so authorization is allowed when
+#     the underlying machine gate is clean);
+#   * ``_find_exact_head_pull_request_run`` returns
+#     ``multiple_exact_head_pr_runs`` for two-or-more matching
+#     runs, refuses to select one, and exits the gate-recheck
+#     caller with a non-zero status;
+#   * zero matches still returns ``no exact-head pull_request CI
+#     run`` and one match still returns the unique run.
+# ---------------------------------------------------------------------------
+
+
+def _r21_clean_packet(head_sha):
+    """A ``CODEX.classify`` packet that advertises a clean pass on
+    the exact head. Used to drive the
+    ``machine_ready=True`` pre-ping path so the P1 regression can
+    prove the authorization phrase is suppressed after a fresh
+    ping.
+    """
+    return _r18_codex_packet(
+        active_threads=[],
+        outdated_threads=[],
+        status="CODEX_CLEAN_PASS",
+        head_sha=head_sha,
+    )
+
+
+class TestRound21FreshPingSuppressesAuthorization:
+    """When ``cmd_advance`` posts a fresh ``@codex review`` ping in
+    this run, the canonical authorization phrase MUST be
+    suppressed. The pre-ping ``codex_clean_passed=True`` evidence
+    is no longer authoritative while a new review is pending.
+    """
+
+    HEAD = "0" * 40
+
+    def _run(self, *, initial_packet, dry_run=False, with_eligible=True):
+        """Run ``cmd_advance`` with the supplied ``CODEX.classify``
+        packet and return the parsed JSON report plus a small
+        meta dict.
+        """
+        import io
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        from pathlib import Path as _P
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = dry_run
+            args.resolve_eligible_bot_threads = with_eligible
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+            fake_proc = _r18_make_fake_subprocess(self.HEAD)
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=initial_packet,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=fake_proc,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        return rc, json.loads(buf.getvalue())
+
+    def test_fresh_ping_suppresses_phrase(self):
+        """The P1 bug repro: pre-ping evidence says clean pass,
+        ``cmd_advance`` posts a fresh ``@codex review`` ping, the
+        canonical authorization phrase MUST be None, and
+        ``machine_ready``/``merge_ready`` MUST be False on the
+        operator-facing report.
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        # A fresh ping was actually posted.
+        assert report["fresh_codex_ping_posted"] is True
+        # The bug was: this would still expose the phrase on a
+        # stale clean pass. The fix suppresses it.
+        assert report["required_authorization_phrase_if_ready"] is None
+        assert report["machine_ready"] is False
+        assert report["merge_ready"] is False
+        assert report["ready"] is False
+        assert report["safe_merge_command_if_ready"] is None
+
+    def test_dry_run_does_not_post_and_does_not_suppress(self):
+        """``--dry-run`` must perform zero mutations. With no
+        ping posted, the suppression flag stays False so a future
+        dry-run report does not falsely advertise blocking just
+        because dry-run was set.
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean, dry_run=True)
+        assert rc == 0
+        assert report["fresh_codex_ping_posted"] is False
+        # The report fields are unaffected by the suppression
+        # logic on a dry run; this is the regression baseline.
+
+    def test_action_report_records_ping(self):
+        """The action record must include a ``codex_review_ping``
+        entry whose ``result`` is a numeric comment id (the new
+        ping was actually posted).
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        ping_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "codex_review_ping"
+        ]
+        assert ping_actions
+        posted = [
+            a for a in ping_actions
+            if a.get("attempted") is True and a.get("ok") is True
+        ]
+        assert posted
+        # The result is the comment database id returned by the
+        # fake POST (fake-comment-id).
+        assert posted[0]["result"] == "fake-comment-id"
+
+
+class TestRound21DuplicatePingDoesNotSuppress:
+    """When ``cmd_advance`` detects an existing exact-head ping
+    and reports ``duplicate_exact_head_request_prevented``,
+    ``fresh_codex_ping_posted`` stays False. The pre-ping
+    ``codex_clean_passed`` evidence is therefore still
+    authoritative.
+    """
+
+    HEAD = "0" * 40
+
+    def test_duplicate_does_not_suppress(self, tmp_path, monkeypatch):
+        import io
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        ctrl.write_trusted_scope(
+            REPO, PR, self.HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+        )
+
+        # Build a fake subprocess that returns an existing
+        # duplicate exact-head ping comment on the inventory
+        # fetch.
+        def fake(cmd, *args, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return _FakeProc(
+                    0, json.dumps(_r18_pr_view_payload(self.HEAD)), "",
+                )
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return _FakeProc(0, json.dumps([
+                    {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "governance-validators", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "pr-gate-live-smoke", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "review-comment-gate", "state": "FAILURE", "workflow": "CI"},
+                ]), "")
+            if cmd[:3] == ["gh", "pr", "diff"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:3] == ["gh", "run", "list"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:3] == ["gh", "api"] and "compare/" in cmd_str:
+                return _FakeProc(0, "ahead", "")
+            if (
+                cmd[:2] == ["gh", "api"]
+                and "/comments" in cmd_str
+                and "POST" not in cmd_str
+            ):
+                # Return an inventory that already contains a
+                # ping for THIS exact head, so the controller
+                # short-circuits with
+                # ``duplicate_exact_head_request_prevented``.
+                existing = [{
+                    "id": 12345,
+                    "body": (
+                        "@codex review\n\n"
+                        f"AED exact-head review request: {self.HEAD}"
+                    ),
+                }]
+                return _FakeProc(0, json.dumps([existing]), "")
+            if cmd[:2] == ["gh", "api"] and "POST" in cmd_str:
+                return _FakeProc(
+                    0, json.dumps({"id": "fake-comment-id"}), "",
+                )
+            if cmd[:2] == ["gh", "api"] and "graphql" in cmd_str:
+                return _FakeProc(0, json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {
+                            "totalCount": 0,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }}}
+                }), "")
+            raise AssertionError(f"unexpected subprocess.run: {cmd}")
+
+        clean = _r21_clean_packet(self.HEAD)
+        args = type("Args", (), {})()
+        args.repo = REPO
+        args.pr_number = PR
+        args.allowed_files = None
+        args.forbidden_files = None
+        args.dry_run = False
+        args.resolve_eligible_bot_threads = True
+        args.ancestry_runner = (
+            lambda *a, **kw: _FakeProc(0, "ahead", "")
+        )
+
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+        try:
+            with mock.patch.object(
+                ctrl.CODEX, "classify",
+                return_value=clean,
+            ), mock.patch.object(
+                subprocess, "run", side_effect=fake,
+            ), mock.patch.object(
+                ctrl, "resolve_review_thread",
+                return_value=(True, "resolved"),
+            ):
+                rc = ctrl.cmd_advance(args)
+        finally:
+            sys_stdout_set(old)
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        # No fresh ping was posted in this run because the
+        # duplicate-detection path short-circuited the POST.
+        assert report["fresh_codex_ping_posted"] is False
+        # The action record shows duplicate_exact_head_request_prevented.
+        dup_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "codex_review_ping"
+            and a.get("duplicate_exact_head_request_prevented") is True
+        ]
+        assert dup_actions
+
+
+class TestRound21FindExactHeadRunMultipleRefusesToSelect:
+    """``_find_exact_head_pull_request_run`` (used by
+    ``cmd_gate_recheck``) MUST return INCONCLUSIVE rather than
+    silently selecting the newest run when two or more matching
+    ``pull_request`` CI runs exist on the same head. The
+    readiness path applies the same rule
+    (``multiple_exact_head_pr_runs``); gate-recheck must apply
+    it too.
+    """
+
+    HEAD = "0" * 40
+
+    def _list_runner(self, runs):
+        def fake(cmd, *args, **kwargs):
+            if cmd[:3] == ["gh", "run", "list"]:
+                return _FakeProc(0, json.dumps(runs), "")
+            raise AssertionError(f"unexpected subprocess.run: {cmd}")
+        return fake
+
+    def _run(self, runs):
+        return ctrl._find_exact_head_pull_request_run(
+            repo=REPO,
+            head_sha=self.HEAD,
+            head_branch="reduction/pr-lifecycle-collapse-v1",
+            list_runner=self._list_runner(runs),
+        )
+
+    def _run_record(self, db_id, head_sha=None):
+        return {
+            "databaseId": db_id,
+            "event": "pull_request",
+            "headBranch": "reduction/pr-lifecycle-collapse-v1",
+            "headSha": head_sha or self.HEAD,
+            "status": "completed",
+            "conclusion": "success",
+            "url": f"https://github.com/{REPO}/actions/runs/{db_id}",
+            "workflowName": "CI",
+            "createdAt": f"2026-07-21T00:00:{db_id:02d}Z",
+            "name": "CI",
+        }
+
+    def test_zero_matches_returns_missing(self):
+        run, err = self._run([])
+        assert run is None
+        assert "no exact-head pull_request CI run" in err
+
+    def test_unique_match_returns_the_run(self):
+        run, err = self._run([self._run_record(111)])
+        assert err == ""
+        assert run is not None
+        assert run["databaseId"] == 111
+
+    def test_two_matches_returns_multiple(self):
+        """P2 bug repro: the previous implementation sorted and
+        returned the newest one; the fix returns
+        ``multiple_exact_head_pr_runs`` so ``cmd_gate_recheck``
+        exits non-zero.
+        """
+        run, err = self._run([
+            self._run_record(111),
+            self._run_record(222),
+        ])
+        assert run is None
+        assert "multiple_exact_head_pr_runs" in err
+
+    def test_three_matches_returns_multiple(self):
+        run, err = self._run([
+            self._run_record(111),
+            self._run_record(222),
+            self._run_record(333),
+        ])
+        assert run is None
+        assert "multiple_exact_head_pr_runs" in err
+
+    def test_non_pr_event_run_is_ignored(self):
+        """A workflow_dispatch or push run on the same head must
+        NOT count as a matching pull_request run; only the
+        pull_request trigger run is acceptable.
+        """
+        runs = [
+            {
+                "databaseId": 111,
+                "event": "workflow_dispatch",
+                "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/111",
+            },
+            {
+                "databaseId": 222,
+                "event": "push",
+                "headBranch": "reduction/pr-lifecycle-collapse-v1",
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": "https://example/222",
+            },
+            self._run_record(333),
+        ]
+        run, err = self._run(runs)
+        # Only the pull_request run counts; the dispatch and push
+        # runs are skipped, so a single match survives.
+        assert err == ""
+        assert run is not None
+        assert run["databaseId"] == 333
+
+    def test_gate_recheck_refuses_multiple_matches(self):
+        """``cmd_gate_recheck`` exits non-zero when two or more
+        matching runs exist (no rerun fires, no false success).
+        """
+        import io
+        import sys
+        runs = [
+            self._run_record(111),
+            self._run_record(222),
+        ]
+        # The pr_view runner must return a head that matches
+        # args.head_sha so the live-binding check passes; we
+        # want to reach the run-list step, where the
+        # multiple-match rejection fires.
+        pr_view_payload = {
+            "number": PR,
+            "headRefOid": self.HEAD,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": True,
+            "state": "OPEN",
+        }
+        args = type("Args", (), {})()
+        args.repo = REPO
+        args.pr_number = PR
+        args.head_sha = self.HEAD
+        args.dry_run = True
+        args.list_runner = self._list_runner(runs)
+        args.view_runner = lambda *a, **kw: _FakeProc(0, "[]", "")
+        args.rerun_runner = lambda *a, **kw: _FakeProc(0, "[]", "")
+        args.pr_view_runner = (
+            lambda *a, **kw: _FakeProc(
+                0, json.dumps(pr_view_payload), "",
+            )
+        )
+        args.allowed_files = None
+        args.forbidden_files = None
+        args.ancestry_runner = (
+            lambda *a, **kw: _FakeProc(0, "ahead", "")
+        )
+
+        out_buf = io.StringIO()
+        err_buf = io.StringIO()
+        old_out = sys.stdout
+        old_err = sys.stderr
+        sys.stdout = out_buf
+        sys.stderr = err_buf
+        try:
+            rc = ctrl.cmd_gate_recheck(args)
+        finally:
+            sys.stdout = old_out
+            sys.stderr = old_err
+        # non-zero: gate-recheck refuses to rerun any job when
+        # the run identity is ambiguous.
+        assert rc != 0
+        # The diagnostic may go to stderr (rejection path) or
+        # stdout (early report on the selected run); assert that
+        # either path surfaces the rejection reason or that
+        # rc reflects an inconclusive exit.
+        combined = out_buf.getvalue() + err_buf.getvalue()
+        assert "multiple_exact_head_pr_runs" in combined or rc == 2
