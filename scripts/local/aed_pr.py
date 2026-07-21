@@ -2578,7 +2578,35 @@ def build_evidence(
     codex_verdict = str(codex_packet.get("status") or "")
     codex_clean = R.is_codex_clean_verdict(codex_verdict)
     codex_reviewed_sha = codex_packet.get("observed_head_sha")
-    codex_artifact_present = bool(codex_verdict)
+    # Round-39 fix: ``codex_artifact_present`` must reflect
+    # whether the classifier actually captured a real Codex
+    # response (formal review or post-ping issue-comment),
+    # NOT merely whether the classifier's ``status`` field is
+    # non-empty. A pending poll returns status
+    # ``HOLD_CODEX_RESPONSE_PENDING`` with
+    # ``latest_codex_response_type == "none"`` and an empty
+    # ``latest_codex_response_id``; treating that pending state
+    # as a "present artifact" caused the readiness verifier to
+    # fall into the ``not is_codex_clean_verdict`` branch and
+    # emit ``REASON_CODEX_FAILED``, which (after Round-38's
+    # lifecycle mapping) routes the lifecycle to ``BLOCKED``
+    # instead of ``WAITING`` and tells the operator to resolve
+    # a deterministic issue while Codex has not yet replied.
+    # The artifact-present invariant is now: a Codex response
+    # actually exists AND its recorded head matches the
+    # requested head (the freshness check still applies
+    # separately via ``codex_artifact_fresh``).
+    codex_response_type = codex_packet.get(
+        "latest_codex_response_type", "none"
+    )
+    codex_response_id = codex_packet.get(
+        "latest_codex_response_id", ""
+    )
+    codex_artifact_present = bool(
+        codex_response_type
+        and codex_response_type != "none"
+        and codex_response_id
+    )
     if (
         isinstance(codex_reviewed_sha, str)
         and isinstance(head_sha, str)

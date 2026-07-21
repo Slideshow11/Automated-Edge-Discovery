@@ -6469,3 +6469,203 @@ class TestRound38TerminalCodexFailureIsBlocked:
         assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == (
             "BLOCKED"
         )
+
+
+class TestRound39PendingCodexPollIsWaiting:
+    """P2 #1 (PRRC_kwDOSHFpYM7XRGA9 / db_id 3625180320):
+    ``build_evidence`` must NOT mark ``codex_artifact_present``
+    when the Codex classifier returns a pending hold status
+    (``HOLD_CODEX_RESPONSE_PENDING``) with
+    ``latest_codex_response_type == "none"`` and an empty
+    ``latest_codex_response_id``. That pending state is
+    correctly mapped to ``WAITING`` by the lifecycle routing;
+    the previous bug marked the artifact present and emitted
+    ``REASON_CODEX_FAILED``, which (after Round-38's lifecycle
+    mapping) routed the lifecycle to ``BLOCKED`` and told the
+    operator to resolve a deterministic issue while Codex had
+    not yet replied.
+    """
+
+    HEAD_SHA = "0" * 40
+
+    def _evidence(self, packet, monkeypatch, *, is_draft=False):
+        """Invoke ``build_evidence`` with a synthetic pr_view and
+        a stubbed ``fetch_codex_packet`` so the partition fields
+        come from the supplied packet.
+        """
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmp:
+            saved = ctrl._CANONICAL_SCOPE_ROOT
+            ctrl._CANONICAL_SCOPE_ROOT = Path(tmp)
+            try:
+                ctrl.write_trusted_scope(
+                    REPO, PR, self.HEAD_SHA,
+                    ["scripts/local/aed_pr*.py"], [],
+                )
+                monkeypatch.setattr(
+                    ctrl, "fetch_codex_packet",
+                    lambda *a, **kw: packet,
+                )
+                monkeypatch.setattr(
+                    ctrl, "fetch_ci_conclusions",
+                    lambda *a, **kw: (
+                        True, {
+                            "test (3.11)": "SUCCESS",
+                            "validator": "SUCCESS",
+                            "governance-validators": "SUCCESS",
+                            "pr-gate-live-smoke": "SUCCESS",
+                        }, [], [], [], [], "",
+                    ),
+                )
+                pr_view = _r18_pr_view_payload(self.HEAD_SHA)
+                # Override isDraft so the lifecycle route is
+                # determined by the Codex reason alone when
+                # callers need that. The default matches the
+                # fixture (isDraft=True); tests that need a
+                # pure Codex-routing path pass is_draft=False.
+                pr_view["isDraft"] = bool(is_draft)
+                return ctrl.build_evidence(
+                    repo=REPO,
+                    pr_number=PR,
+                    pr_view=pr_view,
+                    changed_files=["scripts/local/aed_pr.py"],
+                    changed_files_fetched=True,
+                    changed_files_error="",
+                    authorization_phrase=None,
+                    allowed_files=["scripts/local/aed_pr*.py"],
+                    forbidden_files=[],
+                )
+            finally:
+                ctrl._CANONICAL_SCOPE_ROOT = saved
+
+    def test_pending_codex_poll_artifact_not_present(self, monkeypatch):
+        """Bug repro: a pending Codex poll returns
+        ``HOLD_CODEX_RESPONSE_PENDING`` with
+        ``latest_codex_response_type == "none"`` and empty
+        ``latest_codex_response_id``. ``build_evidence`` MUST
+        mark ``codex_artifact_present`` False, which routes the
+        lifecycle to ``WAITING`` (Codex not yet replied)
+        instead of ``BLOCKED``.
+        """
+        packet = _r18_codex_packet(
+            status="HOLD_CODEX_RESPONSE_PENDING",
+            head_sha=self.HEAD_SHA,
+        )
+        # Override the default response_type/id to simulate the
+        # post-ping pending state — Codex has not replied yet.
+        packet["latest_codex_response_type"] = "none"
+        packet["latest_codex_response_id"] = ""
+        ev = self._evidence(packet, monkeypatch)
+        assert ev.codex_artifact_present is False, (
+            "pending poll must not count as a present Codex "
+            "artifact; got codex_artifact_present=True"
+        )
+
+    def test_pending_codex_poll_verifier_emits_missing_not_failed(
+        self, monkeypatch
+    ):
+        """The verifier path for a pending Codex poll MUST
+        emit ``CODEX_EVIDENCE_MISSING`` (waiting), NOT
+        ``CODEX_EVIDENCE_FAILED`` (terminal). Round-38's
+        lifecycle mapping then routes ``CODEX_EVIDENCE_FAILED``
+        to ``BLOCKED``; the Round-39 fix prevents the pending
+        state from being mis-classified as ``CODEX_EVIDENCE_FAILED``.
+        """
+        import scripts.local.aed_pr_readiness as R
+        packet = _r18_codex_packet(
+            status="HOLD_CODEX_RESPONSE_PENDING",
+            head_sha=self.HEAD_SHA,
+        )
+        packet["latest_codex_response_type"] = "none"
+        packet["latest_codex_response_id"] = ""
+        ev = self._evidence(packet, monkeypatch)
+        verdict = R.evaluate_machine_readiness(ev)
+        codes = {r.code for r in verdict.reasons}
+        assert "CODEX_EVIDENCE_MISSING" in codes, (
+            f"expected MISSING reason, got reasons={codes}"
+        )
+        assert "CODEX_EVIDENCE_FAILED" not in codes, (
+            "pending poll must NOT emit REASON_CODEX_FAILED; "
+            f"got reasons={codes}"
+        )
+
+    def test_pending_codex_lifecycle_is_waiting(self, monkeypatch):
+        """The lifecycle for a pending Codex poll MUST be
+        ``WAITING``, not ``BLOCKED``. The Round-38 lifecycle
+        mapping routes ``CODEX_EVIDENCE_FAILED`` to ``BLOCKED``;
+        the Round-39 fix prevents ``HOLD_CODEX_RESPONSE_PENDING``
+        from being mis-classified as ``CODEX_EVIDENCE_FAILED``.
+        """
+        import scripts.local.aed_pr_readiness as R
+        packet = _r18_codex_packet(
+            status="HOLD_CODEX_RESPONSE_PENDING",
+            head_sha=self.HEAD_SHA,
+        )
+        packet["latest_codex_response_type"] = "none"
+        packet["latest_codex_response_id"] = ""
+        ev = self._evidence(packet, monkeypatch, is_draft=False)
+        verdict = R.evaluate_machine_readiness(ev)
+        pr_view = _r18_pr_view_payload(self.HEAD_SHA)
+        state = ctrl.derive_lifecycle_state(verdict, pr_view)
+        assert state == "WAITING", (
+            f"pending Codex poll must map to WAITING, got {state}"
+        )
+
+    def test_present_clean_codex_artifact_present(self, monkeypatch):
+        """Round-39 guard: a real clean Codex response
+        (``status='CODEX_CLEAN_PASS'`` with
+        ``latest_codex_response_type='issue_comment'`` and a
+        non-empty id) MUST continue to mark the artifact
+        present. The fix surgically tightens only the
+        pending-poll case.
+        """
+        packet = _r18_codex_packet(
+            status="CODEX_CLEAN_PASS",
+            head_sha=self.HEAD_SHA,
+        )
+        ev = self._evidence(packet, monkeypatch)
+        assert ev.codex_artifact_present is True, (
+            "real clean Codex response must count as present"
+        )
+
+    def test_present_finding_codex_artifact_present(self, monkeypatch):
+        """A real Codex finding (status not clean but with an
+        actual response) MUST count as a present artifact so
+        the verifier correctly emits ``CODEX_EVIDENCE_FAILED``
+        (Round-38 routing) — only the ``HOLD_CODEX_RESPONSE_PENDING``
+        case is suppressed.
+        """
+        import scripts.local.aed_pr_readiness as R
+        packet = _r18_codex_packet(
+            status="HOLD_NEW_CODEX_THREAD",
+            head_sha=self.HEAD_SHA,
+        )
+        packet["latest_codex_response_type"] = "formal_review"
+        packet["latest_codex_response_id"] = "4748407919"
+        ev = self._evidence(packet, monkeypatch)
+        assert ev.codex_artifact_present is True, (
+            "real Codex finding must count as a present artifact"
+        )
+        verdict = R.evaluate_machine_readiness(ev)
+        codes = {r.code for r in verdict.reasons}
+        assert "CODEX_EVIDENCE_FAILED" in codes, (
+            f"expected FAILED reason for real finding, got {codes}"
+        )
+
+    def test_missing_response_id_with_type_is_not_present(self, monkeypatch):
+        """Defensive invariant: even if
+        ``latest_codex_response_type`` is non-empty but
+        ``latest_codex_response_id`` is empty (degenerate
+        classifier output), the artifact MUST be treated as
+        absent. Both fields are required for a present
+        artifact.
+        """
+        packet = _r18_codex_packet(
+            status="HOLD_CODEX_RESPONSE_PENDING",
+            head_sha=self.HEAD_SHA,
+        )
+        packet["latest_codex_response_type"] = "issue_comment"
+        packet["latest_codex_response_id"] = ""  # missing id
+        ev = self._evidence(packet, monkeypatch)
+        assert ev.codex_artifact_present is False
