@@ -3294,6 +3294,60 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # the live head SHA.
     pr_view = fetch_pr_state(repo, pr_number)
     head_sha = pr_view.get("headRefOid")
+
+    # Round-25 fix: short-circuit on a MERGED PR immediately
+    # after ``fetch_pr_state`` so the promised closeout
+    # (``COMPLETE``) is reached even when later readiness /
+    # scope / evidence fetches hang, raise, or otherwise fail
+    # on a merged-PR path. The Round-24 branch lived after the
+    # evidence pipeline and could be skipped by an exception in
+    # ``build_evidence`` or ``_resolve_effective_scope``; a
+    # merged PR is structurally terminal — the controller has
+    # nothing left to advance — so the closeout must run
+    # before any other I/O.
+    if pr_view.get("state") == "MERGED":
+        actions_taken: List[Dict[str, Any]] = [{
+            "action": "post_merge_closeout",
+            "ok": True,
+            "result": "merged_pr_closeout_complete",
+            "merged_at": pr_view.get("mergedAt"),
+            "merge_commit_sha": (
+                pr_view.get("mergeCommit", {}).get("oid")
+                if isinstance(pr_view.get("mergeCommit"), dict)
+                else None
+            ),
+        }]
+        out = {
+            "tool": "aed_pr.advance",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "lifecycle_state": "COMPLETE",
+            "scope_source": (
+                "cli_override" if cli_override else "trusted_file"
+            ),
+            "scope_error": None,
+            "machine_ready": False,
+            "authorization_required": False,
+            "authorization_valid": None,
+            "merge_ready": False,
+            "ready": False,
+            "reason_codes": [],
+            "reasons": [],
+            "actions_taken": actions_taken,
+            "safe_merge_command_if_ready": None,
+            "required_authorization_phrase_if_ready": None,
+            "next_human_action": (
+                "PR is already merged; closeout complete. "
+                "No further action."
+            ),
+            "fresh_codex_ping_posted": False,
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
     allowed_files, forbidden_files, scope_err = _resolve_effective_scope(
         subcommand="advance",
         repo=repo,
@@ -3366,59 +3420,11 @@ def cmd_advance(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
         return 0
 
-    # Round-24 fix: when the live PR is already ``MERGED`` the
-    # controller has nothing left to advance. ``derive_lifecycle_state``
-    # emits ``MERGED_PENDING_CLOSEOUT`` for this case, but
-    # ``cmd_advance`` previously had no merged-PR/closeout branch
-    # and the operator would re-run ``advance`` only to keep
-    # seeing the same pending-closeout state forever (GitHub does
-    # not auto-transition a merged PR to ``CLOSED``). Reach the
-    # promised ``COMPLETE`` state by short-circuiting here: emit
-    # a structured report that records the closeout, surfaces the
-    # merge commit, and tells the operator no further action is
-    # required. No mutation runs; the closeout is purely a
-    # lifecycle transition that the controller was always
-    # supposed to perform.
-    if pr_view.get("state") == "MERGED":
-        actions_taken.append({
-            "action": "post_merge_closeout",
-            "ok": True,
-            "result": "merged_pr_closeout_complete",
-            "merged_at": pr_view.get("mergedAt"),
-            "merge_commit_sha": pr_view.get("mergeCommit", {}).get("oid")
-            if isinstance(pr_view.get("mergeCommit"), dict)
-            else None,
-        })
-        out = {
-            "tool": "aed_pr.advance",
-            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "repo": repo,
-            "pr_number": pr_number,
-            "head_sha": head_sha,
-            "lifecycle_state": "COMPLETE",
-            "scope_source": (
-                "cli_override" if cli_override else "trusted_file"
-            ),
-            "scope_error": scope_err or None,
-            "machine_ready": machine_verdict.machine_ready,
-            "authorization_required": False,
-            "authorization_valid": machine_verdict.authorization_valid,
-            "merge_ready": False,
-            "ready": False,
-            "reason_codes": [r.code for r in machine_verdict.reasons],
-            "reasons": [r.to_dict() for r in machine_verdict.reasons],
-            "actions_taken": actions_taken,
-            "safe_merge_command_if_ready": None,
-            "required_authorization_phrase_if_ready": None,
-            "next_human_action": (
-                "PR is already merged; closeout complete. "
-                "No further action."
-            ),
-            "fresh_codex_ping_posted": False,
-        }
-        json.dump(out, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-        return 0
+    # Round-24 fix: the merged-PR short-circuit now lives at
+    # the top of ``cmd_advance`` (immediately after
+    # ``fetch_pr_state``) so a merged PR can always reach
+    # ``COMPLETE`` even when later readiness fetches hang or
+    # raise. The Round-25 placement is the canonical position.
 
     # Step 1: classify every thread as eligible or ineligible. The
     # eligibility check is deterministic (R.is_eligible_for_bot_resolution)

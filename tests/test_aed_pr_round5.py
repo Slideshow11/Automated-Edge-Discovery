@@ -4155,13 +4155,13 @@ class TestRound24MergedPrReachesCloseout:
         returning the supplied PR view. Returns
         ``(rc, report)``.
 
-        ``build_evidence`` invokes ``gh pr checks``,
-        ``gh run list``, and ``gh api .../pulls/<n>`` to assemble
-        CI / Codex evidence. We stub those with empty payloads
-        so the merged-PR short-circuit fires immediately after
-        evidence is built. ``post_merge_closeout`` itself never
-        runs any subprocess — that is the structural property
-        under test.
+        Round-25 placement: the merged-PR short-circuit lives
+        at the top of ``cmd_advance``, BEFORE
+        ``_resolve_effective_scope``, ``fetch_changed_files``,
+        ``build_evidence``, and ``evaluate_machine_readiness``.
+        A subprocess that raises here is a precise bug
+        detector — the controller must reach ``COMPLETE``
+        without invoking any further I/O.
         """
         import io
         buf = io.StringIO()
@@ -4169,28 +4169,6 @@ class TestRound24MergedPrReachesCloseout:
         sys_stdout_set(buf)
 
         def fake(cmd, *args, **kwargs):
-            cmd_str = " ".join(str(c) for c in cmd)
-            if cmd[:3] == ["gh", "pr", "checks"]:
-                return _FakeProc(0, json.dumps([]), "")
-            if cmd[:3] == ["gh", "run", "list"]:
-                return _FakeProc(0, "[]", "")
-            if cmd[:2] == ["gh", "api"] and "/pulls/" in cmd_str:
-                return _FakeProc(0, json.dumps({
-                    "data": {"repository": {"pullRequest": {
-                        "reviewThreads": {
-                            "totalCount": 0,
-                            "pageInfo": {
-                                "hasNextPage": False,
-                                "endCursor": None,
-                            },
-                            "nodes": [],
-                        }
-                    }}}
-                }), "")
-            if cmd[:2] == ["gh", "api"] and "/comments" in cmd_str:
-                return _FakeProc(0, json.dumps([[]]), "")
-            if cmd[:2] == ["gh", "api"]:
-                return _FakeProc(0, json.dumps({}), "")
             raise AssertionError(
                 f"unexpected subprocess.run on merged-PR path: {cmd}"
             )
@@ -4198,9 +4176,6 @@ class TestRound24MergedPrReachesCloseout:
         try:
             with mock.patch.object(
                 ctrl, "fetch_pr_state", return_value=pr_view,
-            ), mock.patch.object(
-                ctrl, "fetch_changed_files",
-                return_value=(True, [], None),
             ), mock.patch.object(
                 subprocess, "run", side_effect=fake,
             ):
@@ -4360,3 +4335,233 @@ class TestRound24MergedPrReachesCloseout:
         assert closeout
         assert closeout[0]["merged_at"] is None
         assert closeout[0]["merge_commit_sha"] is None
+
+
+# ---------------------------------------------------------------------------
+# Round-25 regression tests.
+#
+# Exact-head Codex review 4741176246 (submitted 2026-07-21T04:15:05Z on
+# head 8cd86614b59ecdfee76156a6c73ab02e7ee34d1f) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7Xu1j5 (db_id 3619379449)
+#     "Close out merged PRs before fetching readiness evidence"
+#     The Round-24 merged-PR short-circuit lived after
+#     ``_resolve_effective_scope``, ``fetch_changed_files``,
+#     ``build_evidence``, and ``evaluate_machine_readiness``.
+#     If any of those pre-closeout evidence calls hung or
+#     raised (for example a Codex audit ``gh api`` timeout
+#     inside ``build_evidence``), the controller never emitted
+#     the promised ``COMPLETE`` closeout report. Move the
+#     merged-state short-circuit immediately after
+#     ``fetch_pr_state`` and before the readiness / scope
+#     evidence fetches.
+#
+# Tests below prove:
+#
+#   * ``cmd_advance`` reaches ``COMPLETE`` on a MERGED PR
+#     even when ``_resolve_effective_scope`` is monkeypatched
+#     to raise (the Round-24 branch was reached only after
+#     this call; the Round-25 placement must short-circuit
+#     before it);
+#   * ``cmd_advance`` reaches ``COMPLETE`` on a MERGED PR
+#     even when ``fetch_changed_files`` is monkeypatched to
+#     raise;
+#   * ``cmd_advance`` reaches ``COMPLETE`` on a MERGED PR
+#     even when ``build_evidence`` is monkeypatched to
+#     raise;
+#   * ``cmd_advance`` reaches ``COMPLETE`` on a MERGED PR
+#     even when ``evaluate_machine_readiness`` is monkeypatched
+#     to raise;
+#   * ``cmd_advance`` does NOT invoke any subprocess when
+#     the live PR is MERGED (the closeout is purely a
+#     lifecycle transition the controller was always
+#     supposed to perform).
+# ---------------------------------------------------------------------------
+
+
+class TestRound25MergedPrClosesOutBeforeEvidence:
+    """P2 (PRRC_kwDOSHFpYM7Xu1j5): the merged-PR short-circuit
+    must run BEFORE ``_resolve_effective_scope``,
+    ``fetch_changed_files``, ``build_evidence``, and
+    ``evaluate_machine_readiness`` so a hang or raise in any
+    of those cannot prevent the closeout.
+    """
+
+    def _run_advance_with_failure(self, *, monkeypatch_target):
+        """Run ``cmd_advance`` on a MERGED PR view while
+        monkeypatching the named readiness helper to raise.
+        Returns ``(rc, report_or_exc)``.
+        """
+        import io
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+        try:
+            with mock.patch.object(
+                ctrl, "fetch_pr_state", return_value=pr_view,
+            ), mock.patch.object(
+                ctrl, monkeypatch_target,
+                side_effect=AssertionError(
+                    f"{monkeypatch_target} must not run on the "
+                    f"merged-PR path"
+                ),
+            ):
+                args = type("Args", (), {})()
+                args.repo = REPO
+                args.pr_number = PR
+                args.allowed_files = None
+                args.forbidden_files = None
+                args.dry_run = False
+                args.resolve_eligible_bot_threads = True
+                args.ancestry_runner = (
+                    lambda *a, **kw: _FakeProc(0, "ahead", "")
+                )
+                rc = ctrl.cmd_advance(args)
+        finally:
+            sys_stdout_set(old)
+        return rc, json.loads(buf.getvalue())
+
+    def test_closeout_short_circuits_scope_resolver(self):
+        """Bug regression: a raise in ``_resolve_effective_scope``
+        must not prevent the closeout.
+        """
+        rc, report = self._run_advance_with_failure(
+            monkeypatch_target="_resolve_effective_scope",
+        )
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+
+    def test_closeout_short_circuits_changed_files(self):
+        rc, report = self._run_advance_with_failure(
+            monkeypatch_target="fetch_changed_files",
+        )
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+
+    def test_closeout_short_circuits_build_evidence(self):
+        rc, report = self._run_advance_with_failure(
+            monkeypatch_target="build_evidence",
+        )
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+
+    def test_closeout_short_circuits_evaluate_readiness(self):
+        """The merged-PR branch must fire before
+        ``R.evaluate_machine_readiness`` is invoked; otherwise
+        a Codex audit timeout inside ``build_evidence`` would
+        skip the closeout. ``evaluate_machine_readiness`` lives
+        in ``aed_pr_readiness`` (referenced as ``R`` in
+        ``aed_pr``), so we patch it on the readiness module.
+        """
+        import scripts.local.aed_pr_readiness as R
+        import io
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+        try:
+            with mock.patch.object(
+                ctrl, "fetch_pr_state", return_value=pr_view,
+            ), mock.patch.object(
+                R, "evaluate_machine_readiness",
+                side_effect=AssertionError(
+                    "R.evaluate_machine_readiness must not run "
+                    "on the merged-PR path"
+                ),
+            ):
+                args = type("Args", (), {})()
+                args.repo = REPO
+                args.pr_number = PR
+                args.allowed_files = None
+                args.forbidden_files = None
+                args.dry_run = False
+                args.resolve_eligible_bot_threads = True
+                args.ancestry_runner = (
+                    lambda *a, **kw: _FakeProc(0, "ahead", "")
+                )
+                rc = ctrl.cmd_advance(args)
+        finally:
+            sys_stdout_set(old)
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+
+    def test_closeout_does_not_invoke_subprocess(self):
+        """Structural property: the merged-PR closeout is a
+        lifecycle transition the controller performs; no
+        subprocess is invoked for it.
+        """
+        import io
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+        try:
+            with mock.patch.object(
+                ctrl, "fetch_pr_state", return_value=pr_view,
+            ), mock.patch.object(
+                subprocess, "run",
+                side_effect=AssertionError(
+                    "no subprocess.run should fire on the "
+                    "merged-PR path"
+                ),
+            ):
+                args = type("Args", (), {})()
+                args.repo = REPO
+                args.pr_number = PR
+                args.allowed_files = None
+                args.forbidden_files = None
+                args.dry_run = False
+                args.resolve_eligible_bot_threads = True
+                args.ancestry_runner = (
+                    lambda *a, **kw: _FakeProc(0, "ahead", "")
+                )
+                rc = ctrl.cmd_advance(args)
+        finally:
+            sys_stdout_set(old)
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+        assert report["fresh_codex_ping_posted"] is False
+        actions = report["actions_taken"]
+        assert [a.get("action") for a in actions] == [
+            "post_merge_closeout",
+        ]
