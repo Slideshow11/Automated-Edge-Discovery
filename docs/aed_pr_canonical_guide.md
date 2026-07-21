@@ -11,8 +11,21 @@ absorbed into the controller and deleted.
 
 `scripts/local/aed_pr.py` is the only CLI a human operator needs
 from the moment a draft PR exists until the post-merge closeout
-finishes. It has three subcommands:
+finishes. It has the following subcommands:
 
+  - `scope-write` Persist the trusted scope record for the
+               exact head SHA. Required before `status`/`advance`
+               can leave the `SCOPE_UNKNOWN` blocking state on a
+               fresh PR. The record is stored under
+               `~/.hermes/aed/pr_scope/<repo>/<pr>/<head>.json`
+               and is the ONLY source of scope truth — both
+               `status` and `advance` reject CLI `--allowed-files`
+               /`--forbidden-files`, and `merge` reads scope from
+               this exact record alone. A moved head requires a
+               new `scope-write` call bound to the new SHA.
+  - `scope-read`  Read and display the trusted scope record for a
+               given PR + head SHA. Useful for diagnosing
+               `SCOPE_UNKNOWN` blockers.
   - `status`   Read live PR state, emit one authoritative JSON report.
                Read-only. Safe to run any number of times.
   - `advance`  Perform every safe mechanical lifecycle step EXCEPT the
@@ -25,14 +38,35 @@ finishes. It has three subcommands:
 ## Workflow
 
 1. Open the draft PR (normal `gh pr create --draft` flow).
-2. Run:
+2. **Persist the trusted scope** for the exact head SHA. This step
+   is REQUIRED before the first readiness check can succeed; a
+   fresh PR with no `~/.hermes/aed/pr_scope/.../<head>.json` will
+   otherwise remain blocked on `SCOPE_UNKNOWN` even after CI and
+   Codex are green. The exact command is:
+
+       python3 scripts/local/aed_pr.py scope-write \
+           --pr-number N \
+           --head-sha <exact 40-character lowercase hex SHA> \
+           --allowed-files "scripts/local/aed_pr*.py"
+
+   The `--allowed-files` glob list is the only scope input; the
+   controller never invents a default allowlist. If a `--forbidden-files`
+   list is also required, pass it comma-separated via
+   `--forbidden-files`. If the head SHA later moves (e.g. a new
+   commit lands), re-run this command bound to the new SHA —
+   the previous record remains on disk but is no longer
+   consulted by the controller.
+3. Run:
 
        python3 scripts/local/aed_pr.py status --pr-number N
 
    This is the operator's single read-only check. The JSON report
    contains the lifecycle state, the exact `safe_merge_command`
-   preview, and the exact `required_authorization_phrase`.
-3. When CI, scope, exact-head Codex, and thread inventory are all
+   preview, and the exact `required_authorization_phrase`. If the
+   report shows `SCOPE_UNKNOWN` despite step 2, run
+   `aed_pr scope-read --pr-number N --head-sha <head>` to confirm
+   the trusted record exists and is bound to the live head.
+4. When CI, scope, exact-head Codex, and thread inventory are all
    green, run:
 
        python3 scripts/local/aed_pr.py advance --pr-number N
@@ -40,7 +74,7 @@ finishes. It has three subcommands:
    This may request a Codex review for the current head, resolve
    eligible outdated Codex-bot-only threads, mark the draft ready,
    and produce the post-merge closeout plan.
-4. Once `status` reports `READY_FOR_MERGE_AUTHORIZATION`, copy the
+5. Once `status` reports `READY_FOR_MERGE_AUTHORIZATION`, copy the
    `required_authorization_phrase` field byte-exact from the JSON
    report and run:
 
