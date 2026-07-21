@@ -1227,6 +1227,48 @@ def classify(
                 c_dt = parse_iso_utc(ts)
                 if c_dt is None or c_dt < ping_dt:
                     continue
+            # Round-43 fix: exclude Codex task-summary
+            # issue-comments from the ``latest_issue``
+            # selection. The task-summary shape (``###
+            # Summary`` body prefix) is a coordination post
+            # describing prior work, NOT a real Codex
+            # response. When the only post-ping Codex
+            # activity is a task-summary, picking it as
+            # ``latest_issue`` would populate
+            # ``latest_codex_response_type="issue_comment"``
+            # with a non-empty id, which the readiness
+            # verifier then treats as a present Codex
+            # artifact (Round-39 invariant). The audit's
+            # ``status`` is ``HOLD_CODEX_RESPONSE_PENDING``
+            # in this case, so the verifier emits
+            # ``REASON_CODEX_FAILED`` and the lifecycle
+            # routes to ``BLOCKED`` instead of ``WAITING``,
+            # telling the operator to fix a terminal
+            # Codex failure even though no review verdict
+            # has arrived yet.
+            #
+            # The predicate is shared with
+            # ``check_pr_review_comments`` so the gate and
+            # the audit agree on what counts as a task
+            # summary. If the predicate is unavailable
+            # (``_co_is_codex_task_summary_issue_comment``
+            # is ``None``), fall back to treating every
+            # issue-comment as substantive — the runtime
+            # check at the call site gates on ``is not
+            # None``, so the worst case here preserves the
+            # Round-39/41 behavior.
+            c_author = (
+                (c.get("user") or {}).get("login", "")
+                if isinstance(c.get("user"), dict) else ""
+            )
+            c_body = c.get("body", "") or ""
+            if (
+                _co_is_codex_task_summary_issue_comment is not None
+                and _co_is_codex_task_summary_issue_comment(
+                    c_author, "issue_comment", c_body
+                )
+            ):
+                continue
             if latest_issue is None or ts > _iso(timestamp_field(latest_issue, "createdAt", "created_at")):
                 latest_issue = c
         latest_review = None

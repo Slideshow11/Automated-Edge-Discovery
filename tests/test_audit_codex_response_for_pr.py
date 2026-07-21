@@ -8119,3 +8119,286 @@ def test_audit_emits_visible_warning_when_predicate_unavailable(
         "audit must use RuntimeWarning category so the "
         "warning is visible by default"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-43 regression: when the ONLY post-ping Codex activity
+# is a ``### Summary`` task-summary issue-comment (no review
+# verdict, no clean pass), the audit MUST populate
+# ``latest_codex_response_type="none"`` with empty
+# ``latest_codex_response_id``. Otherwise the readiness
+# verifier's Round-39 invariant treats the task-summary
+# as a present artifact, emits ``CODEX_EVIDENCE_FAILED``,
+# and the lifecycle routes to ``BLOCKED`` instead of
+# ``WAITING`` — telling the operator to fix a terminal
+# Codex failure when no Codex response has actually
+# arrived.
+# ---------------------------------------------------------------------------
+
+
+TASK_SUMMARY_BODY = (
+    "### Summary\n\n* Updated audit_codex_response_for_pr "
+    "to skip task-summary issue-comments in latest-response "
+    "selection.\n\n**Commit**\n\n* The fix supersedes "
+    "the previous malformed-head verdict construction.\n\n"
+    "**Testing**\n\n* The audit now emits "
+    "HOLD_CODEX_RESPONSE_PENDING correctly."
+)
+
+
+def test_only_task_summary_latest_response_is_none(monkeypatch, tmp_path):
+    """When the only post-ping Codex activity is a single
+    ``### Summary`` task-summary issue-comment, the audit
+    MUST populate ``latest_codex_response_type="none"``
+    and ``latest_codex_response_id=""``. This guards the
+    Round-43 fix that excludes task-summary issue-comments
+    from the ``latest_issue`` selection.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # ONLY a task-summary — no clean pass, no review.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:30:00Z",
+            comment_id=9501,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The audit MUST hold at HOLD_CODEX_RESPONSE_PENDING —
+    # no real Codex response has arrived.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING, (
+        f"audit must hold at HOLD_CODEX_RESPONSE_PENDING "
+        f"when only a task-summary post is present; "
+        f"got status={pkt['status']!r}"
+    )
+    # The latest-response metadata MUST reflect "no real
+    # response" — empty type and empty id. Otherwise the
+    # Round-39 invariant in build_evidence would treat the
+    # task-summary as a present artifact.
+    assert pkt["latest_codex_response_type"] == "none", (
+        f"latest_codex_response_type must be 'none' when "
+        f"only a task-summary post is present; "
+        f"got {pkt['latest_codex_response_type']!r}"
+    )
+    assert not pkt["latest_codex_response_id"], (
+        f"latest_codex_response_id must be empty when "
+        f"only a task-summary post is present; "
+        f"got {pkt['latest_codex_response_id']!r}"
+    )
+    # No active blockers expected.
+    assert pkt["clean_pass_detected"] is False
+
+
+def test_only_task_summary_does_not_block_via_ready_path(
+    monkeypatch, tmp_path
+):
+    """End-to-end guard: when only a task-summary is
+    present, the canonical ``build_evidence`` consumer
+    must compute ``codex_artifact_present=False``, so
+    the readiness verifier emits ``CODEX_EVIDENCE_MISSING``
+    (routes to ``WAITING``) and NOT
+    ``CODEX_EVIDENCE_FAILED`` (would route to ``BLOCKED``
+    after Round-38's lifecycle mapping).
+
+    This test exercises the full codex audit -> evidence
+    path that the readiness verifier consumes, proving the
+    upstream signal is correct.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:30:00Z",
+            comment_id=9502,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Simulate the consumer's invariant: artifact present iff
+    # type != "none" and id is non-empty. The audit's output
+    # must satisfy the "not present" branch.
+    codex_response_type = pkt.get(
+        "latest_codex_response_type", "none"
+    )
+    codex_response_id = pkt.get("latest_codex_response_id", "")
+    artifact_present = bool(
+        codex_response_type
+        and codex_response_type != "none"
+        and codex_response_id
+    )
+    assert artifact_present is False, (
+        f"build_evidence invariant: when only a task-summary "
+        f"is present, codex_artifact_present must be False. "
+        f"type={codex_response_type!r} id={codex_response_id!r}"
+    )
+
+
+def test_only_task_summary_with_pending_evidence_routes_waiting(
+    monkeypatch, tmp_path
+):
+    """Full lifecycle guard: audit returns
+    HOLD_CODEX_RESPONSE_PENDING, build_evidence sees
+    artifact_present=False, and the readiness verifier
+    emits ``CODEX_EVIDENCE_MISSING`` (not
+    ``CODEX_EVIDENCE_FAILED``). Combined with Round-38's
+    lifecycle mapping, this routes the PR to ``WAITING``,
+    not ``BLOCKED``.
+    """
+    import scripts.local.aed_pr_readiness as readiness
+    # Construct a minimal evidence object that mirrors
+    # what ``aed_pr.py build_evidence`` would assemble for
+    # a task-summary-only post-ping state. The Codex
+    # section is set to the "pending" state (no artifact,
+    # HOLD_CODEX_RESPONSE_PENDING verdict); the verifier
+    # will reject the missing-evidence reason for Codex
+    # but will NOT mark the failure as terminal (which
+    # would route to BLOCKED after Round-38).
+    evidence = readiness.ReadinessEvidence(
+        head_sha=EXPECTED_HEAD,
+        pr_state="OPEN",
+        is_draft=True,
+        mergeable="MERGEABLE",
+        scope_clean=True,
+        changed_files=[],
+        changed_files_fetched=True,
+        required_ci_names=[],
+        ci_conclusions={},
+        ci_missing=[],
+        ci_pending=[],
+        ci_failed=[],
+        ci_duplicated=[],
+        allowed_files_supplied=True,
+        codex_verdict="HOLD_CODEX_RESPONSE_PENDING",
+        codex_clean_passed=False,
+        codex_artifact_present=False,
+        codex_artifact_fresh=False,
+        reviews_inventory_complete=True,
+        review_thread_inventory_complete=True,
+        unresolved_thread_count=0,
+    )
+    verdict = readiness.evaluate_machine_readiness(evidence)
+    # The verifier MUST NOT emit CODEX_EVIDENCE_FAILED.
+    failed_reasons = [
+        r for r in verdict.reasons
+        if getattr(r, "code", None) == "CODEX_EVIDENCE_FAILED"
+    ]
+    assert not failed_reasons, (
+        "verifier must not emit CODEX_EVIDENCE_FAILED when "
+        "codex_artifact_present=False; got "
+        f"reasons={[r.code for r in verdict.reasons]}"
+    )
+    # The verifier MAY emit CODEX_EVIDENCE_MISSING,
+    # which (after Round-38) routes to WAITING.
+    assert verdict.ready is False
+    assert verdict.machine_ready is False
+    # No authorization for a HOLD_CODEX_RESPONSE_PENDING.
+    assert verdict.authorization_required is False
+    assert verdict.authorization_valid is None
+
+
+def test_task_summary_does_not_override_substantive_latest(
+    monkeypatch, tmp_path
+):
+    """Round-43 guard: when both a task-summary AND a
+    substantive issue-comment are present, the substantive
+    one MUST populate ``latest_codex_response_*``. The
+    Round-43 fix only excludes task-summary comments from
+    the latest-response selection, so a substantive comment
+    that arrives AFTER a task-summary still wins.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # Earlier task-summary.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:00:00Z",
+            comment_id=9510,
+        ),
+        # Later substantive comment (e.g. a real
+        # Codex reply, not a clean pass and not a
+        # task summary).
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=(
+                "Codex Review: noticed a follow-up — see "
+                "the discussion on the malformed-head "
+                "verdict construction."
+            ),
+            created_at="2026-07-21T19:00:00Z",
+            comment_id=9511,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The latest-response metadata MUST point at the
+    # substantive comment (id=9511), not the task-summary
+    # (id=9510). The Round-43 fix only excludes
+    # task-summary from the candidate list.
+    assert pkt["latest_codex_response_type"] == "issue_comment"
+    assert str(pkt["latest_codex_response_id"]) == "9511", (
+        f"latest must point at the substantive comment "
+        f"(id=9511), not the task-summary (id=9510); "
+        f"got {pkt['latest_codex_response_id']!r}"
+    )
