@@ -25,6 +25,7 @@ Plus direct regression fixtures modeled on PR #401 and PR #400.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -7809,3 +7810,153 @@ def test_mixed_clean_then_finding_review_authorizes_post_clean_comment(
     assert pkt["clean_pass_detected"] is True
     assert pkt["clean_pass_source"] == "issue_comment"
     assert pkt["clean_pass_comment_id"] == 99204
+
+
+# ---------------------------------------------------------------------------
+# Round-41 regression: task-summary issue-comments must NOT
+# downgrade a current-head clean pass to HOLD_NEW_CODEX_THREAD.
+# The Round-36 fix added the predicate in ``check_pr_review_comments``
+# but did not propagate it to the audit's post-clean-pass
+# newer-finding scan. The bug caused the gate to emit clean
+# while ``aed_pr status``/``merge`` reported
+# ``HOLD_NEW_CODEX_THREAD`` / ``CODEX_EVIDENCE_FAILED`` after
+# the Codex bot posted a ``### Summary`` issue-comment following
+# a clean pass. Round-41 shares the predicate between the gate
+# and the audit.
+# ---------------------------------------------------------------------------
+
+
+def test_post_clean_pass_task_summary_does_not_downgrade(
+    monkeypatch, tmp_path
+):
+    """A Codex bot ``### Summary`` issue-comment posted AFTER a
+    clean pass MUST NOT cause the audit to emit
+    ``HOLD_NEW_CODEX_THREAD``. The previous (buggy) audit
+    treated any non-clean-pass Codex issue comment after the
+    clean pass as a new finding; the predicate added in
+    Round-36 (and now shared by Round-41) recognizes
+    ``### Summary`` task-summary posts as coordination posts
+    rather than findings.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # Old clean pass at 18:00
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9400,
+        ),
+        # Newer task-summary post at 18:30 — must be excluded.
+        # Body deliberately includes BLOCKING_WORDS tokens
+        # (e.g. ``malformed``, ``blocking``) to prove the
+        # predicate discriminates on shape, not vocabulary.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=(
+                "### Summary\n\n* Updated fetch_ci_conclusions "
+                "to request event from gh pr checks. The "
+                "previous malformed head was treated as "
+                "blocking; the fix supersedes that. **Commit**"
+                "\n\n* New commit SHA: 5ed3bdf8cea13b463fa1319338d273dd0e0601b6"
+                "\n\n**Testing**\n\n* The blocked code path now "
+                "exits cleanly."
+            ),
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9401,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The audit MUST NOT emit HOLD_NEW_CODEX_THREAD for a
+    # post-clean-pass task-summary issue comment.
+    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD, (
+        f"audit must not downgrade a current-head clean pass "
+        f"to HOLD_NEW_CODEX_THREAD for a task-summary post; "
+        f"got status={pkt['status']!r}"
+    )
+    # The clean pass MUST still be detected (and the audit
+    # should emit a merge-ready variant).
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY, (
+        f"audit must emit MERGE_READY when only a task-summary "
+        f"post follows a clean pass; got status={pkt['status']!r}"
+    )
+
+
+def test_post_clean_pass_real_finding_still_downgrades(
+    monkeypatch, tmp_path
+):
+    """Round-41 guard: a real Codex finding (NOT a
+    task-summary post) AFTER a clean pass MUST still cause the
+    audit to emit ``HOLD_NEW_CODEX_THREAD``. The fix
+    surgically excludes only ``### Summary`` posts.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9500,
+        ),
+        # Newer REAL finding (not a task-summary).
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body="Actually I missed something: P1 real bug",
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9501,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_audit_imports_shared_task_summary_predicate():
+    """Static structural test: the audit module MUST import
+    the shared predicate from ``check_pr_review_comments`` so
+    that future task-summary shape changes only need to be
+    made in one place.
+    """
+    src = inspect.getsource(mod)
+    assert "_is_codex_task_summary_issue_comment" in src, (
+        "audit_codex_response_for_pr must import the shared "
+        "_is_codex_task_summary_issue_comment predicate from "
+        "check_pr_review_comments"
+    )

@@ -58,6 +58,27 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
+# Round-41 fix: share the Codex task-summary issue-comment
+# predicate with ``check_pr_review_comments`` so the canonical
+# ``aed_pr status`` / ``merge`` Codex verdict path treats
+# task-summary issue-comments the same way the
+# ``review-comment-gate`` does. Without this shared
+# predicate, the gate emits clean while the readiness audit
+# emits ``HOLD_NEW_CODEX_THREAD`` / ``CODEX_EVIDENCE_FAILED``
+# after a Codex bot posts a ``### Summary`` issue-comment
+# following a clean pass. The import is wrapped in a
+# try/except so the audit module remains importable in the
+# absence of the gate helper (e.g. when the gate module is
+# not yet present in the repository).
+try:
+    from scripts.local.check_pr_review_comments import (
+        _is_codex_task_summary_issue_comment as
+        _co_is_codex_task_summary_issue_comment,
+    )
+except Exception:
+    _co_is_codex_task_summary_issue_comment = None
+
+
 # ---------------------------------------------------------------------------
 # Status taxonomy
 # ---------------------------------------------------------------------------
@@ -1447,9 +1468,34 @@ def classify(
                 c_dt = parse_iso_utc(timestamp_field(c, "createdAt", "created_at"))
                 if c_dt is None or cp_dt is None or c_dt <= cp_dt:
                     continue
+                # Round-41 fix: exclude Codex task-summary
+                # issue-comments (``### Summary`` body prefix)
+                # from the post-clean-pass newer-finding scan.
+                # These are coordination posts that describe
+                # work the Codex bot performed (e.g. an
+                # earlier repair round) and may incidentally
+                # contain blocking-vocabulary tokens while
+                # describing prior fixes. They are NOT
+                # substantive findings and must NOT
+                # downgrade a valid current-head clean pass
+                # to ``HOLD_NEW_CODEX_THREAD``. The predicate
+                # is shared with ``check_pr_review_comments``
+                # so the gate and the audit agree.
+                c_author = (
+                    (c.get("user") or {}).get("login", "")
+                    if isinstance(c.get("user"), dict) else ""
+                )
+                c_body = c.get("body", "") or ""
+                if (
+                    _co_is_codex_task_summary_issue_comment is not None
+                    and _co_is_codex_task_summary_issue_comment(
+                        c_author, "issue_comment", c_body
+                    )
+                ):
+                    continue
                 # Any post-clean-pass Codex issue comment other than
                 # another clean pass is treated as a finding.
-                if not is_codex_clean_pass_comment(c.get("body", "")):
+                if not is_codex_clean_pass_comment(c_body):
                     newer_finding_after_clean_pass = True
                     break
             if not newer_finding_after_clean_pass:
