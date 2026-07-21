@@ -2673,14 +2673,27 @@ def cmd_status(args: argparse.Namespace) -> int:
     )
     verdict = R.evaluate_machine_readiness(evidence)
     state = derive_lifecycle_state(verdict, pr_view)
-    safe_cmd = L.build_safe_merge_command(pr_number, repo, head_sha)
+    # Round-22 fix: guard the safe-merge preview on a canonical
+    # head SHA. ``build_safe_merge_command`` raises ``ValueError``
+    # on a missing or malformed ``head_sha``; in transient PR
+    # view responses this would surface as a traceback rather
+    # than the structured blocking report. Emit a ``None`` when
+    # the head is not canonical and let the operator see the
+    # machine-ready verdict drive the rest of the report.
+    safe_cmd = (
+        L.build_safe_merge_command(pr_number, repo, head_sha)
+        if R.is_canonical_head_sha(head_sha) else None
+    )
     # The canonical phrase is emitted ONLY when machine readiness
     # converged on the live head from the canonical trusted scope.
     # It is the operator's job to speak it back to ``aed_pr merge``;
     # the controller does not invent or pre-supply a phrase.
     canonical_phrase = (
         L.build_authorization_phrase(pr_number, str(head_sha))
-        if verdict.machine_ready and R.is_canonical_head_sha(head_sha) else None
+        if (
+            verdict.machine_ready
+            and R.is_canonical_head_sha(head_sha)
+        ) else None
     )
 
     report: Dict[str, Any] = {
@@ -3758,21 +3771,35 @@ def cmd_advance(args: argparse.Namespace) -> int:
         ) else None
     )
 
-    # Round-21 fix: a fresh ``@codex review`` ping posted in
+    # Round-22 fix: a fresh ``@codex review`` ping posted in
     # THIS run invalidates the pre-ping ``codex_clean_passed``
     # evidence. ``merge_ready`` and ``safe_merge_command_if_ready``
     # must be suppressed until the new review lands so an
     # operator cannot advertise merge authorization on the back
-    # of a stale clean pass.
+    # of a stale clean pass. The lifecycle state and operator
+    # hint are recomputed on the same suppressed inputs so an
+    # automation keying off ``lifecycle_state`` cannot treat an
+    # in-flight review as ready.
     if fresh_codex_ping_posted:
         # Re-derive the readiness fields the operator-facing
         # report exposes so they cannot advertise authorization
         # while a new Codex review is in flight.
         effective_machine_ready = False
         effective_merge_ready = False
+        # Override the lifecycle state to ``WAITING_FOR_REVIEW``
+        # so an operator or automation cannot read
+        # ``READY_FOR_MERGE_AUTHORIZATION`` while a fresh review
+        # is pending. ``next_human_action`` is rewritten to a
+        # hint that names the wait, not the merge.
+        state = "WAITING_FOR_REVIEW"
+        next_human_action = (
+            "A new @codex review request was posted in this run; "
+            "wait for the response before re-running status."
+        )
     else:
         effective_machine_ready = machine_verdict.machine_ready
         effective_merge_ready = machine_verdict.merge_ready
+        next_human_action = _next_human_action(state)
 
     out: Dict[str, Any] = {
         "tool": "aed_pr.advance",
@@ -3799,7 +3826,7 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if effective_machine_ready else None
         ),
         "required_authorization_phrase_if_ready": canonical_phrase,
-        "next_human_action": _next_human_action(state),
+        "next_human_action": next_human_action,
         "fresh_codex_ping_posted": fresh_codex_ping_posted,
     }
     json.dump(out, sys.stdout, indent=2)

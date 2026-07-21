@@ -3434,3 +3434,377 @@ class TestRound21FindExactHeadRunMultipleRefusesToSelect:
         # rc reflects an inconclusive exit.
         combined = out_buf.getvalue() + err_buf.getvalue()
         assert "multiple_exact_head_pr_runs" in combined or rc == 2
+
+
+# ---------------------------------------------------------------------------
+# Round-22 regression tests.
+#
+# Exact-head Codex review 4740621538 (submitted 2026-07-21T02:03:05Z on
+# head 1125a48316690f1d0c771690e9e3f4f3ac632649) reported two P2
+# findings on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XtIQ0 (db_id 3618931764)
+#     "Recompute state after posting review ping"
+#     When ``cmd_advance`` posts a fresh ``@codex review`` ping,
+#     the report's ``lifecycle_state`` and ``next_human_action``
+#     must be overridden so an operator keying off
+#     ``lifecycle_state`` cannot treat an in-flight review as
+#     READY_FOR_MERGE_AUTHORIZATION.
+#
+#   PRRC_kwDOSHFpYM7XtIQ4 (db_id 3618931768)
+#     "Guard status preview on canonical head SHA"
+#     ``cmd_status`` MUST NOT call ``build_safe_merge_command``
+#     when ``head_sha`` is missing or non-canonical, because
+#     ``build_safe_merge_command`` raises ``ValueError`` and
+#     turns a recoverable ``machine_ready=false`` status into a
+#     traceback. The preview must be ``None`` on a non-canonical
+#     head and the JSON blocking report must still be emitted.
+#
+# Tests below prove:
+#
+#   * ``cmd_advance`` reports ``lifecycle_state == "WAITING_FOR_REVIEW"``
+#     and ``next_human_action`` no longer says "speak the phrase"
+#     when a fresh ping was posted in this run;
+#   * ``cmd_advance`` keeps the pre-ping ``lifecycle_state`` and
+#     the canonical ``next_human_action`` when the duplicate-
+#     prevention path fired (no fresh ping);
+#   * ``cmd_status`` emits ``safe_merge_command_if_ready=None``
+#     when the live PR view returns a missing or non-canonical
+#     ``headRefOid`` instead of raising;
+#   * ``cmd_status`` emits a populated ``safe_merge_command_if_ready``
+#     on a canonical live head.
+# ---------------------------------------------------------------------------
+
+
+class TestRound22LifecycleStateOnFreshPing:
+    """P2 #1 (PRRC_kwDOSHFpYM7XtIQ0): ``lifecycle_state`` and
+    ``next_human_action`` MUST be recomputed when
+    ``fresh_codex_ping_posted`` is True so an operator keying
+    off ``lifecycle_state`` cannot treat an in-flight review
+    as ``READY_FOR_MERGE_AUTHORIZATION``.
+    """
+
+    HEAD = "0" * 40
+
+    def _run(self, *, initial_packet, dry_run=False, with_eligible=True):
+        """Run ``cmd_advance`` with the supplied ``CODEX.classify``
+        packet and return the parsed JSON report.
+        """
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = dry_run
+            args.resolve_eligible_bot_threads = with_eligible
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+            fake_proc = _r18_make_fake_subprocess(self.HEAD)
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=initial_packet,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=fake_proc,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        return rc, json.loads(buf.getvalue())
+
+    def test_fresh_ping_overrides_state_to_waiting(self):
+        """Bug repro: with a fresh ping posted in this run,
+        ``lifecycle_state`` must NOT be
+        ``READY_FOR_MERGE_AUTHORIZATION`` and
+        ``next_human_action`` must NOT tell the operator to
+        speak the phrase.
+        """
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(initial_packet=clean)
+        assert rc == 0
+        assert report["fresh_codex_ping_posted"] is True
+        # The override is mandatory: a stale clean pass must
+        # not advertise authorization through lifecycle_state.
+        assert report["lifecycle_state"] == "WAITING_FOR_REVIEW"
+        # The hint MUST NOT say "speak the phrase" because the
+        # phrase is suppressed in this same report.
+        assert "speak" not in report["next_human_action"].lower()
+        assert "merge" not in report["next_human_action"].lower()
+        # And the hint SHOULD name the wait so the operator
+        # knows why nothing else happened.
+        assert "review" in report["next_human_action"].lower()
+
+    def test_duplicate_ping_keeps_state(self):
+        """When the duplicate-detection path short-circuits the
+        POST, ``fresh_codex_ping_posted`` stays False and the
+        report keeps the pre-ping ``lifecycle_state`` and
+        canonical ``next_human_action``.
+        """
+        import io
+        from pathlib import Path as _P
+        import tempfile
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+
+            def fake(cmd, *args, **kwargs):
+                cmd_str = " ".join(str(c) for c in cmd)
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    return _FakeProc(
+                        0,
+                        json.dumps(_r18_pr_view_payload(self.HEAD)),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "pr", "checks"]:
+                    return _FakeProc(0, json.dumps([
+                        {"name": "test (3.11)", "state": "SUCCESS",
+                         "workflow": "CI"},
+                        {"name": "validator", "state": "SUCCESS",
+                         "workflow": "CI"},
+                        {"name": "governance-validators",
+                         "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "pr-gate-live-smoke",
+                         "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "review-comment-gate",
+                         "state": "FAILURE", "workflow": "CI"},
+                    ]), "")
+                if cmd[:3] == ["gh", "pr", "diff"]:
+                    return _FakeProc(0, "[]", "")
+                if cmd[:3] == ["gh", "run", "list"]:
+                    return _FakeProc(0, "[]", "")
+                if cmd[:3] == ["gh", "api"] and "compare/" in cmd_str:
+                    return _FakeProc(0, "ahead", "")
+                if (
+                    cmd[:2] == ["gh", "api"]
+                    and "/comments" in cmd_str
+                    and "POST" not in cmd_str
+                ):
+                    existing = [{
+                        "id": 12345,
+                        "body": (
+                            "@codex review\n\n"
+                            f"AED exact-head review request: {self.HEAD}"
+                        ),
+                    }]
+                    return _FakeProc(0, json.dumps([existing]), "")
+                if cmd[:2] == ["gh", "api"] and "POST" in cmd_str:
+                    return _FakeProc(
+                        0, json.dumps({"id": "fake-comment-id"}), "",
+                    )
+                if cmd[:2] == ["gh", "api"] and "graphql" in cmd_str:
+                    return _FakeProc(0, json.dumps({
+                        "data": {"repository": {"pullRequest": {
+                            "reviewThreads": {
+                                "totalCount": 0,
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                                "nodes": [],
+                            }
+                        }}}
+                    }), "")
+                raise AssertionError(f"unexpected: {cmd}")
+
+            clean = _r21_clean_packet(self.HEAD)
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = False
+            args.resolve_eligible_bot_threads = True
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=clean,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=fake,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        # No fresh ping was posted, so the lifecycle state is
+        # the pre-ping value (whatever derive_lifecycle_state
+        # returned on the captured evidence). Critically, it
+        # must NOT have been overridden to
+        # ``WAITING_FOR_REVIEW`` because no ping was posted.
+        assert report["fresh_codex_ping_posted"] is False
+        assert report["lifecycle_state"] != "WAITING_FOR_REVIEW"
+        # And the next_human_action must NOT be the Round-22
+        # wait hint.
+        assert "wait for the response" \
+            not in report["next_human_action"].lower()
+
+
+class TestRound22StatusPreviewOnCanonicalHead:
+    """P2 #2 (PRRC_kwDOSHFpYM7XtIQ4): ``cmd_status`` MUST NOT
+    call ``build_safe_merge_command`` on a missing or
+    non-canonical ``head_sha``. The preview must be ``None``
+    and the JSON blocking report must still be emitted without
+    a traceback.
+    """
+
+    def _run_status(self, head_ref_oid):
+        """Invoke ``cmd_status`` with a stubbed PR view whose
+        ``headRefOid`` is the supplied value. Returns
+        ``(rc, report)``.
+        """
+        import io
+        pr_view = {
+            "number": PR,
+            "headRefOid": head_ref_oid,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": True,
+            "state": "OPEN",
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "test",
+        }
+
+        def fake(cmd, *args, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return _FakeProc(0, json.dumps(pr_view), "")
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return _FakeProc(0, json.dumps([]), "")
+            if cmd[:3] == ["gh", "pr", "diff"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:3] == ["gh", "run", "list"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:2] == ["gh", "api"]:
+                if "compare/" in cmd_str:
+                    return _FakeProc(0, "ahead", "")
+                if "graphql" in cmd_str:
+                    return _FakeProc(0, json.dumps({
+                        "data": {"repository": {"pullRequest": {
+                            "reviewThreads": {
+                                "totalCount": 0,
+                                "pageInfo": {
+                                    "hasNextPage": False,
+                                    "endCursor": None,
+                                },
+                                "nodes": [],
+                            }
+                        }}}
+                    }), "")
+                # Comment inventory fetch (empty).
+                return _FakeProc(0, json.dumps([[]]), "")
+            raise AssertionError(f"unexpected: {cmd}")
+
+        args = type("Args", (), {})()
+        args.repo = REPO
+        args.pr_number = PR
+        args.allowed_files = None
+        args.forbidden_files = None
+        args.ancestry_runner = (
+            lambda *a, **kw: _FakeProc(0, "ahead", "")
+        )
+
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+        try:
+            with mock.patch.object(
+                subprocess, "run", side_effect=fake,
+            ):
+                rc = ctrl.cmd_status(args)
+        finally:
+            sys_stdout_set(old)
+        return rc, json.loads(buf.getvalue())
+
+    def test_canonical_head_emits_safe_merge_command(self):
+        """Baseline: on a canonical live head, the preview is
+        populated.
+        """
+        canonical = "0" * 40
+        rc, report = self._run_status(canonical)
+        assert rc == 0
+        # The preview is the canonical safe argv on a
+        # well-formed head.
+        assert report["safe_merge_command_preview"] is not None
+        assert "gh pr merge" in report["safe_merge_command_preview"]
+        assert canonical in report["safe_merge_command_preview"]
+
+    def test_missing_head_ref_does_not_raise(self):
+        """Bug repro: a missing ``headRefOid`` would previously
+        raise ``ValueError`` from ``build_safe_merge_command``
+        before the JSON report was emitted. The fix gates the
+        preview on a canonical head and emits the blocking
+        report with ``safe_merge_command_preview=None``.
+        """
+        rc, report = self._run_status(None)
+        # The report was emitted (no traceback).
+        assert rc == 0
+        assert report["tool"] == "aed_pr.status"
+        assert report["head_sha"] is None
+        # The preview is None instead of raising.
+        assert report["safe_merge_command_preview"] is None
+        # machine_ready stays False on missing evidence.
+        assert report["machine_ready"] is False
+
+    def test_short_head_ref_does_not_raise(self):
+        """A 39-character head SHA would previously raise
+        ``ValueError`` from ``build_safe_merge_command``.
+        """
+        rc, report = self._run_status("0" * 39)
+        assert rc == 0
+        assert report["safe_merge_command_preview"] is None
+        assert report["machine_ready"] is False
+
+    def test_non_hex_head_ref_does_not_raise(self):
+        """A 40-character non-hex head SHA would previously
+        raise ``ValueError`` from ``build_safe_merge_command``.
+        """
+        rc, report = self._run_status("z" * 40)
+        assert rc == 0
+        assert report["safe_merge_command_preview"] is None
+        assert report["machine_ready"] is False
+
+    def test_uppercase_head_ref_does_not_raise(self):
+        """An uppercase 40-character hex head SHA would
+        previously raise ``ValueError`` because
+        ``build_safe_merge_command`` uses ``is_full_sha`` which
+        is case-sensitive.
+        """
+        rc, report = self._run_status("A" * 40)
+        assert rc == 0
+        assert report["safe_merge_command_preview"] is None
+        assert report["machine_ready"] is False
