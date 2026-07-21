@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import unittest.mock as mock
 from typing import Any, List, Optional
 
@@ -4565,3 +4566,187 @@ class TestRound25MergedPrClosesOutBeforeEvidence:
         assert [a.get("action") for a in actions] == [
             "post_merge_closeout",
         ]
+
+
+# ---------------------------------------------------------------------------
+# Round-28 regression tests.
+#
+# Exact-head Codex review 4743626614 (submitted 2026-07-21T10:32:05Z on
+# head 4ce523784c8ec6ac3546f29486461c9e32fdffa0) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X2XkY (db_id 3621353752)
+#     "Guard malformed heads before validating merge phrase"
+#     When ``gh pr view`` returns a missing or non-canonical
+#     ``headRefOid`` (for example a deleted/malformed PR head
+#     while the merge command is refetching live state), this
+#     call reaches ``build_authorization_phrase()`` through
+#     ``is_valid_authorization_phrase()`` and raises
+#     ``ValueError`` before ``cmd_merge`` can emit its
+#     structured deny response. ``cmd_status`` already guards
+#     the same malformed-head case; the final merge path
+#     should also fail closed with a diagnostic instead of a
+#     traceback.
+#
+# Tests below prove:
+#
+#   * ``cmd_merge`` returns rc=1 with a structured deny
+#     response when ``headRefOid`` is None / empty / non-hex /
+#     uppercase / short / long;
+#   * ``cmd_merge`` does NOT invoke ``is_valid_authorization_phrase``
+#     on a malformed head (no ValueError traceback);
+#   * ``cmd_merge`` does NOT invoke ``gh pr merge`` on a
+#     malformed head;
+#   * the same guard does not affect the happy path
+#     (canonical head passes through to the regular deny /
+#     authorize path).
+# ---------------------------------------------------------------------------
+
+
+class TestRound28MergeGuardsMalformedHead:
+    """P2 (PRRC_kwDOSHFpYM7X2XkY): cmd_merge must fail closed
+    with a structured deny response when the live PR view
+    returns a missing or non-canonical headRefOid, instead of
+    crashing inside ``is_valid_authorization_phrase`` /
+    ``build_authorization_phrase``.
+    """
+
+    def _run_merge(self, head_ref_oid):
+        """Run ``cmd_merge`` with the supplied head_ref_oid
+        embedded in the PR view. Returns ``(rc, report_or_None,
+        err_text)``.
+        """
+        import io
+        import subprocess as sp
+
+        from scripts.local import aed_pr as ctrl
+
+        pr_view = {
+            "number": PR,
+            "headRefOid": head_ref_oid,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "OPEN",
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "test",
+            "mergeable": True,
+            "mergeable_state": "clean",
+        }
+
+        recorded_calls = []
+
+        def _fake_run(cmd, *args, **kwargs):
+            recorded_calls.append(list(cmd))
+            # Anything that reaches subprocess on the
+            # malformed-head path is a bug: the merge
+            # guard must short-circuit before any I/O.
+            raise AssertionError(
+                f"unexpected subprocess.run on malformed-head "
+                f"merge path: {cmd}"
+            )
+
+        buf_out = io.StringIO()
+        buf_err = io.StringIO()
+        old_out, old_err = sys.stdout, sys.stderr
+        sys.stdout = buf_out
+        sys.stderr = buf_err
+        try:
+            with mock.patch.object(
+                ctrl, "fetch_pr_state", return_value=pr_view,
+            ), mock.patch.object(
+                sp, "run", side_effect=_fake_run,
+            ):
+                args = type("Args", (), {})()
+                args.repo = REPO
+                args.pr_number = PR
+                args.authorization_phrase = (
+                    f"I confirm merge PR #{PR} at "
+                    + ("a" * 40)
+                    + " using final-head reviewed clean state."
+                )
+                args.allowed_files = None
+                args.forbidden_files = None
+                rc = ctrl.cmd_merge(args)
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+
+        out_text = buf_out.getvalue()
+        err_text = buf_err.getvalue()
+        try:
+            report = json.loads(out_text) if out_text else None
+        except json.JSONDecodeError:
+            report = None
+        return rc, report, err_text, recorded_calls
+
+    def test_merge_returns_1_when_head_oid_is_none(self):
+        rc, report, err, calls = self._run_merge(None)
+        assert rc == 1
+        assert report is not None
+        assert report["merge_attempted"] is False
+        assert report["merge_succeeded"] is False
+        assert report["reason"] == "head_sha_not_canonical"
+        assert report["head_sha"] is None
+        assert "not a canonical" in err
+        # No subprocess should have fired.
+        assert calls == []
+
+    def test_merge_returns_1_when_head_oid_is_empty(self):
+        rc, report, err, calls = self._run_merge("")
+        assert rc == 1
+        assert report is not None
+        assert report["reason"] == "head_sha_not_canonical"
+        assert report["head_sha"] == ""
+        assert calls == []
+
+    def test_merge_returns_1_when_head_oid_is_39_char_hex(self):
+        rc, report, err, calls = self._run_merge("a" * 39)
+        assert rc == 1
+        assert report["reason"] == "head_sha_not_canonical"
+        assert calls == []
+
+    def test_merge_returns_1_when_head_oid_is_41_char_hex(self):
+        rc, report, err, calls = self._run_merge("a" * 41)
+        assert rc == 1
+        assert report["reason"] == "head_sha_not_canonical"
+        assert calls == []
+
+    def test_merge_returns_1_when_head_oid_is_40_char_non_hex(self):
+        rc, report, err, calls = self._run_merge("z" * 40)
+        assert rc == 1
+        assert report["reason"] == "head_sha_not_canonical"
+        assert calls == []
+
+    def test_merge_returns_1_when_head_oid_is_uppercase_40_char_hex(self):
+        rc, report, err, calls = self._run_merge("A" * 40)
+        assert rc == 1
+        assert report["reason"] == "head_sha_not_canonical"
+        assert calls == []
+
+    def test_merge_does_not_raise_valueerror_on_malformed_head(self):
+        """Structural regression: the previous (un-patched)
+        code raised ValueError from inside
+        ``build_authorization_phrase`` on a malformed head.
+        The Round-28 guard must catch the malformed-head
+        case before the helper is invoked, so cmd_merge
+        returns cleanly with rc=1 instead of an
+        unhandled ValueError traceback.
+        """
+        rc, report, err, calls = self._run_merge("not-a-sha")
+        assert rc == 1
+        assert report is not None
+        assert "Traceback" not in err
+        assert "ValueError" not in err
+
+    def test_merge_guard_short_circuits_before_subprocess(self):
+        """On a malformed head, the merge path must NOT
+        invoke any subprocess. The ``_fake_run`` here
+        raises on any call, so a single recorded call
+        means the guard failed.
+        """
+        rc, report, err, calls = self._run_merge(None)
+        assert rc == 1
+        assert calls == []
+        assert report is not None
+        assert report["merge_attempted"] is False

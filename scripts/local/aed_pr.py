@@ -3981,6 +3981,47 @@ def cmd_merge(args: argparse.Namespace) -> int:
     pr_view = fetch_pr_state(repo, pr_number)
     head_sha = pr_view.get("headRefOid")
 
+    # Round-28 fix: when the live PR view returns a missing or
+    # non-canonical ``headRefOid``, the merge path must fail
+    # closed with a structured deny response instead of
+    # crashing inside ``is_valid_authorization_phrase`` /
+    # ``build_authorization_phrase``. Both helpers raise
+    # ``ValueError`` when ``head_sha`` is not a full 40-char
+    # hex string; without this guard, a transient or
+    # malformed PR head surfaced a raw traceback instead of
+    # the expected diagnostic. ``cmd_status`` already guards
+    # the same case (line 2734 ``R.is_canonical_head_sha``);
+    # the final merge path now mirrors that behavior. P2
+    # ``PRRC_kwDOSHFpYM7X2XkY``.
+    if not R.is_canonical_head_sha(head_sha):
+        sys.stderr.write(
+            "Deny: live head_sha is missing or not a canonical "
+            "40-character lowercase hexadecimal SHA. Refusing to "
+            "evaluate the authorization phrase.\n"
+        )
+        sys.stderr.write(
+            f"  observed headRefOid={head_sha!r}\n"
+        )
+        out = {
+            "tool": "aed_pr.merge",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "merge_attempted": False,
+            "merge_succeeded": False,
+            "reason": "head_sha_not_canonical",
+            "diagnosis": (
+                "live PR view did not supply a canonical 40-char "
+                "hex head_sha; refusing to evaluate the "
+                "authorization phrase without one. Re-run merge "
+                "once ``gh pr view`` returns a valid head."
+            ),
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 1
+
     # Step 1: byte-exact phrase validation. Pure local check; no I/O
     # needed beyond the live head_sha we just fetched.
     if not L.is_valid_authorization_phrase(phrase, pr_number, head_sha):
