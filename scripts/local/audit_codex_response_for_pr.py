@@ -1225,21 +1225,41 @@ def classify(
         # ``PRRC_kwDOSHFpYM7XvLCB``). The ping window alone is
         # not sufficient when the operator runs ``status`` /
         # ``merge`` without a fresh ping (``ping_dt is None``):
-        # the entire PR timeline is then accepted. Require an
-        # explicit head-binding — a formal Codex review
-        # anchored to ``expected_head_sha`` that the issue
-        # comment post-dates — before any issue-comment clean
-        # pass can satisfy the gate.
-        has_head_bound_formal_review = False
+        # the entire PR timeline is then accepted.
+        #
+        # Round-27 hardening (P1 ``PRRC_kwDOSHFpYM7XvfoW``):
+        # merely checking "any head-bound formal review exists"
+        # is insufficient. A current-head non-clean formal
+        # review (a finding) must NOT authorize a stale
+        # issue-comment clean pass. The head-bound surface
+        # must itself be a CLEAN review — a formal review on
+        # ``expected_head_sha`` whose body carries the
+        # canonical clean-pass phrase — so the issue comment
+        # is a post-clean echo of the current head's clean
+        # verdict, not a stale artifact. The issue comment
+        # must additionally post-date that clean head-bound
+        # review timestamp; otherwise the comment predates
+        # the clean review and cannot be an echo of it.
+        latest_head_bound_clean_review_ts = ""
         for r in codex_review_submissions:
             rev_commit = extract_review_commit_oid(r)
             if (
-                rev_commit
-                and expected_head_sha
-                and rev_commit == expected_head_sha
+                not rev_commit
+                or not expected_head_sha
+                or rev_commit != expected_head_sha
             ):
-                has_head_bound_formal_review = True
-                break
+                continue
+            if not is_codex_clean_pass_comment(r.get("body", "")):
+                # Round-27 fail-closed: a non-clean formal
+                # review on the current head is a finding,
+                # not a clean-pass authority.
+                continue
+            ts = timestamp_field(
+                r, "submittedAt", "submitted_at",
+                "createdAt", "created_at",
+            )
+            if ts > latest_head_bound_clean_review_ts:
+                latest_head_bound_clean_review_ts = ts
         for c in codex_issue_comments:
             if not is_codex_clean_pass_comment(c.get("body", "")):
                 continue
@@ -1253,17 +1273,23 @@ def classify(
                 c_dt = parse_iso_utc(ts)
                 if c_dt is None or c_dt < ping_dt:
                     continue
-            # Round-26 fail-closed head binding: when the
+            # Round-27 fail-closed head binding: when the
             # operator did not supply a ping boundary, the
             # issue-comment path is the ONLY head-binding
-            # surface. Without a codex formal review anchored
-            # to ``expected_head_sha``, the issue comment
-            # could be from any earlier point on the PR
-            # timeline and would be silently relabeled as
-            # fresh for the current head. Reject the comment
-            # under that exact condition.
-            if ping_dt is None and not has_head_bound_formal_review:
-                continue
+            # surface. The head-binding surface must be a
+            # CLEAN formal review on ``expected_head_sha``,
+            # and the issue comment must postdate it. A
+            # current-head non-clean formal review (a
+            # finding) does NOT authorize the issue comment
+            # — and a comment that predates the clean
+            # review cannot be its echo.
+            if ping_dt is None:
+                if not latest_head_bound_clean_review_ts:
+                    continue
+                c_dt = parse_iso_utc(ts)
+                r_dt = parse_iso_utc(latest_head_bound_clean_review_ts)
+                if c_dt is None or r_dt is None or c_dt < r_dt:
+                    continue
             if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c
         # If no issue-comment clean pass exists, scan ALL post-ping

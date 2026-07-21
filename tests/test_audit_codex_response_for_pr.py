@@ -7481,14 +7481,16 @@ def test_issue_comment_clean_pass_without_head_binding_rejected(
     assert pkt["clean_pass_comment_id"] in (None, 0, "")
 
 
-def test_issue_comment_clean_pass_with_head_bound_formal_review_accepted(
+def test_issue_comment_clean_pass_with_head_bound_clean_formal_review_accepted(
     monkeypatch, tmp_path,
 ):
-    """When a codex formal review anchored to
-    ``expected_head_sha`` exists, an issue-comment clean
-    pass is accepted even without a ping boundary. The
-    formal review is the head-binding surface that proves
-    the issue comment was posted against the current head.
+    """When a CLEAN codex formal review (one whose body
+    carries the clean-pass phrase) anchored to
+    ``expected_head_sha`` exists, AND the issue comment
+    post-dates that review, the issue-comment clean pass is
+    accepted without a ping boundary. The formal clean
+    review is the head-binding surface; the issue comment
+    is its post-clean echo.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -7505,7 +7507,7 @@ def test_issue_comment_clean_pass_with_head_bound_formal_review_accepted(
         make_review(
             author=CODEX_LOGIN,
             state="COMMENTED",
-            body="",
+            body=codex_clean_pass_body(),
             submitted_at="2026-06-11T17:35:00Z",
             review_id=7102,
             commit_oid=EXPECTED_HEAD,
@@ -7599,3 +7601,211 @@ def test_formal_review_clean_pass_from_other_head_rejected(
     # ``clean_pass_detected`` is False.
     assert pkt["clean_pass_detected"] is False
     assert pkt["clean_pass_source"] in (None, "")
+
+
+# ---------------------------------------------------------------------------
+# Round-27 regression tests.
+#
+# Exact-head Codex review 4741378879 (submitted 2026-07-21T05:00:50Z on
+# head a54ca1c33769f960da433c90a7dae22f12630a65) reported one P1
+# finding on scripts/local/audit_codex_response_for_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XvfoW (db_id 3619551766)
+#     "Bind issue-comment clean passes by timestamp"
+#     When ``status``/``merge`` calls this classifier without
+#     a ping boundary, the Round-26 guard only checks that
+#     some Codex formal review exists on ``expected_head_sha``;
+#     it does not require the issue-comment clean pass to be
+#     after that review or that the review itself is clean.
+#     In a PR where Codex submitted a current-head non-clean
+#     formal review and then a delayed/stale PR-level
+#     clean-pass issue comment from an older head arrives
+#     later, the stale comment passes this guard, the
+#     newer-finding scan sees no later finding, and the packet
+#     can become MERGE_READY without a current-head clean
+#     review. Require the issue comment to be tied to a ping
+#     or to postdate a clean head-bound review before
+#     accepting it.
+#
+# Tests below prove:
+#
+#   * a current-head non-clean formal review does NOT
+#     authorize a stale issue-comment clean pass;
+#   * a clean head-bound formal review authorizes a
+#     post-review issue-comment clean pass (Round-26
+#     semantic, hardened);
+#   * a stale issue-comment clean pass that predates the
+#     head-bound clean review is rejected;
+#   * a non-clean head-bound review followed by a head-bound
+#     clean review authorizes only the issue-comment clean
+#     pass after the clean review (mixed-review regression).
+# ---------------------------------------------------------------------------
+
+
+def test_non_clean_head_bound_review_does_not_authorize_stale_clean_comment(
+    monkeypatch, tmp_path,
+):
+    """P1 (PRRC_kwDOSHFpYM7XvfoW) bug regression: a current-head
+    non-clean formal review (a finding) must NOT authorize a
+    stale issue-comment clean pass. The head-binding surface
+    must itself be a CLEAN review whose body carries the
+    canonical clean-pass phrase.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path captured by P1 ``PRRC_kwDOSHFpYM7XvfoW``.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # A current-head non-clean formal review (a finding) —
+    # Round-27 hardening says this is NOT a clean-pass
+    # authority.
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Stale finding on current head",  # NOT a clean pass
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7202,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+
+
+def test_issue_comment_clean_pass_with_non_clean_review_rejected(
+    monkeypatch, tmp_path,
+):
+    """The P1 (PRRC_kwDOSHFpYM7XvfoW) bug regression: a
+    current-head non-clean formal review does NOT authorize
+    a stale issue-comment clean pass. The head-binding
+    surface must itself be a CLEAN review (one whose body
+    carries the canonical clean-pass phrase). With a
+    non-clean head-bound review, an issue-comment clean
+    pass is unsafe even when ``has_head_bound_formal_review``
+    would have been True under the Round-26 guard.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # A current-head non-clean formal review (a finding) —
+    # Round-27 hardening says this is NOT a clean-pass
+    # authority, even though it is on the expected head.
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Stale finding on current head",  # NOT a clean pass
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7302,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The issue-comment path must NOT accept the stale
+    # comment. The non-clean review is not a clean-pass
+    # authority, so the issue-comment path produces no
+    # clean pass. ``clean_pass_source`` must NOT be
+    # ``issue_comment`` (it might be ``None`` or
+    # ``pull_request_review`` only if the formal-review
+    # fallback finds a clean review — there is none here).
+    assert pkt["clean_pass_source"] != "issue_comment"
+    assert pkt["clean_pass_comment_id"] != 99204
+
+
+def test_mixed_clean_then_finding_review_authorizes_post_clean_comment(
+    monkeypatch, tmp_path,
+):
+    """Mixed-review regression: a codex clean formal review
+    on the current head followed by a later finding review
+    on the same head. The clean review is the
+    head-binding surface; an issue-comment clean pass
+    after the clean review is accepted.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Issue-comment clean pass AFTER both formal reviews.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T19:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # First: clean review on current head. Second: a
+    # later finding on the same head (after the clean
+    # review, before the issue comment).
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T17:35:00Z",
+            review_id=7303,
+            commit_oid=EXPECTED_HEAD,
+        ),
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="New finding after the clean review",
+            submitted_at="2026-06-11T18:30:00Z",
+            review_id=7304,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The issue comment is dated 19:00, after the clean
+    # review at 17:35. The clean review IS the
+    # head-binding surface; the comment is its post-clean
+    # echo. Issue-comment clean pass accepted.
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "issue_comment"
+    assert pkt["clean_pass_comment_id"] == 99204
