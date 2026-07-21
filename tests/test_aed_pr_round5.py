@@ -1730,10 +1730,14 @@ class TestRound18CoherentRefresh:
         assert ready_actions
         for a in ready_actions:
             assert a.get("ok") is False
-            # The exact reason is either ``prerequisites_not_clean``
-            # or ``dry_run`` — never True.
-            assert "prerequisites" in a.get("result", "") or "dry_run" in (
-                a.get("result", "")
+            # The exact reason is either ``prerequisites_not_clean``,
+            # ``fresh_codex_ping_pending`` (Round-33), or
+            # ``dry_run`` — never True.
+            result = a.get("result", "")
+            assert (
+                "prerequisites" in result
+                or "dry_run" in result
+                or "fresh_codex_ping_pending" in result
             )
 
     def test_ordered_packet_unsafe_mixed_snapshot_under_old_impl(
@@ -5972,3 +5976,385 @@ class TestRound32RecoverBoundaryMatchesDuplicateHelper:
         # Both paths MUST agree on the newest ping boundary.
         assert rec_ping_id == dup_ping_id
         assert rec_ping_ts == dup_ping_ts
+
+
+# ---------------------------------------------------------------------------
+# Round-33 regression tests.
+#
+# Exact-head Codex review 4744707672 (submitted 2026-07-21T12:48:58Z on
+# head 072c91874de960c413a89f00024371487a937433) reported TWO P2
+# findings. This round repairs the first one on
+# scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X5yLQ (db_id 3622249168)
+#     "Avoid readying drafts while a fresh Codex review is
+#      pending"
+#     When ``advance`` posts a new exact-head `@codex review`
+#     because no duplicate ping exists,
+#     ``fresh_codex_ping_posted`` is set before this block,
+#     but the draft-ready condition can still run using the
+#     pre-ping clean Codex evidence. In that scenario a draft
+#     PR is published via ``gh pr ready`` while the
+#     exact-head review the command just requested is still
+#     pending; the later suppression only hides merge fields,
+#     not this mutation. Gate this condition on
+#     ``not fresh_codex_ping_posted`` or refetch/re-evaluate
+#     after the new review lands before marking ready.
+#
+# The second finding (PRRC_kwDOSHFpYM7X5yLW on
+# docs/aed_pr_canonical_guide.md) is documentation-only and
+# is deferred to a later round per the standing
+# one-finding-per-round rule.
+#
+# Tests below prove:
+#
+#   * When ``cmd_advance`` posts a fresh ``@codex review`` ping
+#     AND all other draft-ready prerequisites are clean AND
+#     ``pr_view.isDraft`` is True, ``mark_pr_ready`` is
+#     skipped with ``skipped:fresh_codex_ping_pending`` and
+#     ``_mark_pr_ready_for_review`` is NOT invoked.
+#   * When ``cmd_advance`` does NOT post a fresh ping (i.e.
+#     ``fresh_codex_ping_posted=False``) AND all other
+#     prerequisites are clean, the pre-Round-33 behavior is
+#     preserved: ``mark_pr_ready`` runs.
+#   * When ``fresh_codex_ping_posted=False`` and other
+#     prerequisites are NOT clean, the action report still
+#     shows ``skipped:prerequisites_not_clean`` (no behavior
+#     change for the non-fresh-ping path).
+# ---------------------------------------------------------------------------
+
+
+class TestRound33MarkPrReadyGatedOnFreshPing:
+    """P2 (PRRC_kwDOSHFpYM7X5yLQ): the draft-to-ready
+    transition in ``cmd_advance`` MUST be gated on
+    ``not fresh_codex_ping_posted``. A fresh ``@codex review``
+    ping posted in this run must NOT cause ``_mark_pr_ready_for_review``
+    to invoke ``gh pr ready`` while the exact-head review
+    the command just requested is still pending.
+    """
+
+    HEAD = "0" * 40
+
+    def _run(
+        self, *, initial_packet, dry_run=False, with_eligible=False,
+        ready_invoked_tracker=None,
+    ):
+        """Run ``cmd_advance`` and return the parsed JSON
+        report. ``ready_invoked_tracker`` is a list; the
+        controller's ``_mark_pr_ready_for_review`` will append
+        ``True`` to it when invoked.
+        """
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = dry_run
+            args.resolve_eligible_bot_threads = with_eligible
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+            fake_proc = _r18_make_fake_subprocess(self.HEAD)
+
+            def tracking_mark(repo, pr_number):
+                if ready_invoked_tracker is not None:
+                    ready_invoked_tracker.append(True)
+                return True, "marked-ready"
+
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=initial_packet,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=fake_proc,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ), mock.patch.object(
+                    ctrl, "_mark_pr_ready_for_review",
+                    side_effect=tracking_mark,
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        return rc, json.loads(buf.getvalue())
+
+    def test_fresh_ping_blocks_draft_ready(self):
+        """Bug repro: a clean pre-ping Codex evidence on a
+        draft PR, combined with ``cmd_advance`` posting a
+        fresh ``@codex review`` ping (no duplicate
+        existed), MUST NOT result in ``_mark_pr_ready_for_review``
+        being invoked. The action report must show
+        ``skipped:fresh_codex_ping_pending``.
+        """
+        tracker = []
+        clean = _r21_clean_packet(self.HEAD)
+        rc, report = self._run(
+            initial_packet=clean,
+            with_eligible=False,
+            ready_invoked_tracker=tracker,
+        )
+        assert rc == 0
+        # Fresh ping was posted in this run.
+        assert report["fresh_codex_ping_posted"] is True
+        # ``_mark_pr_ready_for_review`` was NOT invoked.
+        assert tracker == []
+        # The action report shows the fresh-ping suppression.
+        ready_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "mark_pr_ready"
+        ]
+        assert ready_actions
+        for a in ready_actions:
+            assert a.get("ok") is False
+            assert a.get("result") == "skipped:fresh_codex_ping_pending"
+            assert a.get("gates_blocking") == ["fresh_codex_ping_pending"]
+
+    def test_no_fresh_ping_runs_draft_ready_when_prereqs_clean(self):
+        """Regression: when no fresh ping was posted (i.e.
+        ``fresh_codex_ping_posted=False``) and all other
+        draft-ready prerequisites are clean, the action
+        report does NOT show ``skipped:fresh_codex_ping_pending``.
+        The pre-Round-33 ``skipped:prerequisites_not_clean``
+        reason applies only when prerequisites are actually
+        not clean.
+        """
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        clean = _r21_clean_packet(self.HEAD)
+
+        existing_ping = {
+            "id": "12345",
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD}"
+            ),
+            "created_at": "2026-07-21T10:00:00Z",
+        }
+
+        def fake_with_duplicate(cmd, *args, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if cmd[:3] == ["gh", "pr", "view"]:
+                return _FakeProc(
+                    0,
+                    json.dumps(_r18_pr_view_payload(self.HEAD)),
+                    "",
+                )
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return _FakeProc(0, json.dumps([
+                    {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "governance-validators", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "pr-gate-live-smoke", "state": "SUCCESS", "workflow": "CI"},
+                    {"name": "review-comment-gate", "state": "FAILURE", "workflow": "CI"},
+                ]), "")
+            if cmd[:3] == ["gh", "pr", "diff"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:3] == ["gh", "run", "list"]:
+                return _FakeProc(0, "[]", "")
+            if (
+                cmd[:2] == ["gh", "api"]
+                and "/comments" in cmd_str
+                and "POST" not in cmd_str
+            ):
+                return _FakeProc(
+                    0,
+                    json.dumps([[existing_ping]]),
+                    "",
+                )
+            if cmd[:2] == ["gh", "api"] and "graphql" in cmd_str:
+                return _FakeProc(0, json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {
+                            "totalCount": 0,
+                            "pageInfo": {"hasNextPage": False, "endCursor": None},
+                            "nodes": [],
+                        }
+                    }}}
+                }), "")
+            if cmd[:3] == ["gh", "api"] and "compare/" in cmd_str:
+                return _FakeProc(0, "ahead", "")
+            raise AssertionError(f"unexpected subprocess.run: {cmd}")
+
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = False
+            args.resolve_eligible_bot_threads = False
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=clean,
+                ), mock.patch.object(
+                    subprocess, "run",
+                    side_effect=fake_with_duplicate,
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        # No fresh ping was posted in this run because the
+        # duplicate-detect path found the existing ping.
+        assert report["fresh_codex_ping_posted"] is False
+        ready_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "mark_pr_ready"
+        ]
+        assert ready_actions
+        for a in ready_actions:
+            # ``skipped:fresh_codex_ping_pending`` is reserved
+            # for the fresh-ping path; it MUST NOT appear
+            # here.
+            assert a.get("result") != "skipped:fresh_codex_ping_pending"
+
+    def test_no_fresh_ping_blocked_prereq_unchanged(self):
+        """Regression: when no fresh ping was posted AND
+        prerequisites are not clean, the action report still
+        shows ``skipped:prerequisites_not_clean`` (the
+        pre-Round-33 fallback is preserved verbatim).
+        """
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        from unittest import mock as _mock
+
+        # Build a packet where Codex is NOT clean.
+        not_clean = _r18_codex_packet(
+            active_threads=[],
+            outdated_threads=[],
+            status="CODEX_PENDING_REVIEW",
+            head_sha=self.HEAD,
+        )
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+
+            existing_ping = {
+                "id": "12345",
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD}"
+                ),
+                "created_at": "2026-07-21T10:00:00Z",
+            }
+
+            def fake(cmd, *args, **kwargs):
+                cmd_str = " ".join(str(c) for c in cmd)
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    return _FakeProc(
+                        0,
+                        json.dumps(_r18_pr_view_payload(self.HEAD)),
+                        "",
+                    )
+                if cmd[:3] == ["gh", "pr", "checks"]:
+                    return _FakeProc(0, json.dumps([
+                        {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "governance-validators", "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "pr-gate-live-smoke", "state": "SUCCESS", "workflow": "CI"},
+                        {"name": "review-comment-gate", "state": "FAILURE", "workflow": "CI"},
+                    ]), "")
+                if cmd[:3] == ["gh", "pr", "diff"]:
+                    return _FakeProc(0, "[]", "")
+                if cmd[:3] == ["gh", "run", "list"]:
+                    return _FakeProc(0, "[]", "")
+                if (
+                    cmd[:2] == ["gh", "api"]
+                    and "/comments" in cmd_str
+                    and "POST" not in cmd_str
+                ):
+                    return _FakeProc(
+                        0,
+                        json.dumps([[existing_ping]]),
+                        "",
+                    )
+                if cmd[:2] == ["gh", "api"] and "graphql" in cmd_str:
+                    return _FakeProc(0, json.dumps({
+                        "data": {"repository": {"pullRequest": {
+                            "reviewThreads": {
+                                "totalCount": 0,
+                                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                                "nodes": [],
+                            }
+                        }}}
+                    }), "")
+                if cmd[:3] == ["gh", "api"] and "compare/" in cmd_str:
+                    return _FakeProc(0, "ahead", "")
+                raise AssertionError(f"unexpected subprocess.run: {cmd}")
+
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = False
+            args.resolve_eligible_bot_threads = False
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with _mock.patch.object(
+                    ctrl.CODEX, "classify",
+                    return_value=not_clean,
+                ), _mock.patch.object(
+                    subprocess, "run", side_effect=fake,
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+
+        report = json.loads(buf.getvalue())
+        assert rc == 0
+        # No fresh ping was posted in this run.
+        assert report["fresh_codex_ping_posted"] is False
+        ready_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "mark_pr_ready"
+        ]
+        assert ready_actions
+        for a in ready_actions:
+            assert a.get("ok") is False
+            assert a.get("result") == "skipped:prerequisites_not_clean"

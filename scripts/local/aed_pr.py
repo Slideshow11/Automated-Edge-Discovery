@@ -3946,8 +3946,23 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # This step is intentionally separate from the F4 mutation;
         # ``mark_pr_ready`` requires zero unresolved threads which
         # may not be achievable until eligible threads are resolved.
+        #
+        # Round-33 hardening (P2 ``PRRC_kwDOSHFpYM7X5yLQ``):
+        # the draft-ready condition MUST also be gated on
+        # ``not fresh_codex_ping_posted``. When ``cmd_advance``
+        # just posted a fresh ``@codex review`` ping (no
+        # duplicate existed), ``fresh_codex_ping_posted`` is
+        # set BEFORE this block. The pre-ping ``codex_clean``
+        # evidence can otherwise pass this condition and run
+        # ``gh pr ready`` while the exact-head review the
+        # command just requested is still pending. The later
+        # suppression at line 4157+ only hides the merge
+        # authorization fields, not the draft-ready mutation.
+        # Without this guard, a draft PR can be published
+        # while a fresh Codex review is in flight.
         if (
             pr_view.get("isDraft") is True
+            and not fresh_codex_ping_posted
             and evidence.scope_clean is True
             and not evidence.ci_failed
             and not evidence.ci_missing
@@ -3964,12 +3979,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 "result": ready_result,
             })
         elif pr_view.get("isDraft") is True:
-            actions_taken.append({
-                "action": "mark_pr_ready",
-                "ok": False,
-                "result": "skipped:prerequisites_not_clean",
-                "gates_blocking": machine_verdict.gates_failed,
-            })
+            # Round-33: distinguish "skipped because a fresh
+            # ping was just posted" from "skipped because the
+            # other prerequisites are not clean", so the
+            # operator can tell which gate is blocking the
+            # draft-ready transition.
+            if fresh_codex_ping_posted:
+                actions_taken.append({
+                    "action": "mark_pr_ready",
+                    "ok": False,
+                    "result": "skipped:fresh_codex_ping_pending",
+                    "gates_blocking": ["fresh_codex_ping_pending"],
+                })
+            else:
+                actions_taken.append({
+                    "action": "mark_pr_ready",
+                    "ok": False,
+                    "result": "skipped:prerequisites_not_clean",
+                    "gates_blocking": machine_verdict.gates_failed,
+                })
 
         # 3. Eligible-bot-thread resolution (round-3 fix #4).
         #
