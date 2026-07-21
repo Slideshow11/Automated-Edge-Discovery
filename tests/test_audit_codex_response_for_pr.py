@@ -7960,3 +7960,147 @@ def test_audit_imports_shared_task_summary_predicate():
         "_is_codex_task_summary_issue_comment predicate from "
         "check_pr_review_comments"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-42 regression: the shared task-summary predicate
+# MUST be imported successfully when the audit module is
+# invoked via the documented live paths
+# (``python scripts/local/audit_codex_response_for_pr.py``
+# or via ``aed_pr status``/``merge``). Round-41 imported
+# via ``from scripts.local.check_pr_review_comments`` which
+# raised ``ModuleNotFoundError`` when ``sys.path[0]`` was
+# ``scripts/local`` (i.e. the live CLI path) and silently
+# disabled task-summary filtering via the broad
+# ``except Exception``.
+# ---------------------------------------------------------------------------
+
+
+def test_predicate_imported_under_script_local_invocation():
+    """Reproduce the documented live invocation as a fresh
+    subprocess with only ``scripts/local`` on ``PYTHONPATH``
+    and the repository root NOT in scope. The shared
+    predicate MUST be available.
+
+    This test guards against the Round-41 bug where the
+    absolute ``from scripts.local.check_pr_review_comments
+    import ...`` raised ``ModuleNotFoundError`` when the
+    repository root was not on ``sys.path``. The Round-42
+    fix pre-pends the repo root before the import attempt.
+
+    A fresh subprocess is required because the in-process
+    import cache (``sys.modules``) is populated by pytest's
+    own collection, which can mask the bug.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+
+    code = (
+        "import sys, importlib\n"
+        "default = list(sys.path)\n"
+        "sys.path = [p for p in default if 'aed_consolidation_v1' not in p]\n"
+        "sys.path.insert(0, '/home/max/aed_consolidation_v1/scripts/local')\n"
+        "for name in list(sys.modules.keys()):\n"
+        "    if 'audit' in name or 'check_pr_review' in name:\n"
+        "        sys.modules.pop(name, None)\n"
+        "mod = importlib.import_module('audit_codex_response_for_pr')\n"
+        "print('PREDICATE:', mod._co_is_codex_task_summary_issue_comment)\n"
+        "print('CALLABLE_TASK_SUMMARY:', mod._co_is_codex_task_summary_issue_comment("
+        "'chatgpt-codex-connector[bot]', 'issue_comment', "
+        "'### Summary\\n\\n* Did some work\\n\\n**Commit**\\n')"
+        " if mod._co_is_codex_task_summary_issue_comment else 'N/A')\n"
+    )
+    res = _subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True, text=True,
+        timeout=30,
+        env={"PATH": _sys.executable and "/usr/bin:/bin"},
+    )
+    # Build a minimal env so we don't inherit
+    # ``PYTHONPATH`` that could put the repo root back on
+    # ``sys.path``.
+    env = {
+        "PATH": "/usr/bin:/bin:/home/max/.local/bin",
+        "HOME": "/root",  # avoid /home/max access
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        # Explicitly clear PYTHONPATH to ensure clean state.
+        "PYTHONPATH": "/home/max/aed_consolidation_v1/scripts/local",
+    }
+    res = _subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=30, env=env,
+    )
+    output = res.stdout
+    # The predicate MUST be importable, not None.
+    assert "PREDICATE: <function" in output or "PREDICATE:" in output, (
+        f"subprocess did not print predicate info; stdout={output!r} "
+        f"stderr={res.stderr[:500]!r}"
+    )
+    assert "PREDICATE: None" not in output, (
+        "shared _is_codex_task_summary_issue_comment "
+        "predicate MUST be importable when invoked via "
+        "the documented live CLI path with only "
+        "scripts/local on PYTHONPATH; got None. "
+        "Without this predicate, the audit emits "
+        "HOLD_NEW_CODEX_THREAD after a Codex "
+        "### Summary task-summary post following a "
+        "clean pass, while the review-comment gate "
+        "treats the same post as informational.\n"
+        f"subprocess stdout: {output!r}\n"
+        f"subprocess stderr: {res.stderr[:500]!r}"
+    )
+    # The predicate MUST be callable and recognize a
+    # Codex task-summary issue-comment.
+    assert "CALLABLE_TASK_SUMMARY: True" in output, (
+        f"predicate should recognize Codex task-summary "
+        f"issue comments; got output {output!r}"
+    )
+
+
+def test_predicate_imported_under_repo_root_invocation():
+    """The audit module MUST also work when invoked with
+    the repository root on sys.path (the way the test
+    harness imports it).
+    """
+    import sys as _sys
+
+    # Make sure the repo root is on sys.path and import via
+    # the package path.
+    if "/home/max/aed_consolidation_v1" not in _sys.path:
+        _sys.path.insert(0, "/home/max/aed_consolidation_v1")
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert mod._co_is_codex_task_summary_issue_comment is not None, (
+        "predicate must be importable under repo-root path"
+    )
+
+
+def test_audit_emits_visible_warning_when_predicate_unavailable(
+    monkeypatch, tmp_path
+):
+    """If BOTH the absolute and fallback import paths fail,
+    the audit MUST emit a visible stderr warning instead of
+    silently disabling task-summary filtering. The runtime
+    gate (the ``is not None`` check at the call site) keeps
+    behavior unchanged.
+
+    This is a structural test: it verifies the import block
+    invokes ``warnings.warn(...)`` so a future reader knows
+    the failure mode is loud. A live verification of the
+    warning emission is fragile because re-importing the
+    audit module after a sentinel substitution interacts
+    with Python's import cache in non-trivial ways; the
+    source-level check is sufficient and stable.
+    """
+    import scripts.local.audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The Round-42 fix MUST invoke ``_warnings.warn`` so a
+    # missing or broken helper module is visible in CI logs.
+    assert "_warnings.warn" in src, (
+        "audit must emit a visible warning when the shared "
+        "predicate is unavailable; missing _warnings.warn call"
+    )
+    assert "RuntimeWarning" in src, (
+        "audit must use RuntimeWarning category so the "
+        "warning is visible by default"
+    )

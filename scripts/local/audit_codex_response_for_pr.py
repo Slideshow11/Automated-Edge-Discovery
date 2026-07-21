@@ -58,25 +58,75 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# Round-41 fix: share the Codex task-summary issue-comment
-# predicate with ``check_pr_review_comments`` so the canonical
-# ``aed_pr status`` / ``merge`` Codex verdict path treats
-# task-summary issue-comments the same way the
-# ``review-comment-gate`` does. Without this shared
-# predicate, the gate emits clean while the readiness audit
-# emits ``HOLD_NEW_CODEX_THREAD`` / ``CODEX_EVIDENCE_FAILED``
-# after a Codex bot posts a ``### Summary`` issue-comment
-# following a clean pass. The import is wrapped in a
-# try/except so the audit module remains importable in the
-# absence of the gate helper (e.g. when the gate module is
-# not yet present in the repository).
+# Round-42 fix: import the shared Codex task-summary
+# predicate robustly. Round-41 imported it via
+# ``from scripts.local.check_pr_review_comments import ...``
+# but the documented live invocation
+# (``python scripts/local/audit_codex_response_for_pr.py ...``
+# or via ``aed_pr status``/``merge`` with ``sys.path[0]``
+# pointing at ``scripts/local``) does NOT have the repository
+# root on ``sys.path``, so the absolute import raised
+# ``ModuleNotFoundError`` and the broad ``except Exception``
+# silently set the predicate to ``None``. As a result the
+# Round-41 task-summary exclusion never ran under the live
+# CLI, and a Codex ``### Summary`` issue-comment after a
+# clean pass could still downgrade the audit to
+# ``HOLD_NEW_CODEX_THREAD``.
+#
+# The fix has three parts:
+#  1. Compute the repository root from this file's location
+#     (``scripts/local/`` → parent is the repo root) and add
+#     it to ``sys.path`` BEFORE attempting the absolute
+#     import. This makes the import succeed under both
+#     invocation modes.
+#  2. Try the absolute import first
+#     (``scripts.local.check_pr_review_comments``); on
+#     failure, fall back to a relative-style import via the
+#     SCRIPT_DIR-on-sys.path mode (the way the audit is
+#     invoked directly).
+#  3. Fail closed but visibly: if both import attempts
+#     fail, log a stderr warning so a missing module
+#     surfaces in CI logs instead of silently disabling
+#     task-summary filtering. The runtime check at the call
+#     site still gates on ``is not None`` so behavior is
+#     unchanged when the predicate truly is unavailable.
+import os as _os
+import sys as _sys
+_SCRIPT_DIR_HERE = _os.path.dirname(_os.path.abspath(__file__))
+_REPO_ROOT_HERE = _os.path.dirname(_SCRIPT_DIR_HERE)
+if _REPO_ROOT_HERE not in _sys.path:
+    _sys.path.insert(0, _REPO_ROOT_HERE)
+if _SCRIPT_DIR_HERE not in _sys.path:
+    _sys.path.insert(0, _SCRIPT_DIR_HERE)
+_co_is_codex_task_summary_issue_comment = None
 try:
     from scripts.local.check_pr_review_comments import (
         _is_codex_task_summary_issue_comment as
         _co_is_codex_task_summary_issue_comment,
     )
-except Exception:
-    _co_is_codex_task_summary_issue_comment = None
+except Exception as _co_abs_exc:
+    # Fallback: when this module is run directly
+    # (``python scripts/local/audit_codex_response_for_pr.py``)
+    # ``scripts.local`` is not importable because the repo
+    # root is not on sys.path; try a top-level import that
+    # works when ``scripts/local`` itself is on sys.path.
+    try:
+        from check_pr_review_comments import (  # type: ignore[import-not-found]
+            _is_codex_task_summary_issue_comment as
+            _co_is_codex_task_summary_issue_comment,
+        )
+    except Exception as _co_fallback_exc:
+        import warnings as _warnings
+        _warnings.warn(
+            "audit_codex_response_for_pr: could not import "
+            "_is_codex_task_summary_issue_comment from "
+            "check_pr_review_comments; task-summary "
+            "filtering will be disabled. "
+            f"abs_exc={type(_co_abs_exc).__name__}:{_co_abs_exc}; "
+            f"fallback_exc={type(_co_fallback_exc).__name__}:{_co_fallback_exc}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 # ---------------------------------------------------------------------------
