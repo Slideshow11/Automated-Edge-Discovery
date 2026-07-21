@@ -4750,3 +4750,209 @@ class TestRound28MergeGuardsMalformedHead:
         assert calls == []
         assert report is not None
         assert report["merge_attempted"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-29 regression tests.
+#
+# Exact-head Codex review 4743813446 (submitted 2026-07-21T10:57:39Z on
+# head ebb0608028c13b9d769971392b70721f22b7dfb9) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X28bT (db_id 3621504723)
+#     "Fail closed on malformed forbidden scope patterns"
+#     When a trusted scope file contains a malformed
+#     ``forbidden_files`` value, for example a string or
+#     object instead of a list, this branch silently converts
+#     it to ``None`` and returns success. In that scenario a
+#     record with broad ``allowed_files`` can drop all
+#     forbidden patterns, so ``status``/``merge`` can treat a
+#     forbidden path as in-scope instead of rejecting the
+#     corrupted trusted record; malformed trusted scope should
+#     fail closed the same way the head/repo/PR bindings do.
+#
+# Tests below prove:
+#
+#   * ``read_trusted_scope`` returns an error when the
+#     on-disk record's ``allowed_files`` is a non-list (str,
+#     dict, int, None);
+#   * ``read_trusted_scope`` returns an error when the
+#     on-disk record's ``forbidden_files`` is a non-list;
+#   * a well-formed record (list of strings) still reads
+#     successfully;
+#   * the upstream ``scope-read`` CLI surfaces the error to
+#     the operator with exit 1.
+# ---------------------------------------------------------------------------
+
+
+class TestRound29TrustedScopeMalformedListFailsClosed:
+    """P2 (PRRC_kwDOSHFpYM7X28bT): ``read_trusted_scope`` MUST
+    return an error when the on-disk record's
+    ``allowed_files`` or ``forbidden_files`` is not a list.
+    A non-list value (string, dict, int, None) would
+    otherwise be silently coerced to ``None`` and drop every
+    forbidden pattern from the effective scope, allowing
+    ``status``/``merge`` to treat a forbidden path as
+    in-scope.
+    """
+
+    HEAD_SHA = "0" * 40
+
+    def _write_raw_scope(self, *, allowed, forbidden):
+        """Write a raw trusted-scope JSON with arbitrary
+        ``allowed_files`` / ``forbidden_files`` shapes (not
+        going through ``write_trusted_scope``, which would
+        normalize). Returns a ``restore`` closure.
+        """
+        import json as _json
+        import tempfile
+        from pathlib import Path
+
+        tmp = Path(tempfile.mkdtemp())
+        saved = ctrl._CANONICAL_SCOPE_ROOT
+        ctrl._CANONICAL_SCOPE_ROOT = tmp
+        path = ctrl._trusted_scope_path(REPO, PR, self.HEAD_SHA)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps({
+            "head_sha": self.HEAD_SHA,
+            "repo": REPO,
+            "pr_number": PR,
+            "allowed_files": allowed,
+            "forbidden_files": forbidden,
+        }))
+
+        def restore():
+            ctrl._CANONICAL_SCOPE_ROOT = saved
+        return restore
+
+    def test_forbidden_string_fails_closed(self):
+        """Bug repro: a string ``forbidden_files`` value used to
+        be silently coerced to ``None`` and treated as no
+        forbidden patterns. Round-29 fails closed.
+        """
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden="*.py",
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files must be a list" in err
+        assert "str" in err
+
+    def test_allowed_string_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed="scripts/local/aed_pr.py",
+            forbidden=[],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "allowed_files must be a list" in err
+
+    def test_allowed_dict_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed={"glob": "*.py"},
+            forbidden=[],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "allowed_files must be a list" in err
+        assert "dict" in err
+
+    def test_forbidden_int_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=42,
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files must be a list" in err
+        assert "int" in err
+
+    def test_allowed_null_fails_closed(self):
+        """JSON ``null`` (Python ``None``) is not a list —
+        the original code coerced ``None`` to ``None``
+        silently. Round-29 fails closed.
+        """
+        restore = self._write_raw_scope(
+            allowed=None,
+            forbidden=[],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "allowed_files must be a list" in err
+
+    def test_well_formed_record_still_reads(self):
+        """Regression: a well-formed trusted-scope record
+        (list of strings) must continue to read cleanly.
+        """
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=["scripts/local/danger.py"],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == ["scripts/local/danger.py"]
+
+    def test_scope_read_cli_surfaces_malformed_error(self):
+        """Upstream check: the ``scope-read`` subcommand must
+        exit non-zero with a stderr message naming the
+        malformed field, so an operator cannot silently
+        read a corrupted record.
+        """
+        import io
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden="*.py",
+        )
+        old_out, old_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.head_sha = self.HEAD_SHA
+            rc = ctrl.cmd_scope_read(args)
+            err_text = sys.stderr.getvalue()
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            restore()
+        assert rc == 1
+        assert "scope-read failed" in err_text
+        assert "forbidden_files must be a list" in err_text

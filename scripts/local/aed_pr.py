@@ -1319,16 +1319,28 @@ def read_trusted_scope(
         )
     allowed_raw = data.get("allowed_files")
     forbidden_raw = data.get("forbidden_files")
-    allowed = (
-        [a for a in allowed_raw if isinstance(a, str) and a]
-        if isinstance(allowed_raw, list)
-        else None
-    )
-    forbidden = (
-        [a for a in forbidden_raw if isinstance(a, str) and a]
-        if isinstance(forbidden_raw, list)
-        else None
-    )
+    # Round-29 hardening: a trusted scope record's
+    # ``allowed_files`` and ``forbidden_files`` fields are
+    # expected to be lists of strings. A malformed value
+    # (string, dict, number, etc.) MUST fail closed the same
+    # way missing/malformed ``head_sha``/``repo``/
+    # ``pr_number`` do. Silently coercing a non-list to
+    # ``None`` drops every forbidden pattern from the
+    # effective scope, allowing ``status``/``merge`` to
+    # treat a forbidden path as in-scope. P2
+    # ``PRRC_kwDOSHFpYM7X28bT``.
+    if not isinstance(allowed_raw, list):
+        return None, None, (
+            f"trusted scope allowed_files must be a list, "
+            f"got {type(allowed_raw).__name__}"
+        )
+    if not isinstance(forbidden_raw, list):
+        return None, None, (
+            f"trusted scope forbidden_files must be a list, "
+            f"got {type(forbidden_raw).__name__}"
+        )
+    allowed = [a for a in allowed_raw if isinstance(a, str) and a]
+    forbidden = [a for a in forbidden_raw if isinstance(a, str) and a]
     return allowed, forbidden, ""
 
 
