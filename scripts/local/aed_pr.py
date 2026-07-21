@@ -3366,6 +3366,60 @@ def cmd_advance(args: argparse.Namespace) -> int:
         sys.stdout.write("\n")
         return 0
 
+    # Round-24 fix: when the live PR is already ``MERGED`` the
+    # controller has nothing left to advance. ``derive_lifecycle_state``
+    # emits ``MERGED_PENDING_CLOSEOUT`` for this case, but
+    # ``cmd_advance`` previously had no merged-PR/closeout branch
+    # and the operator would re-run ``advance`` only to keep
+    # seeing the same pending-closeout state forever (GitHub does
+    # not auto-transition a merged PR to ``CLOSED``). Reach the
+    # promised ``COMPLETE`` state by short-circuiting here: emit
+    # a structured report that records the closeout, surfaces the
+    # merge commit, and tells the operator no further action is
+    # required. No mutation runs; the closeout is purely a
+    # lifecycle transition that the controller was always
+    # supposed to perform.
+    if pr_view.get("state") == "MERGED":
+        actions_taken.append({
+            "action": "post_merge_closeout",
+            "ok": True,
+            "result": "merged_pr_closeout_complete",
+            "merged_at": pr_view.get("mergedAt"),
+            "merge_commit_sha": pr_view.get("mergeCommit", {}).get("oid")
+            if isinstance(pr_view.get("mergeCommit"), dict)
+            else None,
+        })
+        out = {
+            "tool": "aed_pr.advance",
+            "generated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "repo": repo,
+            "pr_number": pr_number,
+            "head_sha": head_sha,
+            "lifecycle_state": "COMPLETE",
+            "scope_source": (
+                "cli_override" if cli_override else "trusted_file"
+            ),
+            "scope_error": scope_err or None,
+            "machine_ready": machine_verdict.machine_ready,
+            "authorization_required": False,
+            "authorization_valid": machine_verdict.authorization_valid,
+            "merge_ready": False,
+            "ready": False,
+            "reason_codes": [r.code for r in machine_verdict.reasons],
+            "reasons": [r.to_dict() for r in machine_verdict.reasons],
+            "actions_taken": actions_taken,
+            "safe_merge_command_if_ready": None,
+            "required_authorization_phrase_if_ready": None,
+            "next_human_action": (
+                "PR is already merged; closeout complete. "
+                "No further action."
+            ),
+            "fresh_codex_ping_posted": False,
+        }
+        json.dump(out, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
     # Step 1: classify every thread as eligible or ineligible. The
     # eligibility check is deterministic (R.is_eligible_for_bot_resolution)
     # and operates on the current inventory snapshot; it does NOT

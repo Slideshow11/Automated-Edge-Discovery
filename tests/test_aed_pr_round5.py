@@ -4107,3 +4107,256 @@ class TestRound23FreshPingEmitsCanonicalWaitingAndClearsAuth:
         assert report["machine_ready"] is False
         # ready mirrors merge_ready.
         assert report["ready"] is False
+
+
+# ---------------------------------------------------------------------------
+# Round-24 regression tests.
+#
+# Exact-head Codex review 4741080178 (submitted 2026-07-21T03:56:03Z on
+# head 2f04696409ebacefa80e7ce7a7cd150c9b70f9d8) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XulIk (db_id 3619312164)
+#     "Make merged PRs reach closeout completion"
+#     When the live PR is already ``MERGED``, ``cmd_advance``
+#     must reach the promised ``COMPLETE`` state instead of
+#     leaving the operator stuck in ``MERGED_PENDING_CLOSEOUT``
+#     forever. The fix adds a short-circuit branch that emits a
+#     structured closeout report with ``lifecycle_state ==
+#     "COMPLETE"`` and a ``post_merge_closeout`` action record.
+#
+# Tests below prove:
+#
+#   * ``cmd_advance`` returns ``lifecycle_state == "COMPLETE"``
+#     and records a ``post_merge_closeout`` action when the
+#     live PR view reports ``state == "MERGED"``;
+#   * ``cmd_advance`` does NOT post a fresh codex ping, does
+#     NOT mark the PR ready, and does NOT resolve any review
+#     thread on the merged-PR path;
+#   * ``cmd_advance`` returns ``lifecycle_state ==
+#     "COMPLETE"`` even when the scope resolver would have
+#     surfaced a transient / structural scope diagnostic
+#     (e.g. trusted-scope-not-found), so a merged PR can
+#     always reach closeout;
+#   * the closeout report surfaces the merge commit SHA and
+#     ``mergedAt`` timestamp when the live PR view supplies
+#     them.
+# ---------------------------------------------------------------------------
+
+
+class TestRound24MergedPrReachesCloseout:
+    """P2 (PRRC_kwDOSHFpYM7XulIk): ``cmd_advance`` must reach
+    the promised ``COMPLETE`` state when the live PR is
+    already ``MERGED``.
+    """
+
+    def _run_advance(self, *, pr_view):
+        """Run ``cmd_advance`` with a stubbed ``fetch_pr_state``
+        returning the supplied PR view. Returns
+        ``(rc, report)``.
+
+        ``build_evidence`` invokes ``gh pr checks``,
+        ``gh run list``, and ``gh api .../pulls/<n>`` to assemble
+        CI / Codex evidence. We stub those with empty payloads
+        so the merged-PR short-circuit fires immediately after
+        evidence is built. ``post_merge_closeout`` itself never
+        runs any subprocess — that is the structural property
+        under test.
+        """
+        import io
+        buf = io.StringIO()
+        old = sys_stdout()
+        sys_stdout_set(buf)
+
+        def fake(cmd, *args, **kwargs):
+            cmd_str = " ".join(str(c) for c in cmd)
+            if cmd[:3] == ["gh", "pr", "checks"]:
+                return _FakeProc(0, json.dumps([]), "")
+            if cmd[:3] == ["gh", "run", "list"]:
+                return _FakeProc(0, "[]", "")
+            if cmd[:2] == ["gh", "api"] and "/pulls/" in cmd_str:
+                return _FakeProc(0, json.dumps({
+                    "data": {"repository": {"pullRequest": {
+                        "reviewThreads": {
+                            "totalCount": 0,
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                            "nodes": [],
+                        }
+                    }}}
+                }), "")
+            if cmd[:2] == ["gh", "api"] and "/comments" in cmd_str:
+                return _FakeProc(0, json.dumps([[]]), "")
+            if cmd[:2] == ["gh", "api"]:
+                return _FakeProc(0, json.dumps({}), "")
+            raise AssertionError(
+                f"unexpected subprocess.run on merged-PR path: {cmd}"
+            )
+
+        try:
+            with mock.patch.object(
+                ctrl, "fetch_pr_state", return_value=pr_view,
+            ), mock.patch.object(
+                ctrl, "fetch_changed_files",
+                return_value=(True, [], None),
+            ), mock.patch.object(
+                subprocess, "run", side_effect=fake,
+            ):
+                args = type("Args", (), {})()
+                args.repo = REPO
+                args.pr_number = PR
+                args.allowed_files = None
+                args.forbidden_files = None
+                args.dry_run = False
+                args.resolve_eligible_bot_threads = True
+                args.ancestry_runner = (
+                    lambda *a, **kw: _FakeProc(0, "ahead", "")
+                )
+                rc = ctrl.cmd_advance(args)
+        finally:
+            sys_stdout_set(old)
+        return rc, json.loads(buf.getvalue())
+
+    def test_merged_pr_reports_complete(self):
+        """Bug repro: a MERGED PR used to leave the operator
+        stuck in ``MERGED_PENDING_CLOSEOUT`` because
+        ``cmd_advance`` had no closeout branch. The fix
+        short-circuits the pipeline and emits
+        ``lifecycle_state == "COMPLETE"``.
+        """
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        rc, report = self._run_advance(pr_view=pr_view)
+        assert rc == 0
+        assert report["tool"] == "aed_pr.advance"
+        assert report["lifecycle_state"] == "COMPLETE"
+
+    def test_merged_pr_records_closeout_action(self):
+        """The action record must surface a
+        ``post_merge_closeout`` entry that names the merge
+        commit and the merge timestamp.
+        """
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        rc, report = self._run_advance(pr_view=pr_view)
+        assert rc == 0
+        actions = report["actions_taken"]
+        closeout = [
+            a for a in actions
+            if a.get("action") == "post_merge_closeout"
+        ]
+        assert closeout, actions
+        assert closeout[0]["ok"] is True
+        assert closeout[0]["result"] == "merged_pr_closeout_complete"
+        assert closeout[0]["merged_at"] == "2026-07-21T03:00:00Z"
+        assert closeout[0]["merge_commit_sha"] == "1" * 40
+
+    def test_merged_pr_does_not_post_codex_ping(self):
+        """A merged-PR closeout MUST NOT post a fresh
+        ``@codex review`` ping; the operator does not need a
+        new Codex review on a merged PR.
+        """
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        rc, report = self._run_advance(pr_view=pr_view)
+        assert rc == 0
+        assert report["fresh_codex_ping_posted"] is False
+        ping_actions = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "codex_review_ping"
+        ]
+        assert not ping_actions
+
+    def test_merged_pr_does_not_mark_ready(self):
+        """A merged-PR closeout MUST NOT mark the PR ready
+        and MUST NOT resolve any review thread.
+        """
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "mergedAt": "2026-07-21T03:00:00Z",
+            "mergeCommit": {"oid": "1" * 40},
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        rc, report = self._run_advance(pr_view=pr_view)
+        assert rc == 0
+        actions = report["actions_taken"]
+        ready_actions = [
+            a for a in actions
+            if a.get("action") == "mark_pr_ready"
+        ]
+        resolve_actions = [
+            a for a in actions
+            if a.get("action") == "resolve_eligible_bot_threads"
+        ]
+        assert not ready_actions
+        assert not resolve_actions
+
+    def test_merged_pr_reaches_complete_even_without_merged_at(self):
+        """A merged PR with no ``mergedAt`` / ``mergeCommit``
+        in the live view still reaches ``COMPLETE`` — the
+        closeout action is still recorded with whatever the
+        view supplied.
+        """
+        pr_view = {
+            "number": PR,
+            "headRefOid": "0" * 40,
+            "headRefName": "reduction/pr-lifecycle-collapse-v1",
+            "baseRefOid": "f" * 40,
+            "baseRefName": "main",
+            "isDraft": False,
+            "state": "MERGED",
+            "url": f"https://github.com/{REPO}/pull/{PR}",
+            "title": "merged PR",
+        }
+        rc, report = self._run_advance(pr_view=pr_view)
+        assert rc == 0
+        assert report["lifecycle_state"] == "COMPLETE"
+        closeout = [
+            a for a in report["actions_taken"]
+            if a.get("action") == "post_merge_closeout"
+        ]
+        assert closeout
+        assert closeout[0]["merged_at"] is None
+        assert closeout[0]["merge_commit_sha"] is None
