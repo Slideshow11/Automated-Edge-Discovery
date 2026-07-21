@@ -1214,6 +1214,32 @@ def classify(
         # one: a later finding might have superseded the clean pass.
         # Filter by ping_dt so old pre-ping clean passes do not count.
         latest_clean_pass = None
+        # Round-26 hardening: PR-level issue comments do not
+        # carry a commit anchor in GitHub's data model (REST
+        # /repos/{owner}/{repo}/issues/{n}/comments returns no
+        # ``commit_oid``). A clean-pass issue comment therefore
+        # cannot be matched to ``expected_head_sha`` by the API
+        # alone, and accepting it without a head-binding
+        # evidence let Codex clean passes from a prior head
+        # satisfy the Codex gate for the current head (P1
+        # ``PRRC_kwDOSHFpYM7XvLCB``). The ping window alone is
+        # not sufficient when the operator runs ``status`` /
+        # ``merge`` without a fresh ping (``ping_dt is None``):
+        # the entire PR timeline is then accepted. Require an
+        # explicit head-binding — a formal Codex review
+        # anchored to ``expected_head_sha`` that the issue
+        # comment post-dates — before any issue-comment clean
+        # pass can satisfy the gate.
+        has_head_bound_formal_review = False
+        for r in codex_review_submissions:
+            rev_commit = extract_review_commit_oid(r)
+            if (
+                rev_commit
+                and expected_head_sha
+                and rev_commit == expected_head_sha
+            ):
+                has_head_bound_formal_review = True
+                break
         for c in codex_issue_comments:
             if not is_codex_clean_pass_comment(c.get("body", "")):
                 continue
@@ -1227,6 +1253,17 @@ def classify(
                 c_dt = parse_iso_utc(ts)
                 if c_dt is None or c_dt < ping_dt:
                     continue
+            # Round-26 fail-closed head binding: when the
+            # operator did not supply a ping boundary, the
+            # issue-comment path is the ONLY head-binding
+            # surface. Without a codex formal review anchored
+            # to ``expected_head_sha``, the issue comment
+            # could be from any earlier point on the PR
+            # timeline and would be silently relabeled as
+            # fresh for the current head. Reject the comment
+            # under that exact condition.
+            if ping_dt is None and not has_head_bound_formal_review:
+                continue
             if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c
         # If no issue-comment clean pass exists, scan ALL post-ping

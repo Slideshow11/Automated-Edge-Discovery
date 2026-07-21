@@ -2898,15 +2898,23 @@ def test_valid_ping_timestamp_still_filters_clean_pass(monkeypatch, tmp_path):
 
 def test_no_ping_timestamp_keeps_prior_behavior(monkeypatch, tmp_path):
     """
-    P2 #1 regression: When --ping-created-at is omitted (empty
-    string), the classifier must continue to apply NO ping
-    filter. All clean passes are accepted as before.
+    Round-26 hardening: When --ping-created-at is omitted and
+    there is no codex formal review anchored to
+    ``expected_head_sha``, a PR-level issue-comment clean
+    pass MUST NOT satisfy the Codex gate on its own. PR
+    issue comments have no commit anchor; accepting them
+    without a head-bound codex surface lets Codex clean
+    passes from a prior head be silently relabeled as
+    fresh for the current head (P1 ``PRRC_kwDOSHFpYM7XvLCB``).
+    Without a head-binding codex surface the classifier
+    must keep the PR in a non-clean-pass state so a fresh
+    ping is required.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
     pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
-    # Pre-ping Codex clean pass. With no --ping-created-at
-    # supplied, this is accepted as a valid clean pass.
+    # Issue-comment clean pass with no ping boundary and
+    # no formal-review anchor on the expected head.
     issue = [
         make_issue_comment(
             author=CODEX_LOGIN,
@@ -2926,12 +2934,18 @@ def test_no_ping_timestamp_keeps_prior_behavior(monkeypatch, tmp_path):
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # When no --ping-created-at is supplied, the classifier
-    # should behave as before: no ping filter, accept the
-    # clean pass, emit MERGE_READY.
     assert pkt["ping_timestamp_supplied"] is False
     assert pkt["ping_timestamp_valid"] is True
-    assert pkt["status"] == mod.STATUS_MERGE_READY
+    # Round-26 fail-closed: no ping boundary AND no
+    # head-bound formal review means the issue-comment
+    # clean pass is not accepted. ``clean_pass_detected``
+    # must be False.
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+    assert pkt["clean_pass_comment_id"] in (None, 0, "")
+    # And the classifier must not have promoted the PR to
+    # MERGE_READY on a head-unbound clean pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
 
 
 def test_naive_ping_timestamp_fails_closed_no_typeerror(monkeypatch, tmp_path):
@@ -7381,3 +7395,207 @@ def test_p2_formal_clean_pass_then_later_review_on_other_head_still_hold_new(
     assert pkt["clean_pass_detected"] is True
     assert pkt["clean_pass_source"] == "pull_request_review"
     assert pkt["clean_pass_review_id"] == 7101
+
+
+# ---------------------------------------------------------------------------
+# Round-26 regression tests.
+#
+# Exact-head Codex review 4741283416 (submitted 2026-07-21T04:36:07Z on
+# head 2f302be11b8704ea9610f85d6ef4a7bd818fc81f) reported one P1
+# finding on scripts/local/audit_codex_response_for_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XvLCB (db_id 3619467393)
+#     "Require head-bound Codex evidence before authorizing"
+#     When ``status`` or ``merge`` reaches this path after a
+#     new commit is pushed, the classifier is called with no
+#     ping boundary (``ping_comment_id=None``,
+#     ``ping_created_at=None``), so issue-comment clean passes
+#     are accepted from any earlier point in the PR. Because
+#     ``build_evidence`` later treats the packet's
+#     ``observed_head_sha`` as the reviewed SHA, an old
+#     issue-comment clean pass from head A can be relabeled
+#     as fresh for current head B and satisfy the Codex gate,
+#     allowing the authorization phrase / merge path without
+#     a current-head Codex review. Pass a head-specific
+#     ping/timestamp or require an explicit head binding for
+#     issue-comment clean passes before marking Codex
+#     evidence fresh.
+#
+# Tests below prove:
+#
+#   * an issue-comment clean pass from prior head A is
+#     rejected when no ping boundary is supplied AND no
+#     codex formal review anchored to ``expected_head_sha``
+#     exists (the unsafe path captured by the P1 finding);
+#   * the same clean pass is accepted when a codex formal
+#     review anchored to ``expected_head_sha`` exists, even
+#     without a ping boundary;
+#   * the same clean pass is accepted when a ping boundary
+#     is supplied (pre-existing behavior, regression);
+#   * a clean pass from a DIFFERENT commit (``OTHER_HEAD``)
+#     on a formal review is rejected (pre-existing behavior,
+#     regression).
+# ---------------------------------------------------------------------------
+
+
+def test_issue_comment_clean_pass_without_head_binding_rejected(
+    monkeypatch, tmp_path,
+):
+    """P1 (PRRC_kwDOSHFpYM7XvLCB) bug regression: when no ping
+    boundary is supplied AND no codex formal review is
+    anchored to ``expected_head_sha``, the issue-comment
+    clean-pass path MUST be rejected. PR-level issue
+    comments carry no commit anchor; accepting them on the
+    absence of any head-binding surface lets Codex clean
+    passes from a prior head satisfy the current-head gate.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # No formal reviews — purely issue-comment based clean
+    # pass. Without ping boundary AND without a
+    # head-bound formal review, the issue-comment clean
+    # pass is unsafe.
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+    assert pkt["clean_pass_comment_id"] in (None, 0, "")
+
+
+def test_issue_comment_clean_pass_with_head_bound_formal_review_accepted(
+    monkeypatch, tmp_path,
+):
+    """When a codex formal review anchored to
+    ``expected_head_sha`` exists, an issue-comment clean
+    pass is accepted even without a ping boundary. The
+    formal review is the head-binding surface that proves
+    the issue comment was posted against the current head.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="",
+            submitted_at="2026-06-11T17:35:00Z",
+            review_id=7102,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "issue_comment"
+    assert pkt["clean_pass_comment_id"] == 99204
+
+
+def test_issue_comment_clean_pass_with_ping_boundary_accepted(
+    monkeypatch, tmp_path,
+):
+    """Regression: when a ping boundary is supplied, the
+    pre-existing post-ping filter applies, and an
+    issue-comment clean pass after the ping is accepted
+    regardless of formal-review anchor. This preserves the
+    ping-driven review flow used by ``cmd_advance`` after
+    ``aed_pr.py advance`` posts a fresh ping.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID,
+        "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "issue_comment"
+
+
+def test_formal_review_clean_pass_from_other_head_rejected(
+    monkeypatch, tmp_path,
+):
+    """Regression: a codex formal-review clean pass anchored
+    to a DIFFERENT commit than ``expected_head_sha`` must
+    not satisfy the gate (the existing
+    ``rev_commit != expected_head_sha`` filter).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7103,
+            commit_oid=OTHER_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, [], reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Stale formal review on a different head does NOT
+    # satisfy the gate; issue-comment path is empty so
+    # ``clean_pass_detected`` is False.
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
