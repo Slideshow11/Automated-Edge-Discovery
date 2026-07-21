@@ -830,6 +830,79 @@ def make_finding_id(
     return f"codex-{digest}"
 
 
+# Codex bot author login used by the task-summary detector. This is a
+# local constant and does NOT affect the gate's policy safeguard that
+# refuses to globally --ignore-users the Codex bot (see the
+# ``if CODEX_BOT_LOGIN in ignore_users`` block near the bottom of this
+# file). The detector is structural: it suppresses the issue-comment
+# class for an author ``login`` that matches ``chatgpt-codex-connector``
+# or ``chatgpt-codex-connector[bot]``, scoped to ``source_kind ==
+# "issue_comment"`` bodies that do NOT start with ``Codex Review:``.
+# Codex review-thread comments and ``Codex Review:`` verdict comments
+# are unaffected by this check.
+_CODEX_BOT_LOGIN_TASK_SUMMARY = "chatgpt-codex-connector"
+_CODEX_BOT_LOGIN_TASK_SUMMARY_BOT = "chatgpt-codex-connector[bot]"
+
+
+def _is_codex_task_summary_issue_comment(
+    user: str,
+    source_kind: str,
+    body: str,
+) -> bool:
+    """Return True iff ``user`` is the Codex bot and ``body`` is a
+    Codex task-summary issue-comment rather than a Codex review
+    verdict.
+
+    Codex occasionally posts issue-comments that describe work it
+    performed (e.g. ``### Summary\\n\\n* Updated fetch_ci_conclusions
+    ... **Commit**\\n\\n* New commit SHA: ... **Testing**\\n\\n* ...``).
+    These are coordination posts that may incidentally use
+    BLOCKING_WORDS vocabulary (``stale`` / ``malformed`` /
+    ``blocking``) inside the body when describing prior fixes. The
+    gate must NOT classify them as ``UNSPECIFIED_BLOCKING``
+    current-head blockers; they are informational posts.
+
+    The structural discriminator is the leading byte sequence:
+
+    * ``Codex Review:`` is the canonical Codex review-verdict
+      prefix. Bodies that begin with this prefix are
+      ``Codex Review:`` verdicts and MUST be classified by the
+      normal pipeline (clean-pass verdicts and substantive
+      review verdicts alike).
+    * ``### Summary`` (with an optional single leading newline)
+      is the canonical Codex task-summary prefix. When the
+      Codex bot's body begins with this Markdown-H3 token, the
+      body is structurally a task summary (it describes work
+      the bot performed, with ``**Commit**`` / ``**Testing**``
+      sections). The body of such a post may incidentally
+      mention ``stale`` / ``malformed`` / ``blocking`` while
+      describing prior fixes. The gate must NOT classify such
+      posts as ``UNSPECIFIED_BLOCKING``.
+
+    Note that other Codex review-thread comments that happen
+    to begin with ``Bumping`` / ``Re-requesting`` / etc. are
+    classified by the coordination-skip / shape-grammar
+    pipeline; the task-summary detector is specific to
+    ``### Summary`` (Markdown H3) and does NOT match them.
+    """
+    if source_kind != "issue_comment":
+        return False
+    if user not in (_CODEX_BOT_LOGIN_TASK_SUMMARY, _CODEX_BOT_LOGIN_TASK_SUMMARY_BOT):
+        return False
+    if not body:
+        return False
+    # The structural discriminator is the leading Markdown H3
+    # ``### Summary`` token (the canonical Codex task-summary
+    # prefix). Codex review-thread comments that happen to
+    # begin with ``Bumping`` / ``Re-requesting`` / etc. are
+    # classified by the coordination-skip / shape-grammar
+    # pipeline; the task-summary detector does NOT match them.
+    # Strip at most ONE optional leading newline so that a body
+    # that starts with ``\n### Summary`` still matches.
+    stripped = body.lstrip("\n")
+    return stripped.startswith("### Summary")
+
+
 def classify_item(
     item: dict[str, Any],
     source_kind: str,
@@ -920,6 +993,20 @@ def classify_item(
     if not has_actionable and is_coordination_comment(body):
         return findings
 
+    # Task-summary override for Codex-bot-authored issue comments
+    # that are NOT ``Codex Review:`` verdicts. The Codex
+    # review-comment gate must not classify Codex task-summary
+    # posts (e.g. ``### Summary\\n\\n* ... **Commit**\\n\\n* New
+    # commit SHA: ...``) as ``UNSPECIFIED_BLOCKING`` just because
+    # the body happens to mention ``stale`` / ``malformed`` /
+    # ``blocking`` while describing prior fixes. The override
+    # only downgrades severity to ``UNSPECIFIED_INFO``; the
+    # comment is still emitted so inventory remains complete,
+    # but it does not block the gate.
+    is_task_summary = _is_codex_task_summary_issue_comment(
+        user=user, source_kind=source_kind, body=body
+    )
+
     # Severity extraction (unchanged — already a single source
     # of truth for severity level mapping).
     severity = extract_severity(combined)
@@ -928,8 +1015,12 @@ def classify_item(
     # extractable severity default to P2 (blocking).
     if severity is None and is_codex_review_thread_current_unresolved:
         severity = "P2"
-    elif severity is None and is_blocking(combined):
+    elif severity is None and is_blocking(combined) and not is_task_summary:
         severity = "UNSPECIFIED_BLOCKING"
+    elif severity is None and is_task_summary:
+        # Codex bot task-summary issue-comments without an
+        # explicit severity are informational, never blocking.
+        severity = "UNSPECIFIED_INFO"
     elif severity is None:
         severity = "UNSPECIFIED_INFO"
 
