@@ -4956,3 +4956,230 @@ class TestRound29TrustedScopeMalformedListFailsClosed:
         assert rc == 1
         assert "scope-read failed" in err_text
         assert "forbidden_files must be a list" in err_text
+
+
+# ---------------------------------------------------------------------------
+# Round-30 regression tests.
+#
+# Exact-head Codex review 4743980445 (submitted 2026-07-21T11:19:13Z on
+# head d78809c0ba8115bf3c339652594c19d708c593af) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X3dkX (db_id 3621640471)
+#     "Fail closed on non-string scope list entries"
+#     When a trusted scope record contains a list with
+#     malformed elements, this filtering silently drops every
+#     non-string entry instead of rejecting the record. In
+#     the same fail-closed scenario handled above for
+#     non-list values, a corrupted file with broad
+#     ``allowed_files`` and ``forbidden_files`` such as
+#     ``[{"pattern": "secrets/**"}]`` is read successfully
+#     with an empty forbidden list, so ``status``/``merge``
+#     can treat a forbidden change as in-scope rather than
+#     rejecting the trusted record as malformed.
+#
+# Tests below prove:
+#
+#   * ``read_trusted_scope`` returns an error when the
+#     ``allowed_files`` list contains a non-string entry
+#     (dict, int, None, empty string);
+#   * ``read_trusted_scope`` returns an error when the
+#     ``forbidden_files`` list contains a non-string entry;
+#   * the offending index is reported in the error message;
+#   * a well-formed list of non-empty strings still reads
+#     cleanly;
+#   * the upstream ``scope-read`` CLI surfaces the error
+#     to the operator with exit 1.
+# ---------------------------------------------------------------------------
+
+
+class TestRound30TrustedScopeMalformedListEntryFailsClosed:
+    """P2 (PRRC_kwDOSHFpYM7X3dkX): ``read_trusted_scope`` MUST
+    fail closed when the ``allowed_files`` or
+    ``forbidden_files`` list contains a non-string entry.
+    A non-string entry (dict, int, None, empty string) used
+    to be silently dropped by the per-entry filter, leaving
+    the effective scope without the (corrupted) forbidden
+    pattern and letting ``status``/``merge`` treat a
+    forbidden change as in-scope.
+    """
+
+    HEAD_SHA = "0" * 40
+
+    def _write_raw_scope(self, *, allowed, forbidden):
+        """Write a raw trusted-scope JSON with arbitrary
+        ``allowed_files`` / ``forbidden_files`` shapes.
+        Returns a ``restore`` closure.
+        """
+        import json as _json
+        import tempfile
+        from pathlib import Path
+
+        tmp = Path(tempfile.mkdtemp())
+        saved = ctrl._CANONICAL_SCOPE_ROOT
+        ctrl._CANONICAL_SCOPE_ROOT = tmp
+        path = ctrl._trusted_scope_path(REPO, PR, self.HEAD_SHA)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps({
+            "head_sha": self.HEAD_SHA,
+            "repo": REPO,
+            "pr_number": PR,
+            "allowed_files": allowed,
+            "forbidden_files": forbidden,
+        }))
+
+        def restore():
+            ctrl._CANONICAL_SCOPE_ROOT = saved
+        return restore
+
+    def test_forbidden_dict_entry_fails_closed(self):
+        """P2 bug repro: a dict entry in ``forbidden_files``
+        used to be silently dropped, leaving an empty
+        forbidden list. Round-30 fails closed.
+        """
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=[{"pattern": "secrets/**"}],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files[0]" in err
+        assert "dict" in err
+        assert "must be a non-empty string" in err
+
+    def test_allowed_dict_entry_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed=[{"glob": "*.py"}, "scripts/local/aed_pr.py"],
+            forbidden=[],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "allowed_files[0]" in err
+        assert "dict" in err
+
+    def test_forbidden_int_entry_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=[42],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files[0]" in err
+        assert "int" in err
+
+    def test_forbidden_null_entry_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=[None],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files[0]" in err
+        assert "NoneType" in err
+
+    def test_forbidden_empty_string_fails_closed(self):
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=[""],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "forbidden_files[0]" in err
+
+    def test_offending_index_is_reported(self):
+        """The error must name the offending index so the
+        operator can locate the corrupted entry in a longer
+        list.
+        """
+        restore = self._write_raw_scope(
+            allowed=[
+                "scripts/local/aed_pr.py",
+                "scripts/local/audit_*.py",
+                {"glob": "*.py"},
+                "scripts/local/check_*.py",
+            ],
+            forbidden=[],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert allowed is None
+        assert forbidden is None
+        assert "allowed_files[2]" in err
+
+    def test_well_formed_list_still_reads(self):
+        """Regression: a well-formed list of non-empty strings
+        continues to read cleanly.
+        """
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=["scripts/local/danger.py"],
+        )
+        try:
+            allowed, forbidden, err = ctrl.read_trusted_scope(
+                REPO, PR, self.HEAD_SHA,
+            )
+        finally:
+            restore()
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == ["scripts/local/danger.py"]
+
+    def test_scope_read_cli_surfaces_malformed_entry_error(self):
+        """Upstream check: ``cmd_scope_read`` exits non-zero
+        with stderr naming the malformed entry index.
+        """
+        import io
+        restore = self._write_raw_scope(
+            allowed=["scripts/local/aed_pr*.py"],
+            forbidden=[{"pattern": "secrets/**"}],
+        )
+        old_out, old_err = sys.stdout, sys.stderr
+        try:
+            sys.stdout = io.StringIO()
+            sys.stderr = io.StringIO()
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.head_sha = self.HEAD_SHA
+            rc = ctrl.cmd_scope_read(args)
+            err_text = sys.stderr.getvalue()
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
+            restore()
+        assert rc == 1
+        assert "scope-read failed" in err_text
+        assert "forbidden_files[0]" in err_text

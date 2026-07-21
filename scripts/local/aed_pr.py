@@ -1339,9 +1339,30 @@ def read_trusted_scope(
             f"trusted scope forbidden_files must be a list, "
             f"got {type(forbidden_raw).__name__}"
         )
-    allowed = [a for a in allowed_raw if isinstance(a, str) and a]
-    forbidden = [a for a in forbidden_raw if isinstance(a, str) and a]
-    return allowed, forbidden, ""
+    # Round-30 hardening: a list with malformed elements
+    # (dict, int, None, …) MUST also fail closed. The
+    # previous code filtered each list with
+    # ``if isinstance(x, str) and x`` — silently dropping
+    # every non-string entry and effectively erasing the
+    # forbidden patterns. A corrupted file with broad
+    # ``allowed_files`` and a malformed forbidden list such
+    # as ``[{"pattern": "secrets/**"}]`` was therefore read
+    # as an empty forbidden list, letting ``status``/
+    # ``merge`` treat a forbidden change as in-scope. P2
+    # ``PRRC_kwDOSHFpYM7X3dkX``.
+    for i, entry in enumerate(allowed_raw):
+        if not isinstance(entry, str) or not entry:
+            return None, None, (
+                f"trusted scope allowed_files[{i}] must be a "
+                f"non-empty string, got {type(entry).__name__}"
+            )
+    for i, entry in enumerate(forbidden_raw):
+        if not isinstance(entry, str) or not entry:
+            return None, None, (
+                f"trusted scope forbidden_files[{i}] must be a "
+                f"non-empty string, got {type(entry).__name__}"
+            )
+    return list(allowed_raw), list(forbidden_raw), ""
 
 
 def write_trusted_scope(
