@@ -3288,7 +3288,7 @@ class TestRound9CodexPingActualTrigger:
 
     def test_posted_body_contains_exact_codex_review(self):
         runner = self._runner(inventory=[])
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         assert ok is True
@@ -3299,7 +3299,7 @@ class TestRound9CodexPingActualTrigger:
 
     def test_posted_body_contains_full_head_sha(self):
         runner = self._runner(inventory=[])
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         # The runner saw a POST with a body containing
@@ -3318,10 +3318,11 @@ class TestRound9CodexPingActualTrigger:
         # (each page is a list of comments).
         inventory = [[
             {"body": f"@codex review\n\nAED exact-head: {self.SHA}",
-             "id": "100"},
+             "id": "100",
+             "created_at": "2026-07-21T10:00:00Z"},
         ]]
         runner = self._runner(inventory=inventory)
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         assert ok is True
@@ -3335,7 +3336,7 @@ class TestRound9CodexPingActualTrigger:
              "id": "100"},
         ]]
         runner = self._runner(inventory=inventory)
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         assert ok is True
@@ -3352,7 +3353,7 @@ class TestRound9CodexPingActualTrigger:
             ), "id": "100"},
         ]]
         runner = self._runner(inventory=inventory)
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         assert ok is True
@@ -3362,7 +3363,7 @@ class TestRound9CodexPingActualTrigger:
         runner = self._runner(
             inventory_ok=False, inventory_err="network"
         )
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, self.SHA, runner=runner
         )
         assert ok is False
@@ -3370,7 +3371,7 @@ class TestRound9CodexPingActualTrigger:
 
     def test_malformed_head_sha_prevents_post(self):
         runner = self._runner(inventory=[])
-        ok, info = ctrl._post_codex_ping_comment(
+        ok, info, _ping_id, _ping_ts = ctrl._post_codex_ping_comment(
             "owner/repo", 411, "not-a-sha", runner=runner
         )
         assert ok is False

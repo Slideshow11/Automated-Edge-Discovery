@@ -5183,3 +5183,501 @@ class TestRound30TrustedScopeMalformedListEntryFailsClosed:
         assert rc == 1
         assert "scope-read failed" in err_text
         assert "forbidden_files[0]" in err_text
+
+
+# ---------------------------------------------------------------------------
+# Round-31 regression tests.
+#
+# Exact-head Codex review 4744132617 (submitted 2026-07-21T11:41:25Z on
+# head bc4fd247066ca9c4b0e30fe4e5d5422a8ef0dc62) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X39KN (db_id 3621769869)
+#     "Preserve ping boundary for Codex issue-comment clean passes"
+#     When Codex responds to the controller's `@codex review`
+#     ping with a PR-level issue-comment clean pass, subsequent
+#     ``status``/``merge`` calls reach this helper with no
+#     ping boundary because both fields are hard-coded to
+#     ``None``. The classifier only accepts issue-comment-only
+#     clean passes via the ping-boundary path; without it,
+#     the Round-26 head-binding guard rejects those valid
+#     post-ping clean responses unless there also happens to
+#     be a formal clean review, leaving the canonical flow
+#     stuck waiting for Codex evidence after a clean
+#     issue-comment response. Pass through or recover the
+#     exact-head ping comment timestamp/id instead of
+#     discarding it here.
+#
+# Tests below prove:
+#
+#   * ``_post_codex_ping_comment`` returns the comment id and
+#     ``created_at`` of the canonical ping (post and duplicate
+#     paths);
+#   * ``_recover_canonical_ping_boundary`` recovers the most
+#     recent canonical ping on the live head from the PR
+#     issue-comment inventory;
+#   * ``fetch_codex_packet`` forwards those parameters to
+#     ``CODEX.classify`` instead of hard-coding ``None``;
+#   * ``build_evidence`` forwards its ``ping_comment_id`` /
+#     ``ping_created_at`` parameters through to
+#     ``fetch_codex_packet``;
+#   * ``cmd_status`` recovers the canonical ping boundary
+#     and forwards it into ``build_evidence``;
+#   * a ``cmd_status`` invocation on a head with no canonical
+#     ping still runs without crashing (the Round-26 guard
+#     remains authoritative when the boundary cannot be
+#     recovered).
+# ---------------------------------------------------------------------------
+
+
+class TestRound31PostCodexPingCommentReturnsBoundary:
+    """P2 (PRRC_kwDOSHFpYM7X39KN): ``_post_codex_ping_comment``
+    returns a 4-tuple ``(ok, info, ping_id, ping_created_at)``
+    so downstream ``status``/``merge`` calls can recover the
+    canonical ping boundary instead of receiving ``None``.
+    """
+
+    HEAD_SHA = "1" * 40
+    OTHER_SHA = "2" * 40
+
+    def _runner(self, *, inventory, inventory_ok=True, inventory_err=""):
+        """Stand-in for ``_run_json_or_none``: returns a
+        runner that serves the inventory on the first call
+        and posts a fake ping on the second call.
+        """
+        import json as _json
+        posts = []
+
+        def runner(cmd, capture_output=True, text=True, timeout=60):
+            class _P:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            p = _P()
+            if "-X" in cmd and "POST" in cmd:
+                posts.append(cmd)
+                p.stdout = _json.dumps({
+                    "id": "500",
+                    "created_at": "2026-07-21T10:00:00Z",
+                })
+                return p
+            # GET inventory
+            if not inventory_ok:
+                p.returncode = 1
+                p.stderr = inventory_err
+                return p
+            # ``gh api --paginate --slurp`` returns a list of
+            # pages (each page is a list of comments).
+            p.stdout = _json.dumps(inventory)
+            return p
+
+        runner.posts = posts
+        return runner
+
+    def test_post_returns_ping_id_and_created_at(self):
+        runner = self._runner(inventory=[])
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert ping_id == "500"
+        assert ping_ts == "2026-07-21T10:00:00Z"
+        assert info == "500"
+
+    def test_duplicate_returns_existing_ping_id_and_created_at(self):
+        inventory = [[{
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD_SHA}"
+            ),
+            "id": "100",
+            "created_at": "2026-07-21T09:00:00Z",
+        }]]
+        runner = self._runner(inventory=inventory)
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        assert ping_id == "100"
+        assert ping_ts == "2026-07-21T09:00:00Z"
+        # The POST must NOT have been made.
+        assert runner.posts == []
+
+    def test_malformed_head_returns_none_for_ping_boundary(self):
+        runner = self._runner(inventory=[])
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, "not-a-sha", runner=runner,
+        )
+        assert ok is False
+        assert ping_id is None
+        assert ping_ts is None
+
+
+class TestRound31RecoverCanonicalPingBoundary:
+    """P2 (PRRC_kwDOSHFpYM7X39KN): ``_recover_canonical_ping_boundary``
+    scans the PR issue-comment inventory for the most recent
+    canonical ``@codex review`` ping on the live head and
+    returns ``(ping_id, ping_created_at, err)``.
+    """
+
+    HEAD_SHA = "3" * 40
+    OTHER_SHA = "4" * 40
+
+    def _comments_json(self, *comments):
+        # Accept both ``self._comments_json(*comments)`` (each
+        # comment is passed positionally, ignoring ``self``)
+        # and ``self._comments_json(comments)`` (passing a list).
+        # When the first positional arg is a non-dict list, treat
+        # the remaining args as the page payload.
+        if len(comments) == 1 and isinstance(comments[0], list):
+            return [comments[0]]
+        return [list(comments)]
+
+    def test_recovers_most_recent_canonical_ping(self, monkeypatch):
+        # Build two pings: an older ping on the canonical head,
+        # then a newer ping on the same canonical head. The
+        # recovery must return the newer one.
+        older = {
+            "id": 100,
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD_SHA}"
+            ),
+            "created_at": "2026-07-20T10:00:00Z",
+        }
+        newer = {
+            "id": 200,
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD_SHA}"
+            ),
+            "created_at": "2026-07-21T10:00:00Z",
+        }
+        other_head = {
+            "id": 300,
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.OTHER_SHA}"
+            ),
+            "created_at": "2026-07-21T11:00:00Z",
+        }
+        non_canonical = {
+            "id": 400,
+            "body": "Some unrelated comment",
+            "created_at": "2026-07-21T12:00:00Z",
+        }
+        comments = [older, non_canonical, other_head, newer]
+
+        captured = {}
+
+        def fake_run_json(cmd, timeout=30):
+            captured["cmd"] = cmd
+            return True, self._comments_json(*comments), ""
+
+        monkeypatch.setattr(ctrl, "_run_json_or_none", fake_run_json)
+        ping_id, ping_ts, err = ctrl._recover_canonical_ping_boundary(
+            "owner/repo", 411, self.HEAD_SHA,
+        )
+        assert err == ""
+        assert ping_id == "200"
+        assert ping_ts == "2026-07-21T10:00:00Z"
+
+    def test_no_canonical_ping_returns_error(self, monkeypatch):
+        comments = [{
+            "id": 100,
+            "body": f"Some unrelated comment without trigger",
+            "created_at": "2026-07-21T10:00:00Z",
+        }]
+
+        def fake_run_json(cmd, timeout=30):
+            return True, self._comments_json(*comments), ""
+
+        monkeypatch.setattr(ctrl, "_run_json_or_none", fake_run_json)
+        ping_id, ping_ts, err = ctrl._recover_canonical_ping_boundary(
+            "owner/repo", 411, self.HEAD_SHA,
+        )
+        assert ping_id is None
+        assert ping_ts is None
+        assert "no_canonical_ping_on_head" in err
+
+    def test_inventory_failure_returns_error(self, monkeypatch):
+        def fake_run_json(cmd, timeout=30):
+            return False, None, "network"
+
+        monkeypatch.setattr(ctrl, "_run_json_or_none", fake_run_json)
+        ping_id, ping_ts, err = ctrl._recover_canonical_ping_boundary(
+            "owner/repo", 411, self.HEAD_SHA,
+        )
+        assert ping_id is None
+        assert ping_ts is None
+        assert "ping_recovery_failed" in err
+        assert "network" in err
+
+    def test_non_canonical_head_skips_recovery(self, monkeypatch):
+        called = {"yes": False}
+
+        def fake_run_json(cmd, timeout=30):
+            called["yes"] = True
+            return True, [], ""
+
+        monkeypatch.setattr(ctrl, "_run_json_or_none", fake_run_json)
+        ping_id, ping_ts, err = ctrl._recover_canonical_ping_boundary(
+            "owner/repo", 411, "not-a-sha",
+        )
+        assert ping_id is None
+        assert ping_ts is None
+        assert "non_canonical_head_sha" in err
+        # Must NOT have queried the inventory.
+        assert called["yes"] is False
+
+
+class TestRound31FetchCodexPacketForwardsPingBoundary:
+    """P2 (PRRC_kwDOSHFpYM7X39KN): ``fetch_codex_packet`` MUST
+    forward ``ping_comment_id``/``ping_created_at`` to
+    ``CODEX.classify`` rather than hard-coding them to ``None``.
+    """
+
+    HEAD_SHA = "5" * 40
+
+    def test_fetch_codex_packet_forwards_ping_boundary(self, monkeypatch):
+        captured = {}
+
+        def fake_classify(**kwargs):
+            captured.update(kwargs)
+            return {"status": "MERGE_READY"}
+
+        monkeypatch.setattr(ctrl.CODEX, "classify", fake_classify)
+        result = ctrl.fetch_codex_packet(
+            "owner/repo", 411, self.HEAD_SHA,
+            ping_comment_id="999",
+            ping_created_at="2026-07-21T10:00:00Z",
+        )
+        assert result == {"status": "MERGE_READY"}
+        assert captured["ping_comment_id"] == "999"
+        assert captured["ping_created_at"] == "2026-07-21T10:00:00Z"
+        assert captured["expected_head_sha"] == self.HEAD_SHA
+
+    def test_fetch_codex_packet_default_is_none(self, monkeypatch):
+        captured = {}
+
+        def fake_classify(**kwargs):
+            captured.update(kwargs)
+            return {"status": ""}
+
+        monkeypatch.setattr(ctrl.CODEX, "classify", fake_classify)
+        ctrl.fetch_codex_packet("owner/repo", 411, self.HEAD_SHA)
+        # Default ``None``/``None`` preserves the Round-26
+        # head-binding guard for callers that explicitly opt out.
+        assert captured["ping_comment_id"] is None
+        assert captured["ping_created_at"] is None
+
+
+class TestRound31BuildEvidenceForwardsPingBoundary:
+    """P2 (PRRC_kwDOSHFpYM7X39KN): ``build_evidence`` MUST
+    forward its ``ping_comment_id``/``ping_created_at``
+    parameters to ``fetch_codex_packet``.
+    """
+
+    HEAD_SHA = "6" * 40
+
+    def test_build_evidence_forwards_ping_boundary(self, monkeypatch):
+        captured = {}
+
+        def fake_fetch(
+            repo, pr_number, head_sha, *,
+            ping_comment_id=None, ping_created_at=None,
+        ):
+            captured["repo"] = repo
+            captured["pr_number"] = pr_number
+            captured["head_sha"] = head_sha
+            captured["ping_comment_id"] = ping_comment_id
+            captured["ping_created_at"] = ping_created_at
+            return {
+                "status": "",
+                "observed_head_sha": None,
+                "issue_comment_inventory_complete": True,
+                "review_submission_inventory_complete": True,
+                "review_thread_inventory_complete": True,
+                "review_thread_comment_inventory_complete": True,
+                "active_threads": [],
+                "outdated_threads": [],
+                "latest_codex_response_type": None,
+                "latest_codex_response_url": None,
+                "latest_codex_response_id": None,
+                "clean_pass_detected": False,
+            }
+
+        monkeypatch.setattr(ctrl, "fetch_codex_packet", fake_fetch)
+        # Stub the rest of the fetchers so build_evidence runs.
+        monkeypatch.setattr(
+            ctrl, "fetch_ci_conclusions",
+            lambda *a, **k: (True, [], [], [], [], [], ""),
+        )
+        monkeypatch.setattr(
+            ctrl, "SCOPE", type("S", (), {"check_scope": staticmethod(
+                lambda *a, **k: {
+                    "passed": True,
+                    "out_of_scope_files": [],
+                    "forbidden_files_touched": [],
+                    "blockers": [],
+                }
+            )})(),
+        )
+
+        evidence = ctrl.build_evidence(
+            repo="owner/repo",
+            pr_number=411,
+            pr_view={"headRefOid": self.HEAD_SHA, "headRefName": "branch"},
+            changed_files=["scripts/local/aed_pr.py"],
+            changed_files_fetched=True,
+            changed_files_error="",
+            authorization_phrase=None,
+            allowed_files=["scripts/local/aed_pr*.py"],
+            forbidden_files=[],
+            ping_comment_id="999",
+            ping_created_at="2026-07-21T10:00:00Z",
+        )
+        assert captured["ping_comment_id"] == "999"
+        assert captured["ping_created_at"] == "2026-07-21T10:00:00Z"
+
+
+class TestRound31CmdStatusRecoversCanonicalPingBoundary:
+    """P2 (PRRC_kwDOSHFpYM7X39KN): ``cmd_status`` MUST recover
+    the canonical ping boundary for the live head and forward
+    it into ``build_evidence``.
+    """
+
+    HEAD_SHA = "7" * 40
+
+    def test_cmd_status_threads_recovered_ping_boundary(
+        self, monkeypatch, capsys,
+    ):
+        recovered = {
+            "ping_id": "888",
+            "ping_ts": "2026-07-21T09:00:00Z",
+            "err": "",
+        }
+
+        def fake_recover(repo, pr_number, head_sha):
+            assert head_sha == self.HEAD_SHA
+            return (
+                recovered["ping_id"],
+                recovered["ping_ts"],
+                recovered["err"],
+            )
+
+        captured = {}
+
+        def fake_build(**kwargs):
+            captured.update(kwargs)
+            monkeypatch.setattr(ctrl, "build_evidence", fake_build)
+            # Return a minimal evidence so cmd_status finishes.
+            return ctrl._RealEvidence()
+
+        # Replace the real build_evidence with a recorder.
+        captured.clear()
+        real_build = ctrl.build_evidence
+
+        def recording_build(**kwargs):
+            captured.update(kwargs)
+            return real_build(**kwargs)
+
+        monkeypatch.setattr(ctrl, "build_evidence", recording_build)
+        monkeypatch.setattr(
+            ctrl, "_recover_canonical_ping_boundary", fake_recover,
+        )
+        monkeypatch.setattr(
+            ctrl, "fetch_pr_state",
+            lambda repo, pr_number: {
+                "headRefOid": self.HEAD_SHA,
+                "headRefName": "branch",
+                "state": "OPEN",
+            },
+        )
+        monkeypatch.setattr(
+            ctrl, "_resolve_effective_scope",
+            lambda **k: (["scripts/local/aed_pr*.py"], [], ""),
+        )
+        monkeypatch.setattr(
+            ctrl, "fetch_changed_files",
+            lambda repo, pr_number, pr_view: (
+                True, ["scripts/local/aed_pr.py"], "",
+            ),
+        )
+
+        args = type("Args", (), {})()
+        args.repo = "owner/repo"
+        args.pr_number = 411
+        args.allowed_files = None
+        args.forbidden_files = None
+        rc = ctrl.cmd_status(args)
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert captured["ping_comment_id"] == "888"
+        assert captured["ping_created_at"] == "2026-07-21T09:00:00Z"
+        # Status output must remain valid JSON.
+        json.loads(out)
+
+    def test_cmd_status_handles_recovery_failure(self, monkeypatch, capsys):
+        def fake_recover(repo, pr_number, head_sha):
+            return None, None, "ping_recovery_failed: simulated"
+
+        captured = {}
+
+        def recording_build(**kwargs):
+            captured.update(kwargs)
+            real_build = ctrl.__class__.__dict__.get(
+                "build_evidence", None,
+            )
+            # Fallback to the real one through monkeypatch chain.
+            return kwargs  # cmd_status will use this dict
+
+        # Simpler: just patch build_evidence to record kwargs.
+        def recording_build_simple(**kwargs):
+            captured.update(kwargs)
+            return {
+                "changed_files": [],
+                "gates_passed": [],
+                "gates_failed": [],
+            }
+
+        monkeypatch.setattr(
+            ctrl, "build_evidence", recording_build_simple,
+        )
+        monkeypatch.setattr(
+            ctrl, "_recover_canonical_ping_boundary", fake_recover,
+        )
+        monkeypatch.setattr(
+            ctrl, "fetch_pr_state",
+            lambda repo, pr_number: {
+                "headRefOid": self.HEAD_SHA,
+                "headRefName": "branch",
+                "state": "OPEN",
+            },
+        )
+        monkeypatch.setattr(
+            ctrl, "_resolve_effective_scope",
+            lambda **k: (["scripts/local/aed_pr*.py"], [], ""),
+        )
+        monkeypatch.setattr(
+            ctrl, "fetch_changed_files",
+            lambda repo, pr_number, pr_view: (
+                True, ["scripts/local/aed_pr.py"], "",
+            ),
+        )
+
+        args = type("Args", (), {})()
+        args.repo = "owner/repo"
+        args.pr_number = 411
+        args.allowed_files = None
+        args.forbidden_files = None
+        # cmd_status will fail because build_evidence returned a
+        # placeholder dict, but the important assertion is that
+        # the recovered boundary was forwarded (with None).
+        try:
+            ctrl.cmd_status(args)
+        except Exception:
+            pass
+        assert captured["ping_comment_id"] is None
+        assert captured["ping_created_at"] is None

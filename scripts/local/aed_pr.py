@@ -980,16 +980,113 @@ def fetch_ci_conclusions(
 # Codex / review-thread / comments inventory (delegated to CODEX module)
 # -----------------------------------------------------------------------------
 
+
+def _recover_canonical_ping_boundary(
+    repo: str, pr_number: int, head_sha: str,
+) -> Tuple[Optional[str], Optional[str], str]:
+    """Recover the canonical ``@codex review`` ping boundary for
+    ``head_sha`` from the PR issue-comment inventory.
+
+    Round-31 hardening (P2 ``PRRC_kwDOSHFpYM7X39KN``): the
+    canonical controller flow needs the exact-head ping
+    boundary (comment id and ``created_at``) so the Codex
+    classifier can accept post-ping clean-pass issue comments
+    when the operator calls ``status``/``merge`` after the
+    ping has already been posted. ``_post_codex_ping_comment``
+    captures the boundary on the same run, but for any
+    subsequent run the boundary must be recovered from the
+    canonical ping on the live PR.
+
+    Returns ``(ping_comment_id, ping_created_at, err)``. When
+    ``err`` is non-empty, both ``ping_comment_id`` and
+    ``ping_created_at`` are ``None``. The recovery is bounded
+    to comments that contain BOTH ``@codex review`` AND the
+    exact 40-character head SHA. If multiple canonical pings
+    exist, the most recent one wins.
+    """
+    if not R.is_canonical_head_sha(head_sha):
+        return None, None, (
+            "ping_recovery_skipped: non_canonical_head_sha"
+        )
+    ok, payload, err = _run_json_or_none([
+        "gh", "api",
+        f"repos/{repo}/issues/{pr_number}/comments",
+        "--paginate", "--slurp",
+    ])
+    if not ok or not isinstance(payload, list):
+        return None, None, (
+            f"ping_recovery_failed: {err or 'comment_inventory_unavailable'}"
+        )
+    comments: List[Dict[str, Any]] = []
+    for page in payload:
+        if isinstance(page, list):
+            comments.extend(page)
+        elif isinstance(page, dict) and isinstance(page.get("items"), list):
+            comments.extend(page["items"])
+    canonical_pings: List[Dict[str, Any]] = []
+    for c in comments:
+        if not isinstance(c, dict):
+            continue
+        body = c.get("body")
+        if not isinstance(body, str):
+            continue
+        if "@codex review" not in body:
+            continue
+        if head_sha not in body:
+            continue
+        created_at = c.get("created_at")
+        if not isinstance(created_at, str):
+            continue
+        canonical_pings.append({
+            "id": c.get("id"),
+            "created_at": created_at,
+        })
+    if not canonical_pings:
+        return None, None, "ping_recovery_failed: no_canonical_ping_on_head"
+    # Sort by created_at descending; most recent wins.
+    canonical_pings.sort(
+        key=lambda p: p.get("created_at") or "",
+        reverse=True,
+    )
+    winner = canonical_pings[0]
+    raw_id = winner.get("id")
+    return (
+        str(raw_id) if raw_id is not None else None,
+        winner.get("created_at"),
+        "",
+    )
+
+
 def fetch_codex_packet(
-    repo: str, pr_number: int, head_sha: str
+    repo: str, pr_number: int, head_sha: str,
+    *,
+    ping_comment_id: Optional[str] = None,
+    ping_created_at: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Call audit_codex_response_for_pr.classify on the live head."""
+    """Call audit_codex_response_for_pr.classify on the live head.
+
+    Round-31 hardening (P2 ``PRRC_kwDOSHFpYM7X39KN``): the
+    ``ping_comment_id``/``ping_created_at`` parameters are
+    forwarded to ``CODEX.classify`` so subsequent ``status``/
+    ``merge`` calls preserve the exact-head ping boundary.
+    The previous implementation hard-coded both fields to
+    ``None``, which caused the Codex classifier to reject
+    valid post-ping clean-pass issue comments (no ``commit_oid``
+    bound to the current head) unless a head-bound formal
+    clean review also existed on the same head.
+
+    The caller is expected to recover the boundary from
+    ``_post_codex_ping_comment`` (which already returns the
+    comment id and ``created_at``) or, for ``status``/``merge``
+    without a fresh ping, from the canonical ping recovery
+    helper.
+    """
     return CODEX.classify(
         repo=repo,
         pr_number=pr_number,
         expected_head_sha=head_sha,
-        ping_comment_id=None,
-        ping_created_at=None,
+        ping_comment_id=ping_comment_id,
+        ping_created_at=ping_created_at,
         max_polls=1,
         poll_seconds=1,
     )
@@ -2389,6 +2486,8 @@ def build_evidence(
     authorization_phrase: Optional[str],
     allowed_files: Optional[List[str]] = None,
     forbidden_files: Optional[List[str]] = None,
+    ping_comment_id: Optional[str] = None,
+    ping_created_at: Optional[str] = None,
 ) -> R.ReadinessEvidence:
     """Build a ReadinessEvidence bundle for the current PR view.
 
@@ -2397,6 +2496,14 @@ def build_evidence(
     mechanism). The controller does not embed any default controller-
     only scope patterns. (Round-2 Codex finding: do not hardcode a
     controller-only path allowlist.)
+
+    Round-31 hardening (P2 ``PRRC_kwDOSHFpYM7X39KN``): the
+    ``ping_comment_id``/``ping_created_at`` parameters carry the
+    canonical ping boundary through to ``fetch_codex_packet`` so the
+    Codex classifier can preserve the exact-head review-request
+    timestamp across calls. ``cmd_advance`` captures these from
+    ``_post_codex_ping_comment``; ``cmd_status``/``cmd_merge``
+    recover them from the canonical ping on disk.
     """
     head_sha = pr_view.get("headRefOid")
     head_branch = pr_view.get("headRefName")
@@ -2443,7 +2550,11 @@ def build_evidence(
     )
 
     # ---- Codex / reviews / threads ------------------------------------------
-    codex_packet = fetch_codex_packet(repo, pr_number, head_sha or "")
+    codex_packet = fetch_codex_packet(
+        repo, pr_number, head_sha or "",
+        ping_comment_id=ping_comment_id,
+        ping_created_at=ping_created_at,
+    )
     codex_verdict = str(codex_packet.get("status") or "")
     codex_clean = R.is_codex_clean_verdict(codex_verdict)
     codex_reviewed_sha = codex_packet.get("observed_head_sha")
@@ -2742,6 +2853,14 @@ def cmd_status(args: argparse.Namespace) -> int:
 
     ok_changed, changed_files, changed_err = fetch_changed_files(repo, pr_number, pr_view)
 
+    # Round-31 hardening: recover the canonical ping boundary
+    # for the live head so the Codex classifier can accept
+    # post-ping clean-pass issue comments. A failure to
+    # recover the boundary falls back to ``None``/``None`` so
+    # the previous Round-26 head-binding guard still applies.
+    ping_comment_id, ping_created_at, _ = _recover_canonical_ping_boundary(
+        repo, pr_number, str(head_sha) if head_sha else "",
+    )
     evidence = build_evidence(
         repo=repo,
         pr_number=pr_number,
@@ -2752,6 +2871,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         authorization_phrase=None,
         allowed_files=allowed_files,
         forbidden_files=forbidden_files,
+        ping_comment_id=ping_comment_id,
+        ping_created_at=ping_created_at,
     )
     verdict = R.evaluate_machine_readiness(evidence)
     state = derive_lifecycle_state(verdict, pr_view)
@@ -2856,7 +2977,7 @@ def _post_codex_ping_comment(
     repo: str, pr_number: int, head_sha: str,
     *,
     runner: Optional[Any] = None,
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, Optional[str], Optional[str]]:
     """Post a Codex-review ping on the current head SHA.
 
     ``runner`` is an injectable subprocess.run replacement for
@@ -2885,8 +3006,9 @@ def _post_codex_ping_comment(
     trigger, and a comment for a different head does NOT
     suppress the current one.
 
-    The function returns ``(ok, info_string)``; ``info_string``
-    is one of:
+    The function returns
+    ``(ok, info_string, ping_id, ping_created_at)``;
+    ``info_string`` is one of:
 
     - a comment database id (``"1234567890"``) when posted;
     - ``"duplicate_exact_head_request_prevented"`` when an exact
@@ -2895,7 +3017,23 @@ def _post_codex_ping_comment(
       be fetched;
     - ``"post_failed: <reason>"`` when the POST failed.
 
-    The caller must report this ``info_string`` verbatim so the
+    ``ping_id`` and ``ping_created_at`` carry the exact-head
+    ping boundary that downstream ``status``/``merge`` calls
+    must thread into ``build_evidence`` so the Codex
+    classifier can recover the ping timestamp without losing
+    the most recent canonical ``@codex review`` comment.
+    Round-31 hardening (P2
+    ``PRRC_kwDOSHFpYM7X39KN``): the previous return shape
+    ``(ok, info_string)`` discarded the ping boundary, so
+    subsequent ``status``/``merge`` calls reached
+    ``fetch_codex_packet`` with both fields hard-coded to
+    ``None``. Without the boundary, the Round-26 head-binding
+    guard rejected valid post-ping clean-pass issue comments
+    unless a formal clean review also existed on the same
+    head, leaving the canonical flow stuck waiting for Codex
+    evidence after a clean issue-comment response.
+
+    The caller must report ``info_string`` verbatim so the
     action report distinguishes posted, deduplicated and failed
     states.
     """
@@ -2903,7 +3041,7 @@ def _post_codex_ping_comment(
     # malformed input so the action report cannot claim
     # ``requested`` for an invalid SHA.
     if not R.is_canonical_head_sha(head_sha):
-        return False, "post_failed: malformed_head_sha"
+        return False, "post_failed: malformed_head_sha", None, None
 
     # Compose the comment body. The actual Codex trigger MUST
     # appear on its own line so the classifier matches it
@@ -2933,7 +3071,7 @@ def _post_codex_ping_comment(
         "--paginate", "--slurp",
     ])
     if not ok or not isinstance(payload, list):
-        return False, "comment_inventory_failed: " + (err or "")
+        return False, "comment_inventory_failed: " + (err or ""), None, None
     comments: List[Dict[str, Any]] = []
     for page in payload:
         if isinstance(page, list):
@@ -2952,7 +3090,19 @@ def _post_codex_ping_comment(
             continue
         if head_sha not in existing_body:
             continue
-        return True, "duplicate_exact_head_request_prevented"
+        # Existing ping on the same head; recover its id and
+        # created_at so downstream ``status``/``merge`` calls
+        # can use it as the ping boundary without losing the
+        # most recent canonical trigger. Round-31 hardening.
+        existing_id = c.get("id")
+        existing_created_at = c.get("created_at")
+        return (
+            True,
+            "duplicate_exact_head_request_prevented",
+            str(existing_id) if existing_id is not None else None,
+            str(existing_created_at)
+            if isinstance(existing_created_at, str) else None,
+        )
 
     # 3. Post the trigger comment.
     ok, payload, err = _run([
@@ -2961,9 +3111,15 @@ def _post_codex_ping_comment(
         "-f", f"body={body}",
     ])
     if not ok or not isinstance(payload, dict):
-        return False, "post_failed: " + (err or "")
+        return False, "post_failed: " + (err or ""), None, None
     new_id = str(payload.get("id") or "")
-    return True, new_id or "posted"
+    new_created_at = payload.get("created_at")
+    return (
+        True,
+        new_id or "posted",
+        new_id if new_id else None,
+        str(new_created_at) if isinstance(new_created_at, str) else None,
+    )
 
 
 def _mark_pr_ready_for_review(repo: str, pr_number: int) -> Tuple[bool, str]:
@@ -3391,6 +3547,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
     )
     ok_changed, changed_files, changed_err = fetch_changed_files(repo, pr_number, pr_view)
 
+    # Round-31 hardening: recover the canonical ping boundary
+    # for the live head. The fresh ping posted later in this
+    # function will replace these values when it succeeds;
+    # the recovered boundary here is the safety net for the
+    # pre-ping ``build_evidence`` call below.
+    ping_comment_id, ping_created_at, _ = _recover_canonical_ping_boundary(
+        repo, pr_number, str(head_sha) if head_sha else "",
+    )
+
     evidence = build_evidence(
         repo=repo,
         pr_number=pr_number,
@@ -3401,6 +3566,8 @@ def cmd_advance(args: argparse.Namespace) -> int:
         authorization_phrase=None,
         allowed_files=allowed_files,
         forbidden_files=forbidden_files,
+        ping_comment_id=ping_comment_id,
+        ping_created_at=ping_created_at,
     )
     machine_verdict = R.evaluate_machine_readiness(evidence)
     state = derive_lifecycle_state(machine_verdict, pr_view)
@@ -3623,8 +3790,10 @@ def cmd_advance(args: argparse.Namespace) -> int:
     # True on the back of an in-flight review.
     fresh_codex_ping_posted = False
     if would_post_codex_ping and not args.dry_run:
-        ok_ping, ping_result = _post_codex_ping_comment(
-            repo, pr_number, str(head_sha) if head_sha else ""
+        ok_ping, ping_result, new_ping_id, new_ping_created_at = (
+            _post_codex_ping_comment(
+                repo, pr_number, str(head_sha) if head_sha else ""
+            )
         )
         # The new ping contract reports specific reason codes so
         # the action report can distinguish posted, deduplicated
@@ -3663,6 +3832,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # trigger was posted in THIS run. The existing
             # evidence is therefore stale for authorization.
             fresh_codex_ping_posted = True
+        # Round-31 hardening: thread the canonical ping
+        # boundary (comment id + created_at) into the
+        # post-resolution refresh below. When the ping is a
+        # fresh post, ``new_ping_id``/``new_ping_created_at``
+        # are non-None; when it was a duplicate, the helper
+        # already recovered them from the existing comment.
+        if ok_ping and new_ping_id is not None:
+            ping_comment_id = new_ping_id
+        if ok_ping and new_ping_created_at is not None:
+            ping_created_at = new_ping_created_at
     elif would_post_codex_ping and args.dry_run:
         actions_taken.append({
             "action": "codex_review_ping",
@@ -3842,6 +4021,15 @@ def cmd_advance(args: argparse.Namespace) -> int:
                         authorization_phrase=None,
                         allowed_files=allowed_files,
                         forbidden_files=forbidden_files,
+                        # Round-31 hardening: forward the
+                        # ping boundary that ``cmd_advance``
+                        # just posted (or recovered) so the
+                        # post-resolution classifier does not
+                        # revert to the pre-ping
+                        # ``ping_comment_id=None`` /
+                        # ``ping_created_at=None`` shape.
+                        ping_comment_id=ping_comment_id,
+                        ping_created_at=ping_created_at,
                     )
                     refreshed_machine_verdict = (
                         R.evaluate_machine_readiness(refreshed_evidence)
@@ -4085,6 +4273,14 @@ def cmd_merge(args: argparse.Namespace) -> int:
         return 1
 
     ok_changed, changed_files, changed_err = fetch_changed_files(repo, pr_number, pr_view)
+    # Round-31 hardening: recover the canonical ping boundary
+    # for the live head so the Codex classifier can accept
+    # post-ping clean-pass issue comments on the merge path.
+    merge_ping_comment_id, merge_ping_created_at, _ = (
+        _recover_canonical_ping_boundary(
+            repo, pr_number, str(head_sha) if head_sha else "",
+        )
+    )
     evidence = build_evidence(
         repo=repo,
         pr_number=pr_number,
@@ -4095,6 +4291,8 @@ def cmd_merge(args: argparse.Namespace) -> int:
         authorization_phrase=phrase,
         allowed_files=allowed_files,
         forbidden_files=forbidden_files,
+        ping_comment_id=merge_ping_comment_id,
+        ping_created_at=merge_ping_created_at,
     )
     verdict = R.evaluate_readiness(evidence)
 
