@@ -6358,3 +6358,114 @@ class TestRound33MarkPrReadyGatedOnFreshPing:
         for a in ready_actions:
             assert a.get("ok") is False
             assert a.get("result") == "skipped:prerequisites_not_clean"
+
+
+class TestRound38TerminalCodexFailureIsBlocked:
+    """P2 #1 (PRRC_kwDOSHFpYM7XPZN4 / db_id 3625026613):
+    ``derive_lifecycle_state`` returns ``BLOCKED`` (not
+    ``WAITING``) when the Codex classifier emits a TERMINAL
+    non-clean verdict (``REASON_CODEX_FAILED``).
+
+    The bug: ``REASON_CODEX_FAILED`` was previously included in
+    the ``waiting_codes`` set, alongside the transient
+    "evidence not yet arrived" codes
+    (``REASON_CODEX_MISSING`` / ``STALE`` / ``CLEAN_MISSING``).
+    When the Codex classifier returned a terminal
+    ``HOLD_NEW_CODEX_THREAD`` (or any other terminal non-clean
+    verdict) on a current issue-comment finding without an
+    unresolved review thread, ``derive_lifecycle_state`` routed
+    the lifecycle to ``WAITING`` and the operator saw "Wait for
+    CI / Codex to converge" instead of "Resolve the
+    deterministic block". The lifecycle could stall on
+    already-arrived blocking feedback.
+
+    The fix removes ``REASON_CODEX_FAILED`` from
+    ``waiting_codes`` so a terminal Codex failure is treated as
+    a deterministic block. The transient codes that remain
+    (``REASON_CODEX_MISSING`` / ``STALE`` / ``CLEAN_MISSING``)
+    correctly capture "evidence not yet arrived" cases.
+    """
+
+    PR_VIEW_OPEN = {
+        "state": "OPEN",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+    }
+
+    def test_codex_failed_only_is_blocked(self):
+        """A verdict whose only failure is ``CODEX_EVIDENCE_FAILED``
+        (a terminal Codex verdict) MUST map to ``BLOCKED``,
+        not ``WAITING``. Codex has already converged with
+        blocking feedback; the operator must be told to address
+        the Codex finding.
+        """
+        v = _r23_verdict(codes=["CODEX_EVIDENCE_FAILED"])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == "BLOCKED"
+
+    def test_codex_failed_plus_pr_draft_is_action_required(self):
+        """``CODEX_EVIDENCE_FAILED`` coexists with ``PR_IS_DRAFT``:
+        the deterministic / human-code reason still wins, so the
+        state is ``ACTION_REQUIRED`` (not ``WAITING`` and not
+        ``BLOCKED``).
+        """
+        v = _r23_verdict(codes=[
+            "CODEX_EVIDENCE_FAILED",
+            "PR_IS_DRAFT",
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert (
+            ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN)
+            == "ACTION_REQUIRED"
+        )
+
+    def test_codex_failed_plus_unresolved_thread_is_action_required(self):
+        """``CODEX_EVIDENCE_FAILED`` coexists with
+        ``UNRESOLVED_REVIEW_THREAD``: the human-code reason wins,
+        so the state is ``ACTION_REQUIRED``.
+        """
+        v = _r23_verdict(codes=[
+            "CODEX_EVIDENCE_FAILED",
+            "UNRESOLVED_REVIEW_THREAD",
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert (
+            ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN)
+            == "ACTION_REQUIRED"
+        )
+
+    def test_transient_codex_codes_still_waiting(self):
+        """Round-38 guard: the remaining transient Codex codes
+        (``CODEX_EVIDENCE_MISSING``, ``CODEX_EVIDENCE_STALE``,
+        ``CODEX_CLEAN_VERDICT_MISSING``) MUST still map to
+        ``WAITING`` when they are the only failure. The fix
+        surgically removes ONLY ``CODEX_EVIDENCE_FAILED`` from
+        the waiting bucket; the other transient codes retain
+        their ``WAITING`` semantics.
+        """
+        for code in (
+            "CODEX_EVIDENCE_MISSING",
+            "CODEX_EVIDENCE_STALE",
+            "CODEX_CLEAN_VERDICT_MISSING",
+        ):
+            v = _r23_verdict(codes=[code])
+            from scripts.local import aed_pr as ctrl
+            assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == (
+                "WAITING"
+            ), f"{code} should still be WAITING"
+
+    def test_codex_failed_plus_ci_failed_is_blocked(self):
+        """``CODEX_EVIDENCE_FAILED`` coexists with
+        ``REQUIRED_CI_FAILED``: the deterministic CI failure
+        still routes to ``BLOCKED`` (the Codex failure is now
+        also deterministic, so the combined state is
+        ``BLOCKED``).
+        """
+        v = _r23_verdict(codes=[
+            "CODEX_EVIDENCE_FAILED",
+            "REQUIRED_CI_FAILED",
+        ])
+        from scripts.local import aed_pr as ctrl
+        assert ctrl.derive_lifecycle_state(v, self.PR_VIEW_OPEN) == (
+            "BLOCKED"
+        )

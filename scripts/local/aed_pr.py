@@ -2757,11 +2757,24 @@ def derive_lifecycle_state(verdict: R.ReadinessVerdict, pr_view: Dict[str, Any])
         # Deterministic policy reasons (scope, forbidden file,
         # PR-not-open, scope-unknown, ...) keep the state at
         # ``BLOCKED`` even when transient codes also appear.
+        #
+        # Round-38 fix: ``REASON_CODEX_FAILED`` is NOT a transient
+        # waiting code. It is emitted when the Codex classifier
+        # returns a TERMINAL non-clean verdict (e.g.
+        # ``HOLD_NEW_CODEX_THREAD`` from a current issue-comment
+        # finding without an unresolved review thread). Treating a
+        # terminal Codex failure as ``WAITING`` would direct the
+        # operator to "Wait for CI / Codex to converge" while
+        # Codex has already converged with blocking feedback; the
+        # operator should instead be routed to address the
+        # deterministic Codex finding. The transient codes that
+        # remain (``REASON_CODEX_MISSING`` / ``STALE`` /
+        # ``CLEAN_MISSING``) correctly capture "evidence not yet
+        # arrived" states.
         waiting_codes = frozenset({
             R.REASON_CI_PENDING,
             R.REASON_CODEX_MISSING,
             R.REASON_CODEX_STALE,
-            R.REASON_CODEX_FAILED,
             R.REASON_CODEX_CLEAN_MISSING,
             R.REASON_REVIEWS_INCOMPLETE,
             R.REASON_THREAD_INVENTORY_FAILED,
