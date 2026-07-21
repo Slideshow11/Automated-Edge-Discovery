@@ -6669,3 +6669,76 @@ class TestRound39PendingCodexPollIsWaiting:
         packet["latest_codex_response_id"] = ""  # missing id
         ev = self._evidence(packet, monkeypatch)
         assert ev.codex_artifact_present is False
+
+
+class TestRound40FetchPrStateIncludesMergeAuditFields:
+    """P3 #1 (PRRC_kwDOSHFpYM7XQVFQ / db_id 3625355722):
+    ``fetch_pr_state`` MUST include ``mergedAt`` and
+    ``mergeCommit`` in its ``gh pr view --json`` request so
+    that ``cmd_advance``'s post-merge closeout report can
+    populate the ``merged_at`` / ``merge_commit_sha`` audit
+    fields. Without these fields in the request, ``gh`` omits
+    them from the JSON response and the live closeout
+    report loses the merge audit data even when those
+    values are available on the PR. The unit tests passed
+    because their stubbed ``fetch_pr_state`` populates those
+    fields directly; the live CLI invocation needs to
+    request them.
+    """
+
+    def _fetch_pr_state_argv(self):
+        """Run ``fetch_pr_state`` with a stubbed ``runner`` so
+        we can inspect the argv the controller would send to
+        ``gh pr view``.
+        """
+        import scripts.local.aed_pr as ctrl
+        captured = {"argv": None}
+
+        def fake_runner(cmd, **kwargs):
+            captured["argv"] = cmd
+            # Return a minimal successful gh response with
+            # state=OPEN so fetch_pr_state does not fall into
+            # the closeout path; we are only inspecting the
+            # field list.
+            class _P:
+                returncode = 0
+                stdout = (
+                    b'{"number":411,"state":"OPEN","isDraft":false,'
+                    b'"mergedAt":null,"mergeCommit":null}'
+                )
+                stderr = b""
+            return _P()
+
+        return ctrl.fetch_pr_state(
+            "Slideshow11/Automated-Edge-Discovery", 411,
+            runner=fake_runner,
+        ), captured
+
+    def test_merged_at_field_in_gh_request(self):
+        """The ``gh pr view --json`` request MUST include
+        ``mergedAt`` so the live response carries the
+        timestamp.
+        """
+        _, captured = self._fetch_pr_state_argv()
+        argv = captured["argv"]
+        # Locate the field list: argv elements after ``--json``
+        idx = argv.index("--json")
+        field_list = argv[idx + 1]
+        assert "mergedAt" in field_list, (
+            "gh pr view --json field list must request "
+            f"mergedAt; got {field_list!r}"
+        )
+
+    def test_merge_commit_field_in_gh_request(self):
+        """The ``gh pr view --json`` request MUST include
+        ``mergeCommit`` so the live response carries the
+        merge commit SHA.
+        """
+        _, captured = self._fetch_pr_state_argv()
+        argv = captured["argv"]
+        idx = argv.index("--json")
+        field_list = argv[idx + 1]
+        assert "mergeCommit" in field_list, (
+            "gh pr view --json field list must request "
+            f"mergeCommit; got {field_list!r}"
+        )

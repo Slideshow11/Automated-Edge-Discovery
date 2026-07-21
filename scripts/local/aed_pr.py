@@ -157,7 +157,18 @@ def fetch_pr_state(
         "--json",
         "number,title,state,isDraft,mergeable,headRefOid,headRefName,"
         "baseRefOid,baseRefName,additions,deletions,changedFiles,url,"
-        "files,headRepository",
+        "files,headRepository,"
+        # Round-40 fix: ``cmd_advance`` reads ``mergedAt`` and
+        # ``mergeCommit`` to populate the post-merge closeout
+        # audit report (``merged_at`` / ``merge_commit_sha``
+        # fields in ``actions_taken``). Without these fields in
+        # the ``--json`` request, ``gh pr view`` returns them as
+        # absent (null) and the closeout report loses the merge
+        # audit data even though the values are available on the
+        # PR. The unit tests passed because their stubbed
+        # ``fetch_pr_state`` populates those fields directly;
+        # the live CLI invocation needs to request them.
+        "mergedAt,mergeCommit",
     ], runner=runner)
 
 
