@@ -8402,3 +8402,133 @@ def test_task_summary_does_not_override_substantive_latest(
         f"(id=9511), not the task-summary (id=9510); "
         f"got {pkt['latest_codex_response_id']!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-44 regression: the audit module's repo-root
+# computation MUST walk two levels up from ``__file__``,
+# not one. ``__file__`` is
+# ``<repo>/scripts/local/audit_codex_response_for_pr.py``,
+# so a single ``dirname`` produces ``<repo>/scripts``
+# (NOT the repository root). Without this fix, the
+# absolute ``from scripts.local.check_pr_review_comments
+# import ...`` import still fails in script-local mode
+# unless something else has already added the repository
+# root to ``sys.path``.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_module_repo_root_is_two_levels_above_script_dir():
+    """Static source check: ``_REPO_ROOT_HERE`` MUST be the
+    parent of the ``scripts/`` directory, NOT the parent
+    of ``__file__`` (which would be ``<repo>/scripts``).
+    """
+    import inspect as _inspect
+    import scripts.local.audit_codex_response_for_pr as _mod
+    src = _inspect.getsource(_mod)
+    # The Round-44 fix MUST walk up two levels (or
+    # equivalent) to land on the repository root. The
+    # canonical layout has ``scripts/`` at the repo root,
+    # so the path computed must equal the parent of
+    # ``scripts/``.
+    # Walk the source for evidence of two-parent resolution.
+    has_two_parent_walk = (
+        "_os.path.dirname(_os.path.dirname(_SCRIPT_DIR_HERE))" in src
+        or "_scripts_dir" in src and "_os.path.basename" in src
+    )
+    assert has_two_parent_walk, (
+        "audit must walk two levels up from __file__ to "
+        "find the repository root; the single-parent walk "
+        "in Round-42 produces <repo>/scripts instead of "
+        "<repo>. Found neither the two-parent walk nor "
+        "the scripts-directory search in source."
+    )
+    # The script directory walk-up logic MUST be present.
+    assert "_SCRIPT_DIR_HERE" in src, (
+        "audit must compute _SCRIPT_DIR_HERE from __file__"
+    )
+    assert "_REPO_ROOT_HERE" in src, (
+        "audit must compute _REPO_ROOT_HERE explicitly"
+    )
+
+
+def test_audit_subprocess_uses_absolute_package_path():
+    """End-to-end subprocess check: in script-local mode
+    with only ``scripts/local`` on ``PYTHONPATH`` and the
+    repository root NOT in scope, the imported predicate
+    must come from the absolute package path
+    ``scripts.local.check_pr_review_comments`` (proving
+    the repo root was added to sys.path). The fallback
+    top-level import ``check_pr_review_comments`` would
+    indicate the repo root was NOT added (Round-42 bug).
+
+    A fresh subprocess is required because pytest's
+    in-process import cache can mask the bug.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+    import os as _os
+    import inspect as _inspect
+
+    import scripts.local.audit_codex_response_for_pr as _audit_mod
+    audit_file = _inspect.getfile(_audit_mod)
+    scripts_local_dir = _os.path.dirname(audit_file)
+    repo_root = _os.path.dirname(_os.path.dirname(scripts_local_dir))
+    audit_basename = _os.path.basename(audit_file)
+
+    # Build the subprocess code as a list of lines joined
+    # by newlines. Using ``"\n".join(...)`` avoids
+    # shell-style escaping pitfalls.
+    code_lines = [
+        "import sys, importlib, os",
+        f"_audit_basename = {audit_basename!r}",
+        f"_scripts_local = {scripts_local_dir!r}",
+        f"_repo_root = {repo_root!r}",
+        "default = list(sys.path)",
+        "sys.path = [p for p in default if _repo_root not in p]",
+        "sys.path.insert(0, _scripts_local)",
+        "for name in list(sys.modules.keys()):",
+        "    if 'audit' in name or 'check_pr_review' in name:",
+        "        sys.modules.pop(name, None)",
+        "mod = importlib.import_module(_audit_basename[:-3])",
+        "pred = mod._co_is_codex_task_summary_issue_comment",
+        "print('PREDICATE:', pred)",
+        "if pred is not None:",
+        "    print('PREDICATE_MODULE:', pred.__module__)",
+        "else:",
+        "    print('PREDICATE_MODULE: None')",
+    ]
+    code = "\n".join(code_lines)
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONPATH": scripts_local_dir,
+    }
+    res = _subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=30, env=env,
+        cwd="/tmp",
+    )
+    output = res.stdout
+    # The predicate MUST be importable.
+    assert "PREDICATE: <function" in output or "PREDICATE:" in output, (
+        f"subprocess did not print predicate info; "
+        f"stdout={output!r} stderr={res.stderr[:500]!r}"
+    )
+    # The predicate MUST come from the absolute package
+    # path ``scripts.local.check_pr_review_comments`` —
+    # NOT the top-level ``check_pr_review_comments``
+    # fallback (which would indicate the Round-42 bug
+    # where the wrong directory was added to sys.path).
+    assert (
+        "PREDICATE_MODULE: scripts.local.check_pr_review_comments" in output
+    ), (
+        "predicate must be imported via the absolute "
+        "package path 'scripts.local.check_pr_review_comments'; "
+        "this proves the audit's repo-root computation "
+        "is correct (two levels above __file__). The "
+        "top-level fallback path indicates the Round-42 "
+        f"single-parent bug. Got: {output!r} stderr={res.stderr[:500]!r}"
+    )

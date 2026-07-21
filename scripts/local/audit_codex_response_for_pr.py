@@ -90,10 +90,44 @@ from typing import Any, Dict, List, Optional, Tuple
 #     task-summary filtering. The runtime check at the call
 #     site still gates on ``is not None`` so behavior is
 #     unchanged when the predicate truly is unavailable.
+# Round-44 fix: compute the repository root correctly.
+# Round-42 computed it with a single ``dirname`` of
+# ``__file__``, but ``__file__`` is
+# ``<repo>/scripts/local/audit_codex_response_for_pr.py``,
+# so ``_SCRIPT_DIR_HERE = <repo>/scripts/local`` and
+# ``_REPO_ROOT_HERE = dirname(_SCRIPT_DIR_HERE)`` =
+# ``<repo>/scripts``. That means the absolute import
+# ``from scripts.local.check_pr_review_comments import ...``
+# still fails in script-local mode unless something else
+# has already added the repository root to ``sys.path``.
+#
+# The repository root is TWO ``dirname`` calls up from
+# ``__file__`` (``scripts/local/<file>.py`` → parent is
+# ``scripts/local`` → parent is ``scripts`` → parent is
+# the repo root). Walk up to the directory whose basename
+# is ``scripts`` and use ITS parent. This is robust to
+# both the canonical layout (where ``scripts/`` lives at
+# the repo root) and any future nested-layout refactor.
 import os as _os
 import sys as _sys
 _SCRIPT_DIR_HERE = _os.path.dirname(_os.path.abspath(__file__))
-_REPO_ROOT_HERE = _os.path.dirname(_SCRIPT_DIR_HERE)
+# Walk up to find the parent of the ``scripts/`` directory.
+# The repo root sits one level above ``scripts/`` in the
+# canonical layout; walking up to the directory whose name
+# is ``scripts`` and then taking its parent is layout-agnostic.
+_scripts_dir = None
+_candidate = _SCRIPT_DIR_HERE
+while _candidate and _candidate != _os.path.dirname(_candidate):
+    if _os.path.basename(_candidate) == "scripts":
+        _scripts_dir = _candidate
+        break
+    _candidate = _os.path.dirname(_candidate)
+if _scripts_dir is not None:
+    _REPO_ROOT_HERE = _os.path.dirname(_scripts_dir)
+else:
+    # Fallback: the standard two-parent walk (covers
+    # ``<repo>/scripts/local/<file>.py`` layouts).
+    _REPO_ROOT_HERE = _os.path.dirname(_os.path.dirname(_SCRIPT_DIR_HERE))
 if _REPO_ROOT_HERE not in _sys.path:
     _sys.path.insert(0, _REPO_ROOT_HERE)
 if _SCRIPT_DIR_HERE not in _sys.path:
