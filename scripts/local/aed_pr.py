@@ -47,6 +47,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import time
 import sys
@@ -1111,6 +1112,87 @@ def _canonical_scope_root() -> _Path:
     return _CANONICAL_SCOPE_ROOT
 
 
+_REPO_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_repo_components(repo: object) -> Tuple[str, str]:
+    """Validate and split a GitHub ``owner/name`` repository value.
+
+    Returns ``(owner, name)`` after enforcing the strict path-safe
+    contract used by every trusted-scope path constructor. The
+    contract is:
+
+    * ``repo`` is a ``str``;
+    * ``repo`` contains exactly one forward slash;
+    * exactly two non-empty components;
+    * each component matches ``[A-Za-z0-9._-]+`` (ASCII only);
+    * neither component equals ``.`` or ``..``;
+    * no backslashes, NUL characters, or whitespace anywhere;
+    * no leading or trailing ``/``.
+
+    Every other shape is rejected with a ``ValueError`` BEFORE any
+    filesystem call. The helper never normalises malformed input
+    into a valid repository name.
+    """
+    if not isinstance(repo, str):
+        raise ValueError(
+            "repo must be a str in 'owner/name' form"
+        )
+    if "\\" in repo:
+        raise ValueError(
+            "repo must not contain backslashes"
+        )
+    if "\x00" in repo:
+        raise ValueError(
+            "repo must not contain NUL characters"
+        )
+    if any(c.isspace() for c in repo):
+        raise ValueError(
+            "repo must not contain whitespace"
+        )
+    if repo.startswith("/"):
+        raise ValueError(
+            "repo must not start with '/'"
+        )
+    if repo.endswith("/"):
+        raise ValueError(
+            "repo must not end with '/'"
+        )
+    if "/" not in repo:
+        raise ValueError(
+            "repo must be in 'owner/name' form"
+        )
+    parts = repo.split("/")
+    if len(parts) != 2:
+        raise ValueError(
+            "repo must contain exactly one '/' separator"
+        )
+    owner, name = parts
+    if not owner or not name:
+        raise ValueError(
+            "repo owner and name must be non-empty"
+        )
+    if owner == "." or owner == "..":
+        raise ValueError(
+            "repo owner may not be '.' or '..'"
+        )
+    if name == "." or name == "..":
+        raise ValueError(
+            "repo name may not be '.' or '..'"
+        )
+    if not _REPO_COMPONENT_RE.match(owner):
+        raise ValueError(
+            "repo owner may only contain ASCII letters, digits, "
+            "'.', '_', or '-'"
+        )
+    if not _REPO_COMPONENT_RE.match(name):
+        raise ValueError(
+            "repo name may only contain ASCII letters, digits, "
+            "'.', '_', or '-'"
+        )
+    return owner, name
+
+
 def _trusted_scope_path(
     repo: str,
     pr_number: int,
@@ -1124,15 +1206,18 @@ def _trusted_scope_path(
     is supplied (tests only), it is used instead of the canonical
     root. The production root is hard-coded; no environment variable,
     CLI flag, or working-directory fall-back is consulted.
+
+    The ``repo`` argument is validated through
+    :func:`_validate_repo_components` before any filesystem call, so
+    malformed repository values cannot escape ``scope_root`` via
+    parent-directory segments or absolute paths.
     """
-    if not isinstance(repo, str) or "/" not in repo:
-        raise ValueError("repo must be in 'owner/name' form")
+    owner, name = _validate_repo_components(repo)
     if not isinstance(pr_number, int) or pr_number <= 0:
         raise ValueError("pr_number must be a positive int")
     if not R.is_canonical_head_sha(head_sha):
         raise ValueError("head_sha must be exactly 40 lowercase hex chars")
     base = scope_root if scope_root is not None else _canonical_scope_root()
-    owner, name = repo.split("/", 1)
     return base / owner / name / str(pr_number) / f"{head_sha}.json"
 
 
@@ -1172,7 +1257,21 @@ def read_trusted_scope(
     if not isinstance(data, dict):
         return None, None, "trusted scope must be a JSON object"
     recorded_head = data.get("head_sha")
-    if recorded_head is not None and recorded_head != head_sha:
+    # Round-19 hardening: ``head_sha`` is REQUIRED on every trusted
+    # record. A missing, non-string, or malformed stored head
+    # MUST NOT be silently accepted. A missing or wrong head would
+    # let a copied/legacy file authorize a head it never attested
+    # to; the fail-closed binding is enforced strictly.
+    if not isinstance(recorded_head, str):
+        return None, None, (
+            "trusted scope head_sha missing or not a string"
+        )
+    if not R.is_canonical_head_sha(recorded_head):
+        return None, None, (
+            "trusted scope head_sha malformed: "
+            "must be exactly 40 lowercase hex characters"
+        )
+    if recorded_head != head_sha:
         return None, None, (
             f"trusted scope head_sha mismatch: recorded "
             f"{recorded_head!r} != live {head_sha!r}"
@@ -1214,8 +1313,10 @@ def write_trusted_scope(
     the canonical root. ``scope_root`` is the ONLY seam that lets
     tests redirect writes; there is no environment-variable override.
     """
-    if not isinstance(repo, str) or "/" not in repo:
-        return False, "repo must be in 'owner/name' form"
+    try:
+        owner, name = _validate_repo_components(repo)
+    except ValueError as exc:
+        return False, f"repo invalid: {exc}"
     if not isinstance(pr_number, int) or pr_number <= 0:
         return False, "pr_number must be a positive int"
     if not R.is_canonical_head_sha(head_sha):
@@ -1228,7 +1329,7 @@ def write_trusted_scope(
     )
     payload = {
         "pr_number": pr_number,
-        "repo": repo,
+        "repo": f"{owner}/{name}",
         "head_sha": head_sha,
         "allowed_files": allowed_clean,
         "forbidden_files": forbidden_clean,

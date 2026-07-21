@@ -2166,3 +2166,487 @@ class TestRound18PartitionConsistency:
         assert ev.unresolved_human_thread_ids == []
         assert ev.unresolved_bot_thread_ids == []
         assert ev.outdated_bot_thread_ids == []
+
+
+# ---------------------------------------------------------------------------
+# Round-19 regression tests.
+#
+# Exact-head Codex review 4739875938 (submitted 2026-07-20T23:55:32Z on
+# head 0b1f53a8) reported two P2 findings on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7Xq6o0 (db_id 3618351668, line 1136)
+#     "Reject path traversal in trusted scope repo names"
+#     A malformed ``repo`` with absolute or parent-directory segments
+#     could escape the canonical scope root.
+#
+#   PRRC_kwDOSHFpYM7Xq6o3 (db_id 3618351671, line 1175)
+#     "Require head_sha in trusted scope records"
+#     A stored scope record with a missing or non-canonical
+#     ``head_sha`` field must not authorize a head it never attested to.
+#
+# Tests below prove:
+#
+#   * every malformed repository value listed in the spec is rejected
+#     before any filesystem call;
+#   * no rejected write creates a file or directory outside the
+#     injected temporary scope root;
+#   * no rejected read touches a path outside the injected root;
+#   * canonical owner/name values still generate the expected path;
+#   * safe punctuation in canonical components remains supported;
+#   * read_trusted_scope and write_trusted_scope expose structured
+#     errors on rejection;
+#   * cmd_scope_read and cmd_scope_write fail nonzero on malformed
+#     repository values;
+#   * status, advance, and merge cannot obtain trusted scope from a
+#     malformed repository value (fail closed);
+#   * a missing head_sha is rejected;
+#   * every malformed stored head (non-string, non-40, non-hex,
+#     uppercase, mismatched canonical) is rejected;
+#   * allowed_files and forbidden_files remain unavailable on every
+#     rejected record;
+#   * a fresh scope-write is accepted by scope-read on the same exact
+#     head.
+# ---------------------------------------------------------------------------
+
+
+class TestRound19RepoPathValidation:
+    """``_validate_repo_components`` rejects every malformed shape
+    the spec enumerates and accepts the canonical safe shapes.
+    """
+
+    REJECTED = [
+        None,
+        "",
+        "owner",
+        "/name",
+        "owner/",
+        "owner/name/extra",
+        "owner//tmp/a",
+        "owner/../../tmp/a",
+        "owner/../name",
+        "../owner/name",
+        "./owner/name",
+        "owner/./name",
+        "owner/..",
+        "../repo",
+        "/tmp/a",
+        "owner\\name",
+        "owner/\x00name",
+        "owner/name\n",
+        " owner/name",
+        "owner/name ",
+    ]
+
+    ACCEPTED = [
+        "Slideshow11/Automated-Edge-Discovery",
+        "owner-1/repo.name_2",
+        "a/b",
+    ]
+
+    @pytest.mark.parametrize("bad", REJECTED)
+    def test_rejects_malformed(self, bad):
+        with pytest.raises(ValueError):
+            ctrl._validate_repo_components(bad)
+
+    @pytest.mark.parametrize("good", ACCEPTED)
+    def test_accepts_canonical(self, good):
+        owner, name = ctrl._validate_repo_components(good)
+        assert owner
+        assert name
+        assert f"{owner}/{name}" == good
+
+    def test_accepts_safe_punctuation(self):
+        owner, name = ctrl._validate_repo_components(
+            "Owner_1.repo-2/repo_name.with-dash"
+        )
+        assert owner == "Owner_1.repo-2"
+        assert name == "repo_name.with-dash"
+
+    def test_does_not_allow_traversal_components(self):
+        # A naive regex would let "." through; the helper must
+        # reject it explicitly.
+        with pytest.raises(ValueError):
+            ctrl._validate_repo_components("./b")
+        with pytest.raises(ValueError):
+            ctrl._validate_repo_components("a/.")
+        with pytest.raises(ValueError):
+            ctrl._validate_repo_components("../b")
+        with pytest.raises(ValueError):
+            ctrl._validate_repo_components("a/..")
+
+
+class TestRound19TrustedScopePath:
+    """The path constructor must reject malformed repository values
+    BEFORE joining any component into the filesystem path, and the
+    canonical input must yield the expected path.
+    """
+
+    HEAD = "0" * 40
+    OTHER_HEAD = "1" * 40
+
+    @pytest.mark.parametrize("bad", TestRound19RepoPathValidation.REJECTED)
+    def test_path_construction_rejects_malformed(self, tmp_path, bad):
+        with pytest.raises(ValueError):
+            ctrl._trusted_scope_path(
+                bad, 411, self.HEAD, scope_root=tmp_path,
+            )
+
+    def test_path_uses_validated_components(self, tmp_path):
+        path = ctrl._trusted_scope_path(
+            "Slideshow11/Automated-Edge-Discovery",
+            411, self.HEAD, scope_root=tmp_path,
+        )
+        assert path == (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.HEAD}.json"
+        )
+
+    def test_path_canonical_does_not_escape_root(self, tmp_path):
+        # Place a sentinel file outside tmp_path; no canonical
+        # resolution may touch it.
+        import tempfile
+        with tempfile.TemporaryDirectory() as outside_root:
+            outside = (
+                __import__("pathlib").Path(outside_root)
+                / "sentinel.txt"
+            )
+            outside.write_text("untouched", encoding="utf-8")
+            # Canonical path remains under the injected root.
+            path = ctrl._trusted_scope_path(
+                "Slideshow11/Automated-Edge-Discovery",
+                411, self.HEAD, scope_root=tmp_path,
+            )
+            assert tmp_path.resolve() in path.resolve().parents
+
+    def test_path_no_filesystem_call_on_malformed(self, tmp_path):
+        # A malformed repo with absolute path must NOT call .resolve()
+        # or open any file outside the injected root. We assert that
+        # _trusted_scope_path raises ValueError before any IO.
+        import pathlib as _pl
+        raised = False
+        try:
+            ctrl._trusted_scope_path(
+                "/tmp/a", 411, self.HEAD, scope_root=tmp_path,
+            )
+        except ValueError:
+            raised = True
+        assert raised
+        # Confirm no write happened at the injected root.
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestRound19WriteTrustedScopeRejection:
+    """``write_trusted_scope`` must refuse every malformed repo
+    value and never create a file or directory outside the injected
+    scope root.
+    """
+
+    HEAD = "0" * 40
+
+    @pytest.mark.parametrize("bad", TestRound19RepoPathValidation.REJECTED)
+    def test_write_rejects_malformed_repo(self, tmp_path, bad):
+        ok, err = ctrl.write_trusted_scope(
+            bad, 411, self.HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+            scope_root=tmp_path,
+        )
+        assert ok is False
+        assert err
+        assert "repo" in err.lower() or "/" in err or "owner" in err.lower() or "name" in err.lower()
+        # No file or directory may have been created under the root.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_write_accepts_canonical_repo(self, tmp_path):
+        ok, result = ctrl.write_trusted_scope(
+            REPO, 411, self.HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+            scope_root=tmp_path,
+        )
+        assert ok is True
+        assert result.endswith(f"{self.HEAD}.json")
+        # The file is at the expected path.
+        expected = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.HEAD}.json"
+        )
+        assert expected.exists()
+
+
+class TestRound19ReadTrustedScopeHead:
+    """``read_trusted_scope`` enforces strict ``head_sha`` binding.
+
+    Rejects:
+    * missing ``head_sha``;
+    * null / boolean / int / list / dict / empty-string ``head_sha``;
+    * 39 / 41 / uppercase / non-hex / whitespace-padded ``head_sha``;
+    * a valid canonical ``head_sha`` that differs from the requested
+      live SHA.
+
+    The previous implementation silently passed ``data.get("head_sha")``
+    returning ``None`` and skipped the mismatch check.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"  # 40 lowercase hex
+    OTHER_HEAD = "fedcba9876543210" * 2 + "fedcba98"  # 40 lowercase hex
+
+    def _write_raw(self, tmp_path, body):
+        import json
+        path = (
+            tmp_path / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(body), encoding="utf-8")
+        return path
+
+    def test_canonical_record_accepted(self, tmp_path):
+        self._write_raw(tmp_path, {
+            "head_sha": self.LIVE_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+            "forbidden_files": [],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == []
+
+    def test_missing_head_sha_rejected(self, tmp_path):
+        self._write_raw(tmp_path, {
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert "head_sha" in err
+
+    @pytest.mark.parametrize("bad_value", [
+        None,
+        True,
+        False,
+        12345,
+        40,
+        [],
+        ["head_sha"],
+        {},
+        {"sha": "abc"},
+        "",
+        "0" * 39,                   # too short
+        "0" * 41,                   # too long
+        "0" * 40,                   # valid format but wrong value
+        ("A" + "0" * 39),           # uppercase
+        "g" * 40,                   # non-hex chars
+        "0" * 39 + " ",             # trailing whitespace
+        " 0" + "0" * 38 + "0",      # leading whitespace
+        "0\n" + "0" * 38 + "0",     # newline padded
+        "0" * 39 + "\x00",          # NUL padded
+    ])
+    def test_malformed_stored_head_rejected(self, tmp_path, bad_value):
+        self._write_raw(tmp_path, {
+            "head_sha": bad_value,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        # Error message must reference the stored head issue.
+        assert "head_sha" in err
+
+    def test_different_canonical_head_rejected(self, tmp_path):
+        self._write_raw(tmp_path, {
+            "head_sha": self.OTHER_HEAD,
+            "allowed_files": ["scripts/local/aed_pr*.py"],
+        })
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert "mismatch" in err
+        assert self.OTHER_HEAD in err
+        assert self.LIVE_HEAD in err
+
+    def test_malformed_repo_does_not_touch_filesystem(self, tmp_path):
+        # Write nothing; a malformed repo must NOT silently fall
+        # back to the canonical root.
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            "owner/../../tmp/a", 411, self.LIVE_HEAD,
+            scope_root=tmp_path,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        # No file or directory created under the injected root.
+        assert list(tmp_path.iterdir()) == []
+
+    def test_scope_write_then_scope_read_round_trip(self, tmp_path):
+        ok, _path = ctrl.write_trusted_scope(
+            REPO, 411, self.LIVE_HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+            scope_root=tmp_path,
+        )
+        assert ok is True
+        allowed, forbidden, err = ctrl.read_trusted_scope(
+            REPO, 411, self.LIVE_HEAD, scope_root=tmp_path,
+        )
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == []
+
+
+class TestRound19ScopeCLIFailClosed:
+    """``cmd_scope_write`` and ``cmd_scope_read`` must fail nonzero
+    on every malformed repository value.
+    """
+
+    HEAD = "0" * 40
+
+    @pytest.mark.parametrize(
+        "bad", TestRound19RepoPathValidation.REJECTED,
+    )
+    def test_cmd_scope_write_rejects_malformed_repo(self, bad, tmp_path, monkeypatch, capsys):
+        # Patch the canonical scope root to a tmp path so we can
+        # assert nothing leaks.
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", tmp_path)
+        args = type("A", (), {})()
+        args.repo = bad
+        args.pr_number = 411
+        args.head_sha = self.HEAD
+        args.allowed_files = "scripts/local/aed_pr*.py"
+        args.forbidden_files = ""
+        rc = ctrl.cmd_scope_write(args)
+        assert rc != 0
+        captured = capsys.readouterr()
+        assert "scope-write failed" in captured.err
+        assert list(tmp_path.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "bad", TestRound19RepoPathValidation.REJECTED,
+    )
+    def test_cmd_scope_read_rejects_malformed_repo(self, bad, tmp_path, monkeypatch, capsys):
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", tmp_path)
+        args = type("A", (), {})()
+        args.repo = bad
+        args.pr_number = 411
+        args.head_sha = self.HEAD
+        rc = ctrl.cmd_scope_read(args)
+        assert rc != 0
+        captured = capsys.readouterr()
+        assert "scope-read failed" in captured.err
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestRound19LifecycleFailClosed:
+    """``_resolve_effective_scope`` for status/advance/merge must
+    fail closed when the repository value is malformed OR when the
+    stored ``head_sha`` is missing/malformed.
+    """
+
+    LIVE_HEAD = "0123456789abcdef" * 2 + "01234567"
+
+    def _args(self, head_sha=None, allowed=None, forbidden=None):
+        args = type("A", (), {})()
+        args.repo = REPO
+        args.pr_number = 411
+        args.head_sha = head_sha
+        args.allowed_files = allowed
+        args.forbidden_files = forbidden
+        return args
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_malformed_repo_fails_closed(self, sub):
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo="owner/../../tmp/a",
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_missing_stored_head_fails_closed(self, sub, tmp_path, monkeypatch):
+        # Write a record without head_sha into the injected root.
+        import json
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        path = (
+            _P(tmp_path) / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({"allowed_files": ["scripts/local/aed_pr*.py"]}),
+            encoding="utf-8",
+        )
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo=REPO,
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
+        assert "head_sha" in err
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_canonical_record_accepted(self, sub, tmp_path, monkeypatch):
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        ok, _ = ctrl.write_trusted_scope(
+            REPO, 411, self.LIVE_HEAD,
+            ["scripts/local/aed_pr*.py"], [],
+        )
+        assert ok is True
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo=REPO,
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert err == ""
+        assert allowed == ["scripts/local/aed_pr*.py"]
+        assert forbidden == []
+
+    @pytest.mark.parametrize("sub", ["status", "advance", "merge"])
+    def test_uppercase_stored_head_fails_closed(self, sub, tmp_path, monkeypatch):
+        import json
+        from pathlib import Path as _P
+        monkeypatch.setattr(ctrl, "_CANONICAL_SCOPE_ROOT", _P(tmp_path))
+        path = (
+            _P(tmp_path) / "Slideshow11" / "Automated-Edge-Discovery"
+            / "411" / f"{self.LIVE_HEAD}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps({
+                "head_sha": self.LIVE_HEAD.upper(),
+                "allowed_files": ["scripts/local/aed_pr*.py"],
+            }),
+            encoding="utf-8",
+        )
+        allowed, forbidden, err = ctrl._resolve_effective_scope(
+            subcommand=sub,
+            repo=REPO,
+            pr_number=411,
+            head_sha=self.LIVE_HEAD,
+            cli_allowed=None,
+            cli_forbidden=None,
+        )
+        assert allowed is None
+        assert forbidden is None
+        assert err
