@@ -7991,51 +7991,66 @@ def test_predicate_imported_under_script_local_invocation():
     A fresh subprocess is required because the in-process
     import cache (``sys.modules``) is populated by pytest's
     own collection, which can mask the bug.
+
+    The test resolves the audit module's absolute path from
+    ``inspect.getfile`` so it works in any CI environment,
+    not just the local /home/max/aed_consolidation_v1 tree.
     """
     import subprocess as _subprocess
     import sys as _sys
+    import os as _os
+    import inspect as _inspect
+
+    # Discover the audit module's file path dynamically so
+    # the test works in both local and CI environments.
+    import scripts.local.audit_codex_response_for_pr as _audit_mod
+    audit_file = _inspect.getfile(_audit_mod)
+    scripts_local_dir = _os.path.dirname(audit_file)
+    repo_root = _os.path.dirname(scripts_local_dir)
+    audit_basename = _os.path.basename(audit_file)
 
     code = (
-        "import sys, importlib\n"
+        "import sys, importlib, os\n"
+        f"_audit_basename = {audit_basename!r}\n"
+        f"_scripts_local = {scripts_local_dir!r}\n"
         "default = list(sys.path)\n"
-        "sys.path = [p for p in default if 'aed_consolidation_v1' not in p]\n"
-        "sys.path.insert(0, '/home/max/aed_consolidation_v1/scripts/local')\n"
+        # Drop any path containing the repo root from sys.path
+        f"sys.path = [p for p in default if {repo_root!r} not in p]\n"
+        f"sys.path.insert(0, _scripts_local)\n"
         "for name in list(sys.modules.keys()):\n"
         "    if 'audit' in name or 'check_pr_review' in name:\n"
         "        sys.modules.pop(name, None)\n"
-        "mod = importlib.import_module('audit_codex_response_for_pr')\n"
-        "print('PREDICATE:', mod._co_is_codex_task_summary_issue_comment)\n"
-        "print('CALLABLE_TASK_SUMMARY:', mod._co_is_codex_task_summary_issue_comment("
-        "'chatgpt-codex-connector[bot]', 'issue_comment', "
-        "'### Summary\\n\\n* Did some work\\n\\n**Commit**\\n')"
-        " if mod._co_is_codex_task_summary_issue_comment else 'N/A')\n"
+        "mod = importlib.import_module(_audit_basename[:-3])  # strip .py\n"
+        "pred = mod._co_is_codex_task_summary_issue_comment\n"
+        "print('PREDICATE:', pred)\n"
+        "if pred is not None:\n"
+        "    print('CALLABLE_TASK_SUMMARY:', pred(\n"
+        "        'chatgpt-codex-connector[bot]', 'issue_comment',\n"
+        "        '### Summary\\n\\n* Did some work\\n\\n**Commit**\\n'\n"
+        "    ))\n"
+        "else:\n"
+        "    print('CALLABLE_TASK_SUMMARY: N/A')\n"
     )
-    res = _subprocess.run(
-        [_sys.executable, "-c", code],
-        capture_output=True, text=True,
-        timeout=30,
-        env={"PATH": _sys.executable and "/usr/bin:/bin"},
-    )
-    # Build a minimal env so we don't inherit
-    # ``PYTHONPATH`` that could put the repo root back on
-    # ``sys.path``.
     env = {
-        "PATH": "/usr/bin:/bin:/home/max/.local/bin",
-        "HOME": "/root",  # avoid /home/max access
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": "/root",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        # Explicitly clear PYTHONPATH to ensure clean state.
-        "PYTHONPATH": "/home/max/aed_consolidation_v1/scripts/local",
+        # Explicitly set PYTHONPATH to scripts/local so the
+        # subprocess only sees the script directory on the
+        # path (mirroring the documented live CLI path).
+        "PYTHONPATH": scripts_local_dir,
     }
     res = _subprocess.run(
         [_sys.executable, "-c", code],
         capture_output=True, text=True, timeout=30, env=env,
+        cwd="/tmp",
     )
     output = res.stdout
     # The predicate MUST be importable, not None.
-    assert "PREDICATE: <function" in output or "PREDICATE:" in output, (
-        f"subprocess did not print predicate info; stdout={output!r} "
-        f"stderr={res.stderr[:500]!r}"
+    assert "PREDICATE:" in output, (
+        f"subprocess did not print predicate info; "
+        f"stdout={output!r} stderr={res.stderr[:500]!r}"
     )
     assert "PREDICATE: None" not in output, (
         "shared _is_codex_task_summary_issue_comment "
