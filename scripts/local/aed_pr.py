@@ -4050,6 +4050,77 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 "ok": ok_ready,
                 "result": ready_result,
             })
+            # Round-45 fix: when ``gh pr ready`` succeeds,
+            # the local ``pr_view`` / ``evidence`` /
+            # ``machine_verdict`` snapshot still reflects the
+            # pre-mutation state (the PR was draft). If we
+            # report on those stale objects, the final report
+            # emits ``PR_IS_DRAFT`` / ``ACTION_REQUIRED`` and
+            # withholds the authorization phrase even though
+            # this same ``advance`` invocation just made the
+            # PR non-draft. Operators would have to run an
+            # extra ``status``/``advance`` cycle to see the
+            # truth, and automation could treat the
+            # transition as still blocked.
+            #
+            # The fix: on a successful ``mark_pr_ready``,
+            # refetch the live PR view and rebuild evidence
+            # plus the machine verdict so the rest of the
+            # function (and the final report) sees the
+            # post-mutation state. This mirrors the same
+            # refetch-rebuild pattern already used by the
+            # eligible-thread-resolution path immediately
+            # below. We only rebuild on success because a
+            # failed ``gh pr ready`` doesn't change the
+            # PR's draft state.
+            if ok_ready:
+                try:
+                    refreshed_pr_view = fetch_pr_state(repo, pr_number)
+                    refreshed_evidence = build_evidence(
+                        repo=repo,
+                        pr_number=pr_number,
+                        pr_view=refreshed_pr_view,
+                        changed_files=(
+                            list(evidence.changed_files)
+                            if evidence.changed_files is not None
+                            else []
+                        ),
+                        changed_files_fetched=evidence.changed_files_fetched,
+                        changed_files_error="",
+                        authorization_phrase=None,
+                        allowed_files=allowed_files,
+                        forbidden_files=forbidden_files,
+                        ping_comment_id=ping_comment_id,
+                        ping_created_at=ping_created_at,
+                    )
+                    refreshed_machine_verdict = (
+                        R.evaluate_machine_readiness(
+                            refreshed_evidence
+                        )
+                    )
+                    # Replace the pre-mutation snapshots with
+                    # the post-mutation ones so every later
+                    # consumer (canonical phrase, lifecycle
+                    # state, final report) reflects the truth.
+                    pr_view = refreshed_pr_view
+                    evidence = refreshed_evidence
+                    machine_verdict = refreshed_machine_verdict
+                    state = derive_lifecycle_state(
+                        machine_verdict, pr_view
+                    )
+                except Exception as exc:
+                    # Refetch failure is logged but does not
+                    # fail the run: the mutation already
+                    # succeeded, and the next ``status``/
+                    # ``advance`` call will pick up the
+                    # post-mutation state anyway. Operators
+                    # see a diagnostic note in ``actions_taken``.
+                    actions_taken.append({
+                        "action": "mark_pr_ready_refresh",
+                        "ok": False,
+                        "result": "post_mutation_refresh_failed",
+                        "error": repr(exc),
+                    })
         elif pr_view.get("isDraft") is True:
             # Round-33: distinguish "skipped because a fresh
             # ping was just posted" from "skipped because the

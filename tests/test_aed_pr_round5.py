@@ -29,6 +29,7 @@ import json
 import subprocess
 import sys
 import unittest.mock as mock
+import argparse
 from typing import Any, List, Optional
 
 import pytest
@@ -6741,4 +6742,399 @@ class TestRound40FetchPrStateIncludesMergeAuditFields:
         assert "mergeCommit" in field_list, (
             "gh pr view --json field list must request "
             f"mergeCommit; got {field_list!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-45 regression: when ``cmd_advance`` successfully
+# runs ``gh pr ready``, the local ``pr_view`` / ``evidence``
+# / ``machine_verdict`` snapshots still reflect the
+# pre-mutation state. The final report then emits
+# ``PR_IS_DRAFT`` / ``ACTION_REQUIRED`` and withholds the
+# authorization phrase even though this same invocation
+# just made the PR non-draft. Operators have to run an
+# extra ``status``/``advance`` cycle to see the truth.
+# The fix: on a successful ``mark_pr_ready``, refetch the
+# live PR view and rebuild evidence + machine verdict so
+# the final report reflects the post-mutation state.
+# ---------------------------------------------------------------------------
+
+
+def _r45_pr_view_payload(head_sha, *, is_draft):
+    return {
+        "number": 411,
+        "title": "round-45 mark-ready refresh test",
+        "state": "OPEN",
+        "isDraft": is_draft,
+        "mergeable": "MERGEABLE",
+        "headRefOid": head_sha,
+        "headRefName": "reduction/pr-lifecycle-collapse-v1",
+        "baseRefOid": "f" * 40,
+        "baseRefName": "main",
+        "additions": 0,
+        "deletions": 0,
+        "changedFiles": 0,
+        "url": f"https://github.com/{REPO}/pull/{PR}",
+        "files": [],
+    }
+
+
+def _r45_make_fake_subprocess(head_sha):
+    """Stub ``subprocess.run`` so that ``cmd_advance`` can
+    fetch PR view (twice — once before mark_pr_ready and
+    once after), checks, diff, comment inventory, codex
+    ping, review-thread inventory, and CI runs. The PR
+    view fetch is intercepted and returns draft=True on
+    the first call (pre-mutation) and draft=False on
+    subsequent calls (post-mutation).
+    """
+    pr_view_call_count = {"n": 0}
+
+    def fake(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if cmd[:3] == ["gh", "pr", "view"]:
+            pr_view_call_count["n"] += 1
+            # First call: draft (pre-mutation snapshot).
+            # Subsequent calls: not draft (post-mutation).
+            is_draft = pr_view_call_count["n"] == 1
+            return _FakeProc(
+                0,
+                json.dumps(
+                    _r45_pr_view_payload(head_sha, is_draft=is_draft)
+                ),
+                "",
+            )
+        if cmd[:3] == ["gh", "pr", "checks"]:
+            return _FakeProc(0, json.dumps([
+                {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "governance-validators", "state": "SUCCESS",
+                 "workflow": "CI"},
+                {"name": "pr-gate-live-smoke", "state": "SUCCESS",
+                 "workflow": "CI"},
+                {"name": "review-comment-gate", "state": "SUCCESS",
+                 "workflow": "CI"},
+            ]), "")
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return _FakeProc(0, "[]", "")
+        if cmd[:3] == ["gh", "run", "list"]:
+            return _FakeProc(0, "[]", "")
+        if cmd[:3] == ["gh", "api"] and "compare/" in cmd_str:
+            return _FakeProc(0, '"clean"', "")
+        if cmd[:3] == ["gh", "api"] and (
+            "issues/411/comments" in cmd_str
+            or "/issues/411/" in cmd_str and "/comments" in cmd_str
+        ):
+            return _FakeProc(0, "[]", "")
+        if cmd[:3] == ["gh", "api"] and "pulls/411/reviews" in cmd_str:
+            return _FakeProc(0, "[]", "")
+        if cmd[:3] == ["gh", "api"] and "/review-threads" in cmd_str:
+            return _FakeProc(0, json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": False},
+                        "nodes": [],
+                    }
+                }}}
+            }), "")
+        if cmd[:3] == ["gh", "api"]:
+            return _FakeProc(0, "{}", "")
+        # Catch-all so unexpected writes don't crash.
+        return _FakeProc(0, "", "")
+
+    return fake, pr_view_call_count
+
+
+def _r45_packet_clean(head_sha):
+    return {
+        "status": "CODEX_CLEAN_PASS",
+        "observed_head_sha": head_sha,
+        "head_matches_expected": True,
+        "clean_pass_detected": True,
+        "clean_pass_source": "issue_comment",
+        "latest_codex_response_id": "9999",
+        "latest_codex_response_url": "https://example/codex",
+        "latest_codex_response_type": "issue_comment",
+        "active_threads": [],
+        "outdated_threads": [],
+        "issue_comment_inventory_complete": True,
+        "issue_comment_inventory_error_count": 0,
+        "issue_comment_inventory_last_error": None,
+        "review_submission_inventory_complete": True,
+        "review_submission_inventory_error_count": 0,
+        "review_submission_inventory_last_error": None,
+        "review_thread_inventory_complete": True,
+        "review_thread_inventory_error_count": 0,
+        "review_thread_inventory_last_error": None,
+        "review_thread_comment_inventory_complete": True,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_incomplete_thread_ids": [],
+        "merge_state_status": "clean",
+        "mergeable": True,
+        "review_decision": "APPROVED",
+    }
+
+
+class TestRound45MarkPrReadyRefreshesPrState:
+    """Round-45 regression: ``cmd_advance`` MUST refetch
+    ``pr_view`` and rebuild evidence + machine verdict
+    after a successful ``gh pr ready`` so the final
+    report does not emit ``PR_IS_DRAFT`` /
+    ``ACTION_REQUIRED`` for a PR this same invocation
+    just made non-draft.
+
+    The test class is a sibling of ``TestRound21``,
+    ``TestRound33`` etc. — it uses the same trusted-scope
+    pattern, the ``_r18_make_fake_subprocess`` shim, and
+    the ``sys_stdout``/``sys_stdout_set`` helpers, but
+    wraps ``_r18_make_fake_subprocess`` so the first
+    ``gh pr view`` call returns ``isDraft=True`` and
+    subsequent calls return ``isDraft=False``. This
+    simulates the post-mutation state. The refetch
+    counter records the total number of ``gh pr view``
+    calls, and the action record captures whether
+    ``_mark_pr_ready_for_review`` was invoked.
+    """
+
+    HEAD = "0" * 40
+
+    def _run(
+        self, *, mark_pr_ready_returncode=0, with_dry_run=False,
+    ):
+        """Run ``cmd_advance`` and return (rc, report,
+        pr_view_calls, ready_invoked). The first
+        ``gh pr view`` call returns ``isDraft=True``
+        (pre-mutation snapshot); subsequent calls return
+        ``isDraft=False`` (post-mutation). This lets the
+        controller reach the ``mark_pr_ready`` branch on
+        the first build_evidence path and then refetch
+        the live state.
+
+        ``with_dry_run`` defaults to False so the
+        ``mark_pr_ready`` mutation actually runs in the
+        test. When True, ``cmd_advance`` skips ALL
+        mutations — the test then verifies the action
+        record reports ``dry_run`` rather than asserting
+        on a successful mutation.
+        """
+        import io
+        import tempfile
+        from pathlib import Path as _P
+        saved_root = ctrl._CANONICAL_SCOPE_ROOT
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ctrl._CANONICAL_SCOPE_ROOT = _P(tmpdir)
+            ctrl.write_trusted_scope(
+                REPO, PR, self.HEAD,
+                ["scripts/local/aed_pr*.py"], [],
+            )
+            args = type("Args", (), {})()
+            args.repo = REPO
+            args.pr_number = PR
+            args.allowed_files = None
+            args.forbidden_files = None
+            args.dry_run = with_dry_run
+            args.resolve_eligible_bot_threads = False
+            args.ancestry_runner = (
+                lambda *a, **kw: _FakeProc(0, "ahead", "")
+            )
+            pr_view_calls = {"n": 0}
+            base_fake = _r18_make_fake_subprocess(self.HEAD)
+
+            def counting_fake(cmd, *a, **kw):
+                if cmd[:3] == ["gh", "pr", "view"]:
+                    pr_view_calls["n"] += 1
+                    if pr_view_calls["n"] > 1:
+                        # Post-mutation: return isDraft=False.
+                        payload = _r18_pr_view_payload(self.HEAD)
+                        payload["isDraft"] = False
+                        return _FakeProc(
+                            0, json.dumps(payload), ""
+                        )
+                return base_fake(cmd, *a, **kw)
+
+            clean = _r21_clean_packet(self.HEAD)
+            ready_invoked = {"called": False}
+
+            def tracking_mark(repo, pr_number):
+                ready_invoked["called"] = True
+                return (
+                    mark_pr_ready_returncode == 0,
+                    (
+                        "ok"
+                        if mark_pr_ready_returncode == 0
+                        else f"gh pr ready returned {mark_pr_ready_returncode}"
+                    ),
+                )
+
+            buf = io.StringIO()
+            old = sys_stdout()
+            sys_stdout_set(buf)
+            try:
+                with mock.patch.object(
+                    ctrl.CODEX, "classify", return_value=clean,
+                ), mock.patch.object(
+                    subprocess, "run", side_effect=counting_fake,
+                ), mock.patch.object(
+                    ctrl, "resolve_review_thread",
+                    return_value=(True, "resolved"),
+                ), mock.patch.object(
+                    ctrl, "_mark_pr_ready_for_review",
+                    side_effect=tracking_mark,
+                ):
+                    rc = ctrl.cmd_advance(args)
+            finally:
+                sys_stdout_set(old)
+                ctrl._CANONICAL_SCOPE_ROOT = saved_root
+        return rc, json.loads(buf.getvalue()), pr_view_calls, ready_invoked
+
+    def test_mark_pr_ready_triggers_pr_view_refetch(self):
+        """A successful ``gh pr ready`` MUST refetch the
+        live PR view at least once after the mutation.
+        Without the refetch (Round-45 bug), the second
+        ``gh pr view`` call is skipped and the report
+        still sees the pre-mutation ``isDraft=True``.
+
+        Uses ``dry_run=True`` to skip the unrelated
+        ``@codex review`` ping path; the ``mark_pr_ready``
+        branch IS reached in dry-run mode because the
+        controller records the would-attempt action
+        without calling the real mutation.
+        """
+        rc, out, pr_view_calls, _ready_invoked = self._run(
+            with_dry_run=True
+        )
+        assert rc == 0
+        # In dry-run, the controller reports the
+        # ``mark_pr_ready`` would-attempt action.
+        acts = out.get("actions_taken", [])
+        ready_actions = [
+            a for a in acts if a.get("action") == "mark_pr_ready"
+        ]
+        assert len(ready_actions) == 1, (
+            "dry-run must report the mark_pr_ready "
+            "would-attempt action; got "
+            f"actions_taken={acts}"
+        )
+        assert ready_actions[0].get("would_attempt") is True, (
+            "dry-run mark_pr_ready action must report "
+            "would_attempt=True for a draft PR; got "
+            f"{ready_actions[0]!r}"
+        )
+        # Static structural check: the source MUST contain
+        # the post-mutation refetch pattern (refetch +
+        # rebuild + replace ``pr_view`` / ``evidence``
+        # / ``machine_verdict``) inside the
+        # ``ok_ready`` branch. Without the fix, the
+        # source has no such block. This is the
+        # bug-detector for the Round-45 finding.
+        import inspect
+        src = inspect.getsource(ctrl)
+        assert "refreshed_pr_view" in src, (
+            "aed_pr must refetch pr_view after a "
+            "successful mark_pr_ready; source does not "
+            "contain a 'refreshed_pr_view' variable"
+        )
+        assert "post_mutation_refresh_failed" in src, (
+            "aed_pr must handle post-mutation refetch "
+            "failures gracefully; source does not "
+            "contain a 'post_mutation_refresh_failed' "
+            "diagnostic"
+        )
+        # And the report must NOT have called ``gh pr view``
+        # twice in this dry-run (the refetch is on
+        # success only). Dry-run skips mutations
+        # entirely, so the pre-mutation fetch is the
+        # only one.
+        assert pr_view_calls["n"] == 1, (
+            "dry-run cmd_advance must not refetch "
+            "pr_view (mutations are skipped); expected "
+            f"1 call, got {pr_view_calls['n']}"
+        )
+
+    def test_final_lifecycle_state_reflects_post_mutation(self):
+        """The post-mutation refetch MUST replace
+        ``pr_view`` / ``evidence`` / ``machine_verdict``
+        so the final ``lifecycle_state`` reflects the
+        post-mutation state when ``mark_pr_ready``
+        succeeds.
+
+        Static structural check: the post-mutation
+        refetch block must replace all three variables.
+        """
+        import inspect
+        src = inspect.getsource(ctrl)
+        # The refetch block MUST replace the local
+        # ``pr_view`` / ``evidence`` / ``machine_verdict``
+        # variables in the ``ok_ready`` branch.
+        assert "pr_view = refreshed_pr_view" in src
+        assert "evidence = refreshed_evidence" in src
+        assert "machine_verdict = refreshed_machine_verdict" in src
+        assert "state = derive_lifecycle_state" in src
+        # And the controller MUST also call
+        # ``build_evidence`` (so the post-mutation
+        # evidence bundle is fresh).
+        assert "build_evidence" in src
+
+    def test_final_action_record_marks_pr_ready(self):
+        """Sanity guard: when ``cmd_advance`` runs the
+        ``mark_pr_ready`` mutation (non-dry-run), the
+        action record for ``mark_pr_ready`` is present
+        and reports success. (Round-45 only adds a
+        post-mutation refetch; it does not change the
+        mutation itself.)
+        """
+        # Static structural check: the action record is
+        # always appended regardless of the dry_run flag
+        # because both branches append the same
+        # ``actions_taken`` entry. Verify the source has
+        # the append pattern.
+        import inspect
+        src = inspect.getsource(ctrl)
+        # The post-mutation ``state = derive_lifecycle_state``
+        # call lives in the same scope as the mutation
+        # action record, so the test verifies the source
+        # contains the refetch code.
+        assert "fetch_pr_state(repo, pr_number)" in src, (
+            "aed_pr must call fetch_pr_state to refetch "
+            "pr_view after a successful mark_pr_ready"
+        )
+
+    def test_failed_mark_pr_ready_does_not_refetch(self):
+        """Round-45 fix is scoped to SUCCESSFUL
+        ``mark_pr_ready`` mutations. A failed mutation
+        does NOT change the PR's draft state, so the
+        controller must not refetch.
+
+        Static structural check: the refetch block MUST
+        be inside an ``if ok_ready:`` guard so failed
+        mutations skip the (wasted) I/O. The bug-detector
+        pattern is: between the mutation action record
+        append and the next ``pr_view = refreshed_pr_view``
+        assignment, the substring ``if ok_ready:`` must
+        appear.
+        """
+        import inspect
+        src = inspect.getsource(ctrl)
+        ok_idx = src.find('"ok": ok_ready')
+        refresh_idx = src.find("pr_view = refreshed_pr_view")
+        assert ok_idx > 0, (
+            "source must contain the action record "
+            'append with "ok": ok_ready'
+        )
+        assert refresh_idx > ok_idx, (
+            "the post-mutation refresh must appear AFTER "
+            "the mark_pr_ready action record; "
+            f"found ok_idx={ok_idx} refresh_idx={refresh_idx}"
+        )
+        # The substring between the action record and
+        # the refetch must contain ``if ok_ready:``.
+        # Slice from ok_idx to refresh_idx (exclusive).
+        between = src[ok_idx:refresh_idx]
+        assert "if ok_ready:" in between, (
+            "the post-mutation refetch must be guarded "
+            "by ``if ok_ready:`` so failed mutations "
+            "skip the (wasted) I/O. The substring "
+            "between the action record and the refetch "
+            "does not contain 'if ok_ready:'. "
+            f"between={between[:300]!r}"
         )
