@@ -5681,3 +5681,294 @@ class TestRound31CmdStatusRecoversCanonicalPingBoundary:
             pass
         assert captured["ping_comment_id"] is None
         assert captured["ping_created_at"] is None
+
+
+# ---------------------------------------------------------------------------
+# Round-32 regression tests.
+#
+# Exact-head Codex review 4744489987 (submitted 2026-07-21T12:24:03Z on
+# head 1cd5832c0d732dfc86e1c1c4b3fa1d4971e6bd63) reported one P2
+# finding on scripts/local/aed_pr.py:
+#
+#   PRRC_kwDOSHFpYM7X5E2a (db_id 3622063514)
+#     "Preserve the newest duplicate ping boundary"
+#     When a PR already has multiple canonical `@codex
+#     review` comments for the same head, this returns the
+#     first match from the issue-comment API; GitHub returns
+#     issue comments in ascending ID order by default, so that
+#     is the oldest ping. `cmd_advance
+#     --resolve-eligible-bot-threads` then overwrites the
+#     recovered latest boundary with this stale timestamp
+#     before its evidence refresh, which can accept a clean
+#     pass that predates the operator's most recent review
+#     request and emit merge authorization while the latest
+#     exact-head review is still pending. Track the newest
+#     matching comment here instead of returning on the first
+#     match.
+#
+# Tests below prove:
+#
+#   * ``_post_codex_ping_comment``'s duplicate-detect path
+#     returns the canonical ping with the most recent
+#     ``created_at`` when multiple matches exist;
+#   * when only one canonical ping exists, the boundary is
+#     still recovered correctly;
+#   * when a canonical ping has no ``created_at`` field, the
+#     fallback to the first-seen record preserves the
+#     duplicate-detection contract from earlier rounds;
+#   * a non-canonical comment (different head or no trigger)
+#     does not influence the duplicate-detection result.
+# ---------------------------------------------------------------------------
+
+
+class TestRound32PostCodexPingCommentPicksNewestDuplicate:
+    """P2 (PRRC_kwDOSHFpYM7X5E2a): ``_post_codex_ping_comment``
+    MUST pick the newest canonical ping on duplicate
+    detection rather than returning the first match from the
+    inventory (which is the OLDEST by ascending ID order).
+    """
+
+    HEAD_SHA = "a" * 40
+    OTHER_SHA = "b" * 40
+
+    def _runner(self, *, inventory):
+        """Stand-in for ``_run_json_or_none`` that serves the
+        inventory on GET and reports no POST.
+        """
+        import json as _json
+        posts = []
+
+        def runner(cmd, capture_output=True, text=True, timeout=60):
+            class _P:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            p = _P()
+            if "-X" in cmd and "POST" in cmd:
+                posts.append(cmd)
+                p.stdout = _json.dumps({
+                    "id": "999",
+                    "created_at": "2099-01-01T00:00:00Z",
+                })
+                return p
+            p.stdout = _json.dumps(inventory)
+            return p
+
+        runner.posts = posts
+        return runner
+
+    def test_newest_canonical_ping_wins_on_duplicate(self):
+        # Two canonical pings on the same head: the older one
+        # has the lower ID, the newer one has the higher ID.
+        # GitHub returns them in ascending ID order; the
+        # helper MUST return the newer one.
+        inventory = [[
+            {
+                "id": 100,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-20T10:00:00Z",
+            },
+            {
+                "id": 200,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-21T10:00:00Z",
+            },
+        ]]
+        runner = self._runner(inventory=inventory)
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        # The NEWER ping wins; the older id must NOT be returned.
+        assert ping_id == "200"
+        assert ping_ts == "2026-07-21T10:00:00Z"
+        # The POST must NOT have been made.
+        assert runner.posts == []
+
+    def test_only_one_canonical_ping_still_works(self):
+        inventory = [[{
+            "id": 100,
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD_SHA}"
+            ),
+            "created_at": "2026-07-21T10:00:00Z",
+        }]]
+        runner = self._runner(inventory=inventory)
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        assert ping_id == "100"
+        assert ping_ts == "2026-07-21T10:00:00Z"
+
+    def test_legacy_ping_without_created_at_falls_back(self):
+        # Legacy inventory entries from older runs may not
+        # carry a ``created_at`` field. The duplicate-detection
+        # contract from earlier rounds MUST still hold.
+        inventory = [[{
+            "id": 100,
+            "body": (
+                "@codex review\n\n"
+                f"AED exact-head review request: {self.HEAD_SHA}"
+            ),
+            # ``created_at`` deliberately omitted.
+        }]]
+        runner = self._runner(inventory=inventory)
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        assert ping_id == "100"
+        assert ping_ts is None
+        # The POST must NOT have been made.
+        assert runner.posts == []
+
+    def test_non_canonical_comments_dont_influence_result(self):
+        # Three other-head pings plus one canonical ping on
+        # the current head. The other-head pings must NOT
+        # contribute to the boundary decision.
+        inventory = [[
+            {
+                "id": 50,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.OTHER_SHA}"
+                ),
+                "created_at": "2099-01-01T00:00:00Z",
+            },
+            {
+                "id": 100,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-21T10:00:00Z",
+            },
+            {
+                "id": 60,
+                "body": "Some unrelated comment",
+                "created_at": "2099-02-01T00:00:00Z",
+            },
+        ]]
+        runner = self._runner(inventory=inventory)
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        assert ping_id == "100"
+        assert ping_ts == "2026-07-21T10:00:00Z"
+
+    def test_no_canonical_ping_proceeds_to_post(self):
+        # Empty inventory → helper must POST a fresh ping.
+        runner = self._runner(inventory=[])
+        ok, info, ping_id, ping_ts = ctrl._post_codex_ping_comment(
+            "owner/repo", 411, self.HEAD_SHA, runner=runner,
+        )
+        assert ok is True
+        assert info == "999"
+        assert ping_id == "999"
+        assert ping_ts == "2099-01-01T00:00:00Z"
+        # The POST must have been made exactly once.
+        assert len(runner.posts) == 1
+
+
+class TestRound32RecoverBoundaryMatchesDuplicateHelper:
+    """P2 (PRRC_kwDOSHFpYM7X5E2a): the duplicate-detect path
+    in ``_post_codex_ping_comment`` MUST agree with
+    ``_recover_canonical_ping_boundary`` on which comment is
+    the newest canonical ping on the same head.
+    """
+
+    HEAD_SHA = "c" * 40
+
+    def test_duplicate_helper_and_recovery_agree(self, monkeypatch):
+        # Inventory with three canonical pings on the same
+        # head, ascending ID order. The newest is id=300.
+        inventory_payload = [[
+            {
+                "id": 100,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-20T10:00:00Z",
+            },
+            {
+                "id": 200,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-21T09:00:00Z",
+            },
+            {
+                "id": 300,
+                "body": (
+                    "@codex review\n\n"
+                    f"AED exact-head review request: {self.HEAD_SHA}"
+                ),
+                "created_at": "2026-07-21T10:00:00Z",
+            },
+        ]]
+
+        # Drive the duplicate-detect path through the runner.
+        import json as _json
+
+        posts = []
+
+        def runner(cmd, capture_output=True, text=True, timeout=60):
+            class _P:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            p = _P()
+            if "-X" in cmd and "POST" in cmd:
+                posts.append(cmd)
+                p.stdout = _json.dumps({
+                    "id": "999",
+                    "created_at": "2099-01-01T00:00:00Z",
+                })
+                return p
+            p.stdout = _json.dumps(inventory_payload)
+            return p
+
+        runner.posts = posts
+
+        # Drive the recovery path through monkeypatch.
+        def fake_run_json(cmd, timeout=30):
+            return True, inventory_payload, ""
+
+        monkeypatch.setattr(ctrl, "_run_json_or_none", fake_run_json)
+
+        # Duplicate-detect path.
+        ok, info, dup_ping_id, dup_ping_ts = (
+            ctrl._post_codex_ping_comment(
+                "owner/repo", 411, self.HEAD_SHA, runner=runner,
+            )
+        )
+        assert ok is True
+        assert info == "duplicate_exact_head_request_prevented"
+        assert dup_ping_id == "300"
+        assert dup_ping_ts == "2026-07-21T10:00:00Z"
+
+        # Recovery path.
+        rec_ping_id, rec_ping_ts, rec_err = (
+            ctrl._recover_canonical_ping_boundary(
+                "owner/repo", 411, self.HEAD_SHA,
+            )
+        )
+        assert rec_err == ""
+        # Both paths MUST agree on the newest ping boundary.
+        assert rec_ping_id == dup_ping_id
+        assert rec_ping_ts == dup_ping_ts

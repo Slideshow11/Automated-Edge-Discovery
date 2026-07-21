@@ -3080,6 +3080,32 @@ def _post_codex_ping_comment(
             comments.extend(page["items"])
     # 2. Duplicate detection: the same exact head, AND the
     # ``@codex review`` trigger string. Anything else is ignored.
+    #
+    # Round-32 hardening (P2 ``PRRC_kwDOSHFpYM7X5E2a``): when
+    # multiple canonical pings exist on the same head (e.g. a
+    # previous advance run posted one before a subsequent run
+    # was triggered), GitHub returns issue comments in ascending
+    # ID order by default — so the FIRST match is the OLDEST
+    # ping. The Round-31 helper returned that oldest timestamp
+    # as the canonical boundary, allowing ``cmd_advance`` to
+    # overwrite the recovered latest boundary with a stale
+    # timestamp before its evidence refresh. The classifier
+    # could then accept a clean pass that predates the
+    # operator's most recent review request and emit merge
+    # authorization while the latest exact-head review is
+    # still pending.
+    #
+    # The Round-32 fix collects EVERY matching canonical ping
+    # and selects the one with the most recent ``created_at``,
+    # mirroring the algorithm used by
+    # ``_recover_canonical_ping_boundary``. Legacy ping
+    # records without a ``created_at`` (or with non-string
+    # ``created_at``) fall back to the first-seen record so
+    # the duplicate-detection contract from earlier rounds
+    # is preserved for inventory entries whose ``created_at``
+    # is missing.
+    first_match: Optional[Dict[str, Any]] = None
+    canonical_pings: List[Dict[str, Any]] = []
     for c in comments:
         if not isinstance(c, dict):
             continue
@@ -3090,12 +3116,30 @@ def _post_codex_ping_comment(
             continue
         if head_sha not in existing_body:
             continue
-        # Existing ping on the same head; recover its id and
-        # created_at so downstream ``status``/``merge`` calls
-        # can use it as the ping boundary without losing the
-        # most recent canonical trigger. Round-31 hardening.
-        existing_id = c.get("id")
-        existing_created_at = c.get("created_at")
+        if first_match is None:
+            first_match = c
+        created_at = c.get("created_at")
+        if not isinstance(created_at, str):
+            continue
+        canonical_pings.append({
+            "id": c.get("id"),
+            "created_at": created_at,
+        })
+    if first_match is not None:
+        if canonical_pings:
+            # Newest canonical ping on this head wins.
+            canonical_pings.sort(
+                key=lambda p: p.get("created_at") or "",
+                reverse=True,
+            )
+            winner = canonical_pings[0]
+        else:
+            # No ping has a usable ``created_at``; fall back
+            # to the first match so the duplicate-detection
+            # contract from earlier rounds is preserved.
+            winner = first_match
+        existing_id = winner.get("id")
+        existing_created_at = winner.get("created_at")
         return (
             True,
             "duplicate_exact_head_request_prevented",
