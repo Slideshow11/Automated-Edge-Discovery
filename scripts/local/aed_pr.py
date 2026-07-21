@@ -823,8 +823,28 @@ def fetch_ci_conclusions(
         repo, pr_number, runner=runner,
     )
     if not ok or not isinstance(payload, list):
-        missing = list(required_check_names)
-        return False, {}, missing, [], missing, [], err
+        # When ``head_sha`` AND ``head_branch`` are supplied
+        # and canonical, the authoritative required-check
+        # inventory comes from the exact-head ``pull_request``
+        # run's job list, NOT from ``gh pr checks``. A
+        # transient ``gh pr checks`` failure MUST NOT prevent
+        # the authoritative lookup from running; otherwise
+        # ``status`` / ``merge`` would report every required
+        # check as missing/failed even when the exact CI run
+        # is readable and green. Fall through to the
+        # authoritative path below; ``payload`` is only used
+        # for unrelated-duplicates diagnostics, so an empty
+        # list is harmless on that path.
+        if bool(
+            head_sha
+            and head_branch
+            and R.is_canonical_head_sha(head_sha)
+        ):
+            payload = []
+            err = err or "diagnostic_gh_pr_checks_unavailable"
+        else:
+            missing = list(required_check_names)
+            return False, {}, missing, [], missing, [], err
 
     # Collect every record by name; ``gh pr checks`` is
     # used for diagnostics only.

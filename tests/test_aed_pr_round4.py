@@ -23,6 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 from unittest import mock
+import unittest
 
 import pytest
 
@@ -5660,3 +5661,191 @@ class TestRound16BuildEvidenceNeverSeesCliScope:
                 "CLI patterns must not be forwarded to build_evidence; "
                 f"got {captured['allowed_files']!r}"
             )
+
+
+class TestRound37AuthoritativePathWhenGhPrChecksFails(unittest.TestCase):
+    """Round-37 regression: when ``gh pr checks`` returns no
+    JSON or has a transient endpoint failure, the controller
+    MUST NOT bail out before consulting the authoritative
+    exact-head ``pull_request`` run's job inventory, provided
+    ``head_sha`` and ``head_branch`` are supplied and
+    canonical. The bug was an early-return at the top of
+    ``fetch_ci_conclusions`` that exited before
+    ``_find_exact_head_pull_request_run_id`` and
+    ``_run_jobs_for_run`` could run; the fix lets the
+    authoritative path proceed when ``head_sha`` and
+    ``head_branch`` are valid, treating the diagnostic
+    ``gh pr checks`` failure as non-fatal.
+
+    Under the previous behavior, a transient ``gh pr checks``
+    failure would cause ``status`` / ``merge`` to report
+    every required check as missing/failed even when the
+    exact CI run was readable and green.
+    """
+
+    PR_RUN_ID = 29694702047
+    HEAD = "48e1a33c511bc05676f43ac4b34b28add6bda4c2"
+    BRANCH = "reduction/pr-lifecycle-collapse-v1"
+    REQUIRED = ["review-comment-gate"]
+
+    def _runner_factory(self, *, pr_checks_records=None,
+                        pr_checks_failure=False,
+                        pr_checks_no_payload=False,
+                        pr_runs=None, pr_jobs=None):
+        log = []
+        pr_runs = list(pr_runs if pr_runs is not None else [
+            {
+                "databaseId": self.PR_RUN_ID,
+                "event": "pull_request",
+                "headBranch": self.BRANCH,
+                "headSha": self.HEAD,
+                "workflowName": "CI",
+                "url": f"https://example/runs/{self.PR_RUN_ID}",
+            },
+        ])
+        pr_jobs = list(pr_jobs if pr_jobs is not None else [
+            {"name": "review-comment-gate", "databaseId": 1,
+             "status": "completed", "conclusion": "success"},
+        ])
+
+        def runner(cmd, *a, **kw):
+            log.append(list(cmd))
+            argv = [str(x) for x in cmd]
+            if argv[:3] == ["gh", "pr", "checks"]:
+                if pr_checks_failure:
+                    return mock.Mock(
+                        returncode=1, stdout="",
+                        stderr="gh pr checks: transient failure",
+                    )
+                if pr_checks_no_payload:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_checks_records or []),
+                    stderr="",
+                )
+            if argv[:3] == ["gh", "run", "list"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps(pr_runs), stderr="",
+                )
+            if argv[:3] == ["gh", "run", "view"]:
+                return mock.Mock(
+                    returncode=0,
+                    stdout=json.dumps({"jobs": pr_jobs}), stderr="",
+                )
+            return mock.Mock(returncode=0, stdout="{}", stderr="")
+
+        return runner, log
+
+    def test_transient_gh_pr_checks_failure_falls_through(self):
+        """Bug repro: ``gh pr checks`` returns non-zero
+        exit code, but ``head_sha`` and ``head_branch`` are
+        supplied. The controller MUST proceed to the
+        authoritative path and report SUCCESS for the
+        required check.
+        """
+        runner, _log = self._runner_factory(
+            pr_checks_failure=True,
+            pr_jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+            head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        # Round-37 invariant: ok=True (the authoritative path
+        # succeeded); conclusions reports the run's status;
+        # missing/failed are EMPTY even though ``gh pr checks``
+        # was unavailable.
+        self.assertTrue(ok)
+        self.assertEqual(conclusions.get("review-comment-gate"), "SUCCESS")
+        self.assertEqual(missing, [])
+        self.assertEqual(failed, [])
+
+    def test_gh_pr_checks_no_payload_falls_through(self):
+        """Bug repro: ``gh pr checks`` returns exit 0 but
+        empty stdout (no payload). Authoritative path must
+        still be used.
+        """
+        runner, _log = self._runner_factory(
+            pr_checks_no_payload=True,
+            pr_jobs=[
+                {"name": "review-comment-gate", "databaseId": 1,
+                 "status": "completed", "conclusion": "success"},
+            ],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+            head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(conclusions.get("review-comment-gate"), "SUCCESS")
+        self.assertEqual(missing, [])
+        self.assertEqual(failed, [])
+
+    def test_no_head_sha_still_bails_on_gh_pr_checks_failure(self):
+        """Round-37 guard: when ``head_sha`` is NOT supplied,
+        the controller has no authoritative binding to fall
+        back to. A ``gh pr checks`` failure MUST fail closed
+        (the previous behavior is preserved).
+        """
+        runner, _log = self._runner_factory(pr_checks_failure=True)
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+            head_sha=None, head_branch=None,
+        )
+        # No authoritative binding; gh pr checks failure
+        # fails closed as before.
+        self.assertFalse(ok)
+        self.assertEqual(missing, list(self.REQUIRED))
+        self.assertEqual(failed, list(self.REQUIRED))
+        self.assertTrue(err, "err field must be non-empty on gh pr checks failure")
+
+    def test_non_canonical_head_sha_still_bails(self):
+        """Round-37 guard: a non-canonical ``head_sha`` (the
+        early-return only falls through on canonical
+        40-lowercase-hex strings) MUST still bail out when
+        ``gh pr checks`` fails. The path safety contract is
+        preserved.
+        """
+        runner, _log = self._runner_factory(pr_checks_failure=True)
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+            head_sha="not-canonical", head_branch=self.BRANCH,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(missing, list(self.REQUIRED))
+        self.assertEqual(failed, list(self.REQUIRED))
+
+    def test_authoritative_failure_still_fails_closed(self):
+        """Round-37 guard: when both ``gh pr checks`` AND
+        the authoritative path fail, every required check is
+        reported missing/failed (fail-closed). The fix MUST
+        NOT silently report success.
+        """
+        # Simulate authoritative path failure: empty pr_runs
+        runner, _log = self._runner_factory(
+            pr_checks_failure=True, pr_runs=[],
+        )
+        (ok, conclusions, missing, pending, failed,
+         duplicated, err) = ctrl.fetch_ci_conclusions(
+            "owner/repo", 411, list(self.REQUIRED),
+            runner=runner,
+            head_sha=self.HEAD, head_branch=self.BRANCH,
+        )
+        # Authoritative path failed (no exact-head PR run);
+        # every required check missing and failed.
+        self.assertTrue(ok)
+        self.assertEqual(missing, list(self.REQUIRED))
+        self.assertEqual(failed, list(self.REQUIRED))

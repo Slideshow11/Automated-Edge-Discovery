@@ -5065,6 +5065,109 @@ class TestCodexTaskSummaryIssueComment(unittest.TestCase):
             "blocking after the fix",
         )
 
+    def test_task_summary_with_p1_token_in_body_is_info(self):
+        """Round-37 regression: a Codex task-summary issue-comment
+        whose body mentions a prior ``P1`` finding it fixed must
+        still be classified as ``UNSPECIFIED_INFO``, not as the
+        mentioned severity."""
+        body = (
+            "### Summary\n\n"
+            "* Addressed the prior P1 stale-state regression in "
+            "fetch_ci_conclusions by binding required-check evidence "
+            "to the exact-head pull_request run.\n"
+            "* Fixed the P2 malformed-event fail-closed path.\n"
+            "\n"
+            "**Commit**\n\n"
+            "* New commit SHA: eb0129db3ac543c5ba705a0eb6d5435a1d40c206\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(
+            got[0]["severity"], "UNSPECIFIED_INFO",
+            "Task-summary override must cap severity even with P1/P2 tokens",
+        )
+
+    def test_task_summary_with_colon_declaration_is_info(self):
+        """Round-37 regression: Codex task-summary with ``P2:``
+        colon-declaration form must still be classified as
+        UNSPECIFIED_INFO."""
+        body = (
+            "### Summary\n\n"
+            "* P2: addressed the prior blocking-vocabulary classifier bug.\n"
+            "\n"
+            "**Commit**\n\n"
+            "* New commit SHA: abc1234567abcdef.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+
+    def test_task_summary_with_text_alias_high_is_info(self):
+        """Round-37 regression: Codex task-summary with text-alias
+        ``high severity`` describing a prior fix must still be
+        classified as UNSPECIFIED_INFO."""
+        body = (
+            "### Summary\n\n"
+            "* Addressed the high severity regression from the prior "
+            "review-cycle fix.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+
+    def test_non_task_summary_with_p_token_still_blocking(self):
+        """Round-37 guard: when the body is NOT a Codex task-summary,
+        the extracted P-token severity MUST still be honored. Only
+        the task-summary detector path is capped."""
+        body = (
+            "Bumping the retry counter - the prior P1 stale-state "
+            "regression has resurfaced and is blocking CI again."
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_task_summary_classification_does_not_suppress_emit(self):
+        """Round-37 invariant: the task-summary cap downgrades
+        severity but MUST still emit the comment so the inventory
+        remains complete."""
+        body = (
+            "### Summary\n\n"
+            "* Fixed the P1 stale-state bug in some_module.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+        self.assertEqual(got[0]["user"], "chatgpt-codex-connector[bot]")
+        self.assertIn("P1", got[0]["body"])
+
+
+
 
 if __name__ == "__main__":
     unittest.main()

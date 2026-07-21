@@ -1000,7 +1000,11 @@ def classify_item(
     # commit SHA: ...``) as ``UNSPECIFIED_BLOCKING`` just because
     # the body happens to mention ``stale`` / ``malformed`` /
     # ``blocking`` while describing prior fixes. The override
-    # only downgrades severity to ``UNSPECIFIED_INFO``; the
+    # is applied as a SEVERITY CAP (force to ``UNSPECIFIED_INFO``)
+    # BEFORE severity extraction, so that even if the body
+    # contains a literal ``P1`` / ``P2`` token or text-alias
+    # ``high`` / ``medium`` describing a prior fix, the
+    # comment is still classified as informational. The
     # comment is still emitted so inventory remains complete,
     # but it does not block the gate.
     is_task_summary = _is_codex_task_summary_issue_comment(
@@ -1011,16 +1015,20 @@ def classify_item(
     # of truth for severity level mapping).
     severity = extract_severity(combined)
 
+    # Task-summary override runs as a CAP: if the body is a
+    # Codex task-summary, force severity to UNSPECIFIED_INFO
+    # regardless of what extract_severity returned. This must
+    # come BEFORE the fail-closed default cascade so a body
+    # that mentions a prior ``P1`` / ``P2`` finding it fixed
+    # is still classified as informational.
+    if is_task_summary:
+        severity = "UNSPECIFIED_INFO"
     # Fail-closed default: unresolved Codex threads without
     # extractable severity default to P2 (blocking).
-    if severity is None and is_codex_review_thread_current_unresolved:
+    elif severity is None and is_codex_review_thread_current_unresolved:
         severity = "P2"
-    elif severity is None and is_blocking(combined) and not is_task_summary:
+    elif severity is None and is_blocking(combined):
         severity = "UNSPECIFIED_BLOCKING"
-    elif severity is None and is_task_summary:
-        # Codex bot task-summary issue-comments without an
-        # explicit severity are informational, never blocking.
-        severity = "UNSPECIFIED_INFO"
     elif severity is None:
         severity = "UNSPECIFIED_INFO"
 
