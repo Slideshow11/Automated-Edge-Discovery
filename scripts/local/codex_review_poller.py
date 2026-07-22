@@ -389,8 +389,25 @@ def _match_response(
         if not _head_matches_response(head, body):
             return None
         ts_raw = candidate.get("created_at", "")
+        # Round-65 fix: pre-scan for finding badges
+        # BEFORE any clean-pass or summary check. A
+        # finding badge in the body MUST take precedence
+        # over any clean fragment ("no major issues" /
+        # "no findings reported" / etc.) or summary
+        # format. Without this pre-scan, the
+        # ``_is_clean_pass`` check below would return
+        # ``CLEAN_PASS`` before the summary-specific
+        # badge scan runs, falsely classifying a
+        # finding-bearing response as clean. The
+        # downstream automation would then exit with
+        # clean verdict and unblock merge even though
+        # the latest Codex response includes a finding.
+        body_has_finding_badge = any(
+            _is_finding(line)
+            for line in body.splitlines()
+        )
         # For issue comments, classify from the body directly.
-        if _is_clean_pass(body):
+        if _is_clean_pass(body) and not body_has_finding_badge:
             verdict = "CLEAN_PASS"
         elif _is_finding(body):
             verdict = "FINDING"
@@ -408,10 +425,7 @@ def _match_response(
             # badge embedded in the summary body would
             # incorrectly unblock the external review
             # loop.
-            if any(
-                _is_finding(line)
-                for line in body.splitlines()
-            ):
+            if body_has_finding_badge:
                 verdict = "FINDING"
             else:
                 verdict = "CLEAN_PASS"

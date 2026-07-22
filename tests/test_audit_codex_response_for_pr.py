@@ -10664,3 +10664,120 @@ def test_round64_source_contract_extra_fragments():
         "Round-64 fix: is_codex_clean_pass_comment "
         "MUST accept summary-format bodies as clean."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-65 regression: do not let clean fragments
+# override finding badges. A summary-format Codex body
+# that contains BOTH a clean fragment ("no major
+# issues" / "no findings reported" / etc.) AND a
+# finding badge MUST be classified as FINDING, not
+# CLEAN_PASS. The finding badge takes precedence.
+# ---------------------------------------------------------------------------
+
+
+def test_round65_audit_summary_with_clean_fragment_and_finding_badge_is_finding():
+    """Round-65: an audit body that is a summary with
+    BOTH a clean fragment and a finding badge MUST
+    NOT be classified as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No major issues found, except:\n"
+        "**<sub><sub>![P1 Badge]...</sub></sub>  Some finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-65 fix: a summary body with both a "
+        "clean fragment AND a finding badge MUST be "
+        "classified as FINDING, not CLEAN_PASS. The "
+        "finding badge takes precedence."
+    )
+
+
+def test_round65_audit_non_summary_with_finding_badge_is_finding():
+    """Round-65 invariant: a non-summary body that
+    contains a finding badge line MUST NOT be
+    classified as a clean pass regardless of clean
+    fragments elsewhere in the body.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "I looked and found no major issues overall.\n"
+        "**<sub><sub>![P2 Badge]...</sub></sub>  Finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-65 invariant: a body with a finding "
+        "badge line MUST NOT be a clean pass even if "
+        "clean fragments are also present."
+    )
+
+
+def test_round65_audit_source_contract_finding_badge_first():
+    """Source-contract: the audit's
+    ``is_codex_clean_pass_comment`` MUST consult
+    finding badges BEFORE clean fragments.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod.is_codex_clean_pass_comment)
+    # The finding-badge check must appear BEFORE the
+    # fragment check.
+    badge_idx = src.find("is_codex_finding_body")
+    fragment_idx = src.find("CODEX_CLEAN_PASS_EXTRA_FRAGMENTS")
+    assert badge_idx > 0
+    assert fragment_idx > 0
+    assert badge_idx < fragment_idx, (
+        "Round-65 fix: the finding-badge check must "
+        "appear BEFORE the fragment check in the "
+        "audit source."
+    )
+
+
+def test_round65_poller_summary_with_clean_fragment_and_finding_badge_is_finding():
+    """Round-65: the poller's issue-comment
+    classification MUST classify a summary body with
+    both a clean fragment and a finding badge as
+    FINDING, not CLEAN_PASS.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    # The poller's _match_response must pre-scan for
+    # finding badges.
+    assert "body_has_finding_badge" in src, (
+        "Round-65 fix: the poller must pre-scan for "
+        "finding badges before clean-pass check."
+    )
+
+
+def test_round65_poller_source_contract_finding_badge_first():
+    """Source-contract: the poller's issue-comment
+    classification MUST consult finding badges BEFORE
+    the clean-pass check.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    # Find the issue-comment classification section.
+    issue_idx = src.find('if kind == "issue_comment":')
+    assert issue_idx > 0
+    section = src[issue_idx:issue_idx + 5000]
+    # The body_has_finding_badge pre-scan must appear
+    # BEFORE the _is_clean_pass check.
+    badge_idx = section.find("body_has_finding_badge")
+    clean_idx = section.find("_is_clean_pass(body)")
+    assert badge_idx > 0
+    assert clean_idx > 0
+    assert badge_idx < clean_idx, (
+        "Round-65 fix: the finding-badge pre-scan "
+        "must appear BEFORE the _is_clean_pass check "
+        "in the poller source."
+    )

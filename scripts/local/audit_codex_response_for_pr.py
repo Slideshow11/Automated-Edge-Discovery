@@ -814,8 +814,27 @@ def is_codex_clean_pass_comment(body: str) -> bool:
     audit's post-clean-pass scan, downgrading a valid
     clean pass to HOLD_NEW_CODEX_THREAD. The audit and
     the poller MUST agree on what counts as clean.
+
+    Round-65 fix: a summary-format body that contains a
+    finding badge MUST NOT be classified as a clean pass
+    even if it also contains a clean fragment. Without
+    this guard, the fragment match below would override
+    the summary-with-finding-badge detection and falsely
+    emit ``is_clean_pass=True`` for a response that
+    actually carries a finding. The same rule applies to
+    any body that contains a finding badge line.
     """
     if not body:
+        return False
+    # Round-65 fix: if the body contains a finding
+    # badge line, it is NEVER a clean pass, regardless
+    # of any clean fragments also present. This is the
+    # fail-closed default: a finding badge in the body
+    # always wins over a clean fragment.
+    if any(
+        is_codex_finding_body(line)
+        for line in body.splitlines()
+    ):
         return False
     # Round-52: summary-format reviews are clean passes
     # when they have no inline-finding markers in the
@@ -825,9 +844,7 @@ def is_codex_clean_pass_comment(body: str) -> bool:
     # as a PR-level issue comment) are also clean
     # passes when the body is free of finding
     # markers.
-    if is_codex_review_summary(body) and not any(
-        is_codex_finding_body(line) for line in body.splitlines()
-    ):
+    if is_codex_review_summary(body):
         return True
     # Legacy exact phrase check.
     if any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES):
