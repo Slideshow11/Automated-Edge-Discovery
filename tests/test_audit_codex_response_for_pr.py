@@ -9202,3 +9202,241 @@ class TestRound47FormalReviewVetoRunsWithPingBoundary:
             "in Round-46, which left the post-ping path "
             "unchecked."
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-52 regression: the audit must recognize Codex's
+# newer ``### 💡 Codex Review`` formal-review summary
+# format as a clean pass when there are no inline-finding
+# markers in the summary body itself. The Round-52
+# finding reported that ``aed_pr.py`` builds readiness
+# evidence through ``fetch_codex_packet`` → ``classify``
+# which only recognized the older exact clean phrase, so
+# the readiness verifier kept reporting missing/failed
+# Codex evidence even after the poller had confirmed a
+# clean exact-head response. The fix extends the
+# formal-review clean-pass detection (and the
+# post-clean-pass newer-finding scan) to also accept
+# the summary format.
+# ---------------------------------------------------------------------------
+
+
+def _r52_clean_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+    )
+
+
+def _r52_finding_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+        # An inline finding marker inside the summary body.
+        # This is rare (findings usually live in inline
+        # review comments, not in the summary body) but
+        # the audit must still classify it as a finding.
+        "\n**<sub><sub>![P2 Badge]"
+        "(https://img.shields.io/badge/P2-yellow?style=flat)"
+        "</sub></sub>  Inline finding in summary body**\n"
+    )
+
+
+def test_round52_summary_clean_review_accepted(monkeypatch, tmp_path):
+    """Round-52 fix: a formal review with the
+    ``### 💡 Codex Review`` summary prefix and no
+    inline-finding markers in the body MUST be
+    detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-52 fix: the audit must accept a "
+        "summary-format review (### 💡 Codex Review) "
+        "as a clean pass when there are no "
+        "inline-finding markers. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+    assert pkt.get("clean_pass_source") == "pull_request_review", (
+        "Round-52 fix: the clean pass must come "
+        "from the formal review, not the issue "
+        f"comment path. Got {pkt.get('clean_pass_source')!r}"
+    )
+
+
+def test_round52_summary_finding_with_inline_marker_rejected(monkeypatch, tmp_path):
+    """Round-52 invariant: a summary-format review
+    whose body contains an inline-finding marker
+    MUST NOT be detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    finding_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_finding_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499127,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[finding_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-52 invariant: a summary-format "
+        "review with an inline-finding marker in "
+        "the body must NOT be a clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round52_older_clean_then_newer_summary_finding_downgrades(monkeypatch, tmp_path):
+    """Round-52 invariant: a clean summary review
+    followed by a NEWER non-clean summary review
+    MUST be downgraded to HOLD_NEW_CODEX_THREAD
+    by the post-clean-pass scan.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_clean_summary_body(),
+        submitted_at="2026-07-22T06:10:00Z",
+        review_id=4751499100,
+        commit_oid=HEAD,
+    )
+    # Newer review with a body that's neither the
+    # exact clean phrase nor the summary-clean
+    # format (i.e. a summary whose body contains an
+    # inline-finding marker). The post-clean-pass
+    # scan must classify this as a finding.
+    finding_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_finding_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[clean_review, finding_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-52 invariant: an older summary clean "
+        "followed by a newer summary finding must "
+        "downgrade to HOLD_NEW_CODEX_THREAD. Got "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round52_source_contract_summary_helpers_exist():
+    """Source-contract: the audit MUST define
+    ``is_codex_review_summary`` and
+    ``is_codex_finding_body`` helpers and use them
+    in the formal-review clean-pass detection.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Helpers must exist.
+    assert hasattr(mod, "is_codex_review_summary"), (
+        "Round-52 fix: audit must define "
+        "is_codex_review_summary helper."
+    )
+    assert hasattr(mod, "is_codex_finding_body"), (
+        "Round-52 fix: audit must define "
+        "is_codex_finding_body helper."
+    )
+    # Helpers must be used in the formal-review
+    # clean-pass detection (the source must
+    # reference them near the
+    # ``is_codex_clean_pass_comment`` check).
+    src = inspect.getsource(mod)
+    assert "is_codex_review_summary" in src
+    assert "is_codex_finding_body" in src
+    # And the CODEX_REVIEW_SUMMARY_PREFIX constant
+    # must be defined.
+    assert "CODEX_REVIEW_SUMMARY_PREFIX" in src
+
+
+# Module-level helper for the function-based tests above.
+def _r52_classify(monkeypatch, *, codex_review_submissions, codex_issue_comments):
+    """Drive ``classify`` end-to-end with the
+    supplied review and comment fixtures.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Use the Round-52 head so head_matches_expected is True.
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )

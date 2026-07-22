@@ -190,6 +190,43 @@ CODEX_CLEAN_PASS_PHRASE = "Codex Review: Didn\u2019t find any major issues"
 CODEX_CLEAN_PASS_PHRASE_ALT = "Codex Review: Didn't find any major issues"
 CODEX_CLEAN_PASS_PHRASES = (CODEX_CLEAN_PASS_PHRASE, CODEX_CLEAN_PASS_PHRASE_ALT)
 
+# Round-52: Codex's newer formal-review summaries start with
+# the ``### 💡 Codex Review`` Markdown header. A review with
+# this prefix and NO inline review comments is a clean
+# pass; the findings live in inline comments. The audit
+# must recognize this format the same way the poller does
+# (Round-47..51 poller fix), or the readiness verifier will
+# keep reporting missing/failed Codex evidence even after
+# the poller has confirmed a clean exact-head response.
+CODEX_REVIEW_SUMMARY_PREFIX = "### \U0001f4a1 Codex Review"
+CODEX_FINDING_BADGE_PREFIX = "**<sub><sub>"
+
+
+def is_codex_review_summary(body: str) -> bool:
+    """Return True if the body is a Codex formal-review
+    summary (Round-52).
+
+    Codex's newer automated review summaries start with
+    the ``### \U0001f4a1 Codex Review`` Markdown header.
+    A review with this prefix carries inline review
+    comments for the actual findings; the summary body
+    itself is not a finding.
+    """
+    if not body:
+        return False
+    return body.lstrip().startswith(CODEX_REVIEW_SUMMARY_PREFIX)
+
+
+def is_codex_finding_body(body: str) -> bool:
+    """Return True if the body looks like a Codex
+    inline review comment carrying a finding badge
+    (Round-52). Used to classify the summary-format
+    review body's inline comments.
+    """
+    if not body:
+        return False
+    return body.lstrip().startswith(CODEX_FINDING_BADGE_PREFIX)
+
 # Exact 40-character lowercase hex
 SHA_REGEX = re.compile(r"^[0-9a-f]{40}$")
 
@@ -1559,7 +1596,28 @@ def classify(
                 body_value = r.get("body", "") or ""
                 if state_value not in ("APPROVED", "COMMENTED"):
                     continue
-                if not is_codex_clean_pass_comment(body_value):
+                # Round-52: accept the older exact clean
+                # phrase OR the newer ``### 💡 Codex Review``
+                # summary format with no inline-finding
+                # marker in the body itself. The summary
+                # body itself never carries inline
+                # findings (those live in separate inline
+                # review comments), so this is a safe
+                # match for the clean case. A newer
+                # summary-format finding review will be
+                # caught by the ``newer_finding_after_
+                # clean_pass`` scan below because its
+                # body is NOT the exact clean phrase
+                # AND not the summary-with-clean prefix.
+                is_clean_phrase = is_codex_clean_pass_comment(body_value)
+                is_summary_format = (
+                    is_codex_review_summary(body_value)
+                    and not any(
+                        is_codex_finding_body(line)
+                        for line in body_value.splitlines()
+                    )
+                )
+                if not (is_clean_phrase or is_summary_format):
                     continue
                 ts = timestamp_field(
                     r, "submittedAt", "submitted_at", "createdAt", "created_at"
@@ -1744,9 +1802,28 @@ def classify(
                     if state_v in ("CHANGES_REQUESTED", "REQUEST_CHANGES"):
                         newer_finding_after_clean_pass = True
                         break
-                    if state_v in ("APPROVED", "COMMENTED") and not is_codex_clean_pass_comment(body):
-                        newer_finding_after_clean_pass = True
-                        break
+                    if state_v in ("APPROVED", "COMMENTED"):
+                        # Round-52: a newer review is a
+                        # finding iff its body is NEITHER
+                        # the exact clean phrase NOR the
+                        # summary-with-clean format. A
+                        # summary-format review whose
+                        # body contains an inline-finding
+                        # marker (rare; findings usually
+                        # live in inline review comments,
+                        # not in the summary body) is also
+                        # a finding.
+                        is_clean_phrase = is_codex_clean_pass_comment(body)
+                        is_summary_clean = (
+                            is_codex_review_summary(body)
+                            and not any(
+                                is_codex_finding_body(line)
+                                for line in body.splitlines()
+                            )
+                        )
+                        if not (is_clean_phrase or is_summary_clean):
+                            newer_finding_after_clean_pass = True
+                            break
 
         # ---- Inventory completeness gate (fail closed per poll) ----
         # All three Codex response surfaces are REQUIRED
