@@ -1646,42 +1646,53 @@ def classify(
                 # from prior heads do not invalidate a
                 # current-head clean pass.
                 if is_summary_format and review_threads:
-                    # Round-54 + Round-56 fix: veto
-                    # summary-format reviews whenever the
-                    # associated Codex inline finding
-                    # exists, regardless of whether the
-                    # thread is still active or has been
-                    # resolved. The presence of a Codex
-                    # inline thread NOT marked outdated
-                    # (i.e. anchored to the current head
-                    # or one of its ancestors) is
-                    # sufficient evidence that the
-                    # summary review carries a finding.
-                    # Without the resolved-thread check,
-                    # an operator who marks the current
-                    # head's Codex thread resolved before
-                    # a later clean re-review would see
-                    # ``clean_pass_detected=True`` for
-                    # the finding review, bypassing the
-                    # later unresolved-thread gate.
+                    # Round-54 + Round-56 + Round-57 fix:
+                    # veto summary-format reviews whenever
+                    # the associated Codex inline finding
+                    # exists AND is anchored to the SAME
+                    # commit as the review being evaluated.
+                    # Round-54 originally only checked
+                    # active threads. Round-56 extended to
+                    # resolved threads but was too
+                    # aggressive: a resolved thread from
+                    # an OLDER finding review on the same
+                    # head would veto a later CLEAN
+                    # re-review, even though the later
+                    # review has no inline findings. The
+                    # correct check ties the thread to
+                    # the review via the commit anchor:
+                    # a thread vetoes a clean review
+                    # only when ``originalCommitSha ==
+                    # commit_id`` (i.e. the thread was
+                    # opened by THIS specific review on
+                    # THIS specific commit). Threads
+                    # from earlier finding reviews on
+                    # older commits do NOT veto later
+                    # clean re-reviews.
                     # Outdated threads (explicitly
                     # marked as anchored to a prior head
                     # no longer reachable from the
                     # current head) are excluded so they
                     # don't invalidate a current-head
                     # clean pass.
-                    has_current_head_thread = False
-                    for t in review_threads:
-                        if (
-                            not bool(t.get("is_outdated", False))
-                            and t.get("author", "") in CODEX_BOT_LOGINS
-                        ):
-                            has_current_head_thread = True
-                            break
-                    if has_current_head_thread:
+                    review_commit = extract_review_commit_oid(r)
+                    has_same_anchor_thread = False
+                    if review_commit:
+                        for t in review_threads:
+                            if (
+                                not bool(t.get("is_outdated", False))
+                                and t.get("author", "") in CODEX_BOT_LOGINS
+                                and (
+                                    t.get("original_commit_sha", "")
+                                    == review_commit
+                                )
+                            ):
+                                has_same_anchor_thread = True
+                                break
+                    if has_same_anchor_thread:
                         # Summary review carries a
-                        # finding. Skip it as a clean
-                        # pass candidate.
+                        # finding on THIS commit. Skip
+                        # it as a clean pass candidate.
                         continue
                 ts = timestamp_field(
                     r, "submittedAt", "submitted_at", "createdAt", "created_at"

@@ -9877,3 +9877,163 @@ def _r56_active_thread(*, is_resolved=False, is_outdated=False, path="scripts/lo
             ],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Round-57 regression: do not let resolved old findings
+# veto clean re-reviews. The Round-56 fix was too
+# aggressive: a resolved thread from an OLDER finding
+# review on the same head would veto a later CLEAN
+# re-review, even though the later review has no inline
+# findings. The correct check ties the thread to the
+# review via the commit anchor: a thread vetoes a clean
+# review only when ``original_commit_sha ==
+# review.commit_id``.
+# ---------------------------------------------------------------------------
+
+
+def test_round57_clean_review_with_older_resolved_thread_accepted(monkeypatch, tmp_path):
+    """Bug repro: a clean summary-format review with
+    a RESOLVED Codex thread anchored to an OLDER
+    commit (a different review's inline finding) MUST
+    be detected as a clean pass. The thread is from
+    an earlier finding review and doesn't invalidate
+    the later clean re-review.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    # Older commit anchor for the earlier finding
+    # review's threads.
+    OLDER_COMMIT = "1111111111111111111111111111111111111111"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread anchored to an OLDER
+    # commit (not the clean review's commit).
+    resolved_old_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Old finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": OLDER_COMMIT},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_old_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-57 fix: a resolved thread anchored to "
+        "an OLDER commit MUST NOT veto a clean "
+        "re-review on the current head. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round57_clean_review_with_same_anchor_resolved_thread_rejected(monkeypatch, tmp_path):
+    """Round-57 invariant: a resolved thread anchored
+    to the SAME commit as the review being evaluated
+    STILL vetoes the clean pass. This is the Round-56
+    fix preserved — a thread opened by THIS specific
+    review on THIS specific commit is a finding
+    regardless of resolved state.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread anchored to the SAME
+    # commit as the review (this review's own inline
+    # finding that was resolved).
+    resolved_same_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "This review's finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-57 invariant: a resolved thread anchored "
+        "to the SAME commit as the review MUST still "
+        "veto the clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round57_source_contract_commit_anchor_match():
+    """Source-contract: the summary-format veto MUST
+    tie the thread to the review via commit anchor
+    equality (``original_commit_sha ==
+    extract_review_commit_oid(review)``). Static
+    source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The veto MUST use ``original_commit_sha`` (the
+    # flattened field name) and
+    # ``extract_review_commit_oid``.
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    veto_section = src[summary_idx:summary_idx + 5000]
+    assert "original_commit_sha" in veto_section, (
+        "Round-57 fix: the summary-format veto MUST "
+        "tie the thread to the review via the flattened "
+        "``original_commit_sha`` field. Found no "
+        "reference in veto section."
+    )
+    assert "extract_review_commit_oid" in veto_section, (
+        "Round-57 fix: the summary-format veto MUST "
+        "use ``extract_review_commit_oid`` to get the "
+        "review's commit anchor. Found no reference in "
+        "veto section."
+    )
