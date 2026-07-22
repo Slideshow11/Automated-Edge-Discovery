@@ -2889,6 +2889,27 @@ def _next_human_action(state: str) -> str:
     }.get(state, "Unknown state; rerun status.")
 
 
+def _head_moved_action() -> str:
+    """Round-55: ``next_human_action`` override used
+    when ``cmd_advance`` detects that the post-mutation
+    ``gh pr ready`` refresh saw a different ``headRefOid``
+    than the original ``head_sha``. This means a push
+    landed during the mutation, so the trusted-scope
+    and changed-file inputs bound to the OLD head are
+    stale. The operator must rebind scope to the new
+    head (``aed_pr scope-write``) and re-run
+    ``aed_pr advance`` so the readiness verdict uses
+    the current-head evidence.
+    """
+    return (
+        "A push landed during mark_pr_ready; the head "
+        "moved and the trusted scope / changed-file "
+        "inputs are stale. Rebind scope to the new "
+        "head (aed_pr scope-write --head-sha <new-sha>) "
+        "and re-run aed_pr advance."
+    )
+
+
 def _parse_scope_arg(value: Optional[str]) -> Optional[List[str]]:
     """Parse a comma-separated scope argument into a list of paths.
 
@@ -3860,7 +3881,21 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 if machine_verdict.machine_ready else None
             ),
             "required_authorization_phrase_if_ready": canonical_phrase,
-            "next_human_action": _next_human_action(state),
+            # Round-55 fix: when a ``post_mutation_refresh_
+            # head_moved`` diagnostic is present, override
+            # ``next_human_action`` to point the operator at
+            # rebinding scope to the new head. Without this
+            # override, the operator would see a generic
+            # ``_next_human_action(state)`` message that
+            # doesn't explain why the run produced a
+            # ``mark_pr_ready_refresh`` failure or what to
+            # do about it.
+            "next_human_action": _head_moved_action()
+            if any(
+                a.get("action") == "post_mutation_refresh_head_moved"
+                for a in actions_taken
+            )
+            else _next_human_action(state),
         }
         json.dump(out, sys.stdout, indent=2)
         sys.stdout.write("\n")
@@ -4178,13 +4213,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     state = derive_lifecycle_state(
                         machine_verdict, pr_view
                     )
-                except _HeadMovedDuringMutation:
-                    # Already recorded the diagnostic above.
-                    # Re-raise so the outer exception
-                    # handler treats this as a refresh
-                    # failure (no ``post_mutation_refresh``
-                    # success, no swap of snapshots).
-                    raise
                 except Exception as exc:
                     # Refetch failure is logged but does not
                     # fail the run: the mutation already
@@ -4192,6 +4220,26 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     # ``advance`` call will pick up the
                     # post-mutation state anyway. Operators
                     # see a diagnostic note in ``actions_taken``.
+                    #
+                    # Round-55 fix: the
+                    # ``_HeadMovedDuringMutation`` sentinel
+                    # raised above also falls through to this
+                    # branch. When the head moves during
+                    # ``mark_pr_ready``, the ``post_mutation_
+                    # refresh_head_moved`` diagnostic is
+                    # already in ``actions_taken`` (appended
+                    # before the raise). We do NOT want to
+                    # re-raise because ``cmd_advance`` has
+                    # no outer exception handler — a
+                    # traceback after the mutation would
+                    # exit with a non-zero return code and
+                    # NO JSON report, breaking automation
+                    # that consumes ``advance`` output for
+                    # recovery. The diagnostic + the
+                    # ``next_human_action`` field below
+                    # give the operator everything they
+                    # need to rebind scope to the new head
+                    # and re-run ``advance``.
                     actions_taken.append({
                         "action": "mark_pr_ready_refresh",
                         "ok": False,

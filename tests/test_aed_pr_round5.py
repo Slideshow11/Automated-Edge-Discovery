@@ -7474,3 +7474,86 @@ def test_round53_source_contract_head_moved_diagnostic():
         "refreshed_head against the original head_sha "
         "and reject the refresh when they differ."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-55 regression: when a push lands during
+# ``mark_pr_ready`` and the refreshed head differs
+# from the original ``head_sha``, ``cmd_advance`` MUST
+# NOT re-raise the ``_HeadMovedDuringMutation`` sentinel.
+# A re-raise would exit via a traceback with no JSON
+# report, breaking automation that consumes ``advance``
+# output for recovery. The diagnostic MUST be appended
+# (already done in Round-53) and the report MUST be
+# emitted with a ``next_human_action`` field pointing
+# the operator at rebinding scope to the new head.
+# ---------------------------------------------------------------------------
+
+
+def test_round55_source_contract_no_reraise_and_head_moved_action():
+    """Source-contract: the ``_HeadMovedDuringMutation``
+    except block MUST NOT re-raise. The report
+    builder MUST use ``_head_moved_action()`` as the
+    ``next_human_action`` override when the head-moved
+    diagnostic is present. Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The Round-53 ``except _HeadMovedDuringMutation: raise``
+    # pattern MUST NOT be present. A re-raise would
+    # exit with a traceback and no JSON report.
+    # We check for the exact Round-53 pattern.
+    assert "except _HeadMovedDuringMutation:" not in src or "raise" not in src.split(
+        "except _HeadMovedDuringMutation:", 1
+    )[1].split("except Exception", 1)[0], (
+        "Round-55 fix: cmd_advance must NOT re-raise "
+        "_HeadMovedDuringMutation. The diagnostic is "
+        "already appended before the raise; the "
+        "exception must fall through to the generic "
+        "except Exception handler so the JSON report is "
+        "emitted."
+    )
+    # The ``_head_moved_action`` override must exist
+    # and be referenced in the report builder.
+    assert "_head_moved_action" in src, (
+        "Round-55 fix: cmd_advance must use "
+        "_head_moved_action() as the next_human_action "
+        "override when the head-moved diagnostic is "
+        "present."
+    )
+    assert "post_mutation_refresh_head_moved" in src, (
+        "Round-53/Round-55: the diagnostic action name "
+        "must be referenced in cmd_advance."
+    )
+    # The ``_head_moved_action`` function must be
+    # defined at module level (not just inlined).
+    assert hasattr(ctrl, "_head_moved_action"), (
+        "Round-55 fix: _head_moved_action must be "
+        "defined at module level so it can be called "
+        "from cmd_advance."
+    )
+    msg = ctrl._head_moved_action()
+    assert "head" in msg.lower()
+    assert "rebind" in msg.lower() or "scope" in msg.lower(), (
+        "Round-55 fix: _head_moved_action message must "
+        f"guide the operator. Got: {msg!r}"
+    )
+
+
+def test_round55_head_moved_action_contains_actionable_steps():
+    """Round-55 invariant: the ``_head_moved_action``
+    message MUST contain actionable steps. A vague
+    message like 'head moved' is insufficient.
+    """
+    from scripts.local import aed_pr as ctrl
+    msg = ctrl._head_moved_action()
+    # Must mention the concrete next step.
+    assert "aed_pr scope-write" in msg, (
+        "Round-55 fix: _head_moved_action must name "
+        "the concrete rebinding step. Got: " + msg
+    )
+    assert "aed_pr advance" in msg, (
+        "Round-55 fix: _head_moved_action must name "
+        "the concrete re-run step. Got: " + msg
+    )
