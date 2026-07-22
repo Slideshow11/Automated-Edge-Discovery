@@ -2771,7 +2771,18 @@ def derive_lifecycle_state(verdict: R.ReadinessVerdict, pr_view: Dict[str, Any])
     if pr_view.get("state") == "MERGED":
         return "MERGED_PENDING_CLOSEOUT"
     if pr_view.get("state") == "CLOSED":
-        return "COMPLETE"
+        # Round-50 fix: distinguish unmerged closed PRs
+        # from the post-merge closeout path. A PR that
+        # was closed without being merged is NOT
+        # ``COMPLETE`` — no merge occurred, so there
+        # is nothing to close out. Return ``BLOCKED``
+        # with a clear ``PR_NOT_MERGED`` reason so the
+        # operator sees the abandoned/accidentally
+        # closed state instead of a misleading
+        # ``COMPLETE`` signal that would tell them
+        # ``No further action``. A genuine closeout
+        # must come through the ``MERGED`` branch.
+        return "BLOCKED"
     # Round-2 fix: machine readiness is the canonical signal for the
     # operator-facing lifecycle state. ``verdict.ready`` mirrors
     # ``merge_ready`` (machine AND authorization), which can never be

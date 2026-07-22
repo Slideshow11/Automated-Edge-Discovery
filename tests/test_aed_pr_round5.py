@@ -7138,3 +7138,219 @@ class TestRound45MarkPrReadyRefreshesPrState:
             "does not contain 'if ok_ready:'. "
             f"between={between[:300]!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-50 regression: an unmerged CLOSED PR must NOT be
+# reported as ``COMPLETE``. The Round-50 finding
+# (PRRC_kwDOSHFpYM7X… — db_id ``3627617282``, review
+# ``4751183218`` on head ``c145637``) reported that
+# ``derive_lifecycle_state`` returned ``COMPLETE`` for any
+# PR with ``state == "CLOSED"`` regardless of whether the
+# PR was actually merged. An abandoned or accidentally
+# closed PR is NOT a successful closeout: there is no
+# merge to close out, and ``COMPLETE`` would tell the
+# operator ``No further action`` even though the
+# evaluator is simultaneously blocking with
+# ``PR_NOT_OPEN``.
+#
+# The fix returns ``BLOCKED`` for unmerged CLOSED PRs so
+# the abandoned/accidentally-closed state is visibly
+# blocked instead of misleadingly finished. The genuine
+# post-merge closeout path is the ``state == "MERGED"``
+# branch which returns ``MERGED_PENDING_CLOSEOUT`` (and
+# ``cmd_advance`` short-circuits to ``COMPLETE``).
+# ---------------------------------------------------------------------------
+
+
+def _r50_verdict():
+    """Build a minimal ``ReadinessVerdict`` for the
+    Round-50 ``derive_lifecycle_state`` tests. The
+    verdict content is irrelevant — the Round-50 branch
+    keys off ``pr_view.state`` alone, not the verdict.
+    """
+    import scripts.local.aed_pr_readiness as R
+    return R.ReadinessVerdict(
+        ready=False,
+        reasons=[],
+        gates_passed=[],
+        gates_failed=[],
+        machine_ready=False,
+        authorization_required=False,
+        authorization_valid=None,
+    )
+
+
+class TestRound50UnmergedClosedPrIsBlocked:
+    """Round-50: an unmerged CLOSED PR must NOT be
+    reported as ``COMPLETE``.
+    """
+
+    PR_VIEW_CLOSED_NOT_MERGED = {
+        "state": "CLOSED",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        # No ``mergedAt`` field — the PR was closed without
+        # being merged. The live ``mergeCommit`` is null.
+        "mergedAt": None,
+        "mergeCommit": None,
+    }
+
+    PR_VIEW_CLOSED_WITH_MERGED_AT = {
+        # A PR that GitHub reports as CLOSED but that has a
+        # ``mergedAt`` timestamp is the genuine post-merge
+        # closeout path. ``derive_lifecycle_state`` should
+        # route this through the ``MERGED`` branch via the
+        # ``cmd_advance`` short-circuit, but
+        # ``derive_lifecycle_state`` itself only inspects
+        # ``state``, not ``mergedAt``. This test pins the
+        # current contract: ``state == "CLOSED"`` maps to
+        # ``BLOCKED`` regardless of ``mergedAt``. The
+        # ``cmd_advance`` short-circuit handles the
+        # post-merge case independently.
+        "state": "CLOSED",
+        "isDraft": False,
+        "mergeable": "MERGEABLE",
+        "mergedAt": "2026-07-21T03:00:00Z",
+        "mergeCommit": {"oid": "1" * 40},
+    }
+
+    def test_unmerged_closed_pr_is_blocked_not_complete(self):
+        """Bug repro: a CLOSED PR without a merge was
+        being reported as ``COMPLETE``. The Round-50 fix
+        returns ``BLOCKED`` instead, so the operator
+        sees the abandoned/accidentally-closed state
+        instead of a misleading ``COMPLETE``.
+        """
+        from scripts.local import aed_pr as ctrl
+        v = _r50_verdict()
+        state = ctrl.derive_lifecycle_state(
+            v, self.PR_VIEW_CLOSED_NOT_MERGED,
+        )
+        assert state != "COMPLETE", (
+            "Round-50 fix: an unmerged CLOSED PR must NOT "
+            "be reported as COMPLETE. Got "
+            f"lifecycle_state={state!r}."
+        )
+        assert state == "BLOCKED", (
+            "Round-50 fix: an unmerged CLOSED PR must be "
+            "reported as BLOCKED so the operator sees the "
+            "abandoned/accidentally-closed state. Got "
+            f"lifecycle_state={state!r}."
+        )
+
+    def test_closed_pr_with_merge_metadata_also_blocked_by_lifecycle(self):
+        """Even a CLOSED PR with ``mergedAt`` set is
+        routed through the ``BLOCKED`` branch by
+        ``derive_lifecycle_state`` (which only inspects
+        ``state``). The post-merge closeout path is
+        handled by ``cmd_advance``'s separate
+        ``state == "MERGED"`` short-circuit, which runs
+        BEFORE ``derive_lifecycle_state``. This test pins
+        the contract so a future change to
+        ``derive_lifecycle_state`` cannot silently
+        return ``COMPLETE`` for a CLOSED PR.
+        """
+        from scripts.local import aed_pr as ctrl
+        v = _r50_verdict()
+        state = ctrl.derive_lifecycle_state(
+            v, self.PR_VIEW_CLOSED_WITH_MERGED_AT,
+        )
+        assert state == "BLOCKED", (
+            "Round-50 fix: derive_lifecycle_state must "
+            "return BLOCKED for any CLOSED PR; the "
+            "post-merge closeout path is handled by "
+            "cmd_advance's MERGED short-circuit, not by "
+            f"derive_lifecycle_state. Got {state!r}."
+        )
+
+    def test_merged_pr_still_reaches_pending_closeout(self):
+        """Regression guard: the Round-50 fix MUST NOT
+        break the MERGED branch. A genuine MERGED PR
+        still maps to ``MERGED_PENDING_CLOSEOUT`` so
+        ``cmd_advance``'s short-circuit (which runs
+        BEFORE ``derive_lifecycle_state``) can emit the
+        promised ``COMPLETE`` closeout report.
+        """
+        from scripts.local import aed_pr as ctrl
+        v = _r50_verdict()
+        state = ctrl.derive_lifecycle_state(
+            v,
+            {
+                "state": "MERGED",
+                "isDraft": False,
+                "mergeable": "MERGEABLE",
+                "mergedAt": "2026-07-21T03:00:00Z",
+                "mergeCommit": {"oid": "1" * 40},
+            },
+        )
+        assert state == "MERGED_PENDING_CLOSEOUT", (
+            "Round-50 regression: MERGED PRs must still "
+            f"map to MERGED_PENDING_CLOSEOUT. Got {state!r}."
+        )
+
+    def test_open_pr_unaffected(self):
+        """Regression guard: the Round-50 fix MUST NOT
+        change the OPEN PR mapping. An OPEN draft PR
+        still routes through the normal readiness path.
+        """
+        from scripts.local import aed_pr as ctrl
+        v = _r50_verdict()
+        state = ctrl.derive_lifecycle_state(
+            v,
+            {
+                "state": "OPEN",
+                "isDraft": True,
+                "mergeable": "MERGEABLE",
+            },
+        )
+        # An OPEN draft PR with an empty verdict falls
+        # through to the ``ACTION_REQUIRED`` /
+        # ``BLOCKED`` paths via the readiness logic. The
+        # exact state depends on the verdict's reason
+        # codes, but it MUST NOT be ``COMPLETE``.
+        assert state != "COMPLETE", (
+            "Round-50 regression: an OPEN PR must not "
+            f"map to COMPLETE. Got {state!r}."
+        )
+
+    def test_source_contract_closed_branch_returns_blocked(self):
+        """Source-contract test: the ``state == "CLOSED"``
+        branch in ``derive_lifecycle_state`` MUST return
+        ``BLOCKED`` (not ``COMPLETE``). A naive substring
+        check on ``return "BLOCKED"`` would also match
+        other branches; we anchor on the CLOSED branch by
+        verifying that the substring
+        ``"COMPLETE"`` does NOT appear as a return value
+        in the source between the
+        ``state == "CLOSED"`` line and the next
+        lifecycle-state return.
+        """
+        import inspect
+        from scripts.local import aed_pr as ctrl
+        src = inspect.getsource(ctrl.derive_lifecycle_state)
+        # Find the CLOSED branch.
+        closed_idx = src.find('pr_view.get("state") == "CLOSED"')
+        assert closed_idx > 0, (
+            "Round-50 fix: derive_lifecycle_state must "
+            "have a state == 'CLOSED' branch."
+        )
+        # Slice from the CLOSED branch forward and verify
+        # that the next ``return "<state>"`` statement
+        # returns ``BLOCKED``, not ``COMPLETE``.
+        rest = src[closed_idx:]
+        # Find the first ``return "..."`` after the
+        # CLOSED branch.
+        import re
+        m = re.search(r'return\s+"([A-Z_]+)"', rest)
+        assert m is not None, (
+            "Round-50 source-contract: the CLOSED branch "
+            "must have a return statement."
+        )
+        returned_state = m.group(1)
+        assert returned_state == "BLOCKED", (
+            "Round-50 fix: the CLOSED branch in "
+            "derive_lifecycle_state must return BLOCKED, "
+            f"not {returned_state!r}. An unmerged CLOSED "
+            "PR must not be reported as COMPLETE."
+        )
