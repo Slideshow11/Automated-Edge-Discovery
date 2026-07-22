@@ -30,9 +30,12 @@ Recent external and internal reviews converge on the same picture.
   is now decidable via two complementary checkers
   (`check_stale_review_thread_resolution.py` and
   `check_current_bot_thread_resolution.py`).
-- Exact-head merge. `check_merge_authorization.py` requires a human
-  phrase including the exact full 40-character SHA.
-  `gh pr merge --match-head-commit` is the only allowed merge form.
+- Exact-head merge. `scripts/local/aed_pr.py merge` (canonical
+  controller) requires the human phrase including the exact full
+  40-character SHA and re-fetches live state immediately before
+  executing. `gh pr merge --match-head-commit` is the only allowed
+  merge form. See `docs/aed_pr_canonical_guide.md` for the active
+  operator path.
 - Fail-closed. Every unhandled case returns a `HOLD_*` state, never a
   permissive default.
 
@@ -94,10 +97,10 @@ This diagnosis is consistent with the existing
   `check_current_bot_thread_resolution.py`).
 
 **Merge authority is the guarded flow, never the worker.** The merge
-step requires three things to all be true:
-1. The machine-checked final gate ran and returned a `MERGE_READY`
-   recommendation (via `scripts/local/aed_final_gate.py`).
-2. `scripts/local/merge_pr_safely.py` produced the exact safe merge
+step is performed by the canonical controller `scripts/local/aed_pr.py`
+which requires three things to all be true:
+1. The merged live state returned `READY_FOR_MERGE_AUTHORIZATION`.
+2. `scripts/local/aed_pr.py merge` produced the exact safe merge
    command (`gh pr merge <PR> --repo <repo> --squash --delete-branch
    --match-head-commit <sha>`) and `--admin` is never present.
 3. The operator's authorization phrase includes the exact full 40-char SHA,
@@ -142,7 +145,8 @@ These invariants are also enforced mechanically where possible:
 - `validate_ci_workflow_invariants.py` checks 17 CI YAML invariants.
 - `scope_guard.py` checks allowed/forbidden file lists.
 - `check_persistent_mutation_guard.py` checks Hermes tree diff.
-- `check_merge_authorization.py` checks exact-SHA + phrase.
+- `scripts/local/aed_pr.py merge` (canonical controller) checks
+  exact-SHA authorization + argv safety + live evidence.
 
 The PR review checklist (Appendix D of
 `/home/max/aed-reviews/2026-06-01/aed-autocoder-full-writeup.md`) maps
@@ -160,10 +164,10 @@ The current intended role assignment:
 | **Long-running implementation worker** | Claude Code | **Only inside harness, only when 12+10+22 readiness gate is fully implemented** |
 | **Long-running implementation worker (alt)** | Open-weight model (e.g. Llama 3 70B) | **Only inside harness, only when ExecutionBackend contract supports it** |
 | **Auditor** | M3 (MiniMax-M3) | Read-only analysis, evidence generation, gate evaluation |
-| **Gate runner** | Humphry / M3 | Runs `aed_final_gate.py` (machine-checked final gate), `wait_for_pr_ready.py`, `scope_guard`, PMG, then `merge_pr_safely.py` to emit the safe merge command |
+| **Gate runner** | Humphry / M3 | Runs the canonical controller `scripts/local/aed_pr.py status` and `advance`; delegates merge-command emission to `scripts/local/aed_pr.py merge` with `merge_pr_safely.py` retained as the verified-by-CI live-readiness surface |
 | **PR controller** | Humphry / M3 | Watches PR state, runs deterministic checks, emits gate state |
-| **Merge authority** | Guarded flow | `aed_final_gate.py` (machine-checked MERGE_READY) + `merge_pr_safely.py` (safe merge-command emitter) + `check_merge_authorization.py` + human phrase + `--match-head-commit` |
-| **Merge executor** | Human (operator) | Runs `gh pr merge` after gate authorizes |
+| **Merge authority** | Canonical controller | `scripts/local/aed_pr.py merge` re-fetches live state, validates the canonical human phrase, and executes the squash merge with `--match-head-commit` |
+| **Merge executor** | Human (operator) | Speaks the canonical authorization phrase; canonical controller performs the `gh pr merge` |
 
 **Model output is never trusted without deterministic checks.** Every
 model-produced artifact (patch, evidence packet, gate state) is

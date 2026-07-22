@@ -361,7 +361,15 @@ class TestOutputInsideRepo:
             return True
         monkeypatch.setattr(aptb, "_git_status_clean", mock_clean)
 
-        # Call main() with output inside REPO_ROOT
+        # Call main() with output inside REPO_ROOT. ``aptb.main``
+        # returns the HOLD_OUTPUT_INSIDE_REPO result without
+        # writing any file, but downstream tests (notably
+        # ``tests/test_run_autocoder_eval_corpus.py``) run in the
+        # repository root and have been observed to inherit
+        # leftover artifacts from this test. The artifact is
+        # already in ``.gitignore``; we additionally clean it up
+        # via ``try/finally`` so the test does not contaminate the
+        # repository root.
         output_json = REPO_ROOT / "test_apply_output.json"
         try:
             # Override parse_args via monkeypatch
@@ -382,6 +390,15 @@ class TestOutputInsideRepo:
             aptb.main()
         except SystemExit:
             pass
+        finally:
+            # Remove any artifact left behind by the controller's
+            # call path. The artifact is also in ``.gitignore``,
+            # but try/finally guarantees the next test in the
+            # same session does not inherit it.
+            try:
+                output_json.unlink(missing_ok=True)
+            except (OSError, TypeError):
+                pass
 
         # Verify the check works
         inside = aptb._path_inside_repo(output_json, REPO_ROOT)

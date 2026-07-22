@@ -156,6 +156,55 @@ class TestCoordinationCommentSkip(unittest.TestCase):
             "Nudge to @codex — please re-review."
         ))
 
+    def test_is_coordination_comment_detects_codex_automated_review_request(self):
+        """Regression: the initial Codex-review request posted
+        by the PR author begins with the exact phrase
+        ``Codex automated review request`` and must be
+        recognized as a coordination message, not a finding."""
+        self.assertTrue(crc.is_coordination_comment(
+            "Codex automated review request for PR #411.\n\n"
+            "Repository: Slideshow11/Automated-Edge-Discovery\n"
+            "PR: #411\n"
+            "Branch: reduction/pr-lifecycle-collapse-v1\n"
+            "Exact head SHA: 0413708ea63b5dcb13743eeb718f53ca3c45a456\n"
+        ))
+
+    def test_human_codex_request_issue_comment_not_classified(self):
+        """The exact blocker from PR #411 on a1c7322: a human
+        issue comment by the PR author issuing a fresh Codex
+        review request must not produce a finding."""
+        item = {
+            "user": {"login": "Slideshow11"},
+            "body": (
+                "Codex automated review request for PR #411.\n\n"
+                "Repository: Slideshow11/Automated-Edge-Discovery\n"
+                "PR: #411\n"
+                "Branch: reduction/pr-lifecycle-collapse-v1\n"
+                "Exact head SHA: 0413708ea63b5dcb13743eeb718f53ca3c45a456\n"
+                "\n"
+                "SCOPE\n"
+                "=====\n"
+                "Additions (net new code):\n"
+                "  + scripts/local/aed_pr.py\n"
+                "\n"
+                "THE KNOWN REGRESSION THAT REQUIRES YOUR ATTENTION\n"
+                "=================================================\n"
+                "The current aed_pr.py merge command is a stub.\n"
+                "Changed-file scope is missing. Stale Codex threads\n"
+                "from the previous round remain. No malformed\n"
+                "evidence was skipped.\n"
+            ),
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(
+            got, [],
+            "Human 'Codex automated review request...' issue "
+            "comment must not be classified as a finding even "
+            "when its body contains 'stale' / 'malformed' / "
+            "'missing' / 'skip' past the leading 100 chars."
+        )
+
     def test_is_coordination_comment_case_insensitive(self):
         self.assertTrue(crc.is_coordination_comment(
             "RE-REQUESTING codex review."
@@ -4771,6 +4820,353 @@ class TestCodexIgnoreSafeguard(unittest.TestCase):
                             with mock.patch.object(crc, "gh_pr_view", return_value=(True, {"headRefOid": "deadbeef" * 5, "state": "OPEN", "url": ""}, "")):
                                 rc = crc.main()
         self.assertEqual(rc, 0, "Non-codex ignore must not be blocked by the safeguard")
+
+
+class TestCodexTaskSummaryIssueComment(unittest.TestCase):
+    """Regression: Codex bot-authored issue-comments whose body
+    begins with the canonical ``### Summary`` Markdown H3 token
+    are task-summary posts (not review verdicts). The
+    review-comment-gate MUST NOT classify them as
+    ``UNSPECIFIED_BLOCKING`` current-head blockers when their
+    body incidentally contains blocking vocabulary such as
+    ``stale`` / ``malformed`` / ``blocking``.
+
+    The bug was: real Codex task-summary posts describe work
+    the bot performed, including phrases like
+    ``...malformed, non-CI, non-push-success, push-only, or
+    otherwise ambiguous records remain blocking.``. The
+    ``is_blocking(combined)`` heuristic matched the literal
+    ``malformed`` and ``blocking`` words, escalating severity
+    to ``UNSPECIFIED_BLOCKING`` even though the post is a
+    coordination / informational message about prior work,
+    not a current code-review finding.
+
+    The fix introduces
+    :func:`crc._is_codex_task_summary_issue_comment` which
+    detects the structural Codex task-summary shape
+    (issue-comment + Codex bot author + leading ``### Summary``
+    Markdown H3) and downgrades severity to
+    ``UNSPECIFIED_INFO``.
+    """
+
+    TASK_SUMMARY_BODY = (
+        "### Summary\n\n"
+        "* Updated fetch_ci_conclusions to request event from "
+        "gh pr checks, enabling event-bound CI evidence for "
+        "review-comment-gate.\n"
+        "* Added narrow filtering for the known skipped push "
+        "duplicate: it is ignored only when a real workflow=CI, "
+        "event=pull_request review-comment-gate record exists; "
+        "malformed, non-CI, non-push-success, push-only, or "
+        "otherwise ambiguous records remain blocking.\n"
+        "\n"
+        "**Commit**\n\n"
+        "* New commit SHA: eb0129db3ac543c5ba705a0eb6d5435a1d40c206\n"
+        "\n"
+        "**Testing**\n\n"
+        "* python3 -m pytest tests/ -q - 1056 passed.\n"
+        "* git push - could not push because this checkout has "
+        "no configured push destination/remote.\n"
+        "\n"
+        " [View task ->](https://chatgpt.com/s/cd_xxx)\n"
+    )
+
+    CODEX_REVIEW_VERDICT_BODY = (
+        "Codex Review: Didn't find any major issues. Bravo.\n\n"
+        "**Reviewed commit:** e3f321c665b7105d9ab8544367b434d628aedccb\n\n"
+        "<details> ...</details>\n"
+    )
+
+    def test_detect_task_summary_shape(self):
+        """The detector returns True for a Codex task-summary
+        issue-comment (Codex bot + ``### Summary`` H3 + non-PR
+        body)."""
+        self.assertTrue(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "issue_comment",
+                self.TASK_SUMMARY_BODY,
+            ),
+            "Codex task-summary issue-comment must be detected",
+        )
+        # Login without the bot suffix also matches
+        self.assertTrue(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector", "issue_comment",
+                self.TASK_SUMMARY_BODY,
+            ),
+        )
+        # Leading newline before ``### Summary`` still matches
+        self.assertTrue(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "issue_comment",
+                "\n" + self.TASK_SUMMARY_BODY,
+            ),
+        )
+
+    def test_does_not_detect_clean_codex_review_verdict(self):
+        """A clean Codex ``Codex Review:`` verdict must NOT be
+        detected as a task-summary (clean verdicts are real
+        signals and MUST keep the normal pipeline)."""
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "issue_comment",
+                self.CODEX_REVIEW_VERDICT_BODY,
+            ),
+        )
+
+    def test_does_not_detect_human_author(self):
+        """A human-authored issue-comment with a task-summary
+        shape is unaffected; the detector is bot-scoped."""
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "alice", "issue_comment", self.TASK_SUMMARY_BODY,
+            ),
+        )
+
+    def test_does_not_detect_codex_review_thread_comment(self):
+        """A Codex review-thread comment (source_kind !=
+        'issue_comment') is unaffected. The detector is
+        source-scoped."""
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "inline_review_comment",
+                self.TASK_SUMMARY_BODY,
+            ),
+        )
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "per_review_comment",
+                self.TASK_SUMMARY_BODY,
+            ),
+        )
+
+    def test_does_not_detect_bumping_review_thread_comment(self):
+        """A Codex review-thread comment that begins with
+        ``Bumping`` (the AQ scenario) must NOT be detected as a
+        task-summary. The detector is specifically anchored on
+        the ``### Summary`` Markdown H3 token, not on
+        coordination prefixes."""
+        # Synthetic AQ scenario rendered as a review-thread
+        # comment (which is where real Codex AQ findings
+        # surface).
+        body = (
+            "Bumping the retry counter can fail when Codex "
+            "reruns after a stale head"
+        )
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "inline_review_comment",
+                body,
+            ),
+        )
+        # Same body but as an issue-comment would still NOT be
+        # detected because the leading Markdown H3 ``### Summary``
+        # token is the only structural discriminator.
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "chatgpt-codex-connector[bot]", "issue_comment",
+                body,
+            ),
+        )
+
+    def test_classify_task_summary_downgrades_to_info(self):
+        """End-to-end: a Codex task-summary issue-comment whose
+        body contains ``malformed`` and ``blocking`` must be
+        classified as ``UNSPECIFIED_INFO`` (not blocking) and
+        must still be emitted so inventory remains complete.
+        """
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": self.TASK_SUMMARY_BODY,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1,
+                         "Task-summary comment must still be emitted")
+        self.assertEqual(
+            got[0]["severity"], "UNSPECIFIED_INFO",
+            "Codex task-summary issue-comment must NOT escalate "
+            "to UNSPECIFIED_BLOCKING despite containing "
+            "BLOCKING_WORDS vocabulary",
+        )
+
+    def test_classify_clean_codex_review_verdict_unchanged(self):
+        """End-to-end: a clean Codex ``Codex Review:`` verdict
+        must keep its normal classification (UNSPECIFIED_INFO
+        with the canonical clean-pass shape).
+        """
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": self.CODEX_REVIEW_VERDICT_BODY,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+
+    def test_classify_human_task_summary_unchanged(self):
+        """End-to-end: a human-authored issue-comment whose body
+        incidentally contains BLOCKING_WORDS vocabulary must
+        keep the existing classifier behaviour
+        (UNSPECIFIED_BLOCKING when applicable). The fix is
+        Codex-bot-scoped; human-authored comments are
+        unaffected.
+        """
+        body = (
+            "### Summary\n\n"
+            "* I ran the test and got a malformed checkpoint "
+            "which means we have a stale state in the test "
+            "fixture; this is blocking the gate.\n"
+        )
+        item = {
+            "user": {"login": "alice"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        # The body mentions blocking vocabulary but the human
+        # author is not the Codex bot; the detector does NOT
+        # match. The classifier may or may not classify as
+        # UNSPECIFIED_BLOCKING depending on the leading-100
+        # detector. The contract being tested here is: human
+        # authors are not short-circuited by the task-summary
+        # detector.
+        self.assertFalse(
+            crc._is_codex_task_summary_issue_comment(
+                "alice", "issue_comment", body,
+            ),
+            "Human-authored issue-comment must not be "
+            "classified by the Codex task-summary detector",
+        )
+
+    def test_classify_aq_finding_inline_review_comment_still_blocking(self):
+        """End-to-end regression: the original Codex AQ scenario
+        is a review-thread comment, not an issue-comment, so
+        the task-summary detector does NOT short-circuit it.
+        The AQ finding body
+        ``Bumping the retry counter can fail when Codex reruns
+        after a stale head`` retains its
+        UNSPECIFIED_BLOCKING classification.
+        """
+        body = (
+            "Bumping the retry counter can fail when Codex "
+            "reruns after a stale head"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "inline_review_comment", set())
+        self.assertGreaterEqual(len(got), 1)
+        self.assertIn(
+            got[0]["severity"], ("UNSPECIFIED_BLOCKING", "P2"),
+            "AQ scenario on inline_review_comment must remain "
+            "blocking after the fix",
+        )
+
+    def test_task_summary_with_p1_token_in_body_is_info(self):
+        """Round-37 regression: a Codex task-summary issue-comment
+        whose body mentions a prior ``P1`` finding it fixed must
+        still be classified as ``UNSPECIFIED_INFO``, not as the
+        mentioned severity."""
+        body = (
+            "### Summary\n\n"
+            "* Addressed the prior P1 stale-state regression in "
+            "fetch_ci_conclusions by binding required-check evidence "
+            "to the exact-head pull_request run.\n"
+            "* Fixed the P2 malformed-event fail-closed path.\n"
+            "\n"
+            "**Commit**\n\n"
+            "* New commit SHA: eb0129db3ac543c5ba705a0eb6d5435a1d40c206\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(
+            got[0]["severity"], "UNSPECIFIED_INFO",
+            "Task-summary override must cap severity even with P1/P2 tokens",
+        )
+
+    def test_task_summary_with_colon_declaration_is_info(self):
+        """Round-37 regression: Codex task-summary with ``P2:``
+        colon-declaration form must still be classified as
+        UNSPECIFIED_INFO."""
+        body = (
+            "### Summary\n\n"
+            "* P2: addressed the prior blocking-vocabulary classifier bug.\n"
+            "\n"
+            "**Commit**\n\n"
+            "* New commit SHA: abc1234567abcdef.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+
+    def test_task_summary_with_text_alias_high_is_info(self):
+        """Round-37 regression: Codex task-summary with text-alias
+        ``high severity`` describing a prior fix must still be
+        classified as UNSPECIFIED_INFO."""
+        body = (
+            "### Summary\n\n"
+            "* Addressed the high severity regression from the prior "
+            "review-cycle fix.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+
+    def test_non_task_summary_with_p_token_still_blocking(self):
+        """Round-37 guard: when the body is NOT a Codex task-summary,
+        the extracted P-token severity MUST still be honored. Only
+        the task-summary detector path is capped."""
+        body = (
+            "Bumping the retry counter - the prior P1 stale-state "
+            "regression has resurfaced and is blocking CI again."
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "P1")
+
+    def test_task_summary_classification_does_not_suppress_emit(self):
+        """Round-37 invariant: the task-summary cap downgrades
+        severity but MUST still emit the comment so the inventory
+        remains complete."""
+        body = (
+            "### Summary\n\n"
+            "* Fixed the P1 stale-state bug in some_module.\n"
+        )
+        item = {
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": body,
+            "state": "",
+        }
+        got = crc.classify_item(item, "issue_comment", set())
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["severity"], "UNSPECIFIED_INFO")
+        self.assertEqual(got[0]["user"], "chatgpt-codex-connector[bot]")
+        self.assertIn("P1", got[0]["body"])
+
+
 
 
 if __name__ == "__main__":

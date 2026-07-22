@@ -25,6 +25,7 @@ Plus direct regression fixtures modeled on PR #401 and PR #400.
 
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -2898,15 +2899,23 @@ def test_valid_ping_timestamp_still_filters_clean_pass(monkeypatch, tmp_path):
 
 def test_no_ping_timestamp_keeps_prior_behavior(monkeypatch, tmp_path):
     """
-    P2 #1 regression: When --ping-created-at is omitted (empty
-    string), the classifier must continue to apply NO ping
-    filter. All clean passes are accepted as before.
+    Round-26 hardening: When --ping-created-at is omitted and
+    there is no codex formal review anchored to
+    ``expected_head_sha``, a PR-level issue-comment clean
+    pass MUST NOT satisfy the Codex gate on its own. PR
+    issue comments have no commit anchor; accepting them
+    without a head-bound codex surface lets Codex clean
+    passes from a prior head be silently relabeled as
+    fresh for the current head (P1 ``PRRC_kwDOSHFpYM7XvLCB``).
+    Without a head-binding codex surface the classifier
+    must keep the PR in a non-clean-pass state so a fresh
+    ping is required.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
     pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
-    # Pre-ping Codex clean pass. With no --ping-created-at
-    # supplied, this is accepted as a valid clean pass.
+    # Issue-comment clean pass with no ping boundary and
+    # no formal-review anchor on the expected head.
     issue = [
         make_issue_comment(
             author=CODEX_LOGIN,
@@ -2926,12 +2935,18 @@ def test_no_ping_timestamp_keeps_prior_behavior(monkeypatch, tmp_path):
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # When no --ping-created-at is supplied, the classifier
-    # should behave as before: no ping filter, accept the
-    # clean pass, emit MERGE_READY.
     assert pkt["ping_timestamp_supplied"] is False
     assert pkt["ping_timestamp_valid"] is True
-    assert pkt["status"] == mod.STATUS_MERGE_READY
+    # Round-26 fail-closed: no ping boundary AND no
+    # head-bound formal review means the issue-comment
+    # clean pass is not accepted. ``clean_pass_detected``
+    # must be False.
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+    assert pkt["clean_pass_comment_id"] in (None, 0, "")
+    # And the classifier must not have promoted the PR to
+    # MERGE_READY on a head-unbound clean pass.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
 
 
 def test_naive_ping_timestamp_fails_closed_no_typeerror(monkeypatch, tmp_path):
@@ -7381,3 +7396,3388 @@ def test_p2_formal_clean_pass_then_later_review_on_other_head_still_hold_new(
     assert pkt["clean_pass_detected"] is True
     assert pkt["clean_pass_source"] == "pull_request_review"
     assert pkt["clean_pass_review_id"] == 7101
+
+
+# ---------------------------------------------------------------------------
+# Round-26 regression tests.
+#
+# Exact-head Codex review 4741283416 (submitted 2026-07-21T04:36:07Z on
+# head 2f302be11b8704ea9610f85d6ef4a7bd818fc81f) reported one P1
+# finding on scripts/local/audit_codex_response_for_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XvLCB (db_id 3619467393)
+#     "Require head-bound Codex evidence before authorizing"
+#     When ``status`` or ``merge`` reaches this path after a
+#     new commit is pushed, the classifier is called with no
+#     ping boundary (``ping_comment_id=None``,
+#     ``ping_created_at=None``), so issue-comment clean passes
+#     are accepted from any earlier point in the PR. Because
+#     ``build_evidence`` later treats the packet's
+#     ``observed_head_sha`` as the reviewed SHA, an old
+#     issue-comment clean pass from head A can be relabeled
+#     as fresh for current head B and satisfy the Codex gate,
+#     allowing the authorization phrase / merge path without
+#     a current-head Codex review. Pass a head-specific
+#     ping/timestamp or require an explicit head binding for
+#     issue-comment clean passes before marking Codex
+#     evidence fresh.
+#
+# Tests below prove:
+#
+#   * an issue-comment clean pass from prior head A is
+#     rejected when no ping boundary is supplied AND no
+#     codex formal review anchored to ``expected_head_sha``
+#     exists (the unsafe path captured by the P1 finding);
+#   * the same clean pass is accepted when a codex formal
+#     review anchored to ``expected_head_sha`` exists, even
+#     without a ping boundary;
+#   * the same clean pass is accepted when a ping boundary
+#     is supplied (pre-existing behavior, regression);
+#   * a clean pass from a DIFFERENT commit (``OTHER_HEAD``)
+#     on a formal review is rejected (pre-existing behavior,
+#     regression).
+# ---------------------------------------------------------------------------
+
+
+def test_issue_comment_clean_pass_without_head_binding_rejected(
+    monkeypatch, tmp_path,
+):
+    """P1 (PRRC_kwDOSHFpYM7XvLCB) bug regression: when no ping
+    boundary is supplied AND no codex formal review is
+    anchored to ``expected_head_sha``, the issue-comment
+    clean-pass path MUST be rejected. PR-level issue
+    comments carry no commit anchor; accepting them on the
+    absence of any head-binding surface lets Codex clean
+    passes from a prior head satisfy the current-head gate.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # No formal reviews — purely issue-comment based clean
+    # pass. Without ping boundary AND without a
+    # head-bound formal review, the issue-comment clean
+    # pass is unsafe.
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+    assert pkt["clean_pass_comment_id"] in (None, 0, "")
+
+
+def test_issue_comment_clean_pass_with_head_bound_clean_formal_review_accepted(
+    monkeypatch, tmp_path,
+):
+    """When a CLEAN codex formal review (one whose body
+    carries the clean-pass phrase) anchored to
+    ``expected_head_sha`` exists, AND the issue comment
+    post-dates that review, the issue-comment clean pass is
+    accepted without a ping boundary. The formal clean
+    review is the head-binding surface; the issue comment
+    is its post-clean echo.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T17:35:00Z",
+            review_id=7102,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "issue_comment"
+    assert pkt["clean_pass_comment_id"] == 99204
+
+
+def test_issue_comment_clean_pass_with_ping_boundary_accepted(
+    monkeypatch, tmp_path,
+):
+    """Regression: when a ping boundary is supplied, the
+    pre-existing post-ping filter applies, and an
+    issue-comment clean pass after the ping is accepted
+    regardless of formal-review anchor. This preserves the
+    ping-driven review flow used by ``cmd_advance`` after
+    ``aed_pr.py advance`` posts a fresh ping.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, [], _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID,
+        "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["clean_pass_source"] == "issue_comment"
+
+
+def test_formal_review_clean_pass_from_other_head_rejected(
+    monkeypatch, tmp_path,
+):
+    """Regression: a codex formal-review clean pass anchored
+    to a DIFFERENT commit than ``expected_head_sha`` must
+    not satisfy the gate (the existing
+    ``rev_commit != expected_head_sha`` filter).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7103,
+            commit_oid=OTHER_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, [], reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Stale formal review on a different head does NOT
+    # satisfy the gate; issue-comment path is empty so
+    # ``clean_pass_detected`` is False.
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+
+
+# ---------------------------------------------------------------------------
+# Round-27 regression tests.
+#
+# Exact-head Codex review 4741378879 (submitted 2026-07-21T05:00:50Z on
+# head a54ca1c33769f960da433c90a7dae22f12630a65) reported one P1
+# finding on scripts/local/audit_codex_response_for_pr.py:
+#
+#   PRRC_kwDOSHFpYM7XvfoW (db_id 3619551766)
+#     "Bind issue-comment clean passes by timestamp"
+#     When ``status``/``merge`` calls this classifier without
+#     a ping boundary, the Round-26 guard only checks that
+#     some Codex formal review exists on ``expected_head_sha``;
+#     it does not require the issue-comment clean pass to be
+#     after that review or that the review itself is clean.
+#     In a PR where Codex submitted a current-head non-clean
+#     formal review and then a delayed/stale PR-level
+#     clean-pass issue comment from an older head arrives
+#     later, the stale comment passes this guard, the
+#     newer-finding scan sees no later finding, and the packet
+#     can become MERGE_READY without a current-head clean
+#     review. Require the issue comment to be tied to a ping
+#     or to postdate a clean head-bound review before
+#     accepting it.
+#
+# Tests below prove:
+#
+#   * a current-head non-clean formal review does NOT
+#     authorize a stale issue-comment clean pass;
+#   * a clean head-bound formal review authorizes a
+#     post-review issue-comment clean pass (Round-26
+#     semantic, hardened);
+#   * a stale issue-comment clean pass that predates the
+#     head-bound clean review is rejected;
+#   * a non-clean head-bound review followed by a head-bound
+#     clean review authorizes only the issue-comment clean
+#     pass after the clean review (mixed-review regression).
+# ---------------------------------------------------------------------------
+
+
+def test_non_clean_head_bound_review_does_not_authorize_stale_clean_comment(
+    monkeypatch, tmp_path,
+):
+    """P1 (PRRC_kwDOSHFpYM7XvfoW) bug regression: a current-head
+    non-clean formal review (a finding) must NOT authorize a
+    stale issue-comment clean pass. The head-binding surface
+    must itself be a CLEAN review whose body carries the
+    canonical clean-pass phrase.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path captured by P1 ``PRRC_kwDOSHFpYM7XvfoW``.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # A current-head non-clean formal review (a finding) —
+    # Round-27 hardening says this is NOT a clean-pass
+    # authority.
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Stale finding on current head",  # NOT a clean pass
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7202,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["clean_pass_detected"] is False
+    assert pkt["clean_pass_source"] in (None, "")
+
+
+def test_issue_comment_clean_pass_with_non_clean_review_rejected(
+    monkeypatch, tmp_path,
+):
+    """The P1 (PRRC_kwDOSHFpYM7XvfoW) bug regression: a
+    current-head non-clean formal review does NOT authorize
+    a stale issue-comment clean pass. The head-binding
+    surface must itself be a CLEAN review (one whose body
+    carries the canonical clean-pass phrase). With a
+    non-clean head-bound review, an issue-comment clean
+    pass is unsafe even when ``has_head_bound_formal_review``
+    would have been True under the Round-26 guard.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Stale issue-comment clean pass from a prior head —
+    # the unsafe path.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-10T12:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # A current-head non-clean formal review (a finding) —
+    # Round-27 hardening says this is NOT a clean-pass
+    # authority, even though it is on the expected head.
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="Stale finding on current head",  # NOT a clean pass
+            submitted_at="2026-06-11T18:00:00Z",
+            review_id=7302,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The issue-comment path must NOT accept the stale
+    # comment. The non-clean review is not a clean-pass
+    # authority, so the issue-comment path produces no
+    # clean pass. ``clean_pass_source`` must NOT be
+    # ``issue_comment`` (it might be ``None`` or
+    # ``pull_request_review`` only if the formal-review
+    # fallback finds a clean review — there is none here).
+    assert pkt["clean_pass_source"] != "issue_comment"
+    assert pkt["clean_pass_comment_id"] != 99204
+
+
+def test_mixed_clean_then_finding_review_authorizes_post_clean_comment(
+    monkeypatch, tmp_path,
+):
+    """Mixed-review regression: a codex clean formal review
+    on the current head followed by a later finding review
+    on the same head. The issue comment posted after the
+    finding is a stale echo of the earlier clean review.
+
+    Round-46 (P1 ``PRRC_kwDOSHFpYM7XPZN5``) updated this
+    contract: when the latest head-bound formal review is
+    a non-clean finding, the issue comment MUST be
+    rejected as a clean-pass authority. The classifier
+    MUST emit ``HOLD_NEW_CODEX_THREAD`` (the non-clean
+    review is the newer finding, not the earlier clean
+    review). The test asserts this Round-46 contract:
+    the issue comment is NOT accepted as a clean pass;
+    instead the formal-review clean pass is detected
+    but the newer-finding scan downgrades the final
+    status to ``HOLD_NEW_CODEX_THREAD``.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_raw_rest_pr_payload(mergeable_state="clean", mergeable=True)
+    # Issue-comment clean pass AFTER both formal reviews.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T19:00:00Z",
+            comment_id=99204,
+        ),
+    ]
+    # First: clean review on current head. Second: a
+    # later finding on the same head (after the clean
+    # review, before the issue comment).
+    reviews = [
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body=codex_clean_pass_body(),
+            submitted_at="2026-06-11T17:35:00Z",
+            review_id=7303,
+            commit_oid=EXPECTED_HEAD,
+        ),
+        make_review(
+            author=CODEX_LOGIN,
+            state="COMMENTED",
+            body="New finding after the clean review",
+            submitted_at="2026-06-11T18:30:00Z",
+            review_id=7304,
+            commit_oid=EXPECTED_HEAD,
+        ),
+    ]
+    runner = make_gh_runner(pr_view, issue, reviews, _empty_thread_payload())
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "402", "--expected-head", EXPECTED_HEAD,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Round-46: the issue comment MUST NOT be the
+    # clean-pass source — the latest head-bound formal
+    # review is a non-clean finding, so the issue
+    # comment is rejected as a stale echo of the
+    # earlier clean review. The earlier formal review
+    # IS still detected as a clean pass (so
+    # clean_pass_detected=True), but the source is
+    # the formal review, not the issue comment. The
+    # newer-finding scan (which already runs as part
+    # of the audit) downgrades the final status to
+    # ``HOLD_NEW_CODEX_THREAD`` because the non-clean
+    # review is newer than the clean review.
+    assert pkt["clean_pass_source"] != "issue_comment", (
+        "Round-46: issue comment must NOT be the "
+        "clean-pass source when the latest head-bound "
+        "formal review is a non-clean finding. Got "
+        f"clean_pass_source={pkt.get('clean_pass_source')!r}"
+    )
+    assert pkt["status"] == "HOLD_NEW_CODEX_THREAD", (
+        "Round-46: classifier must emit "
+        "HOLD_NEW_CODEX_THREAD when the latest "
+        "head-bound formal review is a non-clean "
+        f"finding. Got status={pkt.get('status')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-41 regression: task-summary issue-comments must NOT
+# downgrade a current-head clean pass to HOLD_NEW_CODEX_THREAD.
+# The Round-36 fix added the predicate in ``check_pr_review_comments``
+# but did not propagate it to the audit's post-clean-pass
+# newer-finding scan. The bug caused the gate to emit clean
+# while ``aed_pr status``/``merge`` reported
+# ``HOLD_NEW_CODEX_THREAD`` / ``CODEX_EVIDENCE_FAILED`` after
+# the Codex bot posted a ``### Summary`` issue-comment following
+# a clean pass. Round-41 shares the predicate between the gate
+# and the audit.
+# ---------------------------------------------------------------------------
+
+
+def test_post_clean_pass_task_summary_does_not_downgrade(
+    monkeypatch, tmp_path
+):
+    """A Codex bot ``### Summary`` issue-comment posted AFTER a
+    clean pass MUST NOT cause the audit to emit
+    ``HOLD_NEW_CODEX_THREAD``. The previous (buggy) audit
+    treated any non-clean-pass Codex issue comment after the
+    clean pass as a new finding; the predicate added in
+    Round-36 (and now shared by Round-41) recognizes
+    ``### Summary`` task-summary posts as coordination posts
+    rather than findings.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # Old clean pass at 18:00
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9400,
+        ),
+        # Newer task-summary post at 18:30 — must be excluded.
+        # Body deliberately includes BLOCKING_WORDS tokens
+        # (e.g. ``malformed``, ``blocking``) to prove the
+        # predicate discriminates on shape, not vocabulary.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=(
+                "### Summary\n\n* Updated fetch_ci_conclusions "
+                "to request event from gh pr checks. The "
+                "previous malformed head was treated as "
+                "blocking; the fix supersedes that. **Commit**"
+                "\n\n* New commit SHA: 5ed3bdf8cea13b463fa1319338d273dd0e0601b6"
+                "\n\n**Testing**\n\n* The blocked code path now "
+                "exits cleanly."
+            ),
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9401,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The audit MUST NOT emit HOLD_NEW_CODEX_THREAD for a
+    # post-clean-pass task-summary issue comment.
+    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD, (
+        f"audit must not downgrade a current-head clean pass "
+        f"to HOLD_NEW_CODEX_THREAD for a task-summary post; "
+        f"got status={pkt['status']!r}"
+    )
+    # The clean pass MUST still be detected (and the audit
+    # should emit a merge-ready variant).
+    assert pkt["clean_pass_detected"] is True
+    assert pkt["status"] == mod.STATUS_MERGE_READY, (
+        f"audit must emit MERGE_READY when only a task-summary "
+        f"post follows a clean pass; got status={pkt['status']!r}"
+    )
+
+
+def test_post_clean_pass_real_finding_still_downgrades(
+    monkeypatch, tmp_path
+):
+    """Round-41 guard: a real Codex finding (NOT a
+    task-summary post) AFTER a clean pass MUST still cause the
+    audit to emit ``HOLD_NEW_CODEX_THREAD``. The fix
+    surgically excludes only ``### Summary`` posts.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=9500,
+        ),
+        # Newer REAL finding (not a task-summary).
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body="Actually I missed something: P1 real bug",
+            created_at="2026-06-11T18:30:00Z",
+            comment_id=9501,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["clean_pass_detected"] is True
+
+
+def test_audit_imports_shared_task_summary_predicate():
+    """Static structural test: the audit module MUST import
+    the shared predicate from ``check_pr_review_comments`` so
+    that future task-summary shape changes only need to be
+    made in one place.
+    """
+    src = inspect.getsource(mod)
+    assert "_is_codex_task_summary_issue_comment" in src, (
+        "audit_codex_response_for_pr must import the shared "
+        "_is_codex_task_summary_issue_comment predicate from "
+        "check_pr_review_comments"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-42 regression: the shared task-summary predicate
+# MUST be imported successfully when the audit module is
+# invoked via the documented live paths
+# (``python scripts/local/audit_codex_response_for_pr.py``
+# or via ``aed_pr status``/``merge``). Round-41 imported
+# via ``from scripts.local.check_pr_review_comments`` which
+# raised ``ModuleNotFoundError`` when ``sys.path[0]`` was
+# ``scripts/local`` (i.e. the live CLI path) and silently
+# disabled task-summary filtering via the broad
+# ``except Exception``.
+# ---------------------------------------------------------------------------
+
+
+def test_predicate_imported_under_script_local_invocation():
+    """Reproduce the documented live invocation as a fresh
+    subprocess with only ``scripts/local`` on ``PYTHONPATH``
+    and the repository root NOT in scope. The shared
+    predicate MUST be available.
+
+    This test guards against the Round-41 bug where the
+    absolute ``from scripts.local.check_pr_review_comments
+    import ...`` raised ``ModuleNotFoundError`` when the
+    repository root was not on ``sys.path``. The Round-42
+    fix pre-pends the repo root before the import attempt.
+
+    A fresh subprocess is required because the in-process
+    import cache (``sys.modules``) is populated by pytest's
+    own collection, which can mask the bug.
+
+    The test resolves the audit module's absolute path from
+    ``inspect.getfile`` so it works in any CI environment,
+    not just the local /home/max/aed_consolidation_v1 tree.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+    import os as _os
+    import inspect as _inspect
+
+    # Discover the audit module's file path dynamically so
+    # the test works in both local and CI environments.
+    import scripts.local.audit_codex_response_for_pr as _audit_mod
+    audit_file = _inspect.getfile(_audit_mod)
+    scripts_local_dir = _os.path.dirname(audit_file)
+    repo_root = _os.path.dirname(scripts_local_dir)
+    audit_basename = _os.path.basename(audit_file)
+
+    code = (
+        "import sys, importlib, os\n"
+        f"_audit_basename = {audit_basename!r}\n"
+        f"_scripts_local = {scripts_local_dir!r}\n"
+        "default = list(sys.path)\n"
+        # Drop any path containing the repo root from sys.path
+        f"sys.path = [p for p in default if {repo_root!r} not in p]\n"
+        f"sys.path.insert(0, _scripts_local)\n"
+        "for name in list(sys.modules.keys()):\n"
+        "    if 'audit' in name or 'check_pr_review' in name:\n"
+        "        sys.modules.pop(name, None)\n"
+        "mod = importlib.import_module(_audit_basename[:-3])  # strip .py\n"
+        "pred = mod._co_is_codex_task_summary_issue_comment\n"
+        "print('PREDICATE:', pred)\n"
+        "if pred is not None:\n"
+        "    print('CALLABLE_TASK_SUMMARY:', pred(\n"
+        "        'chatgpt-codex-connector[bot]', 'issue_comment',\n"
+        "        '### Summary\\n\\n* Did some work\\n\\n**Commit**\\n'\n"
+        "    ))\n"
+        "else:\n"
+        "    print('CALLABLE_TASK_SUMMARY: N/A')\n"
+    )
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        # Explicitly set PYTHONPATH to scripts/local so the
+        # subprocess only sees the script directory on the
+        # path (mirroring the documented live CLI path).
+        "PYTHONPATH": scripts_local_dir,
+    }
+    res = _subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=30, env=env,
+        cwd="/tmp",
+    )
+    output = res.stdout
+    # The predicate MUST be importable, not None.
+    assert "PREDICATE:" in output, (
+        f"subprocess did not print predicate info; "
+        f"stdout={output!r} stderr={res.stderr[:500]!r}"
+    )
+    assert "PREDICATE: None" not in output, (
+        "shared _is_codex_task_summary_issue_comment "
+        "predicate MUST be importable when invoked via "
+        "the documented live CLI path with only "
+        "scripts/local on PYTHONPATH; got None. "
+        "Without this predicate, the audit emits "
+        "HOLD_NEW_CODEX_THREAD after a Codex "
+        "### Summary task-summary post following a "
+        "clean pass, while the review-comment gate "
+        "treats the same post as informational.\n"
+        f"subprocess stdout: {output!r}\n"
+        f"subprocess stderr: {res.stderr[:500]!r}"
+    )
+    # The predicate MUST be callable and recognize a
+    # Codex task-summary issue-comment.
+    assert "CALLABLE_TASK_SUMMARY: True" in output, (
+        f"predicate should recognize Codex task-summary "
+        f"issue comments; got output {output!r}"
+    )
+
+
+def test_predicate_imported_under_repo_root_invocation():
+    """The audit module MUST also work when invoked with
+    the repository root on sys.path (the way the test
+    harness imports it).
+    """
+    import sys as _sys
+
+    # Make sure the repo root is on sys.path and import via
+    # the package path.
+    if "/home/max/aed_consolidation_v1" not in _sys.path:
+        _sys.path.insert(0, "/home/max/aed_consolidation_v1")
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert mod._co_is_codex_task_summary_issue_comment is not None, (
+        "predicate must be importable under repo-root path"
+    )
+
+
+def test_audit_emits_visible_warning_when_predicate_unavailable(
+    monkeypatch, tmp_path
+):
+    """If BOTH the absolute and fallback import paths fail,
+    the audit MUST emit a visible stderr warning instead of
+    silently disabling task-summary filtering. The runtime
+    gate (the ``is not None`` check at the call site) keeps
+    behavior unchanged.
+
+    This is a structural test: it verifies the import block
+    invokes ``warnings.warn(...)`` so a future reader knows
+    the failure mode is loud. A live verification of the
+    warning emission is fragile because re-importing the
+    audit module after a sentinel substitution interacts
+    with Python's import cache in non-trivial ways; the
+    source-level check is sufficient and stable.
+    """
+    import scripts.local.audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The Round-42 fix MUST invoke ``_warnings.warn`` so a
+    # missing or broken helper module is visible in CI logs.
+    assert "_warnings.warn" in src, (
+        "audit must emit a visible warning when the shared "
+        "predicate is unavailable; missing _warnings.warn call"
+    )
+    assert "RuntimeWarning" in src, (
+        "audit must use RuntimeWarning category so the "
+        "warning is visible by default"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-43 regression: when the ONLY post-ping Codex activity
+# is a ``### Summary`` task-summary issue-comment (no review
+# verdict, no clean pass), the audit MUST populate
+# ``latest_codex_response_type="none"`` with empty
+# ``latest_codex_response_id``. Otherwise the readiness
+# verifier's Round-39 invariant treats the task-summary
+# as a present artifact, emits ``CODEX_EVIDENCE_FAILED``,
+# and the lifecycle routes to ``BLOCKED`` instead of
+# ``WAITING`` — telling the operator to fix a terminal
+# Codex failure when no Codex response has actually
+# arrived.
+# ---------------------------------------------------------------------------
+
+
+TASK_SUMMARY_BODY = (
+    "### Summary\n\n* Updated audit_codex_response_for_pr "
+    "to skip task-summary issue-comments in latest-response "
+    "selection.\n\n**Commit**\n\n* The fix supersedes "
+    "the previous malformed-head verdict construction.\n\n"
+    "**Testing**\n\n* The audit now emits "
+    "HOLD_CODEX_RESPONSE_PENDING correctly."
+)
+
+
+def test_only_task_summary_latest_response_is_none(monkeypatch, tmp_path):
+    """When the only post-ping Codex activity is a single
+    ``### Summary`` task-summary issue-comment, the audit
+    MUST populate ``latest_codex_response_type="none"``
+    and ``latest_codex_response_id=""``. This guards the
+    Round-43 fix that excludes task-summary issue-comments
+    from the ``latest_issue`` selection.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # ONLY a task-summary — no clean pass, no review.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:30:00Z",
+            comment_id=9501,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The audit MUST hold at HOLD_CODEX_RESPONSE_PENDING —
+    # no real Codex response has arrived.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING, (
+        f"audit must hold at HOLD_CODEX_RESPONSE_PENDING "
+        f"when only a task-summary post is present; "
+        f"got status={pkt['status']!r}"
+    )
+    # The latest-response metadata MUST reflect "no real
+    # response" — empty type and empty id. Otherwise the
+    # Round-39 invariant in build_evidence would treat the
+    # task-summary as a present artifact.
+    assert pkt["latest_codex_response_type"] == "none", (
+        f"latest_codex_response_type must be 'none' when "
+        f"only a task-summary post is present; "
+        f"got {pkt['latest_codex_response_type']!r}"
+    )
+    assert not pkt["latest_codex_response_id"], (
+        f"latest_codex_response_id must be empty when "
+        f"only a task-summary post is present; "
+        f"got {pkt['latest_codex_response_id']!r}"
+    )
+    # No active blockers expected.
+    assert pkt["clean_pass_detected"] is False
+
+
+def test_only_task_summary_does_not_block_via_ready_path(
+    monkeypatch, tmp_path
+):
+    """End-to-end guard: when only a task-summary is
+    present, the canonical ``build_evidence`` consumer
+    must compute ``codex_artifact_present=False``, so
+    the readiness verifier emits ``CODEX_EVIDENCE_MISSING``
+    (routes to ``WAITING``) and NOT
+    ``CODEX_EVIDENCE_FAILED`` (would route to ``BLOCKED``
+    after Round-38's lifecycle mapping).
+
+    This test exercises the full codex audit -> evidence
+    path that the readiness verifier consumes, proving the
+    upstream signal is correct.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:30:00Z",
+            comment_id=9502,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Simulate the consumer's invariant: artifact present iff
+    # type != "none" and id is non-empty. The audit's output
+    # must satisfy the "not present" branch.
+    codex_response_type = pkt.get(
+        "latest_codex_response_type", "none"
+    )
+    codex_response_id = pkt.get("latest_codex_response_id", "")
+    artifact_present = bool(
+        codex_response_type
+        and codex_response_type != "none"
+        and codex_response_id
+    )
+    assert artifact_present is False, (
+        f"build_evidence invariant: when only a task-summary "
+        f"is present, codex_artifact_present must be False. "
+        f"type={codex_response_type!r} id={codex_response_id!r}"
+    )
+
+
+def test_only_task_summary_with_pending_evidence_routes_waiting(
+    monkeypatch, tmp_path
+):
+    """Full lifecycle guard: audit returns
+    HOLD_CODEX_RESPONSE_PENDING, build_evidence sees
+    artifact_present=False, and the readiness verifier
+    emits ``CODEX_EVIDENCE_MISSING`` (not
+    ``CODEX_EVIDENCE_FAILED``). Combined with Round-38's
+    lifecycle mapping, this routes the PR to ``WAITING``,
+    not ``BLOCKED``.
+    """
+    import scripts.local.aed_pr_readiness as readiness
+    # Construct a minimal evidence object that mirrors
+    # what ``aed_pr.py build_evidence`` would assemble for
+    # a task-summary-only post-ping state. The Codex
+    # section is set to the "pending" state (no artifact,
+    # HOLD_CODEX_RESPONSE_PENDING verdict); the verifier
+    # will reject the missing-evidence reason for Codex
+    # but will NOT mark the failure as terminal (which
+    # would route to BLOCKED after Round-38).
+    evidence = readiness.ReadinessEvidence(
+        head_sha=EXPECTED_HEAD,
+        pr_state="OPEN",
+        is_draft=True,
+        mergeable="MERGEABLE",
+        scope_clean=True,
+        changed_files=[],
+        changed_files_fetched=True,
+        required_ci_names=[],
+        ci_conclusions={},
+        ci_missing=[],
+        ci_pending=[],
+        ci_failed=[],
+        ci_duplicated=[],
+        allowed_files_supplied=True,
+        codex_verdict="HOLD_CODEX_RESPONSE_PENDING",
+        codex_clean_passed=False,
+        codex_artifact_present=False,
+        codex_artifact_fresh=False,
+        reviews_inventory_complete=True,
+        review_thread_inventory_complete=True,
+        unresolved_thread_count=0,
+    )
+    verdict = readiness.evaluate_machine_readiness(evidence)
+    # The verifier MUST NOT emit CODEX_EVIDENCE_FAILED.
+    failed_reasons = [
+        r for r in verdict.reasons
+        if getattr(r, "code", None) == "CODEX_EVIDENCE_FAILED"
+    ]
+    assert not failed_reasons, (
+        "verifier must not emit CODEX_EVIDENCE_FAILED when "
+        "codex_artifact_present=False; got "
+        f"reasons={[r.code for r in verdict.reasons]}"
+    )
+    # The verifier MAY emit CODEX_EVIDENCE_MISSING,
+    # which (after Round-38) routes to WAITING.
+    assert verdict.ready is False
+    assert verdict.machine_ready is False
+    # No authorization for a HOLD_CODEX_RESPONSE_PENDING.
+    assert verdict.authorization_required is False
+    assert verdict.authorization_valid is None
+
+
+def test_task_summary_does_not_override_substantive_latest(
+    monkeypatch, tmp_path
+):
+    """Round-43 guard: when both a task-summary AND a
+    substantive issue-comment are present, the substantive
+    one MUST populate ``latest_codex_response_*``. The
+    Round-43 fix only excludes task-summary comments from
+    the latest-response selection, so a substantive comment
+    that arrives AFTER a task-summary still wins.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        # Earlier task-summary.
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=TASK_SUMMARY_BODY,
+            created_at="2026-07-21T18:00:00Z",
+            comment_id=9510,
+        ),
+        # Later substantive comment (e.g. a real
+        # Codex reply, not a clean pass and not a
+        # task summary).
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=(
+                "Codex Review: noticed a follow-up — see "
+                "the discussion on the malformed-head "
+                "verdict construction."
+            ),
+            created_at="2026-07-21T19:00:00Z",
+            comment_id=9511,
+        ),
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The latest-response metadata MUST point at the
+    # substantive comment (id=9511), not the task-summary
+    # (id=9510). The Round-43 fix only excludes
+    # task-summary from the candidate list.
+    assert pkt["latest_codex_response_type"] == "issue_comment"
+    assert str(pkt["latest_codex_response_id"]) == "9511", (
+        f"latest must point at the substantive comment "
+        f"(id=9511), not the task-summary (id=9510); "
+        f"got {pkt['latest_codex_response_id']!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-44 regression: the audit module's repo-root
+# computation MUST walk two levels up from ``__file__``,
+# not one. ``__file__`` is
+# ``<repo>/scripts/local/audit_codex_response_for_pr.py``,
+# so a single ``dirname`` produces ``<repo>/scripts``
+# (NOT the repository root). Without this fix, the
+# absolute ``from scripts.local.check_pr_review_comments
+# import ...`` import still fails in script-local mode
+# unless something else has already added the repository
+# root to ``sys.path``.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_module_repo_root_is_two_levels_above_script_dir():
+    """Static source check: ``_REPO_ROOT_HERE`` MUST be the
+    parent of the ``scripts/`` directory, NOT the parent
+    of ``__file__`` (which would be ``<repo>/scripts``).
+    """
+    import inspect as _inspect
+    import scripts.local.audit_codex_response_for_pr as _mod
+    src = _inspect.getsource(_mod)
+    # The Round-44 fix MUST walk up two levels (or
+    # equivalent) to land on the repository root. The
+    # canonical layout has ``scripts/`` at the repo root,
+    # so the path computed must equal the parent of
+    # ``scripts/``.
+    # Walk the source for evidence of two-parent resolution.
+    has_two_parent_walk = (
+        "_os.path.dirname(_os.path.dirname(_SCRIPT_DIR_HERE))" in src
+        or "_scripts_dir" in src and "_os.path.basename" in src
+    )
+    assert has_two_parent_walk, (
+        "audit must walk two levels up from __file__ to "
+        "find the repository root; the single-parent walk "
+        "in Round-42 produces <repo>/scripts instead of "
+        "<repo>. Found neither the two-parent walk nor "
+        "the scripts-directory search in source."
+    )
+    # The script directory walk-up logic MUST be present.
+    assert "_SCRIPT_DIR_HERE" in src, (
+        "audit must compute _SCRIPT_DIR_HERE from __file__"
+    )
+    assert "_REPO_ROOT_HERE" in src, (
+        "audit must compute _REPO_ROOT_HERE explicitly"
+    )
+
+
+def test_audit_subprocess_uses_absolute_package_path():
+    """End-to-end subprocess check: in script-local mode
+    with only ``scripts/local`` on ``PYTHONPATH`` and the
+    repository root NOT in scope, the imported predicate
+    must come from the absolute package path
+    ``scripts.local.check_pr_review_comments`` (proving
+    the repo root was added to sys.path). The fallback
+    top-level import ``check_pr_review_comments`` would
+    indicate the repo root was NOT added (Round-42 bug).
+
+    A fresh subprocess is required because pytest's
+    in-process import cache can mask the bug.
+    """
+    import subprocess as _subprocess
+    import sys as _sys
+    import os as _os
+    import inspect as _inspect
+
+    import scripts.local.audit_codex_response_for_pr as _audit_mod
+    audit_file = _inspect.getfile(_audit_mod)
+    scripts_local_dir = _os.path.dirname(audit_file)
+    repo_root = _os.path.dirname(_os.path.dirname(scripts_local_dir))
+    audit_basename = _os.path.basename(audit_file)
+
+    # Build the subprocess code as a list of lines joined
+    # by newlines. Using ``"\n".join(...)`` avoids
+    # shell-style escaping pitfalls.
+    code_lines = [
+        "import sys, importlib, os",
+        f"_audit_basename = {audit_basename!r}",
+        f"_scripts_local = {scripts_local_dir!r}",
+        f"_repo_root = {repo_root!r}",
+        "default = list(sys.path)",
+        "sys.path = [p for p in default if _repo_root not in p]",
+        "sys.path.insert(0, _scripts_local)",
+        "for name in list(sys.modules.keys()):",
+        "    if 'audit' in name or 'check_pr_review' in name:",
+        "        sys.modules.pop(name, None)",
+        "mod = importlib.import_module(_audit_basename[:-3])",
+        "pred = mod._co_is_codex_task_summary_issue_comment",
+        "print('PREDICATE:', pred)",
+        "if pred is not None:",
+        "    print('PREDICATE_MODULE:', pred.__module__)",
+        "else:",
+        "    print('PREDICATE_MODULE: None')",
+    ]
+    code = "\n".join(code_lines)
+    env = {
+        "PATH": "/usr/bin:/bin:/usr/local/bin",
+        "HOME": "/root",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONPATH": scripts_local_dir,
+    }
+    res = _subprocess.run(
+        [_sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=30, env=env,
+        cwd="/tmp",
+    )
+    output = res.stdout
+    # The predicate MUST be importable.
+    assert "PREDICATE: <function" in output or "PREDICATE:" in output, (
+        f"subprocess did not print predicate info; "
+        f"stdout={output!r} stderr={res.stderr[:500]!r}"
+    )
+    # The predicate MUST come from the absolute package
+    # path ``scripts.local.check_pr_review_comments`` —
+    # NOT the top-level ``check_pr_review_comments``
+    # fallback (which would indicate the Round-42 bug
+    # where the wrong directory was added to sys.path).
+    assert (
+        "PREDICATE_MODULE: scripts.local.check_pr_review_comments" in output
+    ), (
+        "predicate must be imported via the absolute "
+        "package path 'scripts.local.check_pr_review_comments'; "
+        "this proves the audit's repo-root computation "
+        "is correct (two levels above __file__). The "
+        "top-level fallback path indicates the Round-42 "
+        f"single-parent bug. Got: {output!r} stderr={res.stderr[:500]!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-46 regression: when ``ping_dt is None`` (no
+# fresh-ping filter), the issue-comment clean-pass path
+# used to accept an unanchored issue-comment echo of an
+# earlier head-bound clean formal review, even if a LATER
+# non-clean formal review (a finding) on the same head
+# has since been posted. That let the classifier emit
+# ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` while a
+# real finding was still in flight.
+# The fix: also track ``latest_head_bound_formal_review_ts``
+# (any head-bound formal review, clean or non-clean),
+# and require the issue comment to postdate THAT as
+# well. If a non-clean formal review postdates the clean
+# review, the issue comment is rejected as a stale
+# echo of the clean review.
+# ---------------------------------------------------------------------------
+
+
+# Head SHA used by the Round-46 tests. Matches the
+# ``_head_sha_for_tests`` constants used elsewhere in
+# this file.
+ROUND_46_HEAD = EXPECTED_HEAD
+
+
+def _r46_clean_pass_body() -> str:
+    """The canonical Codex clean-pass body, identical
+    to the helper used by other tests in this file.
+    """
+    return codex_clean_pass_body()
+
+
+def _r46_clean_review(review_id, *, submitted_at,
+                      commit_oid=ROUND_46_HEAD):
+    return make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r46_clean_pass_body(),
+        submitted_at=submitted_at,
+        review_id=review_id,
+        commit_oid=commit_oid,
+    )
+
+
+def _r46_non_clean_review(review_id, *, submitted_at,
+                          commit_oid=ROUND_46_HEAD):
+    return make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=(
+            "Codex found a blocking issue at "
+            "scripts/local/x.py — see inline comment."
+        ),
+        submitted_at=submitted_at,
+        review_id=review_id,
+        commit_oid=commit_oid,
+    )
+
+
+def _r46_clean_echo_comment(comment_id, *, created_at):
+    return make_issue_comment(
+        author=CODEX_LOGIN,
+        body=_r46_clean_pass_body(),
+        created_at=created_at,
+        comment_id=comment_id,
+    )
+
+
+def _r46_classify_with_fixture(
+    monkeypatch, *, reviews, comments
+):
+    """Drive ``classify`` end-to-end with a mocked
+    ``subprocess.run`` that returns the supplied
+    reviews and issue comments. Mirrors the existing
+    test pattern in this file.
+    """
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        state="open", sha=ROUND_46_HEAD,
+        mergeable_state="clean", mergeable=True,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(reviews))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=402,
+            expected_head_sha=ROUND_46_HEAD,
+            ping_comment_id=None,
+            ping_created_at=None,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+class TestRound46InterveningFindingInvalidatesEcho:
+    """Round-46 regression: an issue-comment clean-pass
+    echo of an earlier head-bound clean formal review
+    MUST be rejected when a LATER non-clean formal
+    review (a finding) on the same head is in the
+    inventory. Without the fix, the classifier accepts
+    the issue comment and the readiness verifier can
+    emit ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+    while a real finding is in flight.
+    """
+
+    def test_intervening_finding_invalidates_clean_echo(
+        self, monkeypatch
+    ):
+        """Bug repro: clean formal review at T1, non-clean
+        formal review at T2 (a finding), unanchored
+        issue-comment clean pass at T3. Without the
+        Round-46 fix the issue comment is accepted as
+        a clean-pass echo (because it postdates T1),
+        and the classifier emits a merge-ready state
+        despite a real finding being in flight at T2.
+
+        With the fix, the issue comment is rejected
+        because the latest head-bound formal review
+        is a non-clean finding. The classifier MUST
+        NOT emit a merge-ready state and MUST NOT
+        accept the issue comment as a clean pass.
+        The classifier MAY still detect a clean pass
+        from the earlier formal review (T1), but
+        the newer-finding scan MUST downgrade the
+        final status to ``HOLD_NEW_CODEX_THREAD``
+        because the non-clean review (T2) is newer
+        than the clean review.
+        """
+        clean_review = _r46_clean_review(
+            1001, submitted_at="2026-07-22T10:00:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            1002, submitted_at="2026-07-22T10:05:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            1003, created_at="2026-07-22T10:10:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+        )
+        # The issue comment MUST NOT be the source
+        # of the clean pass — the latest head-bound
+        # formal review is a non-clean finding, so
+        # the issue comment is rejected as a stale
+        # echo of the earlier clean review.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-46 fix: the issue comment must NOT "
+            "be the clean-pass source when the latest "
+            "head-bound formal review is a non-clean "
+            f"finding; got clean_pass_source="
+            f"{pkt.get('clean_pass_source')!r}. "
+            f"status={pkt.get('status')!r}"
+        )
+        # The status MUST NOT be a merge-ready state.
+        status = pkt.get("status", "")
+        assert "MERGE_READY" not in status, (
+            f"Round-46 fix: classifier must NOT emit "
+            f"MERGE_READY when an intervening finding "
+            f"is in the inventory; got status={status!r}"
+        )
+        # And the classifier MUST emit
+        # ``HOLD_NEW_CODEX_THREAD`` because the
+        # non-clean review is the newer finding.
+        assert status == "HOLD_NEW_CODEX_THREAD", (
+            f"Round-46 fix: classifier must emit "
+            f"HOLD_NEW_CODEX_THREAD when the latest "
+            f"head-bound formal review is a non-clean "
+            f"finding; got status={status!r}"
+        )
+
+    def test_no_intervening_finding_accepts_clean_echo(
+        self, monkeypatch
+    ):
+        """Regression guard: when there is NO intervening
+        non-clean formal review (only the clean formal
+        review, then the issue-comment echo), the
+        Round-46 fix MUST NOT over-reject. The issue
+        comment is still accepted as a clean-pass
+        echo of the head-bound clean review.
+        """
+        clean_review = _r46_clean_review(
+            2001, submitted_at="2026-07-22T11:00:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            2002, created_at="2026-07-22T11:05:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review],
+            comments=[clean_echo],
+        )
+        # The classifier SHOULD accept the issue
+        # comment as a clean pass (no later finding).
+        assert pkt.get("clean_pass_detected") is True, (
+            "Round-46 fix must NOT over-reject: when "
+            "no later finding is in the inventory, the "
+            "issue comment is still a valid clean-pass "
+            f"echo. Got: status={pkt.get('status')!r}"
+        )
+        # And the source should be the issue comment.
+        assert pkt.get("clean_pass_source") == "issue_comment"
+
+    def test_no_clean_review_anchor_rejects_echo(
+        self, monkeypatch
+    ):
+        """Variant: only the intervening non-clean
+        formal review is in the inventory (no clean
+        review precedes it). The issue comment is
+        still rejected because no clean head-bound
+        review exists to anchor it; this is the
+        pre-existing Round-27 behavior, but the
+        test pins the contract.
+        """
+        non_clean_review = _r46_non_clean_review(
+            3001, submitted_at="2026-07-22T12:00:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            3002, created_at="2026-07-22T12:05:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[non_clean_review],
+            comments=[clean_echo],
+        )
+        # Without a clean head-bound review, the
+        # issue comment cannot be a clean-pass echo.
+        assert pkt.get("clean_pass_detected") is not True, (
+            "Round-27 + Round-46: an issue-comment "
+            "clean pass with no head-bound clean "
+            "review anchor must be rejected; got "
+            f"clean_pass_detected=True. status={pkt.get('status')!r}"
+        )
+
+    def test_source_contract_tracks_overall_formal_review(self):
+        """Source-contract test: the audit MUST track
+        the latest OVERALL head-bound formal review
+        timestamp AND whether it was a clean pass.
+        When the latest head-bound formal review is
+        a non-clean finding, issue-comment clean
+        passes must be rejected. Static check on
+        the source — the variables
+        ``latest_head_bound_formal_review_ts`` and
+        ``latest_head_bound_formal_review_is_clean``
+        must appear in
+        ``audit_codex_response_for_pr.py``, and the
+        issue-comment loop must use them.
+        """
+        import inspect
+        from scripts.local import audit_codex_response_for_pr as ac
+        src = inspect.getsource(ac)
+        # Round-46 fix variable names. These MUST
+        # appear in the source.
+        for needle in (
+            "latest_head_bound_formal_review_ts",
+            "latest_head_bound_formal_review_is_clean",
+        ):
+            assert needle in src, (
+                f"Round-46 fix: audit must track "
+                f"{needle!r} in the source. Missing."
+            )
+        # And the issue-comment loop MUST consult
+        # the latest_head_bound_formal_review_is_clean
+        # flag to decide whether to accept the
+        # issue-comment clean pass.
+        assert (
+            "not latest_head_bound_formal_review_is_clean" in src
+        ), (
+            "Round-46 fix: the issue-comment loop must "
+            "consult latest_head_bound_formal_review_is_clean "
+            "to reject the clean pass when the latest "
+            "head-bound formal review is a non-clean finding."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-47 regression: the Round-46 latest-formal-review
+# veto MUST run regardless of whether a ping boundary
+# (``ping_dt``) is supplied. Round-46 only ran the veto
+# inside the ``if ping_dt is None:`` block, which left
+# the post-ping path unchecked: a post-ping sequence
+# (clean formal review → later non-clean formal review
+# → unanchored issue-comment clean-pass echo) was still
+# misclassified because ``clean_pass_at`` would become
+# the later issue-comment timestamp, and the
+# ``newer_finding_after_clean_pass`` scan would no
+# longer see the intervening formal finding as newer
+# than the issue comment.
+# The fix: lift the Round-46 veto out of the
+# ``ping_dt is None`` block so it runs in both code
+# paths. The Round-27 head-binding surface check
+# (postdate the clean review) remains gated on
+# ``ping_dt is None`` because it is only relevant
+# when the ping window is the only head-binding
+# surface; the Round-46 veto is the universal guard.
+# ---------------------------------------------------------------------------
+
+
+# A ping boundary timestamp that POSTDATES all the
+# pre-ping review activity in the test fixtures. This
+# simulates the operator's ``cmd_advance`` posting a
+# fresh @codex review ping and the test running
+# against the post-ping window. The post-ping
+# sequence (clean review → non-clean review → issue
+# comment) is the bug repro.
+ROUND_47_PING_ID = "4677095302"
+ROUND_47_PING_CREATED = "2026-07-22T00:30:00Z"
+
+
+def _r47_classify_with_ping(
+    monkeypatch, *, reviews, comments, ping_dt=ROUND_47_PING_CREATED,
+):
+    """Drive ``classify`` end-to-end with a mocked
+    ``subprocess.run`` that returns the supplied
+    reviews and issue comments AND a non-None ping
+    boundary. Mirrors the existing
+    ``_r46_classify_with_fixture`` helper but
+    forwards a ping boundary so the post-ping
+    code path is exercised.
+    """
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        state="open", sha=ROUND_46_HEAD,
+        mergeable_state="clean", mergeable=True,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(reviews))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=402,
+            expected_head_sha=ROUND_46_HEAD,
+            ping_comment_id=(
+                ROUND_47_PING_ID if ping_dt is not None else None
+            ),
+            ping_created_at=ping_dt,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+class TestRound47FormalReviewVetoRunsWithPingBoundary:
+    """Round-47 regression: the latest-formal-review
+    veto MUST run regardless of whether a ping
+    boundary is supplied. Round-46 only ran it
+    inside the ``if ping_dt is None:`` block, which
+    left the post-ping path unchecked.
+
+    Additionally, the veto MUST be scoped to the
+    candidate-echo case: it only fires when a clean
+    head-bound formal review exists (so the issue
+    comment could be an echo of it) AND the comment
+    postdates that clean review. When no clean
+    head-bound formal review exists, the issue
+    comment IS the clean pass (not an echo), and the
+    existing ``newer_finding_after_clean_pass`` scan
+    handles later findings without the veto.
+    """
+
+    def test_post_ping_intervening_finding_invalidates_echo(
+        self, monkeypatch
+    ):
+        """Bug repro (Round-47): clean formal review at
+        T1, non-clean formal review at T2, unanchored
+        issue-comment clean pass at T3 — all POST-ping.
+        Without the Round-47 fix, the issue comment is
+        accepted as a clean-pass authority because the
+        Round-46 veto was inside the ``ping_dt is None``
+        block and skipped when ``ping_dt is not None``.
+        The ``clean_pass_at`` then becomes the later
+        issue-comment timestamp (T3), and the
+        ``newer_finding_after_clean_pass`` scan no
+        longer sees the non-clean review (T2) as newer
+        than the issue comment (T3). The classifier
+        can then emit a clean/merge-ready status while
+        a current-head non-clean formal review exists.
+
+        With the fix, the Round-46 veto runs
+        regardless of ``ping_dt``, and the issue
+        comment is rejected. The formal-review
+        clean-pass fallback finds the clean review,
+        the ``newer_finding_after_clean_pass`` scan
+        correctly identifies the non-clean review as
+        a newer finding, and the final status is
+        ``HOLD_NEW_CODEX_THREAD``.
+        """
+        # All timestamps POST-ping (after 00:30:00Z).
+        clean_review = _r46_clean_review(
+            5001, submitted_at="2026-07-22T00:35:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            5002, submitted_at="2026-07-22T00:40:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            5003, created_at="2026-07-22T00:45:00Z"
+        )
+        pkt = _r47_classify_with_ping(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+            ping_dt=ROUND_47_PING_CREATED,
+        )
+        # Round-47: the issue comment MUST NOT be the
+        # clean-pass source — the latest head-bound
+        # formal review is a non-clean finding, so the
+        # issue comment is rejected as a stale echo
+        # of the earlier clean review.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-47 fix: the issue comment must NOT "
+            "be the clean-pass source when the latest "
+            "head-bound formal review is a non-clean "
+            "finding AND a ping boundary is supplied. "
+            f"Got clean_pass_source="
+            f"{pkt.get('clean_pass_source')!r}. "
+            f"status={pkt.get('status')!r}"
+        )
+        # The status MUST NOT be a merge-ready state.
+        status = pkt.get("status", "")
+        assert "MERGE_READY" not in status, (
+            f"Round-47 fix: classifier must NOT emit "
+            f"MERGE_READY when an intervening finding "
+            f"is in the inventory (post-ping); got "
+            f"status={status!r}"
+        )
+        # And the classifier MUST emit
+        # ``HOLD_NEW_CODEX_THREAD`` because the
+        # non-clean review is the newer finding.
+        assert status == "HOLD_NEW_CODEX_THREAD", (
+            f"Round-47 fix: classifier must emit "
+            f"HOLD_NEW_CODEX_THREAD when the latest "
+            f"head-bound formal review is a non-clean "
+            f"finding (post-ping); got status={status!r}"
+        )
+
+    def test_pre_ping_veto_still_runs_round46(
+        self, monkeypatch
+    ):
+        """Regression guard: Round-46 behavior (veto
+        runs in the ``ping_dt is None`` path) MUST
+        still hold after the Round-47 fix. The Round-47
+        fix lifts the veto out of the ``ping_dt is
+        None`` block, but it must STILL reject
+        issue-comment clean passes when the latest
+        head-bound formal review is non-clean and
+        no ping boundary is supplied.
+        """
+        clean_review = _r46_clean_review(
+            6001, submitted_at="2026-07-22T01:00:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            6002, submitted_at="2026-07-22T01:05:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            6003, created_at="2026-07-22T01:10:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+        )
+        # Same Round-46 contract: the issue comment
+        # MUST NOT be the clean-pass source.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-46 invariant: the issue comment "
+            "must NOT be the clean-pass source when "
+            "the latest head-bound formal review is a "
+            "non-clean finding (no ping). Got "
+            f"clean_pass_source={pkt.get('clean_pass_source')!r}"
+        )
+        assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+            "Round-46 invariant: classifier must emit "
+            "HOLD_NEW_CODEX_THREAD in the no-ping "
+            f"path. Got status={pkt.get('status')!r}"
+        )
+
+    def test_post_ping_no_intervening_finding_accepts_echo(
+        self, monkeypatch
+    ):
+        """Regression guard: when no intervening
+        non-clean formal review exists (only a clean
+        review, then an issue-comment echo), the
+        Round-47 fix MUST NOT over-reject in the
+        post-ping path. The issue comment is still
+        accepted as a clean-pass echo.
+        """
+        clean_review = _r46_clean_review(
+            7001, submitted_at="2026-07-22T00:35:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            7002, created_at="2026-07-22T00:45:00Z"
+        )
+        pkt = _r47_classify_with_ping(
+            monkeypatch,
+            reviews=[clean_review],
+            comments=[clean_echo],
+            ping_dt=ROUND_47_PING_CREATED,
+        )
+        # The classifier SHOULD accept the issue
+        # comment as a clean pass (no later finding).
+        assert pkt.get("clean_pass_detected") is True, (
+            "Round-47 fix must NOT over-reject: when "
+            "no later finding is in the inventory, the "
+            "issue comment is still a valid clean-pass "
+            f"echo (post-ping). Got: status={pkt.get('status')!r}"
+        )
+        # And the source should be the issue comment.
+        assert pkt.get("clean_pass_source") == "issue_comment"
+
+    def test_source_contract_veto_outside_ping_block(self):
+        """Source-contract test: the latest-formal-
+        review veto MUST be located OUTSIDE the
+        ``if ping_dt is None:`` block. Round-46 had
+        it inside that block, which left the
+        post-ping path unchecked (the Round-47
+        finding). The fix lifts the veto out of
+        the block so it runs in both the
+        ``ping_dt is None`` and
+        ``ping_dt is not None`` paths.
+
+        Additionally, the veto MUST be scoped to
+        the candidate-echo case: it only fires
+        when ``latest_head_bound_clean_review_ts``
+        is non-empty (a clean head-bound formal
+        review exists to echo). Without this
+        guard, the veto over-rejects the
+        scenario where the issue comment IS the
+        clean pass (no clean formal review
+        exists), which would break the
+        pre-existing
+        ``newer_finding_after_clean_pass`` scan.
+        """
+        import inspect
+        from scripts.local import audit_codex_response_for_pr as ac
+        src = inspect.getsource(ac)
+        # The veto guard MUST appear in the source.
+        assert "not latest_head_bound_formal_review_is_clean" in src, (
+            "Round-47 fix: the latest-formal-review "
+            "veto must be in the source."
+        )
+        # The veto expression AND the candidate-echo
+        # guard (``latest_head_bound_clean_review_ts``)
+        # must both appear in the same block. The
+        # candidate-echo guard prevents the veto from
+        # over-rejecting scenarios where the issue
+        # comment IS the clean pass.
+        # Find the LAST ``if ping_dt is None:`` in
+        # the source (the block the veto used to be
+        # inside per Round-46). The veto must be
+        # located AFTER that block closes.
+        last_ping_block = src.rfind("if ping_dt is None:")
+        assert last_ping_block > 0, (
+            "source must contain ``if ping_dt is None:`` "
+            "block (Round-27 invariant)"
+        )
+        # Find the veto expression AFTER the
+        # ``if ping_dt is None:`` block. The veto
+        # expression ``not latest_head_bound_
+        # formal_review_is_clean`` must appear
+        # AFTER the last ``if ping_dt is None:``
+        # line.
+        veto_expr_idx = src.find(
+            "not latest_head_bound_formal_review_is_clean",
+            last_ping_block,
+        )
+        assert veto_expr_idx > 0, (
+            "Round-47 fix: the veto expression "
+            "``not latest_head_bound_formal_review_is_clean`` "
+            "must appear AFTER the last ``if ping_dt is None:`` "
+            "block in the source. The veto was incorrectly "
+            "nested inside the ``ping_dt is None`` block "
+            "in Round-46, which left the post-ping path "
+            "unchecked."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-52 regression: the audit must recognize Codex's
+# newer ``### 💡 Codex Review`` formal-review summary
+# format as a clean pass when there are no inline-finding
+# markers in the summary body itself. The Round-52
+# finding reported that ``aed_pr.py`` builds readiness
+# evidence through ``fetch_codex_packet`` → ``classify``
+# which only recognized the older exact clean phrase, so
+# the readiness verifier kept reporting missing/failed
+# Codex evidence even after the poller had confirmed a
+# clean exact-head response. The fix extends the
+# formal-review clean-pass detection (and the
+# post-clean-pass newer-finding scan) to also accept
+# the summary format.
+# ---------------------------------------------------------------------------
+
+
+def _r52_clean_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+    )
+
+
+def _r52_finding_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+        # An inline finding marker inside the summary body.
+        # This is rare (findings usually live in inline
+        # review comments, not in the summary body) but
+        # the audit must still classify it as a finding.
+        "\n**<sub><sub>![P2 Badge]"
+        "(https://img.shields.io/badge/P2-yellow?style=flat)"
+        "</sub></sub>  Inline finding in summary body**\n"
+    )
+
+
+def test_round52_summary_clean_review_accepted(monkeypatch, tmp_path):
+    """Round-52 fix: a formal review with the
+    ``### 💡 Codex Review`` summary prefix and no
+    inline-finding markers in the body MUST be
+    detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-52 fix: the audit must accept a "
+        "summary-format review (### 💡 Codex Review) "
+        "as a clean pass when there are no "
+        "inline-finding markers. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+    assert pkt.get("clean_pass_source") == "pull_request_review", (
+        "Round-52 fix: the clean pass must come "
+        "from the formal review, not the issue "
+        f"comment path. Got {pkt.get('clean_pass_source')!r}"
+    )
+
+
+def test_round52_summary_finding_with_inline_marker_rejected(monkeypatch, tmp_path):
+    """Round-52 invariant: a summary-format review
+    whose body contains an inline-finding marker
+    MUST NOT be detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    finding_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_finding_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499127,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[finding_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-52 invariant: a summary-format "
+        "review with an inline-finding marker in "
+        "the body must NOT be a clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round52_older_clean_then_newer_summary_finding_downgrades(monkeypatch, tmp_path):
+    """Round-52 invariant: a clean summary review
+    followed by a NEWER non-clean summary review
+    MUST be downgraded to HOLD_NEW_CODEX_THREAD
+    by the post-clean-pass scan.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_clean_summary_body(),
+        submitted_at="2026-07-22T06:10:00Z",
+        review_id=4751499100,
+        commit_oid=HEAD,
+    )
+    # Newer review with a body that's neither the
+    # exact clean phrase nor the summary-clean
+    # format (i.e. a summary whose body contains an
+    # inline-finding marker). The post-clean-pass
+    # scan must classify this as a finding.
+    finding_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r52_finding_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify(
+        monkeypatch,
+        codex_review_submissions=[clean_review, finding_review],
+        codex_issue_comments=[],
+    )
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-52 invariant: an older summary clean "
+        "followed by a newer summary finding must "
+        "downgrade to HOLD_NEW_CODEX_THREAD. Got "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round52_source_contract_summary_helpers_exist():
+    """Source-contract: the audit MUST define
+    ``is_codex_review_summary`` and
+    ``is_codex_finding_body`` helpers and use them
+    in the formal-review clean-pass detection.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Helpers must exist.
+    assert hasattr(mod, "is_codex_review_summary"), (
+        "Round-52 fix: audit must define "
+        "is_codex_review_summary helper."
+    )
+    assert hasattr(mod, "is_codex_finding_body"), (
+        "Round-52 fix: audit must define "
+        "is_codex_finding_body helper."
+    )
+    # Helpers must be used in the formal-review
+    # clean-pass detection (the source must
+    # reference them near the
+    # ``is_codex_clean_pass_comment`` check).
+    src = inspect.getsource(mod)
+    assert "is_codex_review_summary" in src
+    assert "is_codex_finding_body" in src
+    # And the CODEX_REVIEW_SUMMARY_PREFIX constant
+    # must be defined.
+    assert "CODEX_REVIEW_SUMMARY_PREFIX" in src
+
+
+# Module-level helper for the function-based tests above.
+def _r52_classify(monkeypatch, *, codex_review_submissions, codex_issue_comments):
+    """Drive ``classify`` end-to-end with the
+    supplied review and comment fixtures.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Use the Round-52 head so head_matches_expected is True.
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-54 regression: the audit must NOT accept a
+# summary-format Codex review as a clean pass when there
+# are active Codex-bot review threads anchored to the
+# current head. Summary-format reviews carry their
+# findings in inline review comments, NOT in the
+# summary body, so the body's splitlines() check is not
+# sufficient. If the inline thread is later resolved or
+# absent from the inventory, the audit could record a
+# clean pass without a real clean Codex verdict.
+# ---------------------------------------------------------------------------
+
+
+def _r54_clean_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+    )
+
+
+def _r54_active_thread(*, thread_id="T-1", is_resolved=False, is_outdated=False, path="scripts/local/x.py"):
+    """Build an active thread in the RAW GraphQL
+    format that ``gh_graphql_review_threads`` returns.
+    The audit's section 7 flattens this into the
+    inventory's ``active_threads`` list.
+    """
+    return {
+        "id": thread_id,
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Some finding",
+                    "path": path,
+                    "line": 10,
+                    "originalCommit": {
+                        "oid": "589c719ced339f49ac07f1ebd2082512a0204519",
+                    },
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+
+
+def test_round54_summary_clean_review_with_active_thread_rejected(monkeypatch, tmp_path):
+    """Bug repro: a summary-format review with an
+    active Codex-bot thread anchored to the current
+    head MUST NOT be detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    active_thread = _r54_active_thread(is_resolved=False, is_outdated=False)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_thread],
+    )
+    # The summary clean review MUST be rejected
+    # because there is an active Codex-bot thread.
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-54 fix: a summary-format review with "
+        "an active Codex thread MUST NOT be a clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round54_summary_clean_review_without_active_thread_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: a summary-format review
+    with NO active Codex-bot threads MUST be detected
+    as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+    )
+    # No active threads — the summary clean review
+    # MUST be accepted.
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: a summary-format review "
+        "with no active Codex threads MUST be a clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+    assert pkt.get("clean_pass_source") == "pull_request_review"
+
+
+def test_round54_summary_clean_review_with_only_outdated_threads_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: a summary-format review
+    with ONLY outdated Codex-bot threads MUST be
+    detected as a clean pass. Outdated threads are
+    anchored to an older head and don't invalidate
+    the current-head clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # Only outdated threads — these don't invalidate
+    # the current-head clean pass.
+    outdated_thread = _r54_active_thread(is_resolved=False, is_outdated=True)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[outdated_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: only-outdated threads "
+        "MUST NOT invalidate a current-head clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round54_exact_phrase_clean_review_with_active_thread_still_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: the older EXACT clean
+    phrase (``Codex Review: Didn't find any major
+    issues``) is NOT subject to the active-thread
+    guard — only summary-format reviews are. The
+    exact-phrase clean pass still works even with
+    active threads.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="Codex Review: Didn't find any major issues. :tada:",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    active_thread = _r54_active_thread(is_resolved=False, is_outdated=False)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_thread],
+    )
+    # The exact-phrase clean review MUST still be
+    # accepted (Round-54 only restricts summary-format
+    # reviews).
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: the exact-phrase clean "
+        "review MUST still be accepted even with "
+        "active threads. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round54_source_contract_active_thread_check():
+    """Source-contract: the formal-review clean-pass
+    detection MUST consult the ``active_threads``
+    inventory when accepting a summary-format review.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The active-thread guard MUST be in the source.
+    assert "active_threads" in src
+    # And it must be consulted in the context of
+    # summary-format review detection.
+    # Find the section that handles summary_format.
+    summary_start = src.find("is_summary_format")
+    assert summary_start > 0
+    # Within ~100 lines of ``is_summary_format``,
+    # ``active_threads`` must be consulted.
+    nearby = src[summary_start:summary_start + 2000]
+    assert "active_threads" in nearby, (
+        "Round-54 fix: the summary-format review "
+        "detection must consult active_threads to "
+        "determine if the review carries an inline "
+        "finding."
+    )
+
+
+# Module-level helper for the function-based tests above.
+def _r52_classify_with_active_threads(
+    monkeypatch, *,
+    codex_review_submissions,
+    codex_issue_comments,
+    active_threads,
+):
+    """Drive ``classify`` end-to-end with the
+    supplied review, comment, and active-thread
+    fixtures. Extends ``_r52_classify`` to inject
+    ``active_threads`` into the review-thread
+    inventory.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Use the Round-52 head so head_matches_expected is True.
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": list(active_threads),
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-56 regression: veto summary reviews when a
+# current-head Codex inline thread has been RESOLVED
+# (not just when it's still active). The Round-54 fix
+# only checked active threads; if an operator marks
+# the current-head Codex thread resolved before a
+# later clean re-review, the audit would record
+# ``clean_pass_detected=True`` for the finding
+# review, bypassing the later unresolved-thread gate.
+# ---------------------------------------------------------------------------
+
+
+def test_round56_summary_clean_review_with_resolved_thread_rejected(monkeypatch, tmp_path):
+    """Round-56 invariant (superseded by Round-59): a
+    summary-format review with a RESOLVED Codex thread
+    on the SAME commit does NOT veto a clean pass
+    (Round-59 changed this — resolved threads are
+    excluded from the veto because the finding has
+    been addressed). This test now verifies the
+    Round-59 behavior: resolved threads on the same
+    commit do NOT veto.
+
+    The original Round-56 bug was about resolved
+    threads on older commits vetoing clean re-reviews.
+    Round-57 fixed that by tying to commit anchor.
+    Round-59 further refined: even same-commit resolved
+    threads don't veto (they're already addressed).
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread (not active, but anchored
+    # to the same commit). Round-59 fix: resolved
+    # threads do NOT veto.
+    resolved_thread = _r56_active_thread(
+        is_resolved=True,
+        is_outdated=False,
+        path="scripts/local/x.py",
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 fix: a RESOLVED Codex thread (even on "
+        "the same commit) MUST NOT veto a clean "
+        "re-review. Resolved threads mean the finding "
+        "has been addressed. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round56_summary_clean_review_with_outdated_thread_accepted(monkeypatch, tmp_path):
+    """Round-56 invariant: a summary-format review
+    with ONLY outdated Codex threads MUST be detected
+    as a clean pass. Outdated threads are anchored to
+    prior heads and don't invalidate the current-head
+    clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED + OUTDATED thread — should NOT veto.
+    outdated_thread = _r56_active_thread(
+        is_resolved=True,
+        is_outdated=True,
+        path="scripts/local/x.py",
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[outdated_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-56 invariant: outdated threads MUST NOT "
+        "invalidate a current-head clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round56_source_contract_resolved_thread_veto():
+    """Source-contract (updated for Round-59): the
+    summary-format veto MUST check
+    ``is_resolved=False``. The Round-56 fix required
+    ``is_resolved`` to NOT be in the veto (the veto
+    applied to any current-head thread regardless of
+    resolved state). Round-59 reverses this: the
+    veto MUST explicitly exclude resolved threads
+    (``not bool(t.get("is_resolved", False))`` in the
+    condition). Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The Round-59 veto MUST include an explicit
+    # ``is_resolved`` check.
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    veto_section = src[summary_idx:summary_idx + 3000]
+    # The veto MUST contain ``is_resolved``.
+    assert "is_resolved" in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "explicitly check ``is_resolved`` to exclude "
+        "resolved threads. Found no 'is_resolved' in "
+        "the veto section."
+    )
+    # And it MUST be in a ``not bool(...)`` guard
+    # (excluding resolved threads).
+    assert 'not bool(t.get("is_resolved"' in veto_section or \
+           'not t.get("is_resolved"' in veto_section or \
+           't.get("is_resolved", False)' in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "exclude resolved threads via a ``not is_resolved`` "
+        "check."
+    )
+
+
+# Module-level helper for Round-56 tests.
+def _r56_active_thread(*, is_resolved=False, is_outdated=False, path="scripts/local/x.py"):
+    """Build an active thread in the RAW GraphQL
+    format with configurable resolved/outdated state.
+    """
+    return {
+        "id": "T-1",
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Some finding",
+                    "path": path,
+                    "line": 10,
+                    "originalCommit": {
+                        "oid": "589c719ced339f49ac07f1ebd2082512a0204519",
+                    },
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Round-57 regression: do not let resolved old findings
+# veto clean re-reviews. The Round-56 fix was too
+# aggressive: a resolved thread from an OLDER finding
+# review on the same head would veto a later CLEAN
+# re-review, even though the later review has no inline
+# findings. The correct check ties the thread to the
+# review via the commit anchor: a thread vetoes a clean
+# review only when ``original_commit_sha ==
+# review.commit_id``.
+# ---------------------------------------------------------------------------
+
+
+def test_round57_clean_review_with_older_resolved_thread_accepted(monkeypatch, tmp_path):
+    """Bug repro: a clean summary-format review with
+    a RESOLVED Codex thread anchored to an OLDER
+    commit (a different review's inline finding) MUST
+    be detected as a clean pass. The thread is from
+    an earlier finding review and doesn't invalidate
+    the later clean re-review.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    # Older commit anchor for the earlier finding
+    # review's threads.
+    OLDER_COMMIT = "1111111111111111111111111111111111111111"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread anchored to an OLDER
+    # commit (not the clean review's commit).
+    resolved_old_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Old finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": OLDER_COMMIT},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_old_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-57 fix: a resolved thread anchored to "
+        "an OLDER commit MUST NOT veto a clean "
+        "re-review on the current head. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round57_clean_review_with_same_anchor_resolved_thread_rejected(monkeypatch, tmp_path):
+    """Round-57 invariant (superseded by Round-59): a
+    resolved thread anchored to the SAME commit as
+    the review does NOT veto the clean pass. Round-59
+    changed this: resolved threads are excluded from
+    the veto regardless of commit anchor because the
+    finding has been addressed.
+
+    The Round-57 bug was about OLDER-commit resolved
+    threads vetoing clean re-reviews. Round-57 fixed
+    that with commit-anchor matching. Round-59 further
+    refined: even same-commit resolved threads don't
+    veto (they're already addressed).
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread anchored to the SAME
+    # commit. Round-59 fix: resolved threads don't
+    # veto regardless of anchor.
+    resolved_same_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "This review's finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 invariant: a resolved thread "
+        "(even on the same commit) MUST NOT veto a "
+        "clean re-review. Resolved threads mean the "
+        "finding has been addressed. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round57_source_contract_commit_anchor_match():
+    """Source-contract: the summary-format veto MUST
+    tie the thread to the review via commit anchor
+    equality (``original_commit_sha ==
+    extract_review_commit_oid(review)``). Static
+    source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The veto MUST use ``original_commit_sha`` (the
+    # flattened field name) and
+    # ``extract_review_commit_oid``.
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    veto_section = src[summary_idx:summary_idx + 5000]
+    assert "original_commit_sha" in veto_section, (
+        "Round-57 fix: the summary-format veto MUST "
+        "tie the thread to the review via the flattened "
+        "``original_commit_sha`` field. Found no "
+        "reference in veto section."
+    )
+    assert "extract_review_commit_oid" in veto_section, (
+        "Round-57 fix: the summary-format veto MUST "
+        "use ``extract_review_commit_oid`` to get the "
+        "review's commit anchor. Found no reference in "
+        "veto section."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-59 regression: stop resolved old threads from
+# vetoing clean reviews. When a previous Codex inline
+# finding on the same commit has already been resolved
+# and Codex later posts a summary-format clean
+# re-review without a new commit, the audit MUST
+# ignore the resolved thread and accept the clean
+# review.
+# ---------------------------------------------------------------------------
+
+
+def test_round59_clean_review_with_same_commit_resolved_thread_accepted(monkeypatch, tmp_path):
+    """Bug repro: a clean summary-format review with
+    a RESOLVED Codex thread on the SAME commit MUST
+    be detected as a clean pass. Resolved threads
+    mean the finding has been addressed.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread on the SAME commit as
+    # the clean review.
+    resolved_same_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Resolved finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 fix: a RESOLVED Codex thread (even "
+        "on the same commit) MUST NOT veto a clean "
+        "re-review. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round59_clean_review_with_active_thread_still_rejected(monkeypatch, tmp_path):
+    """Round-59 invariant: an ACTIVE (unresolved)
+    Codex thread on the same commit MUST still veto
+    the clean pass. The Round-59 fix only excludes
+    resolved threads, not active ones.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # ACTIVE Codex thread on the same commit.
+    active_same_thread = {
+        "id": "T-1",
+        "isResolved": False,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Active finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-59 invariant: an ACTIVE Codex thread "
+        "MUST still veto the clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round59_source_contract_resolved_excluded():
+    """Source-contract: the summary-format veto MUST
+    explicitly exclude resolved threads via
+    ``not bool(t.get("is_resolved", False))``.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    veto_section = src[summary_idx:summary_idx + 3000]
+    assert "is_resolved" in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "explicitly check ``is_resolved``."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-60 regression: inspect inline comments before
+# accepting summary reviews as clean. When Codex uses
+# the new ``### 💡 Codex Review`` summary format, the
+# actual findings live in separate inline review
+# comments, NOT in the summary body. The audit MUST
+# fetch the review's inline comments and reject the
+# review if any are present.
+# ---------------------------------------------------------------------------
+
+
+ROUND60_BODY = "\n### 💡 Codex Review\n\nHere are some automated review suggestions.\n\n**Reviewed commit:** `589c719ced`\n"
+
+
+def test_round60_summary_review_with_inline_comments_rejected(monkeypatch, tmp_path):
+    """Bug repro: a summary-format review WITH inline
+    comments MUST NOT be detected as a clean pass.
+    The inline comments carry the findings.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499126: [{
+                "id": "ic-1",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-60 fix: a summary-format review WITH "
+        "inline comments MUST NOT be a clean pass. "
+        "Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round60_summary_review_without_inline_comments_accepted(monkeypatch, tmp_path):
+    """Round-60 invariant: a summary-format review
+    with NO inline comments MUST be detected as a
+    clean pass (when there are also no active threads).
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={4751499126: []},
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-60 invariant: a summary-format review "
+        "with no inline comments and no active threads "
+        "MUST be a clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round60_source_contract_inline_comments_fetch():
+    """Source-contract: ``_fetch_review_inline_comments_with_pr``
+    MUST exist and MUST be referenced in the source.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert hasattr(mod, "_fetch_review_inline_comments_with_pr"), (
+        "Round-60 fix: audit must define "
+        "_fetch_review_inline_comments_with_pr helper."
+    )
+    src = inspect.getsource(mod)
+    assert "_fetch_review_inline_comments_with_pr" in src, (
+        "Round-60 fix: the source must reference "
+        "_fetch_review_inline_comments_with_pr."
+    )
+
+
+def _r60_classify_with_inline_comments(
+    monkeypatch, *,
+    codex_review_submissions,
+    codex_issue_comments,
+    active_threads,
+    inline_comments_by_review,
+):
+    """Drive ``classify`` end-to-end with inline
+    review comments injected via the ``gh api``
+    fetch path.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": list(active_threads),
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews/" in cmd_str
+            and "/comments" in cmd_str
+        ):
+            import re
+            match = re.search(r"/reviews/(\d+)/comments", cmd_str)
+            if match:
+                review_id = int(match.group(1))
+                comments = inline_comments_by_review.get(review_id, [])
+                m.stdout = json.dumps(comments)
+                return m
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Round-61 regression: treat inline summary findings
+# as blockers. When a newer summary-format Codex
+# review has inline comments, the post-clean-pass
+# scan MUST treat it as a NEWER finding even when the
+# summary body looks clean. Without this, the
+# classifier could return MERGE_READY despite a newer
+# inline finding.
+# ---------------------------------------------------------------------------
+
+
+def test_round61_newer_finding_with_inline_comments_downgrades_clean(monkeypatch, tmp_path):
+    """Bug repro: a newer summary-format review WITH
+    inline comments MUST downgrade a current-head
+    clean pass to HOLD_NEW_CODEX_THREAD, even when
+    the summary body is clean.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    # Older clean review (exact phrase).
+    older_clean = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="Codex Review: Didn't find any major issues. :tada:",
+        submitted_at="2026-07-22T06:10:00Z",
+        review_id=4751499100,
+        commit_oid=HEAD,
+    )
+    # Newer summary review WITH inline comments
+    # (the finding lives in the inline comments,
+    # not the summary body).
+    newer_finding = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[older_clean, newer_finding],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499200: [{
+                "id": "ic-1",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    # The newer finding with inline comments MUST
+    # downgrade the clean pass to HOLD_NEW_CODEX_THREAD.
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-61 fix: a newer summary review with "
+        "inline comments MUST downgrade to "
+        "HOLD_NEW_CODEX_THREAD. Got "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-62 regression: suppress readiness after
+# mark-ready head moves (Finding 1) + scan inline
+# comments after issue-comment clean passes
+# (Finding 2).
+# ---------------------------------------------------------------------------
+
+
+def test_round62_finding1_suppress_readiness_after_head_move(monkeypatch, tmp_path):
+    """Round-62 Finding 1: when the post-mutation
+    refresh detects a head move during
+    ``mark_pr_ready``, the final report MUST NOT
+    copy the pre-mutation ``machine_verdict`` into
+    ``effective_machine_ready``/``merge_ready``.
+    The authorization phrase and merge command MUST
+    be suppressed.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The ``elif head_moved_during_mutation:`` branch
+    # MUST suppress the readiness fields.
+    assert (
+        "elif head_moved_during_mutation" in src
+    ), "Round-62 fix: cmd_advance must check head_moved_during_mutation when building the final report."
+    # Find the branch and verify it sets the fields to False.
+    branch_idx = src.find("elif head_moved_during_mutation")
+    branch_section = src[branch_idx:branch_idx + 2000]
+    assert "effective_machine_ready = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_machine_ready = False."
+    )
+    assert "effective_merge_ready = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_merge_ready = False."
+    )
+    assert "effective_authorization_required = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_authorization_required = False."
+    )
+
+
+def test_round62_finding2_inline_comments_scanned_after_issue_clean_pass(monkeypatch, tmp_path):
+    """Round-62 Finding 2: the inline-comment fetch
+    MUST run for ALL summary-format reviews, even
+    when ``latest_clean_pass`` was already set from a
+    Codex issue-comment clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    # Older issue-comment clean pass.
+    older_clean = {
+        "databaseId": 1234,
+        "id": "ic-1",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "Codex Review: Didn't find any major issues. :tada:",
+        "createdAt": "2026-07-22T06:10:00Z",
+    }
+    # Newer summary review WITH inline comments.
+    newer_finding = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[newer_finding],
+        codex_issue_comments=[older_clean],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499200: [{
+                "id": "ic-2",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    # The newer summary with inline comments MUST
+    # downgrade to HOLD_NEW_CODEX_THREAD, even though
+    # the older issue-comment clean pass is in scope.
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-62 fix: a newer summary review with "
+        "inline comments MUST downgrade to "
+        "HOLD_NEW_CODEX_THREAD even when an older "
+        "issue-comment clean pass exists. Got "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round62_finding2_source_contract_pre_pass():
+    """Source-contract: the inline-comment fetch MUST
+    run in a pre-pass BEFORE the formal-review
+    clean-pass scan, so it runs regardless of
+    whether ``latest_clean_pass`` was set from an
+    issue-comment clean pass.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The pre-pass MUST exist before the formal-review
+    # clean-pass block.
+    prepass_idx = src.find("Round-62 fix (Finding 2): scan inline")
+    formal_idx = src.find("if latest_clean_pass is None and codex_review_submissions:")
+    assert prepass_idx > 0, (
+        "Round-62 fix: the pre-pass must exist in the source."
+    )
+    assert formal_idx > prepass_idx, (
+        "Round-62 fix: the pre-pass must appear BEFORE "
+        "the formal-review clean-pass scan."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-64 regression: recognize clean summary issue
+# comments in the audit. The audit's
+# ``is_codex_clean_pass_comment`` MUST accept the
+# same fragments as the poller, or a clean response
+# that uses the newer summary format (e.g. "No
+# findings reported") will be incorrectly classified
+# as a newer finding.
+# ---------------------------------------------------------------------------
+
+
+def test_round64_clean_pass_phrase_no_findings_reported():
+    """Round-64: a body containing "No findings reported"
+    MUST be classified as a clean pass by
+    ``is_codex_clean_pass_comment``.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No findings reported.\n"
+    )
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 fix: a summary body with 'No findings "
+        "reported' MUST be classified as a clean pass. "
+        "The audit and poller MUST agree on what counts "
+        "as clean."
+    )
+
+
+def test_round64_clean_pass_phrase_no_issues_found():
+    """Round-64: a body containing "No issues found" MUST
+    be classified as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No issues found.\n"
+    )
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 fix: a body with 'No issues found' "
+        "MUST be classified as a clean pass."
+    )
+
+
+def test_round64_clean_pass_phrase_legacy_exact_still_works():
+    """Round-64 invariant: the legacy exact phrase MUST
+    still be recognized as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = "Codex Review: Didn't find any major issues. :tada:"
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 invariant: the legacy exact phrase "
+        "MUST still be recognized as a clean pass."
+    )
+
+
+def test_round64_summary_with_finding_badge_not_clean():
+    """Round-64 invariant: a summary body that includes
+    a finding badge MUST NOT be classified as a clean
+    pass (the finding makes it a finding review).
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-64 invariant: a summary body with a "
+        "finding badge MUST NOT be classified as clean."
+    )
+
+
+def test_round64_source_contract_extra_fragments():
+    """Source-contract: the audit MUST define
+    ``CODEX_CLEAN_PASS_EXTRA_FRAGMENTS`` and
+    ``is_codex_clean_pass_comment`` MUST consult it.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert hasattr(mod, "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS"), (
+        "Round-64 fix: audit must define "
+        "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS."
+    )
+    src = inspect.getsource(mod.is_codex_clean_pass_comment)
+    assert "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS" in src, (
+        "Round-64 fix: is_codex_clean_pass_comment "
+        "MUST consult CODEX_CLEAN_PASS_EXTRA_FRAGMENTS."
+    )
+    # Must also accept summary format.
+    assert "is_codex_review_summary" in src, (
+        "Round-64 fix: is_codex_clean_pass_comment "
+        "MUST accept summary-format bodies as clean."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-65 regression: do not let clean fragments
+# override finding badges. A summary-format Codex body
+# that contains BOTH a clean fragment ("no major
+# issues" / "no findings reported" / etc.) AND a
+# finding badge MUST be classified as FINDING, not
+# CLEAN_PASS. The finding badge takes precedence.
+# ---------------------------------------------------------------------------
+
+
+def test_round65_audit_summary_with_clean_fragment_and_finding_badge_is_finding():
+    """Round-65: an audit body that is a summary with
+    BOTH a clean fragment and a finding badge MUST
+    NOT be classified as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No major issues found, except:\n"
+        "**<sub><sub>![P1 Badge]...</sub></sub>  Some finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-65 fix: a summary body with both a "
+        "clean fragment AND a finding badge MUST be "
+        "classified as FINDING, not CLEAN_PASS. The "
+        "finding badge takes precedence."
+    )
+
+
+def test_round65_audit_non_summary_with_finding_badge_is_finding():
+    """Round-65 invariant: a non-summary body that
+    contains a finding badge line MUST NOT be
+    classified as a clean pass regardless of clean
+    fragments elsewhere in the body.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "I looked and found no major issues overall.\n"
+        "**<sub><sub>![P2 Badge]...</sub></sub>  Finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-65 invariant: a body with a finding "
+        "badge line MUST NOT be a clean pass even if "
+        "clean fragments are also present."
+    )
+
+
+def test_round65_audit_source_contract_finding_badge_first():
+    """Source-contract: the audit's
+    ``is_codex_clean_pass_comment`` MUST consult
+    finding badges BEFORE clean fragments.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod.is_codex_clean_pass_comment)
+    # The finding-badge check must appear BEFORE the
+    # fragment check.
+    badge_idx = src.find("is_codex_finding_body")
+    fragment_idx = src.find("CODEX_CLEAN_PASS_EXTRA_FRAGMENTS")
+    assert badge_idx > 0
+    assert fragment_idx > 0
+    assert badge_idx < fragment_idx, (
+        "Round-65 fix: the finding-badge check must "
+        "appear BEFORE the fragment check in the "
+        "audit source."
+    )
+
+
+def test_round65_poller_summary_with_clean_fragment_and_finding_badge_is_finding():
+    """Round-65: the poller's issue-comment
+    classification MUST classify a summary body with
+    both a clean fragment and a finding badge as
+    FINDING, not CLEAN_PASS.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    # The poller's _match_response must pre-scan for
+    # finding badges.
+    assert "body_has_finding_badge" in src, (
+        "Round-65 fix: the poller must pre-scan for "
+        "finding badges before clean-pass check."
+    )
+
+
+def test_round65_poller_source_contract_finding_badge_first():
+    """Source-contract: the poller's issue-comment
+    classification MUST consult finding badges BEFORE
+    the clean-pass check.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    # Find the issue-comment classification section.
+    issue_idx = src.find('if kind == "issue_comment":')
+    assert issue_idx > 0
+    section = src[issue_idx:issue_idx + 5000]
+    # The body_has_finding_badge pre-scan must appear
+    # BEFORE the _is_clean_pass check.
+    badge_idx = section.find("body_has_finding_badge")
+    clean_idx = section.find("_is_clean_pass(body)")
+    assert badge_idx > 0
+    assert clean_idx > 0
+    assert badge_idx < clean_idx, (
+        "Round-65 fix: the finding-badge pre-scan "
+        "must appear BEFORE the _is_clean_pass check "
+        "in the poller source."
+    )

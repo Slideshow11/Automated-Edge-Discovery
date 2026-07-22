@@ -39,3 +39,4 @@ vendor_data/
 
 # Local data manifests (user-specific)
 examples/local_only/
+test_apply_output.json

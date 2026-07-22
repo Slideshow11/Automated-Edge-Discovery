@@ -116,14 +116,24 @@ jobs:
         run: bash scripts/ci/validate_governance_manifests.sh
 
   review-comment-gate:
+    # Round-3 fix: this gate runs on pull_request events. The
+    # operator-facing rerun path is ``aed_pr gate-recheck
+    # --head-sha <sha>`` which uses ``gh run rerun --job <id>``
+    # to rerun THIS job from the existing exact-head pull_request
+    # CI run; no workflow_dispatch is issued. INCONCLUSIVE never
+    # counts as success; the underlying script exits with the
+    # correct code (0/1/2) and the step is failed when the script
+    # returns non-zero.
+    #
+    # Round-11 follow-up (Codex comment 3610828222 on
+    # ``83e3f24``): the gate reads ``github.event.pull_request.*``
+    # directly. On ``push`` triggers those fields are empty,
+    # so the script exits 2 (INCONCLUSIVE) and the gate would
+    # spuriously fail the workflow. The ``if:`` guard below
+    # skips the gate on non-pull_request events; the other
+    # ordinary jobs continue to run on push as before.
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    # Runs only on pull_request events targeting main.
-    # Skipped on push events (branches like feat/*, fix/*) where
-    # github.event.pull_request is absent and PR_NUMBER/HEAD_SHA
-    # would be empty, causing check_pr_review_comments.py to fail.
-    # Uses gh CLI authenticated via GITHUB_TOKEN.
-    # No live Claude, no Hermes mutations.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -141,6 +151,14 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
+          # Refuse to run if the required inputs are missing; this
+          # prevents the gate from silently running on an empty
+          # head SHA, which would let the operator mask INCONCLUSIVE
+          # as success.
+          if [ -z "$PR_NUMBER" ] || [ -z "$HEAD_SHA" ]; then
+            echo "::error::review-comment-gate requires PR_NUMBER and HEAD_SHA"
+            exit 2
+          fi
           mkdir -p /tmp/review_comment_gate
           python scripts/local/check_pr_review_comments.py \
             --repo "$REPO" \
@@ -151,8 +169,10 @@ jobs:
           echo "=== REVIEW COMMENT GATE OUTPUT ==="
           cat /tmp/review_comment_gate/status.json
           echo ""
-          # Exit code 0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE
-          # The script itself exits with the correct code — no wrapper needed.
+          # Exit code 0 = CLEAN, 1 = BLOCKED, 2 = INCONCLUSIVE.
+          # The script itself exits with the correct code; do NOT
+          # mask a non-zero exit code as success. INCONCLUSIVE (2)
+          # fails the gate.
 
       - name: Upload gate artifact
         if: always()
