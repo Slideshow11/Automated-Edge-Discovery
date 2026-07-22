@@ -1622,6 +1622,59 @@ def classify(
         # as the current-head clean pass. Reviews with no commit_oid
         # (legacy / GitHub-emitted without a commit anchor) are kept
         # as authoritative — same convention as `latest_review`.
+        # Round-62 fix (Finding 2): scan inline
+        # comments for ALL summary-format reviews,
+        # not just those considered as clean-pass
+        # candidates. The Round-60/61 fix only
+        # scanned inline comments inside the
+        # ``if latest_clean_pass is None and
+        # codex_review_submissions`` block. When
+        # ``latest_clean_pass`` was already set
+        # from a Codex issue-comment clean pass,
+        # the formal-review scan was skipped and
+        # the inline-comment fetch never ran. A
+        # newer summary review with inline
+        # findings would then be treated as clean
+        # by the post-clean-pass scan, allowing
+        # ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+        # despite a newer inline finding.
+        #
+        # This pre-pass scans every summary-format
+        # review and records those with inline
+        # comments in ``review_ids_with_inline``.
+        # The post-clean-pass scan then consults
+        # the set to treat such reviews as newer
+        # findings (Round-61).
+        for r in codex_review_submissions:
+            body_value = r.get("body", "") or ""
+            if not is_codex_review_summary(body_value):
+                continue
+            review_id = r.get("id")
+            if not review_id:
+                continue
+            inline_ok, inline_comments, inline_err = (
+                _fetch_review_inline_comments_with_pr(
+                    repo, pr_number, review_id
+                )
+            )
+            if not inline_ok:
+                # Fetch failed — record the
+                # review as having a finding (the
+                # review cannot be proven clean
+                # without the inline surface).
+                # We add it to
+                # ``review_ids_with_inline`` so the
+                # post-clean-pass scan treats it
+                # as a finding AND also record it
+                # in ``api_errors`` for
+                # observability.
+                api_errors.append(
+                    f"review_inline_comments:{review_id}:{inline_err}"
+                )
+                review_ids_with_inline.add(str(review_id))
+                continue
+            if inline_comments:
+                review_ids_with_inline.add(str(review_id))
         # State is restricted to APPROVED or COMMENTED; bodies must
         # contain the canonical clean-pass phrase. Ping-window
         # filtering is applied so old pre-ping clean passes are not
@@ -1658,6 +1711,17 @@ def classify(
                 )
                 if not (is_clean_phrase or is_summary_format):
                     continue
+                # Round-60/62 fix: skip summary
+                # reviews with inline comments as
+                # clean-pass candidates. The pre-pass
+                # above (Round-62) populated
+                # ``review_ids_with_inline`` for all
+                # summary reviews with inline
+                # findings. Here we consult that set.
+                if is_summary_format:
+                    r_id_str = str(r.get("id", ""))
+                    if r_id_str in review_ids_with_inline:
+                        continue
                 # Round-54 fix: summary-format reviews
                 # carry their findings in inline review
                 # comments, NOT in the summary body.
@@ -1684,64 +1748,14 @@ def classify(
                 # threads so already-outdated threads
                 # from prior heads do not invalidate a
                 # current-head clean pass.
-                # Round-60 fix: fetch the review's
-                # inline comments whenever this is a
-                # summary-format review. The summary
-                # body itself never carries inline
-                # finding markers (those live in
-                # separate inline review comments),
-                # so the audit MUST fetch this surface
-                # before accepting a summary review as
-                # clean. If any inline comments exist,
-                # the review carries a finding. We
-                # fail closed when the fetch fails (the
-                # review cannot be proven clean without
-                # the inline surface). This check
-                # applies even when ``review_threads``
-                # is empty — a summary review with no
-                # review-thread inventory entries can
-                # still have inline review comments
-                # (e.g. comments that haven't been
-                # turned into threads yet, or
-                # inventory gaps).
-                #
-                # Round-61 fix: when inline comments
-                # exist on a summary review, the review
-                # is recorded in ``review_ids_with_inline``
-                # so the post-clean-pass scan below can
-                # treat it as a NEWER finding. Without
-                # this, the post-clean-pass scan would
-                # see a summary-clean body and NOT mark
-                # the review as a finding, allowing
-                # ``MERGE_READY_AWAITING_HUMAN_
-                # AUTHORIZATION`` despite a newer inline
-                # finding.
-                review_id = r.get("id")
-                if review_id and is_summary_format:
-                    inline_ok, inline_comments, inline_err = (
-                        _fetch_review_inline_comments_with_pr(
-                            repo, pr_number, review_id
-                        )
-                    )
-                    if not inline_ok:
-                        # Fetch failed — fail closed.
-                        # The review cannot be proven
-                        # clean.
-                        api_errors.append(
-                            f"review_inline_comments:{review_id}:{inline_err}"
-                        )
-                        continue
-                    if inline_comments:
-                        # Inline comments present — the
-                        # summary review carries a
-                        # finding. Skip it as a clean
-                        # pass candidate AND record the
-                        # review_id so the
-                        # post-clean-pass scan treats
-                        # this review as a newer finding
-                        # (Round-61).
-                        review_ids_with_inline.add(str(review_id))
-                        continue
+                # Round-60 inline-comment fetch is
+                # done in the pre-pass above (Round-62
+                # fix) so it runs for ALL summary
+                # reviews regardless of clean-pass
+                # source. Here we only check the
+                # ``review_ids_with_inline`` set to
+                # skip the review as a clean
+                # candidate.
                 # Round-54 + Round-56 + Round-57 +
                 # Round-59 fix: veto summary-format
                 # reviews whenever the associated

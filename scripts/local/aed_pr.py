@@ -4512,6 +4512,30 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # for merge authorization while the same report withholds
         # the phrase and says to wait for review.
         effective_authorization_required = False
+    elif head_moved_during_mutation:
+        # Round-62 fix (Finding 1): when the
+        # post-mutation refresh detected a head
+        # move during ``mark_pr_ready``, the
+        # pre-mutation ``machine_verdict`` is
+        # bound to the OLD head. Reporting it as
+        # ready would advertise a safe merge
+        # command and authorization phrase for
+        # the OLD head while the trusted scope and
+        # changed-file inputs are stale. The
+        # operator MUST rebind scope to the new
+        # head (via ``aed_pr scope-write``) and
+        # re-run ``advance`` so the readiness
+        # verdict uses current-head evidence.
+        # The ``next_human_action`` field below
+        # was already overridden in the report
+        # builder for this case.
+        effective_machine_ready = False
+        effective_merge_ready = False
+        effective_authorization_required = False
+        # Default value; the report builder
+        # overrides this with ``_head_moved_action``
+        # when the head-moved diagnostic is present.
+        next_human_action = _next_human_action(state)
     else:
         effective_machine_ready = machine_verdict.machine_ready
         effective_merge_ready = machine_verdict.merge_ready

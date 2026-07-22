@@ -10440,3 +10440,120 @@ def test_round61_newer_finding_with_inline_comments_downgrades_clean(monkeypatch
         "HOLD_NEW_CODEX_THREAD. Got "
         f"status={pkt.get('status')!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-62 regression: suppress readiness after
+# mark-ready head moves (Finding 1) + scan inline
+# comments after issue-comment clean passes
+# (Finding 2).
+# ---------------------------------------------------------------------------
+
+
+def test_round62_finding1_suppress_readiness_after_head_move(monkeypatch, tmp_path):
+    """Round-62 Finding 1: when the post-mutation
+    refresh detects a head move during
+    ``mark_pr_ready``, the final report MUST NOT
+    copy the pre-mutation ``machine_verdict`` into
+    ``effective_machine_ready``/``merge_ready``.
+    The authorization phrase and merge command MUST
+    be suppressed.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The ``elif head_moved_during_mutation:`` branch
+    # MUST suppress the readiness fields.
+    assert (
+        "elif head_moved_during_mutation" in src
+    ), "Round-62 fix: cmd_advance must check head_moved_during_mutation when building the final report."
+    # Find the branch and verify it sets the fields to False.
+    branch_idx = src.find("elif head_moved_during_mutation")
+    branch_section = src[branch_idx:branch_idx + 2000]
+    assert "effective_machine_ready = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_machine_ready = False."
+    )
+    assert "effective_merge_ready = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_merge_ready = False."
+    )
+    assert "effective_authorization_required = False" in branch_section, (
+        "Round-62 fix: the head_moved branch must "
+        "set effective_authorization_required = False."
+    )
+
+
+def test_round62_finding2_inline_comments_scanned_after_issue_clean_pass(monkeypatch, tmp_path):
+    """Round-62 Finding 2: the inline-comment fetch
+    MUST run for ALL summary-format reviews, even
+    when ``latest_clean_pass`` was already set from a
+    Codex issue-comment clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    # Older issue-comment clean pass.
+    older_clean = {
+        "databaseId": 1234,
+        "id": "ic-1",
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "Codex Review: Didn't find any major issues. :tada:",
+        "createdAt": "2026-07-22T06:10:00Z",
+    }
+    # Newer summary review WITH inline comments.
+    newer_finding = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[newer_finding],
+        codex_issue_comments=[older_clean],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499200: [{
+                "id": "ic-2",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    # The newer summary with inline comments MUST
+    # downgrade to HOLD_NEW_CODEX_THREAD, even though
+    # the older issue-comment clean pass is in scope.
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-62 fix: a newer summary review with "
+        "inline comments MUST downgrade to "
+        "HOLD_NEW_CODEX_THREAD even when an older "
+        "issue-comment clean pass exists. Got "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round62_finding2_source_contract_pre_pass():
+    """Source-contract: the inline-comment fetch MUST
+    run in a pre-pass BEFORE the formal-review
+    clean-pass scan, so it runs regardless of
+    whether ``latest_clean_pass`` was set from an
+    issue-comment clean pass.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The pre-pass MUST exist before the formal-review
+    # clean-pass block.
+    prepass_idx = src.find("Round-62 fix (Finding 2): scan inline")
+    formal_idx = src.find("if latest_clean_pass is None and codex_review_submissions:")
+    assert prepass_idx > 0, (
+        "Round-62 fix: the pre-pass must exist in the source."
+    )
+    assert formal_idx > prepass_idx, (
+        "Round-62 fix: the pre-pass must appear BEFORE "
+        "the formal-review clean-pass scan."
+    )
