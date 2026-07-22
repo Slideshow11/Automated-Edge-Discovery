@@ -7597,14 +7597,69 @@ def test_round58_source_contract_head_moved_flag_skips_resolution():
     # block header and the guard.
     before_resolve = src[:resolve_call_idx]
     # The guard MUST appear within 3000 chars before
-    # the resolve call.
-    assert "head_moved_during_mutation" in before_resolve[-3000:], (
+    # the resolve call. Accept either ``head_moved_
+    # during_mutation`` (Round-58) or ``head_moved_
+    # during_resolution`` (Round-67).
+    assert (
+        "head_moved_during_mutation" in before_resolve[-3000:]
+        or "head_moved_during_resolution" in before_resolve[-3000:]
+    ), (
         "Round-58 fix: the resolve_eligible_bot_threads "
         "block must check head_moved_during_mutation "
-        "and skip when True."
+        "(or head_moved_during_resolution) and skip when "
+        "True."
     )
     # The reason string MUST be present.
     assert "head_moved_during_mark_pr_ready" in src, (
         "Round-58 fix: the skip action record must "
         "include the reason string 'head_moved_during_mark_pr_ready'."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-67 regression: recheck the head before
+# marking ready (Finding 1) and before resolving
+# threads (Finding 2). Stale-head races must NOT
+# publish mutations using evidence bound to the
+# OLD head.
+# ---------------------------------------------------------------------------
+
+
+def test_round67_finding1_source_contract_pre_check_mark_pr_ready():
+    """Round-67 Finding 1: cmd_advance MUST refetch
+    the live ``headRefOid`` immediately before
+    ``gh pr ready`` and skip the mutation if the head
+    changed. Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The pre-check MUST call fetch_pr_state before
+    # _mark_pr_ready_for_review.
+    assert "mark_pr_ready_pre_check_head_moved" in src, (
+        "Round-67 fix: cmd_advance must pre-check the "
+        "live head before mark_pr_ready and skip if "
+        "the head moved."
+    )
+
+
+def test_round67_finding2_source_contract_pre_check_resolve():
+    """Round-67 Finding 2: cmd_advance MUST refetch
+    the live ``headRefOid`` before resolving each
+    eligible thread and abort the loop if the head
+    changed. Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The pre-check MUST call fetch_pr_state before
+    # the resolve loop and break on head move.
+    assert "head_moved_during_resolution" in src, (
+        "Round-67 fix: cmd_advance must pre-check the "
+        "live head before each resolve and abort the "
+        "loop on head move."
+    )
+    assert "resolve_eligible_bot_threads_pre_check_head_moved" in src, (
+        "Round-67 fix: the pre-check must record the "
+        "abort action."
     )
