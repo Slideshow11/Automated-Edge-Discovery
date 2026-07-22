@@ -380,3 +380,215 @@ class TestCLISmoke:
         )
         assert proc.returncode == 2
         assert "ISO 8601" in (proc.stdout + proc.stderr)
+
+
+# ---------------------------------------------------------------------------
+# Round-48 regression: pagination + summary-format handling
+# ---------------------------------------------------------------------------
+
+
+class TestPaginatedFetch:
+    """Round-48 fix: the poller MUST use ``gh api --paginate``
+    to follow all pages of a list endpoint. Without
+    pagination, a PR with more than 100 issue comments only
+    returns the first page, and a post-ping Codex response
+    on a long PR can sit on page 2+ and never be scanned.
+    """
+
+    def test_paginated_helper_invokes_paginate_flag(self):
+        """Static source check: the poller MUST use
+        ``--paginate`` when calling ``gh api`` for
+        list endpoints.
+        """
+        import inspect
+        from scripts.local import codex_review_poller as mod
+        src = inspect.getsource(mod)
+        assert "--paginate" in src, (
+            "Round-48 fix: the poller must use "
+            "``gh api --paginate`` for list endpoints. "
+            "Without pagination, a PR with more than 100 "
+            "issue comments only returns the first page."
+        )
+        # And the paginated helper must be used by the
+        # fetch functions.
+        assert "_gh_api_paginated" in src, (
+            "Round-48 fix: the poller must define and use "
+            "a _gh_api_paginated helper."
+        )
+
+    def test_paginated_helper_uses_subprocess_paginate(self, monkeypatch):
+        """End-to-end subprocess check: the paginated
+        helper invokes ``gh api --paginate <endpoint>``.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        # Use a fake ``gh`` that returns a single-line JSON
+        # array (the --paginate output format).
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps([
+            {"id": 1, "user": {"login": "alice"}},
+            {"id": 2, "user": {"login": "bob"}},
+        ])
+        fake_proc.stderr = ""
+        seen_argv = []
+        real_run = _subprocess.run
+        def spy_run(argv, *a, **kw):
+            seen_argv.append(list(argv))
+            return fake_proc
+        with _mp.object(_subprocess, "run", side_effect=spy_run):
+            data, err = mod._gh_api_paginated("repos/o/r/issues/1/comments")
+        assert err is None
+        assert len(data) == 2
+        # The argv MUST include ``--paginate``.
+        assert any("--paginate" in argv for argv in seen_argv), (
+            "Round-48 fix: the paginated helper must pass "
+            "``--paginate`` to ``gh api``. Seen argv: "
+            f"{seen_argv}"
+        )
+
+
+class TestCodexReviewSummaryFormat:
+    """Round-48 fix: Codex's automated review summaries
+    start with the ``### 💡 Codex Review`` Markdown
+    header. The poller MUST recognize this format and
+    fetch inline review comments to determine the
+    verdict (CLEAN_PASS vs FINDING).
+    """
+
+    HEAD = "d8f6f480e1020e3e4007c6a9e732c768c428fead"
+    PING_DT = _dt.datetime(2026, 7, 22, 1, 8, 48, tzinfo=_dt.timezone.utc)
+
+    def test_summary_prefix_detected(self):
+        mod = _load_module()
+        body = (
+            "\n### 💡 Codex Review\n\n"
+            "Here are some automated review suggestions for this PR.\n\n"
+            "**Reviewed commit:** `d8f6f480e1`\n"
+        )
+        assert mod._is_codex_review_summary(body) is True
+        # The summary body is NOT itself a finding or a
+        # clean pass — its verdict comes from the inline
+        # comments.
+        assert mod._is_clean_pass(body) is False
+        assert mod._is_finding(body) is False
+
+    def test_summary_with_inline_finding_is_finding(self, monkeypatch):
+        """A formal review with the summary prefix and
+        inline review comments carrying the finding
+        badge MUST be classified as FINDING.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        review = {
+            "id": 4750934578,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "\n### 💡 Codex Review\n\n"
+                "Here are some automated review suggestions.\n\n"
+                "**Reviewed commit:** `d8f6f480e1`\n"
+            ),
+            "commit_id": self.HEAD,
+            "submitted_at": "2026-07-22T04:08:37Z",
+        }
+        # Fake inline comments response.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps([
+            {
+                "id": 3627411228,
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": (
+                    "**<sub><sub>![P2 Badge]"
+                    "(https://img.shields.io/badge/P2-yellow?style=flat)"
+                    "</sub></sub>  Paginate issue comments before polling**\n\n"
+                    "When a PR has more than 100 issue comments..."
+                ),
+                "path": "scripts/local/codex_review_poller.py",
+            }
+        ])
+        fake_proc.stderr = ""
+        with _mp.object(_subprocess, "run", return_value=fake_proc):
+            m = mod._match_response(
+                review, kind="review",
+                repo="Slideshow11/Automated-Edge-Discovery",
+                pr_number=411,
+                head=self.HEAD, ping_dt=self.PING_DT,
+            )
+        assert m is not None
+        assert m["verdict"] == "FINDING"
+
+    def test_summary_without_inline_finding_is_clean_pass(self, monkeypatch):
+        """A formal review with the summary prefix and
+        NO inline review comments (or only non-finding
+        inline comments) MUST be classified as
+        CLEAN_PASS. This is the round-47 fix in action:
+        a review summary on its own is not a finding.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        review = {
+            "id": 4750934579,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "\n### 💡 Codex Review\n\n"
+                "Here are some automated review suggestions.\n\n"
+                "**Reviewed commit:** `f47d977233`\n"
+            ),
+            "commit_id": "f47d977233d1b6b58268e2af2540127f5ff93de1",
+            "submitted_at": "2026-07-22T05:00:00Z",
+        }
+        # No inline comments.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps([])
+        fake_proc.stderr = ""
+        with _mp.object(_subprocess, "run", return_value=fake_proc):
+            m = mod._match_response(
+                review, kind="review",
+                repo="Slideshow11/Automated-Edge-Discovery",
+                pr_number=411,
+                head="f47d977233d1b6b58268e2af2540127f5ff93de1",
+                ping_dt=self.PING_DT,
+            )
+        assert m is not None
+        assert m["verdict"] == "CLEAN_PASS"
+
+    def test_summary_with_inline_fetch_failure_fails_closed(self, monkeypatch):
+        """If the inline-comments fetch fails for a
+        summary-format review, the poller MUST fail
+        closed and classify as FINDING. A false FINDING
+        is safer than a missed FINDING.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        review = {
+            "id": 4750934580,
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "\n### 💡 Codex Review\n\n"
+                "Here are some automated review suggestions.\n\n"
+                "**Reviewed commit:** `f47d977233`\n"
+            ),
+            "commit_id": "f47d977233d1b6b58268e2af2540127f5ff93de1",
+            "submitted_at": "2026-07-22T05:00:00Z",
+        }
+        # Inline fetch fails (non-zero returncode).
+        fake_proc = MagicMock()
+        fake_proc.returncode = 1
+        fake_proc.stdout = ""
+        fake_proc.stderr = "gh api --paginate error"
+        with _mp.object(_subprocess, "run", return_value=fake_proc):
+            m = mod._match_response(
+                review, kind="review",
+                repo="Slideshow11/Automated-Edge-Discovery",
+                pr_number=411,
+                head="f47d977233d1b6b58268e2af2540127f5ff93de1",
+                ping_dt=self.PING_DT,
+            )
+        assert m is not None
+        assert m["verdict"] == "FINDING"

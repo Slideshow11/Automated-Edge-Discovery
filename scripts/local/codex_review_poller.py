@@ -78,6 +78,17 @@ CLEAN_PASS_FRAGMENTS = (
 # (Codex uses ``**<sub>...badge...</sub>  <headline>``).
 FINDING_BADGE_PREFIX = "**<sub><sub>"
 
+# Recognized Codex review summary prefix. Codex's automated
+# review summaries start with this Markdown header. A
+# review with this prefix may contain inline review
+# comments that are the actual findings.
+CODEX_REVIEW_SUMMARY_PREFIX = "### 💡 Codex Review"
+
+# Reaction-based clean signal. Codex sometimes signals a
+# clean pass by reacting with 👍 on the PR rather than
+# posting a formal review. This is checked separately
+# via the reactions API.
+
 
 def _log(level: str, msg: str) -> None:
     sys.stdout.write(
@@ -102,6 +113,61 @@ def _gh_api(endpoint: str) -> Tuple[Optional[Any], Optional[str]]:
         return None, (proc.stderr or "").strip() or f"gh api rc={proc.returncode}"
     try:
         return json.loads(proc.stdout), None
+    except json.JSONDecodeError as exc:
+        return None, f"json decode error: {exc}"
+
+
+def _gh_api_paginated(endpoint: str) -> Tuple[Optional[List[Any]], Optional[str]]:
+    """Run ``gh api --paginate <endpoint>`` and return the
+    concatenation of all pages as a single list (or the
+    raw object if the response is not a list).
+
+    GitHub REST list endpoints are paginated. ``per_page``
+    only controls page size; additional pages must be
+    followed. The ``--paginate`` flag tells ``gh`` to
+    follow all pages and concatenate the results. This
+    is the round-48 fix: without pagination, a PR with
+    more than 100 issue comments only returns the first
+    page (oldest-first by default), and a post-ping Codex
+    response on a long PR can sit on page 2+ and never
+    be scanned, causing a false timeout.
+    """
+    # Strip any leading "repos/..." or "user/..." prefix
+    # because ``--paginate`` expects the bare endpoint.
+    # The endpoint may already include a query string.
+    cmd = ["gh", "api", "--paginate", endpoint]
+    # ``--paginate`` writes each page on its own line in
+    # newline-delimited JSON, OR concatenates the list
+    # elements into a single JSON array. Try parsing the
+    # full output as a single array first; if that fails,
+    # try NDJSON.
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "gh api --paginate timeout"
+    except FileNotFoundError:
+        return None, "gh not found in PATH"
+    if proc.returncode != 0:
+        return None, (proc.stderr or "").strip() or f"gh api --paginate rc={proc.returncode}"
+    out = (proc.stdout or "").strip()
+    if not out:
+        return [], None
+    # Try single JSON array.
+    try:
+        data = json.loads(out)
+        if isinstance(data, list):
+            return data, None
+        # Non-list response (single object): wrap in list
+        # of one so the caller can iterate uniformly.
+        return [data], None
+    except json.JSONDecodeError:
+        pass
+    # Try NDJSON (one JSON object per line).
+    try:
+        data = [json.loads(line) for line in out.splitlines() if line.strip()]
+        return data, None
     except json.JSONDecodeError as exc:
         return None, f"json decode error: {exc}"
 
@@ -142,6 +208,20 @@ def _is_finding(body: str) -> bool:
     return body.lstrip().startswith(FINDING_BADGE_PREFIX)
 
 
+def _is_codex_review_summary(body: str) -> bool:
+    """True iff the body is a Codex review summary.
+
+    Codex's automated review summaries start with the
+    ``### 💡 Codex Review`` Markdown header. A review
+    with this prefix may contain inline review comments
+    that carry the actual findings; the summary body
+    itself is not a finding.
+    """
+    if not body:
+        return False
+    return body.lstrip().startswith(CODEX_REVIEW_SUMMARY_PREFIX)
+
+
 def _head_matches_response(head: str, body: str) -> bool:
     """True iff the response body references the current head.
 
@@ -169,19 +249,84 @@ def _head_matches_response(head: str, body: str) -> bool:
 
 
 def _fetch_formal_reviews(repo: str, pr_number: int) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    """Return list of formal reviews or (None, error_msg)."""
-    data, err = _gh_api(f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100")
+    """Return list of formal reviews (paginated) or (None, error_msg)."""
+    data, err = _gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews")
     if err is not None:
         return None, err
     return data or [], None
 
 
 def _fetch_issue_comments(repo: str, pr_number: int) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
-    """Return list of PR-level issue comments or (None, error_msg)."""
-    data, err = _gh_api(f"repos/{repo}/issues/{pr_number}/comments?per_page=100")
+    """Return list of PR-level issue comments (paginated) or (None, error_msg)."""
+    data, err = _gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments")
     if err is not None:
         return None, err
     return data or [], None
+
+
+def _fetch_review_inline_comments(
+    repo: str, pr_number: int, review_id: Any
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Return list of inline review comments for a single
+    review (paginated) or (None, error_msg).
+
+    A formal review with the Codex review summary prefix
+    may carry inline review comments that are the actual
+    findings. The poller fetches these to distinguish a
+    clean pass (no inline comments) from a finding (one
+    or more inline comments with the finding badge).
+    """
+    data, err = _gh_api_paginated(
+        f"repos/{repo}/pulls/{pr_number}/reviews/{review_id}/comments"
+    )
+    if err is not None:
+        return None, err
+    return data or [], None
+
+
+def _classify_review_with_inline(
+    review: Dict[str, Any],
+    *,
+    repo: str,
+    pr_number: int,
+) -> str:
+    """Classify a formal review as CLEAN_PASS or FINDING.
+
+    For reviews with the Codex review summary prefix
+    (``### 💡 Codex Review``), the summary body itself is
+    not a finding; the findings are in inline review
+    comments. We fetch the inline comments and check
+    whether any carry the finding badge. If so, the
+    review is a FINDING. Otherwise, it is a CLEAN_PASS.
+
+    For other review body formats, fall back to the
+    direct body classification.
+    """
+    body = review.get("body", "") or ""
+    if _is_codex_review_summary(body):
+        # Fetch inline comments to determine the verdict.
+        review_id = review.get("id")
+        inline, err = _fetch_review_inline_comments(repo, pr_number, review_id)
+        if err is not None or inline is None:
+            # If we can't fetch inline comments, conservatively
+            # classify as FINDING (fail closed) so the operator
+            # sees the response and can investigate. A false
+            # FINDING is safer than a missed FINDING.
+            return "FINDING"
+        if not inline:
+            return "CLEAN_PASS"
+        # Any inline comment with the finding badge prefix
+        # makes the review a FINDING.
+        for c in inline:
+            c_body = c.get("body", "") or ""
+            if _is_finding(c_body):
+                return "FINDING"
+        return "CLEAN_PASS"
+    if _is_clean_pass(body):
+        return "CLEAN_PASS"
+    if _is_finding(body):
+        return "FINDING"
+    return ""
 
 
 def _match_response(
@@ -206,8 +351,10 @@ def _match_response(
       boundary (post-ping).
 
     The match is structured:
-    - the candidate body must look like either a clean pass or
-      a finding (recognized badge prefix or clean-pass phrase).
+    - the candidate body (or, for summary-format reviews, the
+      inline review comments) must look like either a clean
+      pass or a finding (recognized badge prefix or clean-pass
+      phrase).
     """
     # Author check (Codex bot identity).
     author = candidate.get("user", {}).get("login", "") if isinstance(candidate.get("user"), dict) else ""
@@ -222,6 +369,19 @@ def _match_response(
         if not _head_matches_response(head, body):
             return None
         ts_raw = candidate.get("created_at", "")
+        # For issue comments, classify from the body directly.
+        if _is_clean_pass(body):
+            verdict = "CLEAN_PASS"
+        elif _is_finding(body):
+            verdict = "FINDING"
+        elif _is_codex_review_summary(body):
+            # Issue comment that looks like a review summary
+            # (e.g. an echoed review). Classify as CLEAN_PASS
+            # only if the body is empty of finding phrases.
+            verdict = "CLEAN_PASS"
+        else:
+            # Body has no recognized structure. Skip it.
+            return None
     else:
         # Formal reviews may be head-bound via ``commit_id``;
         # if so, the head check is satisfied by the equality.
@@ -233,6 +393,14 @@ def _match_response(
         if not commit_id and not _head_matches_response(head, body):
             return None
         ts_raw = candidate.get("submitted_at", "") or candidate.get("created_at", "")
+        # Classify the review, fetching inline comments
+        # for summary-format reviews.
+        verdict = _classify_review_with_inline(
+            candidate, repo=repo, pr_number=pr_number,
+        )
+        if not verdict:
+            # Body has no recognized structure. Skip it.
+            return None
     # Timestamp check (post-ping).
     dt = _parse_iso_utc(ts_raw)
     if dt is None:
@@ -243,14 +411,6 @@ def _match_response(
     else:
         if dt < ping_dt:
             return None
-    # Structure check: clean pass or finding.
-    if _is_clean_pass(body):
-        verdict = "CLEAN_PASS"
-    elif _is_finding(body):
-        verdict = "FINDING"
-    else:
-        # Body has no recognized structure. Skip it.
-        return None
     return {
         "kind": kind,
         "id": candidate.get("id"),
