@@ -4124,41 +4124,51 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # bound to the OLD head. Refetch and compare
             # the live ``headRefOid``; skip the mutation
             # if the head moved.
-            try:
-                live_pr_view_pre_ready = fetch_pr_state(
-                    repo, pr_number
-                )
-                live_head_pre_ready = (
-                    live_pr_view_pre_ready.get("headRefOid")
-                    if isinstance(live_pr_view_pre_ready, dict)
-                    else None
-                )
-                if (
-                    live_head_pre_ready
-                    and str(head_sha)
-                    and live_head_pre_ready != str(head_sha)
-                ):
-                    # Head moved between evidence
-                    # fetch and ``mark_pr_ready``.
-                    # Skip the mutation.
-                    actions_taken.append({
-                        "action": "mark_pr_ready_pre_check_head_moved",
-                        "ok": False,
-                        "result": "head_changed_before_mark_pr_ready",
-                        "original_head": str(head_sha),
-                        "live_head": live_head_pre_ready,
-                    })
-                    head_moved_during_mutation = True
-                else:
-                    ok_ready, ready_result = _mark_pr_ready_for_review(
-                        repo, pr_number
-                    )
-                    actions_taken.append({
-                        "action": "mark_pr_ready",
-                        "ok": ok_ready,
-                        "result": ready_result,
-                    })
-            except Exception as exc:
+            #
+            # Round-68 fix: fail closed when the
+            # pre-check fails. A transient ``gh pr
+            # view``/API error after a push must NOT
+            # fall through to ``_mark_pr_ready_for_review``
+            # (the old scope, CI, and Codex evidence
+            # would publish the draft). The mutation is
+            # skipped and a blocking diagnostic is
+            # recorded so the operator can rebind scope
+            # and re-run.
+            live_pr_view_pre_ready = fetch_pr_state(
+                repo, pr_number
+            )
+            live_head_pre_ready = (
+                live_pr_view_pre_ready.get("headRefOid")
+                if isinstance(live_pr_view_pre_ready, dict)
+                else None
+            )
+            if (
+                live_head_pre_ready
+                and str(head_sha)
+                and live_head_pre_ready != str(head_sha)
+            ):
+                # Head moved between evidence
+                # fetch and ``mark_pr_ready``.
+                # Skip the mutation.
+                actions_taken.append({
+                    "action": "mark_pr_ready_pre_check_head_moved",
+                    "ok": False,
+                    "result": "head_changed_before_mark_pr_ready",
+                    "original_head": str(head_sha),
+                    "live_head": live_head_pre_ready,
+                })
+                head_moved_during_mutation = True
+            elif not live_head_pre_ready:
+                # Pre-check returned no headRefOid —
+                # fail closed. Skip the mutation.
+                actions_taken.append({
+                    "action": "mark_pr_ready_pre_check_failed",
+                    "ok": False,
+                    "result": "pre_check_returned_no_head",
+                    "original_head": str(head_sha),
+                })
+                head_moved_during_mutation = True
+            else:
                 ok_ready, ready_result = _mark_pr_ready_for_review(
                     repo, pr_number
                 )
@@ -4166,7 +4176,6 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     "action": "mark_pr_ready",
                     "ok": ok_ready,
                     "result": ready_result,
-                    "pre_check_error": repr(exc),
                 })
             # Round-45 fix: when ``gh pr ready`` succeeds,
             # the local ``pr_view`` / ``evidence`` /
@@ -4399,52 +4408,62 @@ def cmd_advance(args: argparse.Namespace) -> int:
                 # on the NEW head uses stale exact-head
                 # evidence. Abort the loop if the head
                 # changed.
+                #
+                # Round-68 fix: fail closed when the
+                # pre-check fails. A transient API
+                # error after a push must NOT fall
+                # through to ``resolve_review_thread``
+                # (the old eligibility evidence would
+                # resolve threads on the new head
+                # using stale data). The loop aborts
+                # and a blocking diagnostic is
+                # recorded.
                 head_moved_during_resolution = False
                 for record in eligible_thread_records:
                     # Pre-check the live head before
-                    # each mutation.
-                    try:
-                        live_pr_view_during_resolve = fetch_pr_state(
-                            repo, pr_number
+                    # each mutation. Fail closed on
+                    # any error.
+                    live_pr_view_during_resolve = fetch_pr_state(
+                        repo, pr_number
+                    )
+                    live_head_during_resolve = (
+                        live_pr_view_during_resolve.get("headRefOid")
+                        if isinstance(
+                            live_pr_view_during_resolve, dict
                         )
-                        live_head_during_resolve = (
-                            live_pr_view_during_resolve.get("headRefOid")
-                            if isinstance(
-                                live_pr_view_during_resolve, dict
-                            )
-                            else None
-                        )
-                        if (
-                            live_head_during_resolve
-                            and str(head_sha)
-                            and live_head_during_resolve != str(head_sha)
-                        ):
-                            # Head moved between evidence
-                            # fetch and this resolution.
-                            # Abort the loop.
-                            head_moved_during_resolution = True
-                            actions_taken.append({
-                                "action": "resolve_eligible_bot_threads_pre_check_head_moved",
-                                "ok": False,
-                                "result": "head_changed_during_resolve",
-                                "original_head": str(head_sha),
-                                "live_head": live_head_during_resolve,
-                                "aborted_at_thread": record["thread_id"],
-                            })
-                            break
-                    except Exception as exc:
-                        # Fetch failed — log and
-                        # continue with the mutation
-                        # (the existing failure path
-                        # will catch any actual
-                        # resolve error).
+                        else None
+                    )
+                    if (
+                        live_head_during_resolve
+                        and str(head_sha)
+                        and live_head_during_resolve != str(head_sha)
+                    ):
+                        # Head moved between evidence
+                        # fetch and this resolution.
+                        # Abort the loop.
+                        head_moved_during_resolution = True
                         actions_taken.append({
-                            "action": "resolve_pre_check_error",
+                            "action": "resolve_eligible_bot_threads_pre_check_head_moved",
                             "ok": False,
-                            "result": "pre_check_failed",
-                            "thread_id": record["thread_id"],
-                            "error": repr(exc),
+                            "result": "head_changed_during_resolve",
+                            "original_head": str(head_sha),
+                            "live_head": live_head_during_resolve,
+                            "aborted_at_thread": record["thread_id"],
                         })
+                        break
+                    if not live_head_during_resolve:
+                        # Pre-check returned no
+                        # headRefOid — fail closed.
+                        # Abort the loop.
+                        head_moved_during_resolution = True
+                        actions_taken.append({
+                            "action": "resolve_pre_check_failed",
+                            "ok": False,
+                            "result": "pre_check_returned_no_head",
+                            "original_head": str(head_sha),
+                            "aborted_at_thread": record["thread_id"],
+                        })
+                        break
                     tid = record["thread_id"]
                     if not tid:
                         continue

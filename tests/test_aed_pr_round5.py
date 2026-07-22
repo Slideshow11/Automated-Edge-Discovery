@@ -7663,3 +7663,113 @@ def test_round67_finding2_source_contract_pre_check_resolve():
         "Round-67 fix: the pre-check must record the "
         "abort action."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-68 regression: fail closed when the
+# ready-head or resolve-head check fails. The
+# Round-67 ``except Exception`` fall-through paths
+# are removed. A transient API error must NOT
+# proceed with the mutation using stale evidence.
+# ---------------------------------------------------------------------------
+
+
+def test_round68_finding1_source_contract_no_except_fallthrough():
+    """Round-68 Finding 1: cmd_advance MUST NOT have an
+    ``except Exception`` clause that falls through to
+    ``_mark_pr_ready_for_review`` after the pre-check.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The pre-check block for ``mark_pr_ready`` must
+    # NOT have an ``except Exception`` that calls
+    # ``_mark_pr_ready_for_review``.
+    pre_check_idx = src.find("mark_pr_ready_pre_check_head_moved")
+    assert pre_check_idx > 0
+    # Look at the block BEFORE the next action or
+    # the next ``if``.
+    next_section = src[pre_check_idx:pre_check_idx + 3000]
+    # The pre-check block MUST contain a
+    # ``mark_pr_ready_pre_check_failed`` action.
+    assert "mark_pr_ready_pre_check_failed" in next_section, (
+        "Round-68 fix: the mark_pr_ready pre-check "
+        "must record a failure action when the "
+        "pre-check returns no head."
+    )
+
+
+def test_round68_finding2_source_contract_no_except_fallthrough():
+    """Round-68 Finding 2: the resolve-loop MUST NOT
+    have an ``except Exception`` clause that falls
+    through to ``resolve_review_thread`` after the
+    pre-check. Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The resolve-loop must NOT contain the old
+    # ``resolve_pre_check_error`` action (which was
+    # the fall-through path).
+    # The new ``resolve_pre_check_failed`` action
+    # aborts the loop instead.
+    assert "resolve_pre_check_failed" in src, (
+        "Round-68 fix: the resolve-loop must record "
+        "a failure action that aborts the loop when "
+        "the pre-check returns no head."
+    )
+    # The old fall-through action must be gone.
+    # Check that ``resolve_pre_check_error`` is not
+    # used as an action name.
+    assert '"action": "resolve_pre_check_error"' not in src, (
+        "Round-68 fix: the resolve-loop must NOT "
+        "fall through to resolve_review_thread on "
+        "pre-check failure."
+    )
+
+
+def test_round68_finding2_resolve_aborts_on_no_head():
+    """Round-68 Finding 2 invariant: the resolve-loop
+    MUST abort on pre-check failure (no headRefOid).
+    The action record must indicate abort.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The resolve-loop must contain the
+    # ``resolve_pre_check_failed`` action.
+    assert "resolve_pre_check_failed" in src, (
+        "Round-68 fix: the resolve-loop must record "
+        "a failure action when the pre-check returns "
+        "no head."
+    )
+    # The old fall-through action must be gone.
+    assert '"action": "resolve_pre_check_error"' not in src, (
+        "Round-68 fix: the resolve-loop must NOT "
+        "fall through to resolve_review_thread on "
+        "pre-check failure."
+    )
+    # The resolve-loop must abort on pre-check
+    # failure (break).
+    # Find the resolve-loop and check for break
+    # after the action.
+    fail_idx = src.find('"action": "resolve_pre_check_failed"')
+    assert fail_idx > 0
+    # The action must be followed by ``break``
+    # before the next resolve_review_thread call.
+    after_action = src[fail_idx:fail_idx + 500]
+    assert "break" in after_action, (
+        "Round-68 fix: the resolve-loop must abort "
+        "(break) on pre-check failure."
+    )
+    # The loop must set
+    # ``head_moved_during_resolution = True``
+    # before the break.
+    before_action = src[max(0, fail_idx - 500):fail_idx]
+    assert "head_moved_during_resolution = True" in before_action, (
+        "Round-68 fix: the resolve-loop must set "
+        "head_moved_during_resolution=True before "
+        "the break."
+    )
