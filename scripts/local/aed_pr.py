@@ -4526,16 +4526,17 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # head (via ``aed_pr scope-write``) and
         # re-run ``advance`` so the readiness
         # verdict uses current-head evidence.
-        # The ``next_human_action`` field below
-        # was already overridden in the report
-        # builder for this case.
+        # Round-63 fix: also override
+        # ``next_human_action`` to
+        # ``_head_moved_action()`` here so the
+        # emitted report gives operators the
+        # concrete scope-write / re-run recovery
+        # steps, not the stale pre-mutation
+        # ``_next_human_action(state)`` hint.
         effective_machine_ready = False
         effective_merge_ready = False
         effective_authorization_required = False
-        # Default value; the report builder
-        # overrides this with ``_head_moved_action``
-        # when the head-moved diagnostic is present.
-        next_human_action = _next_human_action(state)
+        next_human_action = _head_moved_action()
     else:
         effective_machine_ready = machine_verdict.machine_ready
         effective_merge_ready = machine_verdict.merge_ready

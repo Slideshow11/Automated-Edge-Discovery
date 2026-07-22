@@ -838,3 +838,93 @@ class TestSelectNewestMatch:
             "finding. Found 'break' in the scan section: "
             f"{scan_section!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-63 regression: use head-moved recovery hint
+# (Finding 1) + treat summary issue-comment badges as
+# findings (Finding 2).
+# ---------------------------------------------------------------------------
+
+
+def test_round63_finding1_head_moved_action_used(monkeypatch, tmp_path):
+    """Round-63 Finding 1: when
+    ``head_moved_during_mutation=True``, the final
+    report MUST use ``_head_moved_action()`` for
+    ``next_human_action``, not the stale pre-mutation
+    ``_next_human_action(state)`` hint.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    branch_idx = src.find("elif head_moved_during_mutation")
+    branch_section = src[branch_idx:branch_idx + 2000]
+    assert "next_human_action = _head_moved_action()" in branch_section, (
+        "Round-63 fix: the head_moved branch must "
+        "set next_human_action = _head_moved_action()."
+    )
+
+
+def test_round63_finding2_summary_issue_comment_with_finding_badge_is_finding(monkeypatch, tmp_path):
+    """Round-63 Finding 2: a summary issue comment
+    whose body includes a finding badge later in the
+    text MUST be classified as FINDING, not
+    CLEAN_PASS.
+    """
+    from scripts.local.codex_review_poller import (
+        FINDING_BADGE_PREFIX,
+        CODEX_REVIEW_SUMMARY_PREFIX,
+    )
+    head = "edf46d85aad2c94fad109903a1629b689e1cd880"
+    # Summary body that includes a finding badge
+    # later in the text.
+    summary_body_with_finding = (
+        f"\n{CODEX_REVIEW_SUMMARY_PREFIX}\n\n"
+        "Here are some automated review suggestions.\n\n"
+        f"**Reviewed commit:** `{head[:10]}`\n\n"
+        f"{FINDING_BADGE_PREFIX}  Some finding here\n"
+    )
+    from scripts.local.codex_review_poller import _is_finding
+    assert _is_finding(FINDING_BADGE_PREFIX + "  Some finding"), (
+        "Round-63 fix: _is_finding must detect a "
+        "finding badge line."
+    )
+    has_finding_line = any(
+        _is_finding(line)
+        for line in summary_body_with_finding.splitlines()
+    )
+    assert has_finding_line, (
+        "Round-63 fix: a summary body with a finding "
+        "badge line MUST be detected as FINDING."
+    )
+
+
+def test_round63_finding2_source_contract_summary_scan():
+    """Source-contract: the poller's issue-comment
+    classification MUST scan summary body lines for
+    finding markers.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    # The classification MUST include a check for
+    # finding markers in summary body lines.
+    assert "Round-63 fix" in src, (
+        "Round-63 fix: codex_review_poller must "
+        "scan summary body lines for finding markers."
+    )
+    # And it must use ``any`` over ``_is_finding(line)``
+    # for summary body lines.
+    # Use a regex-friendly check that tolerates
+    # whitespace/newlines between ``any`` and
+    # ``_is_finding``.
+    import re
+    assert re.search(
+        r"any\s*\(\s*_is_finding\s*\(\s*line\s*\)",
+        src,
+    ), (
+        "Round-63 fix: the summary issue-comment "
+        "classification must use any(_is_finding(line) "
+        "for line in body.splitlines())."
+    )

@@ -398,7 +398,23 @@ def _match_response(
             # Issue comment that looks like a review summary
             # (e.g. an echoed review). Classify as CLEAN_PASS
             # only if the body is empty of finding phrases.
-            verdict = "CLEAN_PASS"
+            # Round-63 fix: also scan the summary body
+            # lines for finding markers. A summary issue
+            # comment whose body includes a finding badge
+            # later in the text (after the summary header)
+            # MUST be classified as FINDING, not
+            # CLEAN_PASS. Without this check, a
+            # post-ping response that contains a finding
+            # badge embedded in the summary body would
+            # incorrectly unblock the external review
+            # loop.
+            if any(
+                _is_finding(line)
+                for line in body.splitlines()
+            ):
+                verdict = "FINDING"
+            else:
+                verdict = "CLEAN_PASS"
         else:
             # Body has no recognized structure. Skip it.
             return None
