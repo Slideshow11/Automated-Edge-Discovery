@@ -3601,6 +3601,23 @@ def resolve_review_thread(
 
 def cmd_advance(args: argparse.Namespace) -> int:
     """Perform every safe mechanical lifecycle step except the merge."""
+
+    class _HeadMovedDuringMutation(Exception):
+        """Round-53 internal sentinel: raised when the
+        post-mutation refresh sees a different
+        ``headRefOid`` than the one captured at the
+        start of ``advance``. The outer handler treats
+        this the same as any other refresh failure
+        (diagnostic note in ``actions_taken``, no swap
+        of pre-mutation snapshots).
+        """
+        def __init__(self, *, original_head: str, refreshed_head: str) -> None:
+            super().__init__(
+                f"head moved during mark_pr_ready: "
+                f"original={original_head} refreshed={refreshed_head}"
+            )
+            self.original_head = original_head
+            self.refreshed_head = refreshed_head
     repo = args.repo
     pr_number = args.pr_number
     cli_allowed = _parse_scope_arg(args.allowed_files)
@@ -4087,6 +4104,48 @@ def cmd_advance(args: argparse.Namespace) -> int:
             if ok_ready:
                 try:
                     refreshed_pr_view = fetch_pr_state(repo, pr_number)
+                    # Round-53 fix: if a push landed while
+                    # ``gh pr ready`` was running, the
+                    # refreshed ``headRefOid`` may differ
+                    # from the ``head_sha`` we captured at
+                    # the start of this ``advance``
+                    # invocation. The trusted scope and
+                    # changed-file inputs below are bound
+                    # to the OLD head, so reporting
+                    # readiness against the NEW head would
+                    # mix evidence from two different
+                    # commits. Fail closed: reject the
+                    # refresh when the head moved, and
+                    # force the operator to re-run
+                    # ``advance`` against the new head
+                    # (which will rebind scope to the new
+                    # SHA via ``scope-write``).
+                    refreshed_head = (
+                        refreshed_pr_view.get("headRefOid")
+                        if isinstance(refreshed_pr_view, dict)
+                        else None
+                    )
+                    if (
+                        refreshed_head
+                        and head_sha
+                        and refreshed_head != head_sha
+                    ):
+                        # Head moved during mutation. Do
+                        # NOT swap the local snapshots;
+                        # report a diagnostic and let the
+                        # operator re-run against the new
+                        # head.
+                        actions_taken.append({
+                            "action": "post_mutation_refresh_head_moved",
+                            "ok": False,
+                            "result": "head_changed_during_mark_pr_ready",
+                            "original_head": head_sha,
+                            "refreshed_head": refreshed_head,
+                        })
+                        raise _HeadMovedDuringMutation(
+                            original_head=head_sha,
+                            refreshed_head=refreshed_head,
+                        )
                     refreshed_evidence = build_evidence(
                         repo=repo,
                         pr_number=pr_number,
@@ -4119,6 +4178,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     state = derive_lifecycle_state(
                         machine_verdict, pr_view
                     )
+                except _HeadMovedDuringMutation:
+                    # Already recorded the diagnostic above.
+                    # Re-raise so the outer exception
+                    # handler treats this as a refresh
+                    # failure (no ``post_mutation_refresh``
+                    # success, no swap of snapshots).
+                    raise
                 except Exception as exc:
                     # Refetch failure is logged but does not
                     # fail the run: the mutation already

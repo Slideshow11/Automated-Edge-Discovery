@@ -28,7 +28,9 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import tempfile
 import unittest.mock as mock
+from unittest.mock import MagicMock
 import argparse
 from typing import Any, List, Optional
 
@@ -7354,3 +7356,121 @@ class TestRound50UnmergedClosedPrIsBlocked:
             f"not {returned_state!r}. An unmerged CLOSED "
             "PR must not be reported as COMPLETE."
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-53 regression: fail closed when the post-mutation
+# refresh sees a moved head. If a push lands while
+# ``gh pr ready`` is running, the refreshed ``headRefOid``
+# may differ from the ``head_sha`` captured at the start
+# of ``advance``. The trusted scope and changed-file
+# inputs are bound to the OLD head, so reporting
+# readiness against the NEW head would mix evidence from
+# two different commits. The fix: reject the refresh
+# when the head moved, and force the operator to re-run
+# ``advance`` against the new head.
+# ---------------------------------------------------------------------------
+
+
+def _r53_make_fake_subprocess_for_advance(*, initial_pr_view, refreshed_pr_view):
+    """Build a fake subprocess runner for cmd_advance
+    that returns ``initial_pr_view`` on the first
+    fetch_pr_state call and ``refreshed_pr_view`` on
+    the second (post-mark-pr-ready refresh).
+    """
+    state = {"fetch_pr_state_count": 0}
+
+    def fake(cmd, *args, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if cmd[:3] == ["gh", "pr", "view"]:
+            state["fetch_pr_state_count"] += 1
+            if state["fetch_pr_state_count"] == 1:
+                return _FakeProc(0, json.dumps(initial_pr_view), "")
+            return _FakeProc(0, json.dumps(refreshed_pr_view), "")
+        if cmd[:3] == ["gh", "pr", "checks"]:
+            return _FakeProc(0, json.dumps([
+                {"name": "test (3.11)", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "validator", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "governance-validators", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "pr-gate-live-smoke", "state": "SUCCESS", "workflow": "CI"},
+                {"name": "review-comment-gate", "state": "FAILURE", "workflow": "CI"},
+            ]), "")
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return _FakeProc(0, "[]", "")
+        if cmd[:3] == ["gh", "run", "list"]:
+            return _FakeProc(0, "[]", "")
+        if cmd[:2] == ["gh", "api"] and "compare/" in cmd_str:
+            return _FakeProc(0, "ahead", "")
+        if cmd[:2] == ["gh", "api"] and "/comments" in cmd_str and "POST" not in cmd_str:
+            return _FakeProc(0, json.dumps([[]]), "")
+        if cmd[:2] == ["gh", "api"] and "POST" in cmd_str:
+            return _FakeProc(0, json.dumps({"id": "fake-comment-id"}), "")
+        if cmd[:2] == ["gh", "api"] and "graphql" in cmd_str:
+            return _FakeProc(0, json.dumps({
+                "data": {"repository": {"pullRequest": {
+                    "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []}
+                }}}
+            }), "")
+        if cmd[:2] == ["gh", "api"] and "/reviews" in cmd_str and "POST" not in cmd_str:
+            return _FakeProc(0, json.dumps([]), "")
+        if cmd[:2] == ["gh", "pr", "ready"]:
+            # mark_pr_ready — the controller calls this
+            # via ``gh pr ready <pr-number> --repo R``.
+            return _FakeProc(0, "", "")
+        return _FakeProc(0, "[]", "")
+
+    return fake
+
+
+def _r53_build_pr_view(head, *, state="CLOSED", is_draft=True):
+    """Build a PR view for the Round-53 test. The state
+    is CLOSED (not OPEN) so the controller does NOT
+    attempt to post a Codex ping (``would_post_codex_ping``
+    requires ``state == OPEN``). This lets the
+    ``mark_pr_ready`` branch run unconditionally on the
+    draft PR, which is what the Round-53 fix exercises.
+    """
+    return {
+        "number": PR,
+        "headRefOid": head,
+        "headRefName": "reduction/pr-lifecycle-collapse-v1",
+        "baseRefOid": "f" * 40,
+        "baseRefName": "main",
+        "isDraft": is_draft,
+        # ``state == CLOSED`` disables the Codex ping
+        # block. The mark_pr_ready branch is gated on
+        # ``isDraft`` only, not on ``state``.
+        "state": state,
+        "mergeable": "MERGEABLE",
+        "mergedAt": None,
+        "mergeCommit": None,
+        "additions": 0,
+        "deletions": 0,
+        "changedFiles": 0,
+        "url": f"https://github.com/{REPO}/pull/{PR}",
+        "title": "round-53 test",
+        "files": [],
+    }
+
+
+def test_round53_source_contract_head_moved_diagnostic():
+    """Source-contract: cmd_advance MUST record a
+    ``post_mutation_refresh_head_moved`` diagnostic
+    when the refreshed ``headRefOid`` differs from
+    the original ``head_sha``. Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The diagnostic action name must appear.
+    assert "post_mutation_refresh_head_moved" in src, (
+        "Round-53 fix: cmd_advance must record a "
+        "post_mutation_refresh_head_moved diagnostic "
+        "when the head moves during mark_pr_ready."
+    )
+    # The head-moved comparison must appear.
+    assert "refreshed_head != head_sha" in src, (
+        "Round-53 fix: cmd_advance must compare "
+        "refreshed_head against the original head_sha "
+        "and reject the refresh when they differ."
+    )
