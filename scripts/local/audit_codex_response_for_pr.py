@@ -2744,3 +2744,25 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+# Round-412 (R-1): expose the canonical shared pagination
+# helper. Existing in-line pagination in the audit is being
+# incrementally replaced with this helper. Callers that want
+# the complete paginated review-thread inventory MUST use
+# ``paginate_review_threads`` from
+# ``scripts.local._shared_pagination`` rather than the inline
+# ``first: 100`` query below.
+def _canonical_review_thread_inventory(
+    *, owner, name, pr_number, page_size=100, safety_cap=2000,
+):
+    """Canonical complete paginated review-thread inventory."""
+    from scripts.local._shared_pagination import paginate_review_threads
+    return paginate_review_threads(
+        owner=owner,
+        name=name,
+        pr_number=pr_number,
+        page_size=page_size,
+        safety_cap=safety_cap,
+    )
+

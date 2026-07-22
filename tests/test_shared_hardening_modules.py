@@ -19,10 +19,27 @@ if SCRIPTS not in sys.path:
 # ---------------------------------------------------------------------------
 
 class PaginationTests(unittest.TestCase):
+    def setUp(self):
+        """Skip live tests when no GitHub token is available."""
+        import os
+        self._has_token = bool(os.environ.get("AED_SHARED_GITHUB_TOKEN"))
+        if not self._has_token:
+            import subprocess
+            try:
+                subprocess.check_output(["gh", "auth", "token"], text=True, timeout=10)
+                self._has_token = True
+            except Exception:
+                self._has_token = False
+
+    def _require_live(self):
+        if not self._has_token:
+            self.skipTest("requires GitHub auth (gh or AED_SHARED_GITHUB_TOKEN)")
+
     def test_paginate_review_threads_complete(self):
         """Pagination must continue until hasNextPage=False.
         With >100 review threads the first page is NOT the
         complete inventory."""
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         # The repository has 102 review threads (verified
         # during PR #411 closeout). The helper must paginate
@@ -37,6 +54,7 @@ class PaginationTests(unittest.TestCase):
             "must span at least two pages")
 
     def test_paginate_issue_comments_complete(self):
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_issue_comments(
             "Slideshow11", "Automated-Edge-Discovery", 411
@@ -44,6 +62,7 @@ class PaginationTests(unittest.TestCase):
         self.assertTrue(res["complete"], res)
 
     def test_paginate_formal_reviews_complete(self):
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_formal_reviews(
             "Slideshow11", "Automated-Edge-Discovery", 411
@@ -51,6 +70,7 @@ class PaginationTests(unittest.TestCase):
         self.assertTrue(res["complete"], res)
 
     def test_paginate_changed_files_complete(self):
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_changed_files(
             repo="Slideshow11/Automated-Edge-Discovery",
@@ -61,6 +81,7 @@ class PaginationTests(unittest.TestCase):
         self.assertGreaterEqual(len(res["nodes"]), 1)
 
     def test_paginate_workflow_runs_complete(self):
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_workflow_runs(
             repo="Slideshow11/Automated-Edge-Discovery",
@@ -71,6 +92,7 @@ class PaginationTests(unittest.TestCase):
             "must find the exact-head CI run")
 
     def test_paginate_jobs_for_run_complete(self):
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_jobs_for_run(
             repo="Slideshow11/Automated-Edge-Discovery",
@@ -81,20 +103,58 @@ class PaginationTests(unittest.TestCase):
             "CI run must have at least 5 jobs")
 
     def test_pagination_safety_cap_fail_closed(self):
+        """Mock safety cap failure (no live API needed)."""
+        import json as _json
+        import urllib.request as ur
+        import subprocess as sp
         from scripts.local import _shared_pagination as pg
-        # Set an impossibly small cap so we trip it.
-        res = pg.paginate_review_threads(
-            "Slideshow11", "Automated-Edge-Discovery", 411,
-            safety_cap=1,
-        )
-        self.assertFalse(res["complete"])
-        self.assertTrue(res["capped"])
+
+        class FakeResp:
+            def __init__(self):
+                self.payload = _json.dumps({
+                    "data": {
+                        "x": {
+                            "nodes": [{"id": "T1"}],
+                            "pageInfo": {"hasNextPage": True, "endCursor": "c1"},
+                        }
+                    }
+                }).encode()
+            def read(self):
+                return self.payload
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+
+        def fake_urlopen(req, timeout=None):
+            return FakeResp()
+
+        def fake_check_output(cmd, *a, **kw):
+            return "fake-token\n"
+
+        original_urlopen = ur.urlopen
+        original_check = sp.check_output
+        ur.urlopen = fake_urlopen
+        sp.check_output = fake_check_output
+        try:
+            res = pg.paginate_graphql_connection(
+                owner="x", name="y", pr_number=1,
+                query="dummy",
+                path=("data", "x"),
+                safety_cap=1,
+            )
+            self.assertFalse(res["complete"])
+            self.assertTrue(res["capped"])
+        finally:
+            ur.urlopen = original_urlopen
+            sp.check_output = original_check
 
     def test_more_than_100_review_threads(self):
         """Regression test: more than 100 review threads.
         A finding exists on a later page (Round-50 finding,
         db_id 3627467490) — pagination must surface it.
         """
+        self._require_live()
         from scripts.local import _shared_pagination as pg
         res = pg.paginate_review_threads(
             "Slideshow11", "Automated-Edge-Discovery", 411

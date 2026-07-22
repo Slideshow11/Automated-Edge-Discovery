@@ -38,6 +38,16 @@ DEFAULT_SAFETY_CAP = 2000  # hard upper bound per surface
 
 
 def _gh_token() -> str:
+    """Return the GitHub auth token.
+
+    Allows ``AED_SHARED_GITHUB_TOKEN`` to override the
+    ``gh auth token`` subprocess call so tests and CI can
+    run without a configured ``gh`` CLI.
+    """
+    import os
+    env_token = os.environ.get("AED_SHARED_GITHUB_TOKEN")
+    if env_token:
+        return env_token
     return subprocess.check_output(["gh", "auth", "token"], text=True).strip()
 
 
