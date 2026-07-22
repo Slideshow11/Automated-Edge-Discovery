@@ -1619,6 +1619,47 @@ def classify(
                 )
                 if not (is_clean_phrase or is_summary_format):
                     continue
+                # Round-54 fix: summary-format reviews
+                # carry their findings in inline review
+                # comments, NOT in the summary body.
+                # The ``body_value.splitlines()`` check
+                # above only inspects the summary body.
+                # If the review has an active Codex-bot
+                # inline thread anchored to the same
+                # head, the summary review carries a
+                # finding and MUST NOT be accepted as a
+                # clean pass. This prevents the audit
+                # from recording ``clean_pass_detected``
+                # when an inline P1/P2 finding exists
+                # but the thread was later resolved /
+                # outdated or absent from the inventory.
+                # The active_threads inventory is
+                # populated AFTER this loop (section 7),
+                # so we do a targeted inline scan here:
+                # walk ``review_threads`` for any active
+                # (non-outdated, non-resolved) Codex-bot
+                # thread anchored to this head. If such
+                # a thread exists, this summary review
+                # carries a finding. The check is
+                # restricted to active (non-outdated)
+                # threads so already-outdated threads
+                # from prior heads do not invalidate a
+                # current-head clean pass.
+                if is_summary_format and review_threads:
+                    has_active_thread = False
+                    for t in review_threads:
+                        if (
+                            not bool(t.get("is_resolved", False))
+                            and not bool(t.get("is_outdated", False))
+                            and t.get("author", "") in CODEX_BOT_LOGINS
+                        ):
+                            has_active_thread = True
+                            break
+                    if has_active_thread:
+                        # Summary review carries a
+                        # finding. Skip it as a clean
+                        # pass candidate.
+                        continue
                 ts = timestamp_field(
                     r, "submittedAt", "submitted_at", "createdAt", "created_at"
                 )

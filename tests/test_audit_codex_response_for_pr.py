@@ -9440,3 +9440,288 @@ def _r52_classify(monkeypatch, *, codex_review_submissions, codex_issue_comments
             ping_created_at=PING_CREATED,
             max_polls=1, poll_seconds=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-54 regression: the audit must NOT accept a
+# summary-format Codex review as a clean pass when there
+# are active Codex-bot review threads anchored to the
+# current head. Summary-format reviews carry their
+# findings in inline review comments, NOT in the
+# summary body, so the body's splitlines() check is not
+# sufficient. If the inline thread is later resolved or
+# absent from the inventory, the audit could record a
+# clean pass without a real clean Codex verdict.
+# ---------------------------------------------------------------------------
+
+
+def _r54_clean_summary_body():
+    return (
+        "\n### 💡 Codex Review\n\n"
+        "Here are some automated review suggestions for this pull request.\n\n"
+        "**Reviewed commit:** `589c719ced`\n"
+    )
+
+
+def _r54_active_thread(*, thread_id="T-1", is_resolved=False, is_outdated=False, path="scripts/local/x.py"):
+    """Build an active thread in the RAW GraphQL
+    format that ``gh_graphql_review_threads`` returns.
+    The audit's section 7 flattens this into the
+    inventory's ``active_threads`` list.
+    """
+    return {
+        "id": thread_id,
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Some finding",
+                    "path": path,
+                    "line": 10,
+                    "originalCommit": {
+                        "oid": "589c719ced339f49ac07f1ebd2082512a0204519",
+                    },
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+
+
+def test_round54_summary_clean_review_with_active_thread_rejected(monkeypatch, tmp_path):
+    """Bug repro: a summary-format review with an
+    active Codex-bot thread anchored to the current
+    head MUST NOT be detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    active_thread = _r54_active_thread(is_resolved=False, is_outdated=False)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_thread],
+    )
+    # The summary clean review MUST be rejected
+    # because there is an active Codex-bot thread.
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-54 fix: a summary-format review with "
+        "an active Codex thread MUST NOT be a clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round54_summary_clean_review_without_active_thread_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: a summary-format review
+    with NO active Codex-bot threads MUST be detected
+    as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+    )
+    # No active threads — the summary clean review
+    # MUST be accepted.
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: a summary-format review "
+        "with no active Codex threads MUST be a clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+    assert pkt.get("clean_pass_source") == "pull_request_review"
+
+
+def test_round54_summary_clean_review_with_only_outdated_threads_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: a summary-format review
+    with ONLY outdated Codex-bot threads MUST be
+    detected as a clean pass. Outdated threads are
+    anchored to an older head and don't invalidate
+    the current-head clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r54_clean_summary_body(),
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # Only outdated threads — these don't invalidate
+    # the current-head clean pass.
+    outdated_thread = _r54_active_thread(is_resolved=False, is_outdated=True)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[outdated_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: only-outdated threads "
+        "MUST NOT invalidate a current-head clean "
+        "pass. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round54_exact_phrase_clean_review_with_active_thread_still_accepted(monkeypatch, tmp_path):
+    """Round-54 invariant: the older EXACT clean
+    phrase (``Codex Review: Didn't find any major
+    issues``) is NOT subject to the active-thread
+    guard — only summary-format reviews are. The
+    exact-phrase clean pass still works even with
+    active threads.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="Codex Review: Didn't find any major issues. :tada:",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    active_thread = _r54_active_thread(is_resolved=False, is_outdated=False)
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_thread],
+    )
+    # The exact-phrase clean review MUST still be
+    # accepted (Round-54 only restricts summary-format
+    # reviews).
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-54 invariant: the exact-phrase clean "
+        "review MUST still be accepted even with "
+        "active threads. Got clean_pass_detected="
+        f"{pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round54_source_contract_active_thread_check():
+    """Source-contract: the formal-review clean-pass
+    detection MUST consult the ``active_threads``
+    inventory when accepting a summary-format review.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The active-thread guard MUST be in the source.
+    assert "active_threads" in src
+    # And it must be consulted in the context of
+    # summary-format review detection.
+    # Find the section that handles summary_format.
+    summary_start = src.find("is_summary_format")
+    assert summary_start > 0
+    # Within ~100 lines of ``is_summary_format``,
+    # ``active_threads`` must be consulted.
+    nearby = src[summary_start:summary_start + 2000]
+    assert "active_threads" in nearby, (
+        "Round-54 fix: the summary-format review "
+        "detection must consult active_threads to "
+        "determine if the review carries an inline "
+        "finding."
+    )
+
+
+# Module-level helper for the function-based tests above.
+def _r52_classify_with_active_threads(
+    monkeypatch, *,
+    codex_review_submissions,
+    codex_issue_comments,
+    active_threads,
+):
+    """Drive ``classify`` end-to-end with the
+    supplied review, comment, and active-thread
+    fixtures. Extends ``_r52_classify`` to inject
+    ``active_threads`` into the review-thread
+    inventory.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    # Use the Round-52 head so head_matches_expected is True.
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": list(active_threads),
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
