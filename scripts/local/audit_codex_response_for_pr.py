@@ -110,6 +110,27 @@ from typing import Any, Dict, List, Optional, Tuple
 # the repo root) and any future nested-layout refactor.
 import os as _os
 import sys as _sys
+
+# Round-412: delegate to the shared Codex classifier.
+try:
+    from scripts.local._shared_codex_classifier import (
+        CODEX_CLEAN_PASS_PHRASES,
+        CODEX_CLEAN_PASS_EXTRA_FRAGMENTS,
+        CODEX_REVIEW_SUMMARY_PREFIX,
+        CODEX_FINDING_BADGE_PREFIX,
+        is_codex_clean_pass_comment as _shared_is_clean,
+        is_codex_finding_body as _shared_is_finding,
+        is_codex_review_summary as _shared_is_summary,
+        extract_review_commit_oid as _shared_extract_oid,
+        body_has_finding_badge as _shared_body_has_finding,
+    )
+except ImportError:
+    _shared_is_clean = None
+    _shared_is_finding = None
+    _shared_is_summary = None
+    _shared_extract_oid = None
+    _shared_body_has_finding = None
+
 _SCRIPT_DIR_HERE = _os.path.dirname(_os.path.abspath(__file__))
 # Walk up to find the parent of the ``scripts/`` directory.
 # The repo root sits one level above ``scripts/`` in the
