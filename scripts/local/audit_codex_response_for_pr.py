@@ -329,6 +329,7 @@ def flatten_paginated_items(payload: Any) -> Tuple[List[Dict[str, Any]], bool]:
     """
     Flatten a gh api --paginate --slurp payload into a single list of items.
 
+
     The slurped output is a JSON array where each element is one page. Each
     page is itself a JSON array of items. Older REST endpoints sometimes
     wrap items in an object ({"items": [...]}); we unwrap that case too.
@@ -853,6 +854,37 @@ def extract_review_commit_oid(review: Dict[str, Any]) -> str:
         or ((review.get("commit") or {}).get("oid") if isinstance(review.get("commit"), dict) else "")
         or ""
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-60: fetch inline review comments
+# ---------------------------------------------------------------------------
+
+
+def _fetch_review_inline_comments_with_pr(
+    repo: str, pr_number: int, review_id: Any,
+    timeout: int = 30,
+) -> Tuple[bool, List[Dict[str, Any]], str]:
+    """Round-60 fix: fetch the inline review comments
+    for a specific review on a specific PR. The
+    summary-format review body never carries inline
+    finding markers (those live in separate inline
+    review comments), so the audit MUST fetch this
+    surface before accepting a summary review as
+    clean. If any inline comments exist, the review
+    carries a finding.
+
+    Returns ``(ok, comments, error_msg)``. On any
+    failure (network, auth, parse, unexpected shape),
+    returns ``(False, [], error)`` so the caller can
+    fail closed — the review cannot be proven clean
+    without the inline surface.
+    """
+    endpoint = (
+        f"pulls/{pr_number}/reviews/{review_id}/"
+        f"comments?per_page=100"
+    )
+    return gh_api_paginated(repo, endpoint, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
@@ -1645,47 +1677,68 @@ def classify(
                 # threads so already-outdated threads
                 # from prior heads do not invalidate a
                 # current-head clean pass.
+                # Round-60 fix: fetch the review's
+                # inline comments whenever this is a
+                # summary-format review. The summary
+                # body itself never carries inline
+                # finding markers (those live in
+                # separate inline review comments),
+                # so the audit MUST fetch this surface
+                # before accepting a summary review as
+                # clean. If any inline comments exist,
+                # the review carries a finding. We
+                # fail closed when the fetch fails (the
+                # review cannot be proven clean without
+                # the inline surface). This check
+                # applies even when ``review_threads``
+                # is empty — a summary review with no
+                # review-thread inventory entries can
+                # still have inline review comments
+                # (e.g. comments that haven't been
+                # turned into threads yet, or
+                # inventory gaps).
+                review_id = r.get("id")
+                if review_id and is_summary_format:
+                    inline_ok, inline_comments, inline_err = (
+                        _fetch_review_inline_comments_with_pr(
+                            repo, pr_number, review_id
+                        )
+                    )
+                    if not inline_ok:
+                        # Fetch failed — fail closed.
+                        # The review cannot be proven
+                        # clean.
+                        api_errors.append(
+                            f"review_inline_comments:{review_id}:{inline_err}"
+                        )
+                        continue
+                    if inline_comments:
+                        # Inline comments present — the
+                        # summary review carries a
+                        # finding. Skip it as a clean
+                        # pass candidate.
+                        continue
+                # Round-54 + Round-56 + Round-57 +
+                # Round-59 fix: veto summary-format
+                # reviews whenever the associated
+                # Codex inline finding exists AND is
+                # anchored to the SAME commit as the
+                # review being evaluated AND is NOT yet
+                # resolved.
+                # Round-54 originally only checked
+                # active threads. Round-56 extended
+                # to resolved threads but was too
+                # aggressive. Round-57 tied the thread
+                # to the review's commit anchor.
+                # Round-59 excluded resolved threads
+                # from the veto (they've been
+                # addressed).
+                # Outdated threads (explicitly marked
+                # as anchored to a prior head no longer
+                # reachable from the current head) are
+                # excluded so they don't invalidate a
+                # current-head clean pass.
                 if is_summary_format and review_threads:
-                    # Round-54 + Round-56 + Round-57 +
-                    # Round-59 fix: veto summary-format
-                    # reviews whenever the associated
-                    # Codex inline finding exists AND
-                    # is anchored to the SAME commit as
-                    # the review being evaluated AND is
-                    # NOT yet resolved.
-                    # Round-54 originally only checked
-                    # active threads. Round-56 extended
-                    # to resolved threads but was too
-                    # aggressive: a resolved thread from
-                    # an OLDER finding review on the
-                    # same head would veto a later CLEAN
-                    # re-review, even though the later
-                    # review has no inline findings.
-                    # Round-57 tied the thread to the
-                    # review's commit anchor.
-                    # Round-59 adds the final piece:
-                    # exclude resolved threads from the
-                    # veto. A resolved thread means the
-                    # finding HAS BEEN ADDRESSED, so it
-                    # doesn't invalidate a later clean
-                    # re-review on the same commit. The
-                    # audit's unresolved-thread gate
-                    # (section 8) already correctly
-                    # counts active threads only, so the
-                    # resolved-thread gate at the
-                    # review-classification level is
-                    # redundant.
-                    # Without the resolved-thread
-                    # exclusion, a clean re-review on
-                    # the same commit (no new push)
-                    # would be perpetually vetoed by
-                    # its own resolved finding.
-                    # Outdated threads (explicitly
-                    # marked as anchored to a prior head
-                    # no longer reachable from the
-                    # current head) are excluded so they
-                    # don't invalidate a current-head
-                    # clean pass.
                     review_commit = extract_review_commit_oid(r)
                     has_same_anchor_thread = False
                     if review_commit:

@@ -10196,3 +10196,183 @@ def test_round59_source_contract_resolved_excluded():
         "Round-59 fix: the summary-format veto MUST "
         "explicitly check ``is_resolved``."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-60 regression: inspect inline comments before
+# accepting summary reviews as clean. When Codex uses
+# the new ``### 💡 Codex Review`` summary format, the
+# actual findings live in separate inline review
+# comments, NOT in the summary body. The audit MUST
+# fetch the review's inline comments and reject the
+# review if any are present.
+# ---------------------------------------------------------------------------
+
+
+ROUND60_BODY = "\n### 💡 Codex Review\n\nHere are some automated review suggestions.\n\n**Reviewed commit:** `589c719ced`\n"
+
+
+def test_round60_summary_review_with_inline_comments_rejected(monkeypatch, tmp_path):
+    """Bug repro: a summary-format review WITH inline
+    comments MUST NOT be detected as a clean pass.
+    The inline comments carry the findings.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499126: [{
+                "id": "ic-1",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-60 fix: a summary-format review WITH "
+        "inline comments MUST NOT be a clean pass. "
+        "Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round60_summary_review_without_inline_comments_accepted(monkeypatch, tmp_path):
+    """Round-60 invariant: a summary-format review
+    with NO inline comments MUST be detected as a
+    clean pass (when there are also no active threads).
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={4751499126: []},
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-60 invariant: a summary-format review "
+        "with no inline comments and no active threads "
+        "MUST be a clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round60_source_contract_inline_comments_fetch():
+    """Source-contract: ``_fetch_review_inline_comments_with_pr``
+    MUST exist and MUST be referenced in the source.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert hasattr(mod, "_fetch_review_inline_comments_with_pr"), (
+        "Round-60 fix: audit must define "
+        "_fetch_review_inline_comments_with_pr helper."
+    )
+    src = inspect.getsource(mod)
+    assert "_fetch_review_inline_comments_with_pr" in src, (
+        "Round-60 fix: the source must reference "
+        "_fetch_review_inline_comments_with_pr."
+    )
+
+
+def _r60_classify_with_inline_comments(
+    monkeypatch, *,
+    codex_review_submissions,
+    codex_issue_comments,
+    active_threads,
+    inline_comments_by_review,
+):
+    """Drive ``classify`` end-to-end with inline
+    review comments injected via the ``gh api``
+    fetch path.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        mergeable_state="clean", mergeable=True, sha=HEAD,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": list(active_threads),
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews/" in cmd_str
+            and "/comments" in cmd_str
+        ):
+            import re
+            match = re.search(r"/reviews/(\d+)/comments", cmd_str)
+            if match:
+                review_id = int(match.group(1))
+                comments = inline_comments_by_review.get(review_id, [])
+                m.stdout = json.dumps(comments)
+                return m
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(codex_issue_comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(codex_review_submissions))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=411,
+            expected_head_sha=HEAD,
+            ping_comment_id=PING_ID,
+            ping_created_at=PING_CREATED,
+            max_polls=1, poll_seconds=0,
+        )
