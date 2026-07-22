@@ -74,6 +74,28 @@ finishes. It has the following subcommands:
    This may request a Codex review for the current head, resolve
    eligible outdated Codex-bot-only threads, mark the draft ready,
    and produce the post-merge closeout plan.
+
+   **Important — eligible-thread resolution is a mutating flag.**
+   `advance` ONLY resolves eligible outdated Codex-bot threads
+   when the operator passes `--resolve-eligible-bot-threads`.
+   Without that flag, the controller runs every other step
+   (request a Codex review, mark the draft ready, etc.) but
+   reports `mutation_flag_not_supplied` for the thread-resolution
+   step and leaves the threads open. To actually resolve eligible
+   threads, run:
+
+       python3 scripts/local/aed_pr.py advance --pr-number N \
+           --resolve-eligible-bot-threads
+
+   This is intentional: thread resolution is a mutation against
+   live GitHub state, and the controller refuses to perform it
+   without an explicit operator opt-in. The default `advance`
+   invocation is safe to run repeatedly on a still-blocked PR
+   because it never mutates threads; the `--resolve-eligible-bot-
+   threads` flag is what turns that step on. Operators can
+   preview what would resolve by reading the
+   `actions_taken[*].eligible_thread_ids` field of the `advance`
+   JSON output.
 5. Once `status` reports `READY_FOR_MERGE_AUTHORIZATION`, copy the
    `required_authorization_phrase` field byte-exact from the JSON
    report and run:

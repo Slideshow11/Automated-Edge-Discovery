@@ -235,3 +235,67 @@ class TestRound34CanonicalGuideDocumentsScopeWrite:
             "status/advance reject CLI scope flags or that "
             "merge reads scope only from the trusted record"
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-46 regression: the canonical guide MUST document
+# that ``aed_pr advance`` only resolves eligible outdated
+# Codex-bot threads when ``--resolve-eligible-bot-threads``
+# is supplied. Without that flag the controller reports
+# ``mutation_flag_not_supplied`` and leaves the threads
+# open, so the operator workflow can stall. Static check
+# on the canonical guide source.
+# ---------------------------------------------------------------------------
+
+
+def _r46_guide_text():
+    import os
+    here = os.path.dirname(__file__)
+    guide = os.path.normpath(
+        os.path.join(here, "..", "docs", "aed_pr_canonical_guide.md")
+    )
+    with open(guide) as f:
+        return f.read(), guide
+
+
+class TestRound46CanonicalGuideDocumentsResolveFlag:
+    """Round-46 docs regression: the canonical
+    ``docs/aed_pr_canonical_guide.md`` MUST mention
+    the ``--resolve-eligible-bot-threads`` flag and
+    explain that without it the controller does NOT
+    resolve eligible threads — only reports
+    eligibility. Operators following the documented
+    workflow must be able to resolve eligible threads
+    by following the guide alone.
+    """
+
+    def test_guide_mentions_resolve_flag(self):
+        text, path = _r46_guide_text()
+        assert "--resolve-eligible-bot-threads" in text, (
+            "Round-46 docs: the canonical guide must "
+            "mention the --resolve-eligible-bot-threads "
+            "flag so operators can resolve eligible "
+            f"threads. Guide path: {path}"
+        )
+
+    def test_guide_explains_default_does_not_resolve(self):
+        text, path = _r46_guide_text()
+        # The guide MUST explain that without the
+        # flag, the controller reports
+        # ``mutation_flag_not_supplied`` and leaves
+        # threads open. We look for the diagnostic
+        # string OR a clear explanation.
+        needle_options = [
+            "mutation_flag_not_supplied",
+            "does not resolve",
+            "does NOT resolve",
+            "without that flag",
+            "Without that flag",
+        ]
+        assert any(n in text for n in needle_options), (
+            "Round-46 docs: the canonical guide must "
+            "explain that without the resolve flag the "
+            "controller does NOT mutate threads. None "
+            f"of the expected explanation needles found "
+            f"in {path}."
+        )

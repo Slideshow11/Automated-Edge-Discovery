@@ -1378,7 +1378,7 @@ def classify(
         # merely checking "any head-bound formal review exists"
         # is insufficient. A current-head non-clean formal
         # review (a finding) must NOT authorize a stale
-        # issue-comment clean pass. The head-bound surface
+        # issue-comment clean pass. The head-binding surface
         # must itself be a CLEAN review — a formal review on
         # ``expected_head_sha`` whose body carries the
         # canonical clean-pass phrase — so the issue comment
@@ -1387,7 +1387,29 @@ def classify(
         # must additionally post-date that clean head-bound
         # review timestamp; otherwise the comment predates
         # the clean review and cannot be an echo of it.
+        #
+        # Round-46 hardening (P1 ``PRRC_kwDOSHFpYM7XPZN5``):
+        # comparing the issue comment ONLY against the
+        # latest CLEAN head-bound formal review is
+        # insufficient. The latest OVERALL head-bound
+        # formal review (clean or non-clean) is the
+        # authoritative current-head Codex surface. If
+        # the latest head-bound formal review is a
+        # non-clean finding, no later issue-comment
+        # clean-pass text can authorize a clean-pass
+        # verdict on the current head — the finding
+        # is the controlling Codex surface, and the
+        # issue comment is a stale echo of an earlier
+        # clean review that has since been superseded.
+        # The fix: also track the timestamp AND body
+        # of the latest head-bound formal review, and
+        # reject issue-comment clean-pass texts when
+        # the latest head-bound formal review is
+        # non-clean.
         latest_head_bound_clean_review_ts = ""
+        latest_head_bound_formal_review_ts = ""
+        latest_head_bound_formal_review_is_clean = True
+        latest_head_bound_formal_review_body = ""
         for r in codex_review_submissions:
             rev_commit = extract_review_commit_oid(r)
             if (
@@ -1396,15 +1418,26 @@ def classify(
                 or rev_commit != expected_head_sha
             ):
                 continue
-            if not is_codex_clean_pass_comment(r.get("body", "")):
-                # Round-27 fail-closed: a non-clean formal
-                # review on the current head is a finding,
-                # not a clean-pass authority.
-                continue
             ts = timestamp_field(
                 r, "submittedAt", "submitted_at",
                 "createdAt", "created_at",
             )
+            body_value = (r.get("body", "") or "")
+            is_clean = is_codex_clean_pass_comment(body_value)
+            # Track the latest head-bound formal review
+            # of ANY kind. A later non-clean formal
+            # review (Round-46 bug) is the controlling
+            # current-head Codex surface, not the
+            # earlier clean review.
+            if ts > latest_head_bound_formal_review_ts:
+                latest_head_bound_formal_review_ts = ts
+                latest_head_bound_formal_review_is_clean = is_clean
+                latest_head_bound_formal_review_body = body_value
+            if not is_clean:
+                # Round-27 fail-closed: a non-clean formal
+                # review on the current head is a finding,
+                # not a clean-pass authority.
+                continue
             if ts > latest_head_bound_clean_review_ts:
                 latest_head_bound_clean_review_ts = ts
         for c in codex_issue_comments:
@@ -1436,6 +1469,26 @@ def classify(
                 c_dt = parse_iso_utc(ts)
                 r_dt = parse_iso_utc(latest_head_bound_clean_review_ts)
                 if c_dt is None or r_dt is None or c_dt < r_dt:
+                    continue
+                # Round-46: if the latest OVERALL
+                # head-bound formal review is a
+                # non-clean finding, the issue
+                # comment is a stale echo of the
+                # earlier clean review and must NOT
+                # be accepted as a clean-pass
+                # authority. The current-head Codex
+                # surface is the finding, not the
+                # earlier clean review.
+                if (
+                    latest_head_bound_formal_review_ts
+                    and not latest_head_bound_formal_review_is_clean
+                ):
+                    # The latest head-bound formal
+                    # review is a non-clean finding.
+                    # No issue-comment clean pass can
+                    # authorize the current head's
+                    # clean-pass verdict while that
+                    # finding is in flight.
                     continue
             if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c

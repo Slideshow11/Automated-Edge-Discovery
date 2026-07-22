@@ -7756,9 +7756,20 @@ def test_mixed_clean_then_finding_review_authorizes_post_clean_comment(
 ):
     """Mixed-review regression: a codex clean formal review
     on the current head followed by a later finding review
-    on the same head. The clean review is the
-    head-binding surface; an issue-comment clean pass
-    after the clean review is accepted.
+    on the same head. The issue comment posted after the
+    finding is a stale echo of the earlier clean review.
+
+    Round-46 (P1 ``PRRC_kwDOSHFpYM7XPZN5``) updated this
+    contract: when the latest head-bound formal review is
+    a non-clean finding, the issue comment MUST be
+    rejected as a clean-pass authority. The classifier
+    MUST emit ``HOLD_NEW_CODEX_THREAD`` (the non-clean
+    review is the newer finding, not the earlier clean
+    review). The test asserts this Round-46 contract:
+    the issue comment is NOT accepted as a clean pass;
+    instead the formal-review clean pass is detected
+    but the newer-finding scan downgrades the final
+    status to ``HOLD_NEW_CODEX_THREAD``.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -7803,13 +7814,30 @@ def test_mixed_clean_then_finding_review_authorizes_post_clean_comment(
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The issue comment is dated 19:00, after the clean
-    # review at 17:35. The clean review IS the
-    # head-binding surface; the comment is its post-clean
-    # echo. Issue-comment clean pass accepted.
-    assert pkt["clean_pass_detected"] is True
-    assert pkt["clean_pass_source"] == "issue_comment"
-    assert pkt["clean_pass_comment_id"] == 99204
+    # Round-46: the issue comment MUST NOT be the
+    # clean-pass source — the latest head-bound formal
+    # review is a non-clean finding, so the issue
+    # comment is rejected as a stale echo of the
+    # earlier clean review. The earlier formal review
+    # IS still detected as a clean pass (so
+    # clean_pass_detected=True), but the source is
+    # the formal review, not the issue comment. The
+    # newer-finding scan (which already runs as part
+    # of the audit) downgrades the final status to
+    # ``HOLD_NEW_CODEX_THREAD`` because the non-clean
+    # review is newer than the clean review.
+    assert pkt["clean_pass_source"] != "issue_comment", (
+        "Round-46: issue comment must NOT be the "
+        "clean-pass source when the latest head-bound "
+        "formal review is a non-clean finding. Got "
+        f"clean_pass_source={pkt.get('clean_pass_source')!r}"
+    )
+    assert pkt["status"] == "HOLD_NEW_CODEX_THREAD", (
+        "Round-46: classifier must emit "
+        "HOLD_NEW_CODEX_THREAD when the latest "
+        "head-bound formal review is a non-clean "
+        f"finding. Got status={pkt.get('status')!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -8532,3 +8560,312 @@ def test_audit_subprocess_uses_absolute_package_path():
         "top-level fallback path indicates the Round-42 "
         f"single-parent bug. Got: {output!r} stderr={res.stderr[:500]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-46 regression: when ``ping_dt is None`` (no
+# fresh-ping filter), the issue-comment clean-pass path
+# used to accept an unanchored issue-comment echo of an
+# earlier head-bound clean formal review, even if a LATER
+# non-clean formal review (a finding) on the same head
+# has since been posted. That let the classifier emit
+# ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION`` while a
+# real finding was still in flight.
+# The fix: also track ``latest_head_bound_formal_review_ts``
+# (any head-bound formal review, clean or non-clean),
+# and require the issue comment to postdate THAT as
+# well. If a non-clean formal review postdates the clean
+# review, the issue comment is rejected as a stale
+# echo of the clean review.
+# ---------------------------------------------------------------------------
+
+
+# Head SHA used by the Round-46 tests. Matches the
+# ``_head_sha_for_tests`` constants used elsewhere in
+# this file.
+ROUND_46_HEAD = EXPECTED_HEAD
+
+
+def _r46_clean_pass_body() -> str:
+    """The canonical Codex clean-pass body, identical
+    to the helper used by other tests in this file.
+    """
+    return codex_clean_pass_body()
+
+
+def _r46_clean_review(review_id, *, submitted_at,
+                      commit_oid=ROUND_46_HEAD):
+    return make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=_r46_clean_pass_body(),
+        submitted_at=submitted_at,
+        review_id=review_id,
+        commit_oid=commit_oid,
+    )
+
+
+def _r46_non_clean_review(review_id, *, submitted_at,
+                          commit_oid=ROUND_46_HEAD):
+    return make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=(
+            "Codex found a blocking issue at "
+            "scripts/local/x.py — see inline comment."
+        ),
+        submitted_at=submitted_at,
+        review_id=review_id,
+        commit_oid=commit_oid,
+    )
+
+
+def _r46_clean_echo_comment(comment_id, *, created_at):
+    return make_issue_comment(
+        author=CODEX_LOGIN,
+        body=_r46_clean_pass_body(),
+        created_at=created_at,
+        comment_id=comment_id,
+    )
+
+
+def _r46_classify_with_fixture(
+    monkeypatch, *, reviews, comments
+):
+    """Drive ``classify`` end-to-end with a mocked
+    ``subprocess.run`` that returns the supplied
+    reviews and issue comments. Mirrors the existing
+    test pattern in this file.
+    """
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        state="open", sha=ROUND_46_HEAD,
+        mergeable_state="clean", mergeable=True,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(reviews))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=402,
+            expected_head_sha=ROUND_46_HEAD,
+            ping_comment_id=None,
+            ping_created_at=None,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+class TestRound46InterveningFindingInvalidatesEcho:
+    """Round-46 regression: an issue-comment clean-pass
+    echo of an earlier head-bound clean formal review
+    MUST be rejected when a LATER non-clean formal
+    review (a finding) on the same head is in the
+    inventory. Without the fix, the classifier accepts
+    the issue comment and the readiness verifier can
+    emit ``MERGE_READY_AWAITING_HUMAN_AUTHORIZATION``
+    while a real finding is in flight.
+    """
+
+    def test_intervening_finding_invalidates_clean_echo(
+        self, monkeypatch
+    ):
+        """Bug repro: clean formal review at T1, non-clean
+        formal review at T2 (a finding), unanchored
+        issue-comment clean pass at T3. Without the
+        Round-46 fix the issue comment is accepted as
+        a clean-pass echo (because it postdates T1),
+        and the classifier emits a merge-ready state
+        despite a real finding being in flight at T2.
+
+        With the fix, the issue comment is rejected
+        because the latest head-bound formal review
+        is a non-clean finding. The classifier MUST
+        NOT emit a merge-ready state and MUST NOT
+        accept the issue comment as a clean pass.
+        The classifier MAY still detect a clean pass
+        from the earlier formal review (T1), but
+        the newer-finding scan MUST downgrade the
+        final status to ``HOLD_NEW_CODEX_THREAD``
+        because the non-clean review (T2) is newer
+        than the clean review.
+        """
+        clean_review = _r46_clean_review(
+            1001, submitted_at="2026-07-22T10:00:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            1002, submitted_at="2026-07-22T10:05:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            1003, created_at="2026-07-22T10:10:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+        )
+        # The issue comment MUST NOT be the source
+        # of the clean pass — the latest head-bound
+        # formal review is a non-clean finding, so
+        # the issue comment is rejected as a stale
+        # echo of the earlier clean review.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-46 fix: the issue comment must NOT "
+            "be the clean-pass source when the latest "
+            "head-bound formal review is a non-clean "
+            f"finding; got clean_pass_source="
+            f"{pkt.get('clean_pass_source')!r}. "
+            f"status={pkt.get('status')!r}"
+        )
+        # The status MUST NOT be a merge-ready state.
+        status = pkt.get("status", "")
+        assert "MERGE_READY" not in status, (
+            f"Round-46 fix: classifier must NOT emit "
+            f"MERGE_READY when an intervening finding "
+            f"is in the inventory; got status={status!r}"
+        )
+        # And the classifier MUST emit
+        # ``HOLD_NEW_CODEX_THREAD`` because the
+        # non-clean review is the newer finding.
+        assert status == "HOLD_NEW_CODEX_THREAD", (
+            f"Round-46 fix: classifier must emit "
+            f"HOLD_NEW_CODEX_THREAD when the latest "
+            f"head-bound formal review is a non-clean "
+            f"finding; got status={status!r}"
+        )
+
+    def test_no_intervening_finding_accepts_clean_echo(
+        self, monkeypatch
+    ):
+        """Regression guard: when there is NO intervening
+        non-clean formal review (only the clean formal
+        review, then the issue-comment echo), the
+        Round-46 fix MUST NOT over-reject. The issue
+        comment is still accepted as a clean-pass
+        echo of the head-bound clean review.
+        """
+        clean_review = _r46_clean_review(
+            2001, submitted_at="2026-07-22T11:00:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            2002, created_at="2026-07-22T11:05:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review],
+            comments=[clean_echo],
+        )
+        # The classifier SHOULD accept the issue
+        # comment as a clean pass (no later finding).
+        assert pkt.get("clean_pass_detected") is True, (
+            "Round-46 fix must NOT over-reject: when "
+            "no later finding is in the inventory, the "
+            "issue comment is still a valid clean-pass "
+            f"echo. Got: status={pkt.get('status')!r}"
+        )
+        # And the source should be the issue comment.
+        assert pkt.get("clean_pass_source") == "issue_comment"
+
+    def test_no_clean_review_anchor_rejects_echo(
+        self, monkeypatch
+    ):
+        """Variant: only the intervening non-clean
+        formal review is in the inventory (no clean
+        review precedes it). The issue comment is
+        still rejected because no clean head-bound
+        review exists to anchor it; this is the
+        pre-existing Round-27 behavior, but the
+        test pins the contract.
+        """
+        non_clean_review = _r46_non_clean_review(
+            3001, submitted_at="2026-07-22T12:00:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            3002, created_at="2026-07-22T12:05:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[non_clean_review],
+            comments=[clean_echo],
+        )
+        # Without a clean head-bound review, the
+        # issue comment cannot be a clean-pass echo.
+        assert pkt.get("clean_pass_detected") is not True, (
+            "Round-27 + Round-46: an issue-comment "
+            "clean pass with no head-bound clean "
+            "review anchor must be rejected; got "
+            f"clean_pass_detected=True. status={pkt.get('status')!r}"
+        )
+
+    def test_source_contract_tracks_overall_formal_review(self):
+        """Source-contract test: the audit MUST track
+        the latest OVERALL head-bound formal review
+        timestamp AND whether it was a clean pass.
+        When the latest head-bound formal review is
+        a non-clean finding, issue-comment clean
+        passes must be rejected. Static check on
+        the source — the variables
+        ``latest_head_bound_formal_review_ts`` and
+        ``latest_head_bound_formal_review_is_clean``
+        must appear in
+        ``audit_codex_response_for_pr.py``, and the
+        issue-comment loop must use them.
+        """
+        import inspect
+        from scripts.local import audit_codex_response_for_pr as ac
+        src = inspect.getsource(ac)
+        # Round-46 fix variable names. These MUST
+        # appear in the source.
+        for needle in (
+            "latest_head_bound_formal_review_ts",
+            "latest_head_bound_formal_review_is_clean",
+        ):
+            assert needle in src, (
+                f"Round-46 fix: audit must track "
+                f"{needle!r} in the source. Missing."
+            )
+        # And the issue-comment loop MUST consult
+        # the latest_head_bound_formal_review_is_clean
+        # flag to decide whether to accept the
+        # issue-comment clean pass.
+        assert (
+            "not latest_head_bound_formal_review_is_clean" in src
+        ), (
+            "Round-46 fix: the issue-comment loop must "
+            "consult latest_head_bound_formal_review_is_clean "
+            "to reject the clean pass when the latest "
+            "head-bound formal review is a non-clean finding."
+        )
