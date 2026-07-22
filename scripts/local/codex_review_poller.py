@@ -534,8 +534,20 @@ def main(argv: Optional[List[str]] = None) -> int:
             last_api_error = f"comments: {err2}"
             _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err2}")
 
-        # Scan formal reviews first.
-        match = None
+        # Scan ALL surfaces and collect ALL matching
+        # responses, then pick the newest by timestamp.
+        # Round-51 fix: the previous implementation
+        # accepted the first matching formal review and
+        # skipped the issue-comment scan, so an older
+        # clean pass could be reported even if Codex
+        # posted a newer finding later. We must collect
+        # every matching review AND every matching
+        # issue comment, then select the one with the
+        # newest timestamp. This is critical because
+        # GitHub's list endpoints return items in
+        # chronological / ID order, not reverse-chrono.
+        all_matches: List[Dict[str, Any]] = []
+        match: Optional[Dict[str, Any]] = None
         if reviews is not None:
             for r in reviews:
                 m = _match_response(
@@ -544,11 +556,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                     head=args.head, ping_dt=earliest_ping_dt,
                 )
                 if m is not None:
-                    match = m
-                    break
-
-        # If no formal-review match, scan issue comments.
-        if match is None and comments is not None:
+                    all_matches.append(m)
+        if comments is not None:
             for c in comments:
                 m = _match_response(
                     c, kind="issue_comment",
@@ -556,15 +565,45 @@ def main(argv: Optional[List[str]] = None) -> int:
                     head=args.head, ping_dt=earliest_ping_dt,
                 )
                 if m is not None:
-                    match = m
-                    break
+                    all_matches.append(m)
+
+        # Select the newest match by parsed timestamp.
+        # If two matches share the exact same timestamp,
+        # prefer formal reviews over issue comments
+        # (formal reviews carry inline findings; issue
+        # comments may be echoes).
+        if all_matches:
+            def _match_sort_key(m: Dict[str, Any]) -> Tuple[float, int]:
+                dt = _parse_iso_utc(m.get("timestamp", ""))
+                kind_rank = 0 if m.get("kind") == "review" else 1
+                # Sort by timestamp DESCENDING (newest first).
+                # Use the negative of the timestamp via the
+                # epoch seconds, then by kind_rank ascending
+                # (formal reviews win ties).
+                epoch = (
+                    dt.timestamp() if dt is not None else float("-inf")
+                )
+                return (-epoch, kind_rank)
+            all_matches.sort(key=_match_sort_key)
+            match = all_matches[0]
+            # Log the alternates for operator visibility.
+            if len(all_matches) > 1:
+                _log(
+                    "INFO",
+                    f"selected_newest match_id={match['id']} "
+                    f"kind={match['kind']} timestamp={match['timestamp']} "
+                    f"verdict={match['verdict']} "
+                    f"(alternates={len(all_matches)-1})",
+                )
 
         n_reviews = len(reviews) if reviews is not None else 0
         n_comments = len(comments) if comments is not None else 0
         _log(
             "HEARTBEAT",
             f"poll={poll_count} elapsed_min={elapsed_min} head={args.head} "
-            f"reviews={n_reviews} issue_comments={n_comments} match={'YES' if match else 'NO'}",
+            f"reviews={n_reviews} issue_comments={n_comments} "
+            f"matches={len(all_matches)} "
+            f"match={'YES' if match else 'NO'}",
         )
 
         if match is not None:

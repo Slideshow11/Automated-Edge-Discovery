@@ -640,3 +640,201 @@ class TestCodexReviewSummaryFormat:
             )
         assert m is not None
         assert m["verdict"] == "FINDING"
+
+
+# ---------------------------------------------------------------------------
+# Round-51 regression: select the newest Codex response
+# before reporting. The previous implementation accepted
+# the first matching formal review and skipped the
+# issue-comment scan, so an older clean pass could be
+# reported even if Codex posted a newer finding later.
+# ---------------------------------------------------------------------------
+
+
+class TestSelectNewestMatch:
+    """Round-51 fix: the poller MUST collect ALL matching
+    reviews and issue comments, then select the one
+    with the newest timestamp before emitting the
+    verdict. GitHub's list endpoints return items in
+    chronological / ID order, not reverse-chrono.
+    """
+
+    HEAD = "d8f6f480e1020e3e4007c6a9e732c768c428fead"
+    PING_DT = _dt.datetime(2026, 7, 22, 1, 8, 48, tzinfo=_dt.timezone.utc)
+
+    def _make_clean_review(self, review_id, submitted_at):
+        return {
+            "id": str(review_id),
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": "Codex Review: Didn't find any major issues. :tada:",
+            "commit_id": self.HEAD,
+            "submitted_at": submitted_at,
+        }
+
+    def _make_finding_review(self, review_id, submitted_at):
+        # Inline-finding body — a finding is identified
+        # by its inline review comment carrying the
+        # finding badge, not by the summary body itself.
+        return {
+            "id": str(review_id),
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "\n### 💡 Codex Review\n\n"
+                "Here are some automated review suggestions.\n\n"
+                f"**Reviewed commit:** `{self.HEAD[:10]}`\n"
+            ),
+            "commit_id": self.HEAD,
+            "submitted_at": submitted_at,
+        }
+
+    def _make_finding_inline(self):
+        return {
+            "id": "9999",
+            "user": {"login": "chatgpt-codex-connector[bot]"},
+            "body": (
+                "**<sub><sub>![P2 Badge]"
+                "(https://img.shields.io/badge/P2-yellow?style=flat)"
+                "</sub></sub>  Some finding**\n\nDetails."
+            ),
+            "path": "scripts/local/x.py",
+        }
+
+    @staticmethod
+    def _select_newest(mod, matches):
+        """Standalone helper to select the newest match
+        by timestamp (Round-51 fix). Mirrors the main
+        loop's selection logic.
+        """
+        def _sort_key(m):
+            dt = mod._parse_iso_utc(m.get("timestamp", ""))
+            kind_rank = 0 if m.get("kind") == "review" else 1
+            epoch = dt.timestamp() if dt is not None else float("-inf")
+            return (-epoch, kind_rank)
+        matches.sort(key=_sort_key)
+        return matches[0]
+
+    def test_older_clean_then_newer_finding_picks_finding(self, monkeypatch):
+        """Bug repro: an older clean pass (T1) followed
+        by a newer finding (T2) MUST emit FINDING, not
+        CLEAN_PASS. The Round-51 fix collects all
+        matches and selects the newest by timestamp.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        # Older clean pass at T1.
+        older_clean = self._make_clean_review(
+            5001, submitted_at="2026-07-22T02:00:00Z"
+        )
+        # Newer finding at T2 — must carry an inline
+        # finding comment so the classifier recognizes
+        # it as FINDING (not CLEAN_PASS).
+        newer_finding = self._make_finding_review(
+            5002, submitted_at="2026-07-22T04:00:00Z"
+        )
+        # Inline comments fetch returns one finding for
+        # the newer review.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps([self._make_finding_inline()])
+        fake_proc.stderr = ""
+        with _mp.object(_subprocess, "run", return_value=fake_proc):
+            matches: list = []
+            for r in [older_clean, newer_finding]:
+                m = mod._match_response(
+                    r, kind="review",
+                    repo="Slideshow11/Automated-Edge-Discovery",
+                    pr_number=411,
+                    head=self.HEAD, ping_dt=self.PING_DT,
+                )
+                if m is not None:
+                    matches.append(m)
+            selected = self._select_newest(mod, matches)
+        # The newer finding MUST be selected.
+        assert selected["id"] == "5002", (
+            "Round-51 fix: the poller MUST select the "
+            "newest match by timestamp. Got id="
+            f"{selected['id']!r}, expected id='5002' "
+            "(the newer finding review)."
+        )
+        assert selected["verdict"] == "FINDING", (
+            "Round-51 fix: the newest match's verdict "
+            "must be FINDING, not CLEAN_PASS. Got "
+            f"verdict={selected['verdict']!r}"
+        )
+
+    def test_newer_clean_then_older_finding_picks_clean(self, monkeypatch):
+        """Round-51 invariant: a newer clean pass (T2)
+        followed by an older finding (T1) MUST emit
+        CLEAN_PASS. The newest match wins.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        # Older finding at T1 (with inline finding).
+        older_finding = self._make_finding_review(
+            6001, submitted_at="2026-07-22T02:00:00Z"
+        )
+        # Newer clean pass at T2 (no inline finding).
+        newer_clean = self._make_clean_review(
+            6002, submitted_at="2026-07-22T04:00:00Z"
+        )
+        # Inline comments fetch returns a finding for
+        # the older review, no comments for the newer.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        # The fake is invoked twice (once per review).
+        # Use a side_effect to return different lists.
+        fake_proc.stdout = json.dumps([self._make_finding_inline()])
+        fake_proc.stderr = ""
+
+        def side_effect(*a, **kw):
+            # The inline-comments endpoint returns the
+            # same list every time (we only have one
+            # finding). But the test must drive the
+            # finding review to be classified as FINDING
+            # by ensuring its inline fetch returns the
+            # finding. The clean review is classified by
+            # body (no inline fetch needed).
+            return fake_proc
+
+        with _mp.object(_subprocess, "run", side_effect=side_effect):
+            matches: list = []
+            for r in [older_finding, newer_clean]:
+                m = mod._match_response(
+                    r, kind="review",
+                    repo="Slideshow11/Automated-Edge-Discovery",
+                    pr_number=411,
+                    head=self.HEAD, ping_dt=self.PING_DT,
+                )
+                if m is not None:
+                    matches.append(m)
+            selected = self._select_newest(mod, matches)
+        assert selected["id"] == "6002"
+        assert selected["verdict"] == "CLEAN_PASS"
+
+    def test_source_contract_collects_all_matches(self):
+        """Source-contract: the main loop MUST collect
+        all matches before selecting. The substring
+        ``break`` MUST NOT appear in the loop body
+        that scans reviews and comments.
+        """
+        import inspect
+        from scripts.local import codex_review_poller as mod
+        src = inspect.getsource(mod.main)
+        # Find the scan loop.
+        scan_start = src.find("Scan ALL surfaces")
+        scan_end = src.find("Select the newest match")
+        assert scan_start > 0
+        assert scan_end > scan_start
+        scan_section = src[scan_start:scan_end]
+        # ``break`` MUST NOT appear in the scan loop body.
+        assert "break" not in scan_section, (
+            "Round-51 fix: the scan loop must collect "
+            "ALL matching responses without breaking "
+            "on the first match. The previous "
+            "implementation used ``break`` which caused "
+            "an older clean pass to win over a newer "
+            "finding. Found 'break' in the scan section: "
+            f"{scan_section!r}"
+        )
