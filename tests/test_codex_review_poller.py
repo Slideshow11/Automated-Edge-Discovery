@@ -448,6 +448,54 @@ class TestPaginatedFetch:
             f"{seen_argv}"
         )
 
+    def test_paginated_helper_uses_slurp_and_flattens(self, monkeypatch):
+        """Round-49 fix: the paginated helper MUST use
+        ``--slurp`` AND flatten the resulting list of
+        pages into a single list. Without ``--slurp``,
+        ``gh api --paginate`` emits each page as a
+        separate JSON array, and callers iterate a list
+        of lists — making the poller crash or miss the
+        post-ping Codex response on long PRs.
+        """
+        from unittest.mock import patch as _mp, MagicMock
+        import subprocess as _subprocess
+        mod = _load_module()
+        # Simulate the --slurp output: a list of pages,
+        # each page itself a list of items.
+        fake_proc = MagicMock()
+        fake_proc.returncode = 0
+        fake_proc.stdout = json.dumps([
+            # page 1
+            [
+                {"id": 1, "user": {"login": "alice"}},
+                {"id": 2, "user": {"login": "bob"}},
+            ],
+            # page 2
+            [
+                {"id": 3, "user": {"login": "carol"}},
+            ],
+        ])
+        fake_proc.stderr = ""
+        seen_argv = []
+        def spy_run(argv, *a, **kw):
+            seen_argv.append(list(argv))
+            return fake_proc
+        with _mp.object(_subprocess, "run", side_effect=spy_run):
+            data, err = mod._gh_api_paginated("repos/o/r/issues/1/comments")
+        assert err is None
+        # The data MUST be flattened: 3 items, not 2 pages.
+        assert len(data) == 3, (
+            "Round-49 fix: the paginated helper must "
+            "flatten the list of pages into a single "
+            f"list. Got {len(data)} items."
+        )
+        # And the argv MUST include ``--slurp``.
+        assert any("--slurp" in argv for argv in seen_argv), (
+            "Round-49 fix: the paginated helper must pass "
+            "``--slurp`` to ``gh api``. Seen argv: "
+            f"{seen_argv}"
+        )
+
 
 class TestCodexReviewSummaryFormat:
     """Round-48 fix: Codex's automated review summaries

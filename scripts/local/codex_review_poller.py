@@ -119,55 +119,75 @@ def _gh_api(endpoint: str) -> Tuple[Optional[Any], Optional[str]]:
 
 def _gh_api_paginated(endpoint: str) -> Tuple[Optional[List[Any]], Optional[str]]:
     """Run ``gh api --paginate <endpoint>`` and return the
-    concatenation of all pages as a single list (or the
-    raw object if the response is not a list).
+    flattened concatenation of all pages as a single list.
 
     GitHub REST list endpoints are paginated. ``per_page``
     only controls page size; additional pages must be
     followed. The ``--paginate`` flag tells ``gh`` to
-    follow all pages and concatenate the results. This
-    is the round-48 fix: without pagination, a PR with
-    more than 100 issue comments only returns the first
-    page (oldest-first by default), and a post-ping Codex
-    response on a long PR can sit on page 2+ and never
-    be scanned, causing a false timeout.
+    follow all pages. Without ``--slurp``, each page is
+    emitted as a SEPARATE JSON array, and callers iterate
+    a list of lists. With ``--slurp``, the pages are
+    collected into a single JSON array of arrays which
+    we then flatten. The round-49 fix adds the
+    ``--slurp`` flag and the flattening step.
+
+    The round-48 fix (without ``--slurp``) caused the
+    caller to iterate ``[page1, page2, ...]`` and call
+    ``.get()`` on a list, making the poller crash or
+    miss the post-ping Codex response on long PRs.
     """
-    # Strip any leading "repos/..." or "user/..." prefix
-    # because ``--paginate`` expects the bare endpoint.
-    # The endpoint may already include a query string.
-    cmd = ["gh", "api", "--paginate", endpoint]
-    # ``--paginate`` writes each page on its own line in
-    # newline-delimited JSON, OR concatenates the list
-    # elements into a single JSON array. Try parsing the
-    # full output as a single array first; if that fails,
-    # try NDJSON.
+    cmd = ["gh", "api", "--paginate", "--slurp", endpoint]
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=120,
         )
     except subprocess.TimeoutExpired:
-        return None, "gh api --paginate timeout"
+        return None, "gh api --paginate --slurp timeout"
     except FileNotFoundError:
         return None, "gh not found in PATH"
     if proc.returncode != 0:
-        return None, (proc.stderr or "").strip() or f"gh api --paginate rc={proc.returncode}"
+        return None, (proc.stderr or "").strip() or f"gh api --paginate --slurp rc={proc.returncode}"
     out = (proc.stdout or "").strip()
     if not out:
         return [], None
-    # Try single JSON array.
+    # ``--slurp`` produces a single JSON array of pages
+    # when the endpoint is a list endpoint, or a
+    # single-element array of the single object when
+    # the endpoint is a non-list endpoint. Try parsing
+    # as a flat list first; if that fails, try NDJSON
+    # (each line is a page).
     try:
         data = json.loads(out)
         if isinstance(data, list):
+            # ``--slurp`` may produce [page1, page2, ...]
+            # where each page is itself a list. Flatten
+            # one level. If the top-level items are
+            # dicts (non-list endpoint), the data is
+            # already flat.
+            if data and isinstance(data[0], list):
+                flat = []
+                for page in data:
+                    if isinstance(page, list):
+                        flat.extend(page)
+                    else:
+                        flat.append(page)
+                return flat, None
             return data, None
-        # Non-list response (single object): wrap in list
-        # of one so the caller can iterate uniformly.
-        return [data], None
     except json.JSONDecodeError:
         pass
-    # Try NDJSON (one JSON object per line).
+    # Try NDJSON (one JSON object/array per line).
     try:
-        data = [json.loads(line) for line in out.splitlines() if line.strip()]
-        return data, None
+        all_items: List[Any] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            page = json.loads(line)
+            if isinstance(page, list):
+                all_items.extend(page)
+            else:
+                all_items.append(page)
+        return all_items, None
     except json.JSONDecodeError as exc:
         return None, f"json decode error: {exc}"
 
