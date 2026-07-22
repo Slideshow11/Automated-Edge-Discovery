@@ -4134,14 +4134,36 @@ def cmd_advance(args: argparse.Namespace) -> int:
             # skipped and a blocking diagnostic is
             # recorded so the operator can rebind scope
             # and re-run.
-            live_pr_view_pre_ready = fetch_pr_state(
-                repo, pr_number
-            )
-            live_head_pre_ready = (
-                live_pr_view_pre_ready.get("headRefOid")
-                if isinstance(live_pr_view_pre_ready, dict)
-                else None
-            )
+            #
+            # Round-69 fix: wrap the ``fetch_pr_state``
+            # call in ``try/except`` so a transient API
+            # failure does NOT abort ``cmd_advance``
+            # with a traceback and no JSON report (which
+            # could happen after a fresh Codex ping was
+            # already posted). On exception, record the
+            # fail-closed diagnostic and skip the
+            # mutation.
+            try:
+                live_pr_view_pre_ready = fetch_pr_state(
+                    repo, pr_number
+                )
+            except Exception as exc:
+                actions_taken.append({
+                    "action": "mark_pr_ready_pre_check_failed",
+                    "ok": False,
+                    "result": "pre_check_raised",
+                    "original_head": str(head_sha),
+                    "error": repr(exc),
+                })
+                head_moved_during_mutation = True
+                live_head_pre_ready = None
+                live_pr_view_pre_ready = None
+            else:
+                live_head_pre_ready = (
+                    live_pr_view_pre_ready.get("headRefOid")
+                    if isinstance(live_pr_view_pre_ready, dict)
+                    else None
+                )
             if (
                 live_head_pre_ready
                 and str(head_sha)
@@ -4423,9 +4445,33 @@ def cmd_advance(args: argparse.Namespace) -> int:
                     # Pre-check the live head before
                     # each mutation. Fail closed on
                     # any error.
-                    live_pr_view_during_resolve = fetch_pr_state(
-                        repo, pr_number
-                    )
+                    #
+                    # Round-69 fix: wrap the
+                    # ``fetch_pr_state`` call in
+                    # ``try/except`` so a transient API
+                    # failure does NOT escape
+                    # ``cmd_advance`` with a traceback
+                    # and no JSON report (especially
+                    # disruptive if earlier eligible
+                    # threads in the same loop were
+                    # already resolved). On exception,
+                    # record the fail-closed diagnostic
+                    # and abort the loop.
+                    try:
+                        live_pr_view_during_resolve = fetch_pr_state(
+                            repo, pr_number
+                        )
+                    except Exception as exc:
+                        head_moved_during_resolution = True
+                        actions_taken.append({
+                            "action": "resolve_pre_check_failed",
+                            "ok": False,
+                            "result": "pre_check_raised",
+                            "original_head": str(head_sha),
+                            "aborted_at_thread": record["thread_id"],
+                            "error": repr(exc),
+                        })
+                        break
                     live_head_during_resolve = (
                         live_pr_view_during_resolve.get("headRefOid")
                         if isinstance(

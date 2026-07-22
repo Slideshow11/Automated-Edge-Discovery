@@ -7773,3 +7773,121 @@ def test_round68_finding2_resolve_aborts_on_no_head():
         "head_moved_during_resolution=True before "
         "the break."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-69 regression: handle ready-head and
+# resolve-head recheck failures before mutating. A
+# transient ``fetch_pr_state`` failure must NOT
+# escape ``cmd_advance`` with a traceback and no
+# JSON report. The pre-check must record the
+# fail-closed diagnostic and skip the mutation.
+# ---------------------------------------------------------------------------
+
+
+def test_round69_finding1_source_contract_try_except_pre_check():
+    """Round-69 Finding 1: cmd_advance MUST wrap the
+    ``mark_pr_ready`` pre-check ``fetch_pr_state`` call
+    in ``try/except`` so a transient API failure does
+    NOT abort with a traceback. On exception, record
+    the fail-closed diagnostic and skip the mutation.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The mark_pr_ready pre-check MUST be wrapped in
+    # try/except.
+    # Find the mark_pr_ready_pre_check_failed action
+    # with reason pre_check_raised — that's the
+    # exception handler.
+    assert "mark_pr_ready_pre_check_failed" in src, (
+        "Round-69 fix: the mark_pr_ready pre-check "
+        "must include the fail-closed diagnostic "
+        "action."
+    )
+    assert "pre_check_raised" in src, (
+        "Round-69 fix: the mark_pr_ready pre-check "
+        "must record reason 'pre_check_raised'."
+    )
+    # The fetch_pr_state call for mark_pr_ready MUST
+    # be wrapped in try/except.
+    fetch_idx = src.find("mark_pr_ready_pre_check_head_moved")
+    # Look backward to find the first fetch_pr_state
+    # before this action.
+    pre_section = src[max(0, fetch_idx - 2000):fetch_idx]
+    assert "try:" in pre_section, (
+        "Round-69 fix: the mark_pr_ready fetch_pr_state "
+        "call must be wrapped in try/except."
+    )
+    assert "except Exception" in pre_section, (
+        "Round-69 fix: the mark_pr_ready fetch_pr_state "
+        "call must have an except Exception handler."
+    )
+
+
+def test_round69_finding2_source_contract_try_except_pre_check():
+    """Round-69 Finding 2: cmd_advance MUST wrap the
+    resolve-loop ``fetch_pr_state`` call in
+    ``try/except`` so a transient API failure does
+    NOT escape with a traceback. On exception,
+    record the fail-closed diagnostic and abort the
+    loop.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The resolve-loop must record the
+    # pre_check_raised diagnostic.
+    assert "resolve_pre_check_failed" in src, (
+        "Round-69 fix: the resolve-loop must record "
+        "the fail-closed diagnostic."
+    )
+    assert "pre_check_raised" in src, (
+        "Round-69 fix: the resolve-loop must record "
+        "reason 'pre_check_raised'."
+    )
+    # The fetch_pr_state call for the resolve-loop
+    # MUST be wrapped in try/except.
+    resolve_idx = src.find("resolve_eligible_bot_threads_pre_check_head_moved")
+    # Look backward to find the fetch_pr_state
+    # before this action.
+    pre_section = src[max(0, resolve_idx - 2000):resolve_idx]
+    assert "try:" in pre_section, (
+        "Round-69 fix: the resolve-loop fetch_pr_state "
+        "call must be wrapped in try/except."
+    )
+    assert "except Exception" in pre_section, (
+        "Round-69 fix: the resolve-loop fetch_pr_state "
+        "call must have an except Exception handler."
+    )
+    # The exception handler must break the loop.
+    exception_section = pre_section
+    assert "break" in exception_section, (
+        "Round-69 fix: the resolve-loop exception "
+        "handler must break the loop."
+    )
+
+
+def test_round69_finding1_pre_check_raised_records_diagnostic():
+    """Round-69 Finding 1: when the mark_pr_ready
+    pre-check raises, the action record MUST include
+    ``mark_pr_ready_pre_check_failed`` with reason
+    ``pre_check_raised``.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The mark_pr_ready exception handler must record
+    # reason 'pre_check_raised' alongside
+    # 'mark_pr_ready_pre_check_failed'.
+    assert "mark_pr_ready_pre_check_failed" in src, (
+        "Round-69 fix: the mark_pr_ready exception "
+        "handler must emit mark_pr_ready_pre_check_failed."
+    )
+    assert "pre_check_raised" in src, (
+        "Round-69 fix: the mark_pr_ready exception "
+        "handler must record reason 'pre_check_raised'."
+    )
