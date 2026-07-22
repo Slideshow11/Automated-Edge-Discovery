@@ -1646,16 +1646,39 @@ def classify(
                 # from prior heads do not invalidate a
                 # current-head clean pass.
                 if is_summary_format and review_threads:
-                    has_active_thread = False
+                    # Round-54 + Round-56 fix: veto
+                    # summary-format reviews whenever the
+                    # associated Codex inline finding
+                    # exists, regardless of whether the
+                    # thread is still active or has been
+                    # resolved. The presence of a Codex
+                    # inline thread NOT marked outdated
+                    # (i.e. anchored to the current head
+                    # or one of its ancestors) is
+                    # sufficient evidence that the
+                    # summary review carries a finding.
+                    # Without the resolved-thread check,
+                    # an operator who marks the current
+                    # head's Codex thread resolved before
+                    # a later clean re-review would see
+                    # ``clean_pass_detected=True`` for
+                    # the finding review, bypassing the
+                    # later unresolved-thread gate.
+                    # Outdated threads (explicitly
+                    # marked as anchored to a prior head
+                    # no longer reachable from the
+                    # current head) are excluded so they
+                    # don't invalidate a current-head
+                    # clean pass.
+                    has_current_head_thread = False
                     for t in review_threads:
                         if (
-                            not bool(t.get("is_resolved", False))
-                            and not bool(t.get("is_outdated", False))
+                            not bool(t.get("is_outdated", False))
                             and t.get("author", "") in CODEX_BOT_LOGINS
                         ):
-                            has_active_thread = True
+                            has_current_head_thread = True
                             break
-                    if has_active_thread:
+                    if has_current_head_thread:
                         # Summary review carries a
                         # finding. Skip it as a clean
                         # pass candidate.

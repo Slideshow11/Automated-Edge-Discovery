@@ -9725,3 +9725,155 @@ def _r52_classify_with_active_threads(
             ping_created_at=PING_CREATED,
             max_polls=1, poll_seconds=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-56 regression: veto summary reviews when a
+# current-head Codex inline thread has been RESOLVED
+# (not just when it's still active). The Round-54 fix
+# only checked active threads; if an operator marks
+# the current-head Codex thread resolved before a
+# later clean re-review, the audit would record
+# ``clean_pass_detected=True`` for the finding
+# review, bypassing the later unresolved-thread gate.
+# ---------------------------------------------------------------------------
+
+
+def test_round56_summary_clean_review_with_resolved_thread_rejected(monkeypatch, tmp_path):
+    """Bug repro: a summary-format review with a
+    RESOLVED Codex-bot thread anchored to the current
+    head MUST NOT be detected as a clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread (not active, but anchored
+    # to the current head). The Round-54 fix would
+    # miss this; Round-56 catches it.
+    resolved_thread = _r56_active_thread(
+        is_resolved=True,
+        is_outdated=False,
+        path="scripts/local/x.py",
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_thread],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-56 fix: a summary-format review with a "
+        "RESOLVED Codex thread MUST NOT be a clean "
+        "pass. The Round-54 fix only checked active "
+        "threads; Round-56 extends to resolved threads "
+        "from the current head. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round56_summary_clean_review_with_outdated_thread_accepted(monkeypatch, tmp_path):
+    """Round-56 invariant: a summary-format review
+    with ONLY outdated Codex threads MUST be detected
+    as a clean pass. Outdated threads are anchored to
+    prior heads and don't invalidate the current-head
+    clean pass.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED + OUTDATED thread — should NOT veto.
+    outdated_thread = _r56_active_thread(
+        is_resolved=True,
+        is_outdated=True,
+        path="scripts/local/x.py",
+    )
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[outdated_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-56 invariant: outdated threads MUST NOT "
+        "invalidate a current-head clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round56_source_contract_resolved_thread_veto():
+    """Source-contract: the summary-format review
+    detection MUST NOT require ``is_resolved=False``
+    on the Codex thread. The veto applies to any
+    current-head (non-outdated) Codex thread.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    # The Round-56 logic is in the formal-review
+    # clean-pass detection. The ``is_resolved=False``
+    # guard from Round-54 MUST be removed.
+    # Find the section that handles summary_format
+    # and verify ``is_resolved=False`` is NOT used
+    # in the veto condition.
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    # Look forward from summary_idx to find the
+    # veto condition.
+    veto_section = src[summary_idx:summary_idx + 3000]
+    assert "is_resolved" not in veto_section, (
+        "Round-56 fix: the summary-format veto MUST "
+        "NOT check ``is_resolved``. The veto applies "
+        "to any current-head (non-outdated) Codex "
+        "thread, regardless of resolved state. "
+        "Found 'is_resolved' in veto section."
+    )
+
+
+# Module-level helper for Round-56 tests.
+def _r56_active_thread(*, is_resolved=False, is_outdated=False, path="scripts/local/x.py"):
+    """Build an active thread in the RAW GraphQL
+    format with configurable resolved/outdated state.
+    """
+    return {
+        "id": "T-1",
+        "isResolved": is_resolved,
+        "isOutdated": is_outdated,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Some finding",
+                    "path": path,
+                    "line": 10,
+                    "originalCommit": {
+                        "oid": "589c719ced339f49ac07f1ebd2082512a0204519",
+                    },
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
