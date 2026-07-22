@@ -3639,6 +3639,13 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
             self.original_head = original_head
             self.refreshed_head = refreshed_head
+    # Round-58 fix: track whether the post-mutation
+    # refresh detected a head move. When True, ALL
+    # subsequent mutations in this ``advance``
+    # invocation are skipped because the eligible
+    # thread IDs, changed-file inputs, and trusted
+    # scope are bound to the OLD head.
+    head_moved_during_mutation = False
     repo = args.repo
     pr_number = args.pr_number
     cli_allowed = _parse_scope_arg(args.allowed_files)
@@ -4177,6 +4184,25 @@ def cmd_advance(args: argparse.Namespace) -> int:
                             "original_head": head_sha,
                             "refreshed_head": refreshed_head,
                         })
+                        # Round-58 fix: set a flag so
+                        # that ALL subsequent mutations
+                        # in this ``advance`` invocation
+                        # are skipped. The eligible
+                        # thread IDs, changed-file
+                        # inputs, and trusted scope are
+                        # all bound to the OLD head —
+                        # resolving threads against the
+                        # NEW head would use stale
+                        # exact-head evidence. The
+                        # operator must rebind scope to
+                        # the new head (via
+                        # ``scope-write``) and re-run
+                        # ``advance`` so the readiness
+                        # verdict uses the current-head
+                        # evidence. The flag is scoped
+                        # to this ``cmd_advance``
+                        # invocation (no global state).
+                        head_moved_during_mutation = True
                         raise _HeadMovedDuringMutation(
                             original_head=head_sha,
                             refreshed_head=refreshed_head,
@@ -4289,7 +4315,20 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # squash merge so it sees the post-resolution inventory and
         # refuses merge if anything is still unresolved.
         if getattr(args, "resolve_eligible_bot_threads", False):
-            if not R.is_canonical_head_sha(head_sha):
+            if head_moved_during_mutation:
+                # Round-58 fix: skip thread resolution
+                # when the head moved during
+                # ``mark_pr_ready``. The eligible
+                # thread IDs were computed from the
+                # OLD head/scope; resolving them now
+                # would use stale exact-head evidence.
+                actions_taken.append({
+                    "action": "resolve_eligible_bot_threads",
+                    "attempted": False,
+                    "reason": "head_moved_during_mark_pr_ready",
+                    "ok": False,
+                })
+            elif not R.is_canonical_head_sha(head_sha):
                 actions_taken.append({
                     "action": "resolve_eligible_bot_threads",
                     "attempted": False,

@@ -7557,3 +7557,54 @@ def test_round55_head_moved_action_contains_actionable_steps():
         "Round-55 fix: _head_moved_action must name "
         "the concrete re-run step. Got: " + msg
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-58 regression: stop advancing after a
+# post-ready head move. When ``gh pr ready`` succeeds
+# but the refresh detects that ``headRefOid`` changed,
+# the ``resolve_eligible_bot_threads`` block MUST
+# be skipped because the eligible thread IDs were
+# computed from the old head/scope before the push.
+# ---------------------------------------------------------------------------
+
+
+def test_round58_source_contract_head_moved_flag_skips_resolution():
+    """Source-contract: ``cmd_advance`` MUST declare a
+    ``head_moved_during_mutation`` flag, set it when
+    the post-mutation refresh detects a head move,
+    and use it to skip the
+    ``resolve_eligible_bot_threads`` block.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import aed_pr as ctrl
+    src = inspect.getsource(ctrl.cmd_advance)
+    # The flag MUST be declared.
+    assert "head_moved_during_mutation" in src, (
+        "Round-58 fix: cmd_advance must declare and "
+        "use head_moved_during_mutation flag."
+    )
+    # Find the NON-dry_run resolve_eligible_bot_threads
+    # block. The dry_run block adds action records but
+    # doesn't actually resolve threads. The non-dry_run
+    # block has the guard we added.
+    # Find the line that calls ``resolve_review_thread``
+    # — that's the non-dry_run path.
+    resolve_call_idx = src.find("resolve_review_thread(repo, tid)")
+    assert resolve_call_idx > 0
+    # Look backward from the resolve call to find the
+    # block header and the guard.
+    before_resolve = src[:resolve_call_idx]
+    # The guard MUST appear within 3000 chars before
+    # the resolve call.
+    assert "head_moved_during_mutation" in before_resolve[-3000:], (
+        "Round-58 fix: the resolve_eligible_bot_threads "
+        "block must check head_moved_during_mutation "
+        "and skip when True."
+    )
+    # The reason string MUST be present.
+    assert "head_moved_during_mark_pr_ready" in src, (
+        "Round-58 fix: the skip action record must "
+        "include the reason string 'head_moved_during_mark_pr_ready'."
+    )
