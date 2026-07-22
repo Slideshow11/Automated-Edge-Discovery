@@ -1430,6 +1430,13 @@ def classify(
         # one: a later finding might have superseded the clean pass.
         # Filter by ping_dt so old pre-ping clean passes do not count.
         latest_clean_pass = None
+        # Round-61: track review IDs whose inline
+        # comments carry findings. Declared at this
+        # scope (not inside the ``if`` block below)
+        # so the post-clean-pass scan at line ~1986
+        # can consult it even when no clean pass
+        # was detected from the formal-review path.
+        review_ids_with_inline: set = set()
         # Round-26 hardening: PR-level issue comments do not
         # carry a commit anchor in GitHub's data model (REST
         # /repos/{owner}/{repo}/issues/{n}/comments returns no
@@ -1697,6 +1704,18 @@ def classify(
                 # (e.g. comments that haven't been
                 # turned into threads yet, or
                 # inventory gaps).
+                #
+                # Round-61 fix: when inline comments
+                # exist on a summary review, the review
+                # is recorded in ``review_ids_with_inline``
+                # so the post-clean-pass scan below can
+                # treat it as a NEWER finding. Without
+                # this, the post-clean-pass scan would
+                # see a summary-clean body and NOT mark
+                # the review as a finding, allowing
+                # ``MERGE_READY_AWAITING_HUMAN_
+                # AUTHORIZATION`` despite a newer inline
+                # finding.
                 review_id = r.get("id")
                 if review_id and is_summary_format:
                     inline_ok, inline_comments, inline_err = (
@@ -1716,7 +1735,12 @@ def classify(
                         # Inline comments present — the
                         # summary review carries a
                         # finding. Skip it as a clean
-                        # pass candidate.
+                        # pass candidate AND record the
+                        # review_id so the
+                        # post-clean-pass scan treats
+                        # this review as a newer finding
+                        # (Round-61).
+                        review_ids_with_inline.add(str(review_id))
                         continue
                 # Round-54 + Round-56 + Round-57 +
                 # Round-59 fix: veto summary-format
@@ -1962,6 +1986,21 @@ def classify(
                                 for line in body.splitlines()
                             )
                         )
+                        # Round-61 fix: if the review
+                        # has inline comments (recorded
+                        # by the Round-60 fetch), it is a
+                        # finding even when the body is
+                        # summary-clean. The post-clean-
+                        # pass scan MUST consult
+                        # ``review_ids_with_inline`` so a
+                        # newer summary review with
+                        # inline findings correctly
+                        # downgrades a current-head clean
+                        # pass to HOLD_NEW_CODEX_THREAD.
+                        r_id_str = str(r.get("id", ""))
+                        if r_id_str and r_id_str in review_ids_with_inline:
+                            newer_finding_after_clean_pass = True
+                            break
                         if not (is_clean_phrase or is_summary_clean):
                             newer_finding_after_clean_pass = True
                             break

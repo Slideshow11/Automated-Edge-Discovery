@@ -10376,3 +10376,67 @@ def _r60_classify_with_inline_comments(
             ping_created_at=PING_CREATED,
             max_polls=1, poll_seconds=0,
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-61 regression: treat inline summary findings
+# as blockers. When a newer summary-format Codex
+# review has inline comments, the post-clean-pass
+# scan MUST treat it as a NEWER finding even when the
+# summary body looks clean. Without this, the
+# classifier could return MERGE_READY despite a newer
+# inline finding.
+# ---------------------------------------------------------------------------
+
+
+def test_round61_newer_finding_with_inline_comments_downgrades_clean(monkeypatch, tmp_path):
+    """Bug repro: a newer summary-format review WITH
+    inline comments MUST downgrade a current-head
+    clean pass to HOLD_NEW_CODEX_THREAD, even when
+    the summary body is clean.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    # Older clean review (exact phrase).
+    older_clean = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="Codex Review: Didn't find any major issues. :tada:",
+        submitted_at="2026-07-22T06:10:00Z",
+        review_id=4751499100,
+        commit_oid=HEAD,
+    )
+    # Newer summary review WITH inline comments
+    # (the finding lives in the inline comments,
+    # not the summary body).
+    newer_finding = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body=ROUND60_BODY,
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499200,
+        commit_oid=HEAD,
+    )
+    pkt = _r60_classify_with_inline_comments(
+        monkeypatch,
+        codex_review_submissions=[older_clean, newer_finding],
+        codex_issue_comments=[],
+        active_threads=[],
+        inline_comments_by_review={
+            4751499200: [{
+                "id": "ic-1",
+                "user": {"login": "chatgpt-codex-connector[bot]"},
+                "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
+                "path": "scripts/local/x.py",
+            }],
+        },
+    )
+    # The newer finding with inline comments MUST
+    # downgrade the clean pass to HOLD_NEW_CODEX_THREAD.
+    assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+        "Round-61 fix: a newer summary review with "
+        "inline comments MUST downgrade to "
+        "HOLD_NEW_CODEX_THREAD. Got "
+        f"status={pkt.get('status')!r}"
+    )
