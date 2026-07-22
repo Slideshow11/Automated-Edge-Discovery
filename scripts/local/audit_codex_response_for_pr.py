@@ -1470,25 +1470,59 @@ def classify(
                 r_dt = parse_iso_utc(latest_head_bound_clean_review_ts)
                 if c_dt is None or r_dt is None or c_dt < r_dt:
                     continue
-                # Round-46: if the latest OVERALL
-                # head-bound formal review is a
-                # non-clean finding, the issue
-                # comment is a stale echo of the
-                # earlier clean review and must NOT
-                # be accepted as a clean-pass
-                # authority. The current-head Codex
-                # surface is the finding, not the
-                # earlier clean review.
+            # Round-46 + Round-47 fix: the latest
+            # OVERALL head-bound formal review veto.
+            # When the latest head-bound formal review
+            # is a non-clean finding AND a clean
+            # head-bound formal review exists AND the
+            # issue comment postdates that clean
+            # review, the issue comment is a stale
+            # echo of the clean review (a non-clean
+            # review has been posted in between) and
+            # MUST NOT be accepted as a clean-pass
+            # authority. The current-head Codex
+            # surface is the finding, not the earlier
+            # clean review.
+            #
+            # The veto MUST run regardless of
+            # whether a ping boundary is supplied
+            # (Round-47 correction: Round-46 had
+            # the veto inside the ``ping_dt is
+            # None`` block, which left the
+            # post-ping path unchecked). But the
+            # veto MUST also be scoped to the
+            # candidate-echo case: it only fires
+            # when ``latest_head_bound_clean_
+            # review_ts`` is non-empty (a clean
+            # head-bound formal review exists to
+            # echo) AND the comment postdates that
+            # clean review. When no clean
+            # head-bound formal review exists, the
+            # issue comment IS the clean pass (not
+            # an echo), and the existing
+            # ``newer_finding_after_clean_pass``
+            # scan handles later findings.
+            if (
+                latest_head_bound_formal_review_ts
+                and not latest_head_bound_formal_review_is_clean
+                and latest_head_bound_clean_review_ts
+            ):
+                c_dt_check = parse_iso_utc(ts)
+                r_dt_check = parse_iso_utc(
+                    latest_head_bound_clean_review_ts
+                )
                 if (
-                    latest_head_bound_formal_review_ts
-                    and not latest_head_bound_formal_review_is_clean
+                    c_dt_check is not None
+                    and r_dt_check is not None
+                    and c_dt_check >= r_dt_check
                 ):
-                    # The latest head-bound formal
-                    # review is a non-clean finding.
-                    # No issue-comment clean pass can
-                    # authorize the current head's
-                    # clean-pass verdict while that
-                    # finding is in flight.
+                    # The issue comment is a
+                    # candidate post-clean echo,
+                    # and a later non-clean
+                    # formal review (the latest
+                    # head-bound formal review) is
+                    # in flight. Reject the
+                    # comment as a stale echo.
                     continue
             if latest_clean_pass is None or ts > timestamp_field(latest_clean_pass, "createdAt", "created_at"):
                 latest_clean_pass = c

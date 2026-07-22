@@ -8869,3 +8869,336 @@ class TestRound46InterveningFindingInvalidatesEcho:
             "to reject the clean pass when the latest "
             "head-bound formal review is a non-clean finding."
         )
+
+
+# ---------------------------------------------------------------------------
+# Round-47 regression: the Round-46 latest-formal-review
+# veto MUST run regardless of whether a ping boundary
+# (``ping_dt``) is supplied. Round-46 only ran the veto
+# inside the ``if ping_dt is None:`` block, which left
+# the post-ping path unchecked: a post-ping sequence
+# (clean formal review → later non-clean formal review
+# → unanchored issue-comment clean-pass echo) was still
+# misclassified because ``clean_pass_at`` would become
+# the later issue-comment timestamp, and the
+# ``newer_finding_after_clean_pass`` scan would no
+# longer see the intervening formal finding as newer
+# than the issue comment.
+# The fix: lift the Round-46 veto out of the
+# ``ping_dt is None`` block so it runs in both code
+# paths. The Round-27 head-binding surface check
+# (postdate the clean review) remains gated on
+# ``ping_dt is None`` because it is only relevant
+# when the ping window is the only head-binding
+# surface; the Round-46 veto is the universal guard.
+# ---------------------------------------------------------------------------
+
+
+# A ping boundary timestamp that POSTDATES all the
+# pre-ping review activity in the test fixtures. This
+# simulates the operator's ``cmd_advance`` posting a
+# fresh @codex review ping and the test running
+# against the post-ping window. The post-ping
+# sequence (clean review → non-clean review → issue
+# comment) is the bug repro.
+ROUND_47_PING_ID = "4677095302"
+ROUND_47_PING_CREATED = "2026-07-22T00:30:00Z"
+
+
+def _r47_classify_with_ping(
+    monkeypatch, *, reviews, comments, ping_dt=ROUND_47_PING_CREATED,
+):
+    """Drive ``classify`` end-to-end with a mocked
+    ``subprocess.run`` that returns the supplied
+    reviews and issue comments AND a non-None ping
+    boundary. Mirrors the existing
+    ``_r46_classify_with_fixture`` helper but
+    forwards a ping boundary so the post-ping
+    code path is exercised.
+    """
+    from unittest.mock import patch as _mp
+    from scripts.local import audit_codex_response_for_pr as mod
+    pr_view = make_raw_rest_pr_payload(
+        state="open", sha=ROUND_46_HEAD,
+        mergeable_state="clean", mergeable=True,
+    )
+    threads_payload = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [],
+            }
+        }}}
+    }
+
+    def runner(cmd, *args, **kwargs):
+        m = MagicMock()
+        m.returncode = 0
+        m.stderr = ""
+        cmd_str = " ".join(str(c) for c in cmd)
+        if (
+            "repos/" in cmd_str
+            and "/pulls/" in cmd_str
+            and "/reviews" not in cmd_str
+            and "/comments" not in cmd_str
+        ):
+            m.stdout = json.dumps(pr_view)
+            return m
+        if "graphql" in cmd_str:
+            m.stdout = json.dumps(threads_payload)
+            return m
+        if "/issues/" in cmd_str and "/comments" in cmd_str:
+            m.stdout = json.dumps(list(comments))
+            return m
+        if "/reviews" in cmd_str and "/comments" not in cmd_str:
+            m.stdout = json.dumps(list(reviews))
+            return m
+        m.stdout = "[]"
+        return m
+
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    with _mp.object(mod.subprocess, "run", runner):
+        return mod.classify(
+            repo=REPO, pr_number=402,
+            expected_head_sha=ROUND_46_HEAD,
+            ping_comment_id=(
+                ROUND_47_PING_ID if ping_dt is not None else None
+            ),
+            ping_created_at=ping_dt,
+            max_polls=1, poll_seconds=0,
+        )
+
+
+class TestRound47FormalReviewVetoRunsWithPingBoundary:
+    """Round-47 regression: the latest-formal-review
+    veto MUST run regardless of whether a ping
+    boundary is supplied. Round-46 only ran it
+    inside the ``if ping_dt is None:`` block, which
+    left the post-ping path unchecked.
+
+    Additionally, the veto MUST be scoped to the
+    candidate-echo case: it only fires when a clean
+    head-bound formal review exists (so the issue
+    comment could be an echo of it) AND the comment
+    postdates that clean review. When no clean
+    head-bound formal review exists, the issue
+    comment IS the clean pass (not an echo), and the
+    existing ``newer_finding_after_clean_pass`` scan
+    handles later findings without the veto.
+    """
+
+    def test_post_ping_intervening_finding_invalidates_echo(
+        self, monkeypatch
+    ):
+        """Bug repro (Round-47): clean formal review at
+        T1, non-clean formal review at T2, unanchored
+        issue-comment clean pass at T3 — all POST-ping.
+        Without the Round-47 fix, the issue comment is
+        accepted as a clean-pass authority because the
+        Round-46 veto was inside the ``ping_dt is None``
+        block and skipped when ``ping_dt is not None``.
+        The ``clean_pass_at`` then becomes the later
+        issue-comment timestamp (T3), and the
+        ``newer_finding_after_clean_pass`` scan no
+        longer sees the non-clean review (T2) as newer
+        than the issue comment (T3). The classifier
+        can then emit a clean/merge-ready status while
+        a current-head non-clean formal review exists.
+
+        With the fix, the Round-46 veto runs
+        regardless of ``ping_dt``, and the issue
+        comment is rejected. The formal-review
+        clean-pass fallback finds the clean review,
+        the ``newer_finding_after_clean_pass`` scan
+        correctly identifies the non-clean review as
+        a newer finding, and the final status is
+        ``HOLD_NEW_CODEX_THREAD``.
+        """
+        # All timestamps POST-ping (after 00:30:00Z).
+        clean_review = _r46_clean_review(
+            5001, submitted_at="2026-07-22T00:35:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            5002, submitted_at="2026-07-22T00:40:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            5003, created_at="2026-07-22T00:45:00Z"
+        )
+        pkt = _r47_classify_with_ping(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+            ping_dt=ROUND_47_PING_CREATED,
+        )
+        # Round-47: the issue comment MUST NOT be the
+        # clean-pass source — the latest head-bound
+        # formal review is a non-clean finding, so the
+        # issue comment is rejected as a stale echo
+        # of the earlier clean review.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-47 fix: the issue comment must NOT "
+            "be the clean-pass source when the latest "
+            "head-bound formal review is a non-clean "
+            "finding AND a ping boundary is supplied. "
+            f"Got clean_pass_source="
+            f"{pkt.get('clean_pass_source')!r}. "
+            f"status={pkt.get('status')!r}"
+        )
+        # The status MUST NOT be a merge-ready state.
+        status = pkt.get("status", "")
+        assert "MERGE_READY" not in status, (
+            f"Round-47 fix: classifier must NOT emit "
+            f"MERGE_READY when an intervening finding "
+            f"is in the inventory (post-ping); got "
+            f"status={status!r}"
+        )
+        # And the classifier MUST emit
+        # ``HOLD_NEW_CODEX_THREAD`` because the
+        # non-clean review is the newer finding.
+        assert status == "HOLD_NEW_CODEX_THREAD", (
+            f"Round-47 fix: classifier must emit "
+            f"HOLD_NEW_CODEX_THREAD when the latest "
+            f"head-bound formal review is a non-clean "
+            f"finding (post-ping); got status={status!r}"
+        )
+
+    def test_pre_ping_veto_still_runs_round46(
+        self, monkeypatch
+    ):
+        """Regression guard: Round-46 behavior (veto
+        runs in the ``ping_dt is None`` path) MUST
+        still hold after the Round-47 fix. The Round-47
+        fix lifts the veto out of the ``ping_dt is
+        None`` block, but it must STILL reject
+        issue-comment clean passes when the latest
+        head-bound formal review is non-clean and
+        no ping boundary is supplied.
+        """
+        clean_review = _r46_clean_review(
+            6001, submitted_at="2026-07-22T01:00:00Z"
+        )
+        non_clean_review = _r46_non_clean_review(
+            6002, submitted_at="2026-07-22T01:05:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            6003, created_at="2026-07-22T01:10:00Z"
+        )
+        pkt = _r46_classify_with_fixture(
+            monkeypatch,
+            reviews=[clean_review, non_clean_review],
+            comments=[clean_echo],
+        )
+        # Same Round-46 contract: the issue comment
+        # MUST NOT be the clean-pass source.
+        assert pkt.get("clean_pass_source") != "issue_comment", (
+            "Round-46 invariant: the issue comment "
+            "must NOT be the clean-pass source when "
+            "the latest head-bound formal review is a "
+            "non-clean finding (no ping). Got "
+            f"clean_pass_source={pkt.get('clean_pass_source')!r}"
+        )
+        assert pkt.get("status") == "HOLD_NEW_CODEX_THREAD", (
+            "Round-46 invariant: classifier must emit "
+            "HOLD_NEW_CODEX_THREAD in the no-ping "
+            f"path. Got status={pkt.get('status')!r}"
+        )
+
+    def test_post_ping_no_intervening_finding_accepts_echo(
+        self, monkeypatch
+    ):
+        """Regression guard: when no intervening
+        non-clean formal review exists (only a clean
+        review, then an issue-comment echo), the
+        Round-47 fix MUST NOT over-reject in the
+        post-ping path. The issue comment is still
+        accepted as a clean-pass echo.
+        """
+        clean_review = _r46_clean_review(
+            7001, submitted_at="2026-07-22T00:35:00Z"
+        )
+        clean_echo = _r46_clean_echo_comment(
+            7002, created_at="2026-07-22T00:45:00Z"
+        )
+        pkt = _r47_classify_with_ping(
+            monkeypatch,
+            reviews=[clean_review],
+            comments=[clean_echo],
+            ping_dt=ROUND_47_PING_CREATED,
+        )
+        # The classifier SHOULD accept the issue
+        # comment as a clean pass (no later finding).
+        assert pkt.get("clean_pass_detected") is True, (
+            "Round-47 fix must NOT over-reject: when "
+            "no later finding is in the inventory, the "
+            "issue comment is still a valid clean-pass "
+            f"echo (post-ping). Got: status={pkt.get('status')!r}"
+        )
+        # And the source should be the issue comment.
+        assert pkt.get("clean_pass_source") == "issue_comment"
+
+    def test_source_contract_veto_outside_ping_block(self):
+        """Source-contract test: the latest-formal-
+        review veto MUST be located OUTSIDE the
+        ``if ping_dt is None:`` block. Round-46 had
+        it inside that block, which left the
+        post-ping path unchecked (the Round-47
+        finding). The fix lifts the veto out of
+        the block so it runs in both the
+        ``ping_dt is None`` and
+        ``ping_dt is not None`` paths.
+
+        Additionally, the veto MUST be scoped to
+        the candidate-echo case: it only fires
+        when ``latest_head_bound_clean_review_ts``
+        is non-empty (a clean head-bound formal
+        review exists to echo). Without this
+        guard, the veto over-rejects the
+        scenario where the issue comment IS the
+        clean pass (no clean formal review
+        exists), which would break the
+        pre-existing
+        ``newer_finding_after_clean_pass`` scan.
+        """
+        import inspect
+        from scripts.local import audit_codex_response_for_pr as ac
+        src = inspect.getsource(ac)
+        # The veto guard MUST appear in the source.
+        assert "not latest_head_bound_formal_review_is_clean" in src, (
+            "Round-47 fix: the latest-formal-review "
+            "veto must be in the source."
+        )
+        # The veto expression AND the candidate-echo
+        # guard (``latest_head_bound_clean_review_ts``)
+        # must both appear in the same block. The
+        # candidate-echo guard prevents the veto from
+        # over-rejecting scenarios where the issue
+        # comment IS the clean pass.
+        # Find the LAST ``if ping_dt is None:`` in
+        # the source (the block the veto used to be
+        # inside per Round-46). The veto must be
+        # located AFTER that block closes.
+        last_ping_block = src.rfind("if ping_dt is None:")
+        assert last_ping_block > 0, (
+            "source must contain ``if ping_dt is None:`` "
+            "block (Round-27 invariant)"
+        )
+        # Find the veto expression AFTER the
+        # ``if ping_dt is None:`` block. The veto
+        # expression ``not latest_head_bound_
+        # formal_review_is_clean`` must appear
+        # AFTER the last ``if ping_dt is None:``
+        # line.
+        veto_expr_idx = src.find(
+            "not latest_head_bound_formal_review_is_clean",
+            last_ping_block,
+        )
+        assert veto_expr_idx > 0, (
+            "Round-47 fix: the veto expression "
+            "``not latest_head_bound_formal_review_is_clean`` "
+            "must appear AFTER the last ``if ping_dt is None:`` "
+            "block in the source. The veto was incorrectly "
+            "nested inside the ``ping_dt is None`` block "
+            "in Round-46, which left the post-ping path "
+            "unchecked."
+        )
