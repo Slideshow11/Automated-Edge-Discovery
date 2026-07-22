@@ -9740,9 +9740,20 @@ def _r52_classify_with_active_threads(
 
 
 def test_round56_summary_clean_review_with_resolved_thread_rejected(monkeypatch, tmp_path):
-    """Bug repro: a summary-format review with a
-    RESOLVED Codex-bot thread anchored to the current
-    head MUST NOT be detected as a clean pass.
+    """Round-56 invariant (superseded by Round-59): a
+    summary-format review with a RESOLVED Codex thread
+    on the SAME commit does NOT veto a clean pass
+    (Round-59 changed this — resolved threads are
+    excluded from the veto because the finding has
+    been addressed). This test now verifies the
+    Round-59 behavior: resolved threads on the same
+    commit do NOT veto.
+
+    The original Round-56 bug was about resolved
+    threads on older commits vetoing clean re-reviews.
+    Round-57 fixed that by tying to commit anchor.
+    Round-59 further refined: even same-commit resolved
+    threads don't veto (they're already addressed).
     """
     HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
     PING_ID = "5042469465"
@@ -9758,8 +9769,8 @@ def test_round56_summary_clean_review_with_resolved_thread_rejected(monkeypatch,
         commit_oid=HEAD,
     )
     # RESOLVED Codex thread (not active, but anchored
-    # to the current head). The Round-54 fix would
-    # miss this; Round-56 catches it.
+    # to the same commit). Round-59 fix: resolved
+    # threads do NOT veto.
     resolved_thread = _r56_active_thread(
         is_resolved=True,
         is_outdated=False,
@@ -9771,14 +9782,12 @@ def test_round56_summary_clean_review_with_resolved_thread_rejected(monkeypatch,
         codex_issue_comments=[],
         active_threads=[resolved_thread],
     )
-    assert pkt.get("clean_pass_detected") is not True, (
-        "Round-56 fix: a summary-format review with a "
-        "RESOLVED Codex thread MUST NOT be a clean "
-        "pass. The Round-54 fix only checked active "
-        "threads; Round-56 extends to resolved threads "
-        "from the current head. Got "
-        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
-        f"status={pkt.get('status')!r}"
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 fix: a RESOLVED Codex thread (even on "
+        "the same commit) MUST NOT veto a clean "
+        "re-review. Resolved threads mean the finding "
+        "has been addressed. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
     )
 
 
@@ -9822,32 +9831,39 @@ def test_round56_summary_clean_review_with_outdated_thread_accepted(monkeypatch,
 
 
 def test_round56_source_contract_resolved_thread_veto():
-    """Source-contract: the summary-format review
-    detection MUST NOT require ``is_resolved=False``
-    on the Codex thread. The veto applies to any
-    current-head (non-outdated) Codex thread.
-    Static source check.
+    """Source-contract (updated for Round-59): the
+    summary-format veto MUST check
+    ``is_resolved=False``. The Round-56 fix required
+    ``is_resolved`` to NOT be in the veto (the veto
+    applied to any current-head thread regardless of
+    resolved state). Round-59 reverses this: the
+    veto MUST explicitly exclude resolved threads
+    (``not bool(t.get("is_resolved", False))`` in the
+    condition). Static source check.
     """
     import inspect
     from scripts.local import audit_codex_response_for_pr as mod
     src = inspect.getsource(mod)
-    # The Round-56 logic is in the formal-review
-    # clean-pass detection. The ``is_resolved=False``
-    # guard from Round-54 MUST be removed.
-    # Find the section that handles summary_format
-    # and verify ``is_resolved=False`` is NOT used
-    # in the veto condition.
+    # The Round-59 veto MUST include an explicit
+    # ``is_resolved`` check.
     summary_idx = src.find("is_summary_format and review_threads")
     assert summary_idx > 0
-    # Look forward from summary_idx to find the
-    # veto condition.
     veto_section = src[summary_idx:summary_idx + 3000]
-    assert "is_resolved" not in veto_section, (
-        "Round-56 fix: the summary-format veto MUST "
-        "NOT check ``is_resolved``. The veto applies "
-        "to any current-head (non-outdated) Codex "
-        "thread, regardless of resolved state. "
-        "Found 'is_resolved' in veto section."
+    # The veto MUST contain ``is_resolved``.
+    assert "is_resolved" in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "explicitly check ``is_resolved`` to exclude "
+        "resolved threads. Found no 'is_resolved' in "
+        "the veto section."
+    )
+    # And it MUST be in a ``not bool(...)`` guard
+    # (excluding resolved threads).
+    assert 'not bool(t.get("is_resolved"' in veto_section or \
+           'not t.get("is_resolved"' in veto_section or \
+           't.get("is_resolved", False)' in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "exclude resolved threads via a ``not is_resolved`` "
+        "check."
     )
 
 
@@ -9953,12 +9969,18 @@ def test_round57_clean_review_with_older_resolved_thread_accepted(monkeypatch, t
 
 
 def test_round57_clean_review_with_same_anchor_resolved_thread_rejected(monkeypatch, tmp_path):
-    """Round-57 invariant: a resolved thread anchored
-    to the SAME commit as the review being evaluated
-    STILL vetoes the clean pass. This is the Round-56
-    fix preserved — a thread opened by THIS specific
-    review on THIS specific commit is a finding
-    regardless of resolved state.
+    """Round-57 invariant (superseded by Round-59): a
+    resolved thread anchored to the SAME commit as
+    the review does NOT veto the clean pass. Round-59
+    changed this: resolved threads are excluded from
+    the veto regardless of commit anchor because the
+    finding has been addressed.
+
+    The Round-57 bug was about OLDER-commit resolved
+    threads vetoing clean re-reviews. Round-57 fixed
+    that with commit-anchor matching. Round-59 further
+    refined: even same-commit resolved threads don't
+    veto (they're already addressed).
     """
     HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
     PING_ID = "5042469465"
@@ -9974,8 +9996,8 @@ def test_round57_clean_review_with_same_anchor_resolved_thread_rejected(monkeypa
         commit_oid=HEAD,
     )
     # RESOLVED Codex thread anchored to the SAME
-    # commit as the review (this review's own inline
-    # finding that was resolved).
+    # commit. Round-59 fix: resolved threads don't
+    # veto regardless of anchor.
     resolved_same_thread = {
         "id": "T-1",
         "isResolved": True,
@@ -10001,10 +10023,11 @@ def test_round57_clean_review_with_same_anchor_resolved_thread_rejected(monkeypa
         codex_issue_comments=[],
         active_threads=[resolved_same_thread],
     )
-    assert pkt.get("clean_pass_detected") is not True, (
-        "Round-57 invariant: a resolved thread anchored "
-        "to the SAME commit as the review MUST still "
-        "veto the clean pass. Got "
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 invariant: a resolved thread "
+        "(even on the same commit) MUST NOT veto a "
+        "clean re-review. Resolved threads mean the "
+        "finding has been addressed. Got "
         f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
     )
 
@@ -10036,4 +10059,140 @@ def test_round57_source_contract_commit_anchor_match():
         "use ``extract_review_commit_oid`` to get the "
         "review's commit anchor. Found no reference in "
         "veto section."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-59 regression: stop resolved old threads from
+# vetoing clean reviews. When a previous Codex inline
+# finding on the same commit has already been resolved
+# and Codex later posts a summary-format clean
+# re-review without a new commit, the audit MUST
+# ignore the resolved thread and accept the clean
+# review.
+# ---------------------------------------------------------------------------
+
+
+def test_round59_clean_review_with_same_commit_resolved_thread_accepted(monkeypatch, tmp_path):
+    """Bug repro: a clean summary-format review with
+    a RESOLVED Codex thread on the SAME commit MUST
+    be detected as a clean pass. Resolved threads
+    mean the finding has been addressed.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # RESOLVED Codex thread on the SAME commit as
+    # the clean review.
+    resolved_same_thread = {
+        "id": "T-1",
+        "isResolved": True,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Resolved finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[resolved_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is True, (
+        "Round-59 fix: a RESOLVED Codex thread (even "
+        "on the same commit) MUST NOT veto a clean "
+        "re-review. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}, "
+        f"status={pkt.get('status')!r}"
+    )
+
+
+def test_round59_clean_review_with_active_thread_still_rejected(monkeypatch, tmp_path):
+    """Round-59 invariant: an ACTIVE (unresolved)
+    Codex thread on the same commit MUST still veto
+    the clean pass. The Round-59 fix only excludes
+    resolved threads, not active ones.
+    """
+    HEAD = "589c719ced339f49ac07f1ebd2082512a0204519"
+    PING_ID = "5042469465"
+    PING_CREATED = "2026-07-22T06:06:50Z"
+    clean_review = make_review(
+        author=CODEX_LOGIN,
+        state="COMMENTED",
+        body="\n### 💡 Codex Review\n\n"
+             "Here are some automated review suggestions.\n\n"
+             f"**Reviewed commit:** `{HEAD[:10]}`\n",
+        submitted_at="2026-07-22T06:14:56Z",
+        review_id=4751499126,
+        commit_oid=HEAD,
+    )
+    # ACTIVE Codex thread on the same commit.
+    active_same_thread = {
+        "id": "T-1",
+        "isResolved": False,
+        "isOutdated": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                {
+                    "databaseId": 1234,
+                    "url": "https://example.com",
+                    "body": "Active finding",
+                    "path": "scripts/local/x.py",
+                    "line": 10,
+                    "originalCommit": {"oid": HEAD},
+                    "author": {"login": "chatgpt-codex-connector"},
+                }
+            ],
+        },
+    }
+    pkt = _r52_classify_with_active_threads(
+        monkeypatch,
+        codex_review_submissions=[clean_review],
+        codex_issue_comments=[],
+        active_threads=[active_same_thread],
+    )
+    assert pkt.get("clean_pass_detected") is not True, (
+        "Round-59 invariant: an ACTIVE Codex thread "
+        "MUST still veto the clean pass. Got "
+        f"clean_pass_detected={pkt.get('clean_pass_detected')!r}"
+    )
+
+
+def test_round59_source_contract_resolved_excluded():
+    """Source-contract: the summary-format veto MUST
+    explicitly exclude resolved threads via
+    ``not bool(t.get("is_resolved", False))``.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    src = inspect.getsource(mod)
+    summary_idx = src.find("is_summary_format and review_threads")
+    assert summary_idx > 0
+    veto_section = src[summary_idx:summary_idx + 3000]
+    assert "is_resolved" in veto_section, (
+        "Round-59 fix: the summary-format veto MUST "
+        "explicitly check ``is_resolved``."
     )

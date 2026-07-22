@@ -1646,29 +1646,40 @@ def classify(
                 # from prior heads do not invalidate a
                 # current-head clean pass.
                 if is_summary_format and review_threads:
-                    # Round-54 + Round-56 + Round-57 fix:
-                    # veto summary-format reviews whenever
-                    # the associated Codex inline finding
-                    # exists AND is anchored to the SAME
-                    # commit as the review being evaluated.
+                    # Round-54 + Round-56 + Round-57 +
+                    # Round-59 fix: veto summary-format
+                    # reviews whenever the associated
+                    # Codex inline finding exists AND
+                    # is anchored to the SAME commit as
+                    # the review being evaluated AND is
+                    # NOT yet resolved.
                     # Round-54 originally only checked
-                    # active threads. Round-56 extended to
-                    # resolved threads but was too
+                    # active threads. Round-56 extended
+                    # to resolved threads but was too
                     # aggressive: a resolved thread from
-                    # an OLDER finding review on the same
-                    # head would veto a later CLEAN
+                    # an OLDER finding review on the
+                    # same head would veto a later CLEAN
                     # re-review, even though the later
-                    # review has no inline findings. The
-                    # correct check ties the thread to
-                    # the review via the commit anchor:
-                    # a thread vetoes a clean review
-                    # only when ``originalCommitSha ==
-                    # commit_id`` (i.e. the thread was
-                    # opened by THIS specific review on
-                    # THIS specific commit). Threads
-                    # from earlier finding reviews on
-                    # older commits do NOT veto later
-                    # clean re-reviews.
+                    # review has no inline findings.
+                    # Round-57 tied the thread to the
+                    # review's commit anchor.
+                    # Round-59 adds the final piece:
+                    # exclude resolved threads from the
+                    # veto. A resolved thread means the
+                    # finding HAS BEEN ADDRESSED, so it
+                    # doesn't invalidate a later clean
+                    # re-review on the same commit. The
+                    # audit's unresolved-thread gate
+                    # (section 8) already correctly
+                    # counts active threads only, so the
+                    # resolved-thread gate at the
+                    # review-classification level is
+                    # redundant.
+                    # Without the resolved-thread
+                    # exclusion, a clean re-review on
+                    # the same commit (no new push)
+                    # would be perpetually vetoed by
+                    # its own resolved finding.
                     # Outdated threads (explicitly
                     # marked as anchored to a prior head
                     # no longer reachable from the
@@ -1681,6 +1692,7 @@ def classify(
                         for t in review_threads:
                             if (
                                 not bool(t.get("is_outdated", False))
+                                and not bool(t.get("is_resolved", False))
                                 and t.get("author", "") in CODEX_BOT_LOGINS
                                 and (
                                     t.get("original_commit_sha", "")
@@ -1690,7 +1702,8 @@ def classify(
                                 has_same_anchor_thread = True
                                 break
                     if has_same_anchor_thread:
-                        # Summary review carries a
+                        # Summary review carries an
+                        # active (unresolved) inline
                         # finding on THIS commit. Skip
                         # it as a clean pass candidate.
                         continue
