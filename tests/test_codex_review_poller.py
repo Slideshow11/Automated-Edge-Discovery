@@ -928,3 +928,57 @@ def test_round63_finding2_source_contract_summary_scan():
         "classification must use any(_is_finding(line) "
         "for line in body.splitlines())."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-66 regression: treat body-level finding
+# badges as findings. A non-summary issue comment
+# that contains a clean fragment before a later
+# finding badge MUST be classified as FINDING, not
+# fall through to ``return None``.
+# ---------------------------------------------------------------------------
+
+
+def test_round66_poller_source_contract_body_level_finding():
+    """Source-contract: the poller's issue-comment
+    classification MUST use ``body_has_finding_badge``
+    in the finding branch (not just the summary
+    branch). Static source check.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    issue_idx = src.find('if kind == "issue_comment":')
+    assert issue_idx > 0
+    section = src[issue_idx:issue_idx + 5000]
+    # The finding branch MUST reference
+    # body_has_finding_badge.
+    assert "body_has_finding_badge" in section, (
+        "Round-66 fix: the poller must use "
+        "body_has_finding_badge to classify non-summary "
+        "bodies with finding badges as FINDING."
+    )
+
+
+def test_round66_poller_finding_branch_uses_body_level_check():
+    """Source-contract: the ``elif _is_finding(body)``
+    branch MUST also check ``body_has_finding_badge``.
+    This ensures a body that doesn't start with a
+    finding badge but contains one later is still
+    classified as FINDING.
+    """
+    import inspect
+    from scripts.local import codex_review_poller as mod
+    src = inspect.getsource(mod)
+    issue_idx = src.find('if kind == "issue_comment":')
+    assert issue_idx > 0
+    section = src[issue_idx:issue_idx + 5000]
+    # Find the ``elif _is_finding(body)`` branch.
+    finding_idx = section.find("elif _is_finding(body)")
+    assert finding_idx > 0
+    # The branch MUST include body_has_finding_badge.
+    branch_section = section[finding_idx:finding_idx + 500]
+    assert "body_has_finding_badge" in branch_section, (
+        "Round-66 fix: the elif _is_finding branch must "
+        "also check body_has_finding_badge."
+    )

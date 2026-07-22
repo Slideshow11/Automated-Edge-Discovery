@@ -409,7 +409,19 @@ def _match_response(
         # For issue comments, classify from the body directly.
         if _is_clean_pass(body) and not body_has_finding_badge:
             verdict = "CLEAN_PASS"
-        elif _is_finding(body):
+        elif _is_finding(body) or body_has_finding_badge:
+            # Round-66 fix: ``_is_finding(body)`` only
+            # checks whether the whole body starts with a
+            # finding badge. A non-summary body that
+            # contains a clean fragment before a later
+            # finding badge would fall through to
+            # ``return None`` instead of being
+            # classified as FINDING, causing the poller
+            # to miss a post-ping finding-bearing
+            # response and time out. Use the already-
+            # computed ``body_has_finding_badge`` (from
+            # the Round-65 pre-scan) to catch any body-
+            # level finding badge.
             verdict = "FINDING"
         elif _is_codex_review_summary(body):
             # Issue comment that looks like a review summary
