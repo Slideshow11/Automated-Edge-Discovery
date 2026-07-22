@@ -10557,3 +10557,110 @@ def test_round62_finding2_source_contract_pre_pass():
         "Round-62 fix: the pre-pass must appear BEFORE "
         "the formal-review clean-pass scan."
     )
+
+
+# ---------------------------------------------------------------------------
+# Round-64 regression: recognize clean summary issue
+# comments in the audit. The audit's
+# ``is_codex_clean_pass_comment`` MUST accept the
+# same fragments as the poller, or a clean response
+# that uses the newer summary format (e.g. "No
+# findings reported") will be incorrectly classified
+# as a newer finding.
+# ---------------------------------------------------------------------------
+
+
+def test_round64_clean_pass_phrase_no_findings_reported():
+    """Round-64: a body containing "No findings reported"
+    MUST be classified as a clean pass by
+    ``is_codex_clean_pass_comment``.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No findings reported.\n"
+    )
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 fix: a summary body with 'No findings "
+        "reported' MUST be classified as a clean pass. "
+        "The audit and poller MUST agree on what counts "
+        "as clean."
+    )
+
+
+def test_round64_clean_pass_phrase_no_issues_found():
+    """Round-64: a body containing "No issues found" MUST
+    be classified as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "No issues found.\n"
+    )
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 fix: a body with 'No issues found' "
+        "MUST be classified as a clean pass."
+    )
+
+
+def test_round64_clean_pass_phrase_legacy_exact_still_works():
+    """Round-64 invariant: the legacy exact phrase MUST
+    still be recognized as a clean pass.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = "Codex Review: Didn't find any major issues. :tada:"
+    assert is_codex_clean_pass_comment(body), (
+        "Round-64 invariant: the legacy exact phrase "
+        "MUST still be recognized as a clean pass."
+    )
+
+
+def test_round64_summary_with_finding_badge_not_clean():
+    """Round-64 invariant: a summary body that includes
+    a finding badge MUST NOT be classified as a clean
+    pass (the finding makes it a finding review).
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        is_codex_clean_pass_comment,
+    )
+    body = (
+        "### 💡 Codex Review\n\n"
+        "**Reviewed commit:** `589c719ced`\n\n"
+        "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**\n"
+    )
+    assert not is_codex_clean_pass_comment(body), (
+        "Round-64 invariant: a summary body with a "
+        "finding badge MUST NOT be classified as clean."
+    )
+
+
+def test_round64_source_contract_extra_fragments():
+    """Source-contract: the audit MUST define
+    ``CODEX_CLEAN_PASS_EXTRA_FRAGMENTS`` and
+    ``is_codex_clean_pass_comment`` MUST consult it.
+    Static source check.
+    """
+    import inspect
+    from scripts.local import audit_codex_response_for_pr as mod
+    assert hasattr(mod, "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS"), (
+        "Round-64 fix: audit must define "
+        "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS."
+    )
+    src = inspect.getsource(mod.is_codex_clean_pass_comment)
+    assert "CODEX_CLEAN_PASS_EXTRA_FRAGMENTS" in src, (
+        "Round-64 fix: is_codex_clean_pass_comment "
+        "MUST consult CODEX_CLEAN_PASS_EXTRA_FRAGMENTS."
+    )
+    # Must also accept summary format.
+    assert "is_codex_review_summary" in src, (
+        "Round-64 fix: is_codex_clean_pass_comment "
+        "MUST accept summary-format bodies as clean."
+    )

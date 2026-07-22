@@ -190,6 +190,23 @@ CODEX_CLEAN_PASS_PHRASE = "Codex Review: Didn\u2019t find any major issues"
 CODEX_CLEAN_PASS_PHRASE_ALT = "Codex Review: Didn't find any major issues"
 CODEX_CLEAN_PASS_PHRASES = (CODEX_CLEAN_PASS_PHRASE, CODEX_CLEAN_PASS_PHRASE_ALT)
 
+# Round-64: additional clean-pass fragments accepted by the
+# poller (``scripts/local/codex_review_poller.py``). The audit
+# MUST accept the same fragments as the poller, or a clean
+# response that uses the newer summary format (e.g. "No
+# findings reported") will be incorrectly classified as a
+# newer finding and downgrade a valid clean pass to
+# HOLD_NEW_CODEX_THREAD. This mirrors the poller's
+# ``CLEAN_PASS_FRAGMENTS`` vocabulary.
+CODEX_CLEAN_PASS_EXTRA_FRAGMENTS = (
+    "no findings reported",
+    "no issues found",
+    "all clear",
+    "looks good to me",
+    "no blocking findings",
+    "no major issues",
+)
+
 # Round-52: Codex's newer formal-review summaries start with
 # the ``### 💡 Codex Review`` Markdown header. A review with
 # this prefix and NO inline review comments is a clean
@@ -786,10 +803,41 @@ def parse_iso_utc(s: str) -> Optional[datetime]:
 
 
 def is_codex_clean_pass_comment(body: str) -> bool:
-    """Return True if the body contains the Codex clean-pass phrase."""
+    """Return True if the body contains the Codex clean-pass phrase.
+
+    Round-64: also accept the summary-format clean pass and
+    the additional clean-pass fragments accepted by the
+    poller (``scripts/local/codex_review_poller.py``). Without
+    this, a clean response that uses the newer summary
+    format (e.g. "No findings reported") would be
+    incorrectly classified as a newer finding by the
+    audit's post-clean-pass scan, downgrading a valid
+    clean pass to HOLD_NEW_CODEX_THREAD. The audit and
+    the poller MUST agree on what counts as clean.
+    """
     if not body:
         return False
-    return any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES)
+    # Round-52: summary-format reviews are clean passes
+    # when they have no inline-finding markers in the
+    # body. The audit already recognizes this for
+    # formal reviews; issue comments that look like
+    # summary reviews (e.g. an echoed review posted
+    # as a PR-level issue comment) are also clean
+    # passes when the body is free of finding
+    # markers.
+    if is_codex_review_summary(body) and not any(
+        is_codex_finding_body(line) for line in body.splitlines()
+    ):
+        return True
+    # Legacy exact phrase check.
+    if any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES):
+        return True
+    # Round-64: additional clean-pass fragments
+    # mirroring the poller's vocabulary.
+    lower = body.lower()
+    if any(frag in lower for frag in CODEX_CLEAN_PASS_EXTRA_FRAGMENTS):
+        return True
+    return False
 
 
 def normalize_merge_state(value: Any) -> Optional[str]:
