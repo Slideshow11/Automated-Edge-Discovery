@@ -616,30 +616,88 @@ def gh_graphql_review_threads(
             .get("reviewThreads", {})
             .get("nodes", [])
         )
-        # Flatten: keep thread metadata + each comment's databaseId/url/author.
-        threads: list[dict[str, Any]] = []
-        for node in nodes:
-            thread_id = node.get("id", "")
-            is_resolved = node.get("isResolved", False)
-            is_outdated = node.get("isOutdated", False)
-            for comment in (node.get("comments", {}) or {}).get("nodes", []):
-                author_login = (
-                    (comment.get("author") or {}).get("login", "")
-                    if comment.get("author") else ""
-                )
-                threads.append({
-                    "thread_id": thread_id,
-                    "is_resolved": is_resolved,
-                    "is_outdated": is_outdated,
-                    "database_id": comment.get("databaseId"),
-                    "url": comment.get("url") or "",
-                    "author_login": author_login,
-                })
-        return True, threads, ""
-    except (json.JSONDecodeError, KeyError) as exc:
-        return False, [], f"invalid GraphQL response: {exc}"
+    except (json.JSONDecodeError, OSError) as exc:
+        return False, [], f"gh graphql decode failed: {exc}"
+
+    # Flatten: keep thread metadata + each comment's databaseId/url/author.
+    threads: list[dict[str, Any]] = []
+    for node in nodes:
+        thread_id = node.get("id", "")
+        is_resolved = node.get("isResolved", False)
+        is_outdated = node.get("isOutdated", False)
+        for comment in (node.get("comments", {}) or {}).get("nodes", []):
+            author_login = (
+                (comment.get("author") or {}).get("login", "")
+                if comment.get("author") else ""
+            )
+            threads.append({
+                "thread_id": thread_id,
+                "is_resolved": is_resolved,
+                "is_outdated": is_outdated,
+                "database_id": comment.get("databaseId"),
+                "url": comment.get("url") or "",
+                "author_login": author_login,
+            })
+    return True, threads, ""
 
 
+def paginated_review_threads(
+    repo: str, pr_number: int
+) -> tuple[bool, list[dict[str, Any]], str]:
+    """PHASE 2 (PR #412): production paginated review-thread
+    inventory via the SHARED paginator.
+
+    Continues until ``hasNextPage=false`` and fails closed on
+    pagination errors or safety-cap exhaustion. The first page
+    is never treated as the complete inventory.
+
+    Returns (success, threads_list, error_msg) in the same
+    shape as :func:`gh_graphql_review_threads`.
+    """
+    owner, name = repo.split("/", 1)
+    try:
+        from scripts.local._shared_pagination import (
+            paginate_review_threads as _shared_paginate,
+        )
+        result = _shared_paginate(
+            owner=owner,
+            name=name,
+            pr_number=pr_number,
+        )
+    except Exception as exc:
+        return False, [], f"shared_pagination_failed: {exc}"
+    if not result.get("complete"):
+        if result.get("capped"):
+            return False, [], (
+                f"review_thread_inventory_capped: "
+                f"pages={result.get('pages')}"
+            )
+        if result.get("error"):
+            return False, [], (
+                f"review_thread_pagination_failed: "
+                f"{result.get('error')}"
+            )
+        return False, [], "review_thread_inventory_incomplete"
+    nodes = result.get("nodes", []) or []
+    threads: list[dict[str, Any]] = []
+    for node in nodes:
+        thread_id = node.get("id", "")
+        is_resolved = node.get("isResolved", False)
+        is_outdated = node.get("isOutdated", False)
+        for comment in (node.get("comments", {}) or {}).get("nodes", []):
+            author_login = (
+                (comment.get("author") or {}).get("login", "")
+                if comment.get("author") else ""
+            )
+            threads.append({
+                "thread_id": thread_id,
+                "is_resolved": is_resolved,
+                "is_outdated": is_outdated,
+                "database_id": comment.get("databaseId"),
+                "url": comment.get("url") or "",
+                "author_login": author_login,
+            })
+    return True, threads, ""
 # --------------------------------------------------------------------------
 # GitHub REST API helpers (list-argv, no shell=True)
 # --------------------------------------------------------------------------

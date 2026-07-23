@@ -249,7 +249,15 @@ def is_codex_review_summary(body: str) -> bool:
     A review with this prefix carries inline review
     comments for the actual findings; the summary body
     itself is not a finding.
+
+    PHASE 3 (PR #412): delegates to the shared module so
+    the audit, poller, gate, and controller share one
+    canonical predicate.
     """
+    if _shared_is_summary is not None:
+        return _shared_is_summary(body)
+    # Fail-closed default if the shared module could not be
+    # imported at startup.
     if not body:
         return False
     return body.lstrip().startswith(CODEX_REVIEW_SUMMARY_PREFIX)
@@ -260,7 +268,11 @@ def is_codex_finding_body(body: str) -> bool:
     inline review comment carrying a finding badge
     (Round-52). Used to classify the summary-format
     review body's inline comments.
+
+    PHASE 3 (PR #412): delegates to the shared module.
     """
+    if _shared_is_finding is not None:
+        return _shared_is_finding(body)
     if not body:
         return False
     return body.lstrip().startswith(CODEX_FINDING_BADGE_PREFIX)
@@ -844,34 +856,27 @@ def is_codex_clean_pass_comment(body: str) -> bool:
     emit ``is_clean_pass=True`` for a response that
     actually carries a finding. The same rule applies to
     any body that contains a finding badge line.
+
+    PHASE 3 (PR #412): delegates to the shared module so
+    the audit, poller, gate, and controller share one
+    canonical predicate. The shared module already
+    enforces the Round-64/65 invariants.
     """
+    if _shared_is_clean is not None:
+        return _shared_is_clean(body)
+    # Fail-closed default if the shared module could not be
+    # imported at startup.
     if not body:
         return False
-    # Round-65 fix: if the body contains a finding
-    # badge line, it is NEVER a clean pass, regardless
-    # of any clean fragments also present. This is the
-    # fail-closed default: a finding badge in the body
-    # always wins over a clean fragment.
     if any(
         is_codex_finding_body(line)
         for line in body.splitlines()
     ):
         return False
-    # Round-52: summary-format reviews are clean passes
-    # when they have no inline-finding markers in the
-    # body. The audit already recognizes this for
-    # formal reviews; issue comments that look like
-    # summary reviews (e.g. an echoed review posted
-    # as a PR-level issue comment) are also clean
-    # passes when the body is free of finding
-    # markers.
     if is_codex_review_summary(body):
         return True
-    # Legacy exact phrase check.
     if any(phrase in body for phrase in CODEX_CLEAN_PASS_PHRASES):
         return True
-    # Round-64: additional clean-pass fragments
-    # mirroring the poller's vocabulary.
     lower = body.lower()
     if any(frag in lower for frag in CODEX_CLEAN_PASS_EXTRA_FRAGMENTS):
         return True
