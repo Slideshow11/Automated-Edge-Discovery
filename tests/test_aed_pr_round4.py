@@ -507,9 +507,16 @@ class TestRound5FollowUpAncestryVerifier:
         assert reason == "ancestry_unavailable"
 
     def test_verified_ancestry_cannot_override_failed_safety(self):
-        """Even with verified ancestry, an outdated-required or
-        actor-required failure still blocks the thread."""
-        # ``is_outdated=False`` -> reason "not_outdated".
+        """Even with verified ancestry, a non-Codex actor or
+        missing anchor still blocks the thread.
+
+        PHASE 3 R-3 (PR #412): ``is_outdated=False`` is no
+        longer a blocker on its own. The new policy rejects
+        only when a HARD SAFETY condition fails. The
+        legacy ``not_outdated`` reason is removed.
+        """
+        # ``is_outdated=False`` with all other evidence
+        # proven -> ELIGIBLE (no ``not_outdated`` rejection).
         thread = _bot_thread(anchor=OTHER_HEAD, is_outdated=False)
         ancestry_runner = lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
@@ -518,8 +525,22 @@ class TestRound5FollowUpAncestryVerifier:
             thread,
             **_eligibility_kwargs(ancestry_runner=ancestry_runner),
         )
+        assert ok is True
+        assert reason == "eligible"
+
+        # Non-Codex top-level actor -> ``actor_not_codex``
+        # despite verified ancestry and ``is_outdated=False``.
+        thread = _bot_thread(
+            anchor=OTHER_HEAD,
+            is_outdated=False,
+            author="dependabot[bot]",
+        )
+        ok, reason = R.is_eligible_for_bot_resolution(
+            thread,
+            **_eligibility_kwargs(ancestry_runner=ancestry_runner),
+        )
         assert ok is False
-        assert reason == "not_outdated"
+        assert reason == "actor_not_codex"
 
 
 # ---------------------------------------------------------------------------

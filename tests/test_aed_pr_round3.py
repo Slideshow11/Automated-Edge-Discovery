@@ -702,10 +702,17 @@ class TestF4Eligibility:
         assert ok is True and reason == "eligible"
 
     def test_current_bot_thread_rejected(self):
+        # PHASE 3 R-3 (PR #412): the outdated-only rule is
+        # REMOVED. A current (non-outdated) Codex thread IS
+        # eligible when all repair, ancestry, clean-review,
+        # participant, and live-head evidence is proven.
+        # The new policy therefore accepts this thread
+        # when ``is_outdated=False`` but every other
+        # condition passes.
         ok, reason = R.is_eligible_for_bot_resolution(
             _bot_thread(is_outdated=False), **_eligibility_kwargs()
         )
-        assert ok is False and reason == "not_outdated"
+        assert ok is True and reason == "eligible"
 
     def test_human_reply_rejected(self):
         thread = _bot_thread(comments=[

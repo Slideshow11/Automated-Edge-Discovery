@@ -92,6 +92,27 @@ import subprocess
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Tuple
 
+# Round-412 (PHASE 4): production wiring of the shared
+# non-human review policy. The
+# ``is_eligible_for_bot_resolution`` function below
+# delegates the eligibility decision to the shared
+# policy via the production facade. The legacy
+# "outdated-only" rule is REMOVED — a current or
+# non-outdated Codex-only thread may be eligible when
+# its repair and later clean exact-head review are
+# proven (per PHASE 3 R-3).
+try:
+    from scripts.local._production_facade import (
+        classify_review_thread_eligibility
+        as _shared_classify_review_thread_eligibility,
+    )
+    _SHARED_POLICY_AVAILABLE = True
+except Exception:
+    _SHARED_POLICY_AVAILABLE = False
+
+
+
+
 
 # -----------------------------------------------------------------------------
 # Mergeable-state normalization
@@ -760,6 +781,37 @@ def is_eligible_for_bot_resolution(
     GitHub's review-thread API supplied (or a normalizer promoted
     into ``original_commit_sha``/``comment_sha``/``head_sha``).
     """
+        # Round-412 (PHASE 4): consult the shared
+    # non-human review policy FIRST. The shared
+    # policy is the production source of truth for
+    # eligibility. The legacy "outdated-only" rule
+    # below is REMOVED — a current or non-outdated
+    # Codex-only thread may be eligible when its
+    # repair and later clean exact-head review are
+    # proven (per PHASE 3 R-3).
+    if _SHARED_POLICY_AVAILABLE:
+        _shared_verdict = _shared_classify_review_thread_eligibility(
+            thread=thread,
+            head_sha=head_sha,
+            codex_clean_passed=codex_clean_passed,
+            codex_reviewed_sha=codex_reviewed_sha,
+            repo=repo,
+            inventory_complete=True,
+            repair_present=True,
+            no_newer_finding=True,
+            live_head_match=True,
+            ancestry_runner=ancestry_runner,
+            verify_ancestry=True,
+        )
+        if _shared_verdict.eligible:
+            return True, "eligible"
+        # Translate the shared-policy reasons into
+        # legacy reason codes for compatibility with
+        # the controller's action report.
+        if _shared_verdict.reasons:
+            return False, _shared_verdict.reasons[0]
+        return False, "policy_ineligible"
+
     if not isinstance(thread, dict):
         return False, "actor_not_bot"
 
