@@ -521,6 +521,199 @@ class SourceContractTests(unittest.TestCase):
             "classifier.",
         )
 
+    def test_planner_has_script_local_path_setup(self):
+        """PHASE 6 (Finding 1): planner CLI MUST add the repo
+        root to ``sys.path`` before importing scripts.local
+        packages."""
+        from scripts.local import aed_repair_planner as planner
+        import inspect
+        src = inspect.getsource(planner)
+        self.assertIn(
+            "sys.path.insert",
+            src,
+            "PHASE 6: planner must add repo root to sys.path.",
+        )
+        self.assertIn(
+            "_REPO_ROOT",
+            src,
+            "PHASE 6: planner must define _REPO_ROOT.",
+        )
+
+    def test_runner_has_script_local_path_setup(self):
+        """PHASE 6 (Finding 1): runner CLI MUST add the repo
+        root to ``sys.path``."""
+        from scripts.local import aed_test_runner as runner
+        import inspect
+        src = inspect.getsource(runner)
+        self.assertIn(
+            "sys.path.insert",
+            src,
+            "PHASE 6: runner must add repo root to sys.path.",
+        )
+        self.assertIn(
+            "_REPO_ROOT",
+            src,
+            "PHASE 6: runner must define _REPO_ROOT.",
+        )
+
+    def test_aed_pr_readiness_has_script_local_path_setup(self):
+        """PHASE 4 (Finding 2): aed_pr_readiness MUST add the
+        repo root to ``sys.path`` so the shared policy
+        import works in script-local controller mode."""
+        from scripts.local import aed_pr_readiness as R
+        import inspect
+        src = inspect.getsource(R)
+        self.assertIn(
+            "sys.path.insert",
+            src,
+            "PHASE 4: aed_pr_readiness must add repo root to sys.path.",
+        )
+
+    def test_paginate_review_threads_fails_closed_on_nested(self):
+        """PHASE 2 (Finding 3): the shared paginator MUST
+        fail closed when any thread's nested ``comments``
+        connection has ``hasNextPage=true``."""
+        from scripts.local import _shared_pagination as pg
+        # Scoped token injection: set the env var for this
+        # test only and restore it on teardown so other
+        # tests in the same process are not affected.
+        import os as _os
+        _old_token = _os.environ.get("AED_SHARED_GITHUB_TOKEN")
+        _os.environ["AED_SHARED_GITHUB_TOKEN"] = "test-token"
+
+        # Simulate one page with hasNextPage=true on outer
+        # reviewThreads but a nested comments pageInfo that
+        # also has hasNextPage=true.
+        fake_response = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "pageInfo": {
+                                "hasNextPage": False,
+                                "endCursor": None,
+                            },
+                            "nodes": [
+                                {
+                                    "id": "T-1",
+                                    "isResolved": False,
+                                    "isOutdated": False,
+                                    "comments": {
+                                        "pageInfo": {
+                                            "hasNextPage": True,
+                                            "endCursor": "more",
+                                        },
+                                        "nodes": [
+                                            {
+                                                "databaseId": 1,
+                                                "url": "x",
+                                                "body": "b",
+                                                "path": "p",
+                                                "line": 1,
+                                                "originalCommit": {"oid": "abc"},
+                                                "author": {"login": "a"},
+                                            }
+                                        ],
+                                    },
+                                }
+                            ],
+                        }
+                    }
+                }
+            }
+        }
+        import urllib.request as ur
+        import json as _json
+        class FakeResp:
+            def read(self):
+                return _json.dumps(fake_response).encode()
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                pass
+        original = ur.urlopen
+        ur.urlopen = lambda *a, **kw: FakeResp()
+        try:
+            result = pg.paginate_review_threads(
+                "owner", "repo", 1,
+            )
+            self.assertFalse(
+                result["complete"],
+                "must fail closed when nested comments are "
+                "incomplete: " + repr(result),
+            )
+            self.assertEqual(
+                result.get("error"),
+                "nested_comments_not_paginated",
+            )
+            self.assertIn("T-1", result.get(
+                "incomplete_nested_thread_ids", []
+            ))
+        finally:
+            ur.urlopen = original
+            # Restore the env var to its previous value to
+            # avoid leaking into other tests in the same
+            # process.
+            if _old_token is None:
+                _os.environ.pop("AED_SHARED_GITHUB_TOKEN", None)
+            else:
+                _os.environ["AED_SHARED_GITHUB_TOKEN"] = _old_token
+
+    def test_test_selection_suites_point_to_existing_files(self):
+        """PHASE 6 (Finding 4): the focused suites MUST
+        reference only test files that exist in tests/."""
+        import os
+        from scripts.local import _shared_test_selection as ts
+        for component, tests in ts.TIER_2_SUITES.items():
+            if tests == ["FULL_REPOSITORY_SUITE"]:
+                continue
+            for test_file in tests:
+                path = os.path.join(
+                    "/home/max/aed_hardening_v1", test_file,
+                )
+                self.assertTrue(
+                    os.path.exists(path),
+                    f"{component} suite references nonexistent "
+                    f"file: {test_file}",
+                )
+
+    def test_facade_log_path_handles_bare_filename(self):
+        """PHASE 6 (Finding 5): ``run_selected_tests`` MUST
+        handle bare-filename ``log_path`` values without
+        raising ``os.makedirs("")``."""
+        import os, tempfile, json
+        from scripts.local import _production_facade as F
+        from scripts.local._shared_test_selection import (
+            ValidationTier, select_tests,
+        )
+        # Create a plan that requires full validation.
+        plan = select_tests(
+            changed_paths=["scripts/local/x.py"],
+            tier=ValidationTier.TIER_2_COHESIVE_BATCH,
+            final_candidate=False,
+        )
+        # Use a bare filename in the current working directory.
+        log_file = "test_bare_log.json"
+        try:
+            # Use a tiny pytest_args that will fail fast but
+            # we only care that the log file is written.
+            result = F.run_selected_tests(
+                plan=plan,
+                pytest_args=["--co"],  # collect-only, fast
+                cwd="/home/max/aed_hardening_v1",
+                log_path=log_file,
+            )
+            # The log file MUST exist (proves bare-filename
+            # handling works).
+            self.assertTrue(
+                os.path.exists(log_file),
+                "bare-filename log path not written: "
+                f"{result.get('error')}",
+            )
+        finally:
+            if os.path.exists(log_file):
+                os.unlink(log_file)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

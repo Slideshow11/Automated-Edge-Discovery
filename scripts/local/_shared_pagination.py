@@ -193,8 +193,19 @@ def paginate_review_threads(
     page_size: int = DEFAULT_PAGE_SIZE,
     safety_cap: int = DEFAULT_SAFETY_CAP,
 ) -> Dict[str, Any]:
-    """Complete paginated review-thread inventory."""
-    return paginate_graphql_connection(
+    """Complete paginated review-thread inventory.
+
+    Round-412 (PHASE 2): the outer ``reviewThreads``
+    connection is paginated until ``hasNextPage=false``.
+    In addition, EVERY thread's nested ``comments``
+    connection must be paginated too. If any thread's
+    nested ``comments.pageInfo.hasNextPage=true`` is
+    detected, the helper fails closed with
+    ``error="nested_comments_not_paginated"`` and
+    ``complete=False``. The first page of comments per
+    thread is NEVER treated as the complete inventory.
+    """
+    result = paginate_graphql_connection(
         owner=owner,
         name=name,
         pr_number=pr_number,
@@ -203,6 +214,33 @@ def paginate_review_threads(
         page_size=page_size,
         safety_cap=safety_cap,
     )
+    # Fail closed on nested-comment pagination: if any
+    # thread's ``comments.pageInfo.hasNextPage`` is True,
+    # the inventory is incomplete regardless of the outer
+    # reviewThreads completion state.
+    nodes = result.get("nodes", []) or []
+    incomplete_thread_ids: List[str] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        comments_field = node.get("comments")
+        if not isinstance(comments_field, dict):
+            continue
+        page_info = comments_field.get("pageInfo") or {}
+        if page_info.get("hasNextPage"):
+            tid = node.get("id")
+            if tid is not None:
+                incomplete_thread_ids.append(tid)
+    if incomplete_thread_ids:
+        return {
+            "nodes": nodes,
+            "complete": False,
+            "pages": result.get("pages"),
+            "capped": result.get("capped"),
+            "error": "nested_comments_not_paginated",
+            "incomplete_nested_thread_ids": incomplete_thread_ids,
+        }
+    return result
 
 
 _ISSUE_COMMENTS_QUERY = """

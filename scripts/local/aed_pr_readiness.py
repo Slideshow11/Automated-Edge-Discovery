@@ -89,8 +89,20 @@ owns the I/O. The module is pure-Python and stdlib-only.
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass, field, asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+# Round-412 (PHASE 4): script-local path setup.
+# When this module is imported via the documented
+# ``python3 scripts/local/aed_pr.py ...`` invocation,
+# Python places ``scripts/local`` on ``sys.path`` but
+# not the repository root. Add the repo root so the
+# ``scripts.local`` package imports below succeed.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # Round-412 (PHASE 4): production wiring of the shared
 # non-human review policy. The

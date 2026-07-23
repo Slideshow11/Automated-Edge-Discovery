@@ -102,18 +102,16 @@ _COMPONENT_MANIFEST: List[tuple] = [
 
 
 # Tier-2 focused suites (by component).
+# Round-412 (PHASE 6): list only test files that
+# actually exist in this repository. Test files
+# referenced here MUST be present in ``tests/`` or the
+# tier-2 run will fail with "file not found".
 TIER_2_SUITES: Dict[Component, List[str]] = {
     Component.AUTOCODER: [
         "tests/test_autocoder_run_controller.py",
         "tests/test_aed_continue_pr.py",
         "tests/test_aed_tasker_packet.py",
-        "tests/test_apply_temp_worktree_patch_to_branch.py",
-        "tests/test_bounded_command_runner.py",
-        "tests/test_shared_codex_classifier.py",
-        "tests/test_shared_pagination.py",
-        "tests/test_shared_non_human_policy.py",
-        "tests/test_shared_batching.py",
-        "tests/test_shared_test_selection.py",
+        "tests/test_shared_hardening_modules.py",
     ],
     Component.AED: [
         "tests/test_aed_pr.py",
@@ -128,11 +126,7 @@ TIER_2_SUITES: Dict[Component, List[str]] = {
         "tests/test_codex_review_poller.py",
         "tests/test_merge_pr_safely.py",
         "tests/test_phase_ledger_unit.py",
-        "tests/test_shared_codex_classifier.py",
-        "tests/test_shared_pagination.py",
-        "tests/test_shared_non_human_policy.py",
-        "tests/test_shared_batching.py",
-        "tests/test_shared_test_selection.py",
+        "tests/test_shared_hardening_modules.py",
     ],
     Component.SHARED: ["FULL_REPOSITORY_SUITE"],
     Component.UNKNOWN: ["FULL_REPOSITORY_SUITE"],

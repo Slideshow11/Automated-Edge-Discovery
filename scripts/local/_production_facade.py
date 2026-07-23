@@ -404,7 +404,12 @@ def run_selected_tests(
     }
     if log_path:
         try:
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            # Round-412 (PHASE 6): guard against bare
+            # filenames (where ``os.path.dirname`` is the
+            # empty string and ``os.makedirs("")`` raises).
+            _dir = os.path.dirname(log_path)
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
             with open(log_path, "w") as f:
                 json.dump(result, f, indent=2)
         except Exception:

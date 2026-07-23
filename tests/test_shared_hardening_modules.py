@@ -20,16 +20,19 @@ if SCRIPTS not in sys.path:
 
 class PaginationTests(unittest.TestCase):
     def setUp(self):
-        """Skip live tests when no GitHub token is available."""
+        """Skip live tests unless an explicit token is set."""
         import os
-        self._has_token = bool(os.environ.get("AED_SHARED_GITHUB_TOKEN"))
-        if not self._has_token:
-            import subprocess
-            try:
-                subprocess.check_output(["gh", "auth", "token"], text=True, timeout=10)
-                self._has_token = True
-            except Exception:
-                self._has_token = False
+        # Only run live API tests when AED_SHARED_GITHUB_TOKEN
+        # is explicitly set in the test environment. This
+        # prevents 401 errors when ``gh auth token`` returns
+        # a placeholder or stale token during batch test runs.
+        self._has_token = bool(
+            os.environ.get("AED_SHARED_GITHUB_TOKEN")
+        )
+        # Allow opting in via a sentinel env var for live
+        # integration tests against the real repo.
+        if os.environ.get("AED_SHARED_LIVE_INTEGRATION") == "1":
+            self._has_token = True
 
     def _require_live(self):
         if not self._has_token:

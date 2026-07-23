@@ -27,7 +27,17 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+# Round-412 (PHASE 6): script-local import path setup.
+# When this CLI is run as ``python3 scripts/local/aed_test_runner.py``
+# Python puts ``scripts/local`` rather than the repository root
+# on ``sys.path``. Add the repo root so the ``scripts.local``
+# package is importable without setting PYTHONPATH externally.
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 from scripts.local._production_facade import (
     select_tests_with_invocation,
