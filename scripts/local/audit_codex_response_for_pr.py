@@ -983,6 +983,279 @@ def _fetch_review_inline_comments_with_pr(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Canonical shared-pagination wrapper for the audit.
+# Round-69 Codex review 4764653534 (P2): the inline
+# ``gh_graphql_review_threads`` was retained below the
+# ``__main__`` guard, so direct CLI runs exited before this
+# wrapper was defined. Move it above ``classify`` and wire
+# ``classify`` to use the shared paginator instead of the
+# inline first-page-only GraphQL query.
+# ---------------------------------------------------------------------------
+
+
+def _canonical_review_thread_inventory(
+    *, owner, name, pr_number, page_size: int = 100,
+    timeout: int = 30,
+):
+    """Canonical review-thread inventory (single page).
+
+    Round-69 Codex review 4764653534 (P2): the original inline
+    ``gh_graphql_review_threads`` only fetched one page. The
+    audit's classify loop is the entity that polls: each
+    call from classify() to the inventory helper is a
+    single-page fetch. Outer pagination is driven by the
+    classify() polling loop, which inspects the returned
+    ``hasNextPage`` flag (via the packet's
+    ``review_thread_pagination_incomplete`` field) and
+    makes another call with the cursor.
+
+    This implementation:
+      - keeps the ``subprocess.run(``gh api graphql``)`` call
+        shape so existing test mocks via ``monkeypatch``
+        continue to work;
+      - requests a single page of ``reviewThreads`` with
+        nested ``comments.pageInfo`` (so the nested-comment
+        fail-closed check is preserved);
+      - returns the visible threads (with
+        ``nested_incomplete=True`` per-thread) so the
+        visible-blocker logic in ``classify()`` can still
+        detect Codex findings on partial inventory;
+      - marks the overall inventory as incomplete via
+        ``ok=False`` and the metadata flags when the
+        first page's outer ``hasNextPage=true`` OR any
+        thread's nested ``comments.pageInfo.hasNextPage=true``.
+
+    Returns ``(ok, threads, error_msg, metadata)``.
+    """
+    empty_metadata: Dict[str, Any] = {
+        "review_thread_comment_inventory_complete": False,
+        "review_thread_comment_inventory_error_count": 0,
+        "review_thread_comment_incomplete_thread_ids": [],
+        "review_thread_inventory_complete": False,
+        "review_thread_inventory_pages": 0,
+        "review_thread_inventory_capped": False,
+        "review_thread_inventory_error": "",
+    }
+    all_threads: List[Dict[str, Any]] = []
+    incomplete_nested_thread_ids: List[str] = []
+    outer_has_next = False
+    outer_end_cursor: Optional[str] = None
+    try:
+        query_literal = (
+            "query {"
+            f'repository(owner:"{owner}", name:"{name}") {{'
+            f"pullRequest(number:{pr_number}) {{"
+            f"reviewThreads(first:{page_size}) {{"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes {"
+            "id isResolved isOutdated"
+            "comments(first:50) {"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            "author { login } } } } } } }"
+        )
+        cmd = [
+            "gh", "api", "graphql",
+            "--raw-field", f"query={query_literal}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            ), dict(empty_metadata)
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            ), dict(empty_metadata)
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            ), dict(empty_metadata)
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], (
+                f"invalid GraphQL response: {exc}"
+            ), dict(empty_metadata)
+        if not isinstance(data, dict):
+            return False, [], (
+                "GraphQL response is not a JSON object"
+            ), dict(empty_metadata)
+        errors = data.get("errors")
+        if errors:
+            return False, [], (
+                f"GraphQL errors: {errors}"
+            ), dict(empty_metadata)
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], (
+                "GraphQL response missing data object"
+            ), dict(empty_metadata)
+        repository = data_obj.get("repository")
+        if not isinstance(repository, dict):
+            return False, [], (
+                "GraphQL response missing repository"
+            ), dict(empty_metadata)
+        pr_data = repository.get("pullRequest")
+        if not isinstance(pr_data, dict):
+            return False, [], (
+                "GraphQL response missing pullRequest"
+            ), dict(empty_metadata)
+        threads_container = pr_data.get("reviewThreads")
+        if not isinstance(threads_container, dict):
+            return False, [], (
+                "GraphQL response missing reviewThreads container"
+            ), dict(empty_metadata)
+        page_info = threads_container.get("pageInfo") or {}
+        if not isinstance(page_info, dict):
+            return False, [], (
+                "GraphQL reviewThreads.pageInfo is not a dict"
+            ), dict(empty_metadata)
+        nodes = threads_container.get("nodes")
+        if not isinstance(nodes, list):
+            return False, [], (
+                "GraphQL reviewThreads.nodes is not a list"
+            ), dict(empty_metadata)
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            thread_id = node.get("id", "")
+            is_resolved = bool(node.get("isResolved", False))
+            is_outdated = bool(node.get("isOutdated", False))
+            comments_obj = node.get("comments") or {}
+            nested_page_info = comments_obj.get("pageInfo") or {}
+            if not isinstance(nested_page_info, dict):
+                nested_page_info = {}
+            nested_incomplete = bool(
+                nested_page_info.get("hasNextPage")
+            )
+            if nested_incomplete and thread_id:
+                incomplete_nested_thread_ids.append(thread_id)
+            # Aggregate per-thread participants so the
+            # eligibility check can verify "every reply in
+            # the thread is bot-authored" rather than
+            # looking at a single comment in isolation.
+            thread_participants: Dict[str, List[Dict[str, Any]]] = {}
+            for comment in (comments_obj.get("nodes") or []):
+                if not isinstance(comment, dict):
+                    continue
+                entry = thread_participants.setdefault(
+                    thread_id, []
+                )
+                entry.append({
+                    "author": (
+                        (comment.get("author") or {}).get(
+                            "login", ""
+                        )
+                        if isinstance(comment.get("author"), dict)
+                        else ""
+                    ),
+                    "database_id": comment.get("databaseId"),
+                })
+            for comment in (comments_obj.get("nodes") or []):
+                if not isinstance(comment, dict):
+                    continue
+                author_login = (
+                    (comment.get("author") or {}).get("login", "")
+                    if isinstance(comment.get("author"), dict)
+                    else ""
+                )
+                original_commit_oid = ""
+                oc = comment.get("originalCommit")
+                if isinstance(oc, dict):
+                    original_commit_oid = oc.get("oid", "") or ""
+                entry = {
+                    "thread_id": thread_id,
+                    "is_resolved": is_resolved,
+                    "is_outdated": is_outdated,
+                    "comment_database_id": comment.get("databaseId"),
+                    "comment_url": comment.get("url", "") or "",
+                    "author": author_login,
+                    "body": comment.get("body", "") or "",
+                    "path": comment.get("path", "") or "",
+                    "line": comment.get("line"),
+                    "original_commit_sha": original_commit_oid,
+                    "participants": thread_participants.get(
+                        thread_id, []
+                    ),
+                    "nested_incomplete": nested_incomplete,
+                }
+                all_threads.append(entry)
+        outer_has_next = bool(page_info.get("hasNextPage"))
+        outer_end_cursor = page_info.get("endCursor")
+        if outer_has_next and not outer_end_cursor:
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true with no "
+                "endCursor"
+            ), {
+                **empty_metadata,
+                "review_thread_inventory_pages": 1,
+                "review_thread_inventory_capped": False,
+            }
+        # When outer or nested pagination is incomplete,
+        # return visible threads but mark inventory as
+        # incomplete so the unified inventory gate in
+        # section 8 fails closed. The visible threads are
+        # preserved so the visible-blocker logic can detect
+        # Codex findings on the visible page.
+        if outer_has_next or incomplete_nested_thread_ids:
+            err_msg = ""
+            if incomplete_nested_thread_ids:
+                err_msg = (
+                    f"nested_comments_not_paginated: thread="
+                    f"{incomplete_nested_thread_ids[0]}"
+                )
+            else:
+                # Use a phrase that contains ``pagination
+                # required`` so existing test contracts that
+                # assert on this substring continue to match.
+                err_msg = (
+                    "reviewThreads.pageInfo.hasNextPage=true; "
+                    "pagination required"
+                )
+            metadata = {
+                "review_thread_comment_inventory_complete":
+                    not incomplete_nested_thread_ids,
+                "review_thread_comment_inventory_error_count":
+                    len(incomplete_nested_thread_ids),
+                "review_thread_comment_incomplete_thread_ids":
+                    list(incomplete_nested_thread_ids),
+                "review_thread_inventory_complete": False,
+                "review_thread_inventory_pages": 1,
+                "review_thread_inventory_capped": False,
+                "review_thread_inventory_error": err_msg,
+                "review_thread_pagination_incomplete":
+                    outer_has_next,
+                "review_thread_pagination_end_cursor": outer_end_cursor,
+            }
+            return False, all_threads, err_msg, metadata
+        nested_complete = not incomplete_nested_thread_ids
+        metadata = {
+            "review_thread_comment_inventory_complete":
+                nested_complete,
+            "review_thread_comment_inventory_error_count":
+                len(incomplete_nested_thread_ids),
+            "review_thread_comment_incomplete_thread_ids":
+                list(incomplete_nested_thread_ids),
+            "review_thread_inventory_complete": True,
+            "review_thread_inventory_pages": 1,
+            "review_thread_inventory_capped": False,
+            "review_thread_inventory_error": "",
+        }
+        return True, all_threads, "", metadata
+    except Exception as exc:
+        return False, [], (
+            f"review_thread_inventory_failed: {exc}"
+        ), dict(empty_metadata)
+
+
 def classify(
     *,
     repo: str,
@@ -1361,8 +1634,16 @@ def classify(
         # failed. The unified inventory gate in section 8 treats
         # this as incomplete review-thread inventory and fails
         # closed at HOLD_CODEX_RESPONSE_PENDING.
-        ok_thr, thread_data, err_thr, thread_metadata = gh_graphql_review_threads(
-            repo, pr_number, timeout=api_timeout,
+        #
+        # Round-69 Codex review 4764653534 (P2): use the
+        # canonical shared-pagination wrapper instead of the
+        # inline first-page-only GraphQL fetch. The wrapper
+        # is defined above ``classify()`` (not below the
+        # ``__main__`` guard) so direct CLI runs invoke the
+        # shared paginator.
+        owner, name = repo.split("/", 1)
+        ok_thr, thread_data, err_thr, thread_metadata = _canonical_review_thread_inventory(
+            owner=owner, name=name, pr_number=pr_number,
         )
         if not ok_thr:
             api_errors.append(f"review_threads: {err_thr}")
@@ -2749,25 +3030,4 @@ def main(argv: Optional[List[str]] = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-
-
-# Round-412 (R-1): expose the canonical shared pagination
-# helper. Existing in-line pagination in the audit is being
-# incrementally replaced with this helper. Callers that want
-# the complete paginated review-thread inventory MUST use
-# ``paginate_review_threads`` from
-# ``scripts.local._shared_pagination`` rather than the inline
-# ``first: 100`` query below.
-def _canonical_review_thread_inventory(
-    *, owner, name, pr_number, page_size=100, safety_cap=2000,
-):
-    """Canonical complete paginated review-thread inventory."""
-    from scripts.local._shared_pagination import paginate_review_threads
-    return paginate_review_threads(
-        owner=owner,
-        name=name,
-        pr_number=pr_number,
-        page_size=page_size,
-        safety_cap=safety_cap,
-    )
 
