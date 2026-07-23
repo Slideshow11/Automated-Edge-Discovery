@@ -2734,6 +2734,15 @@ def build_evidence(
         review_threads=active_threads + outdated_threads,
         review_thread_inventory_complete=review_thread_inventory_complete,
         review_thread_inventory_error=review_thread_inventory_error,
+        # Round-412 (PHASE 4 Finding 1): nested-comment
+        # inventory completeness flows from the audit
+        # packet's review_thread_comment_inventory_complete
+        # flag. When not present, the policy fails closed.
+        nested_comment_inventory_complete=bool(
+            codex_packet.get(
+                "review_thread_comment_inventory_complete", False
+            )
+        ),
         unresolved_thread_count=unresolved_total,
         unresolved_thread_ids=unresolved_human_ids + unresolved_bot_current_ids + outdated_bot_ids,
         unresolved_human_thread_ids=unresolved_human_ids,
@@ -3469,6 +3478,12 @@ def select_eligible_bot_threads(
     codex_reviewed_sha: Optional[str] = None,
     repo: Optional[str] = None,
     ancestry_runner: Optional[Any] = None,
+    inventory_complete: bool = False,
+    review_thread_inventory_complete: bool = False,
+    nested_comment_inventory_complete: bool = False,
+    no_newer_finding: bool = False,
+    live_head_match: bool = False,
+    live_head_sha: Optional[str] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run the eligibility checker over a thread inventory.
 
@@ -3483,6 +3498,13 @@ def select_eligible_bot_threads(
     GitHub packet supplied one. Threads without a canonical anchor
     after normalization are ineligible with reason
     ``missing_commit_anchor`` (or ``malformed_commit_anchor``).
+
+    Round-412 (PHASE 4 Finding 1): ``inventory_complete``,
+    ``review_thread_inventory_complete``,
+    ``nested_comment_inventory_complete``, ``no_newer_finding``,
+    ``live_head_match``, and ``live_head_sha`` MUST be derived
+    from the actual audit evidence. Defaults are False / None
+    so missing evidence fails closed.
     """
     eligible: List[Dict[str, Any]] = []
     ineligible: List[Dict[str, Any]] = []
@@ -3496,6 +3518,12 @@ def select_eligible_bot_threads(
             codex_reviewed_sha=codex_reviewed_sha,
             repo=repo,
             ancestry_runner=ancestry_runner,
+            inventory_complete=inventory_complete,
+            review_thread_inventory_complete=review_thread_inventory_complete,
+            nested_comment_inventory_complete=nested_comment_inventory_complete,
+            no_newer_finding=no_newer_finding,
+            live_head_match=live_head_match,
+            live_head_sha=live_head_sha,
         )
         annotated = dict(thread)
         annotated["reason"] = reason
@@ -3923,6 +3951,40 @@ def cmd_advance(args: argparse.Namespace) -> int:
         codex_reviewed_sha=evidence.codex_reviewed_sha,
         repo=repo,
         ancestry_runner=getattr(args, "ancestry_runner", None),
+        # Round-412 (PHASE 4 Finding 1): thread the
+        # actual audit evidence. ``inventory_complete``
+        # is the conjunction of outer review-thread
+        # pagination and the existing per-thread check;
+        # nested-comment inventory completeness flows
+        # through ``review_thread_inventory_complete``.
+        inventory_complete=bool(
+            evidence.review_thread_inventory_complete
+        ),
+        review_thread_inventory_complete=bool(
+            evidence.review_thread_inventory_complete
+        ),
+        # Nested-comment inventory completeness is tracked
+        # separately on the evidence object (Round-412
+        # PHASE 4 Finding 1). When not present on the
+        # evidence, default to False so the policy fails
+        # closed.
+        nested_comment_inventory_complete=bool(
+            getattr(
+                evidence,
+                "nested_comment_inventory_complete",
+                False,
+            )
+        ),
+        # ``no_newer_finding`` is True iff the latest
+        # Codex response was a clean pass at the
+        # exact head.
+        no_newer_finding=bool(evidence.codex_clean_passed),
+        # ``live_head_match`` is True iff the artifact's
+        # reviewed SHA equals the live head.
+        live_head_match=bool(evidence.codex_artifact_fresh),
+        # Pass the live head so the policy can verify
+        # it hasn't moved since the audit was collected.
+        live_head_sha=str(head_sha) if head_sha else None,
     )
     eligible_thread_records = [
         {

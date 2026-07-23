@@ -689,6 +689,17 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "ancestry_runner": lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
         ),
+        # Round-412 (PHASE 4 Finding 1): evidence flags
+        # required by the new shared policy contract.
+        # Defaults to "all satisfied" so the legacy F4
+        # tests keep their intent of testing the
+        # anchor / actor / codex-shape decisions.
+        "inventory_complete": True,
+        "review_thread_inventory_complete": True,
+        "nested_comment_inventory_complete": True,
+        "no_newer_finding": True,
+        "live_head_match": True,
+        "live_head_sha": head,
     }
     base.update(overrides)
     return base

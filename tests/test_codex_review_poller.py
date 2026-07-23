@@ -516,10 +516,16 @@ class TestCodexReviewSummaryFormat:
             "**Reviewed commit:** `d8f6f480e1`\n"
         )
         assert mod._is_codex_review_summary(body) is True
-        # The summary body is NOT itself a finding or a
-        # clean pass — its verdict comes from the inline
-        # comments.
-        assert mod._is_clean_pass(body) is False
+        # Round-412 (PHASE 4 Finding 3): under the shared
+        # classifier, a summary-format body IS a clean-pass
+        # because the inline comments (not the summary body)
+        # carry the actual findings. The classifier's
+        # contract is: a summary body with no finding-badge
+        # line is a clean pass. The downstream
+        # ``_classify_review_with_inline`` function fetches
+        # the inline comments and downgrades to FINDING if
+        # any inline comment carries the badge.
+        assert mod._is_clean_pass(body) is True
         assert mod._is_finding(body) is False
 
     def test_summary_with_inline_finding_is_finding(self, monkeypatch):

@@ -153,6 +153,8 @@ def classify_review_thread_eligibility(
     codex_reviewed_sha: Optional[str],
     repo: Optional[str],
     inventory_complete: bool = True,
+    review_thread_inventory_complete: bool = True,
+    nested_comment_inventory_complete: bool = True,
     ancestry_ok: bool = True,
     repair_present: bool = True,
     no_newer_finding: bool = True,
@@ -167,25 +169,27 @@ def classify_review_thread_eligibility(
     module. Preserves every legacy reason code the controller
     previously produced. No fallback to legacy behavior; an
     import error from the shared module fails closed.
+
+    Round-412 (PHASE 4 Finding 1): inventory completeness
+    is now the conjunction of ``inventory_complete``,
+    ``review_thread_inventory_complete``, and
+    ``nested_comment_inventory_complete``. Any missing
+    component fails closed.
     """
-    if not inventory_complete:
-        verdict = EligibilityVerdict(
-            eligible=False,
-            reasons=["unknown_actor_in_thread"],
-            reviewer_classes=[],
-        )
-    else:
-        verdict = _validate_thread_for_resolution(
-            thread=thread,
-            head_sha=head_sha,
-            codex_clean_passed=codex_clean_passed,
-            codex_reviewed_sha=codex_reviewed_sha,
-            repo=repo,
-            ancestry_runner=ancestry_runner,
-            verify_ancestry=verify_ancestry,
-            no_newer_finding=no_newer_finding,
-            live_head_match=live_head_match,
-        )
+    verdict = _validate_thread_for_resolution(
+        thread=thread,
+        head_sha=head_sha,
+        codex_clean_passed=codex_clean_passed,
+        codex_reviewed_sha=codex_reviewed_sha,
+        repo=repo,
+        ancestry_runner=ancestry_runner,
+        verify_ancestry=verify_ancestry,
+        no_newer_finding=no_newer_finding,
+        live_head_match=live_head_match,
+        inventory_complete=inventory_complete,
+        review_thread_inventory_complete=review_thread_inventory_complete,
+        nested_comment_inventory_complete=nested_comment_inventory_complete,
+    )
     record_invocation(
         "non_human_policy.validate_thread_for_resolution",
         inputs={
@@ -194,6 +198,8 @@ def classify_review_thread_eligibility(
             ),
             "head_sha": head_sha,
             "inventory_complete": inventory_complete,
+            "review_thread_inventory_complete": review_thread_inventory_complete,
+            "nested_comment_inventory_complete": nested_comment_inventory_complete,
             "codex_clean_passed": codex_clean_passed,
             "codex_reviewed_sha": codex_reviewed_sha,
             "verify_ancestry": verify_ancestry,

@@ -8108,14 +8108,34 @@ def test_predicate_imported_under_repo_root_invocation():
     """
     import sys as _sys
 
-    # Make sure the repo root is on sys.path and import via
-    # the package path.
-    if "/home/max/aed_consolidation_v1" not in _sys.path:
-        _sys.path.insert(0, "/home/max/aed_consolidation_v1")
-    from scripts.local import audit_codex_response_for_pr as mod
-    assert mod._co_is_codex_task_summary_issue_comment is not None, (
-        "predicate must be importable under repo-root path"
-    )
+    # Round-69 (PHASE 4): use a try/finally to restore the
+    # original sys.path so subsequent tests in the same
+    # pytest session do not inherit a polluted import path.
+    # The previous version inserted the wrong hard-coded
+    # path ("/home/max/aed_consolidation_v1") which caused
+    # cross-test pollution when pytest re-imported modules
+    # from ``scripts.local`` after the path was mutated.
+    # The audit module's import block already handles
+    # multiple sys.path shapes; this test only needs to
+    # confirm the audit module imports when the repo
+    # root is on sys.path.
+    original_path = list(_sys.path)
+    try:
+        # Use the actual pytest worktree path so the test
+        # is environment-agnostic. The repo root is the
+        # grandparent of the scripts/local directory of
+        # this very module.
+        import os as _os
+        _audit_dir = _os.path.dirname(_os.path.abspath(__file__))
+        _repo_root = _os.path.dirname(_os.path.dirname(_audit_dir))
+        if _repo_root not in _sys.path:
+            _sys.path.insert(0, _repo_root)
+        from scripts.local import audit_codex_response_for_pr as mod
+        assert mod._co_is_codex_task_summary_issue_comment is not None, (
+            "predicate must be importable under repo-root path"
+        )
+    finally:
+        _sys.path[:] = original_path
 
 
 def test_audit_emits_visible_warning_when_predicate_unavailable(

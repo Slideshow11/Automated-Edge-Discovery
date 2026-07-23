@@ -175,6 +175,17 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "ancestry_runner": lambda *a, **kw: mock.Mock(
             returncode=0, stdout="ahead", stderr=""
         ),
+        # Round-412 (PHASE 4 Finding 1): evidence flags
+        # required by the new shared policy contract.
+        # Defaults to "all satisfied" so the legacy F4
+        # tests keep their intent of testing the
+        # anchor / actor / codex-shape decisions.
+        "inventory_complete": True,
+        "review_thread_inventory_complete": True,
+        "nested_comment_inventory_complete": True,
+        "no_newer_finding": True,
+        "live_head_match": True,
+        "live_head_sha": head,
     }
     base.update(overrides)
     return base
@@ -2616,6 +2627,16 @@ class TestRound8CodexOnlyAutoResolution:
             "ancestry_runner": lambda *a, **kw: mock.Mock(
                 returncode=0, stdout="ahead", stderr=""
             ),
+            # Round-412 (PHASE 4 Finding 1): new evidence
+            # flags default to satisfied so existing F4
+            # tests keep their intent of testing the
+            # anchor / actor / codex-shape decisions.
+            "inventory_complete": True,
+            "review_thread_inventory_complete": True,
+            "nested_comment_inventory_complete": True,
+            "no_newer_finding": True,
+            "live_head_match": True,
+            "live_head_sha": DEFAULT_HEAD,
         }
         base.update(overrides)
         return base
@@ -2762,6 +2783,15 @@ class TestRound8CodexOnlyAutoResolution:
             ancestry_runner=lambda *a, **kw: mock.Mock(
                 returncode=0, stdout="ahead", stderr=""
             ),
+            # Round-412 (PHASE 4 Finding 1): explicit
+            # evidence flags so the legacy F4 test keeps
+            # its intent of partitioning by thread shape.
+            inventory_complete=True,
+            review_thread_inventory_complete=True,
+            nested_comment_inventory_complete=True,
+            no_newer_finding=True,
+            live_head_match=True,
+            live_head_sha=DEFAULT_HEAD,
         )
         eligible_ids = [t["thread_id"] for t in result["eligible"]]
         assert eligible_ids == ["T-CODEX-A"]
@@ -4969,6 +4999,32 @@ class TestRound14RequireNonemptyThreadParticipants:
         base.update(kwargs)
         return base
 
+    def _eligibility_kwargs(self, head_sha="d" * 40, **overrides):
+        """Return kwargs for ``is_eligible_for_bot_resolution``
+        that satisfy the new shared-policy evidence flags.
+
+        Round-412 (PHASE 4 Finding 1): every eligibility
+        call MUST supply the audit evidence flags. Tests
+        in this class that test non-inventory-shape decisions
+        (e.g. ``human_reply``, ``actor_not_codex``,
+        ``nonempty complete Codex-only``) need the new
+        flags passed to reach the actor/anchor checks.
+        """
+        base = {
+            "head_sha": head_sha,
+            "codex_verdict": "clean",
+            "codex_clean_passed": True,
+            "codex_reviewed_sha": head_sha,
+            "inventory_complete": True,
+            "review_thread_inventory_complete": True,
+            "nested_comment_inventory_complete": True,
+            "no_newer_finding": True,
+            "live_head_match": True,
+            "live_head_sha": head_sha,
+        }
+        base.update(overrides)
+        return base
+
     def test_missing_comments_and_comment_list_blocks(self):
         from scripts.local import aed_pr_readiness as R
         thread = self._thread()
@@ -5060,9 +5116,7 @@ class TestRound14RequireNonemptyThreadParticipants:
                        {"author": "human-user"}],
         )
         eligible, reason = R.is_eligible_for_bot_resolution(
-            thread, head_sha="d" * 40,
-            codex_verdict="clean",
-            codex_clean_passed=True,
+            thread, **self._eligibility_kwargs(),
         )
         assert eligible is False
         assert reason == "human_reply"
@@ -5095,11 +5149,10 @@ class TestRound14RequireNonemptyThreadParticipants:
             comments=[{"author": "chatgpt-codex-connector[bot]"}],
         )
         eligible, reason = R.is_eligible_for_bot_resolution(
-            thread, head_sha="a" * 40,
-            codex_verdict="clean",
-            codex_clean_passed=True,
-            repo="owner/repo",
-            codex_reviewed_sha="a" * 40,
+            thread, **self._eligibility_kwargs(
+                head_sha="a" * 40,
+                repo="owner/repo",
+            ),
         )
         # Either eligible=True (when ancestry matches) or
         # the test still proves the comments check passes

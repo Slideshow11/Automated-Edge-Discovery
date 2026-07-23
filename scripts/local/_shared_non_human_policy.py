@@ -236,6 +236,9 @@ def validate_thread_for_resolution(
     verify_ancestry: bool = True,
     no_newer_finding: bool = True,
     live_head_match: bool = True,
+    inventory_complete: bool = True,
+    review_thread_inventory_complete: bool = True,
+    nested_comment_inventory_complete: bool = True,
 ) -> EligibilityVerdict:
     """Canonical production eligibility decision.
 
@@ -261,6 +264,18 @@ def validate_thread_for_resolution(
     # re-resolved.
     if bool(thread.get("isResolved") or thread.get("is_resolved")):
         return _deny("already_resolved", [])
+
+    # Round-412 (PHASE 4 Finding 1): inventory completeness
+    # MUST be proven from the audit evidence. Missing outer
+    # review-thread pagination OR nested-comment pagination
+    # is a hard stop. ``inventory_complete`` is the
+    # conjunction.
+    if not (
+        bool(inventory_complete)
+        and bool(review_thread_inventory_complete)
+        and bool(nested_comment_inventory_complete)
+    ):
+        return _deny("unknown_actor_in_thread", [])
 
     # Fail closed when the latest exact-head Codex evidence
     # is not clean.
@@ -311,14 +326,17 @@ def validate_thread_for_resolution(
     ):
         return _deny("malformed_commit_anchor", classes)
 
-    # codex_reviewed_sha vs head_sha mismatch.
-    if (
-        isinstance(codex_reviewed_sha, str)
-        and codex_reviewed_sha
-        and isinstance(head_sha, str)
-        and head_sha
-        and codex_reviewed_sha != head_sha
-    ):
+    # Round-412 (PHASE 4 Finding 2): missing or malformed
+    # exact-head evidence MUST fail closed. The reviewed
+    # SHA must be a canonical 40-character lowercase hex
+    # string that EQUALS the canonical live head SHA. Any
+    # missing/empty/short/malformed component is treated
+    # as a hard stop, not a satisfied condition.
+    if not isinstance(head_sha, str) or not _SHA1_PATTERN.match(head_sha):
+        return _deny("head_unknown", classes)
+    if not isinstance(codex_reviewed_sha, str) or not _SHA1_PATTERN.match(codex_reviewed_sha):
+        return _deny("codex_head_mismatch", classes)
+    if codex_reviewed_sha != head_sha:
         return _deny("codex_head_mismatch", classes)
 
     # Ancestry verification. The controller's verifier

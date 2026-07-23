@@ -322,6 +322,10 @@ class ReadinessEvidence:
     review_threads: Optional[List[Dict[str, Any]]] = None
     review_thread_inventory_complete: bool = False
     review_thread_inventory_error: Optional[str] = None
+    # Round-412 (PHASE 4 Finding 1): nested-comment
+    # inventory completeness is tracked separately from
+    # outer review-thread inventory completeness.
+    nested_comment_inventory_complete: bool = False
     unresolved_thread_count: int = 0
     unresolved_thread_ids: List[str] = field(default_factory=list)
     unresolved_human_thread_ids: List[str] = field(default_factory=list)
@@ -782,6 +786,12 @@ def is_eligible_for_bot_resolution(
     codex_reviewed_sha: Optional[str] = None,
     repo: Optional[str] = None,
     ancestry_runner: Optional[Any] = None,
+    inventory_complete: bool = False,
+    review_thread_inventory_complete: bool = False,
+    nested_comment_inventory_complete: bool = False,
+    no_newer_finding: bool = False,
+    live_head_match: bool = False,
+    live_head_sha: Optional[str] = None,
 ) -> Tuple[bool, str]:
     """Return ``(eligible, reason)`` for a single review thread.
 
@@ -792,15 +802,48 @@ def is_eligible_for_bot_resolution(
     fire when the thread lacks a canonical 40-hex SHA anchor that
     GitHub's review-thread API supplied (or a normalizer promoted
     into ``original_commit_sha``/``comment_sha``/``head_sha``).
+
+    Round-412 (PHASE 4 Finding 1): the evidence booleans
+    ``inventory_complete``, ``review_thread_inventory_complete``,
+    ``nested_comment_inventory_complete``, ``no_newer_finding``,
+    and ``live_head_match`` MUST be derived from the actual
+    audit evidence. Defaults are ``False`` so missing evidence
+    fails closed. Production callers MUST pass real values.
     """
+    # Round-412 (PHASE 4 Finding 1): inventory completeness
+    # is the conjunction of outer-thread pagination and
+    # nested-comment pagination. Treat them as one
+    # fail-closed evidence object.
+    effective_inventory_complete = bool(
+        inventory_complete
+        and review_thread_inventory_complete
+        and nested_comment_inventory_complete
+    )
+
+    # Round-412 (PHASE 4 Finding 1): the live-head match
+    # MUST be derived from a fresh head read. If the
+    # caller did not provide ``live_head_sha``, fail closed.
+    if live_head_sha is None:
+        effective_live_head_match = False
+    elif (
+        isinstance(head_sha, str)
+        and head_sha
+        and live_head_sha == head_sha
+    ):
+        effective_live_head_match = bool(live_head_match)
+    else:
+        # The caller's live_head_sha disagrees with the
+        # controller's head_sha: the head has moved.
+        effective_live_head_match = False
+
         # Round-412 (PHASE 4): consult the shared
-    # non-human review policy FIRST. The shared
-    # policy is the production source of truth for
-    # eligibility. The legacy "outdated-only" rule
-    # below is REMOVED — a current or non-outdated
-    # Codex-only thread may be eligible when its
-    # repair and later clean exact-head review are
-    # proven (per PHASE 3 R-3).
+        # non-human review policy FIRST. The shared
+        # policy is the production source of truth for
+        # eligibility. The legacy "outdated-only" rule
+        # below is REMOVED — a current or non-outdated
+        # Codex-only thread may be eligible when its
+        # repair and later clean exact-head review are
+        # proven (per PHASE 3 R-3).
     if _SHARED_POLICY_AVAILABLE:
         _shared_verdict = _shared_classify_review_thread_eligibility(
             thread=thread,
@@ -808,10 +851,16 @@ def is_eligible_for_bot_resolution(
             codex_clean_passed=codex_clean_passed,
             codex_reviewed_sha=codex_reviewed_sha,
             repo=repo,
-            inventory_complete=True,
+            inventory_complete=effective_inventory_complete,
+            review_thread_inventory_complete=bool(
+                review_thread_inventory_complete
+            ),
+            nested_comment_inventory_complete=bool(
+                nested_comment_inventory_complete
+            ),
             repair_present=True,
-            no_newer_finding=True,
-            live_head_match=True,
+            no_newer_finding=bool(no_newer_finding),
+            live_head_match=effective_live_head_match,
             ancestry_runner=ancestry_runner,
             verify_ancestry=True,
         )

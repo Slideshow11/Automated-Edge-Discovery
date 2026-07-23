@@ -63,12 +63,18 @@ try:
         is_codex_login as _shared_is_codex_login,
     )
 except ImportError:
-    _shared_is_clean = None
-    _shared_is_finding = None
-    _shared_is_summary = None
-    _shared_extract_oid = None
-    _shared_body_has_finding = None
-    _shared_is_codex_login = None
+    # Round-412 (PHASE 4 Finding 3): the names set in the
+    # except block MUST be module-level so subsequent
+    # attribute lookups succeed. Declare them global.
+    global _shared_is_clean, _shared_is_finding
+    global _shared_is_summary, _shared_extract_oid
+    global _shared_body_has_finding, _shared_is_codex_login
+    _shared_is_clean = None  # noqa: PLW0603
+    _shared_is_finding = None  # noqa: PLW0603
+    _shared_is_summary = None  # noqa: PLW0603
+    _shared_extract_oid = None  # noqa: PLW0603
+    _shared_body_has_finding = None  # noqa: PLW0603
+    _shared_is_codex_login = None  # noqa: PLW0603
 
 
 # Canonical Codex bot identities (login values GitHub uses for
@@ -237,18 +243,55 @@ def _is_codex_login(login: str) -> bool:
 
 
 def _is_clean_pass(body: str) -> bool:
-    """True iff the body looks like a Codex clean-pass response."""
+    """True iff the body looks like a Codex clean-pass response.
+
+    Round-412 (PHASE 4 Finding 3): the poller MUST use the
+    shared classifier as the authoritative source. Local
+    predicate retained as a thin alias for backward
+    compatibility but every clean-pass decision delegates
+    to the shared module.
+    """
     if not body:
+        return False
+    if _shared_is_clean is not None:
+        return _shared_is_clean(body)
+    # Fail closed if the shared module could not be
+    # imported: a finding badge in the body always wins
+    # over a clean fragment, so without the shared
+    # classifier we cannot safely emit CLEAN_PASS.
+    if any(_is_finding(line) for line in body.splitlines()):
         return False
     lower = body.lower()
     return any(frag in lower for frag in CLEAN_PASS_FRAGMENTS)
 
 
 def _is_finding(body: str) -> bool:
-    """True iff the body looks like a Codex finding response."""
+    """True iff the body looks like a Codex finding response.
+
+    Round-412 (PHASE 4 Finding 3): the poller MUST use the
+    shared classifier. The shared predicate supersedes the
+    local stub; the local predicate remains as a
+    backward-compatibility alias.
+    """
     if not body:
         return False
+    if _shared_is_finding is not None:
+        return _shared_is_finding(body)
     return body.lstrip().startswith(FINDING_BADGE_PREFIX)
+
+
+def _body_has_finding_badge(body: str) -> bool:
+    """True iff any line in the body has a Codex finding badge.
+
+    Round-412 (PHASE 4 Finding 3): re-exported from the
+    shared classifier. A finding badge MUST override any
+    clean wording in the same body.
+    """
+    if not body:
+        return False
+    if _shared_body_has_finding is not None:
+        return _shared_body_has_finding(body)
+    return any(_is_finding(line) for line in body.splitlines())
 
 
 def _is_codex_review_summary(body: str) -> bool:
