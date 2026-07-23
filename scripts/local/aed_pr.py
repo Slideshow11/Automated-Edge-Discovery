@@ -3976,9 +3976,18 @@ def cmd_advance(args: argparse.Namespace) -> int:
             )
         ),
         # ``no_newer_finding`` is True iff the latest
-        # Codex response was a clean pass at the
-        # exact head.
-        no_newer_finding=bool(evidence.codex_clean_passed),
+        # Codex response was a clean pass at the exact
+        # head. Round-69 Codex review 4764488626 (P1):
+        # derive this from the verdict + freshness, NOT
+        # from the historical ``clean_pass_detected``
+        # flag (which can stay True after a newer
+        # finding arrives and the verdict flips to
+        # ``HOLD_NEW_CODEX_THREAD``).
+        no_newer_finding=bool(
+            evidence.codex_clean_passed is True
+            and evidence.codex_artifact_fresh is True
+            and R.is_codex_clean_verdict(evidence.codex_verdict)
+        ),
         # ``live_head_match`` is True iff the artifact's
         # reviewed SHA equals the live head.
         live_head_match=bool(evidence.codex_artifact_fresh),

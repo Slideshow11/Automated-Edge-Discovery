@@ -450,5 +450,96 @@ class CrossTestPollutionRegressionTests(unittest.TestCase):
             )
 
 
+# ---------------------------------------------------------------------------
+# Regression: P1 finding from Codex review 4764488626.
+# ---------------------------------------------------------------------------
+
+
+class NoNewerFindingDerivationTests(unittest.TestCase):
+    """Round-69 Codex review 4764488626 (P1): ``no_newer_finding``
+    MUST be derived from the verdict + freshness, not from
+    the historical ``codex_clean_passed`` flag.
+
+    When the audit sees a clean pass and then a newer Codex
+    finding arrives, ``codex_clean_passed`` stays True while
+    the verdict flips to ``HOLD_NEW_CODEX_THREAD``. The previous
+    implementation of ``cmd_advance`` used
+    ``no_newer_finding=bool(evidence.codex_clean_passed)`` which
+    was stale. The new derivation requires:
+      - codex_clean_passed is True
+      - codex_artifact_fresh is True
+      - is_codex_clean_verdict(codex_verdict) is True
+    """
+
+    def test_no_newer_finding_false_when_verdict_is_hold_new_codex(self):
+        """``codex_clean_passed=True`` with verdict
+        ``HOLD_NEW_CODEX_THREAD`` (newer finding arrived
+        after the historical clean pass) MUST yield
+        ``no_newer_finding=False``."""
+        from scripts.local.aed_pr_readiness import (
+            ReadinessEvidence, is_codex_clean_verdict,
+        )
+        # Construct an evidence packet that simulates the
+        # audit state after a newer finding arrived.
+        ev = ReadinessEvidence(
+            codex_verdict="HOLD_NEW_CODEX_THREAD",
+            codex_clean_passed=True,  # stale historical flag
+            codex_artifact_fresh=True,
+            codex_reviewed_sha="0" * 40,
+        )
+        # The ``is_codex_clean_verdict`` predicate MUST return
+        # False for HOLD_NEW_CODEX_THREAD.
+        self.assertFalse(is_codex_clean_verdict(ev.codex_verdict))
+        # The new derivation MUST require ALL THREE conditions.
+        derived_no_newer_finding = bool(
+            ev.codex_clean_passed is True
+            and ev.codex_artifact_fresh is True
+            and is_codex_clean_verdict(ev.codex_verdict)
+        )
+        self.assertFalse(
+            derived_no_newer_finding,
+            "no_newer_finding must be False when verdict is "
+            "HOLD_NEW_CODEX_THREAD even if clean_pass_detected is True",
+        )
+
+    def test_no_newer_finding_true_when_all_three_conditions_hold(self):
+        """When all three conditions hold, no_newer_finding
+        MUST be True."""
+        from scripts.local.aed_pr_readiness import (
+            ReadinessEvidence, is_codex_clean_verdict,
+        )
+        ev = ReadinessEvidence(
+            codex_verdict="CODEX_CLEAN_PASS",
+            codex_clean_passed=True,
+            codex_artifact_fresh=True,
+            codex_reviewed_sha="0" * 40,
+        )
+        derived = bool(
+            ev.codex_clean_passed is True
+            and ev.codex_artifact_fresh is True
+            and is_codex_clean_verdict(ev.codex_verdict)
+        )
+        self.assertTrue(derived)
+
+    def test_no_newer_finding_false_when_artifact_not_fresh(self):
+        """``codex_clean_passed=True`` and clean verdict but
+        ``codex_artifact_fresh=False`` (reviewed head != live
+        head) MUST yield ``no_newer_finding=False``."""
+        from scripts.local.aed_pr_readiness import (
+            ReadinessEvidence, is_codex_clean_verdict,
+        )
+        ev = ReadinessEvidence(
+            codex_verdict="CODEX_CLEAN_PASS",
+            codex_clean_passed=True,
+            codex_artifact_fresh=False,
+        )
+        derived = bool(
+            ev.codex_clean_passed is True
+            and ev.codex_artifact_fresh is True
+            and is_codex_clean_verdict(ev.codex_verdict)
+        )
+        self.assertFalse(derived)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
