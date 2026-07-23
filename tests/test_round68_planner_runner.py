@@ -724,6 +724,47 @@ class SourceContractTests(unittest.TestCase):
             if os.path.exists(log_file):
                 os.unlink(log_file)
 
+    def test_aed_pr_lib_classifies_as_shared(self):
+        """PHASE 6 (Round-68 Finding 1): ``scripts/local/aed_pr_lib.py``
+        MUST classify as ``Component.SHARED``, NOT ``Component.AED``,
+        because the broad ``aed_pr_*.py`` AED glob would otherwise
+        match first and override the explicit shared entry.
+        """
+        from scripts.local._shared_test_selection import (
+            classify_path, Component,
+        )
+        c = classify_path("scripts/local/aed_pr_lib.py")
+        self.assertEqual(
+            c, Component.SHARED,
+            f"aed_pr_lib.py must be SHARED, got {c}",
+        )
+
+    def test_select_tests_empty_paths_fails_closed(self):
+        """PHASE 6 (Round-68 Finding 2): an empty
+        ``changed_paths`` list MUST fail closed to the full
+        repository suite rather than emitting a plan with
+        ``selected_tests=[]`` and ``requires_full_validation=False``.
+        """
+        from scripts.local._shared_test_selection import (
+            select_tests, ValidationTier,
+        )
+        plan = select_tests(
+            changed_paths=[],
+            tier=ValidationTier.TIER_2_COHESIVE_BATCH,
+            final_candidate=False,
+        )
+        self.assertTrue(
+            plan.requires_full_validation,
+            "empty paths must fail closed to full validation",
+        )
+        self.assertEqual(
+            plan.selected_tests, ["FULL_REPOSITORY_SUITE"]
+        )
+        self.assertIn(
+            "empty_changed_paths",
+            plan.classification_failures,
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

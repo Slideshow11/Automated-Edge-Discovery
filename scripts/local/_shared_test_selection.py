@@ -56,7 +56,9 @@ class Component(str, Enum):
 
 
 # Component manifests: glob → component mapping.
-# The first matching glob wins. Keep order broad→narrow.
+# The first matching glob wins. Specific patterns
+# (especially SHARED entries) MUST come BEFORE broad
+# AED globs that would otherwise match first.
 _COMPONENT_MANIFEST: List[tuple] = [
     # Autocoder (Tier 2 autocoder-focused suite).
     ("autocoder_*.py", Component.AUTOCODER),
@@ -74,7 +76,19 @@ _COMPONENT_MANIFEST: List[tuple] = [
     ("tests/test_aed_continue_pr.py", Component.AUTOCODER),
     ("tests/test_aed_tasker_*.py", Component.AUTOCODER),
     ("tests/test_apply_temp_worktree_*.py", Component.AUTOCODER),
-    # AED.
+    # Shared foundational paths MUST come BEFORE the
+    # broad ``aed_pr_*.py`` AED glob so that
+    # ``aed_pr_lib.py`` (shared) is matched as SHARED,
+    # not as AED.
+    ("scripts/local/_shared_*.py", Component.SHARED),
+    ("scripts/local/aed_pr_lib.py", Component.SHARED),
+    ("aed_policy/policy.py", Component.SHARED),
+    ("docs/aed_*.md", Component.SHARED),
+    # CI workflows are shared.
+    (".github/workflows/*.yml", Component.SHARED),
+    ("pyproject.toml", Component.SHARED),
+    ("tests/conftest.py", Component.SHARED),
+    # AED (broad globs last so shared files match first).
     ("scripts/local/aed_pr.py", Component.AED),
     ("scripts/local/aed_pr_*.py", Component.AED),
     ("scripts/local/audit_*.py", Component.AED),
@@ -89,15 +103,6 @@ _COMPONENT_MANIFEST: List[tuple] = [
     ("tests/test_codex_review_poller.py", Component.AED),
     ("tests/test_check_pr_review_comments.py", Component.AED),
     ("tests/test_merge_*.py", Component.AED),
-    # Shared foundational paths always force full validation.
-    ("scripts/local/_shared_*.py", Component.SHARED),
-    ("aed_policy/policy.py", Component.SHARED),
-    ("docs/aed_*.md", Component.SHARED),
-    # CI workflows are shared.
-    (".github/workflows/*.yml", Component.SHARED),
-    ("pyproject.toml", Component.SHARED),
-    ("scripts/local/aed_pr_lib.py", Component.SHARED),
-    ("tests/conftest.py", Component.SHARED),
 ]
 
 
@@ -198,27 +203,54 @@ def select_tests(
         suite;
       * Any SHARED component or any UNKNOWN path forces full
         validation;
+      * An EMPTY ``changed_paths`` input is treated as
+        ambiguous input that fails closed to the full
+        repository suite (Round-412 Finding 2);
       * Otherwise Tier 2 uses the focused suite for the
         detected component(s).
     """
-    classification = classify_paths(changed_paths)
-    components = classification["components"]
-    failures = classification["failures"]
-    is_shared = classification["shared"]
-    has_unknown = bool(failures)
-
+    # Round-412 (PHASE 6): final-candidate mode is the
+    # authoritative tier override. Check it FIRST so an
+    # empty changed_paths list still produces a Tier 3
+    # plan, then fall through to the empty-paths fail-closed
+    # branch.
     if final_candidate:
         return TestPlan(
             tier=ValidationTier.TIER_3_FINAL_CANDIDATE,
-            components=components,
+            components=[],
             selected_tests=["FULL_REPOSITORY_SUITE"],
             requires_full_validation=True,
             selection_reason=(
                 "Tier 3 final candidate always selects the full "
                 "repository suite before ready status."
             ),
-            classification_failures=failures,
+            classification_failures=["empty_changed_paths"]
+            if not changed_paths else [],
         )
+
+    # Round-412 (PHASE 6): an empty ``changed_paths``
+    # list is ambiguous input. Fail closed to the full
+    # repository suite so the runner cannot accidentally
+    # emit machine-readable evidence that no full
+    # validation is required when the impact is unknown.
+    if not changed_paths:
+        return TestPlan(
+            tier=tier,
+            components=[],
+            selected_tests=["FULL_REPOSITORY_SUITE"],
+            requires_full_validation=True,
+            selection_reason=(
+                "Missing or empty changed_paths is ambiguous "
+                "input — full repository suite required."
+            ),
+            classification_failures=["empty_changed_paths"],
+        )
+
+    classification = classify_paths(changed_paths)
+    components = classification["components"]
+    failures = classification["failures"]
+    is_shared = classification["shared"]
+    has_unknown = bool(failures)
 
     if is_shared or has_unknown:
         return TestPlan(
