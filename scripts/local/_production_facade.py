@@ -189,6 +189,12 @@ def classify_review_thread_eligibility(
         inventory_complete=inventory_complete,
         review_thread_inventory_complete=review_thread_inventory_complete,
         nested_comment_inventory_complete=nested_comment_inventory_complete,
+        # Round-69 Codex review 4768843522 (P1): forward
+        # the repair evidence flag. The previous facade
+        # accepted ``repair_present`` but never threaded
+        # it into the shared policy, allowing threads
+        # without proven fixes to be auto-resolved.
+        repair_present=repair_present,
     )
     record_invocation(
         "non_human_policy.validate_thread_for_resolution",

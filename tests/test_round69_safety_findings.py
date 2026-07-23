@@ -23,7 +23,9 @@ import sys
 import unittest
 from unittest import mock
 
-REPO = "/home/max/aed_hardening_v1"
+REPO = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
@@ -416,7 +418,7 @@ class CrossTestPollutionRegressionTests(unittest.TestCase):
                 "--tb=line",
             ],
             capture_output=True, text=True,
-            cwd="/home/max/aed_hardening_v1",
+            cwd=REPO,
             timeout=120,
         )
         self.assertEqual(
@@ -440,7 +442,7 @@ class CrossTestPollutionRegressionTests(unittest.TestCase):
                     "-q", "--tb=line",
                 ],
                 capture_output=True, text=True,
-                cwd="/home/max/aed_hardening_v1",
+                cwd=REPO,
                 timeout=120,
             )
             self.assertEqual(

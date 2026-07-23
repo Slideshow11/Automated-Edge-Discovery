@@ -28,7 +28,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 # ---------------------------------------------------------------------------
 # Needles and blocking words
@@ -641,6 +641,160 @@ def gh_graphql_review_threads(
     return True, threads, ""
 
 
+def _walk_pagination_cursors(
+    *, owner: str, name: str, pr_number: int,
+    page_size: int, safety_cap: int, timeout: int,
+    starting_cursor: Optional[str] = None,
+    starting_pages: int = 0,
+) -> tuple[bool, list[dict[str, Any]], str, int]:
+    """Walk the reviewThreads cursor from the given cursor.
+
+    Returns ``(ok, threads, error_msg, pages_fetched)``.
+
+    Round-69 Codex review 4768843522 (P2): the previous
+    delegate-to-gh_graphql_review_threads approach still
+    stopped at the first page because that helper does
+    not follow pageInfo cursors. This helper performs the
+    cursor walk using ``subprocess.run(``gh api graphql``)``
+    so existing test mocks of ``subprocess.run`` continue
+    to work.
+    """
+    all_threads: list[dict[str, Any]] = []
+    cursor: Optional[str] = starting_cursor
+    pages_fetched = starting_pages
+    while True:
+        pages_fetched += 1
+        if pages_fetched > safety_cap:
+            return False, [], (
+                f"review_thread_inventory_capped: "
+                f"pages={pages_fetched} safety_cap={safety_cap}"
+            ), pages_fetched
+        after_clause = f', after: "{cursor}"' if cursor else ""
+        query_literal = (
+            "query {"
+            f'repository(owner:"{owner}", name:"{name}") {{'
+            f"pullRequest(number:{pr_number}) {{"
+            f"reviewThreads(first:{page_size}{after_clause}) {{"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes {"
+            "id isResolved isOutdated"
+            "comments(first:50) {"
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            "author { login } } } } } } }"
+        )
+        cmd = [
+            "gh", "api", "graphql",
+            "--raw-field", f"query={query_literal}",
+        ]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            ), pages_fetched
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            ), pages_fetched
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            ), pages_fetched
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], (
+                f"invalid GraphQL response: {exc}"
+            ), pages_fetched
+        if not isinstance(data, dict):
+            return False, [], (
+                "GraphQL response is not a JSON object"
+            ), pages_fetched
+        errors = data.get("errors")
+        if errors:
+            return False, [], (
+                f"GraphQL errors: {errors}"
+            ), pages_fetched
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], (
+                "GraphQL response missing data object"
+            ), pages_fetched
+        repository = data_obj.get("repository")
+        if not isinstance(repository, dict):
+            return False, [], (
+                "GraphQL response missing repository"
+            ), pages_fetched
+        pr_data = repository.get("pullRequest")
+        if not isinstance(pr_data, dict):
+            return False, [], (
+                "GraphQL response missing pullRequest"
+            ), pages_fetched
+        threads_container = pr_data.get("reviewThreads")
+        if not isinstance(threads_container, dict):
+            return False, [], (
+                "GraphQL response missing reviewThreads container"
+            ), pages_fetched
+        page_info = threads_container.get("pageInfo") or {}
+        if not isinstance(page_info, dict):
+            return False, [], (
+                "GraphQL reviewThreads.pageInfo is not a dict"
+            ), pages_fetched
+        nodes = threads_container.get("nodes")
+        if not isinstance(nodes, list):
+            return False, [], (
+                "GraphQL reviewThreads.nodes is not a list"
+            ), pages_fetched
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            thread_id = node.get("id", "")
+            is_resolved = bool(node.get("isResolved", False))
+            is_outdated = bool(node.get("isOutdated", False))
+            comments_obj = node.get("comments") or {}
+            nested_page_info = comments_obj.get("pageInfo") or {}
+            if not isinstance(nested_page_info, dict):
+                nested_page_info = {}
+            nested_incomplete = bool(
+                nested_page_info.get("hasNextPage")
+            )
+            if nested_incomplete:
+                return False, [], (
+                    f"nested_comments_not_paginated: thread={thread_id}"
+                ), pages_fetched
+            for comment in (comments_obj.get("nodes") or []):
+                if not isinstance(comment, dict):
+                    continue
+                author_login = (
+                    (comment.get("author") or {}).get("login", "")
+                    if isinstance(comment.get("author"), dict)
+                    else ""
+                )
+                all_threads.append({
+                    "thread_id": thread_id,
+                    "is_resolved": is_resolved,
+                    "is_outdated": is_outdated,
+                    "database_id": comment.get("databaseId"),
+                    "url": comment.get("url") or "",
+                    "author_login": author_login,
+                })
+        if not page_info.get("hasNextPage"):
+            break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true with no "
+                "endCursor"
+            ), pages_fetched
+    return True, all_threads, "", pages_fetched
+
+
 def paginated_review_threads(
     repo: str, pr_number: int,
     *, page_size: int = 100, safety_cap: int = 2000,
@@ -649,52 +803,62 @@ def paginated_review_threads(
     """PHASE 2 (PR #412): production paginated review-thread
     inventory.
 
-    Round-69 Codex review 4764653534 (P2): the original
-    implementation called the shared urllib-based paginator,
-    which the existing ``subprocess.run`` test mocks did not
-    intercept. This implementation:
+    Round-69 Codex reviews 4764653534 and 4768843522 (P2):
+    the previous implementations had two bugs:
+      - the first version used a urllib-based shared
+        paginator that the existing ``subprocess.run`` test
+        mocks did not intercept;
+      - the second version delegated to the inline
+        ``gh_graphql_review_threads`` which still only
+        requests ``reviewThreads(first:100)`` /
+        ``comments(first:50)`` without following the
+        ``pageInfo.hasNextPage`` cursor.
 
+    This implementation:
       - delegates the first page to the existing
         ``gh_graphql_review_threads`` (which uses
-        ``subprocess.run`` and is mockable via ``monkeypatch``);
-      - when that returns ``ok=False`` because the outer
-        ``hasNextPage=true`` or a nested ``comments.pageInfo.hasNextPage=true``,
-        continues fetching additional pages with the
-        returned cursor via direct ``gh api graphql`` calls;
-      - returns the same ``(success, threads_list, error_msg)``
-        tuple shape as :func:`gh_graphql_review_threads`.
+        ``subprocess.run`` and is mockable via
+        ``monkeypatch``). When tests mock it to return
+        ``(True, [], "")`` the wrapper short-circuits and
+        returns the mock result unchanged. This preserves
+        every existing test contract.
+      - when the first page returns ``ok=False`` because
+        the outer ``hasNextPage=true`` or any nested
+        ``comments.pageInfo.hasNextPage=true``, walks the
+        cursor via direct ``gh api graphql`` subprocess
+        calls so the inventory is complete (or the safety
+        cap is exhausted, fail-closed).
 
-    The first page is NEVER treated as the complete
-    inventory when the original fetch reports incomplete
-    outer or nested pagination.
+    Returns ``(success, threads_list, error_msg)`` in the
+    same shape as :func:`gh_graphql_review_threads`.
     """
-    # Round-69: the original code used a urllib-based shared
-    # paginator that the existing test mocks did not
-    # intercept. Delegate to the existing
-    # ``gh_graphql_review_threads`` first so test mocks via
-    # ``monkeypatch.setattr(subprocess, "run", ...)`` continue
-    # to work, then follow up with cursor-based pagination if
-    # needed.
-    ok, threads, err = gh_graphql_review_threads(repo, pr_number)
-    if ok:
-        return True, threads, err
-    # Round-69: if the existing ``gh_graphql_review_threads``
-    # reports incomplete inventory, follow up by walking
-    # additional pages with the returned cursor. The
-    # inventory is only complete when all outer pages and
-    # all nested comment pages have been traversed. For
-    # simplicity in this fix, when the first page reports
-    # incomplete outer pagination we paginate the outer
-    # connection until ``hasNextPage=false`` (or the
-    # safety cap is exhausted, fail-closed). Nested-comment
-    # incompleteness is preserved as a fail-closed error.
     try:
-        all_threads: list[dict[str, Any]] = list(threads or [])
-        return False, all_threads, err
-    except Exception as exc:
-        return False, threads, (
-            f"{err}; pagination_followup_failed: {exc}"
-        )
+        owner, name = repo.split("/", 1)
+    except ValueError:
+        return False, [], f"invalid repo format: {repo!r}"
+    # First page: delegate to ``gh_graphql_review_threads``
+    # so existing test mocks of that helper (via
+    # ``mock.patch.object(crc, "gh_graphql_review_threads",
+    # return_value=(True, [], ""))``) continue to short-circuit
+    # the wrapper for the simple single-page case.
+    ok_first, threads_first, err_first = gh_graphql_review_threads(
+        repo, pr_number
+    )
+    if ok_first:
+        return True, threads_first, err_first
+    # First page reported incomplete inventory. Walk the
+    # cursor via the helper so the inventory is complete.
+    ok, threads, err, _pages = _walk_pagination_cursors(
+        owner=owner, name=name, pr_number=pr_number,
+        page_size=page_size, safety_cap=safety_cap,
+        timeout=timeout, starting_cursor=None, starting_pages=0,
+    )
+    if not ok:
+        # Preserve any visible threads from the first page so
+        # the visible-blocker logic in ``main()`` can still
+        # detect Codex findings on partial inventory.
+        return False, list(threads_first or []) + threads, err
+    return ok, threads, err
 # --------------------------------------------------------------------------
 # GitHub REST API helpers (list-argv, no shell=True)
 # --------------------------------------------------------------------------

@@ -1182,7 +1182,17 @@ def _canonical_review_thread_inventory(
                     "path": comment.get("path", "") or "",
                     "line": comment.get("line"),
                     "original_commit_sha": original_commit_oid,
-                    "participants": thread_participants.get(
+                    # Round-69 Codex review 4768843522 (P2):
+                    # the packet builder at line 2233 reads
+                    # ``t.get("comments")`` to extract the
+                    # per-thread participant list. Storing
+                    # it under "participants" made the
+                    # shared non-human policy reject
+                    # otherwise eligible Codex-only threads
+                    # as ``unknown_actor_in_thread``. Use
+                    # "comments" to match the original key
+                    # the packet builder expects.
+                    "comments": thread_participants.get(
                         thread_id, []
                     ),
                     "nested_incomplete": nested_incomplete,

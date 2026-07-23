@@ -239,6 +239,7 @@ def validate_thread_for_resolution(
     inventory_complete: bool = True,
     review_thread_inventory_complete: bool = True,
     nested_comment_inventory_complete: bool = True,
+    repair_present: bool = True,
 ) -> EligibilityVerdict:
     """Canonical production eligibility decision.
 
@@ -276,6 +277,16 @@ def validate_thread_for_resolution(
         and bool(nested_comment_inventory_complete)
     ):
         return _deny("unknown_actor_in_thread", [])
+
+    # Round-69 Codex review 4768843522 (P1): require
+    # ``repair_present`` evidence before allowing a
+    # Codex-only thread to be auto-resolved. Without this
+    # gate, threads with complete inventory + valid
+    # ancestry + later clean exact-head evidence can be
+    # marked eligible even though the specific finding
+    # was never proven fixed.
+    if not repair_present:
+        return _deny("repair_not_present", [])
 
     # Fail closed when the latest exact-head Codex evidence
     # is not clean.
