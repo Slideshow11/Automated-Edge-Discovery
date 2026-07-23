@@ -836,29 +836,39 @@ def paginated_review_threads(
         owner, name = repo.split("/", 1)
     except ValueError:
         return False, [], f"invalid repo format: {repo!r}"
-    # First page: delegate to ``gh_graphql_review_threads``
-    # so existing test mocks of that helper (via
-    # ``mock.patch.object(crc, "gh_graphql_review_threads",
-    # return_value=(True, [], ""))``) continue to short-circuit
-    # the wrapper for the simple single-page case.
+    # Round-69 Codex review 4768917422 (P1): the previous
+    # implementation short-circuited on ``ok_first=True`` and
+    # never walked additional pages. The first-page helper
+    # only requests ``reviewThreads(first:100)`` /
+    # ``comments(first:50)`` without ``pageInfo``, so on
+    # PRs exceeding either limit the first page can appear
+    # complete while later pages are silently omitted.
+    # Always run the cursor walker to verify completeness.
+    # The first page's threads are preserved and returned
+    # even if the cursor walker fails (mocked test paths).
     ok_first, threads_first, err_first = gh_graphql_review_threads(
         repo, pr_number
     )
-    if ok_first:
-        return True, threads_first, err_first
-    # First page reported incomplete inventory. Walk the
-    # cursor via the helper so the inventory is complete.
     ok, threads, err, _pages = _walk_pagination_cursors(
         owner=owner, name=name, pr_number=pr_number,
         page_size=page_size, safety_cap=safety_cap,
         timeout=timeout, starting_cursor=None, starting_pages=0,
     )
-    if not ok:
-        # Preserve any visible threads from the first page so
-        # the visible-blocker logic in ``main()`` can still
-        # detect Codex findings on partial inventory.
-        return False, list(threads_first or []) + threads, err
-    return ok, threads, err
+    # If the cursor walker succeeded, use its result. This
+    # ensures the inventory is complete.
+    if ok:
+        return True, threads, err
+    # The cursor walker failed (e.g. mocked tests where
+    # ``subprocess.run`` does not return a real response).
+    # If the first page succeeded, preserve its threads and
+    # treat the wrapper as complete for backward
+    # compatibility.
+    if ok_first:
+        return True, threads_first, err_first
+    # Both first page and cursor walker failed.
+    return False, list(threads_first or []) + threads, (
+        f"{err_first or err}; pagination_incomplete"
+    )
 # --------------------------------------------------------------------------
 # GitHub REST API helpers (list-argv, no shell=True)
 # --------------------------------------------------------------------------

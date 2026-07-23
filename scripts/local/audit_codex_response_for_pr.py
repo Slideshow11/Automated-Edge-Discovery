@@ -1054,7 +1054,7 @@ def _canonical_review_thread_inventory(
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "
             "originalCommit { oid } "
-            "author { login } } } } } } }"
+            "author { login } } } } } } } }"
         )
         cmd = [
             "gh", "api", "graphql",
