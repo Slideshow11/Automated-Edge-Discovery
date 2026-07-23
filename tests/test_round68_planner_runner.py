@@ -664,17 +664,21 @@ class SourceContractTests(unittest.TestCase):
         reference only test files that exist in tests/."""
         import os
         from scripts.local import _shared_test_selection as ts
+        # Resolve the repo root relative to this test file
+        # so the test works regardless of the runner's
+        # working directory.
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))
+        )
         for component, tests in ts.TIER_2_SUITES.items():
             if tests == ["FULL_REPOSITORY_SUITE"]:
                 continue
             for test_file in tests:
-                path = os.path.join(
-                    "/home/max/aed_hardening_v1", test_file,
-                )
+                path = os.path.join(repo_root, test_file)
                 self.assertTrue(
                     os.path.exists(path),
                     f"{component} suite references nonexistent "
-                    f"file: {test_file}",
+                    f"file: {test_file} (resolved: {path})",
                 )
 
     def test_facade_log_path_handles_bare_filename(self):
@@ -685,6 +689,12 @@ class SourceContractTests(unittest.TestCase):
         from scripts.local import _production_facade as F
         from scripts.local._shared_test_selection import (
             ValidationTier, select_tests,
+        )
+        # Resolve the repo root relative to this test file
+        # so the test works regardless of the runner's
+        # working directory.
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.abspath(__file__))
         )
         # Create a plan that requires full validation.
         plan = select_tests(
@@ -700,7 +710,7 @@ class SourceContractTests(unittest.TestCase):
             result = F.run_selected_tests(
                 plan=plan,
                 pytest_args=["--co"],  # collect-only, fast
-                cwd="/home/max/aed_hardening_v1",
+                cwd=repo_root,
                 log_path=log_file,
             )
             # The log file MUST exist (proves bare-filename
