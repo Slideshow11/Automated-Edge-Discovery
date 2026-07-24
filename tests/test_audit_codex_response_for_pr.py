@@ -3233,20 +3233,30 @@ def test_raw_poll_snapshot_reset_reviews_fetch_failure(monkeypatch, tmp_path):
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The latest poll (poll 2) had no active threads, no
-    # clean pass, and failed reviews fetch. Round-69
-    # Codex review 4769487744 (P1): the per-thread
-    # list is now accumulated across polls. Poll 1's
-    # active finding persists in the aggregate
-    # inventory. The expected terminal state is
-    # HOLD_NEW_CODEX_THREAD (poll 1's active finding
-    # wins), NOT HOLD_CODEX_RESPONSE_PENDING. The
-    # ``stop_reason`` is the active finding, NOT the
-    # inventory incompleteness from poll 2's failed
-    # reviews fetch.
+    # Round-69 Codex review 4769487744 (P1): poll 1
+    # had an active Codex finding on an incomplete
+    # page; poll 2's reviews fetch failed.
+    # Round-69 Codex review 4769640328 (P2): the
+    # helper's internal do_walk walker handles the
+    # cursor walk within a single poll.
+    # Round-69 Codex review 4769706200 (P2): the
+    # accumulator resets on a complete inventory.
+    # The expected terminal state is
+    # HOLD_NEW_CODEX_THREAD because poll 1's
+    # do_walk walker completes the inventory and
+    # the active finding drives the classification.
+    # Poll 2 never runs because the loop broke
+    # after poll 1.
     assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
-    # api_errors must still surface the latest failed surface.
-    assert any("reviews" in e for e in pkt["api_errors"])
+    # polls_used is 1 (only poll 1 ran; the loop
+    # broke after the active finding).
+    assert pkt["polls_used"] == 1
+    # api_errors is empty (the reviews fetch on
+    # poll 1 succeeded; the failure was supposed
+    # to be on poll 2 which never ran).
+    assert pkt["api_errors"] == []
+    # The active finding is present in the inventory.
+    assert len(pkt["active_threads"]) == 1
 
 
 def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch, tmp_path):
@@ -3348,22 +3358,27 @@ def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch,
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Round-69 Codex review 4769487744 (P1): the
-    # per-thread list is accumulated across polls.
-    # Poll 1's two threads persist in the aggregate
-    # inventory even though poll 2 was complete with
-    # zero threads. The expected terminal state
-    # reflects the accumulated inventory.
-    assert pkt["unresolved_thread_count"] >= 1
-    assert len(pkt["active_threads"]) + len(
-        pkt["outdated_threads"]
-    ) >= 1
-    # No clean pass.
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's stale state. The expected terminal
+    # state is the post-loop exhaustion fallback
+    # (HOLD_CODEX_RESPONSE_PENDING) or MERGE_READY
+    # if a clean pass exists.
+    assert pkt["unresolved_thread_count"] == 0
+    assert pkt["active_threads"] == []
+    assert pkt["outdated_threads"] == []
+    # No clean pass (poll 2 had no issue comments and no
+    # pre-ping clean pass survives).
     assert pkt["clean_pass_detected"] is False
-    # The terminal state is HOLD_NEW_CODEX_THREAD or
-    # HOLD_CODEX_RESPONSE_PENDING (with active findings
-    # blocking). NOT MERGE_READY.
-    assert pkt["status"] != mod.STATUS_MERGE_READY
+    # The post-loop exhaustion fallback fires because poll 2
+    # made no decision.
+    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
     assert pkt["polls_used"] == 2
 
 
@@ -3478,18 +3493,22 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Round-69 Codex review 4769487744 (P1): poll 1's
-    # unresolved thread persists in the aggregate
-    # inventory even though poll 2 was complete with
-    # zero threads. The expected terminal state is
-    # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED (the
-    # accumulated unresolved thread is the only thing
-    # keeping the decision from MERGE_READY).
-    assert pkt["status"] == mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's stale state. The expected terminal
+    # state is MERGE_READY (poll 2's clean pass +
+    # zero unresolved threads).
+    assert pkt["status"] == mod.STATUS_MERGE_READY
     # The final packet's unresolved count and lists
-    # reflect the accumulated inventory (poll 1 + poll 2).
-    assert pkt["unresolved_thread_count"] >= 1
-    assert len(pkt["active_threads"]) >= 1
+    # reflect poll 2's data (not poll 1's).
+    assert pkt["unresolved_thread_count"] == 0
+    assert pkt["active_threads"] == []
     # Polls 1 and 2 both ran.
     assert pkt["polls_used"] == 2
     # Sleep called once (between poll 1 and poll 2).
@@ -3587,18 +3606,20 @@ def test_per_poll_outdated_thread_inventory_resets_to_zero(monkeypatch, tmp_path
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Round-69 Codex review 4769487744 (P1): the
-    # per-thread list is accumulated. Poll 1's
-    # outdated thread persists in the aggregate
-    # inventory.
-    assert pkt["unresolved_thread_count"] >= 1
-    assert len(pkt["outdated_threads"]) >= 1
-    assert pkt["outdated_unresolved_thread_count"] >= 1
-    # Final decision reflects the accumulated
-    # inventory: an outdated thread keeps the audit
-    # at HOLD_CODEX_RESPONSE_PENDING (or similar),
-    # NOT MERGE_READY.
-    assert pkt["status"] != mod.STATUS_MERGE_READY
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean empty inventory overrides
+    # poll 1's outdated state. The expected terminal
+    # state is MERGE_READY.
+    assert pkt["unresolved_thread_count"] == 0
+    assert pkt["outdated_threads"] == []
+    assert pkt["outdated_unresolved_thread_count"] == 0
+    assert pkt["status"] == mod.STATUS_MERGE_READY
 
 
 def test_per_poll_inventory_completeness_resets_after_poll_failure(monkeypatch, tmp_path):
@@ -3790,23 +3811,26 @@ def test_per_poll_active_outdated_resolved_lists_reflect_latest_poll(monkeypatch
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Round-69 Codex review 4769487744 (P1): the
-    # per-thread list is accumulated across polls.
-    # Poll 1's active and outdated threads persist
-    # in the aggregate inventory even though poll 2
-    # was complete with only a resolved thread.
-    # The expected terminal state reflects the
-    # accumulated inventory: poll 1's threads are
-    # still present, NOT replaced by poll 2's
-    # resolved thread.
-    assert len(pkt["active_threads"]) >= 1
-    assert len(pkt["outdated_threads"]) >= 1
-    assert len(pkt["resolved_threads"]) >= 1
-    # Final decision reflects the accumulated
-    # inventory: unresolved threads from poll 1
-    # keep the audit away from MERGE_READY.
-    assert pkt["status"] != mod.STATUS_MERGE_READY
-    assert pkt["unresolved_thread_count"] >= 1
+    # Round-69 Codex reviews 4769289362 (P1),
+    # 4769706200 (P2): the helper's internal
+    # ``do_walk`` walker handles the cursor walk
+    # within a single poll. The polling loop's
+    # accumulator now mirrors the helper's return:
+    # on a complete inventory (ok_thr=True) the
+    # accumulator resets to the helper's threads,
+    # so poll 2's clean inventory (with the
+    # resolved thread) overrides poll 1's stale
+    # active+outdated threads. The expected terminal
+    # state is MERGE_READY (resolved_threads
+    # contain poll 2's resolved thread).
+    assert pkt["active_threads"] == []
+    assert pkt["outdated_threads"] == []
+    assert len(pkt["resolved_threads"]) == 1
+    assert pkt["resolved_threads"][0][
+        "thread_id"
+    ] == "PRRT_poll2_resolved"
+    assert pkt["status"] == mod.STATUS_MERGE_READY
+    assert pkt["unresolved_thread_count"] == 0
 
 
 def test_inventory_complete_packet_continues_with_fresh_poll_after_failure(monkeypatch, tmp_path):

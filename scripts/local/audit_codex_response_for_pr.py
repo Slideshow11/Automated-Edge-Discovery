@@ -1008,19 +1008,19 @@ def _canonical_review_thread_inventory(
     starting_cursor: Optional[str] = None,
     starting_pages: int = 0,
     safety_cap: int = 2000,
-    do_walk: bool = True,
+    do_walk: bool = False,
 ):
     """Canonical review-thread inventory.
 
     Round-69 Codex review 4769640328 (P2): the production
     status/advance/merge path calls this helper with
     ``max_polls=1`` and cannot advance the cursor across
-    multiple poll iterations. When the first page reports
-    ``hasNextPage=true`` the inventory is stuck incomplete
-    forever. To make the one-shot controller path work, the
-    helper walks every page internally (when ``do_walk`` is
-    True) so the classify() polling loop's first call
-    returns a complete inventory.
+    multiple poll iterations. To make the one-shot
+    controller path work, the polling loop in
+    ``classify()`` calls this helper with ``do_walk=True``
+    on the first poll to walk every page internally. The
+    multi-poll cursor path uses ``do_walk=False`` so each
+    poll iteration returns just one page.
 
     This implementation:
       - keeps the ``subprocess.run(``gh api graphql``)`` call
@@ -1237,37 +1237,58 @@ def _canonical_review_thread_inventory(
         # section 8 fails closed. The visible threads are
         # preserved so the visible-blocker logic can detect
         # Codex findings on the visible page.
+        # Round-69 Codex review 4769706200 (P2): when
+        # ``do_walk`` is True and the inventory is
+        # incomplete, do NOT return False early. Fall
+        # through to the walker below so the one-shot
+        # controller path can complete the inventory.
+        # Only return early when ``do_walk`` is False
+        # (i.e. the multi-poll cursor path wants just
+        # one page).
         if outer_has_next or incomplete_nested_thread_ids:
+            if not do_walk:
+                err_msg = ""
+                if incomplete_nested_thread_ids:
+                    err_msg = (
+                        f"nested_comments_not_paginated: thread="
+                        f"{incomplete_nested_thread_ids[0]}"
+                    )
+                else:
+                    # Use a phrase that contains ``pagination
+                    # required`` so existing test contracts that
+                    # assert on this substring continue to match.
+                    err_msg = (
+                        "reviewThreads.pageInfo.hasNextPage=true; "
+                        "pagination required"
+                    )
+                metadata = {
+                    "review_thread_comment_inventory_complete":
+                        not incomplete_nested_thread_ids,
+                    "review_thread_comment_inventory_error_count":
+                        len(incomplete_nested_thread_ids),
+                    "review_thread_comment_incomplete_thread_ids":
+                        list(incomplete_nested_thread_ids),
+                    "review_thread_inventory_complete": False,
+                    "review_thread_inventory_pages": 1,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": err_msg,
+                    "review_thread_pagination_incomplete":
+                        outer_has_next,
+                    "review_thread_pagination_end_cursor":
+                        outer_end_cursor,
+                }
+                return False, all_threads, err_msg, metadata
+            # else: do_walk=True and inventory is
+            # incomplete. Fall through to the success
+            # metadata + walker below so the one-shot
+            # controller path can complete the inventory.
+            # Mark inventory as not complete so the
+            # walker's early-return check sees it.
+            outer_has_next_for_walk = True
             err_msg = ""
-            if incomplete_nested_thread_ids:
-                err_msg = (
-                    f"nested_comments_not_paginated: thread="
-                    f"{incomplete_nested_thread_ids[0]}"
-                )
-            else:
-                # Use a phrase that contains ``pagination
-                # required`` so existing test contracts that
-                # assert on this substring continue to match.
-                err_msg = (
-                    "reviewThreads.pageInfo.hasNextPage=true; "
-                    "pagination required"
-                )
-            metadata = {
-                "review_thread_comment_inventory_complete":
-                    not incomplete_nested_thread_ids,
-                "review_thread_comment_inventory_error_count":
-                    len(incomplete_nested_thread_ids),
-                "review_thread_comment_incomplete_thread_ids":
-                    list(incomplete_nested_thread_ids),
-                "review_thread_inventory_complete": False,
-                "review_thread_inventory_pages": 1,
-                "review_thread_inventory_capped": False,
-                "review_thread_inventory_error": err_msg,
-                "review_thread_pagination_incomplete":
-                    outer_has_next,
-                "review_thread_pagination_end_cursor": outer_end_cursor,
-            }
-            return False, all_threads, err_msg, metadata
+        else:
+            outer_has_next_for_walk = False
+            err_msg = ""
         nested_complete = not incomplete_nested_thread_ids
         metadata = {
             "review_thread_comment_inventory_complete":
@@ -1276,10 +1297,15 @@ def _canonical_review_thread_inventory(
                 len(incomplete_nested_thread_ids),
             "review_thread_comment_incomplete_thread_ids":
                 list(incomplete_nested_thread_ids),
-            "review_thread_inventory_complete": True,
+            "review_thread_inventory_complete":
+                not outer_has_next_for_walk,
             "review_thread_inventory_pages": 1,
             "review_thread_inventory_capped": False,
-            "review_thread_inventory_error": "",
+            "review_thread_inventory_error": err_msg,
+            "review_thread_pagination_incomplete":
+                outer_has_next_for_walk,
+            "review_thread_pagination_end_cursor":
+                outer_end_cursor,
         }
         # Round-69 Codex review 4769640328 (P2):
         # when ``do_walk`` is True and the inventory is
@@ -1355,6 +1381,18 @@ def _canonical_review_thread_inventory(
                             False,
                         )
                     ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
+                        )
+                    ),
                     "review_thread_inventory_pages": pages,
                     "review_thread_inventory_capped": False,
                     "review_thread_inventory_error": err_next,
@@ -1369,6 +1407,18 @@ def _canonical_review_thread_inventory(
                         metadata.get(
                             "review_thread_comment_inventory_complete",
                             False,
+                        )
+                    ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
                         )
                     ),
                     "review_thread_inventory_pages": pages,
@@ -1387,6 +1437,18 @@ def _canonical_review_thread_inventory(
                         metadata.get(
                             "review_thread_comment_inventory_complete",
                             False,
+                        )
+                    ),
+                    "review_thread_comment_inventory_error_count": (
+                        metadata.get(
+                            "review_thread_comment_inventory_error_count",
+                            0,
+                        )
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        metadata.get(
+                            "review_thread_comment_incomplete_thread_ids",
+                            [],
                         )
                     ),
                     "review_thread_inventory_pages": pages,
@@ -1821,9 +1883,24 @@ def classify(
         # helper returns ``ok=False`` so the next poll
         # iteration makes the next call with the cursor.
         owner, name = repo.split("/", 1)
+        # Round-69 Codex review 4769640328 (P2): on
+        # the first poll (or when the previous poll
+        # had no starting cursor), call the helper
+        # with ``do_walk=True`` so the cursor walk
+        # happens within a single audit pass. The
+        # one-shot controller path (``max_polls=1``)
+        # then completes the inventory without
+        # needing multiple poll iterations. The
+        # multi-poll path also benefits: the first
+        # poll completes the inventory and the
+        # remaining polls re-verify.
+        do_walk_this_poll = (
+            pagination_cursor is None
+        )
         ok_thr, thread_data, err_thr, thread_metadata = _canonical_review_thread_inventory(
             owner=owner, name=name, pr_number=pr_number,
             starting_cursor=pagination_cursor,
+            do_walk=do_walk_this_poll,
         )
         if not ok_thr:
             api_errors.append(f"review_threads: {err_thr}")
@@ -1832,26 +1909,30 @@ def classify(
             review_thread_inventory_last_error = err_thr
         # Round-69 Codex reviews 4769289362 (P1),
         # 4769344844 (P1), and 4769487744 (P1):
-        # accumulate per-page thread_data into the
-        # running ``accumulated_review_threads``
-        # ALWAYS, even when the current poll's inventory
-        # is complete. The previous implementations
-        # (a) replaced threads on each poll (losing
-        # earlier pages), and (b) reset the accumulator
-        # when ok_thr=True (losing earlier pages again).
-        # Both behaviors allowed a complete final page
-        # with no threads to mask an active finding on
-        # an earlier incomplete page. Always
-        # accumulate so the aggregate inventory
-        # reflects every page walked across polls.
-        # The Round-18 coherent-refresh contract is
-        # preserved by per-poll resets of the
-        # terminal decision state (final_status,
-        # recommendation, stop_reason, clean_pass_*)
-        # which already happen at the start of each
-        # poll — the per-thread list itself is the
-        # only field that must accumulate.
-        accumulated_review_threads.extend(thread_data or [])
+        # the per-thread list is now handled by the
+        # helper's internal do_walk loop, so the
+        # accumulator simply mirrors the helper's
+        # return value. When the helper returns
+        # ok_thr=True (inventory complete after the
+        # walk), reset the accumulator to the helper's
+        # threads so a fresh first-page poll starts
+        # clean and an old unresolved entry from a
+        # previous poll is replaced by the latest
+        # state. When the helper returns ok_thr=False
+        # (inventory incomplete — walk capped or
+        # errored), extend the accumulator with the
+        # visible threads so the audit's
+        # visible-blocker logic catches the
+        # active-finding even when the cursor walker
+        # fails.
+        if ok_thr:
+            accumulated_review_threads[:] = list(
+                thread_data or []
+            )
+        else:
+            accumulated_review_threads.extend(
+                thread_data or []
+            )
         review_threads = accumulated_review_threads
         # Round-69 Codex review 4769230169 (P2): advance
         # the cursor between polls. When the current poll
