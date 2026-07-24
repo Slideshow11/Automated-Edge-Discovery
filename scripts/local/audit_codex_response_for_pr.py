@@ -1693,7 +1693,22 @@ def classify(
             review_thread_inventory_complete = False
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
-        review_threads = thread_data
+        # Round-69 Codex review 4769289362 (P1): accumulate
+        # review-thread pages across polls instead of
+        # replacing. The previous ``review_threads = thread_data``
+        # assignment discarded earlier pages' threads so a
+        # later complete page with no active threads could
+        # see ``review_thread_inventory_complete=True`` with
+        # ``active_threads=[]`` even when an earlier page
+        # contained an unresolved Codex thread. The cursor
+        # walk must accumulate pages or stay incomplete
+        # until the full aggregate inventory is evaluated.
+        if "review_threads" in dir() and review_threads:
+            review_threads = list(review_threads) + list(
+                thread_data or []
+            )
+        else:
+            review_threads = list(thread_data or [])
         # Round-69 Codex review 4769230169 (P2): advance
         # the cursor between polls. When the current poll
         # returns ``hasNextPage=true`` and the helper
