@@ -997,6 +997,8 @@ def _fetch_review_inline_comments_with_pr(
 def _canonical_review_thread_inventory(
     *, owner, name, pr_number, page_size: int = 100,
     timeout: int = 30,
+    starting_cursor: Optional[str] = None,
+    starting_pages: int = 0,
 ):
     """Canonical review-thread inventory (single page).
 
@@ -1009,6 +1011,11 @@ def _canonical_review_thread_inventory(
     ``hasNextPage`` flag (via the packet's
     ``review_thread_pagination_incomplete`` field) and
     makes another call with the cursor.
+
+    Round-69 Codex review 4768977809 (P2): when ``starting_cursor``
+    is provided, the query requests the page after that
+    cursor so the classify() loop can walk additional pages
+    without an extra in-process loop helper.
 
     This implementation:
       - keeps the ``subprocess.run(``gh api graphql``)`` call
@@ -1042,11 +1049,16 @@ def _canonical_review_thread_inventory(
     outer_has_next = False
     outer_end_cursor: Optional[str] = None
     try:
+        after_clause = (
+            f', after: "{starting_cursor}"'
+            if starting_cursor
+            else ""
+        )
         query_literal = (
             "query {"
             f'repository(owner:"{owner}", name:"{name}") {{'
             f"pullRequest(number:{pr_number}) {{"
-            f"reviewThreads(first:{page_size}) {{"
+            f"reviewThreads(first:{page_size}{after_clause}) {{"
             "pageInfo { hasNextPage endCursor }"
             "nodes {"
             "id isResolved isOutdated"
@@ -1651,6 +1663,13 @@ def classify(
         # is defined above ``classify()`` (not below the
         # ``__main__`` guard) so direct CLI runs invoke the
         # shared paginator.
+        # Round-69 Codex review 4768977809 (P2): the audit
+        # does NOT walk additional pages within a single
+        # poll. The classify() loop is the entity that polls
+        # and each call to the inventory helper is a
+        # single-page fetch. If ``hasNextPage=true`` the
+        # helper returns ``ok=False`` so the next poll
+        # iteration makes the next call with the cursor.
         owner, name = repo.split("/", 1)
         ok_thr, thread_data, err_thr, thread_metadata = _canonical_review_thread_inventory(
             owner=owner, name=name, pr_number=pr_number,

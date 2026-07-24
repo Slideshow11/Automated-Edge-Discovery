@@ -76,6 +76,16 @@ class Finding1EvidenceTests(unittest.TestCase):
             codex_reviewed_sha="0" * 40,
             repo=None,
             ancestry_runner=None,
+            # Round-69 follow-up: the new ``repair_present``
+            # evidence flag defaults to False. Tests in
+            # this class that exercise the eligible path
+            # (``test_complete_evidence_with_eligible_thread_permits``
+            # and friends) must opt in to ``repair_present=True``
+            # via the ``evidence`` kwargs. The new
+            # repair-presence-fail-closed test
+            # (``test_repair_not_present_denies``) explicitly
+            # exercises the False path.
+            repair_present=False,
         )
         kw.update(evidence)
         return is_eligible_for_bot_resolution(thread, **kw)
@@ -203,9 +213,33 @@ class Finding1EvidenceTests(unittest.TestCase):
             no_newer_finding=True,
             live_head_match=True,
             live_head_sha="0" * 40,
+            repair_present=True,
         )
         self.assertTrue(ok, (ok, reason))
         self.assertEqual(reason, "eligible", reason)
+
+    def test_repair_not_present_denies(self):
+        """Round-69 Codex review 4768977809 (P1): when
+        ``repair_present`` is False (no audit evidence that
+        the specific finding was proven fixed), the
+        shared policy MUST fail closed with
+        ``repair_not_present``. This is the production
+        gate that prevents auto-resolution of threads
+        without proven fixes."""
+        ok, reason = self._call(
+            _bot_thread(anchor="1" * 40),
+            inventory_complete=True,
+            review_thread_inventory_complete=True,
+            nested_comment_inventory_complete=True,
+            no_newer_finding=True,
+            live_head_match=True,
+            live_head_sha="0" * 40,
+            # repair_present defaults to False in
+            # ``_call``; explicitly restated for clarity.
+            repair_present=False,
+        )
+        self.assertFalse(ok, (ok, reason))
+        self.assertEqual(reason, "repair_not_present")
 
 
 # ---------------------------------------------------------------------------

@@ -186,6 +186,12 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "no_newer_finding": True,
         "live_head_match": True,
         "live_head_sha": head,
+        # Round-69 follow-up: repair_present must be
+        # True so the legacy F4 tests can isolate the
+        # anchor / actor / codex-shape decisions
+        # without every test constructing an extra
+        # evidence flag.
+        "repair_present": True,
     }
     base.update(overrides)
     return base
@@ -2637,6 +2643,12 @@ class TestRound8CodexOnlyAutoResolution:
             "no_newer_finding": True,
             "live_head_match": True,
             "live_head_sha": DEFAULT_HEAD,
+            # Round-69 follow-up: repair_present default
+            # to True so legacy F4 tests can isolate the
+            # anchor / actor / codex-shape decisions
+            # without every test constructing an extra
+            # evidence flag.
+            "repair_present": True,
         }
         base.update(overrides)
         return base
@@ -2792,6 +2804,10 @@ class TestRound8CodexOnlyAutoResolution:
             no_newer_finding=True,
             live_head_match=True,
             live_head_sha=DEFAULT_HEAD,
+            # Round-69 follow-up: explicit repair_present
+            # so the legacy F4 test keeps its intent of
+            # partitioning by thread shape.
+            repair_present=True,
         )
         eligible_ids = [t["thread_id"] for t in result["eligible"]]
         assert eligible_ids == ["T-CODEX-A"]
@@ -5009,6 +5025,11 @@ class TestRound14RequireNonemptyThreadParticipants:
         (e.g. ``human_reply``, ``actor_not_codex``,
         ``nonempty complete Codex-only``) need the new
         flags passed to reach the actor/anchor checks.
+
+        Round-69 follow-up: ``repair_present`` must be
+        True so these tests can isolate the actor /
+        anchor decisions without every test constructing
+        an extra evidence flag.
         """
         base = {
             "head_sha": head_sha,
@@ -5021,6 +5042,7 @@ class TestRound14RequireNonemptyThreadParticipants:
             "no_newer_finding": True,
             "live_head_match": True,
             "live_head_sha": head_sha,
+            "repair_present": True,
         }
         base.update(overrides)
         return base

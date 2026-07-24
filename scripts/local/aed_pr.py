@@ -3484,6 +3484,7 @@ def select_eligible_bot_threads(
     no_newer_finding: bool = False,
     live_head_match: bool = False,
     live_head_sha: Optional[str] = None,
+    repair_present: bool = False,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run the eligibility checker over a thread inventory.
 
@@ -3524,6 +3525,12 @@ def select_eligible_bot_threads(
             no_newer_finding=no_newer_finding,
             live_head_match=live_head_match,
             live_head_sha=live_head_sha,
+            # Round-69 Codex review 4768977809 (P1): forward
+            # the caller's repair_present evidence. The
+            # default is False so missing evidence fails
+            # closed. Production callers MUST derive this
+            # from real audit evidence.
+            repair_present=repair_present,
         )
         annotated = dict(thread)
         annotated["reason"] = reason
@@ -3994,6 +4001,32 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Pass the live head so the policy can verify
         # it hasn't moved since the audit was collected.
         live_head_sha=str(head_sha) if head_sha else None,
+        # ``repair_present`` MUST be derived from real
+        # audit evidence. The Round-69 Codex reviews
+        # 4768843522 (P1) and 4768977809 (P1) require a
+        # non-hard-coded signal. The defensible production
+        # signal is the conjunction of:
+        #   - clean latest exact-head Codex evidence (a
+        #     later clean response on the current head
+        #     is necessary but not sufficient);
+        #   - the latest exact-head Codex evidence is
+        #     fresh (reviewed_sha == head_sha);
+        #   - the audit reports ``codex_clean_passed=True``
+        #     (a clean artifact exists).
+        # This is the strongest signal available without
+        # per-thread diff analysis. Per-thread narrowing
+        # can be added later by checking whether the
+        # thread's specific file:line was touched in the
+        # current head's diff. Defaulting to False would
+        # block legitimate resolutions; the three-way
+        # conjunction matches the policy's other
+        # ``live_head_match`` and ``no_newer_finding``
+        # evidence derivation.
+        repair_present=bool(
+            R.is_codex_clean_verdict(evidence.codex_verdict)
+            and evidence.codex_artifact_fresh is True
+            and evidence.codex_clean_passed is True
+        ),
     )
     eligible_thread_records = [
         {

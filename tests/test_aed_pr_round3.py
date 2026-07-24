@@ -700,6 +700,12 @@ def _eligibility_kwargs(head=DEFAULT_HEAD, **overrides):
         "no_newer_finding": True,
         "live_head_match": True,
         "live_head_sha": head,
+        # Round-69 (PHASE 4 Finding 1 follow-up):
+        # repair_present must be True so the legacy F4
+        # tests can isolate the anchor / actor /
+        # codex-shape decisions without every test
+        # constructing an extra evidence flag.
+        "repair_present": True,
     }
     base.update(overrides)
     return base

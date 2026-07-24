@@ -792,6 +792,7 @@ def is_eligible_for_bot_resolution(
     no_newer_finding: bool = False,
     live_head_match: bool = False,
     live_head_sha: Optional[str] = None,
+    repair_present: bool = False,
 ) -> Tuple[bool, str]:
     """Return ``(eligible, reason)`` for a single review thread.
 
@@ -858,7 +859,16 @@ def is_eligible_for_bot_resolution(
             nested_comment_inventory_complete=bool(
                 nested_comment_inventory_complete
             ),
-            repair_present=True,
+            # Round-69 Codex review 4768977809 (P1): forward
+            # the caller's repair_present evidence. The
+            # previous implementation hard-coded True,
+            # allowing threads without proven fixes to be
+            # auto-resolved. The default is False so a
+            # caller that forgets to pass the argument
+            # fails closed. Production callers (cmd_advance
+            # → select_eligible_bot_threads) MUST derive
+            # this from real audit evidence.
+            repair_present=bool(repair_present),
             no_newer_finding=bool(no_newer_finding),
             live_head_match=effective_live_head_match,
             ancestry_runner=ancestry_runner,

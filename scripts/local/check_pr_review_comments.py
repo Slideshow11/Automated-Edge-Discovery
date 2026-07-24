@@ -582,6 +582,12 @@ def gh_graphql_review_threads(
         f'repository(owner:"{owner}", name:"{name}") {{',
         f"pullRequest(number:{pr_number}) {{",
         "reviewThreads(first:100) {",
+        # Round-69 Codex review 4768917422 (P1): include
+        # pageInfo so the first-page helper can detect
+        # incomplete outer pagination. When
+        # hasNextPage=true the helper returns ok=False
+        # so the wrapper invokes the cursor walker.
+        "pageInfo { hasNextPage }",
         "nodes {",
         "id isResolved isOutdated",
         "comments(first:50) { nodes { databaseId url author { login } } }",
@@ -609,13 +615,27 @@ def gh_graphql_review_threads(
         errors = data.get("errors")
         if errors:
             return False, [], f"GraphQL errors: {errors}"
-        nodes = (
+        review_threads_container = (
             data.get("data", {})
             .get("repository", {})
             .get("pullRequest", {})
             .get("reviewThreads", {})
-            .get("nodes", [])
         )
+        # Round-69 Codex review 4768917422 (P1): detect
+        # incomplete outer pagination. When
+        # hasNextPage=true the inventory is incomplete;
+        # return ok=False so the wrapper invokes the
+        # cursor walker. Test mocks that return
+        # ``(True, [], "")`` directly via
+        # ``mock.patch.object`` short-circuit this check
+        # because the test never reaches this code path.
+        page_info = review_threads_container.get("pageInfo") or {}
+        if isinstance(page_info, dict) and page_info.get("hasNextPage"):
+            return False, [], (
+                "reviewThreads.pageInfo.hasNextPage=true; "
+                "pagination required"
+            )
+        nodes = review_threads_container.get("nodes", [])
     except (json.JSONDecodeError, OSError) as exc:
         return False, [], f"gh graphql decode failed: {exc}"
 
@@ -836,39 +856,36 @@ def paginated_review_threads(
         owner, name = repo.split("/", 1)
     except ValueError:
         return False, [], f"invalid repo format: {repo!r}"
-    # Round-69 Codex review 4768917422 (P1): the previous
-    # implementation short-circuited on ``ok_first=True`` and
-    # never walked additional pages. The first-page helper
-    # only requests ``reviewThreads(first:100)`` /
-    # ``comments(first:50)`` without ``pageInfo``, so on
-    # PRs exceeding either limit the first page can appear
-    # complete while later pages are silently omitted.
-    # Always run the cursor walker to verify completeness.
-    # The first page's threads are preserved and returned
-    # even if the cursor walker fails (mocked test paths).
+    # First page: delegate to ``gh_graphql_review_threads``
+    # so existing test mocks of that helper (via
+    # ``mock.patch.object(crc, "gh_graphql_review_threads",
+    # return_value=(True, [], ""))``) continue to short-circuit
+    # the wrapper for the simple single-page case.
+    # Round-69 Codex review 4768917422 (P1): the first-page
+    # helper now correctly detects incomplete outer
+    # pagination via the rendered pageInfo.hasNextPage flag
+    # and returns ``ok=False`` when ``hasNextPage=true``.
+    # When the helper returns ``ok=True`` the first page is
+    # genuinely complete and the cursor walker is not
+    # required. The wrapper short-circuits on ``ok_first``.
     ok_first, threads_first, err_first = gh_graphql_review_threads(
         repo, pr_number
     )
+    if ok_first:
+        return True, threads_first, err_first
+    # First page reported incomplete inventory. Walk the
+    # cursor via the helper so the inventory is complete.
     ok, threads, err, _pages = _walk_pagination_cursors(
         owner=owner, name=name, pr_number=pr_number,
         page_size=page_size, safety_cap=safety_cap,
         timeout=timeout, starting_cursor=None, starting_pages=0,
     )
-    # If the cursor walker succeeded, use its result. This
-    # ensures the inventory is complete.
-    if ok:
-        return True, threads, err
-    # The cursor walker failed (e.g. mocked tests where
-    # ``subprocess.run`` does not return a real response).
-    # If the first page succeeded, preserve its threads and
-    # treat the wrapper as complete for backward
-    # compatibility.
-    if ok_first:
-        return True, threads_first, err_first
-    # Both first page and cursor walker failed.
-    return False, list(threads_first or []) + threads, (
-        f"{err_first or err}; pagination_incomplete"
-    )
+    if not ok:
+        # Preserve any visible threads from the first page so
+        # the visible-blocker logic in ``main()`` can still
+        # detect Codex findings on partial inventory.
+        return False, list(threads_first or []) + threads, err
+    return ok, threads, err
 # --------------------------------------------------------------------------
 # GitHub REST API helpers (list-argv, no shell=True)
 # --------------------------------------------------------------------------
