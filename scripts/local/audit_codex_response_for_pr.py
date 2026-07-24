@@ -51,7 +51,6 @@ import argparse
 import json
 import re
 import subprocess
-import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1931,6 +1930,38 @@ def classify(
             review_thread_inventory_complete = False
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
+        # Round-69 Codex review 4769856466 (P2): the
+        # helper can return ok_thr=True after walking
+        # later outer pages while its metadata still
+        # reports
+        # review_thread_comment_inventory_complete=False
+        # (e.g. a non-final page had
+        # comments.pageInfo.hasNextPage=true). The
+        # section 8 inventory gate only checks the
+        # boolean flag, so on PRs with multiple
+        # review-thread pages and a long thread on an
+        # earlier page, the audit could emit
+        # CODEX_CLEAN_PASS / merge-ready even though
+        # later nested comments were never fetched.
+        # Honor the metadata's explicit completeness
+        # flags here so the gate fails closed when the
+        # nested-comment inventory is incomplete.
+        if ok_thr and not thread_metadata.get(
+            "review_thread_comment_inventory_complete", False
+        ):
+            review_thread_inventory_complete = False
+            review_thread_inventory_error_count += 1
+            review_thread_inventory_last_error = (
+                "review_thread_comment_inventory_incomplete"
+            )
+        if ok_thr and not thread_metadata.get(
+            "review_thread_inventory_complete", False
+        ):
+            review_thread_inventory_complete = False
+            review_thread_inventory_error_count += 1
+            review_thread_inventory_last_error = (
+                "review_thread_inventory_incomplete"
+            )
         # Round-69 Codex reviews 4769289362 (P1),
         # 4769344844 (P1), and 4769487744 (P1):
         # the per-thread list is now handled by the
