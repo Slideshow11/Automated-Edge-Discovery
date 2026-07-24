@@ -1065,6 +1065,7 @@ def _r18_run_advance(
     refreshed_packet,
     resolution_results=None,
     head_sha="0" * 40,
+    repair_present=True,
 ):
     """Drive ``cmd_advance --resolve-eligible-bot-threads``
     end-to-end with a mocked environment.
@@ -1081,6 +1082,11 @@ def _r18_run_advance(
     resolution_results : list[tuple(thread_id, ok)]
         Per-eligible-thread resolution outcomes. The default
         resolves every eligible thread successfully.
+    repair_present : bool
+        Default True so the Round-18 coherent-refresh tests
+        can isolate the action-report behavior. The
+        production ``cmd_advance`` defaults to False
+        (Round-69 Codex review 4769230169 P1 fail-closed).
     """
     import io
     saved_root = ctrl._CANONICAL_SCOPE_ROOT
@@ -1128,6 +1134,16 @@ def _r18_run_advance(
     args.forbidden_files = None
     args.dry_run = False
     args.resolve_eligible_bot_threads = True
+    # Round-69 follow-up: the production ``cmd_advance``
+    # default is ``repair_present=False`` (P1
+    # fail-closed). Tests in this class exercise the
+    # coherent-refresh behavior under the assumption
+    # that ``repair_present=True`` was explicitly set
+    # (e.g. via the ``--repair-present`` CLI flag or
+    # a future per-thread diff gate). Set the flag on
+    # the test args so the resolution attempt can
+    # actually reach eligible threads.
+    args.repair_present = repair_present
     args.ancestry_runner = lambda *a, **kw: _FakeProc(0, "ahead", "")
 
     fake_proc = _r18_make_fake_subprocess(head)

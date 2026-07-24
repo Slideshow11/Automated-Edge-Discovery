@@ -590,7 +590,17 @@ def gh_graphql_review_threads(
         "pageInfo { hasNextPage }",
         "nodes {",
         "id isResolved isOutdated",
-        "comments(first:50) { nodes { databaseId url author { login } } }",
+        # Round-69 Codex review 4769230169 (P2): include
+        # the nested comments pageInfo so the first-page
+        # helper can detect incomplete nested comment
+        # pagination. When any thread's
+        # ``comments.pageInfo.hasNextPage=true`` the
+        # helper returns ok=False so the wrapper invokes
+        # the cursor walker (or the audit's visible-blocker
+        # logic catches the current-finding).
+        "comments(first:50) {"
+        "pageInfo { hasNextPage }"
+        "nodes { databaseId url author { login } } }",
         "}",  # close nodes
         "}",  # close reviewThreads
         "}",  # close pullRequest
@@ -636,6 +646,28 @@ def gh_graphql_review_threads(
                 "pagination required"
             )
         nodes = review_threads_container.get("nodes", [])
+        # Round-69 Codex review 4769230169 (P2): detect
+        # incomplete nested comment pagination. When any
+        # thread's ``comments.pageInfo.hasNextPage=true`` the
+        # nested inventory is incomplete. Return ok=False
+        # so the wrapper invokes the cursor walker (which
+        # walks nested comments via the
+        # ``_walk_pagination_cursors`` helper).
+        for _node in nodes:
+            if not isinstance(_node, dict):
+                continue
+            _comments = _node.get("comments") or {}
+            if not isinstance(_comments, dict):
+                continue
+            _nested_pi = _comments.get("pageInfo") or {}
+            if (
+                isinstance(_nested_pi, dict)
+                and _nested_pi.get("hasNextPage")
+            ):
+                return False, [], (
+                    "reviewThreads.comments.pageInfo.hasNextPage=true; "
+                    "nested pagination required"
+                )
     except (json.JSONDecodeError, OSError) as exc:
         return False, [], f"gh graphql decode failed: {exc}"
 

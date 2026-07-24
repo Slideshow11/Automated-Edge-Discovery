@@ -1432,6 +1432,19 @@ def classify(
                 "'2026-06-11T17:30:00+00:00') and re-run."
             )
 
+    # Round-69 Codex review 4769230169 (P2): advance the
+    # review-thread cursor between audit polls. The
+    # previous implementation called
+    # ``_canonical_review_thread_inventory`` on every
+    # poll with the same ``starting_cursor=None`` so PRs
+    # with more than ``page_size`` review threads would
+    # refetch the same first page on every poll and
+    # ``review_thread_inventory_complete`` would stay
+    # False until ``max_polls`` expired. Track the
+    # last seen endCursor across polls and pass it as
+    # the next poll's starting cursor. Reset on a fresh
+    # classification cycle.
+    pagination_cursor: Optional[str] = None
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
 
@@ -1673,6 +1686,7 @@ def classify(
         owner, name = repo.split("/", 1)
         ok_thr, thread_data, err_thr, thread_metadata = _canonical_review_thread_inventory(
             owner=owner, name=name, pr_number=pr_number,
+            starting_cursor=pagination_cursor,
         )
         if not ok_thr:
             api_errors.append(f"review_threads: {err_thr}")
@@ -1680,6 +1694,25 @@ def classify(
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
         review_threads = thread_data
+        # Round-69 Codex review 4769230169 (P2): advance
+        # the cursor between polls. When the current poll
+        # returns ``hasNextPage=true`` and the helper
+        # exposes a ``review_thread_pagination_end_cursor``,
+        # use it as the next poll's starting cursor so
+        # the audit eventually walks every page of the
+        # review-thread connection. When ``hasNextPage=false``
+        # (inventory complete), reset the cursor to None
+        # so the next fresh classification cycle starts at
+        # the first page.
+        _outer_end_cursor = thread_metadata.get(
+            "review_thread_pagination_end_cursor"
+        )
+        if ok_thr and not thread_metadata.get(
+            "review_thread_pagination_incomplete", False
+        ):
+            pagination_cursor = None
+        else:
+            pagination_cursor = _outer_end_cursor or pagination_cursor
         # Propagate the nested-comment inventory state from the
         # fetch metadata. The metadata flags are reported as-is;
         # the section 8 inventory gate will refuse merge-ready if

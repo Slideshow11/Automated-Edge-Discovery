@@ -883,6 +883,20 @@ def is_eligible_for_bot_resolution(
             return False, _shared_verdict.reasons[0]
         return False, "policy_ineligible"
 
+    # Round-69 Codex review 4769230169 (P1): if the shared
+    # policy import failed, do NOT silently fall through
+    # to the legacy resolver path below. The legacy
+    # resolver does not consult the new fail-closed
+    # evidence arguments (inventory_complete,
+    # repair_present, no_newer_finding, live_head_match).
+    # Returning ``(False, "shared_policy_unavailable")``
+    # blocks resolution until the shared policy module
+    # is importable, ensuring the hardened
+    # inventory/repair/live-head checks are actually
+    # applied. Import uncertainty must not opt into
+    # legacy behavior.
+    return False, "shared_policy_unavailable"
+
     if not isinstance(thread, dict):
         return False, "actor_not_bot"
 

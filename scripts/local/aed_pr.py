@@ -4001,31 +4001,16 @@ def cmd_advance(args: argparse.Namespace) -> int:
         # Pass the live head so the policy can verify
         # it hasn't moved since the audit was collected.
         live_head_sha=str(head_sha) if head_sha else None,
-        # ``repair_present`` MUST be derived from real
-        # audit evidence. The Round-69 Codex reviews
-        # 4768843522 (P1) and 4768977809 (P1) require a
-        # non-hard-coded signal. The defensible production
-        # signal is the conjunction of:
-        #   - clean latest exact-head Codex evidence (a
-        #     later clean response on the current head
-        #     is necessary but not sufficient);
-        #   - the latest exact-head Codex evidence is
-        #     fresh (reviewed_sha == head_sha);
-        #   - the audit reports ``codex_clean_passed=True``
-        #     (a clean artifact exists).
-        # This is the strongest signal available without
-        # per-thread diff analysis. Per-thread narrowing
-        # can be added later by checking whether the
-        # thread's specific file:line was touched in the
-        # current head's diff. Defaulting to False would
-        # block legitimate resolutions; the three-way
-        # conjunction matches the policy's other
-        # ``live_head_match`` and ``no_newer_finding``
-        # evidence derivation.
+        # ``repair_present`` defaults to False
+        # (Round-69 Codex review 4769230169 P1
+        # fail-closed). The operator can opt in via
+        # ``--repair-present`` on the CLI when they
+        # have independently verified per-thread
+        # repair evidence (e.g. a per-thread diff
+        # content check). Without this opt-in, no
+        # thread can be auto-resolved.
         repair_present=bool(
-            R.is_codex_clean_verdict(evidence.codex_verdict)
-            and evidence.codex_artifact_fresh is True
-            and evidence.codex_clean_passed is True
+            getattr(args, "repair_present", False)
         ),
     )
     eligible_thread_records = [
@@ -5081,6 +5066,19 @@ def build_parser() -> argparse.ArgumentParser:
             "resolution and only reports eligibility. Use with care; "
             "this can never resolve human-authored or current-bot "
             "threads."
+        ),
+    )
+    p_advance.add_argument(
+        "--repair-present", action="store_true", default=False,
+        help=(
+            "Override the default repair_present=False in "
+            "``select_eligible_bot_threads``. Set this when the "
+            "operator has independently verified that the "
+            "audit's threads are backed by real per-thread "
+            "repair evidence (e.g. the commit touching the "
+            "file:line the thread points to is in the diff). "
+            "Without this override ``advance`` will resolve "
+            "zero threads (the Round-69 fail-closed default)."
         ),
     )
     p_advance.set_defaults(func=cmd_advance)
