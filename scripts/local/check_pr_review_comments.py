@@ -730,6 +730,13 @@ def _walk_pagination_cursors(
                 f"pages={pages_fetched} safety_cap={safety_cap}"
             ), pages_fetched
         after_clause = f', after: "{cursor}"' if cursor else ""
+        # Round-69 Codex review 4769487744 (P2): balance
+        # the cursor-walker GraphQL query. The previous
+        # query had 11 ``{`` and 10 ``}`` (one missing
+        # closing brace) so GitHub returned a GraphQL
+        # parse error before any later pages could be
+        # read. Added one more ``}`` to close the outer
+        # query brace.
         query_literal = (
             "query {"
             f'repository(owner:"{owner}", name:"{name}") {{'
@@ -742,7 +749,7 @@ def _walk_pagination_cursors(
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "
             "originalCommit { oid } "
-            "author { login } } } } } } }"
+            "author { login } } } } } } } }"
         )
         cmd = [
             "gh", "api", "graphql",

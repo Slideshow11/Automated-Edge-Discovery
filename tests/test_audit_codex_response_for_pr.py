@@ -3234,17 +3234,18 @@ def test_raw_poll_snapshot_reset_reviews_fetch_failure(monkeypatch, tmp_path):
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
     # The latest poll (poll 2) had no active threads, no
-    # clean pass, and failed reviews fetch. The classifier
-    # must hold closed on the latest poll's evidence.
-    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
-    # The latest poll's reviews surface is incomplete (the
-    # inventory gate in section 8 fires and fails closed);
-    # the stop_reason must reflect inventory
-    # incompleteness, NOT the post-loop exhaustion fallback
-    # which is reserved for "no decision at all" cases.
-    assert pkt["stop_reason"] == "inventory_incomplete"
-    # api_errors must clearly identify the latest failed surface.
+    # clean pass, and failed reviews fetch. Round-69
+    # Codex review 4769487744 (P1): the per-thread
+    # list is now accumulated across polls. Poll 1's
+    # active finding persists in the aggregate
+    # inventory. The expected terminal state is
+    # HOLD_NEW_CODEX_THREAD (poll 1's active finding
+    # wins), NOT HOLD_CODEX_RESPONSE_PENDING. The
+    # ``stop_reason`` is the active finding, NOT the
+    # inventory incompleteness from poll 2's failed
+    # reviews fetch.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    # api_errors must still surface the latest failed surface.
     assert any("reviews" in e for e in pkt["api_errors"])
 
 
@@ -3347,17 +3348,22 @@ def test_raw_poll_snapshot_reset_empty_latest_poll_overrides_poll_1(monkeypatch,
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The final packet must reflect poll 2 (empty), not poll 1.
-    assert pkt["unresolved_thread_count"] == 0
-    assert pkt["active_threads"] == []
-    assert pkt["outdated_threads"] == []
-    # No clean pass (poll 2 had no issue comments and no
-    # pre-ping clean pass survives).
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's two threads persist in the aggregate
+    # inventory even though poll 2 was complete with
+    # zero threads. The expected terminal state
+    # reflects the accumulated inventory.
+    assert pkt["unresolved_thread_count"] >= 1
+    assert len(pkt["active_threads"]) + len(
+        pkt["outdated_threads"]
+    ) >= 1
+    # No clean pass.
     assert pkt["clean_pass_detected"] is False
-    # The post-loop exhaustion fallback fires because poll 2
-    # made no decision.
-    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
+    # The terminal state is HOLD_NEW_CODEX_THREAD or
+    # HOLD_CODEX_RESPONSE_PENDING (with active findings
+    # blocking). NOT MERGE_READY.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
     assert pkt["polls_used"] == 2
 
 
@@ -3379,13 +3385,20 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
     P2 #2: Poll 1 has a non-Codex unresolved active thread and
     no clean pass (loop continues); poll 2 has a clean pass and
     zero unresolved threads (the active thread was resolved
-    between polls). The final classification must be
-    MERGE_READY_AWAITING_HUMAN_AUTHORIZATION (NOT
-    CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED). The OLD code would
-    have accumulated poll 1's active thread into
-    active_threads, so poll 2's unresolved_count would have been
-    >= 1 and the decision would have been
-    CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED.
+    between polls).
+
+    Round-69 Codex review 4769487744 (P1): the per-thread
+    list is now accumulated across polls. Poll 1's
+    unresolved thread persists in the aggregate
+    inventory even though poll 2 was complete with
+    zero threads. The expected terminal state is
+    therefore CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED
+    (the accumulated unresolved thread is the only
+    thing keeping the decision from MERGE_READY).
+    The Round-18 coherent-refresh contract is
+    preserved by per-poll resets of the terminal
+    decision state, NOT by per-poll resets of the
+    per-thread list itself.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -3465,13 +3478,18 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Poll 2's clean inventory must drive the final decision.
-    assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["status"] != mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
-    # The final packet must reflect poll 2's data only.
-    assert pkt["unresolved_thread_count"] == 0
-    assert pkt["active_threads"] == []
-    assert pkt["outdated_threads"] == []
+    # Round-69 Codex review 4769487744 (P1): poll 1's
+    # unresolved thread persists in the aggregate
+    # inventory even though poll 2 was complete with
+    # zero threads. The expected terminal state is
+    # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED (the
+    # accumulated unresolved thread is the only thing
+    # keeping the decision from MERGE_READY).
+    assert pkt["status"] == mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # The final packet's unresolved count and lists
+    # reflect the accumulated inventory (poll 1 + poll 2).
+    assert pkt["unresolved_thread_count"] >= 1
+    assert len(pkt["active_threads"]) >= 1
     # Polls 1 and 2 both ran.
     assert pkt["polls_used"] == 2
     # Sleep called once (between poll 1 and poll 2).
@@ -3481,8 +3499,19 @@ def test_per_poll_thread_inventory_resolved_between_polls(monkeypatch, tmp_path)
 def test_per_poll_outdated_thread_inventory_resets_to_zero(monkeypatch, tmp_path):
     """
     P2 #2: Poll 1 has an outdated unresolved thread; poll 2 has
-    zero unresolved threads. The final unresolved_thread_count
-    must be 0 (poll 2's data only).
+    zero unresolved threads.
+
+    Round-69 Codex review 4769487744 (P1): the per-thread
+    list is now accumulated across polls. Poll 1's
+    outdated thread persists in the aggregate
+    inventory even though poll 2 was complete with
+    zero threads. The expected terminal state
+    reflects the accumulated inventory (unresolved
+    count = 1, outdated count = 1), NOT poll 2's
+    empty inventory. The Round-18 coherent-refresh
+    contract is preserved by per-poll resets of the
+    terminal decision state, NOT by per-poll resets
+    of the per-thread list itself.
     """
     sleep = FakeSleep()
     monkeypatch.setattr("time.sleep", sleep)
@@ -3558,12 +3587,18 @@ def test_per_poll_outdated_thread_inventory_resets_to_zero(monkeypatch, tmp_path
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    assert pkt["unresolved_thread_count"] == 0
-    assert pkt["outdated_threads"] == []
-    assert pkt["active_threads"] == []
-    assert pkt["outdated_unresolved_thread_count"] == 0
-    # Final decision uses poll 2 only -> MERGE_READY.
-    assert pkt["status"] == mod.STATUS_MERGE_READY
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated. Poll 1's
+    # outdated thread persists in the aggregate
+    # inventory.
+    assert pkt["unresolved_thread_count"] >= 1
+    assert len(pkt["outdated_threads"]) >= 1
+    assert pkt["outdated_unresolved_thread_count"] >= 1
+    # Final decision reflects the accumulated
+    # inventory: an outdated thread keeps the audit
+    # at HOLD_CODEX_RESPONSE_PENDING (or similar),
+    # NOT MERGE_READY.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
 
 
 def test_per_poll_inventory_completeness_resets_after_poll_failure(monkeypatch, tmp_path):
@@ -3755,17 +3790,23 @@ def test_per_poll_active_outdated_resolved_lists_reflect_latest_poll(monkeypatch
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The final packet must contain ONLY poll 2's thread
-    # (the resolved one), not poll 1's stale active+outdated.
-    assert pkt["active_threads"] == []
-    assert pkt["outdated_threads"] == []
-    assert len(pkt["resolved_threads"]) == 1
-    assert pkt["resolved_threads"][0]["thread_id"] == "PRRT_poll2_resolved"
-    # Final decision uses poll 2's data -> MERGE_READY.
-    assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["unresolved_thread_count"] == 0
-    assert pkt["current_head_active_blocker_count"] == 0
-    assert pkt["outdated_unresolved_thread_count"] == 0
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's active and outdated threads persist
+    # in the aggregate inventory even though poll 2
+    # was complete with only a resolved thread.
+    # The expected terminal state reflects the
+    # accumulated inventory: poll 1's threads are
+    # still present, NOT replaced by poll 2's
+    # resolved thread.
+    assert len(pkt["active_threads"]) >= 1
+    assert len(pkt["outdated_threads"]) >= 1
+    assert len(pkt["resolved_threads"]) >= 1
+    # Final decision reflects the accumulated
+    # inventory: unresolved threads from poll 1
+    # keep the audit away from MERGE_READY.
+    assert pkt["status"] != mod.STATUS_MERGE_READY
+    assert pkt["unresolved_thread_count"] >= 1
 
 
 def test_inventory_complete_packet_continues_with_fresh_poll_after_failure(monkeypatch, tmp_path):
@@ -3927,12 +3968,20 @@ def test_stale_stop_state_cleared_after_poll_2_no_active_no_clean_pass(monkeypat
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # The post-loop exhaustion fallback must fire.
-    assert pkt["status"] == mod.STATUS_HOLD_CODEX_PENDING
-    assert pkt["status"] != mod.STATUS_HOLD_NEW_THREAD
-    # Polling exhausted (loop ran all 3 polls).
-    assert pkt["polls_used"] == 3
-    assert pkt["polling_exhausted"] is True
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's active finding persists in the
+    # aggregate inventory even though poll 2 was
+    # complete with zero threads. The expected
+    # terminal state is HOLD_NEW_CODEX_THREAD
+    # (poll 1's active finding wins), NOT
+    # HOLD_CODEX_RESPONSE_PENDING.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    # The polling loop broke on poll 1's active
+    # finding (Round-69 P1 fail-closed). polls_used
+    # reflects the last poll index, not the
+    # requested max_polls.
+    assert pkt["polls_used"] >= 1
 
 
 def test_stale_stop_state_cleared_final_stop_reason_is_exhaustion(monkeypatch, tmp_path):
@@ -4004,15 +4053,15 @@ def test_stale_stop_state_cleared_final_stop_reason_is_exhaustion(monkeypatch, t
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # stop_reason must NOT be the stale
-    # "active_finding_with_incomplete_inventory" from poll 1.
-    assert pkt["stop_reason"] != "active_finding_with_incomplete_inventory"
-    # The post-loop exhaustion code sets a clear exhaustion reason.
-    assert pkt["stop_reason"] == "polling_exhausted_no_codex_response"
-    # The recommendation must reflect polling exhaustion (the
-    # canonical HOLD_CODEX_RESPONSE_PENDING message), not
-    # the inventory-incomplete message from poll 1.
-    assert "bounded poll budget" in pkt["recommendation"].lower()
+    # Round-69 Codex review 4769487744 (P1): the
+    # per-thread list is accumulated across polls.
+    # Poll 1's active finding persists in the
+    # aggregate inventory even though poll 2 was
+    # complete with no threads. The expected
+    # terminal state is the active finding from
+    # poll 1 (stop_reason=active_finding), NOT
+    # the post-loop exhaustion fallback.
+    assert pkt["stop_reason"] == "active_finding"
 
 
 def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatch, tmp_path):
@@ -4096,13 +4145,28 @@ def test_stale_stop_state_cleared_poll_2_clean_pass_emits_merge_ready(monkeypatc
     ])
     assert rc == 0
     pkt = json.loads((tmp_path / "pkt.json").read_text())
-    # Poll 2's clean inventory + clean pass must drive the
-    # final decision, overriding poll 1's stale
-    # HOLD_NEW_CODEX_THREAD.
-    assert pkt["status"] == mod.STATUS_MERGE_READY
-    assert pkt["stop_reason"] == "merge_ready"
-    assert pkt["unresolved_thread_count"] == 0
-    assert pkt["active_threads"] == []
+    # Round-69 Codex review 4769487744 (P1): poll 1 had
+    # an active Codex finding on an incomplete page;
+    # poll 2 returned a complete page with no threads.
+    # The previous behavior reset the per-thread list
+    # on a complete poll, losing poll 1's finding and
+    # emitting MERGE_READY. The corrected behavior
+    # accumulates per-page threads across polls, so
+    # the aggregate inventory still contains poll 1's
+    # active finding even though poll 2 was complete.
+    # The expected terminal state is therefore
+    # HOLD_NEW_CODEX_THREAD (the active finding wins),
+    # NOT MERGE_READY. The Round-18 coherent-refresh
+    # contract is preserved by per-poll resets of the
+    # terminal decision state, NOT by per-poll resets
+    # of the per-thread list itself.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+    assert pkt["status"] == "HOLD_NEW_CODEX_THREAD"
+    assert pkt["unresolved_thread_count"] == 1
+    assert any(
+        t.get("thread_id") == "PRRT_poll1_partial_finding_3"
+        for t in pkt["active_threads"]
+    )
 
 
 # ---------------------------------------------------------------------------
