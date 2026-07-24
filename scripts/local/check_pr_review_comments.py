@@ -590,6 +590,14 @@ def gh_graphql_review_threads(
         "pageInfo { hasNextPage }",
         "nodes {",
         "id isResolved isOutdated",
+        # Round-69 Codex review 4769344844 (P2): add
+        # whitespace between ``isOutdated`` and
+        # ``comments`` so the rendered query is
+        # ``... isOutdated comments(first:50) ...``
+        # instead of ``... isOutdatedcomments(first:50) ...``
+        # (a single nonexistent field that causes GitHub
+        # to return a GraphQL error).
+        " ",  # explicit whitespace separator
         # Round-69 Codex review 4769230169 (P2): include
         # the nested comments pageInfo so the first-page
         # helper can detect incomplete nested comment
@@ -729,7 +737,7 @@ def _walk_pagination_cursors(
             f"reviewThreads(first:{page_size}{after_clause}) {{"
             "pageInfo { hasNextPage endCursor }"
             "nodes {"
-            "id isResolved isOutdated"
+            "id isResolved isOutdated "
             "comments(first:50) {"
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "

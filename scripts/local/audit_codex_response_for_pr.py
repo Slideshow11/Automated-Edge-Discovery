@@ -583,7 +583,15 @@ def gh_graphql_review_threads(
         "reviewThreads(first:100) {",
         "pageInfo { hasNextPage endCursor }",
         "nodes {",
-        "id isResolved isOutdated",
+        # Round-69 Codex review 4769344844 (P1): add
+        # whitespace between ``isOutdated`` and
+        # ``comments`` so the rendered query is
+        # ``... isOutdated comments(first:50) ...``
+        # instead of ``... isOutdatedcomments(first:50) ...``
+        # (the latter is a single nonexistent field that
+        # causes GitHub to return a GraphQL error on every
+        # live run).
+        "id isResolved isOutdated ",
         "comments(first:50) {",
         "pageInfo { hasNextPage endCursor }",
         # ``originalCommit`` is the commit the comment was posted
@@ -1061,7 +1069,12 @@ def _canonical_review_thread_inventory(
             f"reviewThreads(first:{page_size}{after_clause}) {{"
             "pageInfo { hasNextPage endCursor }"
             "nodes {"
-            "id isResolved isOutdated"
+            # Round-69 Codex review 4769344844 (P1): add
+            # whitespace between ``isOutdated`` and
+            # ``comments`` so the rendered query is
+            # ``... isOutdated comments(first:50) ...``
+            # instead of ``... isOutdatedcomments(first:50) ...``.
+            "id isResolved isOutdated "
             "comments(first:50) {"
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "
@@ -1445,6 +1458,13 @@ def classify(
     # the next poll's starting cursor. Reset on a fresh
     # classification cycle.
     pagination_cursor: Optional[str] = None
+    # Round-69 Codex review 4769344844 (P1): accumulate
+    # the review-thread page list across polls. Initialize
+    # once before the polling loop so the aggregate
+    # inventory reflects every page walked. Per-poll
+    # resets for inventory completeness flags remain
+    # unchanged; only the per-thread list is accumulated.
+    accumulated_review_threads: List[Dict[str, Any]] = []
     for poll_idx in range(1, max_polls + 1):
         polls_used = poll_idx
 
@@ -1502,7 +1522,14 @@ def classify(
         # actually observe.
         pr_issue_comments = []
         pr_reviews = []
-        review_threads = []
+        # Round-69 Codex review 4769344844 (P1): the
+        # ``review_threads`` list is accumulated across
+        # polls (see ``accumulated_review_threads``
+        # above) so the aggregate inventory reflects
+        # every page walked. Do NOT reset it to ``[]``
+        # here. The local ``review_threads`` variable
+        # below aliases the accumulator for the
+        # downstream per-poll logic.
         # Reset terminal decision state.
         final_status = STATUS_HOLD_CODEX_PENDING
         recommendation = RECOMMENDATIONS[STATUS_HOLD_CODEX_PENDING]
@@ -1693,22 +1720,40 @@ def classify(
             review_thread_inventory_complete = False
             review_thread_inventory_error_count += 1
             review_thread_inventory_last_error = err_thr
-        # Round-69 Codex review 4769289362 (P1): accumulate
-        # review-thread pages across polls instead of
-        # replacing. The previous ``review_threads = thread_data``
-        # assignment discarded earlier pages' threads so a
-        # later complete page with no active threads could
-        # see ``review_thread_inventory_complete=True`` with
-        # ``active_threads=[]`` even when an earlier page
-        # contained an unresolved Codex thread. The cursor
-        # walk must accumulate pages or stay incomplete
-        # until the full aggregate inventory is evaluated.
-        if "review_threads" in dir() and review_threads:
-            review_threads = list(review_threads) + list(
-                thread_data or []
-            )
+        # Round-69 Codex reviews 4769289362 (P1) and
+        # 4769344844 (P1): accumulate or replace the
+        # review-thread page list depending on the
+        # current poll's inventory completeness.
+        #
+        # The accumulator must be empty when the current
+        # poll returns ``ok=True`` (inventory complete
+        # for the requested cursor). The Round-18
+        # coherent-refresh contract requires poll 2's
+        # fresh inventory to override poll 1's stale
+        # one when poll 2 is complete, so a complete
+        # poll resets the accumulator and only the
+        # current page's threads survive.
+        #
+        # When the current poll returns ``ok=False``
+        # (inventory incomplete) the page-level threads
+        # are still visible to the visible-blocker
+        # logic. Accumulate them so an earlier poll's
+        # unresolved Codex threads are not lost when a
+        # later page is incomplete.
+        if ok_thr:
+            # Inventory complete: reset the accumulator
+            # so the current poll's threads are the only
+            # ones in scope. This preserves the
+            # Round-18 coherent-refresh contract.
+            accumulated_review_threads[:] = list(thread_data or [])
         else:
-            review_threads = list(thread_data or [])
+            # Inventory incomplete: accumulate the
+            # visible threads so the audit's
+            # visible-blocker logic catches the
+            # active-finding even when the cursor
+            # walker fails.
+            accumulated_review_threads.extend(thread_data or [])
+        review_threads = accumulated_review_threads
         # Round-69 Codex review 4769230169 (P2): advance
         # the cursor between polls. When the current poll
         # returns ``hasNextPage=true`` and the helper
