@@ -208,13 +208,29 @@ def select_tests(
         repository suite (Round-412 Finding 2);
       * Otherwise Tier 2 uses the focused suite for the
         detected component(s).
+
+    Round-69 Codex review 4769577891 (P1): a caller that
+    passes ``tier=TIER_3_FINAL_CANDIDATE`` WITHOUT also
+    passing ``final_candidate=True`` must still get the
+    full-repository Tier 3 plan. The two flags are
+    equivalent; honor ``tier`` first so machine-readable
+    final-candidate evidence is never produced with a
+    focused suite.
     """
+    # Round-69 Codex review 4769577891 (P1): treat
+    # ``tier == TIER_3_FINAL_CANDIDATE`` the same as
+    # ``final_candidate=True``. Either signal alone is
+    # sufficient to force a full-repository Tier 3 plan.
+    effective_final_candidate = bool(
+        final_candidate
+        or tier == ValidationTier.TIER_3_FINAL_CANDIDATE
+    )
     # Round-412 (PHASE 6): final-candidate mode is the
     # authoritative tier override. Check it FIRST so an
     # empty changed_paths list still produces a Tier 3
     # plan, then fall through to the empty-paths fail-closed
     # branch.
-    if final_candidate:
+    if effective_final_candidate:
         return TestPlan(
             tier=ValidationTier.TIER_3_FINAL_CANDIDATE,
             components=[],

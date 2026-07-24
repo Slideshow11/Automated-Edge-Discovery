@@ -126,6 +126,27 @@ def paginate_graphql_connection(
                 "capped": capped,
                 "error": repr(exc),
             }
+        # Round-69 Codex review 4769577891 (P2): fail
+        # closed on GraphQL ``errors`` payloads. GitHub
+        # may return an ``errors`` array together with
+        # partial ``data`` (e.g. field / permission
+        # errors). The previous behavior ignored
+        # ``d.get("errors")`` and continued navigating
+        # the partial connection, so a page with errors
+        # could still be reported as ``complete=True``
+        # with truncated evidence. The shared paginators
+        # are used to decide review / comment inventory
+        # completeness, so partial evidence must be
+        # reported as incomplete.
+        errors = d.get("errors") if isinstance(d, dict) else None
+        if errors:
+            return {
+                "nodes": all_nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": f"graphql_errors: {errors}",
+            }
         # Navigate the connection via ``path``.
         node = d
         for segment in path:
@@ -320,7 +341,7 @@ def paginate_formal_reviews(
 
 
 _REVIEW_INLINE_COMMENTS_QUERY = """
-query($owner:String!,$name:String!,$number:Int!,$reviewId:ID!,$first:Int!,$after:String){
+query($reviewId:ID!,$first:Int!,$after:String){
   node(id:$reviewId){
     ... on PullRequestReview{
       comments(first:$first, after:$after){
