@@ -1007,23 +1007,20 @@ def _canonical_review_thread_inventory(
     timeout: int = 30,
     starting_cursor: Optional[str] = None,
     starting_pages: int = 0,
+    safety_cap: int = 2000,
+    do_walk: bool = True,
 ):
-    """Canonical review-thread inventory (single page).
+    """Canonical review-thread inventory.
 
-    Round-69 Codex review 4764653534 (P2): the original inline
-    ``gh_graphql_review_threads`` only fetched one page. The
-    audit's classify loop is the entity that polls: each
-    call from classify() to the inventory helper is a
-    single-page fetch. Outer pagination is driven by the
-    classify() polling loop, which inspects the returned
-    ``hasNextPage`` flag (via the packet's
-    ``review_thread_pagination_incomplete`` field) and
-    makes another call with the cursor.
-
-    Round-69 Codex review 4768977809 (P2): when ``starting_cursor``
-    is provided, the query requests the page after that
-    cursor so the classify() loop can walk additional pages
-    without an extra in-process loop helper.
+    Round-69 Codex review 4769640328 (P2): the production
+    status/advance/merge path calls this helper with
+    ``max_polls=1`` and cannot advance the cursor across
+    multiple poll iterations. When the first page reports
+    ``hasNextPage=true`` the inventory is stuck incomplete
+    forever. To make the one-shot controller path work, the
+    helper walks every page internally (when ``do_walk`` is
+    True) so the classify() polling loop's first call
+    returns a complete inventory.
 
     This implementation:
       - keeps the ``subprocess.run(``gh api graphql``)`` call
@@ -1284,7 +1281,120 @@ def _canonical_review_thread_inventory(
             "review_thread_inventory_capped": False,
             "review_thread_inventory_error": "",
         }
-        return True, all_threads, "", metadata
+        # Round-69 Codex review 4769640328 (P2):
+        # when ``do_walk`` is True and the inventory is
+        # incomplete (``review_thread_pagination_incomplete``),
+        # keep walking additional pages until
+        # ``hasNextPage=false`` (or the safety cap fires,
+        # fail-closed). This is the one-shot controller
+        # path; the polling-loop path uses
+        # ``do_walk=False`` (currently the polling loop
+        # also relies on ``do_walk=True`` because the
+        # production path uses ``max_polls=1``).
+        if not do_walk or not metadata.get(
+            "review_thread_pagination_incomplete", False
+        ):
+            return True, all_threads, "", metadata
+        # The first page had ``hasNextPage=true``. Walk
+        # additional pages internally so the one-shot
+        # controller path can complete the inventory.
+        cursor = metadata.get(
+            "review_thread_pagination_end_cursor"
+        )
+        pages = 1
+        while True:
+            if pages >= safety_cap:
+                # Safety cap fired. The inventory is
+                # incomplete in this case; the section 8
+                # inventory gate will refuse merge-ready.
+                return False, all_threads, (
+                    f"review_thread_pagination_capped: "
+                    f"pages={pages} safety_cap={safety_cap}"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        not incomplete_nested_thread_ids
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": True,
+                    "review_thread_inventory_error": (
+                        "review_thread_pagination_capped"
+                    ),
+                }
+            pages += 1
+            # Recursively call ourselves for the next page.
+            ok_next, more_threads, err_next, meta_next = (
+                _canonical_review_thread_inventory(
+                    owner=owner, name=name, pr_number=pr_number,
+                    starting_cursor=cursor,
+                    starting_pages=pages,
+                    do_walk=False,
+                )
+            )
+            all_threads.extend(more_threads or [])
+            # Propagate nested-comment completeness across
+            # pages. If any page reports an incomplete
+            # nested inventory, the overall inventory is
+            # incomplete.
+            if not meta_next.get(
+                "review_thread_comment_inventory_complete", False
+            ):
+                metadata[
+                    "review_thread_comment_inventory_complete"
+                ] = False
+            if not ok_next:
+                # The page walker hit an error. Propagate
+                # ``err_next`` (use the most recent error
+                # message) and return ok=False so the
+                # section 8 inventory gate fails closed.
+                return False, all_threads, err_next, {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": err_next,
+                }
+            if not meta_next.get(
+                "review_thread_pagination_incomplete", False
+            ):
+                # Inventory complete. Done.
+                return True, all_threads, "", {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": "",
+                }
+            cursor = meta_next.get(
+                "review_thread_pagination_end_cursor"
+            )
+            if not cursor:
+                return False, all_threads, (
+                    f"{err_next}; cursor_missing"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": (
+                        metadata.get(
+                            "review_thread_comment_inventory_complete",
+                            False,
+                        )
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": (
+                        "cursor_missing"
+                    ),
+                }
     except Exception as exc:
         return False, [], (
             f"review_thread_inventory_failed: {exc}"
