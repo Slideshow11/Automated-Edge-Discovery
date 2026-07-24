@@ -1368,10 +1368,29 @@ def _canonical_review_thread_inventory(
                 metadata[
                     "review_thread_comment_inventory_complete"
                 ] = False
-            if not ok_next:
-                # The page walker hit an error. Propagate
-                # ``err_next`` (use the most recent error
-                # message) and return ok=False so the
+            # Round-69 Codex review 4769796846 (P2): when
+            # the recursive call returns ok_next=False
+            # AND ``review_thread_pagination_incomplete`` is
+            # True, the recursive call signaled "more
+            # pages available" (the helper's
+            # single-page-mode ``do_walk=False`` returns
+            # ok=False with pagination_incomplete=True
+            # for the controller's polling protocol).
+            # Treat this as a normal "keep walking" signal
+            # by updating the cursor and continuing the
+            # walker loop. Only treat it as a terminal
+            # error when the recursive call's
+            # ``err_next`` indicates a real failure (e.g.
+            # GraphQL error, cursor missing, cap fired).
+            cursor = meta_next.get(
+                "review_thread_pagination_end_cursor"
+            )
+            if not ok_next and not meta_next.get(
+                "review_thread_pagination_incomplete", False
+            ):
+                # The page walker hit a real error
+                # (not "more pages available"). Propagate
+                # ``err_next`` and return ok=False so the
                 # section 8 inventory gate fails closed.
                 return False, all_threads, err_next, {
                     **empty_metadata,
@@ -1425,10 +1444,15 @@ def _canonical_review_thread_inventory(
                     "review_thread_inventory_capped": False,
                     "review_thread_inventory_error": "",
                 }
-            cursor = meta_next.get(
-                "review_thread_pagination_end_cursor"
-            )
-            if not cursor:
+            # ok_next=False with
+            # pagination_incomplete=True: the
+            # recursive call signaled "more pages
+            # available". Continue walking with the
+            # new cursor.
+            if not ok_next and not cursor:
+                # ``hasNextPage=true`` with no
+                # ``endCursor`` is an error inside
+                # the wrapper.
                 return False, all_threads, (
                     f"{err_next}; cursor_missing"
                 ), {

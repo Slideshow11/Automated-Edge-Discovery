@@ -2447,7 +2447,18 @@ def test_fail_closed_on_unhandled_pagination(monkeypatch, tmp_path):
     assert pkt["status"] != mod.STATUS_MERGE_READY
     assert pkt["review_thread_inventory_complete"] is False
     assert pkt["review_thread_inventory_error_count"] >= 1
-    assert any("pagination required" in e for e in pkt["api_errors"])
+    # Round-69 Codex review 4769796846 (P2): the
+    # audit's do_walk walker now continues walking
+    # pages until the safety cap fires. The error
+    # message changed from "pagination required"
+    # to "review_thread_pagination_capped" when
+    # the safety cap is reached. Either message
+    # signals the same fail-closed state.
+    assert any(
+        "pagination required" in e
+        or "review_thread_pagination_capped" in e
+        for e in pkt["api_errors"]
+    )
 
 
 def test_fail_closed_on_missing_review_threads_in_response(monkeypatch, tmp_path):
