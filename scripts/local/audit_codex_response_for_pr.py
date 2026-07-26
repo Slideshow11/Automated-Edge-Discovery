@@ -216,6 +216,42 @@ CODEX_BOT_LOGINS = frozenset({
     "chatgpt-codex-connector[bot]",
 })
 
+# Precomputed normalized (lowercase) fallback login set. Used by
+# ``_local_codex_login_fallback`` when the canonical shared
+# ``is_codex_login`` predicate is unavailable. Precomputed once
+# at module load so the generator inside ``has_active_blocker``
+# does not rebuild the set for every thread.
+_LOCAL_CODEX_LOGINS_LOWER: frozenset = frozenset(
+    a.lower() for a in CODEX_BOT_LOGINS
+)
+
+
+def _local_codex_login_fallback(login: Any) -> bool:
+    """Local fallback Codex-login predicate.
+
+    Round-412 (FINAL direct-CLI micro-repair): the canonical
+    ``is_codex_login`` predicate from ``_shared_codex_classifier``
+    requires a non-empty string and normalizes with ``.lower()``.
+    The previous fallback in ``has_active_blocker`` was
+    ``(t.get("author", "") or "").lower() in {a.lower() for a in CODEX_BOT_LOGINS}``
+    which raises ``AttributeError`` when ``author`` is a truthy
+    non-string (e.g., an integer from a malformed GraphQL
+    response). This fallback matches the canonical predicate's
+    type-safety and case-insensitive identity semantics: it
+    returns False for any non-string value (None, int, list,
+    dict, empty string) and otherwise compares
+    ``login.lower()`` against the precomputed normalized
+    ``_LOCAL_CODEX_LOGINS_LOWER`` set. Never raises.
+
+    The canonical predicate is still preferred when available
+    (single source of truth); this fallback is only used when
+    the shared classifier import fails.
+    """
+    if not isinstance(login, str) or not login:
+        return False
+    return login.lower() in _LOCAL_CODEX_LOGINS_LOWER
+
+
 # Exact phrase Codex uses to denote a clean pass in issue-level comments.
 CODEX_CLEAN_PASS_PHRASE = "Codex Review: Didn\u2019t find any major issues"
 # Accept both curly and straight apostrophes
@@ -2647,11 +2683,20 @@ def classify(
         # 3) Codex clean-pass exists AND no newer active finding -> resolve-only or merge-ready
         # 4) Otherwise -> HOLD_CODEX_RESPONSE_PENDING
 
+        # Round-412 (FINAL direct-CLI micro-repair): the
+        # local fallback uses ``_local_codex_login_fallback``
+        # which is type-safe (rejects non-string values) and
+        # case-insensitive (delegates to the canonical
+        # ``is_codex_login`` when available, otherwise uses
+        # the precomputed ``_LOCAL_CODEX_LOGINS_LOWER`` set).
+        # The previous inline fallback
+        # ``(t.get("author", "") or "").lower() in {...}``
+        # raised ``AttributeError`` on truthy non-string
+        # authors.
         has_active_blocker = any(
             _shared_is_codex_login(t.get("author", ""))
             if _shared_is_codex_login is not None
-            else (t.get("author", "") or "").lower()
-            in {a.lower() for a in CODEX_BOT_LOGINS}
+            else _local_codex_login_fallback(t.get("author", ""))
             for t in active_threads
         )
         # If a clean pass exists, we also need to check whether any NEWER

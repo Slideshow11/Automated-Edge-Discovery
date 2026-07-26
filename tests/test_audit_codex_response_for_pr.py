@@ -11029,3 +11029,174 @@ def test_minimax_p2_lowercase_codex_login_still_recognized(
     pkt = json.loads((tmp_path / "pkt.json").read_text())
     assert pkt["current_head_active_blocker_count"] == 1
     assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+# ---------------------------------------------------------------------------
+# FINAL direct-CLI micro-repair: fallback type-safety and
+# case-insensitive identity semantics
+# ---------------------------------------------------------------------------
+#
+# When the canonical ``is_codex_login`` share-classifier import
+# is unavailable, ``has_active_blocker`` falls back to a local
+# predicate. The previous fallback
+# ``(t.get("author", "") or "").lower() in {a.lower() for a in CODEX_BOT_LOGINS}``
+# raised ``AttributeError`` when ``author`` was a truthy non-string
+# value (e.g., an integer from a malformed GraphQL response). The
+# micro-repair introduces ``_local_codex_login_fallback`` which is
+# type-safe (rejects non-string values) and case-insensitive
+# (delegates to the precomputed ``_LOCAL_CODEX_LOGINS_LOWER`` set).
+
+
+def test_final_fallback_mixed_case_codex_classified_as_active_blocker(
+    monkeypatch, tmp_path,
+):
+    """FINAL #1: when the canonical ``is_codex_login``
+    is unavailable, the local fallback must still recognize
+    mixed-case Codex identities (case-insensitive identity
+    semantics) and drive the audit to ``HOLD_NEW_CODEX_THREAD``.
+
+    This proves the fallback itself (not the canonical
+    predicate) handles mixed-case Codex identities.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=8001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_final_fallback_uppercase",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9501,
+                            "url": "https://example/9501",
+                            "body": "P1 finding (uppercase, fallback)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            "author": {"login": "CHATGPT-CODEX-CONNECTOR"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    # Force the fallback path by nulling the canonical
+    # shared predicate.
+    monkeypatch.setattr(mod, "_shared_is_codex_login", None)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Inventory must be complete.
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    # The fallback must drive the audit to HOLD_NEW_CODEX_THREAD
+    # (the case-insensitive identity must still work).
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+def test_final_fallback_malformed_non_string_author_does_not_crash(
+    monkeypatch, tmp_path,
+):
+    """FINAL #2: when the canonical ``is_codex_login``
+    is unavailable, a truthy non-string author (e.g., integer
+    123) MUST NOT cause ``AttributeError`` or ERROR_TOOL_FAILURE.
+    The malformed author must be rejected (not classified as
+    Codex), the unresolved thread must remain in the
+    inventory, and the audit must reach a safe lifecycle status
+    consistent with the existing non-Codex unresolved-thread
+    policy.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=8101,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_final_fallback_malformed",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9601,
+                            "url": "https://example/9601",
+                            "body": "P1 finding (malformed author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            # INTEGER author — the previous
+                            # fallback would raise
+                            # ``AttributeError`` when
+                            # calling ``.lower()``. The
+                            # fix must reject this safely.
+                            "author": {"login": 123},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    # Force the fallback path.
+    monkeypatch.setattr(mod, "_shared_is_codex_login", None)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    # The audit must complete without raising AttributeError.
+    # The previous fallback would raise AttributeError inside
+    # ``classify()`` which would surface as a non-zero rc
+    # and an error status. The fix must succeed and emit a
+    # safe lifecycle status.
+    assert rc == 0, (
+        f"Audit returned rc={rc}; expected rc=0 (no crash on "
+        f"malformed author)"
+    )
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # The unresolved thread must remain in the inventory.
+    assert any(
+        t.get("thread_id") == "PRRT_final_fallback_malformed"
+        for t in pkt["active_threads"]
+    )
+    # The malformed author must NOT be classified as a Codex
+    # blocker, so the clean pass wins. The audit must reach
+    # CODEX_CLEAN_PASS_RESOLVE_ONLY_NEEDED (clean pass + the
+    # unresolved non-Codex thread). This is the existing
+    # non-Codex unresolved-thread policy applied to a
+    # malformed author.
+    assert pkt["status"] == mod.STATUS_CLEAN_PASS_RESOLVE_ONLY
+    # The audit must not be an error status.
+    assert pkt["status"] != mod.STATUS_ERROR_TOOL_FAILURE
+    assert pkt["status"] != mod.STATUS_ERROR_INVALID_ARGS
