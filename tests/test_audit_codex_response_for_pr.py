@@ -10875,3 +10875,157 @@ def test_round65_poller_source_contract_finding_badge_first():
         "must appear BEFORE the _is_clean_pass check "
         "in the poller source."
     )
+
+
+# ---------------------------------------------------------------------------
+# MINIMAX P2 Finding 1: case-insensitive Codex login classification
+# ---------------------------------------------------------------------------
+#
+# The audit's previous ``has_active_blocker`` used a case-sensitive
+# ``in CODEX_BOT_LOGINS`` check. A Codex-authored active thread whose
+# ``author`` field came back from GitHub in any case other than the
+# exact lowercase value stored in ``CODEX_BOT_LOGINS`` was silently
+# treated as a non-Codex author, routing the audit to
+# ``HOLD_CODEX_RESPONSE_PENDING`` instead of
+# ``HOLD_NEW_CODEX_THREAD``. The shared policy's ``is_codex_login``
+# predicate is case-insensitive (uses ``login.lower()``); the audit
+# now routes through the same canonical predicate, with a fallback
+# that uses the same case-insensitive identity semantics.
+
+
+def test_minimax_p2_uppercase_codex_login_classified_as_active_blocker(
+    monkeypatch, tmp_path,
+):
+    """P2 #1: an unresolved non-outdated Codex-authored active thread
+    whose author field is uppercase
+    (``CHATGPT-CODEX-CONNECTOR``) MUST be classified as a
+    current-head active blocker so the audit emits
+    ``HOLD_NEW_CODEX_THREAD``.
+
+    Pre-fix, the audit's ``has_active_blocker`` used a
+    case-sensitive ``in CODEX_BOT_LOGINS`` check, which would
+    miss this thread and emit ``HOLD_CODEX_RESPONSE_PENDING``.
+    The fix routes the check through the canonical
+    ``is_codex_login`` predicate (case-insensitive).
+
+    Companion assertion: the ordinary lowercase Codex login
+    remains recognized (no regression of the working path).
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    # Exact-head clean pass + one uppercase-Codex active thread.
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=6001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_minimax_uppercase_1",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9001,
+                            "url": "https://example/9001",
+                            "body": "P1 finding (uppercase author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            # UPPERCASE — the canonical GitHub
+                            # login is lowercase. The audit must
+                            # still recognize this as Codex.
+                            "author": {"login": "CHATGPT-CODEX-CONNECTOR"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    # Inventory must be complete (the mock returns hasNextPage=false
+    # and no nested ``hasNextPage=true``).
+    assert pkt["review_thread_inventory_complete"] is True
+    assert pkt["review_thread_comment_inventory_complete"] is True
+    # The clean pass is detected and recognized.
+    assert pkt["clean_pass_detected"] is True
+    # The active thread is present and counted as a blocker.
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert any(
+        t.get("thread_id") == "PRRT_minimax_uppercase_1"
+        for t in pkt["active_threads"]
+    )
+    # The case-insensitive classifier must drive the audit to
+    # HOLD_NEW_CODEX_THREAD, not HOLD_CODEX_RESPONSE_PENDING.
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD
+
+
+def test_minimax_p2_lowercase_codex_login_still_recognized(
+    monkeypatch, tmp_path,
+):
+    """Companion regression: the lowercase Codex login
+    (``chatgpt-codex-connector``) MUST keep working so the
+    fix does not break the existing happy path.
+    """
+    sleep = FakeSleep()
+    monkeypatch.setattr("time.sleep", sleep)
+    pr_view = make_pr_view()
+    issue = [
+        make_issue_comment(
+            author=CODEX_LOGIN,
+            body=codex_clean_pass_body(),
+            created_at="2026-06-11T18:00:00Z",
+            comment_id=7001,
+        )
+    ]
+    threads = {
+        "data": {"repository": {"pullRequest": {
+            "reviewThreads": {
+                "pageInfo": {"hasNextPage": False},
+                "nodes": [
+                    {
+                        "id": "PRRT_minimax_lowercase_1",
+                        "isResolved": False,
+                        "isOutdated": False,
+                        "comments": {"nodes": [{
+                            "databaseId": 9101,
+                            "url": "https://example/9101",
+                            "body": "P1 finding (lowercase author)",
+                            "path": "scripts/local/foo.py",
+                            "line": 1,
+                            "author": {"login": "chatgpt-codex-connector"},
+                        }]},
+                    },
+                ],
+            }
+        }}}
+    }
+    runner = make_gh_runner(pr_view, issue, [], threads)
+    monkeypatch.setattr(mod.subprocess, "run", runner)
+    rc = mod.main([
+        "--repo", REPO, "--pr", "401", "--expected-head", EXPECTED_HEAD,
+        "--ping-comment-id", PING_ID, "--ping-created-at", PING_CREATED,
+        "--max-polls", "1", "--poll-seconds", "0",
+        "--output-json", str(tmp_path / "pkt.json"),
+        "--output-md", str(tmp_path / "pkt.md"),
+    ])
+    assert rc == 0
+    pkt = json.loads((tmp_path / "pkt.json").read_text())
+    assert pkt["current_head_active_blocker_count"] == 1
+    assert pkt["status"] == mod.STATUS_HOLD_NEW_THREAD

@@ -122,6 +122,17 @@ try:
         is_codex_review_summary as _shared_is_summary,
         extract_review_commit_oid as _shared_extract_oid,
         body_has_finding_badge as _shared_body_has_finding,
+        # Round-412 (MINIMAX P2 Finding 1): route
+        # ``has_active_blocker`` through the canonical
+        # case-insensitive ``is_codex_login`` predicate
+        # so a Codex-authored active thread whose
+        # author field is not lowercased is still
+        # recognized as a current-head finding. The
+        # previous code used a case-sensitive ``in``
+        # check against ``CODEX_BOT_LOGINS`` (the
+        # audit's local frozenset), which silently
+        # missed uppercase/mixed-case Codex logins.
+        is_codex_login as _shared_is_codex_login,
     )
 except ImportError:
     _shared_is_clean = None
@@ -129,6 +140,7 @@ except ImportError:
     _shared_is_summary = None
     _shared_extract_oid = None
     _shared_body_has_finding = None
+    _shared_is_codex_login = None
 
 _SCRIPT_DIR_HERE = _os.path.dirname(_os.path.abspath(__file__))
 # Walk up to find the parent of the ``scripts/`` directory.
@@ -2636,7 +2648,11 @@ def classify(
         # 4) Otherwise -> HOLD_CODEX_RESPONSE_PENDING
 
         has_active_blocker = any(
-            t.get("author", "") in CODEX_BOT_LOGINS for t in active_threads
+            _shared_is_codex_login(t.get("author", ""))
+            if _shared_is_codex_login is not None
+            else (t.get("author", "") or "").lower()
+            in {a.lower() for a in CODEX_BOT_LOGINS}
+            for t in active_threads
         )
         # If a clean pass exists, we also need to check whether any NEWER
         # Codex comment/review (with a real finding) arrived after it.
