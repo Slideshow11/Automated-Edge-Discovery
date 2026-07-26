@@ -173,7 +173,6 @@ def wild_cluster_bootstrap_ci(formula: str, df: pd.DataFrame, cluster_col: str, 
 
     clusters = df[cluster_col].values
     unique_clusters = np.unique(clusters)
-    n_clusters = unique_clusters.shape[0]
 
     # precompute indices for clusters
     cluster_idx = {c: np.where(clusters == c)[0] for c in unique_clusters}
