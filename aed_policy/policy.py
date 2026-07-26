@@ -15,7 +15,7 @@ shape (``evaluate_action`` -> ``AEDDecision``) is stable.
 from __future__ import annotations
 
 import os
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence
 
 from .action_types import (
     AEDActionType,
