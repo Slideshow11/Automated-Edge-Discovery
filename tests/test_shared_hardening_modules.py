@@ -3,11 +3,17 @@
 shared modules added in PR #412.
 """
 import json
+from pathlib import Path
 import os
 import sys
 import unittest
 
-REPO = "/home/max/aed_hardening_v1"
+# Round-70 fix: derive the repository root from the test file
+# location instead of a hardcoded /home/max/aed_hardening_v1 path.
+# This makes the tests hermetic across worktrees and CI checkout
+# locations. Path(__file__).resolve().parents[N] walks up from the
+# test file at tests/test_X.py to the repository root.
+REPO = str(Path(__file__).resolve().parents[1])
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 SCRIPTS = os.path.join(REPO, "scripts", "local")
