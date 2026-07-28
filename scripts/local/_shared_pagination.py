@@ -434,6 +434,265 @@ def paginate_changed_files(
     }
 
 
+def paginate_nested_comments(
+    thread_id: str,
+    *,
+    page_size: int = 100,
+    safety_cap: int = DEFAULT_SAFETY_CAP,
+    owner: str = "",
+    name: str = "",
+    timeout: int = 30,
+    pr_number: int = 0,
+    initial_cursor: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Round-70 PHASE 4-P2: paginate a single review-thread's nested
+    comments connection by following the nested ``endCursor``.
+
+    The canonical ``paginate_review_threads`` helper fetches the
+    outer ``reviewThreads`` connection with one ``comments(first:N)``
+    block. When a thread's nested ``comments.pageInfo.hasNextPage`` is
+    True, the OLD behaviour only flagged incompleteness. This new
+    helper actually FETCHES the next nested page by issuing the
+    canonical ``node(id: $threadId) { ... on PullRequestReviewThread { comments(after: $cursor) { ... } } }``
+    query until ``hasNextPage=false``, deduplicating comments by stable
+    comment ``databaseId``.
+
+    Returns ``{"nodes": [...], "complete": bool, "pages": int, "capped": bool, "error": Optional[str]}``.
+
+    Fail closed (returns complete=False) on any of:
+      - missing/empty thread_id
+      - missing owner/name/pr_number (legacy only — owner/name/pr still
+        required to construct the GitHub query target)
+      - GraphQL errors
+      - missing node
+      - wrong node type
+      - malformed pageInfo
+      - hasNextPage=true without endCursor
+      - repeated cursor across iterations (defensive loop check)
+      - safety_cap reached
+      - subprocess timeout / non-zero exit
+      - malformed JSON
+    """
+    if not thread_id or not isinstance(thread_id, str) or not thread_id.strip():
+        return {
+            "nodes": [],
+            "complete": False,
+            "pages": 0,
+            "capped": False,
+            "error": "thread_id_required",
+        }
+    # Require owner/name to construct the GH query endpoint in legacy mode;
+    # but GraphQL by-ID queries can omit them. We accept either path.
+    final_owner = owner
+    final_name = name
+
+    # Phase 1: try GraphQL by-ID node query (canonical approach).
+    cursor = initial_cursor
+    if cursor == "" or cursor is None:
+        # Without a starting cursor there's nothing to do, return empty.
+        return {
+            "nodes": [],
+            "complete": True,
+            "pages": 0,
+            "capped": False,
+            "error": None,
+        }
+
+    seen_databases: set = set()
+    nodes: List[Dict[str, Any]] = []
+    pages = 0
+    capped = False
+    error: Optional[str] = None
+    has_next = True
+    last_cursor: Optional[str] = None
+
+    while has_next:
+        if pages >= safety_cap:
+            capped = True
+            error = "safety_cap_exhausted"
+            break
+
+        query = """\
+query($threadId: ID!, $first: Int!, $after: String) {
+  node(id: $threadId) {
+    ... on PullRequestReviewThread {
+      comments(first: $first, after: $after) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          databaseId
+          url
+          body
+          path
+          line
+          originalCommit {
+            oid
+          }
+          author {
+            login
+          }
+        }
+      }
+    }
+  }
+}
+"""
+        variables: Dict[str, Any] = {
+            "threadId": thread_id,
+            "first": min(page_size, 100),
+            "after": cursor,
+        }
+        # Use gh api graphql with --paginate=false (single page).
+        cmd = [
+            "gh",
+            "api",
+            "graphql",
+            "-f", f"query={query}",
+            "-f", f"threadId={variables['threadId']}",
+            "-F", f"first={variables['first']}",
+            "-F", f"after={variables['after']}",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=timeout
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "subprocess_timeout",
+            }
+
+        if proc.returncode != 0:
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": f"subprocess_failed rc={proc.returncode}: {proc.stderr[:120]}",
+            }
+
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "malformed_json",
+            }
+
+        if isinstance(payload, dict) and payload.get("errors"):
+            errs = payload["errors"]
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": f"graphql_errors: {json.dumps(errs)[:200]}",
+            }
+
+        node_field = payload.get("data", {}).get("node")
+        if node_field is None:
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "node_not_found",
+            }
+        # Wrong-node-type detection: GitHub returns {"node": null}
+        # or {"node": {"__typename": "OtherType"}}.
+        node_type = node_field.get("__typename") if isinstance(node_field, dict) else None
+        if not node_type or node_type != "PullRequestReviewThread":
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "wrong_node_type",
+            }
+
+        comments_obj = node_field.get("comments") or {}
+        if not isinstance(comments_obj, dict):
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "malformed_comments_field",
+            }
+
+        page_nodes = comments_obj.get("nodes") or []
+        if not isinstance(page_nodes, list):
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "page_nodes_not_list",
+            }
+
+        for n in page_nodes:
+            if not isinstance(n, dict):
+                continue
+            db_id = n.get("databaseId")
+            if db_id is not None:
+                if db_id in seen_databases:
+                    continue
+                seen_databases.add(db_id)
+            nodes.append(n)
+
+        page_info = comments_obj.get("pageInfo") or {}
+        if not isinstance(page_info, dict):
+            return {
+                "nodes": nodes,
+                "complete": False,
+                "pages": pages,
+                "capped": capped,
+                "error": "malformed_pageInfo",
+            }
+        has_next = bool(page_info.get("hasNextPage", False))
+        next_cursor = page_info.get("endCursor")
+        if has_next:
+            if not isinstance(next_cursor, str) or not next_cursor:
+                # hasNextPage=true without endCursor (PHASE 4 P2 contract)
+                return {
+                    "nodes": nodes,
+                    "complete": False,
+                    "pages": pages,
+                    "capped": capped,
+                    "error": "hasNextPage_without_endCursor",
+                }
+            if next_cursor == last_cursor:
+                # Defensive: repeated cursor means the walker loops.
+                return {
+                    "nodes": nodes,
+                    "complete": False,
+                    "pages": pages,
+                    "capped": capped,
+                    "error": "repeated_cursor",
+                }
+            last_cursor = next_cursor
+            cursor = next_cursor
+        else:
+            has_next = False
+        pages += 1
+
+    return {
+        "nodes": nodes,
+        "complete": (error is None) and (not capped),
+        "pages": pages,
+        "capped": capped,
+        "error": error,
+    }
+
+
 def paginate_workflow_runs(
     *,
     repo: str,

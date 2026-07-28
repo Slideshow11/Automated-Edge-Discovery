@@ -1049,6 +1049,96 @@ def _fetch_review_inline_comments_with_pr(
 # ---------------------------------------------------------------------------
 
 
+def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, timeout: int) -> dict:
+    """Round-70 PHASE 3-P2: follow nested ``comments(after: <cursor>)`` for every
+    thread whose initial comments(first:50) returned
+    ``pageInfo.hasNextPage=true``. Aggregates all nested comments by
+    stable ``databaseId`` and attaches them to the thread node's
+    ``comments`` list under the original key the eligibility/packet
+    builders expect (Round-69 ``comments`` key).
+
+    Returns::
+      {
+        "complete": bool,
+        "pages": int,
+        "capped": bool,
+        "error": Optional[str],
+        "fetched_comments_by_thread_id": Dict[str, list],
+      }
+
+    Fail closed on:
+      - missing or non-importable helper;
+      - any thread fetch returning ok=False;
+      - safety cap exceeded while following nested cursors;
+      - paginate_nested_comments returning complete=False.
+    """
+    try:
+        from scripts.local._shared_pagination import paginate_nested_comments
+    except Exception:
+        return {
+            "complete": False,
+            "pages": 0,
+            "capped": False,
+            "error": "paginate_nested_comments_unavailable",
+            "fetched_comments_by_thread_id": {},
+        }
+    fetched: dict = {}
+    pages_total = 0
+    for tn in thread_nodes:
+        if not isinstance(tn, dict):
+            continue
+        tid = tn.get("id", "")
+        if not tid:
+            continue
+        # Find the nested cursor from the first-page comments.pageInfo.endCursor.
+        comments_field = tn.get("comments") or {}
+        if not isinstance(comments_field, dict):
+            continue
+        page_info = (comments_field.get("pageInfo") or {})
+        if not isinstance(page_info, dict):
+            page_info = {}
+        nested_cursor = page_info.get("endCursor") or ""
+        nested_has_next = bool(page_info.get("hasNextPage"))
+        if not nested_has_next:
+            continue  # nothing to follow
+        if not nested_cursor:
+            # hasNextPage=true without endCursor is a fail-closed
+            # condition per the contract.
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": False,
+                "error": (
+                    f"hasNextPage_without_endCursor: thread={tid}"
+                ),
+                "fetched_comments_by_thread_id": fetched,
+            }
+        result = paginate_nested_comments(
+            tid,
+            page_size=100,
+            safety_cap=safety_cap,
+            timeout=timeout,
+            initial_cursor=nested_cursor,
+        )
+        pages_total += int(result.get("pages", 0) or 0)
+        if not result.get("complete"):
+            return {
+                "complete": False,
+                "pages": pages_total,
+                "capped": bool(result.get("capped")),
+                "error": result.get("error") or "nested_pagination_failed",
+                "fetched_comments_by_thread_id": fetched,
+            }
+        fetched[tid] = result.get("nodes", [])
+    return {
+        "complete": True,
+        "pages": pages_total,
+        "capped": False,
+        "error": None,
+        "fetched_comments_by_thread_id": fetched,
+    }
+
+
 def _canonical_review_thread_inventory(
     *, owner, name, pr_number, page_size: int = 100,
     timeout: int = 30,
@@ -1294,6 +1384,8 @@ def _canonical_review_thread_inventory(
         # one page).
         if outer_has_next or incomplete_nested_thread_ids:
             if not do_walk:
+                # Legacy one-shot path (no walk): preserve the original
+                # behaviour and fail closed on outer or nested incomplete.
                 err_msg = ""
                 if incomplete_nested_thread_ids:
                     err_msg = (
@@ -1466,6 +1558,61 @@ def _canonical_review_thread_inventory(
             if not meta_next.get(
                 "review_thread_pagination_incomplete", False
             ):
+                # Outer inventory complete. If any nested
+                # pagination remained incomplete across
+                # pages, follow cursors now.
+                if incomplete_nested_thread_ids:
+                    nested_follow = (
+                        _follow_nested_cursor_for_threads(
+                            all_threads,
+                            safety_cap=safety_cap,
+                            timeout=timeout,
+                        )
+                    )
+                    if not nested_follow.get("complete"):
+                        # Fail closed.
+                        return False, all_threads, (
+                            nested_follow.get("error")
+                            or "nested_pagination_failed"
+                        ), {
+                            **empty_metadata,
+                            "review_thread_comment_inventory_complete": False,
+                            "review_thread_comment_inventory_error_count": len(incomplete_nested_thread_ids),
+                            "review_thread_comment_incomplete_thread_ids": list(incomplete_nested_thread_ids),
+                            "review_thread_inventory_pages": pages,
+                            "review_thread_inventory_capped": bool(nested_follow.get("capped", False)),
+                            "review_thread_inventory_error": (
+                                nested_follow.get("error") or "nested_pagination_failed"
+                            ),
+                        }
+                    # Merge nested-follow results into per-thread comments.
+                    fetched = nested_follow.get("fetched_comments_by_thread_id", {})
+                    for nt in all_threads:
+                        tid = nt.get("thread_id") or nt.get("id") or ""
+                        if tid not in fetched:
+                            continue
+                        existing_authors = {
+                            (c.get("author") if isinstance(c, dict) else "")
+                            for c in nt.get("comments", [])
+                        }
+                        existing_authors.discard("")
+                        for en in fetched[tid]:
+                            if not isinstance(en, dict):
+                                continue
+                            au = en.get("author") or {}
+                            author_login = (
+                                au.get("login", "")
+                                if isinstance(au, dict)
+                                else ""
+                            )
+                            db_id = en.get("databaseId")
+                            nt.setdefault("comments", []).append(
+                                {
+                                    "author": author_login,
+                                    "database_id": db_id,
+                                }
+                            )
+                        nt["nested_incomplete"] = False
                 # Inventory complete. Done.
                 return True, all_threads, "", {
                     **empty_metadata,

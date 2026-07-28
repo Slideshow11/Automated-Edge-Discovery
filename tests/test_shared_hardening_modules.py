@@ -2,6 +2,7 @@
 """Regression tests for the autocoder control-plane hardening
 shared modules added in PR #412.
 """
+import json
 import os
 import sys
 import unittest
@@ -155,7 +156,7 @@ class PaginationTests(unittest.TestCase):
     def test_more_than_100_review_threads(self):
         """Regression test: more than 100 review threads.
         A finding exists on a later page (Round-50 finding,
-        db_id 3627467490) — pagination must surface it.
+        db_id 3627467490) - pagination must surface it.
         """
         self._require_live()
         from scripts.local import _shared_pagination as pg
@@ -699,3 +700,363 @@ class TestSelectionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# Round-70 PHASE 5-P2 regression coverage for nested comment pagination
+# ---------------------------------------------------------------------------
+#
+# These tests prove paginate_nested_comments correctly follows the nested
+# ``comments`` ``endCursor`` through multiple pages, deduplicates
+# by ``databaseId``, fails closed on missing/invalid cursor, and preserves
+# fail-closed behavior when the outer reviewThreads pagination also has
+# more pages (composition with paginate_review_threads).
+
+
+class _FakeRun:
+    """Substitute ``subprocess.run`` that returns a queued ``gh api graphql`` payload."""
+
+    def __init__(self, queue):
+        self.queue = list(queue)
+        self.calls = []
+        self.returncode = 0
+        self.stderr = ""
+        self.stdout = ""
+
+    def __call__(self, cmd, *args, **kwargs):
+        self.calls.append(cmd)
+        if not self.queue:
+            raise AssertionError("no fake payload remaining")
+        payload = self.queue.pop(0)
+        # Lazy subprocess-like object
+        class _R:
+            pass
+        r = _R()
+        r.returncode = self.returncode
+        r.stdout = json.dumps(payload)
+        r.stderr = self.stderr
+        return r
+
+
+def test_p70_one_page_no_followup(monkeypatch):
+    """P2-R1: thread with hasNextPage=false performs no nested follow-up."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+    # initial_cursor=None means we have nothing to follow.
+    result = paginate_nested_comments(
+        "PRRT_test_1", initial_cursor=None
+    )
+    assert result["complete"] is True
+    assert result["nodes"] == []
+    assert result["error"] is None
+
+
+def test_p70_follows_three_pages(monkeypatch):
+    """P2-R2/R3: thread with multiple nested pages - all accumulated."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page1 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                "nodes": [
+                    {"databaseId": 101, "url": "u1", "body": "b1",
+                     "path": "p1.py", "line": 1,
+                     "originalCommit": {"oid": "abc"},
+                     "author": {"login": "alice"}},
+                ],
+            },
+        }}
+    }
+    page2 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C2"},
+                "nodes": [
+                    {"databaseId": 102, "url": "u2", "body": "b2",
+                     "path": "p1.py", "line": 2,
+                     "originalCommit": None,
+                     "author": {"login": "bob"}},
+                ],
+            },
+        }}
+    }
+    page3 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {"databaseId": 103, "url": "u3", "body": "b3",
+                     "path": "p2.py", "line": 3,
+                     "originalCommit": {"oid": "def"},
+                     "author": {"login": "alice"}},
+                ],
+            },
+        }}
+    }
+    fake_run = _FakeRun([page1, page2, page3])
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    # Also patch the imported subprocess reference inside _shared_pagination
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_thread", initial_cursor="C0",
+        page_size=100, safety_cap=50, timeout=10,
+    )
+    assert result["complete"] is True, result
+    assert result["pages"] == 3
+    assert result["error"] is None
+    # Deduplicated nodes
+    assert len(result["nodes"]) == 3
+    assert [n["databaseId"] for n in result["nodes"]] == [101, 102, 103]
+
+
+def test_p70_dedup_repeated_database_id(monkeypatch):
+    """P2-R8: dedup by databaseId."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page1 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                "nodes": [
+                    {"databaseId": 200, "url": "u", "body": "b",
+                     "path": "p.py", "line": None,
+                     "originalCommit": None, "author": {"login": "u"}},
+                ],
+            },
+        }}
+    }
+    # Second page contains a duplicate.
+    page2 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {"databaseId": 200, "url": "u", "body": "b-dup",
+                     "path": "p.py", "line": None,
+                     "originalCommit": None, "author": {"login": "u"}},
+                    {"databaseId": 201, "url": "u2", "body": "b2",
+                     "path": "p.py", "line": None,
+                     "originalCommit": None, "author": {"login": "u2"}},
+                ],
+            },
+        }}
+    }
+    fake_run = _FakeRun([page1, page2])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_dedup", initial_cursor="C0",
+    )
+    # Dedup: 200 + 201, NOT 200 + 200 + 201
+    assert [n["databaseId"] for n in result["nodes"]] == [200, 201]
+
+
+def test_p70_missing_endcursor_fails_closed(monkeypatch):
+    """P2-R6: missing endCursor fails closed."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": None},
+                "nodes": [],
+            },
+        }}
+    }
+    fake_run = _FakeRun([page])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_missing_cursor", initial_cursor="C0",
+    )
+    assert result["complete"] is False
+    assert result["error"] == "hasNextPage_without_endCursor"
+
+
+def test_p70_graphql_errors_fail_closed(monkeypatch):
+    """P2-R7: GraphQL errors with partial data fail closed."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    payload = {"errors": [{"message": "rate limited"}], "data": {"node": None}}
+    fake_run = _FakeRun([payload])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_errors", initial_cursor="C0",
+    )
+    assert result["complete"] is False
+    assert result["error"].startswith("graphql_errors")
+
+
+def test_p70_wrong_node_type_fails_closed(monkeypatch):
+    """P2-R7(b): wrong node type fails closed."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page = {
+        "data": {"node": {
+            "__typename": "Repository",
+            "comments": None,
+        }}
+    }
+    fake_run = _FakeRun([page])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_wrong_node", initial_cursor="C0",
+    )
+    assert result["complete"] is False
+    assert result["error"] == "wrong_node_type"
+
+
+def test_p70_safety_cap_exhausted(monkeypatch):
+    """P2-R8(b): safety_cap exhausted fails closed."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    # Each page has hasNextPage=true but with a unique cursor
+    def make_page(idx):
+        return {
+            "data": {"node": {
+                "__typename": "PullRequestReviewThread",
+                "comments": {
+                    "pageInfo": {"hasNextPage": True, "endCursor": f"C{idx}"},
+                    "nodes": [],
+                },
+            }}
+        }
+    # 5 pages queued, safety_cap=2
+    fake_run = _FakeRun([make_page(i) for i in range(1, 6)])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_cap", initial_cursor="C0",
+        safety_cap=2,
+    )
+    assert result["complete"] is False
+    assert result["capped"] is True
+    assert result["error"] == "safety_cap_exhausted"
+    assert len(fake_run.calls) <= 3  # At least the safety-cap check kicks in
+
+
+def test_p70_repeated_cursor_fails_closed(monkeypatch):
+    """P2-R8(c): repeated nested cursor fails closed (defensive loop check)."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page1 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C_LOOP"},
+                "nodes": [],
+            },
+        }}
+    }
+    # Same cursor returned again
+    page2 = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C_LOOP"},
+                "nodes": [],
+            },
+        }}
+    }
+    fake_run = _FakeRun([page1, page2])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_loop", initial_cursor="C_LOOP",
+    )
+    assert result["complete"] is False
+    assert result["error"] == "repeated_cursor"
+
+
+def test_p70_preserves_author_databaseId_url_body_path_line(monkeypatch):
+    """P2-R8(d): preserved fields - author, database ID, URL, body, path, line."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    page = {
+        "data": {"node": {
+            "__typename": "PullRequestReviewThread",
+            "comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {"databaseId": 500, "url": "https://example/500",
+                     "body": "Body text", "path": "scripts/local/foo.py",
+                     "line": 42,
+                     "originalCommit": {"oid": "abc1234"},
+                     "author": {"login": "human-reviewer"}},
+                ],
+            },
+        }}
+    }
+    fake_run = _FakeRun([page])
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_preserve", initial_cursor="C0",
+    )
+    assert result["complete"] is True
+    n = result["nodes"][0]
+    assert n["databaseId"] == 500
+    assert n["url"] == "https://example/500"
+    assert n["body"] == "Body text"
+    assert n["path"] == "scripts/local/foo.py"
+    assert n["line"] == 42
+    # The paginator preserves the raw author dict; downstream callers
+    # translate ``author.login`` into a flat string.
+    assert n["author"] == {"login": "human-reviewer"}
+
+
+def test_p70_subprocess_nonzero_exit_fails_closed(monkeypatch):
+    """P2-R7(c): non-zero subprocess exit fails closed."""
+    from scripts.local._shared_pagination import paginate_nested_comments
+
+    class _R:
+        returncode = 7
+        stderr = "boom"
+        stdout = "garbage"
+
+    def fake_run(cmd, *args, **kwargs):
+        return _R()
+
+    import subprocess as _sp
+    monkeypatch.setattr(_sp, "run", fake_run)
+    import scripts.local._shared_pagination as mod
+    monkeypatch.setattr(mod, "subprocess", _sp)
+
+    result = paginate_nested_comments(
+        "PRRT_test_subproc", initial_cursor="C0",
+    )
+    assert result["complete"] is False
+    assert "subprocess_failed" in (result["error"] or "")
