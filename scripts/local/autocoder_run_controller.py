@@ -33,7 +33,14 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+import time
+from typing import Any, Dict, List, Optional
+
+# Round-70 PHASE 3-P1: bring the standalone planner and runner
+# into this controller's namespace without introducing
+# side-effect imports at module load. The seam is a dict the
+# production flow uses by default and tests can swap.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 
 # ---------------------------------------------------------------------------
@@ -898,12 +905,118 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                 "reason": "codex_repair_limit_exceeded",
             }
         else:
-            next_action = {
-                "action": "repair_task",
-                "task_id": None,
-                "reason": "codex_findings",
-                "source": "codex_review",
-            }
+            # Round-70 PHASE 3-P1: when --status=findings, the
+            # autonomous production path MUST persist a repair
+            # plan produced by the planner seam. The operator
+            # supplies --findings-file as the evidence input.
+            findings_evidence_path = getattr(args, "findings_file", None) or ""
+            plan_persisted = False
+            plan_error = ""
+            if not findings_evidence_path or not str(findings_evidence_path).strip():
+                plan_error = "findings_evidence_missing"
+            else:
+                fpath = Path(str(findings_evidence_path))
+                if not fpath.exists():
+                    plan_error = "findings_evidence_not_found"
+                else:
+                    try:
+                        with open(fpath) as _ffh:
+                            findings_data = json.load(_ffh)
+                    except (OSError, json.JSONDecodeError) as exc:
+                        plan_error = f"findings_evidence_malformed:{type(exc).__name__}"
+                        findings_data = None
+                    else:
+                        if (not isinstance(findings_data, list)
+                                or not findings_data):
+                            plan_error = "findings_evidence_empty"
+                        else:
+                            valid = True
+                            for _i, _f in enumerate(findings_data):
+                                if (not isinstance(_f, dict)
+                                        or not (
+                                            _f.get("finding_id")
+                                            or _f.get("id")
+                                        )):
+                                    plan_error = (
+                                        f"findings_invalid_index:{_i}"
+                                    )
+                                    valid = False
+                                    break
+                            if valid:
+                                seam = _autonomous_repair_seam()
+                                plan_dir = (
+                                    Path(str(args.state)).parent
+                                    / "plans"
+                                )
+                                plan_dir.mkdir(parents=True, exist_ok=True)
+                                plan_path = (
+                                    plan_dir
+                                    / f"repair-plan-{int(time.time())}.json"
+                                )
+                                try:
+                                    plan = seam["planner_call"](
+                                        findings=findings_data,
+                                        changed_paths=[],
+                                        tier="tier_2_cohesive_batch",
+                                        final_candidate=False,
+                                    )
+                                except Exception as exc:
+                                    plan_error = (
+                                        f"planner_failed:"
+                                        f"{type(exc).__name__}"
+                                    )
+                                else:
+                                    try:
+                                        with open(plan_path, "w") as _pfh:
+                                            json.dump(plan, _pfh, indent=2)
+                                    except OSError as exc:
+                                        plan_error = (
+                                            f"plan_persist_failed:"
+                                            f"{type(exc).__name__}"
+                                        )
+                                    else:
+                                        plan_persisted = True
+                                        codex[
+                                            "repair_plan_path"
+                                        ] = str(plan_path)
+                                        codex[
+                                            "repair_plan_generated_at"
+                                        ] = _utcnow()
+                                        codex[
+                                            "repair_plan_finding_count"
+                                        ] = plan.get(
+                                            "finding_count", 0
+                                        )
+                                        codex[
+                                            "repair_plan_batch_count"
+                                        ] = plan.get(
+                                            "batch_count", 0
+                                        )
+
+            if plan_error:
+                # Fail closed: do NOT silently advance to
+                # repair_task. Request human instead.
+                codex["repair_plan_error"] = plan_error
+                next_action = {
+                    "action": "request_human",
+                    "task_id": None,
+                    "reason": f"repair_planning_failed:{plan_error}",
+                }
+            elif plan_persisted:
+                next_action = {
+                    "action": "repair_task",
+                    "task_id": None,
+                    "reason": "codex_findings_plan_generated",
+                    "source": "codex_review",
+                }
+            else:
+                # No findings-file supplied but counter-intuitive
+                # flag (we got past the if/else above). Fail closed.
+                next_action = {
+                    "action": "request_human",
+                    "task_id": None,
+                    "reason": "repair_planning_missing_input",
+                }
     elif status == "blocked":
         next_action = {
             "action": "request_human",
@@ -984,15 +1097,82 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
     codex["repair_attempts"] = codex.get("repair_attempts", 0) + 1
 
     if repair_status == "repaired":
-        # After repair, reset findings state so operator can run a new Codex review
-        codex["status"] = "not_started"
-        codex["findings_count"] = 0
-        codex["highest_severity"] = "none"
-        next_action = {
-            "action": "request_human",
-            "task_id": None,
-            "reason": "await_codex_review_after_repair",
-        }
+        # Round-70 PHASE 3-P1: when --status=repaired the
+        # autonomous production path MUST invoke the
+        # impact-selected runner seam. Failed validation
+        # preserves findings state (no advance to
+        # ``await_codex_review_after_repair``).
+        validation_outcome = "pending"
+        validation_log_path = ""
+        validation_return_code = None
+        validation_error = ""
+        cleaned_paths = [
+            str(p or "").strip()
+            for p in (getattr(args, "changed_path", []) or [])
+        ]
+        cleaned_paths = [p for p in cleaned_paths if p]
+        if not cleaned_paths:
+            validation_error = "no_changed_paths_supplied"
+        else:
+            log_dir = (
+                Path(str(args.state)).parent / "validations"
+            )
+            log_dir.mkdir(parents=True, exist_ok=True)
+            validation_log_path = str(
+                log_dir / f"validation-{int(time.time())}.json"
+            )
+            seam = _autonomous_repair_seam()
+            try:
+                result = seam["runner_call"](
+                    changed_paths=cleaned_paths,
+                    tier="tier_2_cohesive_batch",
+                    final_candidate=False,
+                    log_path=validation_log_path,
+                )
+            except Exception as exc:
+                validation_error = (
+                    f"runner_failed:{type(exc).__name__}"
+                )
+            else:
+                validation_return_code = int(
+                    result.get("return_code", -1)
+                )
+                if validation_return_code == 0:
+                    validation_outcome = "passed"
+                else:
+                    validation_outcome = "failed"
+
+        codex["last_validation_outcome"] = validation_outcome
+        codex["last_validation_log_path"] = validation_log_path
+        if validation_return_code is not None:
+            codex["last_validation_return_code"] = (
+                validation_return_code
+            )
+        if validation_error:
+            codex["last_validation_error"] = validation_error
+
+        if validation_outcome == "passed":
+            # Validation succeeded: clear findings state and
+            # advance to awaiting another Codex review.
+            codex["status"] = "not_started"
+            codex["findings_count"] = 0
+            codex["highest_severity"] = "none"
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": "await_codex_review_after_repair",
+            }
+        else:
+            # Validation failed (or no paths supplied):
+            # preserve findings state and do NOT advance.
+            next_action = {
+                "action": "request_human",
+                "task_id": None,
+                "reason": (
+                    f"validation_failed_no_repair:"
+                    f"{validation_error or 'rc' + str(validation_return_code)}"
+                ),
+            }
     elif repair_status == "failed":
         if codex["repair_attempts"] >= codex.get("max_repair_attempts", DEFAULT_MAX_CODEX_REPAIR):
             codex["status"] = "repair_limit_exceeded"
@@ -1040,6 +1220,266 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
     print(f"Recorded Codex repair result: {repair_status}")
     print(f"  repair_attempts: {codex['repair_attempts']}/{codex.get('max_repair_attempts', DEFAULT_MAX_CODEX_REPAIR)}")
     print(f"  next action: {next_action['action']} — {next_action['reason']}")
+
+
+def _autonomous_repair_seam():
+    """Return the planner/runner seam for autonomous repair.
+
+    Round-70 PHASE 3-P1: the controller's autonomous
+    Codex-repair path now consults this seam rather than
+    only mutating state. Tests inject a fake dict with the
+    keys ``planner_call`` and ``runner_call`` to capture
+    what would have been invoked without doing the work.
+    """
+    try:
+        from scripts.local import aed_repair_planner as _planner
+        from scripts.local import aed_test_runner as _runner
+        return {
+            "planner_call": lambda **kw: _planner.build_repair_plan(**kw),
+            "runner_call": lambda **kw: _runner.run_impact_selected_tests(**kw),
+            "planner_module": _planner,
+            "runner_module": _runner,
+        }
+    except Exception:
+        # If the planner/runner modules fail to import, return a
+        # fail-closed seam that raises if invoked (the controller
+        # must explicitly fail closed when the wiring is broken).
+        def _raise(_exc):
+            def _f(**_kw):
+                raise _exc
+            return _f
+        return {
+            "planner_call": _raise(ImportError("aed_repair_planner unavailable")),
+            "runner_call": _raise(ImportError("aed_test_runner unavailable")),
+            "planner_module": None,
+            "runner_module": None,
+        }
+
+
+def _record_autonomous_repair_plan(args: argparse.Namespace) -> None:
+    """Record the plan produced by the autonomous planner.
+
+    Round-70 PHASE 3-P1: this records the plan path and key
+    plan metadata in controller state so the operator and
+    downstream tooling can verify cohesive batching and
+    impact-selected tests were actually produced. Sets
+    next_action=repair_task on success. Fails closed (no
+    state mutation) when the planner input is missing or
+    malformed.
+    """
+    state = _load_state(args.state)
+
+    if not args.findings_file or not str(args.findings_file).strip():
+        print("ERROR: --findings-file is required to record a repair plan",
+              file=sys.stderr)
+        sys.exit(2)
+    findings_path = Path(str(args.findings_file))
+    if not findings_path.exists():
+        print(f"ERROR: findings file not found: {findings_path}",
+              file=sys.stderr)
+        sys.exit(2)
+    try:
+        with open(findings_path) as f:
+            findings = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"ERROR: findings file could not be parsed: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+    if not isinstance(findings, list) or not findings:
+        print("ERROR: findings file must contain a non-empty list",
+              file=sys.stderr)
+        sys.exit(2)
+    # Validate each finding is a dict with a finding_id
+    for i, f in enumerate(findings):
+        if not isinstance(f, dict):
+            print(f"ERROR: findings[{i}] must be a dict", file=sys.stderr)
+            sys.exit(2)
+        if not f.get("finding_id") and not f.get("id"):
+            print(f"ERROR: findings[{i}] missing finding_id", file=sys.stderr)
+            sys.exit(2)
+
+    output_plan = Path(str(args.output_plan or ""))
+
+    # Invoke planner seam (or test seam).
+    seam = _autonomous_repair_seam()
+    try:
+        plan = seam["planner_call"](
+            findings=findings,
+            changed_paths=[],
+            tier="tier_2_cohesive_batch",
+            final_candidate=False,
+        )
+    except Exception as e:
+        print(f"ERROR: planner failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Persist the plan if output_plan is given. The planner API
+    # performs no GitHub mutation and writes only when given an
+    # explicit output path. We then record the path in state.
+    if output_plan:
+        output_plan.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(output_plan, "w") as fh:
+                json.dump(plan, fh, indent=2)
+        except OSError as e:
+            print(f"ERROR: could not persist plan to {output_plan}: {e}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    codex = state.get("codex_review", {})
+    codex["repair_plan_path"] = str(output_plan) if output_plan else ""
+    codex["repair_plan_generated_at"] = _utcnow()
+    codex["repair_plan_finding_count"] = plan.get("finding_count", 0)
+    codex["repair_plan_batch_count"] = plan.get("batch_count", 0)
+    state["codex_review"] = codex
+
+    next_action = {
+        "action": "repair_task",
+        "task_id": None,
+        "reason": "codex_findings_plan_generated",
+        "source": "codex_review",
+    }
+    state["next_action"] = next_action
+    state["updated_at"] = _utcnow()
+    state["human_action_required"] = False
+
+    _save_state(state, args.state)
+
+    print(
+        f"Recorded autonomous repair plan: "
+        f"findings={plan.get('finding_count', 0)} "
+        f"batches={plan.get('batch_count', 0)} "
+        f"plan={output_plan or '(in-memory)'}"
+    )
+
+
+def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
+    """Record the impact-selected validation run after repair.
+
+    Round-70 PHASE 3-P1: this records the test-runner outcome
+    so the operator can verify selected tests actually ran
+    before the repaired transition was claimed. Fails closed
+    (does NOT advance to await_codex_review_after_repair)
+    when validation fails or evidence is malformed.
+    """
+    state = _load_state(args.state)
+
+    # argparse action='append' populates args.changed_path (singular)
+    raw_paths = list(getattr(args, "changed_path", []) or [])
+    cleaned_paths = [p for p in raw_paths if str(p or "").strip()]
+    if not cleaned_paths:
+        print("ERROR: at least one non-empty --changed-path is required "
+              "to record repair validation", file=sys.stderr)
+        sys.exit(2)
+
+    log_path = Path(str(args.output_log or "")) if str(args.output_log or "").strip() else None
+    # Invoke the runner seam.
+    seam = _autonomous_repair_seam()
+    try:
+        # argparse action='append' populates args.changed_path (singular)
+        changed_paths = cleaned_paths
+        result = seam["runner_call"](
+            changed_paths=changed_paths,
+            tier=str(args.tier or "tier_2_cohesive_batch"),
+            final_candidate=bool(args.final_candidate),
+            log_path=str(log_path) if log_path else None,
+        )
+    except Exception as e:
+        # On runner failure, do NOT advance to repaired state.
+        # Record the failure but leave the finding state intact
+        # so the operator can re-run validation.
+        codex = state.get("codex_review", {})
+        codex["last_validation_status"] = "runner_error"
+        codex["last_validation_error"] = (
+            f"{type(e).__name__}: {e}"
+        )
+        codex["last_validation_at"] = _utcnow()
+        state["codex_review"] = codex
+        state["updated_at"] = _utcnow()
+        # Mark human action required to inspect.
+        state["human_action_required"] = True
+        state["next_action"] = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_runner_error",
+        }
+        _save_state(state, args.state)
+        print(f"ERROR: runner failed: {type(e).__name__}: {e}",
+              file=sys.stderr)
+        sys.exit(2)
+
+    # Persist the runner log if log_path was provided and is a real path.
+    if log_path and isinstance(log_path, Path) and str(log_path):
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(log_path, "w") as fh:
+                json.dump(result, fh, indent=2)
+        except OSError as e:
+            print(f"ERROR: could not persist log to {log_path}: {e}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+    rc = int(result.get("return_code", -1))
+    selected = list(result.get("selected_tests", []))
+    duration = result.get("duration", 0.0)
+
+    codex = state.get("codex_review", {})
+    codex["last_validation_at"] = _utcnow()
+    codex["last_validation_status"] = "passed" if rc == 0 else "failed"
+    codex["last_validation_return_code"] = rc
+    codex["last_validation_duration_seconds"] = duration
+    codex["last_validation_selected_tests"] = selected
+    codex["last_validation_log_path"] = str(log_path) if log_path else ""
+
+    # Apply transition:
+    #  - rc == 0: validated successfully, allow transition to
+    #    await_codex_review_after_repair (mirrors the contract).
+    #  - rc != 0: validation failed, do NOT reset findings state
+    #    and do NOT claim repair succeeded.
+    codex_repair_event = {
+        "timestamp": _utcnow(),
+        "source": "autonomous_validation",
+        "head_sha": codex.get("head_sha") or "",
+        "artifact_path": codex.get("artifact_path") or "",
+        "status": "repaired" if rc == 0 else "failed",
+        "findings_count": codex.get("findings_count", 0),
+        "highest_severity": codex.get("highest_severity", "none"),
+        "repair_attempt": codex.get("repair_attempts", 0),
+        "blocker_fingerprint": codex.get("last_blocker_fingerprint") or "",
+        "summary": f"validation rc={rc} duration={duration:.1f}s",
+    }
+    state["codex_repair_events"] = state.get("codex_repair_events", [])
+    state["codex_repair_events"].append(codex_repair_event)
+
+    if rc == 0:
+        codex["status"] = "not_started"
+        codex["findings_count"] = 0
+        codex["highest_severity"] = "none"
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "await_codex_review_after_repair",
+        }
+        state["human_action_required"] = True
+    else:
+        # Validation failed; do NOT reset finding state. Remain repairable.
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_failed_does_not_repair",
+        }
+        state["human_action_required"] = True
+    state["codex_review"] = codex
+    state["next_action"] = next_action
+    state["updated_at"] = _utcnow()
+
+    _save_state(state, args.state)
+    print(
+        f"Recorded autonomous validation: rc={rc} duration={duration:.1f}s "
+        f"selected={len(selected)}"
+    )
+
 
 
 def _finalize_run(args: argparse.Namespace) -> None:
@@ -1136,6 +1576,12 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Highest severity among findings")
     p_codex_rev.add_argument("--summary", help="Summary text of findings or clean result")
     p_codex_rev.add_argument("--blocker-fingerprint", help="Fingerprint/hash identifying the blocker")
+    p_codex_rev.add_argument("--findings-file",
+                              help="Path to JSON findings artifact (Round-70 PHASE 3-P1: "
+                                   "the controller invokes the planner seam on this). "
+                                   "Required when --status=findings to enable the "
+                                   "autonomous repair plan path; otherwise the "
+                                   "controller fails closed to a human-actionable state.")
 
     # record-codex-repair-result
     p_codex_rep = sub.add_parser("record-codex-repair-result",
@@ -1146,6 +1592,36 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Repair outcome")
     p_codex_rep.add_argument("--summary", help="Brief description of what was done")
     p_codex_rep.add_argument("--blocker-fingerprint", help="Fingerprint matching the original blocker")
+    p_codex_rep.add_argument("--changed-path", action="append",
+                              help="Changed path(s) for impact-selected validation "
+                                   "(Round-70 PHASE 3-P1). Repeatable.")
+
+    # record-autonomous-repair-plan (Round-70 P1 wiring)
+    p_arp = sub.add_parser(
+        "record-autonomous-repair-plan",
+        help="Record a cohesive repair plan generated from findings evidence",
+    )
+    p_arp.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_arp.add_argument("--findings-file", required=True,
+                       help="JSON file containing the findings list")
+    p_arp.add_argument("--output-plan",
+                       help="Destination JSON file for the plan")
+
+    # record-autonomous-repair-validation (Round-70 P1 wiring)
+    p_arv = sub.add_parser(
+        "record-autonomous-repair-validation",
+        help="Record the impact-selected validation run after repair",
+    )
+    p_arv.add_argument("--state", required=True, help="Path to CONTROLLER_STATE.json")
+    p_arv.add_argument("--changed-path", action="append", required=True,
+                       help="Changed path (repeatable)")
+    p_arv.add_argument("--tier",
+                       choices=["tier_1_inner_repair", "tier_2_cohesive_batch",
+                                "tier_3_final_candidate"],
+                       default="tier_2_cohesive_batch")
+    p_arv.add_argument("--final-candidate", action="store_true")
+    p_arv.add_argument("--output-log",
+                       help="Destination JSON file for the validation log")
 
     # finalize-run
     p_fin = sub.add_parser("finalize-run", help="Mark run as complete")
@@ -1345,6 +1821,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "record-pr-result": _record_pr_result,
         "record-codex-review": _record_codex_review,
         "record-codex-repair-result": _record_codex_repair_result,
+        "record-autonomous-repair-plan": _record_autonomous_repair_plan,
+        "record-autonomous-repair-validation": _record_autonomous_repair_validation,
         "finalize-run": _finalize_run,
         "record-persistent-guard-snapshot": _record_persistent_guard_snapshot,
         "record-persistent-guard-compare": _record_persistent_guard_compare,

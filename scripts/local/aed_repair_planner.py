@@ -48,7 +48,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 # Round-412 (PHASE 6): script-local import path setup.
 # When this CLI is run as ``python3 scripts/local/aed_repair_planner.py``
@@ -116,6 +116,48 @@ def batches_to_dict(batches: List[RepairBatch]) -> List[Dict[str, Any]]:
             "requires_full_validation": bool(b.requires_full_validation),
         })
     return out
+
+
+
+
+def build_repair_plan(
+    findings: List[Dict[str, Any]],
+    *,
+    changed_paths: Optional[List[str]] = None,
+    tier: str = "tier_2_cohesive_batch",
+    final_candidate: bool = False,
+) -> Dict[str, Any]:
+    """Importable planner API (Round-70 PHASE 3-P1).
+
+    Round-70 exact-head repair: the autonomous
+    ``autocoder_run_controller`` repairs findings transition
+    needs an importable function that produces the same
+    machine-readable plan as :func:`main`. This function
+    delegates to the existing CLI's primary building blocks
+    (:func:`parse_findings`, :func:`batch_findings`,
+    :func:`select_tests_with_invocation`) and emits the
+    same plan shape the CLI writes to disk.
+
+    Returns the plan dictionary. Performs no GitHub mutation
+    and writes only when the caller invokes a filesystem write
+    explicitly.
+    """
+    parsed = parse_findings(findings)
+    batches = batch_findings(parsed)
+    selected = select_tests_with_invocation(
+        changed_paths=changed_paths or [],
+        tier=ValidationTier(tier),
+        final_candidate=final_candidate,
+    )
+    return {
+        "tier": tier,
+        "batches": batches_to_dict(batches),
+        "selection_reason": selected.selection_reason,
+        "changed_paths": list(changed_paths or []),
+        "test_plan": selected.to_machine_readable(),
+        "finding_count": len(parsed),
+        "batch_count": len(batches),
+    }
 
 
 def main(argv: List[str] | None = None) -> int:

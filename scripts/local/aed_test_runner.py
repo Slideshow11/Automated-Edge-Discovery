@@ -55,6 +55,42 @@ def _read_paths(path: str) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def run_impact_selected_tests(
+    changed_paths: List[str],
+    *,
+    tier: str = "tier_2_cohesive_batch",
+    final_candidate: bool = False,
+    cwd: Optional[str] = None,
+    log_path: Optional[str] = None,
+    executor: Optional[ExecutorFn] = None,
+) -> Dict[str, Any]:
+    """Importable test-runner API (Round-70 PHASE 3-P1).
+
+    Round-70 exact-head repair: the autonomous
+    ``autocoder_run_controller`` repaired transition needs an
+    importable function that invokes the shared test-selection
+    and executor and returns a machine-readable result
+    including ``return_code``, ``duration``, ``selected_tests``,
+    ``selection_reason``, ``tier``, ``command`` and ``capped``.
+    Performs no GitHub mutation. Writes only when ``log_path``
+    is provided.
+    """
+    plan = select_tests_with_invocation(
+        changed_paths=changed_paths,
+        tier=ValidationTier(tier),
+        final_candidate=final_candidate,
+    )
+    return run_selected_tests(
+        plan=plan,
+        cwd=cwd,
+        log_path=log_path,
+        pytest_args=None,
+        executor=executor,
+    )
+
+
+
+
 def main(
     argv: Optional[List[str]] = None,
     *,
@@ -101,9 +137,58 @@ def main(
         default=None,
         help="Working directory (default: current directory).",
     )
+    p.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Round-70 PHASE 5: deterministically return a stub "
+             "validation result without launching pytest. "
+             "Intended for thin-wrapper tests that must not "
+             "execute the repository suite. The output log is "
+             "still written so callers can read the selected "
+             "tests and tier.",
+    )
     args = p.parse_args(argv)
 
     changed_paths = _read_paths(args.changed_paths_file)
+    if args.dry_run:
+        # Round-70 PHASE 5 dry-run: build the plan, write the
+        # log, return a stub result with returncode=0. No
+        # subprocess is launched. This is the only CI-safe
+        # way to verify the CLI wrapper without invoking
+        # the full repository test suite.
+        tier = ValidationTier(args.tier)
+        plan = select_tests_with_invocation(
+            changed_paths=changed_paths,
+            tier=tier,
+            final_candidate=bool(args.final_candidate),
+        )
+        log_payload = {
+            "selected_tests": plan.selected_tests,
+            "selection_reason": plan.selection_reason,
+            "tier": tier.value,
+            "requires_full_validation": plan.requires_full_validation,
+            "duration_seconds": 0.0,
+            "returncode": 0,
+            "command": ["pytest", "-q"] + plan.selected_tests,
+            "capped": False,
+            "dry_run": True,
+        }
+        Path(str(args.output_log)).parent.mkdir(
+            parents=True, exist_ok=True
+        )
+        with open(args.output_log, "w") as _lh:
+            json.dump(log_payload, _lh, indent=2)
+        print(json.dumps({
+            "tool": "aed_test_runner",
+            "selected": plan.selected_tests,
+            "tier": tier.value,
+            "requires_full_validation": plan.requires_full_validation,
+            "returncode": 0,
+            "duration_seconds": 0.0,
+            "dry_run": True,
+        }))
+        return 0
+
     tier = ValidationTier(args.tier)
     plan = select_tests_with_invocation(
         changed_paths=changed_paths,

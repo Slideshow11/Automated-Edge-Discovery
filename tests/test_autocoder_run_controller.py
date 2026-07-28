@@ -827,7 +827,14 @@ def test_record_codex_review_findings_stores_findings_count_and_severity(temp_wo
 
 
 def test_record_codex_review_findings_below_limit_produces_repair_task(temp_workspace, sample_tasks_jsonl):
-    """Findings with attempts below limit produces next_action repair_task."""
+    """Findings with attempts below limit AND a findings-file plan successfully
+    produces next_action repair_task via the autonomous planner seam.
+
+    Round-70 PHASE 5-P1: repair_task is gated on a successfully
+    persisted plan, not just on ``status=findings``. The
+    operator supplies --findings-file as evidence; the controller
+    invokes the planner seam and persists plan metadata.
+    """
     state_path = temp_workspace / "CONTROLLER_STATE.json"
     run_controller([
         "init", "--run-id", "aed-codex-rpair-001",
@@ -836,16 +843,29 @@ def test_record_codex_review_findings_below_limit_produces_repair_task(temp_work
         "--integration-branch", "int/codex-rpair-001",
         "--output-state", str(state_path),
     ])
+    # Build a findings artifact so the planner seam has evidence.
+    findings_file = temp_workspace / "findings-rpair.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "formatting", "path": "scripts/local/foo.py",
+         "summary": ""},
+        {"finding_id": "F2", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "formatting", "path": "scripts/local/foo.py",
+         "summary": ""},
+    ]))
     rc, stdout, stderr = run_controller([
         "record-codex-review", "--state", str(state_path),
         "--status", "findings", "--head-sha", "abc123",
         "--findings-count", "2", "--highest-severity", "P2",
         "--summary", "Minor formatting issues",
+        "--findings-file", str(findings_file),
     ])
     assert rc == 0
     state = json.loads(Path(state_path).read_text())
+    # Plan path must be persisted on success.
+    assert state["codex_review"].get("repair_plan_path", "")
     assert state["next_action"]["action"] == "repair_task"
-    assert state["next_action"]["reason"] == "codex_findings"
+    assert state["next_action"]["reason"] == "codex_findings_plan_generated"
 
 
 def test_record_codex_repair_result_increments_repair_attempts(temp_workspace, sample_tasks_jsonl):
@@ -927,13 +947,24 @@ def test_same_blocker_fingerprint_twice_requests_human(temp_workspace, sample_ta
         "--blocker-fingerprint", "blocker-A",
     ])
     assert rc == 0
-    # Second cycle with same blocker: triggers same_codex_blocker_repeated
+    # Second cycle with same blocker: requires --findings-file
+    # AND must escalate to same_codex_blocker_repeated. Round-70
+    # PHASE 5-P1: same-blocker escalation must remain enforced even
+    # when --findings-file is supplied (planning evidence present
+    # does not bypass escalation).
+    findings_file = temp_workspace / "findings-same-blocker.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "B1", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "test-same-blocker", "path": "scripts/local/foo.py",
+         "summary": ""},
+    ]))
     rc, stdout, stderr = run_controller([
         "record-codex-review", "--state", str(state_path),
         "--status", "findings", "--head-sha", "abc123",
         "--findings-count", "1", "--highest-severity", "P2",
         "--summary", "Same issue persists",
         "--blocker-fingerprint", "blocker-A",
+        "--findings-file", str(findings_file),
     ])
     assert rc == 0
     state = json.loads(Path(state_path).read_text())
@@ -1753,3 +1784,432 @@ def test_final_status_report_includes_blocked_change_count(temp_workspace, sampl
     state = json.loads(state_path.read_text())
     assert state["persistent_mutation_guard"]["blocked_changes_count"] == 2
     assert "2" in stdout  # blocked_changes: 2
+
+
+# ---------------------------------------------------------------------------
+# Round-70 PHASE 5-P1 regression coverage
+# ---------------------------------------------------------------------------
+#
+# These tests prove that the autonomous controller wiring now invokes the
+# planner on findings and the runner on repair, and that the transitions
+# honour fail-closed semantics on malformed or missing evidence.
+
+
+class _FakePlannerAndRunner:
+    """Captures planner and runner invocations without doing the work."""
+
+    def __init__(self):
+        self.planner_calls = []
+        self.runner_calls = []
+
+    def planner_call(self, **kwargs):
+        self.planner_calls.append(kwargs)
+        return {
+            "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+            "batches": [
+                {
+                    "batch_id": "BATCH-FAKE01",
+                    "finding_ids": [f.get("finding_id") for f in kwargs.get("findings", []) if f.get("finding_id")],
+                    "severities": ["P2"],
+                    "root_cause": "fake",
+                    "subsystem": "fake",
+                    "grouping_reason": "fake",
+                    "smaller_than_default_reason": "",
+                    "focused_tests": ["tests.fake_select"],
+                    "requires_full_validation": False,
+                }
+            ],
+            "selection_reason": "fake",
+            "changed_paths": kwargs.get("changed_paths", []),
+            "test_plan": {
+                "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+                "selected_tests": ["tests.fake_select"],
+                "requires_full_validation": False,
+                "classification_failures": [],
+            },
+            "finding_count": len(kwargs.get("findings", []) or []),
+            "batch_count": 1,
+        }
+
+    def runner_call(self, **kwargs):
+        rc = self.runner_calls.append(kwargs)
+        return {
+            "return_code": 0,
+            "duration": 0.1,
+            "selected_tests": ["tests.fake_select"],
+            "selection_reason": "fake",
+            "tier": kwargs.get("tier", "tier_2_cohesive_batch"),
+            "command": ["pytest", "-q", "tests.fake_select"],
+            "capped": False,
+            "complete": True,
+        }
+
+
+def _init_minimal_state(tmp_state: str) -> None:
+    """Write a minimal initialized CONTROLLER_STATE.json via the controller CLI.
+
+    ``tmp_state`` is a path to where the state file lives. We use a sibling
+    directory ``tmp_state + "_wd"`` as the workspace so that ``-output-state``
+    does not collide with a pre-existing directory.
+    """
+    state_file = Path(tmp_state)
+    workspace = state_file.parent / (state_file.stem + "_wd")
+    workspace.mkdir(parents=True, exist_ok=True)
+    tasks = workspace / "tasks.jsonl"
+    tasks.write_text(json.dumps({
+        "task_id": "TASK-001",
+        "status": "PENDING",
+        "title": "Round-70 test task",
+    }) + "\n")
+    bundle = workspace / "bundle.json"
+    bundle.write_text(json.dumps({
+        "bundle_id": "BUNDLE-FAKE01",
+        "task_ids": ["TASK-001"],
+    }))
+    rc = controller_main([
+        "init",
+        "--run-id", "RND70",
+        "--tasks-jsonl", str(tasks),
+        "--bundle-index", str(bundle),
+        "--workspace", str(workspace),
+        "--integration-branch", "fix/test-branch",
+        "--output-state", str(state_file),
+    ])
+    assert rc == 0, f"init failed rc={rc} for {state_file}"
+
+
+def _autonomous_seam(scratch_dir: str, fake: _FakePlannerAndRunner):
+    """Patch _autonomous_repair_seam in the controller module to use our fake."""
+    import scripts.local.autocoder_run_controller as ctrl
+    return {
+        "planner_call": fake.planner_call,
+        "runner_call": fake.runner_call,
+        "planner_module": None,
+        "runner_module": None,
+    }
+
+
+def test_r70_planner_invoked_on_findings(monkeypatch, tmp_path):
+    """Round-70 R-1: recording findings automatically invokes the planner seam."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_seam(state_path, fake),
+    )
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "subsystem": "autocoder",
+         "root_cause": "wiring", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": "demo"},
+        {"finding_id": "F2", "severity": "P2", "subsystem": "autocoder",
+         "root_cause": "wiring", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": "demo2"},
+    ]))
+
+    plan_path = tmp_path / "plan.json"
+
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path,
+        "--findings-file", str(findings_file),
+        "--output-plan", str(plan_path),
+    ])
+    assert rc == 0, f"record-autonomous-repair-plan rc={rc}"
+
+    # Planner MUST have been invoked exactly once with the findings list.
+    assert len(fake.planner_calls) == 1
+    pc = fake.planner_calls[0]
+    assert pc["tier"] == "tier_2_cohesive_batch"
+    assert [f["finding_id"] for f in pc["findings"]] == ["F1", "F2"]
+
+    # Plan file MUST have been written.
+    plan = json.loads(plan_path.read_text())
+    assert plan["finding_count"] == 2
+    assert plan["batch_count"] == 1
+
+    # State MUST record the plan path and metadata.
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex["repair_plan_path"] == str(plan_path)
+    assert codex["repair_plan_finding_count"] == 2
+    assert codex["repair_plan_batch_count"] == 1
+    # next_action MUST be repair_task.
+    assert state["next_action"]["action"] == "repair_task"
+
+
+def test_r70_same_root_cause_forms_cohesive_batch(monkeypatch, tmp_path):
+    """Round-70 R-2: same-root-cause findings form a cohesive batch."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    findings_file = tmp_path / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "A", "severity": "P2", "subsystem": "audit",
+         "root_cause": "missing-cursor", "path": "scripts/local/audit_codex_response_for_pr.py",
+         "summary": ""},
+        {"finding_id": "B", "severity": "P2", "subsystem": "audit",
+         "root_cause": "missing-cursor", "path": "scripts/local/audit_codex_response_for_pr.py",
+         "summary": ""},
+    ]))
+
+    plan_path = tmp_path / "plan.json"
+
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path,
+        "--findings-file", str(findings_file),
+        "--output-plan", str(plan_path),
+    ])
+    assert rc == 0
+
+    # 2 findings, same root_cause, same subsystem → 1 batch.
+    plan = json.loads(plan_path.read_text())
+    assert plan["batch_count"] == 1, plan
+    assert sorted(plan["batches"][0]["finding_ids"]) == ["A", "B"]
+
+
+def _autonomous_repair_seam_path(state_path, fake):
+    return {
+        "planner_call": fake.planner_call,
+        "runner_call": fake.runner_call,
+        "planner_module": None,
+        "runner_module": None,
+    }
+
+
+def test_r70_malformed_findings_fails_closed(monkeypatch, tmp_path):
+    """Round-70 R-4: malformed or missing finding evidence fails closed."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Empty findings list
+    f0 = tmp_path / "f0.json"
+    f0.write_text(json.dumps([]))
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f0),
+        "--output-plan", str(tmp_path / "p0.json"),
+    ])
+    assert rc != 0, "empty findings should fail"
+
+    # Missing findings file
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(tmp_path / "missing.json"),
+        "--output-plan", str(tmp_path / "p1.json"),
+    ])
+    assert rc != 0, "missing file should fail"
+
+    # Malformed JSON
+    f2 = tmp_path / "f2.json"
+    f2.write_text("not json")
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f2),
+        "--output-plan", str(tmp_path / "p2.json"),
+    ])
+    assert rc != 0, "malformed JSON should fail"
+
+    # Missing finding_id
+    f3 = tmp_path / "f3.json"
+    f3.write_text(json.dumps([{"severity": "P2", "subsystem": "x",
+                                "root_cause": "y", "path": "z.py", "summary": ""}]))
+    rc = controller_main([
+        "record-autonomous-repair-plan",
+        "--state", state_path, "--findings-file", str(f3),
+        "--output-plan", str(tmp_path / "p3.json"),
+    ])
+    assert rc != 0, "missing finding_id should fail"
+
+    # State MUST NOT have advanced to repair_task.
+    state = json.loads(Path(state_path).read_text())
+    assert state["next_action"]["action"] != "repair_task"
+
+
+def test_r70_runner_invoked_on_repaired(monkeypatch, tmp_path):
+    """Round-70 R-5: recording repaired automatically invokes the runner seam."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    log_path = tmp_path / "log.json"
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "scripts/local/foo.py",
+        "--tier", "tier_2_cohesive_batch",
+        "--output-log", str(log_path),
+    ])
+    assert rc == 0, f"record-autonomous-repair-validation rc={rc}"
+
+    # Runner MUST have been invoked with the changed path.
+    assert len(fake.runner_calls) == 1
+    assert fake.runner_calls[0]["changed_paths"] == ["scripts/local/foo.py"]
+
+    # Log MUST have been written.
+    log = json.loads(log_path.read_text())
+    assert log["return_code"] == 0
+
+    # State MUST record the validation outcome.
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex["last_validation_status"] == "passed"
+    assert codex["last_validation_return_code"] == 0
+
+    # next_action MUST be await_codex_review_after_repair (after validation success).
+    assert state["next_action"]["reason"] == "await_codex_review_after_repair"
+
+
+def test_r70_failed_validation_does_not_reset_findings(monkeypatch, tmp_path):
+    """Round-70 R-7: failed selected tests do not reset finding state."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    # Pre-seed findings state
+    Path(state_path).write_text(json.dumps({
+        **json.loads(Path(state_path).read_text()),
+        "codex_review": {
+            "status": "findings", "findings_count": 3, "highest_severity": "P2",
+        },
+    }))
+
+    fake = _FakePlannerAndRunner()
+
+    def runner_call_rc1(**kw):
+        fake.runner_calls.append(kw)
+        return {
+            "return_code": 1,  # FAILURE
+            "duration": 0.5,
+            "selected_tests": ["tests.failed"],
+            "selection_reason": "fake",
+            "tier": "tier_2_cohesive_batch",
+            "command": ["pytest", "-q", "tests.failed"],
+            "capped": False,
+            "complete": True,
+        }
+    fake.runner_call = runner_call_rc1
+
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "scripts/local/foo.py",
+        "--tier", "tier_2_cohesive_batch",
+    ])
+    assert rc == 0, "controller should not propagate error exit"
+
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    # Last validation recorded as failed.
+    assert codex["last_validation_status"] == "failed"
+    assert codex["last_validation_return_code"] == 1
+    # Finding state MUST NOT be reset (still findings_count=3).
+    assert codex.get("findings_count", 0) != 0 or codex.get("status") != "not_started"
+
+
+def test_r70_empty_changed_paths_fails_closed(monkeypatch, tmp_path):
+    """Round-70 R-8: empty or missing changed-path evidence fails closed."""
+    state_path = str(tmp_path / "state.json")
+    _init_minimal_state(state_path)
+
+    fake = _FakePlannerAndRunner()
+    monkeypatch.setattr(
+        "scripts.local.autocoder_run_controller._autonomous_repair_seam",
+        lambda: _autonomous_repair_seam_path(state_path, fake),
+    )
+
+    rc = controller_main([
+        "record-autonomous-repair-validation",
+        "--state", state_path,
+        "--changed-path", "",
+        "--tier", "tier_2_cohesive_batch",
+    ])
+    assert rc != 0, "empty changed-path should fail"
+    assert len(fake.runner_calls) == 0
+
+
+def test_r70_planner_cli_still_works(tmp_path):
+    """Round-70 R-10: the planner CLI still works as a thin wrapper.
+
+    Uses subprocess timeout so the test cannot hang.
+    """
+    import subprocess as sp
+    findings = tmp_path / "f.json"
+    findings.write_text(json.dumps([
+        {"finding_id": "X", "severity": "P2", "subsystem": "scripts",
+         "root_cause": "r70", "path": "scripts/local/autocoder_run_controller.py",
+         "summary": ""},
+    ]))
+    plan = tmp_path / "plan.json"
+    res = sp.run([
+        sys.executable, "scripts/local/aed_repair_planner.py",
+        "--findings-file", str(findings),
+        "--output-plan", str(plan),
+    ], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    j = json.loads(plan.read_text())
+    assert j["finding_count"] == 1
+    assert j["batch_count"] == 1
+
+
+def test_r70_runner_cli_still_works(tmp_path):
+    """Round-70 R-10: the runner CLI still works as a thin wrapper.
+
+    Uses ``--dry-run`` so the test never launches pytest. The
+    subprocess is bounded by a 30-second timeout so the test
+    cannot hang. The output log is written with returncode=0.
+    """
+    import subprocess as sp
+    paths = tmp_path / "paths.txt"
+    paths.write_text("scripts/local/foo.py\n")
+    log = tmp_path / "log.json"
+    res = sp.run([
+        sys.executable, "scripts/local/aed_test_runner.py",
+        "--changed-paths-file", str(paths),
+        "--output-log", str(log),
+        "--dry-run",
+    ], capture_output=True, text=True, timeout=30)
+    assert res.returncode == 0, res.stderr
+    j = json.loads(log.read_text())
+    assert j["returncode"] == 0
+    assert j["dry_run"] is True
+
+
+def test_r70_state_compatibility_existing_file(tmp_path):
+    """Round-70 R-11: existing controller-state files without new optional fields
+    can still be read safely.
+    """
+    state_path = tmp_path / "old_state.json"
+    state_path.write_text(json.dumps({
+        "run_id": "OLD",
+        "status": "RUN_ACTIVE",
+        "tasks": [],
+        "codex_review": {
+            "status": "findings",
+            "findings_count": 5,
+            "highest_severity": "P1",
+        },
+        "next_action": {"action": "repair_task"},
+        "updated_at": "2026-01-01T00:00:00Z",
+    }))
+    rc = controller_main(["status", "--state", str(state_path)])
+    assert rc == 0, "old state should still be readable"

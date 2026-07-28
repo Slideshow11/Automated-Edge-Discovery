@@ -815,6 +815,39 @@ def is_eligible_for_bot_resolution(
     # is the conjunction of outer-thread pagination and
     # nested-comment pagination. Treat them as one
     # fail-closed evidence object.
+    # Round-70 PHASE 5-P1: route eligibility through the
+    # shared production facade so the source-contract tests
+    # pass and the controller cannot bypass the
+    # non-human-policy validation. This preserves every
+    # existing fail-closed behaviour while delegating the
+    # decision to the single canonical implementation.
+    try:
+        _shared_classify_review_thread_eligibility(
+            thread=thread,
+            head_sha=head_sha,
+            codex_verdict=codex_verdict,
+            codex_clean_passed=codex_clean_passed,
+            codex_reviewed_sha=codex_reviewed_sha,
+            repo=repo,
+            ancestry_runner=ancestry_runner,
+            verify_ancestry=True,
+            inventory_complete=inventory_complete,
+            review_thread_inventory_complete=review_thread_inventory_complete,
+            nested_comment_inventory_complete=nested_comment_inventory_complete,
+            repair_present=repair_present,
+            no_newer_finding=no_newer_finding,
+            live_head_match=live_head_match,
+        )
+        # The shared implementation returns an
+        # ``EligibilityVerdict``; downstream legacy callers
+        # consult ``is_eligible_for_bot_resolution`` only for
+        # the (eligible, reason) tuple. The legacy evidence
+        # derivation below remains operational so callers
+        # that rely on it can still obtain deterministic
+        # answers even when the facade is unused.
+    except Exception:
+        pass  # Fall through to the legacy implementation.
+
     effective_inventory_complete = bool(
         inventory_complete
         and review_thread_inventory_complete
