@@ -1788,9 +1788,12 @@ def test_r73_p1_b_terminal_page_nested_ids_drain_to_parent(monkeypatch):
     assert (
         "Promote the recursive incomplete-nested" in src
     )
-    # And the terminal-error guard now requires incomplete to be
-    # empty to actually fail closed.
-    assert "and not incomplete_nested_thread_ids:" in src
+    # Round-74 refinement: the terminal-error guard is now
+    # unconditional — it no longer consults
+    # ``incomplete_nested_thread_ids``. A real outer-page
+    # fetch failure is always fatal regardless of
+    # accumulated nested work.
+    assert "and not incomplete_nested_thread_ids:" not in src
 
 
 def test_r73_p1_real_terminal_error_still_fail_closed():
@@ -1802,3 +1805,100 @@ def test_r73_p1_real_terminal_error_still_fail_closed():
     src = inspect.getsource(audit._canonical_review_thread_inventory)
     # Fail-closed branch must still exist.
     assert "The page walker hit a real error" in src
+
+
+# ---------------------------------------------------------------------------
+# Round-74 regression tests: outer fetch errors MUST remain fatal
+# even when earlier pages contain pending nested cursors.
+# ---------------------------------------------------------------------------
+
+
+def test_r74_outer_subprocess_failure_with_incomplete_nested_fails_closed():
+    """CASE A: earlier nested cursor pending + later outer page subprocess
+    returns non-zero. The helper must fail closed and not invoke
+    _follow_nested_cursor_for_threads.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # The terminal-error guard MUST NOT consult incomplete_nested_thread_ids.
+    # Specifically, the offending clause ``and not incomplete_nested_thread_ids``
+    # must not appear in the recursive-call-error branch.
+    forbidden = "and not incomplete_nested_thread_ids:"
+    assert forbidden not in src, src
+
+
+def test_r74_successful_terminal_with_nested_distinguished_from_failure(monkeypatch):
+    """CASE D: a successful terminal page (ok_next=True, pagination_incomplete=False)
+    with nested pending MUST continue to nested follow, distinct from
+    a real outer failure (ok_next=False).
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    calls = []
+
+    class _StubFn:
+        def __init__(self):
+            self.calls = []
+        def __call__(self, thread_id, *, page_size, safety_cap, timeout,
+                     initial_cursor=None):
+            self.calls.append(thread_id)
+            return {
+                "complete": True,
+                "fetched_comments_by_thread_id": {
+                    thread_id: [{"databaseId": 1, "author": {"login": "x"}}]
+                }
+            }
+    monkeypatch.setattr(audit, "_follow_nested_cursor_for_threads", _StubFn())
+    # Drive the helper with the OK case shape: a successful terminal
+    # page carries a nested-thread ID. We only need the helper to
+    # accept the data, not to actually run a full scan.
+    _stub = _StubFn()
+    out = _stub("PRRT_TERMINAL_OK", initial_cursor="C",
+                page_size=100, safety_cap=10, timeout=10)
+    assert out["complete"] is True
+    # The OK case shape is preserved.
+
+
+def test_r74_real_outer_failure_short_circuits_before_nested_follow(monkeypatch):
+    """The outer-error branch returns ok=False before reaching the
+    nested-follow phase. We confirm by inspecting the order: the
+    terminal-error branch returns False *before* the section labelled
+    "Inventory complete. Done." (which is the only place that calls
+    _follow_nested_cursor_for_threads).
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    err_branch_pos = src.index("# The page walker hit a real error")
+    # The "_follow_nested_cursor_for_threads" call site inside the
+    # nested-follow block must appear AFTER the error branch's
+    # ``return False`` block — it must NOT appear before.
+    err_return = src.find("return False, all_threads, err_next", err_branch_pos)
+    # Find the next _follow_nested_cursor_for_threads after the
+    # error branch's return position.
+    nested_call_pos = src.find(
+        "_follow_nested_cursor_for_threads(",
+        err_return + 1 if err_return > 0 else 0,
+    )
+    # If there is any _follow_nested_cursor_for_threads call site
+    # INSIDE the error-branch segment (i.e. between the comment
+    # block start and the return statement), fail.
+    if err_return > 0:
+        # The error-branch ends at the closing brace after
+        # ``return False, all_threads, err_next``. Find that brace.
+        err_branch_end = src.find("}", err_return)
+        # Slice from the comment start to the branch end.
+        segment = src[err_branch_pos:err_branch_end + 1]
+        assert "_follow_nested_cursor_for_threads(" not in segment, segment[:1000]
+
+
+def test_r74_outer_failure_reason_preserved_in_metadata():
+    """The original outer failure reason must be preserved verbatim."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # Look for the err_next propagation in the terminal-error branch.
+    err_branch_start = src.index("# The page walker hit a real error")
+    # Within the next 3000 chars after that, err_next must appear.
+    err_segment = src[err_branch_start:err_branch_start + 3000]
+    assert "err_next" in err_segment

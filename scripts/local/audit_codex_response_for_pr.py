@@ -1699,9 +1699,21 @@ def _canonical_review_thread_inventory(
                 ) or []:
                     if tid not in incomplete_nested_thread_ids:
                         incomplete_nested_thread_ids.append(tid)
+            # Round-74 PHASE 3 P1: a recursive call returning
+            # ``ok_next=False`` is ALWAYS a real outer failure
+            # (subprocess non-zero, GraphQL errors, malformed
+            # JSON, missing outer connection, missing cursor,
+            # safety cap, etc.). The Round-73 fix relaxed this
+            # condition to ``and not incomplete_nested_thread_ids``
+            # but that suppressed genuine outer failures whenever
+            # earlier pages had pending nested work. Outer fetch
+            # success MUST be proven independently of
+            # accumulated nested IDs. Fail closed; preserve the
+            # outer failure reason; do NOT invoke the nested
+            # follower; do NOT mark inventory complete.
             if not ok_next and not meta_next.get(
                 "review_thread_pagination_incomplete", False
-            ) and not incomplete_nested_thread_ids:
+            ):
                 # The page walker hit a real error
                 # (not "more pages available"). Propagate
                 # ``err_next`` and return ok=False so the
