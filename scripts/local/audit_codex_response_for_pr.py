@@ -1480,18 +1480,117 @@ def _canonical_review_thread_inventory(
         # ``do_walk=False`` (currently the polling loop
         # also relies on ``do_walk=True`` because the
         # production path uses ``max_polls=1``).
-        if not do_walk or not metadata.get(
-            "review_thread_pagination_incomplete", False
+        # Round-72 PHASE 3 P1: outer-pagination and nested-cursor
+        # pagination are two separate completion conditions.
+        # Enter the walker whenever EITHER is incomplete.
+        # The walker's body does not issue another outer
+        # request when ``outer_incomplete`` is False, so a
+        # purely nested-pending inventory does not make
+        # any spurious outer requests.
+        outer_incomplete = bool(
+            metadata.get(
+                "review_thread_pagination_incomplete", False
+            )
+        )
+        nested_pending_on_entry = bool(
+            metadata.get(
+                "review_thread_comment_incomplete_thread_ids", []
+            )
+        )
+        if not do_walk or (
+            not outer_incomplete and not nested_pending_on_entry
         ):
             return True, all_threads, "", metadata
         # The first page had ``hasNextPage=true``. Walk
         # additional pages internally so the one-shot
         # controller path can complete the inventory.
+        # Round-72 PHASE 3 P1: gate the outer-while loop on
+        # ``outer_incomplete``. When only nested cursors are
+        # pending, the loop body is skipped entirely and we
+        # transition directly to nested-follow further down.
         cursor = metadata.get(
             "review_thread_pagination_end_cursor"
         )
         pages = 1
-        while True:
+        # Round-72 PHASE 3 P1: if only nested cursors are
+        # pending (outer pagination already complete on
+        # entry), skip outer page fetching entirely and
+        # proceed directly to nested-follow. We achieve
+        # this by setting the outer-while loop guard to
+        # False so it doesn't execute.
+        if not outer_incomplete and incomplete_nested_thread_ids:
+            # Transition directly to nested-follow. The
+            # existing nested-follow code lives inside the
+            # outer-while body under the
+            # "Inventory complete. Done." branch. We here
+            # replicate its core logic for the
+            # outer-already-complete case.
+            nested_follow = _follow_nested_cursor_for_threads(
+                raw_thread_nodes,
+                safety_cap=safety_cap,
+                timeout=timeout,
+            )
+            if not nested_follow.get("complete"):
+                return False, all_threads, (
+                    nested_follow.get("error")
+                    or "nested_pagination_failed"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": False,
+                    "review_thread_comment_inventory_error_count": (
+                        len(incomplete_nested_thread_ids)
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        list(incomplete_nested_thread_ids)
+                    ),
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": bool(
+                        nested_follow.get("capped", False)
+                    ),
+                    "review_thread_inventory_error": (
+                        nested_follow.get("error")
+                        or "nested_pagination_failed"
+                    ),
+                }
+            # Merge nested-follow results into per-thread
+            # flattened audit records.
+            fetched = nested_follow.get(
+                "fetched_comments_by_thread_id", {}
+            )
+            for nt in all_threads:
+                tid = nt.get("thread_id") or nt.get("id") or ""
+                if tid not in fetched:
+                    continue
+                for en in fetched[tid]:
+                    if not isinstance(en, dict):
+                        continue
+                    au = en.get("author") or {}
+                    author_login = (
+                        au.get("login", "")
+                        if isinstance(au, dict)
+                        else ""
+                    )
+                    db_id = en.get("databaseId")
+                    nt.setdefault("comments", []).append({
+                        "author": author_login,
+                        "database_id": db_id,
+                    })
+                nt["nested_incomplete"] = False
+            return True, all_threads, "", {
+                **empty_metadata,
+                "review_thread_comment_inventory_complete": True,
+                "review_thread_comment_inventory_error_count": 0,
+                "review_thread_comment_incomplete_thread_ids": [],
+                "review_thread_inventory_complete": (
+                    not bool(nested_follow.get("capped", False))
+                ),
+                "review_thread_inventory_pages": pages,
+                "review_thread_inventory_capped": bool(
+                    nested_follow.get("capped", False)
+                ),
+                "review_thread_inventory_error": "",
+            }
+        while outer_incomplete:
             if pages >= safety_cap:
                 # Safety cap fired. The inventory is
                 # incomplete in this case; the section 8
