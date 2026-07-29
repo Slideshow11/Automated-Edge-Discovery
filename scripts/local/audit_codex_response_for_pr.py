@@ -1864,38 +1864,58 @@ def _canonical_review_thread_inventory(
                     "is_resolved": bool(nt.get("is_resolved", False)),
                     "is_outdated": bool(nt.get("is_outdated", False)),
                 }
+                # Round-77 PHASE 3 P1-A: iterate a snapshot of
+                # ``all_threads`` so that appended fetched
+                # records do not re-enter the loop. The
+                # previous loop iterated ``all_threads``
+                # directly while _merge_flattened_comment
+                # appended to it, producing cubic growth on
+                # large threads (and indefinite growth when a
+                # fetched record has a null databaseId).
+                _r77_fetched_records: list = []
+                _r77_fetched_authors: list = []
                 for en in fetched[tid]:
                     if not isinstance(en, dict):
                         continue
                     _rec = _flatten_review_thread_comment(
                         thread_state, en
                     )
-                    _merge_flattened_comment(all_threads, _rec)
-                    # Round-76 SMOKE-B follow-up: also update
-                    # the anchor record's ``comments``
-                    # participant list so a late human
-                    # reply (or any fetched author) enters
-                    # participant evidence.
-                    _au_login = ""
+                    _r77_fetched_records.append(_rec)
                     _au_obj = en.get("author") or {}
                     if isinstance(_au_obj, dict):
-                        _au_login = _au_obj.get("login", "") or ""
-                    if _au_login and isinstance(
-                        nt.get("comments"), list
-                    ):
-                        if not any(
-                            isinstance(c, dict)
-                            and c.get("author") == _au_login
-                            for c in nt["comments"]
-                        ):
-                            nt["comments"].append(
-                                {
-                                    "author": _au_login,
-                                    "database_id": en.get(
-                                        "databaseId"
-                                    ),
-                                }
-                            )
+                        _r77_fetched_authors.append(
+                            _au_obj.get("login", "") or ""
+                        )
+                    elif isinstance(_au_obj, str):
+                        _r77_fetched_authors.append(_au_obj)
+                    else:
+                        _r77_fetched_authors.append("")
+                # Extend all_threads once after the loop.
+                for _r77_r in _r77_fetched_records:
+                    _merge_flattened_comment(
+                        all_threads, _r77_r
+                    )
+                # Update anchor participant evidence. Round-77
+                # PHASE 3 P1-B: preserve blank authors as
+                # explicit "unknown" participants so partial
+                # actor evidence fails closed instead of
+                # being dropped (which would let a thread
+                # with a deleted-account comment appear
+                # Codex-only and become eligible for
+                # automatic resolution).
+                if isinstance(nt.get("comments"), list):
+                    _r77_seen_authors = {
+                        c.get("author") if isinstance(c, dict) else ""
+                        for c in nt["comments"]
+                    }
+                    for _r77_au in _r77_fetched_authors:
+                        _r77_label = _r77_au or "unknown"
+                        if _r77_label not in _r77_seen_authors:
+                            nt["comments"].append({
+                                "author": _r77_label,
+                                "database_id": None,
+                            })
+                            _r77_seen_authors.add(_r77_label)
                 nt["nested_incomplete"] = False
             return True, all_threads, "", {
                 **empty_metadata,
@@ -2167,17 +2187,24 @@ def _canonical_review_thread_inventory(
                     fetched = nested_follow.get(
                         "fetched_comments_by_thread_id", {}
                     )
-                    for nt in all_threads:
+                    # Round-77 PHASE 3 P1-A: snapshot
+                    # ``all_threads`` before iteration so that
+                    # fetched records appended via
+                    # _merge_flattened_comment do not re-enter
+                    # the outer loop (cubic growth / indefinite
+                    # append on null-databaseId records).
+                    _r77_anchor_snapshot = list(all_threads)
+                    for nt in _r77_anchor_snapshot:
                         tid = nt.get("thread_id") or nt.get("id") or ""
                         if tid not in fetched:
                             continue
-                        # Capture thread-level anchor state for the
-                        # flattened-record factory.
                         thread_state = {
                             "thread_id": tid,
                             "is_resolved": bool(nt.get("is_resolved", False)),
                             "is_outdated": bool(nt.get("is_outdated", False)),
                         }
+                        _r77_fetched_records: list = []
+                        _r77_fetched_authors: list = []
                         for en in fetched[tid]:
                             if not isinstance(en, dict):
                                 continue
@@ -2186,39 +2213,40 @@ def _canonical_review_thread_inventory(
                                     thread_state, en
                                 )
                             )
-                            _merge_flattened_comment(
-                                all_threads,
-                                _flatten_review_thread_comment_rec,
+                            _r77_fetched_records.append(
+                                _flatten_review_thread_comment_rec
                             )
-                            # Round-76 SMOKE-B follow-up: also
-                            # update the anchor record's
-                            # ``comments`` participant list so a
-                            # late human reply (or any fetched
-                            # author) enters participant
-                            # evidence, matching the pre-Round-76
-                            # semantics. The anchor's
-                            # ``comments`` field is the thread
-                            # participant evidence list.
-                            _au_login = ""
                             _au_obj = en.get("author") or {}
                             if isinstance(_au_obj, dict):
-                                _au_login = _au_obj.get("login", "") or ""
-                            if _au_login and isinstance(
-                                nt.get("comments"), list
-                            ):
-                                if not any(
-                                    isinstance(c, dict)
-                                    and c.get("author") == _au_login
-                                    for c in nt["comments"]
-                                ):
-                                    nt["comments"].append(
-                                        {
-                                            "author": _au_login,
-                                            "database_id": en.get(
-                                                "databaseId"
-                                            ),
-                                        }
-                                    )
+                                _r77_fetched_authors.append(
+                                    _au_obj.get("login", "") or ""
+                                )
+                            elif isinstance(_au_obj, str):
+                                _r77_fetched_authors.append(_au_obj)
+                            else:
+                                _r77_fetched_authors.append("")
+                        # Append fetched records once after
+                        # the inner loop completes.
+                        for _r77_r in _r77_fetched_records:
+                            _merge_flattened_comment(
+                                all_threads, _r77_r
+                            )
+                        # Round-77 PHASE 3 P1-B: preserve
+                        # blank authors as explicit
+                        # "unknown" participant entries.
+                        if isinstance(nt.get("comments"), list):
+                            _r77_seen_authors = {
+                                c.get("author") if isinstance(c, dict) else ""
+                                for c in nt["comments"]
+                            }
+                            for _r77_au in _r77_fetched_authors:
+                                _r77_label = _r77_au or "unknown"
+                                if _r77_label not in _r77_seen_authors:
+                                    nt["comments"].append({
+                                        "author": _r77_label,
+                                        "database_id": None,
+                                    })
+                                    _r77_seen_authors.add(_r77_label)
                         nt["nested_incomplete"] = False
                     # Round-71 PHASE 3-P2-B: after every
                     # required nested cursor succeeds,
