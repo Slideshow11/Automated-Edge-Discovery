@@ -1134,8 +1134,23 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
                     f"runner_failed:{type(exc).__name__}"
                 )
             else:
-                validation_return_code = int(
-                    result.get("return_code", -1)
+                # Round-71 PHASE 3-P1-B: the production facade
+                # ``run_selected_tests`` returns canonical keys
+                # ``returncode`` / ``duration_seconds`` / ``selected``.
+                # Older alias keys ``return_code`` / ``duration`` /
+                # ``selected_tests`` are read only as backward-compat
+                # fallbacks; the canonical value always wins.
+                def _canonical_int(keys, default=-1):
+                    for k in keys:
+                        v = result.get(k)
+                        if v is not None:
+                            try:
+                                return int(v)
+                            except (TypeError, ValueError):
+                                pass
+                    return default
+                validation_return_code = _canonical_int(
+                    ("returncode", "return_code"), -1
                 )
                 if validation_return_code == 0:
                     validation_outcome = "passed"
@@ -1420,16 +1435,28 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
                   file=sys.stderr)
             sys.exit(2)
 
-    rc = int(result.get("return_code", -1))
-    selected = list(result.get("selected_tests", []))
-    duration = result.get("duration", 0.0)
+    # Round-71 PHASE 3-P1-B: facade canonical keys win over
+    # alias keys.
+    rc = int(result.get("returncode", result.get("return_code", -1)))
+    selected = list(result.get("selected", result.get("selected_tests", [])))
+    duration = result.get("duration_seconds", result.get("duration", 0.0))
 
     codex = state.get("codex_review", {})
     codex["last_validation_at"] = _utcnow()
     codex["last_validation_status"] = "passed" if rc == 0 else "failed"
     codex["last_validation_return_code"] = rc
+    codex["last_validation_returncode"] = rc
     codex["last_validation_duration_seconds"] = duration
+    codex["last_validation_selected"] = selected
     codex["last_validation_selected_tests"] = selected
+    codex["last_validation_command"] = result.get("command", [])
+    codex["last_validation_selection_reason"] = result.get(
+        "selection_reason", ""
+    )
+    codex["last_validation_tier"] = result.get("tier", "")
+    codex["last_validation_requires_full_validation"] = result.get(
+        "requires_full_validation", False
+    )
     codex["last_validation_log_path"] = str(log_path) if log_path else ""
 
     # Apply transition:

@@ -55,6 +55,37 @@ def _read_paths(path: str) -> List[str]:
         return [line.strip() for line in f if line.strip()]
 
 
+def _select_runner(executor: Optional[ExecutorFn]):
+    """Round-71 PHASE 3-P1-A: pick a callable that matches the
+    production-facade ``run_selected_tests`` signature.
+
+    The facade accepts ``(plan=..., cwd=..., log_path=...,
+    pytest_args=...)`` but does NOT accept ``executor``. When an
+    injected ``executor`` is supplied we route through a wrapper
+    that invokes the injected callable so the injected callable's
+    signature is fully under test control.
+
+    The default runner is looked up at *call time* (NOT import
+    time) under ``scripts.local._production_facade`` so tests can
+    ``monkeypatch.setattr`` the production facade without reloading
+    the runner module.
+    """
+    if executor is not None:
+        def _wrapped(plan, cwd=None, log_path=None, pytest_args=None, **_ignored):
+            return executor(
+                plan=plan,
+                cwd=cwd,
+                log_path=log_path,
+                pytest_args=pytest_args or None,
+            )
+        return _wrapped
+    import importlib
+    facade_mod = importlib.import_module(
+        "scripts.local._production_facade"
+    )
+    return getattr(facade_mod, "run_selected_tests")
+
+
 def run_impact_selected_tests(
     changed_paths: List[str],
     *,
@@ -64,29 +95,37 @@ def run_impact_selected_tests(
     log_path: Optional[str] = None,
     executor: Optional[ExecutorFn] = None,
 ) -> Dict[str, Any]:
-    """Importable test-runner API (Round-70 PHASE 3-P1).
+    """Importable test-runner API.
 
-    Round-70 exact-head repair: the autonomous
-    ``autocoder_run_controller`` repaired transition needs an
-    importable function that invokes the shared test-selection
-    and executor and returns a machine-readable result
-    including ``return_code``, ``duration``, ``selected_tests``,
-    ``selection_reason``, ``tier``, ``command`` and ``capped``.
-    Performs no GitHub mutation. Writes only when ``log_path``
-    is provided.
+    Builds the impact-selected :class:`TestPlan` via
+    :func:`select_tests_with_invocation` and invokes the chosen
+    runner with arguments only that runner supports. The chosen
+    runner is either the production facade
+    :func:`scripts.local._production_facade.run_selected_tests`
+    (default) or a test-injected callable via the
+    ``executor=`` keyword. The facade returns a canonical result
+    schema::
+
+        returncode   # 0 means pass
+        duration_seconds
+        selected
+        tier
+        requires_full_validation
+        command
+        selection_reason
+
+    Performs no GitHub mutation. Writes only when ``log_path`` is
+    provided. Round-71 PHASE 3-P1-A made this safe by routing
+    ``executor`` through a compatible wrapper instead of
+    forwarding it into the facade as a foreign kwarg.
     """
     plan = select_tests_with_invocation(
         changed_paths=changed_paths,
         tier=ValidationTier(tier),
         final_candidate=final_candidate,
     )
-    return run_selected_tests(
-        plan=plan,
-        cwd=cwd,
-        log_path=log_path,
-        pytest_args=None,
-        executor=executor,
-    )
+    runner = _select_runner(executor)
+    return runner(plan=plan, cwd=cwd, log_path=log_path)
 
 
 
