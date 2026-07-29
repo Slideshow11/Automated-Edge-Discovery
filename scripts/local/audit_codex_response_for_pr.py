@@ -1468,6 +1468,12 @@ def _canonical_review_thread_inventory(
                         "current_page_nested_pending_ids": list(
                             incomplete_nested_thread_ids
                         ),
+                        # Round-75 PHASE 3 P1-A: every
+                        # successfully parsed outer page must
+                        # publish the raw review-thread nodes
+                        # it collected. The parent walker needs
+                        # them for nested-pagination follow-up.
+                        "_raw_thread_nodes": list(raw_thread_nodes),
                     }
                     return False, all_threads, err_msg, metadata
                 # outer_has_next=False: this is a SUCCESSFUL
@@ -1495,6 +1501,15 @@ def _canonical_review_thread_inventory(
                         "current_page_nested_pending_ids": list(
                             incomplete_nested_thread_ids
                         ),
+                        # Round-75 PHASE 3 P1-A: every successful
+                        # outer-page must publish the raw
+                        # review-thread nodes it collected so
+                        # the parent walker can pass them to the
+                        # nested follower. The terminal page is
+                        # where the previously-suppressed bug
+                        # manifested: a pending ID without a
+                        # corresponding raw node.
+                        "_raw_thread_nodes": list(raw_thread_nodes),
                     }
                     # Round-74 PHASE 3: return True with the
                     # structured terminal-page status. Parent
@@ -1593,6 +1608,55 @@ def _canonical_review_thread_inventory(
         # this by setting the outer-while loop guard to
         # False so it doesn't execute.
         if not outer_incomplete and incomplete_nested_thread_ids:
+            # Round-75 PHASE 3 P1-C: validate ID-to-node
+            # coverage in this single-page terminal
+            # path too. Same validation as the multi-page
+            # path below.
+            missing_node_ids = []
+            for _tid in incomplete_nested_thread_ids:
+                _matched = [
+                    rn for rn in raw_thread_nodes
+                    if isinstance(rn, dict)
+                    and rn.get("id") == _tid
+                ]
+                if not _matched:
+                    missing_node_ids.append(_tid)
+                    continue
+                _node = _matched[0]
+                _comments = _node.get("comments")
+                if not isinstance(_comments, dict):
+                    missing_node_ids.append(_tid)
+                    continue
+                _page_info = _comments.get("pageInfo") or {}
+                if not isinstance(_page_info, dict):
+                    missing_node_ids.append(_tid)
+                    continue
+                if not bool(_page_info.get("hasNextPage")):
+                    missing_node_ids.append(_tid)
+                    continue
+                _end_cursor = _page_info.get("endCursor") or ""
+                if not isinstance(_end_cursor, str) or not _end_cursor:
+                    missing_node_ids.append(_tid)
+                    continue
+            if missing_node_ids:
+                return False, all_threads, (
+                    "nested_pending_raw_node_missing"
+                ), {
+                    **empty_metadata,
+                    "review_thread_comment_inventory_complete": False,
+                    "review_thread_comment_inventory_error_count": (
+                        len(missing_node_ids)
+                    ),
+                    "review_thread_comment_incomplete_thread_ids": (
+                        list(missing_node_ids)
+                    ),
+                    "review_thread_inventory_complete": False,
+                    "review_thread_inventory_pages": pages,
+                    "review_thread_inventory_capped": False,
+                    "review_thread_inventory_error": (
+                        "nested_pending_raw_node_missing"
+                    ),
+                }
             # Transition directly to nested-follow. The
             # existing nested-follow code lives inside the
             # outer-while body under the
@@ -1815,6 +1879,67 @@ def _canonical_review_thread_inventory(
                 # pagination remained incomplete across
                 # pages, follow cursors now.
                 if incomplete_nested_thread_ids:
+                    # Round-75 PHASE 3 P1-C: BEFORE invoking
+                    # the nested follower, validate that every
+                    # pending nested thread ID has exactly one
+                    # matching cursor-bearing raw node in
+                    # ``raw_thread_nodes``. A pending ID without
+                    # a matching valid raw node means a terminal
+                    # page failed to publish its raw evidence
+                    # and the nested follower would silently
+                    # skip that thread. Fail closed with a
+                    # specific ``nested_pending_raw_node_missing``
+                    # error and preserve the affected thread IDs.
+                    missing_node_ids = []
+                    for _tid in incomplete_nested_thread_ids:
+                        _matched = [
+                            rn for rn in raw_thread_nodes
+                            if isinstance(rn, dict)
+                            and rn.get("id") == _tid
+                        ]
+                        if not _matched:
+                            missing_node_ids.append(_tid)
+                            continue
+                        _node = _matched[0]
+                        _comments = _node.get("comments")
+                        if not isinstance(_comments, dict):
+                            missing_node_ids.append(_tid)
+                            continue
+                        _page_info = _comments.get("pageInfo") or {}
+                        if not isinstance(_page_info, dict):
+                            missing_node_ids.append(_tid)
+                            continue
+                        if not bool(_page_info.get("hasNextPage")):
+                            missing_node_ids.append(_tid)
+                            continue
+                        _end_cursor = _page_info.get("endCursor") or ""
+                        if not isinstance(_end_cursor, str) or not _end_cursor:
+                            missing_node_ids.append(_tid)
+                            continue
+                    if missing_node_ids:
+                        # Round-75 PHASE 3 P1-C fail-closed:
+                        # preserve every missing ID, mark both
+                        # outer and nested inventories incomplete,
+                        # do NOT invoke the nested follower, do
+                        # NOT report clean or merge-ready.
+                        return False, all_threads, (
+                            "nested_pending_raw_node_missing"
+                        ), {
+                            **empty_metadata,
+                            "review_thread_comment_inventory_complete": False,
+                            "review_thread_comment_inventory_error_count": (
+                                len(missing_node_ids)
+                            ),
+                            "review_thread_comment_incomplete_thread_ids": (
+                                list(missing_node_ids)
+                            ),
+                            "review_thread_inventory_complete": False,
+                            "review_thread_inventory_pages": pages,
+                            "review_thread_inventory_capped": False,
+                            "review_thread_inventory_error": (
+                                "nested_pending_raw_node_missing"
+                            ),
+                        }
                     # Round-71 PHASE 3-P2-A: pass the *raw*
                     # outer thread nodes (with their full
                     # ``id`` and nested

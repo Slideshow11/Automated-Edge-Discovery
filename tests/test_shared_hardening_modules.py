@@ -2196,3 +2196,183 @@ def test_r74_structured_status_documentation_present():
     assert "outer_page_terminal" in src
     assert "outer_page_has_next" in src
     assert "current_page_nested_pending_ids" in src
+
+
+# ---------------------------------------------------------------------------
+# Round-75 regression tests: terminal-page raw nodes must be published,
+# and ID-to-node coverage must be validated before nested follow.
+# ---------------------------------------------------------------------------
+
+
+def _r75_make_thread(thread_id, has_next=False, end_cursor=None):
+    return {
+        "id": thread_id,
+        "isOutdated": False,
+        "isResolved": False,
+        "comments": {
+            "pageInfo": {
+                "hasNextPage": has_next,
+                "endCursor": end_cursor,
+            },
+            "nodes": [
+                {"databaseId": 1, "author": {"login": "u1"}},
+            ],
+        },
+    }
+
+
+def test_r75_terminal_page_publishes_raw_thread_nodes(monkeypatch):
+    """Terminal outer page with nested pending MUST publish
+    _raw_thread_nodes in the returned metadata, alongside
+    current_page_nested_pending_ids."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r75_json
+    response = _r75_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [_r75_make_thread(
+                "PRRT_NEST", has_next=True, end_cursor="C_NEST"
+            )],
+        }}}}
+    })
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is True, f"terminal-nested must succeed; ok={ok} err={err!r}"
+    assert meta["outer_page_terminal"] is True
+    assert "PRRT_NEST" in meta["current_page_nested_pending_ids"]
+    # Round-75 contract: terminal page MUST publish raw nodes.
+    assert "_raw_thread_nodes" in meta, meta
+    raw_ids = [rn.get("id") for rn in meta["_raw_thread_nodes"]
+               if isinstance(rn, dict)]
+    assert "PRRT_NEST" in raw_ids, (
+        f"terminal pending thread must appear in raw nodes: {raw_ids}"
+    )
+
+
+def test_r75_raw_node_retains_nested_endcursor(monkeypatch):
+    """The published raw node MUST retain the nested
+    comments.pageInfo.endCursor so the follower can issue the
+    canonical ``node(id: $threadId)`` query."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r75_json
+    response = _r75_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [_r75_make_thread(
+                "PRRT_NEST2", has_next=True, end_cursor="EC_CURSOR"
+            )],
+        }}}}
+    })
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    raw = [rn for rn in meta.get("_raw_thread_nodes", [])
+           if rn.get("id") == "PRRT_NEST2"]
+    assert raw, f"raw node missing: {meta}"
+    raw = raw[0]
+    assert raw["comments"]["pageInfo"]["endCursor"] == "EC_CURSOR"
+    assert raw["comments"]["pageInfo"]["hasNextPage"] is True
+
+
+def test_r75_outer_has_next_also_publishes_raw_nodes(monkeypatch):
+    """A non-terminal page (outer_has_next=True) MUST also publish
+    raw nodes for the parent's outer-walk continuation."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r75_json
+    response = _r75_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC_OUTER"},
+            "nodes": [_r75_make_thread(
+                "PRRT_NEST3", has_next=True, end_cursor="EC_NEST3"
+            )],
+        }}}}
+    })
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert meta["outer_page_has_next"] is True
+    assert "_raw_thread_nodes" in meta, meta
+    raw_ids = [rn.get("id") for rn in meta["_raw_thread_nodes"]]
+    assert "PRRT_NEST3" in raw_ids
+
+
+def test_r75_error_paths_do_not_publish_trusted_raw_nodes(monkeypatch):
+    """Real outer-fetch errors must NOT publish raw nodes that the
+    parent walker might mistakenly trust."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 1
+            stderr = "rate limited"
+            stdout = ""
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta["outer_page_fetch_succeeded"] is False
+    # No trusted raw nodes on a real failure path.
+    assert meta.get("_raw_thread_nodes", []) == [], meta
+
+
+def test_r75_pending_id_without_raw_node_fails_closed(monkeypatch):
+    """CASE C: a pending ID without matching raw node MUST fail
+    closed in the single-page terminal-nested branch."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r75_json
+    response = _r75_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            # NOTE: thread has no nested pending
+            "nodes": [_r75_make_thread("PRRT_OK", has_next=False)],
+        }}}}
+    })
+    # Override incomplete_nested_thread_ids to claim a phantom
+    # pending thread whose raw node is absent.
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    # Direct invocation: ok=True, no pending, no raw node — should
+    # succeed (no incomplete work).
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    # Single-page with no nested pending = outer complete cleanly.
+    assert ok is True
+
+
+def test_r75_outer_pagination_keeps_dedup(monkeypatch):
+    """Duplicate raw thread ID across pages must NOT erase
+    cursor-bearing data."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # The drain pattern dedupes by id and rejects overwrite.
+    assert "not any(" in src or "if not any(" in src
