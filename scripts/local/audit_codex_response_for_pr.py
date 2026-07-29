@@ -1487,12 +1487,20 @@ def _canonical_review_thread_inventory(
         # request when ``outer_incomplete`` is False, so a
         # purely nested-pending inventory does not make
         # any spurious outer requests.
-        outer_incomplete = bool(
-            metadata.get(
-                "review_thread_pagination_incomplete", False
-            )
-        )
+        # Round-73 PHASE 3 P1-A: derive outer_incomplete from
+        # the FIRST outer page's ``outer_has_next`` flag,
+        # NOT from the combined-inventory metadata flag.
+        # The metadata's ``review_thread_pagination_incomplete``
+        # conflates outer pagination and nested-cursor state
+        # (because it is set by the ``outer_has_next_for_walk``
+        # boolean below which mirrors ``True`` whenever any
+        # inventory remains). Deriving the outer-loop guard
+        # from it caused the walker to re-fetch the first
+        # outer page even when only nested work remained.
+        outer_incomplete = bool(outer_has_next)
         nested_pending_on_entry = bool(
+            incomplete_nested_thread_ids
+        ) and bool(
             metadata.get(
                 "review_thread_comment_incomplete_thread_ids", []
             )
@@ -1655,9 +1663,45 @@ def _canonical_review_thread_inventory(
             cursor = meta_next.get(
                 "review_thread_pagination_end_cursor"
             )
+            # Round-73 PHASE 3 P1-B: when ``ok_next=False`` and
+            # the recursion says pagination is complete,
+            # check whether the recursion still has
+            # incomplete nested thread IDs. If so, this is
+            # NOT a terminal outer error — it is terminal
+            # outer pagination with nested work pending
+            # on the terminal page. Transfer that work into
+            # the parent state, drain raw nodes, and let
+            # the normal nested-follow branch (further down
+            # this same walker invocation) handle it. The
+            # pre-existing outer-metadata ``err_next`` is
+            # typically empty for the success-but-with-
+            # nested-pending case; if a real error
+            # accompanies the nested work, we'll surface it
+            # via the nested-follow branch fail-closed
+            # return.
+            if isinstance(meta_next, dict):
+                # Promote any recursive-page raw nodes
+                # into our cache so nested-follow sees the
+                # terminal-page threads.
+                for raw_node in meta_next.get(
+                    "_raw_thread_nodes", []
+                ):
+                    if not any(
+                        r.get("id") == raw_node.get("id")
+                        for r in raw_thread_nodes
+                    ):
+                        raw_thread_nodes.append(raw_node)
+                # Promote the recursive incomplete-nested
+                # thread IDs into our list.
+                for tid in meta_next.get(
+                    "review_thread_comment_incomplete_thread_ids",
+                    []
+                ) or []:
+                    if tid not in incomplete_nested_thread_ids:
+                        incomplete_nested_thread_ids.append(tid)
             if not ok_next and not meta_next.get(
                 "review_thread_pagination_incomplete", False
-            ):
+            ) and not incomplete_nested_thread_ids:
                 # The page walker hit a real error
                 # (not "more pages available"). Propagate
                 # ``err_next`` and return ok=False so the

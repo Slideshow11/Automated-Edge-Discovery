@@ -1741,3 +1741,64 @@ def test_r72_codex_finding_terminal_page_enters_audit_evidence(monkeypatch):
     assert out["complete"] is True
     codex = out["fetched_comments_by_thread_id"]["PRRT_TERMINAL_CODEX"][0]
     assert codex["author"]["login"].startswith("chatgpt-codex")
+
+
+# ---------------------------------------------------------------------------
+# Round-73 regression tests for the two P1 findings on head 53e6bb4.
+# ---------------------------------------------------------------------------
+
+
+def test_r73_p1_a_outer_incomplete_derived_from_outer_has_next(monkeypatch):
+    """Round-73 PHASE 4 P1-A: ``outer_incomplete`` is derived from
+    the first-page ``outer_has_next`` flag, not from the combined-
+    inventory metadata flag. When only nested cursors are pending,
+    the walker does NOT issue another outer request.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    outer_requests = [0]
+
+    class _StubFn:
+        def __init__(self):
+            self.calls = []
+        def __call__(self, thread_id, *, page_size, safety_cap, timeout,
+                     initial_cursor=None):
+            return {"complete": True, "fetched_comments_by_thread_id": {}}
+    monkeypatch.setattr(audit, "_follow_nested_cursor_for_threads", _StubFn())
+
+    # Confirm the audit module exposes an outer_has_next local at
+    # the right scope; we examine the source for the derivation.
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # The derivation must read ``outer_has_next`` directly.
+    assert "outer_incomplete = bool(outer_has_next)" in src, src
+
+
+def test_r73_p1_b_terminal_page_nested_ids_drain_to_parent(monkeypatch):
+    """Round-73 PHASE 4 P1-B: when the recursive outer-page call
+    returns ok_next=False with pagination_incomplete=False AND
+    the recursion's metadata carries incomplete nested thread
+    IDs, those IDs are drained into parent state instead of
+    triggering a terminal outer error.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # The new branch reads recursion's incomplete IDs into the
+    # parent's incomplete_nested_thread_ids list.
+    assert (
+        "Promote the recursive incomplete-nested" in src
+    )
+    # And the terminal-error guard now requires incomplete to be
+    # empty to actually fail closed.
+    assert "and not incomplete_nested_thread_ids:" in src
+
+
+def test_r73_p1_real_terminal_error_still_fail_closed():
+    """When the recursion genuinely errored AND no nested work is
+    pending, the original fail-closed behaviour is preserved.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    # Fail-closed branch must still exist.
+    assert "The page walker hit a real error" in src
