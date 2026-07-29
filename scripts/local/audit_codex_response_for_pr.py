@@ -1268,10 +1268,16 @@ def _merge_flattened_comment(
     """Round-76 PHASE 3 helper: append a flattened comment record
     to the inventory list, deduplicating by stable
     ``comment_database_id`` and preserving useful original order.
+
+    Round-77 PHASE 3 P1-A defense-in-depth: a null
+    ``comment_database_id`` cannot be deduplicated, so a
+    runaway caller could append the same record many times.
+    Cap the dedup loop at 2000 iterations to bound worst-case
+    work on a malformed null-id record stream.
     """
     db_id = record.get("comment_database_id")
     if db_id is not None:
-        for existing in records:
+        for existing in records[:2000]:
             if (existing.get("thread_id") == record.get("thread_id")
                     and existing.get("comment_database_id") == db_id):
                 # Already materialized; do not duplicate.
@@ -1855,7 +1861,20 @@ def _canonical_review_thread_inventory(
             fetched = nested_follow.get(
                 "fetched_comments_by_thread_id", {}
             )
-            for nt in all_threads:
+            # Round-77 PHASE 3 P1-A: iterate a snapshot of
+            # ``all_threads`` so that appended fetched
+            # records do not re-enter the loop. The
+            # previous loop iterated ``all_threads``
+            # directly while _merge_flattened_comment
+            # appended to it, producing cubic growth on
+            # large threads (and indefinite growth when a
+            # fetched record has a null databaseId). The
+            # do_walk=True walker branch (line 2190+)
+            # already uses this snapshot; this commit
+            # extends the same fix to the do_walk=True
+            # terminal-page fast path.
+            _r77_terminal_snapshot = list(all_threads)
+            for nt in _r77_terminal_snapshot:
                 tid = nt.get("thread_id") or nt.get("id") or ""
                 if tid not in fetched:
                     continue
@@ -1864,14 +1883,6 @@ def _canonical_review_thread_inventory(
                     "is_resolved": bool(nt.get("is_resolved", False)),
                     "is_outdated": bool(nt.get("is_outdated", False)),
                 }
-                # Round-77 PHASE 3 P1-A: iterate a snapshot of
-                # ``all_threads`` so that appended fetched
-                # records do not re-enter the loop. The
-                # previous loop iterated ``all_threads``
-                # directly while _merge_flattened_comment
-                # appended to it, producing cubic growth on
-                # large threads (and indefinite growth when a
-                # fetched record has a null databaseId).
                 _r77_fetched_records: list = []
                 _r77_fetched_authors: list = []
                 for en in fetched[tid]:
