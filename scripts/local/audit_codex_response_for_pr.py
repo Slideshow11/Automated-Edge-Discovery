@@ -1871,6 +1871,31 @@ def _canonical_review_thread_inventory(
                         thread_state, en
                     )
                     _merge_flattened_comment(all_threads, _rec)
+                    # Round-76 SMOKE-B follow-up: also update
+                    # the anchor record's ``comments``
+                    # participant list so a late human
+                    # reply (or any fetched author) enters
+                    # participant evidence.
+                    _au_login = ""
+                    _au_obj = en.get("author") or {}
+                    if isinstance(_au_obj, dict):
+                        _au_login = _au_obj.get("login", "") or ""
+                    if _au_login and isinstance(
+                        nt.get("comments"), list
+                    ):
+                        if not any(
+                            isinstance(c, dict)
+                            and c.get("author") == _au_login
+                            for c in nt["comments"]
+                        ):
+                            nt["comments"].append(
+                                {
+                                    "author": _au_login,
+                                    "database_id": en.get(
+                                        "databaseId"
+                                    ),
+                                }
+                            )
                 nt["nested_incomplete"] = False
             return True, all_threads, "", {
                 **empty_metadata,
@@ -2165,6 +2190,35 @@ def _canonical_review_thread_inventory(
                                 all_threads,
                                 _flatten_review_thread_comment_rec,
                             )
+                            # Round-76 SMOKE-B follow-up: also
+                            # update the anchor record's
+                            # ``comments`` participant list so a
+                            # late human reply (or any fetched
+                            # author) enters participant
+                            # evidence, matching the pre-Round-76
+                            # semantics. The anchor's
+                            # ``comments`` field is the thread
+                            # participant evidence list.
+                            _au_login = ""
+                            _au_obj = en.get("author") or {}
+                            if isinstance(_au_obj, dict):
+                                _au_login = _au_obj.get("login", "") or ""
+                            if _au_login and isinstance(
+                                nt.get("comments"), list
+                            ):
+                                if not any(
+                                    isinstance(c, dict)
+                                    and c.get("author") == _au_login
+                                    for c in nt["comments"]
+                                ):
+                                    nt["comments"].append(
+                                        {
+                                            "author": _au_login,
+                                            "database_id": en.get(
+                                                "databaseId"
+                                            ),
+                                        }
+                                    )
                         nt["nested_incomplete"] = False
                     # Round-71 PHASE 3-P2-B: after every
                     # required nested cursor succeeds,
