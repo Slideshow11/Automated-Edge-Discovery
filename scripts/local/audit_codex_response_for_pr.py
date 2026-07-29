@@ -1149,6 +1149,136 @@ def _follow_nested_cursor_for_threads(thread_nodes: list, *, safety_cap: int, ti
     }
 
 
+
+def _build_raw_thread_node(outer_node: Dict[str, Any]) -> Dict[str, Any]:
+    """Round-76 PHASE 3 helper: build the canonical raw thread node
+    for the nested-pagination follower. One raw node per stable
+    thread id; never per comment.
+    """
+    return {
+        "id": outer_node.get("id", ""),
+        "comments": outer_node.get("comments") or {},
+        "raw": outer_node,
+    }
+
+
+def _dedup_raw_thread_nodes_by_id(
+    raw_nodes: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Round-76 PHASE 3 helper: collapse duplicate raw nodes to one
+    per stable thread id. Preserve the most cursor-complete node
+    (longest ``comments.pageInfo.endCursor`` wins, deterministic).
+    If neither cursor is a prefix-extension of the other AND they
+    differ, fail closed with ``conflicting_cursor_for_thread_id``.
+    """
+    if not raw_nodes:
+        return []
+    by_id: Dict[str, Dict[str, Any]] = {}
+    for rn in raw_nodes:
+        if not isinstance(rn, dict):
+            continue
+        tid = rn.get("id", "") or ""
+        if not tid:
+            continue
+        candidate = rn
+        if tid in by_id:
+            existing = by_id[tid]
+            ec = (
+                (existing.get("comments") or {}).get("pageInfo") or {}
+            ).get("endCursor") or ""
+            cc = (
+                (candidate.get("comments") or {}).get("pageInfo") or {}
+            ).get("endCursor") or ""
+            if ec and cc and ec != cc:
+                # Two non-empty differing cursors. Compatible iff
+                # one extends the other (the longer is a
+                # continuation of the shorter). When they are
+                # both non-empty but neither extends the other,
+                # they are an irreconcilable conflict — fail
+                # closed.
+                if cc.startswith(ec) or ec.startswith(cc):
+                    if len(cc) > len(ec):
+                        by_id[tid] = candidate
+                else:
+                    raise ValueError(
+                        f"conflicting_cursor_for_thread_id: {tid} "
+                        f"existing={ec!r} candidate={cc!r}"
+                    )
+            elif cc and not ec:
+                # Candidate has a cursor, existing doesn't.
+                by_id[tid] = candidate
+            # If both empty, keep existing.
+        else:
+            by_id[tid] = candidate
+    # Preserve original outer-page insertion order by deduplicating
+    # in first-seen order.
+    seen: set = set()
+    ordered: List[Dict[str, Any]] = []
+    for rn in raw_nodes:
+        if not isinstance(rn, dict):
+            continue
+        tid = rn.get("id", "") or ""
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        ordered.append(by_id[tid])
+    return ordered
+
+
+def _flatten_review_thread_comment(
+    thread_state: Dict[str, Any],
+    raw_comment: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Round-76 PHASE 3 helper: build a canonical flattened
+    inventory record for any comment (initial-page or fetched
+    via nested-follower), preserving thread id, anchor state,
+    and the comment's author, body, URL, path, line, original
+    commit OID, and database id.
+    """
+    author_login = ""
+    au = raw_comment.get("author") or {}
+    if isinstance(au, dict):
+        author_login = au.get("login", "") or ""
+    elif isinstance(au, str):
+        author_login = au
+    oc = raw_comment.get("originalCommit")
+    original_commit_oid = ""
+    if isinstance(oc, dict):
+        original_commit_oid = oc.get("oid", "") or ""
+    return {
+        "thread_id": thread_state.get("thread_id", ""),
+        "is_resolved": bool(thread_state.get("is_resolved", False)),
+        "is_outdated": bool(thread_state.get("is_outdated", False)),
+        "comment_database_id": raw_comment.get("databaseId"),
+        "comment_url": raw_comment.get("url", "") or "",
+        "author": author_login,
+        "body": raw_comment.get("body", "") or "",
+        "path": raw_comment.get("path", "") or "",
+        "line": raw_comment.get("line"),
+        "original_commit_sha": original_commit_oid,
+        "comments": [],
+        "nested_incomplete": False,
+    }
+
+
+def _merge_flattened_comment(
+    records: List[Dict[str, Any]],
+    record: Dict[str, Any],
+) -> None:
+    """Round-76 PHASE 3 helper: append a flattened comment record
+    to the inventory list, deduplicating by stable
+    ``comment_database_id`` and preserving useful original order.
+    """
+    db_id = record.get("comment_database_id")
+    if db_id is not None:
+        for existing in records:
+            if (existing.get("thread_id") == record.get("thread_id")
+                    and existing.get("comment_database_id") == db_id):
+                # Already materialized; do not duplicate.
+                return
+    records.append(record)
+
+
 def _canonical_review_thread_inventory(
     *, owner, name, pr_number, page_size: int = 100,
     timeout: int = 30,
@@ -1213,6 +1343,9 @@ def _canonical_review_thread_inventory(
     # GraphQL query against the canonical endpoint.
     raw_thread_nodes: List[Dict[str, Any]] = []
     incomplete_nested_thread_ids: List[str] = []
+    # Round-76 PHASE 3 P1-F2: per-thread raw-node dedup.
+    per_thread_raw_added: set = set()
+    outer_node_id: str = ""
     outer_has_next = False
     outer_end_cursor: Optional[str] = None
     try:
@@ -1310,7 +1443,8 @@ def _canonical_review_thread_inventory(
         for node in nodes:
             if not isinstance(node, dict):
                 continue
-            thread_id = node.get("id", "")
+            outer_node_id = node.get("id", "") or ""
+            thread_id = outer_node_id
             is_resolved = bool(node.get("isResolved", False))
             is_outdated = bool(node.get("isOutdated", False))
             comments_obj = node.get("comments") or {}
@@ -1387,13 +1521,38 @@ def _canonical_review_thread_inventory(
                 # ``node(id: $threadId)`` query against the
                 # original payload, not against the
                 # flattened participant record.
-                raw_node = {
-                    "id": node.get("id", ""),
-                    "comments": node.get("comments") or {},
-                    "raw": node,
-                }
-                raw_thread_nodes.append(raw_node)
+                # Round-76 PHASE 3 P1-F2: build the raw outer
+                # thread node ONCE per thread (NOT per comment),
+                # so a thread with 50 first-page comments no
+                # longer creates 50 duplicate raw nodes. The
+                # helper returns a canonical node; we add it
+                # only on the first time we observe the thread
+                # id on this outer page.
+                if (
+                    outer_node_id
+                    and outer_node_id not in per_thread_raw_added
+                ):
+                    raw_thread_nodes.append(
+                        _build_raw_thread_node(node)
+                    )
+                    per_thread_raw_added.add(outer_node_id)
                 all_threads.append(entry)
+        # Round-76 PHASE 3 P1-F2: dedup raw_thread_nodes by
+        # stable thread id so the nested-pagination follower
+        # walks each connection exactly once.
+        try:
+            raw_thread_nodes = _dedup_raw_thread_nodes_by_id(
+                raw_thread_nodes
+            )
+        except ValueError as _dedup_err:
+            return False, all_threads, str(_dedup_err), {
+                **empty_metadata,
+                "review_thread_inventory_pages": 1,
+                "review_thread_inventory_capped": False,
+                "review_thread_inventory_error": str(_dedup_err),
+                "review_thread_inventory_complete": False,
+                "review_thread_comment_inventory_complete": False,
+            }
         outer_has_next = bool(page_info.get("hasNextPage"))
         outer_end_cursor = page_info.get("endCursor")
         if outer_has_next and not outer_end_cursor:
@@ -1690,8 +1849,9 @@ def _canonical_review_thread_inventory(
                         or "nested_pagination_failed"
                     ),
                 }
-            # Merge nested-follow results into per-thread
-            # flattened audit records.
+            # Round-76 PHASE 3 P1-F1: materialize every fetched
+            # nested comment as a canonical flattened inventory
+            # record via the shared helpers (Finding 1).
             fetched = nested_follow.get(
                 "fetched_comments_by_thread_id", {}
             )
@@ -1699,20 +1859,18 @@ def _canonical_review_thread_inventory(
                 tid = nt.get("thread_id") or nt.get("id") or ""
                 if tid not in fetched:
                     continue
+                thread_state = {
+                    "thread_id": tid,
+                    "is_resolved": bool(nt.get("is_resolved", False)),
+                    "is_outdated": bool(nt.get("is_outdated", False)),
+                }
                 for en in fetched[tid]:
                     if not isinstance(en, dict):
                         continue
-                    au = en.get("author") or {}
-                    author_login = (
-                        au.get("login", "")
-                        if isinstance(au, dict)
-                        else ""
+                    _rec = _flatten_review_thread_comment(
+                        thread_state, en
                     )
-                    db_id = en.get("databaseId")
-                    nt.setdefault("comments", []).append({
-                        "author": author_login,
-                        "database_id": db_id,
-                    })
+                    _merge_flattened_comment(all_threads, _rec)
                 nt["nested_incomplete"] = False
             return True, all_threads, "", {
                 **empty_metadata,
@@ -1973,35 +2131,39 @@ def _canonical_review_thread_inventory(
                                 nested_follow.get("error") or "nested_pagination_failed"
                             ),
                         }
-                    # Merge nested-follow results into per-thread
-                    # *flattened* audit records, keyed by
-                    # thread_id (which the helper looked up via
-                    # raw_thread_nodes[i]["id"]).
-                    fetched = nested_follow.get("fetched_comments_by_thread_id", {})
+                    # Round-76 PHASE 3 P1-F1: materialize every
+                    # fetched nested comment as a canonical
+                    # flattened inventory record (not just a
+                    # participant-list entry). The active-blocker
+                    # scan reads top-level record authors and
+                    # bodies, so a later Codex finding on the
+                    # 51st comment MUST appear as a top-level
+                    # record.
+                    fetched = nested_follow.get(
+                        "fetched_comments_by_thread_id", {}
+                    )
                     for nt in all_threads:
                         tid = nt.get("thread_id") or nt.get("id") or ""
                         if tid not in fetched:
                             continue
-                        existing_authors = {
-                            (c.get("author") if isinstance(c, dict) else "")
-                            for c in nt.get("comments", [])
+                        # Capture thread-level anchor state for the
+                        # flattened-record factory.
+                        thread_state = {
+                            "thread_id": tid,
+                            "is_resolved": bool(nt.get("is_resolved", False)),
+                            "is_outdated": bool(nt.get("is_outdated", False)),
                         }
-                        existing_authors.discard("")
                         for en in fetched[tid]:
                             if not isinstance(en, dict):
                                 continue
-                            au = en.get("author") or {}
-                            author_login = (
-                                au.get("login", "")
-                                if isinstance(au, dict)
-                                else ""
+                            _flatten_review_thread_comment_rec = (
+                                _flatten_review_thread_comment(
+                                    thread_state, en
+                                )
                             )
-                            db_id = en.get("databaseId")
-                            nt.setdefault("comments", []).append(
-                                {
-                                    "author": author_login,
-                                    "database_id": db_id,
-                                }
+                            _merge_flattened_comment(
+                                all_threads,
+                                _flatten_review_thread_comment_rec,
                             )
                         nt["nested_incomplete"] = False
                     # Round-71 PHASE 3-P2-B: after every

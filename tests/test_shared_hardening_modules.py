@@ -2376,3 +2376,210 @@ def test_r75_outer_pagination_keeps_dedup(monkeypatch):
     src = inspect.getsource(audit._canonical_review_thread_inventory)
     # The drain pattern dedupes by id and rejects overwrite.
     assert "not any(" in src or "if not any(" in src
+
+
+# ---------------------------------------------------------------------------
+# Round-76 regression tests: nested-comment materialization + raw-node dedup
+# ---------------------------------------------------------------------------
+
+
+def test_r76_flatten_helper_preserves_anchor_and_body():
+    """_flatten_review_thread_comment MUST carry author, body,
+    URL, database id, path, line, original commit OID, and thread
+    state."""
+    from scripts.local.audit_codex_response_for_pr import (
+        _flatten_review_thread_comment,
+    )
+    state = {"thread_id": "PRRT_X", "is_resolved": False, "is_outdated": True}
+    raw = {
+        "databaseId": 4242,
+        "url": "https://example/review/X#4242",
+        "author": {"login": "codex-bot"},
+        "body": "This is a finding",
+        "path": "scripts/local/audit_codex_response_for_pr.py",
+        "line": 1994,
+        "originalCommit": {"oid": "abc123"},
+    }
+    rec = _flatten_review_thread_comment(state, raw)
+    assert rec["thread_id"] == "PRRT_X"
+    assert rec["is_resolved"] is False
+    assert rec["is_outdated"] is True
+    assert rec["comment_database_id"] == 4242
+    assert rec["comment_url"] == "https://example/review/X#4242"
+    assert rec["author"] == "codex-bot"
+    assert rec["body"] == "This is a finding"
+    assert rec["path"] == "scripts/local/audit_codex_response_for_pr.py"
+    assert rec["line"] == 1994
+    assert rec["original_commit_sha"] == "abc123"
+
+
+def test_r76_merge_helper_dedupes_by_db_id():
+    """_merge_flattened_comment MUST NOT insert a duplicate record
+    with the same (thread_id, comment_database_id) pair."""
+    from scripts.local.audit_codex_response_for_pr import (
+        _merge_flattened_comment, _flatten_review_thread_comment,
+    )
+    state = {"thread_id": "PRRT_X", "is_resolved": False, "is_outdated": False}
+    raw = {"databaseId": 1, "author": {"login": "u"}, "body": "hi"}
+    rec = _flatten_review_thread_comment(state, raw)
+    records = []
+    _merge_flattened_comment(records, rec)
+    _merge_flattened_comment(records, rec)
+    assert len(records) == 1, records
+    _merge_flattened_comment(records, _flatten_review_thread_comment(state, raw))
+    assert len(records) == 1, records
+
+
+def test_r76_dedup_helper_collapses_duplicates():
+    """_dedup_raw_thread_nodes_by_id MUST collapse multiple copies
+    of the same thread id and preserve the most cursor-complete
+    entry."""
+    from scripts.local.audit_codex_response_for_pr import (
+        _dedup_raw_thread_nodes_by_id,
+    )
+    rn_long = {"id": "T1", "comments": {"pageInfo": {"endCursor": "ECC_LONG"}}}
+    rn_short = {"id": "T1", "comments": {"pageInfo": {"endCursor": "ECC"}}}
+    rn_other = {"id": "T2", "comments": {"pageInfo": {"endCursor": "T2C"}}}
+    out = _dedup_raw_thread_nodes_by_id([rn_short, rn_long, rn_other])
+    assert len(out) == 2, out
+    by_id = {r["id"]: r for r in out}
+    assert by_id["T1"]["comments"]["pageInfo"]["endCursor"] == "ECC_LONG"
+    # Order preserved: T1 first, then T2.
+    assert [r["id"] for r in out] == ["T1", "T2"]
+
+
+def test_r76_dedup_helper_fails_closed_on_conflicting_cursor():
+    """Conflicting cursor data for the same thread id MUST fail
+    closed (raise ValueError)."""
+    import pytest as _r76_pytest
+    from scripts.local.audit_codex_response_for_pr import (
+        _dedup_raw_thread_nodes_by_id,
+    )
+    a = {"id": "T1", "comments": {"pageInfo": {"endCursor": "A"}}}
+    b = {"id": "T1", "comments": {"pageInfo": {"endCursor": "B"}}}
+    with _r76_pytest.raises(ValueError, match="conflicting_cursor"):
+        _dedup_raw_thread_nodes_by_id([a, b])
+
+
+def test_r76_fetched_codex_finding_materializes(monkeypatch):
+    """Round-76 PHASE 4: a fetched later Codex comment MUST become a
+    top-level flattened inventory record with author=codex and the
+    comment's body, URL, path, line, original_commit_sha, and
+    database id preserved."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r76_json
+    # Outer page is single, terminal, with nested pending.
+    response = _r76_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{
+            "id": "PRRT_R76",
+            "isOutdated": False,
+            "isResolved": False,
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                "nodes": [
+                    {"databaseId": 1, "url": "u1",
+                     "author": {"login": "human1"},
+                     "body": "first",
+                     "path": "scripts/local/audit_codex_response_for_pr.py",
+                     "line": 100,
+                     "originalCommit": {"oid": "oc1"}},
+                ],
+            },
+        }],
+    }}}}})
+    monkeypatch.setattr(audit.subprocess, "run", lambda *a, **kw: type("R", (), {
+        "returncode": 0, "stderr": "", "stdout": response,
+    })())
+    # Nested follower returns a fetched Codex comment.
+    def fake_follow(thread_nodes, *, safety_cap, timeout):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                "PRRT_R76": [{
+                    "databaseId": 9999,
+                    "url": "https://github.com/x#9999",
+                    "author": {"login": "chatgpt-codex-connector[bot]"},
+                    "body": "Round-76 test finding",
+                    "path": "scripts/local/audit_codex_response_for_pr.py",
+                    "line": 1994,
+                    "originalCommit": {"oid": "oc9999"},
+                }],
+            },
+        }
+    monkeypatch.setattr(audit, "_follow_nested_cursor_for_threads", fake_follow)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=True,
+    )
+    assert ok is True, f"ok={ok} err={err!r} meta={meta}"
+    # The fetched Codex comment must be materialized as a top-level
+    # record with full author/body/url/path preservation.
+    top_level_codex = [
+        t for t in threads
+        if (t.get("author") or "").startswith("chatgpt-codex")
+    ]
+    assert top_level_codex, (
+        f"fetched Codex comment not materialized; threads={threads}"
+    )
+    rec = top_level_codex[0]
+    assert rec["body"] == "Round-76 test finding"
+    assert rec["comment_database_id"] == 9999
+    assert rec["path"] == "scripts/local/audit_codex_response_for_pr.py"
+    assert rec["line"] == 1994
+    assert rec["original_commit_sha"] == "oc9999"
+    assert rec["comment_url"] == "https://github.com/x#9999"
+    assert rec["thread_id"] == "PRRT_R76"
+
+
+def test_r76_raw_node_dedup_in_page_processing(monkeypatch):
+    """A thread with multiple initial comments MUST produce exactly
+    ONE raw node per thread id."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r76_json
+    # 5 comments in one thread on a single outer page.
+    response = _r76_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{
+            "id": "PRRT_R76_DEDUP",
+            "isOutdated": False,
+            "isResolved": False,
+            "comments": {
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+                "nodes": [
+                    {"databaseId": i, "url": f"u{i}",
+                     "author": {"login": f"u{i}"}, "body": f"b{i}",
+                     "path": "p", "line": i,
+                     "originalCommit": {"oid": f"oc{i}"}}
+                    for i in range(1, 6)
+                ],
+            },
+        }],
+    }}}}})
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    raw = meta.get("_raw_thread_nodes", [])
+    ids = [r.get("id") for r in raw]
+    assert ids == ["PRRT_R76_DEDUP"], f"expected 1 raw node; got {ids}"
+
+
+def test_r76_existing_regressions_still_green():
+    """Run Round-70 through Round-75 regression tests to confirm no
+    collateral damage."""
+    import subprocess as _r76_subprocess
+    result = _r76_subprocess.run(
+        ["python3", "-m", "pytest", "-p", "no:cacheprovider", "-q", "--tb=no",
+         "-k", "r70_ or r71_ or r72_ or r73_ or r74_ or r75_"],
+        capture_output=True, text=True,
+        cwd="/home/max/aed_pr412_round76",
+    )
+    assert result.returncode == 0, (
+        f"prior regressions broken\nstdout={result.stdout[-1000:]}"
+    )
