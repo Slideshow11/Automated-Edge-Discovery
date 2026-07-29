@@ -667,6 +667,16 @@ def gh_graphql_review_threads(
         "review_thread_comment_inventory_complete": False,
         "review_thread_comment_inventory_error_count": 0,
         "review_thread_comment_incomplete_thread_ids": [],
+        # Round-74 PHASE 3: every genuine fetch, parse, GraphQL,
+        # schema, cursor, or safety-cap failure path must set
+        # outer_page_fetch_succeeded=False so the parent walker
+        # can distinguish a real outer error from a
+        # successfully-fetched terminal outer page with
+        # pending nested work.
+        "outer_page_fetch_succeeded": False,
+        "outer_page_terminal": False,
+        "outer_page_has_next": False,
+        "current_page_nested_pending_ids": [],
     }
     try:
         result = subprocess.run(
@@ -1185,6 +1195,14 @@ def _canonical_review_thread_inventory(
         "review_thread_inventory_pages": 0,
         "review_thread_inventory_capped": False,
         "review_thread_inventory_error": "",
+        # Round-74 PHASE 3: explicit structured per-page status
+        # to distinguish real outer-fetch failure from a
+        # successfully-fetched terminal outer page with
+        # pending nested work.
+        "outer_page_fetch_succeeded": False,
+        "outer_page_terminal": False,
+        "outer_page_has_next": False,
+        "current_page_nested_pending_ids": [],
     }
     all_threads: List[Dict[str, Any]] = []
     # Round-71 PHASE 3-P2-A: keep raw outer review-thread
@@ -1403,39 +1421,87 @@ def _canonical_review_thread_inventory(
         # one page).
         if outer_has_next or incomplete_nested_thread_ids:
             if not do_walk:
-                # Legacy one-shot path (no walk): preserve the original
-                # behaviour and fail closed on outer or nested incomplete.
-                err_msg = ""
-                if incomplete_nested_thread_ids:
-                    err_msg = (
-                        f"nested_comments_not_paginated: thread="
-                        f"{incomplete_nested_thread_ids[0]}"
-                    )
-                else:
-                    # Use a phrase that contains ``pagination
-                    # required`` so existing test contracts that
-                    # assert on this substring continue to match.
+                # Round-74 PHASE 3: distinguish successful terminal
+                # page-with-nested-work from genuine outer-fetch
+                # failure. We do NOT use the parent's accumulated
+                # nested IDs as the gate — we use the current-page
+                # ``outer_page_has_next`` flag plus the explicit
+                # structured status fields below.
+                #
+                # If outer_has_next=True, the parent walker must
+                # advance the outer cursor — return False with
+                # ``review_thread_pagination_incomplete=True`` so
+                # the parent knows to continue walking outer pages.
+                #
+                # If outer_has_next=False and there is pending
+                # nested work, the outer page itself was SUCCESSFULLY
+                # fetched; it is just a terminal page. Return True
+                # with structured ``outer_page_fetch_succeeded=True``,
+                # ``outer_page_terminal=True``, and
+                # ``current_page_nested_pending_ids=[...]``. The
+                # parent walker will then run nested-follow.
+                if outer_has_next:
                     err_msg = (
                         "reviewThreads.pageInfo.hasNextPage=true; "
                         "pagination required"
                     )
-                metadata = {
-                    "review_thread_comment_inventory_complete":
-                        not incomplete_nested_thread_ids,
-                    "review_thread_comment_inventory_error_count":
-                        len(incomplete_nested_thread_ids),
-                    "review_thread_comment_incomplete_thread_ids":
-                        list(incomplete_nested_thread_ids),
-                    "review_thread_inventory_complete": False,
-                    "review_thread_inventory_pages": 1,
-                    "review_thread_inventory_capped": False,
-                    "review_thread_inventory_error": err_msg,
-                    "review_thread_pagination_incomplete":
-                        outer_has_next,
-                    "review_thread_pagination_end_cursor":
-                        outer_end_cursor,
-                }
-                return False, all_threads, err_msg, metadata
+                    metadata = {
+                        "review_thread_comment_inventory_complete":
+                            not incomplete_nested_thread_ids,
+                        "review_thread_comment_inventory_error_count":
+                            len(incomplete_nested_thread_ids),
+                        "review_thread_comment_incomplete_thread_ids":
+                            list(incomplete_nested_thread_ids),
+                        "review_thread_inventory_complete": False,
+                        "review_thread_inventory_pages": 1,
+                        "review_thread_inventory_capped": False,
+                        "review_thread_inventory_error": err_msg,
+                        "review_thread_pagination_incomplete": True,
+                        "review_thread_pagination_end_cursor":
+                            outer_end_cursor,
+                        # Round-74 PHASE 3: explicit structured
+                        # status: outer page fetched successfully
+                        # and has more pages.
+                        "outer_page_fetch_succeeded": True,
+                        "outer_page_terminal": False,
+                        "outer_page_has_next": True,
+                        "current_page_nested_pending_ids": list(
+                            incomplete_nested_thread_ids
+                        ),
+                    }
+                    return False, all_threads, err_msg, metadata
+                # outer_has_next=False: this is a SUCCESSFUL
+                # terminal page. If nested work is pending, the
+                # parent walker must run nested-follow.
+                if incomplete_nested_thread_ids:
+                    metadata = {
+                        "review_thread_comment_inventory_complete": False,
+                        "review_thread_comment_inventory_error_count":
+                            len(incomplete_nested_thread_ids),
+                        "review_thread_comment_incomplete_thread_ids":
+                            list(incomplete_nested_thread_ids),
+                        "review_thread_inventory_complete": False,
+                        "review_thread_inventory_pages": 1,
+                        "review_thread_inventory_capped": False,
+                        "review_thread_inventory_error": "",
+                        "review_thread_pagination_incomplete": False,
+                        "review_thread_pagination_end_cursor":
+                            outer_end_cursor,
+                        # Round-74 PHASE 3: structured status for
+                        # terminal page with nested work.
+                        "outer_page_fetch_succeeded": True,
+                        "outer_page_terminal": True,
+                        "outer_page_has_next": False,
+                        "current_page_nested_pending_ids": list(
+                            incomplete_nested_thread_ids
+                        ),
+                    }
+                    # Round-74 PHASE 3: return True with the
+                    # structured terminal-page status. Parent
+                    # walker reads outer_page_fetch_succeeded /
+                    # outer_page_terminal / current_page_nested_pending_ids
+                    # to decide whether to invoke nested-follow.
+                    return True, all_threads, "", metadata
             # else: do_walk=True and inventory is
             # incomplete. Fall through to the success
             # metadata + walker below so the one-shot

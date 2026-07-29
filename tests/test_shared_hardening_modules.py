@@ -1902,3 +1902,297 @@ def test_r74_outer_failure_reason_preserved_in_metadata():
     # Within the next 3000 chars after that, err_next must appear.
     err_segment = src[err_branch_start:err_branch_start + 3000]
     assert "err_next" in err_segment
+
+
+# ---------------------------------------------------------------------------
+# Round-74 PHASE 4: behavioural tests proving the structured page-status
+# metadata correctly distinguishes terminal-page-with-nested from real
+# outer-fetch failure. These tests inspect the runtime return values of
+# the actual production helper, not source substring matches.
+# ---------------------------------------------------------------------------
+
+
+def _r74_make_thread(thread_id, has_next=False, end_cursor=None):
+    """Build a minimal thread-node fixture."""
+    return {
+        "id": thread_id,
+        "isOutdated": False,
+        "isResolved": False,
+        "comments": {
+            "pageInfo": {
+                "hasNextPage": has_next,
+                "endCursor": end_cursor,
+            },
+            "nodes": [
+                {"databaseId": 1, "author": {"login": "u1"}},
+            ],
+        },
+    }
+
+
+def _r74_build_response(page_outer_has_next, terminal_page_thread):
+    """Construct a mocked gh stdout JSON for the helper."""
+    import json as _r74_json
+    nodes = []
+    if terminal_page_thread is not None:
+        nodes.append(terminal_page_thread)
+    else:
+        nodes.append(_r74_make_thread("X", has_next=False))
+    return _r74_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": page_outer_has_next, "endCursor": "C"},
+            "nodes": nodes,
+        }}}}
+    })
+
+
+def test_r74_terminal_page_with_nested_returns_outer_page_fetch_succeeded_true(monkeypatch):
+    """A successfully fetched terminal page (has_next=False) that
+    contains a thread with nested pending cursors MUST return
+    outer_page_fetch_succeeded=True with outer_page_terminal=True and
+    current_page_nested_pending_ids populated. The ok flag must be True.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+    response = _r74_build_response(
+        page_outer_has_next=False,
+        terminal_page_thread=_r74_make_thread("T-NEST", has_next=True, end_cursor="C_NEST"),
+    )
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["called"] = True
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert captured.get("called"), "subprocess was not invoked"
+    assert ok is True, (
+        f"terminal page with nested must succeed; got ok={ok} err={err!r}"
+    )
+    assert meta["outer_page_fetch_succeeded"] is True, meta
+    assert meta["outer_page_terminal"] is True, meta
+    assert meta["outer_page_has_next"] is False, meta
+    assert "T-NEST" in meta["current_page_nested_pending_ids"], meta
+    assert err == "", err
+
+
+def test_r74_outer_has_next_returns_pagination_required(monkeypatch):
+    """A successful page fetch with outer has_next=True must return
+    outer_page_fetch_succeeded=True with outer_page_terminal=False.
+    The ok flag is False (parent walker must advance cursor) but the
+    structured status must distinguish this from a fetch failure.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+    response = _r74_build_response(page_outer_has_next=True, terminal_page_thread=None)
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta["outer_page_fetch_succeeded"] is True, meta
+    assert meta["outer_page_terminal"] is False, meta
+    assert meta["outer_page_has_next"] is True, meta
+    assert "pagination required" in err
+
+
+def test_r74_real_outer_subprocess_failure_returns_fetch_succeeded_false(monkeypatch):
+    """A real subprocess failure (returncode != 0) must propagate
+    outer_page_fetch_succeeded=False in metadata.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 1
+            stderr = "unauthorized"
+            stdout = ""
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta.get("outer_page_fetch_succeeded", True) is False, meta
+    assert "gh graphql returned 1" in err
+
+
+def test_r74_graphql_errors_returns_fetch_succeeded_false(monkeypatch):
+    """A GraphQL errors array must set outer_page_fetch_succeeded=False."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+    response = _r74_json.dumps({
+        "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [],
+        }}}},
+        "errors": [{"message": "API rate limit exceeded"}],
+    })
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta.get("outer_page_fetch_succeeded", True) is False, meta
+
+
+def test_r74_malformed_json_returns_fetch_succeeded_false(monkeypatch):
+    """Malformed JSON must set outer_page_fetch_succeeded=False."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = "not json {"
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta.get("outer_page_fetch_succeeded", True) is False, meta
+    assert "invalid GraphQL response" in err
+
+
+def test_r74_missing_outer_connection_returns_fetch_succeeded_false(monkeypatch):
+    """Missing outer reviewThreads connection must set
+    outer_page_fetch_succeeded=False."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+    response = _r74_json.dumps({"data": {"repository": {"pullRequest": None}}})
+    def fake_run(cmd, **kwargs):
+        class _R:
+            returncode = 0
+            stderr = ""
+            stdout = response
+        return _R()
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=False,
+    )
+    assert ok is False
+    assert meta.get("outer_page_fetch_succeeded", True) is False, meta
+
+
+def test_r74_parent_walker_invokes_nested_follower_for_terminal_nested(monkeypatch):
+    """The PARENT walker (do_walk=True) must invoke nested-follower
+    when the recursive call returns terminal-page-with-nested-work.
+    """
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+
+    # Page 1: hasNextPage=False, contains one thread with nested pending.
+    page1_response = _r74_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{
+            "id": "PRRT_PAGE1", "isOutdated": False, "isResolved": False,
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+                "nodes": [{"databaseId": 1, "author": {"login": "u"}}],
+            },
+        }],
+    }}}}} )
+
+    nested_calls = [0]
+    def fake_follow(nodes, *, safety_cap, timeout):
+        nested_calls[0] += 1
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                "PRRT_PAGE1": [{"databaseId": 99, "author": {"login": "later"}}]
+            },
+        }
+    monkeypatch.setattr(audit, "_follow_nested_cursor_for_threads", fake_follow)
+    monkeypatch.setattr(audit.subprocess, "run", lambda *a, **kw: type("R", (), {
+        "returncode": 0, "stderr": "", "stdout": page1_response,
+    })())
+
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=True,
+    )
+    assert ok is True, f"ok={ok} err={err!r} meta={meta}"
+    assert nested_calls[0] >= 1, "nested-follower must be invoked for terminal-page nested work"
+
+
+def test_r74_parent_walker_does_not_invoke_nested_follower_on_real_outer_failure(monkeypatch):
+    """The PARENT walker must NOT invoke nested-follower when the
+    recursive outer-page call returned ok=False with
+    outer_page_fetch_succeeded=False (real outer failure)."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import json as _r74_json
+
+    # Page 1 succeeds (carries nested pending work).
+    page1 = _r74_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": True, "endCursor": "C1"},
+        "nodes": [{
+            "id": "PRRT_PAGE1", "isOutdated": False, "isResolved": False,
+            "comments": {
+                "pageInfo": {"hasNextPage": True, "endCursor": "C_NEST"},
+                "nodes": [{"databaseId": 1, "author": {"login": "u"}}],
+            },
+        }],
+    }}}}})
+
+    # Page 2 fails (subprocess non-zero).
+    state = {"n": 0}
+    def fake_run(cmd, **kwargs):
+        state["n"] += 1
+        class _R:
+            returncode = 0 if state["n"] == 1 else 1
+            stderr = "" if state["n"] == 1 else "rate limit"
+            stdout = page1 if state["n"] == 1 else ""
+        return _R()
+
+    nested_calls = [0]
+    def fake_follow(nodes, *, safety_cap, timeout):
+        nested_calls[0] += 1
+        return {"complete": True, "fetched_comments_by_thread_id": {}}
+
+    monkeypatch.setattr(audit.subprocess, "run", fake_run)
+    monkeypatch.setattr(audit, "_follow_nested_cursor_for_threads", fake_follow)
+
+    ok, threads, err, meta = audit._canonical_review_thread_inventory(
+        owner="o", name="n", pr_number=412, do_walk=True,
+    )
+    assert ok is False
+    assert nested_calls[0] == 0, (
+        "nested-follower must NOT be invoked after a real outer failure"
+    )
+
+
+def test_r74_substring_removed_from_terminal_error_branch():
+    """The over-broad ``and not incomplete_nested_thread_ids`` clause
+    must not appear in the recursive-page terminal-error branch."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    assert "and not incomplete_nested_thread_ids:" not in src
+
+
+def test_r74_structured_status_documentation_present():
+    """The structured status fields must be documented in the helper."""
+    from scripts.local import audit_codex_response_for_pr as audit
+    import inspect
+    src = inspect.getsource(audit._canonical_review_thread_inventory)
+    assert "outer_page_fetch_succeeded" in src
+    assert "outer_page_terminal" in src
+    assert "outer_page_has_next" in src
+    assert "current_page_nested_pending_ids" in src
