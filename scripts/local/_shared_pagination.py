@@ -515,7 +515,9 @@ def paginate_nested_comments(
         query = """\
 query($threadId: ID!, $first: Int!, $after: String) {
   node(id: $threadId) {
+    __typename
     ... on PullRequestReviewThread {
+      __typename
       comments(first: $first, after: $after) {
         pageInfo {
           hasNextPage

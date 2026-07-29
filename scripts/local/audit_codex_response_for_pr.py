@@ -1187,6 +1187,13 @@ def _canonical_review_thread_inventory(
         "review_thread_inventory_error": "",
     }
     all_threads: List[Dict[str, Any]] = []
+    # Round-71 PHASE 3-P2-A: keep raw outer review-thread
+    # nodes (with their full ``id`` and nested
+    # ``comments.pageInfo.endCursor``) alongside the
+    # flattened audit records. The nested-pagination
+    # follower needs the raw shape to issue the correct
+    # GraphQL query against the canonical endpoint.
+    raw_thread_nodes: List[Dict[str, Any]] = []
     incomplete_nested_thread_ids: List[str] = []
     outer_has_next = False
     outer_end_cursor: Optional[str] = None
@@ -1356,6 +1363,18 @@ def _canonical_review_thread_inventory(
                     ),
                     "nested_incomplete": nested_incomplete,
                 }
+                # Round-71 PHASE 3-P2-A: keep the raw outer
+                # thread node so the nested-pagination
+                # follower can issue the canonical
+                # ``node(id: $threadId)`` query against the
+                # original payload, not against the
+                # flattened participant record.
+                raw_node = {
+                    "id": node.get("id", ""),
+                    "comments": node.get("comments") or {},
+                    "raw": node,
+                }
+                raw_thread_nodes.append(raw_node)
                 all_threads.append(entry)
         outer_has_next = bool(page_info.get("hasNextPage"))
         outer_end_cursor = page_info.get("endCursor")
@@ -1436,6 +1455,11 @@ def _canonical_review_thread_inventory(
                 len(incomplete_nested_thread_ids),
             "review_thread_comment_incomplete_thread_ids":
                 list(incomplete_nested_thread_ids),
+            # Round-71 PHASE 3-P2-A: publish raw outer
+            # thread nodes so the outer walker drains
+            # them into its unified raw cache before
+            # invoking the nested follower.
+            "_raw_thread_nodes": list(raw_thread_nodes),
             "review_thread_inventory_complete":
                 not outer_has_next_for_walk,
             "review_thread_inventory_pages": 1,
@@ -1497,6 +1521,14 @@ def _canonical_review_thread_inventory(
                 )
             )
             all_threads.extend(more_threads or [])
+            # Round-71 PHASE 3-P2-A: drain raw outer-page nodes
+            # the recursive page call collected into our own
+            # raw cache so nested-follow sees the full set.
+            for raw_node in (meta_next.get("_raw_thread_nodes", [])
+                             if isinstance(meta_next, dict) else []):
+                if not any(r.get("id") == raw_node.get("id")
+                           for r in raw_thread_nodes):
+                    raw_thread_nodes.append(raw_node)
             # Propagate nested-comment completeness across
             # pages. If any page reports an incomplete
             # nested inventory, the overall inventory is
@@ -1562,15 +1594,25 @@ def _canonical_review_thread_inventory(
                 # pagination remained incomplete across
                 # pages, follow cursors now.
                 if incomplete_nested_thread_ids:
+                    # Round-71 PHASE 3-P2-A: pass the *raw*
+                    # outer thread nodes (with their full
+                    # ``id`` and nested
+                    # ``comments.pageInfo.endCursor``) to
+                    # the nested follower so the helper
+                    # can issue the canonical
+                    # ``node(id: $threadId) { ... }``
+                    # GraphQL query against the raw
+                    # shape, not against the flattened
+                    # audit record.
                     nested_follow = (
                         _follow_nested_cursor_for_threads(
-                            all_threads,
+                            raw_thread_nodes,
                             safety_cap=safety_cap,
                             timeout=timeout,
                         )
                     )
                     if not nested_follow.get("complete"):
-                        # Fail closed.
+                        # Round-71 PHASE 3-P2-B: fail closed.
                         return False, all_threads, (
                             nested_follow.get("error")
                             or "nested_pagination_failed"
@@ -1585,7 +1627,10 @@ def _canonical_review_thread_inventory(
                                 nested_follow.get("error") or "nested_pagination_failed"
                             ),
                         }
-                    # Merge nested-follow results into per-thread comments.
+                    # Merge nested-follow results into per-thread
+                    # *flattened* audit records, keyed by
+                    # thread_id (which the helper looked up via
+                    # raw_thread_nodes[i]["id"]).
                     fetched = nested_follow.get("fetched_comments_by_thread_id", {})
                     for nt in all_threads:
                         tid = nt.get("thread_id") or nt.get("id") or ""
@@ -1613,6 +1658,27 @@ def _canonical_review_thread_inventory(
                                 }
                             )
                         nt["nested_incomplete"] = False
+                    # Round-71 PHASE 3-P2-B: after every
+                    # required nested cursor succeeds,
+                    # reset the inventory-completeness flags
+                    # regardless of the outer-loop metadata
+                    # value computed earlier (which reflected
+                    # the pre-nested view).
+                    final_metadata = {
+                        **empty_metadata,
+                        "review_thread_comment_inventory_complete": True,
+                        "review_thread_comment_inventory_error_count": 0,
+                        "review_thread_comment_incomplete_thread_ids": [],
+                        "review_thread_inventory_complete": (
+                            not nested_follow.get("capped", False)
+                        ),
+                        "review_thread_inventory_pages": pages,
+                        "review_thread_inventory_capped": bool(
+                            nested_follow.get("capped", False)
+                        ),
+                        "review_thread_inventory_error": "",
+                    }
+                    return True, all_threads, "", final_metadata
                 # Inventory complete. Done.
                 return True, all_threads, "", {
                     **empty_metadata,
