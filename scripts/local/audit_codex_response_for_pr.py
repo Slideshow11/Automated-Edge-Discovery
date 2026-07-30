@@ -1225,6 +1225,85 @@ def _dedup_raw_thread_nodes_by_id(
     return ordered
 
 
+
+
+def _attach_canonical_thread_participants(
+    thread_id: str,
+    all_threads: List[Dict[str, Any]],
+) -> None:
+    """Round-78 PHASE 3 P2 fix: ensure every flattened record
+    for ``thread_id`` carries the same canonical participant
+    evidence so that ``aed_pr.deduplicate_thread_records()``
+    never fails closed on a duplicate thread that has an
+    empty ``comments`` list on a fetched record.
+
+    The helper:
+
+    1. finds the canonical participant list by taking the
+       union of all ``comments`` entries across every record
+       that shares ``thread_id`` AND adding the explicit
+       ``unknown`` participant for any fetched author label
+       not yet present;
+    2. deduplicates participants by ``(database_id, author)``
+       while preserving first-seen order;
+    3. writes the same canonical list back to every matching
+       record.
+
+    This is a narrow additive helper. It does not fabricate
+    participants that were not actually observed; it only
+    propagates the canonical evidence that was already
+    assembled for the thread by the Round-77 PHASE 3 P1-B
+    branch (which updates the anchor record's ``comments``).
+    """
+    if not thread_id:
+        return
+    canonical: list = []
+    seen_keys: set = set()
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        for c in rec.get("comments") or []:
+            if not isinstance(c, dict):
+                continue
+            key = c.get("database_id") or c.get("author") or ""
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            canonical.append({
+                "author": c.get("author") or "",
+                "database_id": c.get("database_id"),
+            })
+    # Also fold in any fetched author labels that the canonical
+    # list has not yet captured (mirrors the Round-77 anchor
+    # update path).
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        author_label = rec.get("author") or ""
+        if not author_label:
+            continue
+        anchor_key = author_label
+        if anchor_key not in seen_keys:
+            seen_keys.add(anchor_key)
+            canonical.append({
+                "author": author_label,
+                "database_id": None,
+            })
+    if not canonical:
+        return
+    for rec in all_threads:
+        if not isinstance(rec, dict):
+            continue
+        if (rec.get("thread_id") or rec.get("id") or "") != thread_id:
+            continue
+        rec["comments"] = list(canonical)
+
+
+
 def _flatten_review_thread_comment(
     thread_state: Dict[str, Any],
     raw_comment: Dict[str, Any],
@@ -1928,6 +2007,13 @@ def _canonical_review_thread_inventory(
                             })
                             _r77_seen_authors.add(_r77_label)
                 nt["nested_incomplete"] = False
+                # Round-78 PHASE 3 P2: propagate the canonical
+                # participant evidence to every flattened record
+                # for this thread so duplicate dedup stays
+                # non-empty.
+                _attach_canonical_thread_participants(
+                    tid, all_threads
+                )
             return True, all_threads, "", {
                 **empty_metadata,
                 "review_thread_comment_inventory_complete": True,
@@ -2259,6 +2345,13 @@ def _canonical_review_thread_inventory(
                                     })
                                     _r77_seen_authors.add(_r77_label)
                         nt["nested_incomplete"] = False
+                        # Round-78 PHASE 3 P2: propagate the
+                        # canonical participant evidence to
+                        # every flattened record for this thread
+                        # so duplicate dedup stays non-empty.
+                        _attach_canonical_thread_participants(
+                            tid, all_threads
+                        )
                     # Round-71 PHASE 3-P2-B: after every
                     # required nested cursor succeeds,
                     # reset the inventory-completeness flags
