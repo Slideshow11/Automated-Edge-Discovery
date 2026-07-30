@@ -1735,8 +1735,12 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
     # nonexistent artifact.
     log_path_str = ""
     if log_path and isinstance(log_path, Path) and str(log_path):
-        log_path.parent.mkdir(parents=True, exist_ok=True)
+        # Round-97 follow-up (VPhYp): put the ``mkdir`` inside
+        # the same try block as the write so a parent-directory
+        # creation failure surfaces as ``log_write_error``
+        # rather than as a raw OSError escaping the function.
         try:
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             with open(log_path, "w") as fh:
                 json.dump(result, fh, indent=2)
         except OSError as e:
@@ -1806,15 +1810,25 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
     # failure as a separate failure source so the operator
     # notices the missing artifact.
     if log_write_failure:
-        codex["last_validation_status"] = "log_write_error"
-        codex["last_validation_error"] = log_write_failure_error
-        codex["last_validation_at"] = _utcnow()
+        # Round-97 follow-up (VPhYm): persist the
+        # ``next_action`` dict on the controller state before
+        # saving it. The previous shape created a local
+        # ``next_action`` and called ``_save_state`` without
+        # assigning ``state[\"next_action\"]``, so the
+        # failure mode did not persist to disk and was
+        # overwritten by the previous ``next_action``.
         next_action = {
             "action": "request_human",
             "task_id": None,
             "reason": "validation_log_write_error",
         }
+        codex["last_validation_status"] = "log_write_error"
+        codex["last_validation_error"] = log_write_failure_error
+        codex["last_validation_at"] = _utcnow()
         state["human_action_required"] = True
+        state["codex_review"] = codex
+        state["updated_at"] = _utcnow()
+        state["next_action"] = next_action
         _save_state(state, args.state)
         sys.exit(2)
     if rc == 0:
