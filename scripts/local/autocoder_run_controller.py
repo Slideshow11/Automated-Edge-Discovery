@@ -1648,6 +1648,17 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
     """
     state = _load_state(args.state)
 
+    # Round-96 follow-up (VPRYe): the log-write failure flag is
+    # initialized to False here so subsequent
+    # ``if log_write_failure:`` checks at the codex state write
+    # below have a stable binding. ``log_path`` is also
+    # normalized so a missing caller-supplied value forces a
+    # controller-derived default path under
+    # ``<state.parent>/validations/``.
+    log_write_failure = False
+    log_write_failure_error = ""
+    log_write_failure_path = ""
+
     # argparse action='append' populates args.changed_path (singular)
     raw_paths = list(getattr(args, "changed_path", []) or [])
     cleaned_paths = [p for p in raw_paths if str(p or "").strip()]
@@ -1656,7 +1667,24 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
               "to record repair validation", file=sys.stderr)
         sys.exit(2)
 
-    log_path = Path(str(args.output_log or "")) if str(args.output_log or "").strip() else None
+    log_path: Optional[Path] = (
+        Path(str(args.output_log or "")) if str(args.output_log or "").strip() else None
+    )
+    # Round-96 follow-up (VPRYe): when the caller does not supply
+    # an ``--output-log``, the previous handler silently skipped
+    # the log write and recorded an empty
+    # ``last_validation_log_path`` while still advancing to
+    # ``await_codex_review_after_repair``. Derive a default path
+    # under ``<state.parent>/validations/`` so the on-disk
+    # evidence artifact exists whenever a validation run
+    # completes successfully. A separate failure flag handles
+    # write-time errors below.
+    if log_path is None:
+        log_path = (
+            Path(str(args.state)).parent
+            / "validations"
+            / f"validation-{int(time.time())}.json"
+        )
     # Invoke the runner seam.
     seam = _autonomous_repair_seam()
     try:
@@ -1692,18 +1720,43 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
               file=sys.stderr)
         sys.exit(2)
 
-    # Persist the runner log if log_path was provided and is a real path.
+    # Persist the runner log. Round-96 follow-up (VPRYe):
+    # a missing ``log_path`` used to silently skip the log-write
+    # step while the rest of the function declared a
+    # successful validation. The controller would then
+    # record an empty ``last_validation_log_path`` and
+    # advance to ``await_codex_review_after_repair`` even
+    # though no evidence artifact existed. The default
+    # path is supplied above so ``log_path`` is always
+    # non-None at this point. Treat a write failure as
+    # ``log_write_failure = True`` so the codex transition
+    # below surfaces the failure instead of silently
+    # treating the run as ``returncode == 0`` against a
+    # nonexistent artifact.
+    log_path_str = ""
     if log_path and isinstance(log_path, Path) and str(log_path):
         log_path.parent.mkdir(parents=True, exist_ok=True)
         try:
             with open(log_path, "w") as fh:
                 json.dump(result, fh, indent=2)
         except OSError as e:
+            # Round-96 follow-up: capture the failure but
+            # do not call ``sys.exit(2)`` because the caller
+            # is non-interactive. Mark the state shape so the
+            # transition below picks up the failure.
             print(f"ERROR: could not persist log to {log_path}: {e}",
                   file=sys.stderr)
-            sys.exit(2)
+            log_write_failure = True
+            log_write_failure_error = (
+                f"{type(e).__name__}: {e}"
+            )
+            log_write_failure_path = str(log_path)
+            log_path = None  # do not record a missing artifact
+        else:
+            log_path_str = str(log_path)
+    # If log write succeeded, this string is non-empty.
 
-    # Round-71 PHASE 3-P1-B: facade canonical keys win over
+    # Apply transition:
     # alias keys.
     rc = int(result.get("returncode", result.get("return_code", -1)))
     selected = list(result.get("selected", result.get("selected_tests", [])))
@@ -1747,6 +1800,23 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
     state["codex_repair_events"] = state.get("codex_repair_events", [])
     state["codex_repair_events"].append(codex_repair_event)
 
+    # Round-96 follow-up (VPRYe): when the log write failed but
+    # ``rc == 0``, the controller MUST NOT advance to
+    # ``await_codex_review_after_repair``. Surface the log-write
+    # failure as a separate failure source so the operator
+    # notices the missing artifact.
+    if log_write_failure:
+        codex["last_validation_status"] = "log_write_error"
+        codex["last_validation_error"] = log_write_failure_error
+        codex["last_validation_at"] = _utcnow()
+        next_action = {
+            "action": "request_human",
+            "task_id": None,
+            "reason": "validation_log_write_error",
+        }
+        state["human_action_required"] = True
+        _save_state(state, args.state)
+        sys.exit(2)
     if rc == 0:
         codex["status"] = "not_started"
         codex["findings_count"] = 0

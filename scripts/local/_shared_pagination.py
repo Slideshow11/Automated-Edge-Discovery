@@ -160,7 +160,33 @@ def paginate_graphql_connection(
                     "error": "path_not_found",
                 }
         nodes = node.get("nodes") or []
+        # Round-96 follow-up (VPRYg): a single page may exceed
+        # ``safety_cap`` when ``page_size > safety_cap``. The
+        # previous loop truncated ``all_nodes`` only on the
+        # NEXT iteration and returned ``complete=False`` with
+        # ``capped=True`` while ``all_nodes`` carried every
+        # node from the over-cap page. Detect the cross
+        # BEFORE ``extend`` so the returned ``all_nodes`` is
+        # never larger than ``safety_cap``.
+        # The pre-existing pre-fetch check at line 106
+        # (``if len(all_nodes) >= safety_cap``) prevents
+        # appending an additional full page once the
+        # inventory hits the cap; this in-loop check covers
+        # the first-page-over-cap case the pre-fetch check
+        # cannot see.
+        if len(all_nodes) + len(nodes) > safety_cap:
+            # Truncate to the cap so the inventory stays
+            # bounded by the operator's intent.
+            overflow = (len(all_nodes) + len(nodes)) - safety_cap
+            if overflow > 0:
+                nodes = nodes[: max(0, len(nodes) - overflow)]
+            capped = True
         all_nodes.extend(nodes)
+        if capped:
+            # Stop here so the caller sees ``capped=True`` with
+            # the bounded inventory rather than continuing past
+            # the cap on subsequent iterations.
+            break
         page_info = node.get("pageInfo") or {}
         if not page_info.get("hasNextPage"):
             break

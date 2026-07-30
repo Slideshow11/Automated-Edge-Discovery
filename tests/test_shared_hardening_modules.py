@@ -3909,3 +3909,77 @@ def test_r95_classifier_accepts_legacy_commit_oid_representation():
         "review via extract_review_commit_oid and classify as "
         "FINDING."
     )
+
+
+def test_r96_pagination_bounds_first_page_over_cap():
+    """Round-96 follow-up (VPRYg): a single page may exceed
+    ``safety_cap`` when ``page_size > safety_cap``. The previous
+    loop truncated only on the NEXT iteration and returned
+    ``complete=False`` with ``capped=True`` while ``all_nodes``
+    carried every node from the over-cap page. The fix bounds
+    the inventory to the cap even on the first-page-over-cap
+    case.
+    """
+    import json as _json
+    import urllib.request as ur
+    import subprocess as sp
+    from scripts.local import _shared_pagination as pg
+
+    # Mock that returns 10 nodes on a single page (single
+    # response with hasNextPage=false so the loop ends).
+    class FakeResp:
+        def __init__(self):
+            self.payload = _json.dumps({
+                "data": {
+                    "x": {
+                        # Page returns 10 nodes (mock
+                        # ``page_size=20``). ``safety_cap=5``
+                        # means the first page itself crosses
+                        # the cap. The fix must truncate to 5
+                        # and report ``capped=True``.
+                        "nodes": [{"id": f"N{i}"} for i in range(10)],
+                        "pageInfo": {"hasNextPage": False, "endCursor": None},
+                    }
+                }
+            }).encode()
+        def read(self):
+            return self.payload
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            pass
+
+    def fake_urlopen(req, timeout=None):
+        return FakeResp()
+
+    def fake_check_output(cmd, *a, **kw):
+        return "fake-token\n"
+
+    original_urlopen = ur.urlopen
+    original_check = sp.check_output
+    ur.urlopen = fake_urlopen
+    sp.check_output = fake_check_output
+    try:
+        res = pg.paginate_graphql_connection(
+            owner="x", name="y", pr_number=1,
+            query="dummy",
+            path=("data", "x"),
+            # The default page_size is 50; we want a real
+            # over-cap page. With page_size=20 and
+            # safety_cap=5, the page has 10 nodes which is
+            # already 2x the cap.
+            page_size=20,
+            safety_cap=5,
+        )
+    finally:
+        ur.urlopen = original_urlopen
+        sp.check_output = original_check
+    assert res["capped"] is True, (
+        "Round-96 (VPRYg): a single page of 10 nodes with "
+        "safety_cap=5 MUST report capped=True."
+    )
+    assert len(res["nodes"]) <= 5, (
+        "Round-96 (VPRYg): the inventory must NEVER exceed "
+        "safety_cap. Got %d nodes with safety_cap=5 after "
+        "a page of 10." % len(res["nodes"])
+    )
