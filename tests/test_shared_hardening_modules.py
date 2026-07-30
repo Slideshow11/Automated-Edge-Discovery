@@ -3088,3 +3088,482 @@ def test_r78_dedup_attached_participants_helper_present():
     # Smoke test: helper is a no-op for empty thread_id.
     _r78_a._attach_canonical_thread_participants("", [])
     assert True
+
+
+
+def test_r79_helper_invoked_once_for_one_thread_many_records(monkeypatch):
+    """Round-79 PHASE 4 regression 1: one affected thread with
+    many initial records must invoke
+    _attach_canonical_thread_participants exactly once.
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+
+    thread_id = "PRRT_R79_ONE_THREAD"
+    initial_nodes = []
+    for i in range(5):
+        initial_nodes.append({
+            "databaseId": 100 + i, "url": f"u/{i}",
+            "author": {"login": f"u{i}"},
+            "body": f"anchor-{i}",
+            "path": "p", "line": i + 1,
+            "originalCommit": {"oid": f"oc{i}"},
+        })
+    initial = [{
+        "id": thread_id, "isOutdated": False, "isResolved": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC1"},
+            "nodes": initial_nodes,
+        },
+    }]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+    call_count = [0]
+    orig_attach = audit._attach_canonical_thread_participants
+
+    def counted_attach(*a, **kw):
+        call_count[0] += 1
+        return orig_attach(*a, **kw)
+
+    monkeypatch.setattr(audit, "_attach_canonical_thread_participants",
+                        counted_attach)
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_id: [{
+                    "databaseId": 200, "url": "u/f",
+                    "author": {"login": "codex"},
+                    "body": "fetched",
+                    "path": "p", "line": 99,
+                    "originalCommit": {"oid": "ocf"}},
+            ]}}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True, f"unexpected error: {err}"
+    assert call_count[0] == 1, (
+        f"helper called {call_count[0]} times for one thread; expected 1"
+    )
+
+
+def test_r79_helper_invoked_once_per_thread_for_two_threads(monkeypatch):
+    """Round-79 PHASE 4 regression 2: two affected thread IDs
+    must invoke _attach_canonical_thread_participants exactly
+    twice, once per ID.
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+
+    thread_a = "PRRT_R79_TWO_A"
+    thread_b = "PRRT_R79_TWO_B"
+    initial_nodes_a = [{
+        "databaseId": 100 + i, "url": f"ua/{i}",
+        "author": {"login": f"a{i}"},
+        "body": f"anchor-a-{i}", "path": "p", "line": i + 1,
+        "originalCommit": {"oid": f"oa{i}"},
+    } for i in range(3)]
+    initial_nodes_b = [{
+        "databaseId": 200 + i, "url": f"ub/{i}",
+        "author": {"login": f"b{i}"},
+        "body": f"anchor-b-{i}", "path": "p", "line": i + 1,
+        "originalCommit": {"oid": f"ob{i}"},
+    } for i in range(3)]
+    initial = [
+        {"id": thread_a, "isOutdated": False, "isResolved": False,
+         "comments": {
+             "pageInfo": {"hasNextPage": True, "endCursor": "ECA"},
+             "nodes": initial_nodes_a,
+         }},
+        {"id": thread_b, "isOutdated": False, "isResolved": False,
+         "comments": {
+             "pageInfo": {"hasNextPage": True, "endCursor": "ECB"},
+             "nodes": initial_nodes_b,
+         }},
+    ]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+    call_count = [0]
+    seen_thread_ids = []
+    orig_attach = audit._attach_canonical_thread_participants
+
+    def counted_attach(tid, *a, **kw):
+        call_count[0] += 1
+        seen_thread_ids.append(tid)
+        return orig_attach(tid, *a, **kw)
+
+    monkeypatch.setattr(audit, "_attach_canonical_thread_participants",
+                        counted_attach)
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_a: [{
+                    "databaseId": 300, "url": "u/fa",
+                    "author": {"login": "codex"},
+                    "body": "fetched-a", "path": "p", "line": 99,
+                    "originalCommit": {"oid": "ocfa"}}],
+                thread_b: [{
+                    "databaseId": 301, "url": "u/fb",
+                    "author": {"login": "codex"},
+                    "body": "fetched-b", "path": "p", "line": 99,
+                    "originalCommit": {"oid": "ocfb"}}],
+        }}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True
+    assert call_count[0] == 2, (
+        f"helper called {call_count[0]} times for two threads; expected 2"
+    )
+    # Order: thread_a then thread_b (deterministic from snapshot order).
+    assert sorted(seen_thread_ids) == sorted([thread_a, thread_b]), (
+        f"helper called on unexpected thread ids: {seen_thread_ids}"
+    )
+
+
+def test_r79_terminal_page_branch_also_calls_helper_once_per_thread(monkeypatch):
+    """Round-79 PHASE 4 regression 3: the terminal-page branch
+    must also exhibit unique-thread attachment semantics.
+
+    The terminal-page branch is exercised by do_walk=True with
+    a single-page outer page (hasNextPage=False) but
+    incomplete nested cursors. To reach it, we use do_walk=True
+    and the outer page has hasNextPage=False (which is what the
+    do_walk=True outer takes the terminal-page path on).
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+
+    thread_id = "PRRT_R79_TERMINAL"
+    initial_nodes = [{
+        "databaseId": 100 + i, "url": f"u/{i}",
+        "author": {"login": f"u{i}"},
+        "body": f"a-{i}", "path": "p", "line": i + 1,
+        "originalCommit": {"oid": f"oc{i}"},
+    } for i in range(4)]
+    initial = [{
+        "id": thread_id, "isOutdated": False, "isResolved": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC1"},
+            "nodes": initial_nodes,
+        },
+    }]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+    call_count = [0]
+    orig_attach = audit._attach_canonical_thread_participants
+
+    def counted_attach(*a, **kw):
+        call_count[0] += 1
+        return orig_attach(*a, **kw)
+
+    monkeypatch.setattr(audit, "_attach_canonical_thread_participants",
+                        counted_attach)
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_id: [{
+                    "databaseId": 200, "url": "u/f",
+                    "author": {"login": "codex"},
+                    "body": "f", "path": "p", "line": 99,
+                    "originalCommit": {"oid": "ocf"}}],
+        }}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True
+    # Even with 4 initial comments the terminal-page branch
+    # must call the helper exactly once.
+    assert call_count[0] == 1, (
+        f"terminal-page helper called {call_count[0]} times; expected 1"
+    )
+
+
+def test_r79_fetched_records_still_have_non_empty_canonical_participants(monkeypatch):
+    """Round-79 PHASE 4 regression 4: all fetched records still
+    receive identical non-empty canonical participant evidence
+    after the Round-79 refactor.
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+
+    thread_id = "PRRT_R79_CANONICAL"
+    initial_nodes = [{
+        "databaseId": 100 + i, "url": f"u/{i}",
+        "author": {"login": f"u{i}"},
+        "body": f"a-{i}", "path": "p", "line": i + 1,
+        "originalCommit": {"oid": f"oc{i}"},
+    } for i in range(3)]
+    initial = [{
+        "id": thread_id, "isOutdated": False, "isResolved": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC1"},
+            "nodes": initial_nodes,
+        },
+    }]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_id: [
+                    {"databaseId": 200, "url": "u/f1",
+                     "author": {"login": "codex"},
+                     "body": "f1", "path": "p", "line": 99,
+                     "originalCommit": {"oid": "ocf1"}},
+                    {"databaseId": 201, "url": "u/f2",
+                     "author": {"login": "codex"},
+                     "body": "f2", "path": "p", "line": 100,
+                     "originalCommit": {"oid": "ocf2"}},
+            ]}}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True
+    same_thread = [t for t in threads if t.get("thread_id") == thread_id]
+    assert len(same_thread) >= 5, (
+        f"expected at least 5 records (3 initial + 2 fetched), got {len(same_thread)}"
+    )
+    # All records must share the same canonical comments list.
+    canonical_lists = [tuple(
+        (c.get("author"), c.get("database_id"))
+        for c in (t.get("comments") or [])
+    ) for t in same_thread]
+    first = canonical_lists[0]
+    for i, cl in enumerate(canonical_lists[1:], 1):
+        assert cl == first, (
+            f"record {i} has different comments than record 0: {cl} vs {first}"
+        )
+    # And they must be non-empty.
+    assert first, "canonical comments list is empty"
+
+
+def test_r79_unknown_author_preserved_after_refactor(monkeypatch):
+    """Round-79 PHASE 4 regression 5: unknown / deleted fetched
+    authors remain explicit 'unknown' participants after the
+    Round-79 refactor.
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+
+    thread_id = "PRRT_R79_UNKNOWN_AFTER"
+    initial = [{
+        "id": thread_id, "isOutdated": False, "isResolved": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC1"},
+            "nodes": [
+                {"databaseId": 1, "url": "u/1",
+                 "author": {"login": "codex"},
+                 "body": "anchor", "path": "p", "line": 1,
+                 "originalCommit": {"oid": "oc1"}},
+            ],
+        },
+    }]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_id: [{
+                    "databaseId": 2, "url": "u/2",
+                    "author": None,
+                    "body": "deleted-account", "path": "p", "line": 2,
+                    "originalCommit": {"oid": "oc2"}}],
+        }}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True
+    same_thread = [t for t in threads if t.get("thread_id") == thread_id]
+    unknown_records = [
+        c for t in same_thread
+        for c in (t.get("comments") or [])
+        if isinstance(c, dict) and c.get("author") == "unknown"
+    ]
+    assert unknown_records, (
+        "expected explicit 'unknown' participant for deleted-author fetch"
+    )
+
+
+def test_r79_dedup_still_succeeds_after_refactor(monkeypatch):
+    """Round-79 PHASE 4 regression 6: deduplicate_thread_records
+    still succeeds for valid duplicate records after the
+    Round-79 refactor.
+    """
+    import json as _r79_json
+    from scripts.local import audit_codex_response_for_pr as audit
+    from scripts.local import aed_pr
+
+    thread_id = "PRRT_R79_DEDUP_OK"
+    initial_nodes = [
+        {"databaseId": 1, "url": "u/1", "author": {"login": "codex"},
+         "body": "a-1", "path": "p", "line": 1,
+         "originalCommit": {"oid": "oc1"}},
+        {"databaseId": 2, "url": "u/2", "author": {"login": "codex"},
+         "body": "a-2", "path": "p", "line": 2,
+         "originalCommit": {"oid": "oc2"}},
+    ]
+    initial = [{
+        "id": thread_id, "isOutdated": False, "isResolved": False,
+        "comments": {
+            "pageInfo": {"hasNextPage": True, "endCursor": "EC1"},
+            "nodes": initial_nodes,
+        },
+    }]
+    response = _r79_json.dumps({"data": {"repository": {"pullRequest": {
+        "reviewThreads": {"pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": initial}}}}})
+
+    class R:
+        returncode = 0
+        stderr = ""
+        stdout = response
+
+    def fake_run(*a, **kw):
+        return R()
+
+    def fake_follow(*a, **kw):
+        return {
+            "complete": True,
+            "fetched_comments_by_thread_id": {
+                thread_id: [{
+                    "databaseId": 3, "url": "u/3",
+                    "author": {"login": "codex"},
+                    "body": "f", "path": "p", "line": 99,
+                    "originalCommit": {"oid": "ocf"}}],
+        }}
+
+    with mock.patch.object(audit.subprocess, "run", fake_run), \
+         mock.patch.object(audit, "_follow_nested_cursor_for_threads", fake_follow):
+        ok, threads, err, meta = audit._canonical_review_thread_inventory(
+            owner="o", name="n", pr_number=412, do_walk=True,
+        )
+    assert ok is True
+    canonical, err = aed_pr.deduplicate_thread_records(threads)
+    assert err == "", f"deduplicate_thread_records fail-closed: {err}"
+    assert len(canonical) == 1, (
+        f"expected 1 canonical record, got {len(canonical)}"
+    )
+
+
+def test_r79_conflicting_authors_still_fail_closed(monkeypatch):
+    """Round-79 PHASE 4 regression 7: conflicting state, anchor
+    or known top-level authors must still fail closed.
+    """
+    from scripts.local import aed_pr
+    from scripts.local.audit_codex_response_for_pr import (
+        _flatten_review_thread_comment,
+    )
+    thread_id = "PRRT_R79_CONFLICT"
+    base_state = {"thread_id": thread_id, "is_outdated": False,
+                  "is_resolved": False}
+    initial_record = dict(base_state)
+    initial_record.update({
+        "comment_database_id": 1, "comment_url": "u/1",
+        "author": "codex", "body": "anchor", "path": "p", "line": 1,
+        "original_commit_sha": "oc1", "comments": [],
+        "nested_incomplete": False,
+    })
+    conflicting = dict(base_state)
+    conflicting.update({
+        "comment_database_id": 2, "comment_url": "u/2",
+        "author": "human-user", "body": "reply", "path": "p", "line": 2,
+        "original_commit_sha": "oc1", "comments": [],
+        "nested_incomplete": False,
+    })
+    canonical, err = aed_pr.deduplicate_thread_records(
+        [initial_record, conflicting]
+    )
+    assert err == "conflicting_duplicate_thread_records", (
+        f"expected conflicting_duplicate_thread_records, got {err!r}"
+    )
+    assert canonical == []
+
+
+def test_r79_all_prior_regressions_remain_green():
+    """Round-79 PHASE 4 regression 8: all prior Round-76, Round-77
+    and Round-78 regressions remain green after the Round-79
+    refactor.
+
+    This is a meta-test that invokes pytest programmatically on
+    the focused regression subset and asserts zero failures.
+    """
+    import subprocess as _r79_subprocess
+    result = _r79_subprocess.run(
+        ["python3", "-m", "pytest", "-p", "no:cacheprovider", "-q",
+         "--tb=no", "-k", "r76_ or r77_ or r78_",
+         "tests/test_shared_hardening_modules.py"],
+        capture_output=True, text=True, cwd=REPO,
+    )
+    assert result.returncode == 0, (
+        f"prior regressions broken\nstdout={result.stdout[-1000:]}"
+    )

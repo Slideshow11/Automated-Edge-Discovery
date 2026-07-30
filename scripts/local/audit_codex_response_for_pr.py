@@ -1953,6 +1953,11 @@ def _canonical_review_thread_inventory(
             # extends the same fix to the do_walk=True
             # terminal-page fast path.
             _r77_terminal_snapshot = list(all_threads)
+            # Round-79 PHASE 3 P2: collect affected thread IDs
+            # in stable order so canonical attachment runs once
+            # per unique thread.
+            _r79_affected_thread_ids: List[str] = []
+            _r79_affected_seen: set = set()
             for nt in _r77_terminal_snapshot:
                 tid = nt.get("thread_id") or nt.get("id") or ""
                 if tid not in fetched:
@@ -2007,12 +2012,16 @@ def _canonical_review_thread_inventory(
                             })
                             _r77_seen_authors.add(_r77_label)
                 nt["nested_incomplete"] = False
-                # Round-78 PHASE 3 P2: propagate the canonical
-                # participant evidence to every flattened record
-                # for this thread so duplicate dedup stays
-                # non-empty.
+                # Record the affected thread ID once.
+                if tid not in _r79_affected_seen:
+                    _r79_affected_seen.add(tid)
+                    _r79_affected_thread_ids.append(tid)
+            # Round-78 PHASE 3 P2 + Round-79 PHASE 3 P2:
+            # propagate canonical participant evidence
+            # exactly once per unique affected thread.
+            for _r79_tid in _r79_affected_thread_ids:
                 _attach_canonical_thread_participants(
-                    tid, all_threads
+                    _r79_tid, all_threads
                 )
             return True, all_threads, "", {
                 **empty_metadata,
@@ -2291,6 +2300,14 @@ def _canonical_review_thread_inventory(
                     # the outer loop (cubic growth / indefinite
                     # append on null-databaseId records).
                     _r77_anchor_snapshot = list(all_threads)
+                    # Round-79 PHASE 3 P2 narrow repair:
+                    # collect affected thread IDs in a stable
+                    # ordered set so the canonical participant
+                    # attachment runs exactly once per unique
+                    # thread, regardless of how many flattened
+                    # records the snapshot contains.
+                    _r79_affected_thread_ids: List[str] = []
+                    _r79_affected_seen: set = set()
                     for nt in _r77_anchor_snapshot:
                         tid = nt.get("thread_id") or nt.get("id") or ""
                         if tid not in fetched:
@@ -2345,12 +2362,18 @@ def _canonical_review_thread_inventory(
                                     })
                                     _r77_seen_authors.add(_r77_label)
                         nt["nested_incomplete"] = False
-                        # Round-78 PHASE 3 P2: propagate the
-                        # canonical participant evidence to
-                        # every flattened record for this thread
-                        # so duplicate dedup stays non-empty.
+                        # Record the affected thread ID once;
+                        # canonical attachment happens after the
+                        # loop, once per unique thread.
+                        if tid not in _r79_affected_seen:
+                            _r79_affected_seen.add(tid)
+                            _r79_affected_thread_ids.append(tid)
+                    # Round-78 PHASE 3 P2 + Round-79 PHASE 3 P2:
+                    # propagate canonical participant evidence
+                    # exactly once per unique affected thread.
+                    for _r79_tid in _r79_affected_thread_ids:
                         _attach_canonical_thread_participants(
-                            tid, all_threads
+                            _r79_tid, all_threads
                         )
                     # Round-71 PHASE 3-P2-B: after every
                     # required nested cursor succeeds,
