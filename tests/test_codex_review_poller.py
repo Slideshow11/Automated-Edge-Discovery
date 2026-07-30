@@ -2214,3 +2214,68 @@ def test_r82_poll_cycle_head_drift_overrides_finding_too(monkeypatch):
     result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
     assert result["verdict"] == "HEAD_DRIFT"
     assert result["live_head"] == drift
+
+
+# =====================================================================
+# Round-83 PHASE 3 regression tests: fail closed when the final
+# (post-collection) head fetch fails
+# =====================================================================
+#
+# Codex Round-82 finding: if the initial head fetch succeeded
+# but the post-collection re-fetch transiently errors, my
+# Round-82 fix returned the (stale) verdict anyway. The fix:
+# if the final head fetch fails, treat the head surface as
+# incomplete and withhold the verdict.
+
+
+def _r83_initial_ok_final_fails_stub(HEAD=ROUND81_HEAD_SHA):
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return HEAD, None  # initial succeeds
+        return None, "boom"  # final fails
+    return f, state
+
+
+def test_r83_poll_cycle_initial_head_ok_final_fails_withholds_clean(monkeypatch):
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    stub, state = _r83_initial_ok_final_fails_stub()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    # Even though initial head matched, the final head fetch
+    # failed -> do NOT accept the CLEAN verdict.
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+    assert result["finding_surfaces_complete"] is False
+    assert result["surface_errors"]["head"] == "boom"
+
+
+def test_r83_poll_cycle_initial_head_ok_final_fails_withholds_finding(monkeypatch):
+    """Even a finding is withheld if the final head fetch
+    fails, because we cannot prove the response is for the
+    CURRENT head. The head surface must complete before
+    any verdict — clean or finding — is accepted.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    stub, state = _r83_initial_ok_final_fails_stub()
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    finding = _r81_formal_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["finding_surfaces_complete"] is False

@@ -1029,7 +1029,26 @@ def _run_poll_cycle(
         comments=comments, comments_err=comments_err,
         reactions=reactions, reactions_err=reactions_err,
     )
-    if final_live_head is not None and final_live_head != expected_head:
+    # Round-83: if the post-collection head fetch FAILED, we
+    # cannot prove the response is for the CURRENT head, so
+    # we must fail closed — withhold the verdict and report
+    # the head surface as incomplete. This applies even when
+    # the initial head fetch succeeded, because the head
+    # could have drifted during the surface requests and we
+    # have no second observation to confirm or refute.
+    if final_head_err is not None:
+        _log(
+            "WARN",
+            f"{LOG_CLEAN_WITHHELD} final_head_err={final_head_err!r}",
+        )
+        return _build_terminal_payload(
+            verdict="REQUEST_PENDING", kind="", response_id=None,
+            expected_head=expected_head, live_head=final_live_head,
+            surface=final_surface,
+            timestamp=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            repo=args.repo, pr_number=args.pr_number,
+        )
+    if final_live_head != expected_head:
         # Head drifted during surface collection. Emit HEAD_DRIFT.
         payload = _build_terminal_payload(
             verdict="HEAD_DRIFT", kind="", response_id=None,
@@ -1046,7 +1065,7 @@ def _run_poll_cycle(
         return payload
     # If the re-fetch succeeded but the initial failed, refresh
     # the surface so the payload reports the verified head.
-    if final_live_head is not None and live_head is None:
+    if live_head is None:
         live_head = final_live_head
         head_err = final_head_err
         surface = final_surface
