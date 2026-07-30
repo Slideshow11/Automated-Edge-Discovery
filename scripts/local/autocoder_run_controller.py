@@ -1789,17 +1789,28 @@ def _record_autonomous_repair_validation(args: argparse.Namespace) -> None:
     #    await_codex_review_after_repair (mirrors the contract).
     #  - rc != 0: validation failed, do NOT reset findings state
     #    and do NOT claim repair succeeded.
+    #  - log_write_failure: the log write failed and the
+    #    evidence artifact does not exist; mark the repair
+    #    event ``failed`` even when ``rc == 0`` so the
+    #    append-only history does not falsely claim a
+    #    successful repair. Round-98 follow-up (VPyKS).
+    repair_event_status = "failed"
+    if rc == 0 and not log_write_failure:
+        repair_event_status = "repaired"
     codex_repair_event = {
         "timestamp": _utcnow(),
         "source": "autonomous_validation",
         "head_sha": codex.get("head_sha") or "",
         "artifact_path": codex.get("artifact_path") or "",
-        "status": "repaired" if rc == 0 else "failed",
+        "status": repair_event_status,
         "findings_count": codex.get("findings_count", 0),
         "highest_severity": codex.get("highest_severity", "none"),
         "repair_attempt": codex.get("repair_attempts", 0),
         "blocker_fingerprint": codex.get("last_blocker_fingerprint") or "",
-        "summary": f"validation rc={rc} duration={duration:.1f}s",
+        "summary": (
+            f"validation rc={rc} duration={duration:.1f}s"
+            + (" log_write_error" if log_write_failure else "")
+        ),
     }
     state["codex_repair_events"] = state.get("codex_repair_events", [])
     state["codex_repair_events"].append(codex_repair_event)

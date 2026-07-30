@@ -448,7 +448,22 @@ def paginate_changed_files(
             }
         if not batch:
             break
+        # Round-98 follow-up (VPyKU): the previous loop
+        # extended ``all_files`` without checking the cap on
+        # the FIRST page. When ``safety_cap < len(batch)`` the
+        # inventory extended past the operator's bound and the
+        # loop exited with ``complete=True, capped=False``. The
+        # fix mirrors the GraphQL paginator's behavior:
+        # truncate ``batch`` to ``safety_cap`` and break
+        # immediately when the cap is crossed.
+        if len(all_files) + len(batch) > safety_cap:
+            overflow = (len(all_files) + len(batch)) - safety_cap
+            if overflow > 0:
+                batch = batch[: max(0, len(batch) - overflow)]
+            capped = True
         all_files.extend(batch)
+        if capped:
+            break
         if len(batch) < page_size:
             break
         page += 1
