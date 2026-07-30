@@ -2059,3 +2059,158 @@ def test_r81_terminal_payload_finding_with_incomplete_surfaces_is_honest():
     assert payload["reviews_surface_complete"] is False
     # Surface errors must be carried.
     assert payload["surface_errors"]["reviews"] == "boom"
+
+
+# =====================================================================
+# Round-82 PHASE 3 regression tests: recheck PR head AFTER surface
+# collection
+# =====================================================================
+#
+# Codex Round-81 finding: a single pre-fetch head check is not
+# sufficient. The three surface requests (reviews, comments,
+# reactions) can take minutes, especially with pagination, and the
+# head may drift while they run. The poller must re-fetch and
+# compare head.sha AFTER surface collection and immediately before
+# returning any accepted response.
+
+
+def _r82_pr_payload(head_sha):
+    return {"head": {"sha": head_sha}}
+
+
+def _r82_drifting_fetch_pr_stub(initial_sha, final_sha):
+    """A stub that returns ``initial_sha`` for the first call
+    and ``final_sha`` for every subsequent call.
+    """
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        sha = initial_sha if state["calls"] == 1 else final_sha
+        return sha, None
+
+    return f, state
+
+
+def test_r82_poll_cycle_head_drift_during_surface_collection(monkeypatch):
+    """Round-82 P1: head drifts AFTER initial fetch but BEFORE
+    response selection -> HEAD_DRIFT, NOT CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    drift = "b" * 40
+    stub, state = _r82_drifting_fetch_pr_stub(initial, drift)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "HEAD_DRIFT", (
+        f"expected HEAD_DRIFT, got {result['verdict']}"
+    )
+    assert result["expected_head"] == ROUND81_HEAD_SHA
+    assert result["live_head"] == drift
+    assert result["live_head_verified"] is True
+    assert result["response_accepted"] is False
+    # Verify head was fetched at least twice (initial + post-collection).
+    assert state["calls"] >= 2, (
+        f"expected head to be re-fetched; got {state['calls']} calls"
+    )
+
+
+def test_r82_poll_cycle_no_head_drift_after_surfaces_returns_clean(monkeypatch):
+    """Round-82: head re-checked and STILL matches -> CLEAN_PASS."""
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    stub, state = _r82_drifting_fetch_pr_stub(initial, initial)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "CLEAN_PASS"
+    assert state["calls"] >= 2
+
+
+def test_r82_poll_cycle_head_recheck_succeeds_after_initial_failure(monkeypatch):
+    """Round-82: even if the initial head fetch fails, a
+    successful post-collection re-fetch can still classify
+    the response (but the FINDING/CLEAN acceptance still
+    requires the re-fetch to confirm).
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        if state["calls"] == 1:
+            return None, "boom"  # initial fetch fails
+        return ROUND81_HEAD_SHA, None  # re-fetch succeeds
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", f)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    # First fetch failed -> surface is incomplete initially.
+    # Re-fetch succeeded -> CLEAN_PASS is now permitted.
+    assert result["verdict"] == "CLEAN_PASS"
+    assert result["live_head_verified"] is True
+    assert state["calls"] >= 2
+
+
+def test_r82_poll_cycle_head_recheck_failure_returns_pending(monkeypatch):
+    """Round-82: if the post-collection re-fetch fails too,
+    withhold the verdict even if a clean candidate exists.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    state = {"calls": 0}
+
+    def f(repo, pr_number):
+        state["calls"] += 1
+        return None, "boom"  # every fetch fails
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", f)
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([_r81_reaction()], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "REQUEST_PENDING"
+    assert result["live_head_verified"] is False
+    assert result["finding_surfaces_complete"] is False
+
+
+def test_r82_poll_cycle_head_drift_overrides_finding_too(monkeypatch):
+    """Round-82: even a finding's response is not returned
+    if the head has drifted; HEAD_DRIFT is terminal.
+    """
+    poller = _r80_import_poller()
+    args = _r81_make_args()
+    initial = ROUND81_HEAD_SHA
+    drift = "c" * 40
+    stub, state = _r82_drifting_fetch_pr_stub(initial, drift)
+    monkeypatch.setattr(poller, "_fetch_pull_request_head", stub)
+    finding = _r81_formal_finding()
+    monkeypatch.setattr(poller, "_fetch_formal_reviews",
+                        lambda r, p: ([finding], None))
+    monkeypatch.setattr(poller, "_fetch_issue_comments",
+                        lambda r, p: ([], None))
+    monkeypatch.setattr(poller, "_fetch_reactions",
+                        lambda r, p: ([], None))
+    result = poller._run_poll_cycle(args, _dt.datetime.now(_dt.timezone.utc))
+    assert result["verdict"] == "HEAD_DRIFT"
+    assert result["live_head"] == drift

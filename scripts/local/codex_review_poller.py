@@ -1014,6 +1014,53 @@ def _run_poll_cycle(
             else finding_surfaces_complete
         ),
     )
+    # 6. Round-82: re-fetch and compare live head AFTER surface
+    # collection. The three paginated surface requests can
+    # take minutes, during which the head may have drifted.
+    # A single pre-fetch head check is insufficient; we must
+    # re-verify before returning any accepted verdict.
+    final_live_head, final_head_err = _fetch_pull_request_head(
+        args.repo, args.pr_number,
+    )
+    # Rebuild the surface status with the final head.
+    final_surface = _surface_status(
+        head_sha=final_live_head, head_err=final_head_err,
+        reviews=reviews, reviews_err=reviews_err,
+        comments=comments, comments_err=comments_err,
+        reactions=reactions, reactions_err=reactions_err,
+    )
+    if final_live_head is not None and final_live_head != expected_head:
+        # Head drifted during surface collection. Emit HEAD_DRIFT.
+        payload = _build_terminal_payload(
+            verdict="HEAD_DRIFT", kind="", response_id=None,
+            expected_head=expected_head, live_head=final_live_head,
+            surface=final_surface,
+            timestamp=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            repo=args.repo, pr_number=args.pr_number,
+        )
+        _log(
+            "HEAD_DRIFT",
+            f"HEAD_DRIFT_POST_COLLECTION expected={expected_head} "
+            f"live={final_live_head} (initial={live_head})",
+        )
+        return payload
+    # If the re-fetch succeeded but the initial failed, refresh
+    # the surface so the payload reports the verified head.
+    if final_live_head is not None and live_head is None:
+        live_head = final_live_head
+        head_err = final_head_err
+        surface = final_surface
+        finding_surfaces_complete = surface["all_finding_surfaces_complete"]
+        all_surfaces_complete = surface["all_surfaces_complete"]
+        # Re-run the precedence check with the now-complete head surface.
+        if selected is None:
+            selected, withheld = _select_response(
+                finding_matches, clean_matches,
+                surface_complete=(
+                    finding_surfaces_complete if not finding_matches
+                    else finding_surfaces_complete
+                ),
+            )
     if selected is not None:
         # Build terminal payload for a real response.
         payload = _build_terminal_payload(
