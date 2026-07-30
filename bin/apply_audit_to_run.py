@@ -11,7 +11,6 @@ engine.edge_discovery.auditor.save_audit_report.
 import argparse
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 
@@ -46,7 +45,7 @@ def main():
             metrics.start_http_server(args.metrics_port)
             print(f'Metrics server started on port {args.metrics_port}')
         except ImportError:
-            print(f'Warning: prometheus_client or metrics module not available, skipping metrics server')
+            print('Warning: prometheus_client or metrics module not available, skipping metrics server')
         except Exception as e:
             print(f'Warning: could not start metrics server: {e}')
 

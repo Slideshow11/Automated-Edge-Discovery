@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Iterable, List
 
-from .decisions import AEDDecision, AEDDecisionCode
+from .decisions import AEDDecision
 
 
 def decision_to_paragraph(decision: AEDDecision) -> str:
