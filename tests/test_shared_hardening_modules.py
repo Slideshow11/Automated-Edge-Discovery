@@ -243,6 +243,10 @@ class SharedCodexClassifierTests(unittest.TestCase):
             "user": {"login": "chatgpt-codex-connector[bot]"},
             "body": "**<sub><sub>![P1 Badge]...</sub></sub>  Finding**",
             "submitted_at": "2026-07-22T10:00:00Z",
+            # Round-93 follow-up (VOewE): a formal review MUST
+            # include a commit_oid. Provide it via the canonical
+            # ``commit`` selection so the test continues to pass.
+            "commit": {"oid": "abc"},
         }
         v = classify_codex_response(
             kind="review",
@@ -3657,4 +3661,133 @@ def test_r79_all_prior_regressions_remain_green():
     )
     assert result.returncode == 0, (
         f"prior regressions broken\nstdout={result.stdout[-1000:]}"
+    )
+
+
+def test_r93_classifier_rejects_review_on_different_head():
+    """Round-93 follow-up (VOewE): the classifier MUST compare
+    the formal review's commit_oid with the expected_head_sha
+    and return ``None`` when they differ. A review from an
+    earlier commit MUST NOT count as exact-head evidence even
+    when its body happens to mention the head.
+    """
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    body = (
+        '### Codex Review\n\n'
+        '<details>...comment with the head SHA somewhere...</details>\n'
+    )
+    wrong_commit_review = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": body,
+        "submitted_at": "2026-07-30T19:00:00Z",
+        "commit": {"oid": "earliercommit1234567890abcdef1234567890ab"},
+    }
+    # Wrong commit_oid MUST be rejected (None) even when
+    # expected_head_sha is supplied.
+    verdict = classify_codex_response(
+        kind="review",
+        candidate=wrong_commit_review,
+        head="earliercommit1234567890abcdef1234567890ab",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+    )
+    assert verdict is None, (
+        "Round-93: classifier MUST return None for a review "
+        "whose commit_oid does not match expected_head_sha."
+    )
+    # No expected_head_sha: fallback returns None too.
+    verdict_no_expected = classify_codex_response(
+        kind="review",
+        candidate=wrong_commit_review,
+        head="earliercommit1234567890abcdef1234567890ab",
+        expected_head_sha=None,
+    )
+    assert verdict_no_expected is None
+
+
+def test_r93_classifier_rejects_malformed_or_missing_timestamp():
+    """Round-93 follow-up (VOewF): the classifier MUST NOT
+    silently accept a missing or malformed candidate timestamp
+    when ``ping_dt`` is supplied. Both the exclusive-mode
+    helper and the inclusive-mode helper return ``None``
+    rather than proceed.
+    """
+    from datetime import datetime, timezone, timedelta
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    body = '### Codex Review\n\n... clean ...\n'
+    ping_dt = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Missing timestamp -> None
+    no_ts = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": body,
+        "submitted_at": "",
+    }
+    verdict = classify_codex_response(
+        kind="issue_comment",
+        candidate=no_ts,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict is None, (
+        "Round-93: missing candidate timestamp MUST return None."
+    )
+
+    # Malformed timestamp -> None
+    bad_ts = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": body,
+        "submitted_at": "not-a-timestamp",
+    }
+    verdict_bad = classify_codex_response(
+        kind="issue_comment",
+        candidate=bad_ts,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict_bad is None, (
+        "Round-93: malformed candidate timestamp MUST return None."
+    )
+
+    # Pre-ping timestamp (exclusive mode) -> None
+    pre_ping = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": body,
+        "submitted_at": "2026-07-30T11:00:00Z",  # 1h before ping
+    }
+    verdict_pre = classify_codex_response(
+        kind="issue_comment",
+        candidate=pre_ping,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict_pre is None
+
+    # Post-ping timestamp (exclusive mode) -> CLEAN_PASS would
+    # be returned but we use a finding body to test FINDING.
+    post_finding = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "**<sub><sub>![P1 Badge](...) Test finding",
+        "submitted_at": "2026-07-30T13:00:00Z",  # 1h after ping
+    }
+    verdict_post = classify_codex_response(
+        kind="issue_comment",
+        candidate=post_finding,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict_post == "FINDING", (
+        "Round-93: post-ping finding comment MUST classify as "
+        "FINDING with the new ping_dt gate."
     )

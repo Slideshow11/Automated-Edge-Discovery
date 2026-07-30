@@ -219,7 +219,31 @@ def classify_codex_response(
     if not is_codex_login(login):
         return None
 
-    # Formal reviews: head-bound via commit_oid.
+    # Round-93 follow-up (VOewE): for formal reviews, the
+    # classifier MUST compare the candidate's commit_oid with
+    # the expected_head_sha. A formal review from an earlier
+    # commit MUST NOT be classified as exact-head evidence,
+    # even when the body mentions the head. The caller is
+    # expected to supply ``expected_head_sha``; when ``None``,
+    # the classifier returns ``None`` so the caller falls back
+    # to its own body-bound check.
+    if kind == "review":
+        if expected_head_sha is None:
+            return None
+        commit_oid = (
+            candidate.get("commit_id")
+            or candidate.get("commit_oid")
+            or (
+                (candidate.get("commit") or {}).get("oid")
+                if isinstance(candidate.get("commit"), dict)
+                else None
+            )
+        )
+        if not commit_oid:
+            return None
+        if commit_oid != expected_head_sha:
+            return None
+
     # Issue comments: head-bound via body content (caller).
     body = candidate.get("body", "") or ""
     ts_raw = (
@@ -231,7 +255,17 @@ def classify_codex_response(
     )
 
     # Ping boundary: skip pre-ping responses.
-    if ping_dt is not None and ping_dt_exclusive and ts_raw:
+    # Round-93 follow-up (VOewF): the previous behavior skipped
+    # freshness when ``ping_dt_exclusive=False`` and silently
+    # accepted missing/malformed timestamps under the default
+    # mode. The new behavior:
+    # - requires a parseable candidate timestamp;
+    # - applies the comparison operator named in the finding:
+    #   ``<`` for inclusive mode (``ping_dt_exclusive=False``)
+    #   and ``<=`` for exclusive mode (``ping_dt_exclusive=True``);
+    # - returns ``None`` for missing/malformed timestamps so the
+    #   caller never silently accepts a stale response.
+    if ping_dt is not None and ts_raw:
         try:
             from datetime import datetime, timezone
             def _parse_iso(value: Any) -> Optional[datetime]:
@@ -243,10 +277,26 @@ def classify_codex_response(
                 except ValueError:
                     return None
             cand_dt = _parse_iso(ts_raw)
-            if cand_dt is not None and cand_dt < ping_dt:
+            if cand_dt is None:
+                # Round-93 follow-up: missing or malformed
+                # timestamps MUST NOT silently accept a stale
+                # response. Return None so the caller falls
+                # back to its other guards.
                 return None
+            # Round-93 follow-up: apply the comparison named
+            # in the finding's prescription.
+            if ping_dt_exclusive:
+                # Exclusive mode: reject if cand_dt <= ping_dt
+                # (i.e. accept strictly post-ping).
+                if cand_dt <= ping_dt:
+                    return None
+            else:
+                # Inclusive mode: reject if cand_dt < ping_dt
+                # (i.e. accept at-or-after-ping).
+                if cand_dt < ping_dt:
+                    return None
         except Exception:
-            pass
+            return None
 
     # Finding classification first: badges override clean
     # fragments. This is the canonical ordering required by R-2.
