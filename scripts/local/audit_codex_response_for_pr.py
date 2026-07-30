@@ -1343,6 +1343,7 @@ def _flatten_review_thread_comment(
 def _merge_flattened_comment(
     records: List[Dict[str, Any]],
     record: Dict[str, Any],
+    dedup_index: Optional[Dict[Tuple[Any, Any], int]] = None,
 ) -> None:
     """Round-76 PHASE 3 helper: append a flattened comment record
     to the inventory list, deduplicating by stable
@@ -1351,17 +1352,37 @@ def _merge_flattened_comment(
     Round-77 PHASE 3 P1-A defense-in-depth: a null
     ``comment_database_id`` cannot be deduplicated, so a
     runaway caller could append the same record many times.
-    Cap the dedup loop at 2000 iterations to bound worst-case
-    work on a malformed null-id record stream.
+
+    Round-89 follow-up: the previous implementation used
+    ``for existing in records[:2000]`` which silently
+    allowed duplicate records whose position was past
+    index 2000 to slip through and inflate the audit packet.
+    To support the full inventory correctly, callers that
+    pre-build a ``dedup_index`` (mapping
+    ``(thread_id, comment_database_id) -> index in records``)
+    should pass it in; the loop becomes O(1). Callers that
+    omit ``dedup_index`` fall back to the linear scan but still
+    MUST NOT silently truncate. The linear fallback
+    documents the truncation explicitly so future audits can
+    detect it.
     """
     db_id = record.get("comment_database_id")
+    thread_id = record.get("thread_id")
     if db_id is not None:
-        for existing in records[:2000]:
-            if (existing.get("thread_id") == record.get("thread_id")
-                    and existing.get("comment_database_id") == db_id):
+        if dedup_index is not None:
+            key = (thread_id, db_id)
+            if key in dedup_index:
                 # Already materialized; do not duplicate.
                 return
+        else:
+            for existing in records:
+                if (existing.get("thread_id") == thread_id
+                        and existing.get("comment_database_id") == db_id):
+                    # Already materialized; do not duplicate.
+                    return
     records.append(record)
+    if dedup_index is not None and db_id is not None:
+        dedup_index[(thread_id, db_id)] = len(records) - 1
 
 
 def _canonical_review_thread_inventory(
@@ -1958,6 +1979,22 @@ def _canonical_review_thread_inventory(
             # per unique thread.
             _r79_affected_thread_ids: List[str] = []
             _r79_affected_seen: set = set()
+            # Round-89 follow-up: build the dedup index once
+            # outside the nested-materialization loops so
+            # O(1) lookup replaces the O(2000) linear scan that
+            # silently allowed duplicate records past index
+            # 2000. The index maps ``(thread_id, comment_database_id)``
+            # to the index of the corresponding record in
+            # ``all_threads``. ``Optional`` import is at the
+            # top of this file.
+            _r89_dedup_index: Dict[Tuple[Any, Any], int] = {}
+            _r89_dedup_rebuild = False
+            for _idx, _rt in enumerate(all_threads):
+                _db = _rt.get("comment_database_id")
+                if _db is not None:
+                    _r89_dedup_index[
+                        (_rt.get("thread_id"), _db)
+                    ] = _idx
             for nt in _r77_terminal_snapshot:
                 tid = nt.get("thread_id") or nt.get("id") or ""
                 if tid not in fetched:
@@ -1988,7 +2025,8 @@ def _canonical_review_thread_inventory(
                 # Extend all_threads once after the loop.
                 for _r77_r in _r77_fetched_records:
                     _merge_flattened_comment(
-                        all_threads, _r77_r
+                        all_threads, _r77_r,
+                        dedup_index=_r89_dedup_index,
                     )
                 # Update anchor participant evidence. Round-77
                 # PHASE 3 P1-B: preserve blank authors as
@@ -2300,6 +2338,18 @@ def _canonical_review_thread_inventory(
                     # the outer loop (cubic growth / indefinite
                     # append on null-databaseId records).
                     _r77_anchor_snapshot = list(all_threads)
+                    # Round-89 follow-up: build the dedup index
+                    # once outside the nested-materialization
+                    # loops so O(1) lookup replaces the
+                    # O(2000) linear scan that silently allowed
+                    # duplicate records past index 2000.
+                    _r89_dedup_index: Dict[Tuple[Any, Any], int] = {}
+                    for _idx, _rt in enumerate(all_threads):
+                        _db = _rt.get("comment_database_id")
+                        if _db is not None:
+                            _r89_dedup_index[
+                                (_rt.get("thread_id"), _db)
+                            ] = _idx
                     # Round-79 PHASE 3 P2 narrow repair:
                     # collect affected thread IDs in a stable
                     # ordered set so the canonical participant
@@ -2343,7 +2393,8 @@ def _canonical_review_thread_inventory(
                         # the inner loop completes.
                         for _r77_r in _r77_fetched_records:
                             _merge_flattened_comment(
-                                all_threads, _r77_r
+                                all_threads, _r77_r,
+                                dedup_index=_r89_dedup_index,
                             )
                         # Round-77 PHASE 3 P1-B: preserve
                         # blank authors as explicit

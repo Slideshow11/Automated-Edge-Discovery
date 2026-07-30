@@ -131,6 +131,25 @@ TIER_2_SUITES: Dict[Component, List[str]] = {
         "tests/test_autocoder_run_controller.py",
         "tests/test_aed_continue_pr.py",
         "tests/test_aed_tasker_packet.py",
+        # Round-89 follow-up: include the direct tests for
+        # every owned autocoder path classified in
+        # _COMPONENT_MANIFEST so a Tier-2 repair on, e.g.,
+        # ``scripts/local/aed_tasker_collect_context.py`` or
+        # ``scripts/local/run_autocoder_batch.py`` runs the
+        # matching direct test instead of skipping it. Each
+        # entry here MUST exist in ``tests/``; the tier-2
+        # run will fail with "file not found" otherwise.
+        "tests/test_aed_tasker_collect_context.py",
+        "tests/test_aed_tasker_prompt_bundle.py",
+        "tests/test_run_autocoder_batch.py",
+        "tests/test_run_autocoder_eval_corpus.py",
+        "tests/test_run_autocoder_real_output_eval.py",
+        "tests/test_run_autocoder_single_task.py",
+        "tests/test_run_quarantine_autocoder_dry_run.py",
+        "tests/test_build_autocoder_real_output_result_packet.py",
+        "tests/test_build_autocoder_run_summary.py",
+        "tests/test_overnight_autocoder_harness.py",
+        "tests/test_autocoder_real_output_eval_fixtures.py",
         "tests/test_shared_hardening_modules.py",
     ],
     Component.AED: [

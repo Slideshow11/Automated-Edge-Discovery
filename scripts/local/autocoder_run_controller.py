@@ -883,6 +883,17 @@ def _record_codex_review(args: argparse.Namespace) -> None:
             if p not in existing:
                 existing.append(p)
         state["last_validated_changed_paths"] = existing
+        # Round-89 follow-up: capture the head_sha and the
+        # repair_attempt count alongside the validated path
+        # list so the Round-89 cycle-scoped derivation helper
+        # can verify that the validated list belongs to the
+        # current repair cycle. Without these two fields the
+        # helper would silently re-use historical validated
+        # paths in a later flagless invocation.
+        state["last_validated_head_sha"] = codex.get("head_sha") or args.head_sha or ""
+        state["last_validated_attempt"] = codex_repair_event.get(
+            "repair_attempt", 0
+        )
 
     # Determine next action based on status
     if status == "clean":
@@ -1097,7 +1108,7 @@ def _record_codex_review(args: argparse.Namespace) -> None:
 
 
 def _derive_changed_paths_from_state(
-    state: dict, codex: dict
+    state: dict, codex: dict, *, repair_cycle_id: Optional[Any] = None
 ) -> list:
     """Round-85 follow-up: derive the changed-paths list from
     the controller state when ``record-codex-repair-result``
@@ -1116,6 +1127,19 @@ def _derive_changed_paths_from_state(
        repair event recorded on this run.
     3. The controller's ``last_validated_changed_paths``.
 
+    Round-89 follow-up: when ``repair_cycle_id`` is supplied,
+    the helper MUST restrict derivation to evidence
+    associated with that cycle boundary. Findings paths are
+    always eligible (they describe the current finding);
+    repair-event ``changed_paths`` are eligible only when
+    their ``repair_attempt`` matches ``repair_cycle_id`` or
+    the helper was called without a cycle binding;
+    ``last_validated_changed_paths`` are eligible only when
+    the latest ``head_sha`` matches the most-recent
+    codex_review head. The discriminator prevents a
+    flagless repaired invocation from silently reusing
+    historical paths from an earlier repair cycle.
+
     Returns a deduplicated, ordered list of strings. Empty
     list means every derivation failed and the caller MUST
     fail closed.
@@ -1129,21 +1153,73 @@ def _derive_changed_paths_from_state(
             seen.add(s)
             derived.append(s)
 
-    # 1. Findings paths from the current codex review.
+    # 1. Findings paths from the current codex review. These
+    # always describe the current finding boundary so they
+    # are always eligible.
     for finding in (codex.get("findings") or []):
         if isinstance(finding, dict):
             _add(finding.get("path") or finding.get("file_path") or "")
         else:
             _add(finding)
-    # 2. Paths from any prior repair event on this run.
-    for event in (state.get("codex_repair_events") or []):
+    # 2. Paths from any prior repair event on this run. When
+    # ``repair_cycle_id`` is supplied, restrict to the
+    # ``codex_repair_events`` entry whose ``repair_attempt``
+    # matches the cycle binding. If no event matches, do NOT
+    # silently fall back to an unrelated historical event —
+    # that would defeat the cycle-scoped repair evidence
+    # gate. A later flagless ``repaired`` invocation is then
+    # constrained to the cycle it is operating in.
+    events = list(state.get("codex_repair_events") or [])
+    if repair_cycle_id is not None:
+        # Round-89 follow-up: do not silently re-use historical
+        # paths from earlier cycles. If no event matches the
+        # cycle binding, this source contributes nothing to
+        # ``derived`` — the caller's flagless invocation will
+        # then fail closed at the no-evidence boundary if no
+        # other source has paths.
+        matching_events = [
+            ev for ev in events
+            if isinstance(ev, dict)
+            and ev.get("repair_attempt") == repair_cycle_id
+        ]
+        events = matching_events
+    for event in events:
         if not isinstance(event, dict):
             continue
         for p in (event.get("changed_paths") or []):
             _add(p)
-    # 3. The controller's last-known validated paths.
-    for p in (state.get("last_validated_changed_paths") or []):
-        _add(p)
+    # 3. The controller's last-known validated paths. When
+    # ``repair_cycle_id`` is supplied, only include paths whose
+    # recorded head_sha matches the most-recent
+    # ``codex_review.head_sha`` AND whose last-validated
+    # ``repair_attempt`` matches the cycle binding. This keeps
+    # validated-path evidence scoped to the current cycle.
+    if repair_cycle_id is not None:
+        head_sha = codex.get("head_sha") or ""
+        if not head_sha:
+            return derived
+        validated = state.get("last_validated_changed_paths") or []
+        # The validated paths were only collected against the
+        # current head_sha on a Round-86+ transition; if there
+        # is no head alignment, do not promote them.
+        stored_head = state.get("last_validated_head_sha", "")
+        if stored_head and stored_head != head_sha:
+            return derived
+        # Round-89 follow-up: align last_validated_attempt
+        # with the cycle binding. ``last_validated_attempt`` is
+        # the ``repair_attempt`` count of the controller's
+        # last validated event; if it does not match the cycle
+        # binding, do not promote the validated list.
+        stored_attempt = state.get("last_validated_attempt")
+        if stored_attempt is not None and stored_attempt != (
+            codex.get("repair_attempts", 0) + 1
+        ):
+            return derived
+        for p in validated:
+            _add(p)
+    else:
+        for p in (state.get("last_validated_changed_paths") or []):
+            _add(p)
     return derived
 
 
@@ -1197,7 +1273,7 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
     }
     state["codex_repair_events"].append(codex_repair_event)
     if cleaned_paths_for_event:
-        # Round-87 follow-up: update last_validated_changed_paths
+        # Round-89 follow-up: update last_validated_changed_paths
         # whenever the controller observes a non-empty
         # changed-path list on a repair-result event. The
         # Round-86 fix only updated this on
@@ -1210,6 +1286,16 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             if p not in existing:
                 existing.append(p)
         state["last_validated_changed_paths"] = existing
+        # Round-89 follow-up: capture the head_sha and the
+        # repair_attempt count so the cycle-scoped derivation
+        # helper can verify the validated list belongs to the
+        # current repair cycle. Without these two fields the
+        # helper would silently re-use historical validated
+        # paths in a later flagless invocation.
+        state["last_validated_head_sha"] = codex.get("head_sha") or ""
+        state["last_validated_attempt"] = codex_repair_event.get(
+            "repair_attempt", 0
+        )
 
     codex["repair_attempts"] = codex.get("repair_attempts", 0) + 1
 
@@ -1247,7 +1333,19 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
         # still fails closed, but only AFTER the controller has
         # exhausted every reasonable impact-evidence source.
         if not cleaned_paths:
-            derived = _derive_changed_paths_from_state(state, codex)
+            # Round-89 follow-up: bind the derivation helper to
+            # the current repair cycle so a flagless repaired
+            # invocation does not silently reuse historical
+            # ``changed_paths`` recorded on an earlier cycle.
+            # ``codex[\"repair_attempts\"]`` is the count of
+            # repair attempts already recorded; the upcoming
+            # repaired invocation will increment it on the
+            # event written below. Pass that count as the
+            # cycle binding.
+            derived = _derive_changed_paths_from_state(
+                state, codex,
+                repair_cycle_id=codex.get("repair_attempts", 0) + 1,
+            )
             if derived:
                 cleaned_paths = derived
                 codex["changed_paths_derived"] = True

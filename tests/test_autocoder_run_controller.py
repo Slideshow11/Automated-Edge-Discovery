@@ -2474,3 +2474,90 @@ def test_record_codex_repair_result_event_changed_paths_cleaned(
     assert repair_event["changed_paths"] == [
         "scripts/local/foo.py",
     ]
+
+
+def test_derive_changed_paths_scoped_to_repair_cycle(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-89 follow-up: when ``repair_cycle_id`` is passed,
+    the derivation helper MUST NOT reuse historical paths
+    from a previous repair cycle. This prevents a flagless
+    ``record-codex-repair-result --status repaired`` from
+    silently re-running the previous cycle's evidence.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        # Earlier repair cycle recorded paths under cycle 1.
+        "codex_repair_events": [
+            {
+                "repair_attempt": 1,
+                "status": "failed",
+                "changed_paths": ["scripts/local/old.py"],
+            },
+        ],
+        "last_validated_changed_paths": ["scripts/local/old.py"],
+        # Round-89 follow-up: the validated list is anchored to
+        # cycle 1's head. A flagless invocation on a NEW head
+        # MUST NOT see this list because the helper guards on
+        # ``last_validated_head_sha`` and ``last_validated_attempt``.
+        "last_validated_head_sha": "oldhead",
+        "last_validated_attempt": 1,
+        "codex_review": {
+            "head_sha": "abc123",  # current cycle's NEW head
+            "findings": [],  # current finding has no path
+            "repair_attempts": 0,
+        },
+    }
+    codex = state["codex_review"]
+    # Without cycle binding: derives from all sources including
+    # the previous cycle's evidence.
+    no_cycle = _derive_changed_paths_from_state(state, codex)
+    assert "scripts/local/old.py" in no_cycle
+
+    # With cycle binding to a NEW cycle (2): the previous cycle's
+    # evidence MUST NOT be reused because repair_attempt=1 != 2.
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=2
+    )
+    assert "scripts/local/old.py" not in scoped, (
+        "Round-89: derivation helper MUST NOT reuse "
+        "previous-cycle evidence when a cycle binding is supplied."
+    )
+
+
+def test_derive_changed_paths_cycle_match_includes_cycle_paths(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-89 follow-up: when the cycle binding MATCHES an
+    existing repair cycle, the helper MUST include that
+    cycle's evidence. This is the normal-case happy path.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [
+            {
+                "repair_attempt": 3,
+                "status": "failed",
+                "changed_paths": ["scripts/local/x.py"],
+            },
+            {
+                "repair_attempt": 2,
+                "status": "failed",
+                "changed_paths": ["scripts/local/y.py"],  # OLDER
+            },
+        ],
+        "codex_review": {"findings": []},
+    }
+    codex = state["codex_review"]
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=3
+    )
+    assert "scripts/local/x.py" in scoped
+    assert "scripts/local/y.py" not in scoped, (
+        "Round-89: cycle binding MUST scope evidence to the "
+        "matching cycle only, not earlier cycles."
+    )

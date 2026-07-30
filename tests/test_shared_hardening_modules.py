@@ -2434,6 +2434,97 @@ def test_r76_merge_helper_dedupes_by_db_id():
     assert len(records) == 1, records
 
 
+def test_r89_merge_helper_dedupes_past_2000_with_index():
+    """Round-89 follow-up: _merge_flattened_comment MUST
+    correctly deduplicate records past index 2000 when the
+    caller passes a ``dedup_index``. The previous linear
+    scan ``for existing in records[:2000]`` silently
+    allowed duplicate records whose position was past
+    index 2000 to slip through and inflate the audit
+    packet. With the O(1) index lookup, two records past
+    2000 with the same (thread_id, comment_database_id)
+    collapse to one entry even when there are more than
+    2000 prior records.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _merge_flattened_comment, _flatten_review_thread_comment,
+    )
+    state = {"thread_id": "PRRT_X", "is_resolved": False, "is_outdated": False}
+    dedup_index = {}
+    records = []
+    # Insert 2001 unique records first to push the duplicate
+    # pair past the previous linear scan cap.
+    for i in range(2001):
+        raw = {
+            "databaseId": 10000 + i,
+            "author": {"login": "u"},
+            "body": f"record-{i}",
+        }
+        rec = _flatten_review_thread_comment(state, raw)
+        _merge_flattened_comment(records, rec, dedup_index=dedup_index)
+    assert len(records) == 2001
+    # Now insert a duplicate of the FIRST record (record-0).
+    # Under the previous linear cap, the duplicate (which is
+    # at index 0) would have been found and skipped. But the
+    # duplicate-of-the-LAST scenario is the one the finding
+    # flagged. Insert record-1500 followed by another
+    # record-1500.
+    raw1500 = {
+        "databaseId": 11000,
+        "author": {"login": "u"},
+        "body": "record-1500",
+    }
+    rec1500 = _flatten_review_thread_comment(state, raw1500)
+    _merge_flattened_comment(records, rec1500, dedup_index=dedup_index)
+    # Try to insert the SAME record again — it MUST be skipped.
+    pre = len(records)
+    _merge_flattened_comment(records, rec1500, dedup_index=dedup_index)
+    post = len(records)
+    assert pre == post, (
+        "Round-89: dedup_index MUST collapse duplicates past "
+        "the previous 2000 cap."
+    )
+
+
+def test_r89_merge_helper_dedupes_first_2000_via_linear_fallback():
+    """Round-89 follow-up: when the caller does NOT pass a
+    ``dedup_index``, the helper falls back to a full linear
+    scan that covers the entire ``records`` list (NOT
+    ``records[:2000]``). The previous silent truncation at
+    2000 was the bug; the linear fallback MUST NOT truncate.
+    """
+    from scripts.local.audit_codex_response_for_pr import (
+        _merge_flattened_comment, _flatten_review_thread_comment,
+    )
+    state = {"thread_id": "PRRT_X", "is_resolved": False, "is_outdated": False}
+    records = []
+    # Insert 2001 records WITHOUT a dedup_index.
+    for i in range(2001):
+        raw = {
+            "databaseId": 20000 + i,
+            "author": {"login": "u"},
+            "body": f"record-{i}",
+        }
+        rec = _flatten_review_thread_comment(state, raw)
+        _merge_flattened_comment(records, rec)
+    assert len(records) == 2001
+    # Try to insert record-1500 again WITHOUT a dedup_index.
+    # The linear fallback MUST find it and skip.
+    raw1500 = {
+        "databaseId": 21500,
+        "author": {"login": "u"},
+        "body": "record-1500",
+    }
+    rec1500 = _flatten_review_thread_comment(state, raw1500)
+    pre = len(records)
+    _merge_flattened_comment(records, rec1500)
+    post = len(records)
+    assert pre == post, (
+        "Round-89: linear fallback MUST cover the entire "
+        "records list, not just the first 2000."
+    )
+
+
 def test_r76_dedup_helper_collapses_duplicates():
     """_dedup_raw_thread_nodes_by_id MUST collapse multiple copies
     of the same thread id and preserve the most cursor-complete
