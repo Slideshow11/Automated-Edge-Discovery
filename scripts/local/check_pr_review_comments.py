@@ -101,6 +101,16 @@ _COORDINATION_PATTERNS = (
     # so a Codex finding that incidentally contains the phrase
     # in the middle of its body is unaffected.
     "codex automated review request",
+    # Round-81 P1 follow-up: malformed Codex-review request
+    # comments that lack the canonical ``@codex review``
+    # trigger but begin with the PR author's ``Codex: please
+    # re-review`` coordination phrase. These name a specific
+    # head SHA, summarize the prior-round repairs, and are NOT
+    # findings. Without this entry, the gate treats them as
+    # current-head blockers because the body mentions the
+    # ``P1`` / ``P2`` severity tokens when describing what the
+    # prior-round commits repaired. The match is exact-prefix.
+    "codex: please re-review",
 )
 
 
@@ -608,7 +618,17 @@ def gh_graphql_review_threads(
         # logic catches the current-finding).
         "comments(first:50) {"
         "pageInfo { hasNextPage }"
-        "nodes { databaseId url author { login } } }",
+        # Round-81 follow-up: also fetch the
+        # parent ``pullRequestReview`` so per-review-comment
+        # findings can be linked to threads in the same
+        # review via the review_id index. Without this,
+        # a review-summary finding whose URL is the
+        # review URL (not a thread discussion URL) cannot
+        # inherit the resolution state of any thread in
+        # that review and would falsely remain as a
+        # stale-blocker after every thread in the review
+        # is resolved.
+        "nodes { databaseId url author { login } pullRequestReview { databaseId } } }",
         "}",  # close nodes
         "}",  # close reviewThreads
         "}",  # close pullRequest
@@ -680,6 +700,10 @@ def gh_graphql_review_threads(
         return False, [], f"gh graphql decode failed: {exc}"
 
     # Flatten: keep thread metadata + each comment's databaseId/url/author.
+    # Round-81 follow-up: also carry the parent
+    # ``pull_request_review_id`` so per-review-comment findings
+    # whose URL is the review-summary URL can be linked to
+    # threads in the same review via the review_id index.
     threads: list[dict[str, Any]] = []
     for node in nodes:
         thread_id = node.get("id", "")
@@ -690,6 +714,16 @@ def gh_graphql_review_threads(
                 (comment.get("author") or {}).get("login", "")
                 if comment.get("author") else ""
             )
+            # Round-81 follow-up: thread -> review linkage.
+            # Pulled from the inline comment's
+            # ``pullRequestReview.databaseId`` so per-review-
+            # comment findings can map back to threads in
+            # the same review via the review_id index.
+            pr_review = comment.get("pullRequestReview") or {}
+            review_id = (
+                pr_review.get("databaseId")
+                if isinstance(pr_review, dict) else None
+            )
             threads.append({
                 "thread_id": thread_id,
                 "is_resolved": is_resolved,
@@ -697,6 +731,7 @@ def gh_graphql_review_threads(
                 "database_id": comment.get("databaseId"),
                 "url": comment.get("url") or "",
                 "author_login": author_login,
+                "review_id": review_id,
             })
     return True, threads, ""
 
@@ -1624,6 +1659,11 @@ def main() -> int:
     # fallback) and the gate status is set to INCONCLUSIVE later in
     # this function (existing behavior).
     thread_meta_by_url: dict[str, dict[str, Any]] = {}
+    # Round-81 follow-up: also index by review_id so per-review-comment
+    # findings whose URL is the review-summary URL (not a thread
+    # discussion URL) can be linked to their parent review and
+    # inherit the resolution state of any thread in that review.
+    thread_meta_by_review_id: dict[int, list[dict[str, Any]]] = {}
     thread_api_error: str | None = None
     # Round-69 Codex review 4764653534 (P2): use the
     # production paginated wrapper instead of the inline
@@ -1641,6 +1681,11 @@ def main() -> int:
             url = entry.get("url", "")
             if url:
                 thread_meta_by_url[url] = entry
+            review_id = entry.get("review_id")
+            if review_id:
+                thread_meta_by_review_id.setdefault(
+                    int(review_id), []
+                ).append(entry)
 
     # Codex bot login — same constant used by the policy safeguard
     # further down. Defined here so the source-aware helper can
@@ -1648,6 +1693,33 @@ def main() -> int:
     # ``chatgpt-codex-connector`` or ``chatgpt-codex-connector[bot]``
     # depending on the API surface; we match the prefix.
     CODEX_BOT_LOGIN_PREFIX = "chatgpt-codex-connector"
+
+    def _extract_review_id(
+        item: dict[str, Any], url: str
+    ) -> Optional[int]:
+        """Extract the parent review_id from a per-review-comment
+        finding's URL or payload, if present.
+
+        Returns the integer review_id or ``None`` when the URL
+        does not encode a review id and the item has no
+        ``pull_request_review_id`` field. Used by the
+        Round-81 follow-up fallback that links per-review-
+        comment findings to their parent review's threads.
+        """
+        import re as _re
+        # 1. URL fragment ``#pullrequestreview-<id>``
+        m = _re.search(r"#pullrequestreview-(\d+)", url or "")
+        if m:
+            return int(m.group(1))
+        # 2. Explicit field on the item.
+        for key in ("pull_request_review_id", "review_id"):
+            v = item.get(key)
+            if v is not None:
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+        return None
 
     def _is_codex_review_thread_current_unresolved(item: dict[str, Any]) -> bool:
         """Return True iff ``item`` belongs to a current unresolved
@@ -1751,13 +1823,52 @@ def main() -> int:
     # the thread metadata for the PRIMARY actionability decision; this
     # post-classify attachment is for the thread_id / is_resolved /
     # is_outdated fields used by the blocker classification below.
+    #
+    # Round-81 follow-up: for findings whose URL is a per-review
+    # summary (not a thread discussion URL), the URL-based lookup
+    # returns empty metadata and ``thread_id`` / ``thread_resolved``
+    # would be empty/False. Without a fallback those findings
+    # would remain as stale-blockers even after every thread in
+    # their parent review is resolved. The review_id index lets us
+    # inherit the resolution state from any thread in the same
+    # review: if ALL threads in the review are resolved, the
+    # per-review-comment finding is treated as resolved as well.
     # -----------------------------------------------------------------------
     for f in all_findings:
         url = f.get("url", "")
         meta = thread_meta_by_url.get(url, {})
-        f["thread_id"] = meta.get("thread_id", "")
-        f["thread_resolved"] = meta.get("is_resolved", False)
-        f["thread_outdated"] = meta.get("is_outdated", False)
+        thread_id = meta.get("thread_id", "")
+        thread_resolved = meta.get("is_resolved", False)
+        thread_outdated = meta.get("is_outdated", False)
+        if not thread_id:
+            # Fallback: per-review-comment finding whose URL is
+            # the review-summary URL. Look up threads by review_id
+            # (encoded in the URL fragment ``#pullrequestreview-<id>``
+            # or in the item's ``pull_request_review_id`` field).
+            review_id = _extract_review_id(f, url)
+            if review_id is not None:
+                review_threads = thread_meta_by_review_id.get(
+                    int(review_id), []
+                )
+                if review_threads:
+                    # Inherit from the FIRST thread in the review.
+                    # If every thread is resolved, the review-
+                    # summary finding is moot.
+                    thread_id = review_threads[0].get("thread_id", "")
+                    thread_resolved = all(
+                        t.get("is_resolved", False)
+                        for t in review_threads
+                    )
+                    thread_outdated = all(
+                        t.get("is_outdated", False)
+                        for t in review_threads
+                    )
+                    # Mark the review_id so the gate can show
+                    # the linkage in the rendered report.
+                    f["_review_id"] = int(review_id)
+        f["thread_id"] = thread_id
+        f["thread_resolved"] = thread_resolved
+        f["thread_outdated"] = thread_outdated
 
     # P1-B: Verify live head SHA against --reported-head-sha.
     # This check MUST happen before any waiver loading or blocker classification.
