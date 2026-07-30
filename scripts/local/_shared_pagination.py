@@ -73,6 +73,34 @@ def _gql_request(
         return json.loads(resp.read())
 
 
+def _enforce_cap_and_break(
+    *,
+    inventory: List[Dict[str, Any]],
+    batch: List[Any],
+    safety_cap: int,
+    capped: List[bool],
+) -> bool:
+    """Round-98 follow-up: small helper that bounds an
+    in-loop batch against ``safety_cap`` and signals the caller
+    to break. Returns ``True`` when the caller should ``break``.
+
+    Single-page-over-cap case: the loop's pre-fetch ``len(...)``
+    check fires only on the NEXT iteration, so the FIRST page
+    can carry more rows than ``safety_cap`` and exit cleanly
+    with ``complete=True, capped=False``. Truncate ``batch``
+    in-place, set ``capped[0] = True``, and return ``True`` so
+    the caller exits the loop. Used by every REST paginator
+    in this module after Round-98.
+    """
+    if len(inventory) + len(batch) > safety_cap:
+        overflow = (len(inventory) + len(batch)) - safety_cap
+        if overflow > 0:
+            del batch[: max(0, len(batch) - overflow)]
+        capped[0] = True
+        return True
+    return False
+
+
 def paginate_graphql_connection(
     *,
     owner: str,
@@ -787,6 +815,18 @@ def paginate_workflow_runs(
         else:
             runs = []
         matching = [r for r in runs if r.get("head_sha") == head_sha]
+        # Round-98 follow-up (VQBWU): a single page may exceed
+        # ``safety_cap``. The previous loop appended without
+        # checking the cap on the first page and returned
+        # ``complete=True, capped=False`` once the terminal
+        # page was short. Truncate the batch when the cap is
+        # crossed and break immediately.
+        if _enforce_cap_and_break(
+            inventory=all_runs, batch=matching,
+            safety_cap=safety_cap, capped=[capped],
+        ):
+            all_runs.extend(matching)
+            break
         all_runs.extend(matching)
         # The filter is by head_sha, so we must keep paginating
         # until the entire list is exhausted, not just until we
@@ -852,6 +892,15 @@ def paginate_jobs_for_run(
             jobs = payload
         else:
             jobs = []
+        # Round-98 follow-up (VQBWU): see the matching note in
+        # ``paginate_workflow_runs_for_repo`` above. Apply the
+        # same cap-aware truncation to the jobs paginator.
+        if _enforce_cap_and_break(
+            inventory=all_jobs, batch=jobs,
+            safety_cap=safety_cap, capped=[capped],
+        ):
+            all_jobs.extend(jobs)
+            break
         all_jobs.extend(jobs)
         if len(jobs) < page_size:
             break

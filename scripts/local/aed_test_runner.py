@@ -212,11 +212,30 @@ def main(
             "capped": False,
             "dry_run": True,
         }
-        Path(str(args.output_log)).parent.mkdir(
-            parents=True, exist_ok=True
-        )
-        with open(args.output_log, "w") as _lh:
-            json.dump(log_payload, _lh, indent=2)
+        # Round-99 follow-up (VQBWX): wrap the dry-run log
+        # write in try/except so a write failure surfaces as
+        # a non-zero return code instead of silently reporting
+        # success. Production callers can read the print line
+        # below to inspect the failure.
+        try:
+            Path(str(args.output_log)).parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            with open(args.output_log, "w") as _lh:
+                json.dump(log_payload, _lh, indent=2)
+        except OSError as exc:
+            print(json.dumps({
+                "tool": "aed_test_runner",
+                "selected": plan.selected_tests,
+                "tier": tier.value,
+                "requires_full_validation": plan.requires_full_validation,
+                "returncode": 2,
+                "duration_seconds": 0.0,
+                "dry_run": True,
+                "log_write_error": f"{type(exc).__name__}: {exc}",
+                "log_path": str(args.output_log),
+            }))
+            return 2
         print(json.dumps({
             "tool": "aed_test_runner",
             "selected": plan.selected_tests,
@@ -240,6 +259,14 @@ def main(
         cwd=args.cwd,
         log_path=args.output_log,
     )
+    # Round-99 follow-up (VQBWX): when the executor's log
+    # write or subprocess fails the runner must NOT report
+    # a clean returncode=0 to the caller. Detect a log-write
+    # error recorded on the result and surface it as rc=2.
+    rc = result.get("returncode", 1)
+    log_write_error = result.get("log_write_error")
+    if rc == 0 and log_write_error:
+        rc = 2
     # Print a one-line machine-readable summary.
     print(json.dumps({
         "tool": "aed_test_runner",
@@ -248,10 +275,11 @@ def main(
         "requires_full_validation": result.get(
             "requires_full_validation"
         ),
-        "returncode": result.get("returncode"),
+        "returncode": rc,
         "duration_seconds": result.get("duration_seconds"),
+        "log_write_error": log_write_error,
     }))
-    return 0 if result.get("returncode", 1) == 0 else 1
+    return 0 if rc == 0 else 1
 
 
 if __name__ == "__main__":
