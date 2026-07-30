@@ -227,18 +227,18 @@ def classify_codex_response(
     # expected to supply ``expected_head_sha``; when ``None``,
     # the classifier returns ``None`` so the caller falls back
     # to its own body-bound check.
+    #
+    # Round-94 follow-up (VOxDr): use the canonical
+    # ``extract_review_commit_oid`` extractor so callers
+    # supplying ``commitId`` (camelCase GraphQL form) are
+    # anchored correctly. The previous inline extraction only
+    # honored ``commit_id`` / ``commit_oid`` / ``commit.oid``
+    # and silently rejected reviews that used the supported
+    # ``commitId`` representation.
     if kind == "review":
         if expected_head_sha is None:
             return None
-        commit_oid = (
-            candidate.get("commit_id")
-            or candidate.get("commit_oid")
-            or (
-                (candidate.get("commit") or {}).get("oid")
-                if isinstance(candidate.get("commit"), dict)
-                else None
-            )
-        )
+        commit_oid = extract_review_commit_oid(candidate)
         if not commit_oid:
             return None
         if commit_oid != expected_head_sha:
@@ -265,7 +265,14 @@ def classify_codex_response(
     #   and ``<=`` for exclusive mode (``ping_dt_exclusive=True``);
     # - returns ``None`` for missing/malformed timestamps so the
     #   caller never silently accepts a stale response.
-    if ping_dt is not None and ts_raw:
+    #
+    # Round-94 follow-up (VOxDo): the freshness gate must NOT be
+    # conditional on ``ts_raw``. When ``ping_dt`` is set, the
+    # caller has explicitly opted into a freshness check and a
+    # timestamp-free candidate MUST be treated as unanchored
+    # regardless of the parse result. Drop the ``and ts_raw``
+    # conditional entirely.
+    if ping_dt is not None:
         try:
             from datetime import datetime, timezone
             def _parse_iso(value: Any) -> Optional[datetime]:
@@ -278,10 +285,11 @@ def classify_codex_response(
                     return None
             cand_dt = _parse_iso(ts_raw)
             if cand_dt is None:
-                # Round-93 follow-up: missing or malformed
-                # timestamps MUST NOT silently accept a stale
-                # response. Return None so the caller falls
-                # back to its other guards.
+                # Round-94 follow-up: missing or malformed
+                # timestamps (including empty ts_raw) when
+                # ``ping_dt`` is supplied MUST NOT silently
+                # accept a stale response. Return None so the
+                # caller fails closed.
                 return None
             # Round-93 follow-up: apply the comparison named
             # in the finding's prescription.

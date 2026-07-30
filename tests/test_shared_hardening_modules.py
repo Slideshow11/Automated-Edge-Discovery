@@ -3791,3 +3791,71 @@ def test_r93_classifier_rejects_malformed_or_missing_timestamp():
         "Round-93: post-ping finding comment MUST classify as "
         "FINDING with the new ping_dt gate."
     )
+
+
+def test_r94_classifier_uses_canonical_commitId_extractor():
+    """Round-94 follow-up (VOxDr): ``classify_codex_response``
+    MUST use ``extract_review_commit_oid`` so reviews using the
+    supported camelCase ``commitId`` representation are anchored
+    correctly. The previous inline extraction only honored
+    ``commit_id`` / ``commit_oid`` / ``commit.oid`` and
+    silently rejected ``commitId`` reviews.
+    """
+    from datetime import datetime, timezone
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    ping_dt = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+    # Review supplied with the canonical commitId field (camelCase).
+    review_commitId = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "**<sub><sub>![P1 Badge](...) Test finding**",
+        "submitted_at": "2026-07-30T13:00:00Z",  # post-ping
+        "commitId": "expectedhead000000000000000000000000abcd",
+    }
+    # Should classify as FINDING (post-ping, matching head, body is finding).
+    verdict = classify_codex_response(
+        kind="review",
+        candidate=review_commitId,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict == "FINDING", (
+        "Round-94 (VOxDr): a review using commitId MUST anchor "
+        "via extract_review_commit_oid and classify as FINDING."
+    )
+
+
+def test_r94_classifier_rejects_missing_timestamp_when_ping_dt_set():
+    """Round-94 follow-up (VOxDo): when ``ping_dt`` is supplied,
+    a candidate with a missing or empty timestamp MUST return
+    ``None`` regardless of body content. The freshness gate is
+    no longer conditional on ``ts_raw``.
+    """
+    from datetime import datetime, timezone
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+    )
+    ping_dt = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Clean body but missing timestamp.
+    missing_ts = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "Codex Review: Didn't find any major issues.",
+        "submitted_at": "",
+        "commitId": "expectedhead000000000000000000000000abcd",
+    }
+    verdict = classify_codex_response(
+        kind="review",
+        candidate=missing_ts,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict is None, (
+        "Round-94 (VOxDo): missing timestamp MUST return None "
+        "when ping_dt is supplied."
+    )
