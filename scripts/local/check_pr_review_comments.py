@@ -784,7 +784,16 @@ def _walk_pagination_cursors(
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "
             "originalCommit { oid } "
-            "author { login } } } } } } } }"
+            # Round-83 follow-up: also fetch
+            # ``pullRequestReview.databaseId`` so the
+            # pagination walker can populate the
+            # ``thread_meta_by_review_id`` index used
+            # by the per-review-summary finding
+            # resolution-state fallback. Without this,
+            # a PR with more than 100 review threads
+            # would still leave per-review-summary
+            # findings as stale-blockers.
+            "author { login } pullRequestReview { databaseId } } } } } } } }"
         )
         cmd = [
             "gh", "api", "graphql",
@@ -878,6 +887,17 @@ def _walk_pagination_cursors(
                     if isinstance(comment.get("author"), dict)
                     else ""
                 )
+                # Round-83 follow-up: also carry
+                # ``pullRequestReview.databaseId`` so the
+                # pagination walker can populate
+                # ``thread_meta_by_review_id`` (used by the
+                # per-review-summary resolution-state
+                # fallback).
+                pr_review = comment.get("pullRequestReview") or {}
+                review_id = (
+                    pr_review.get("databaseId")
+                    if isinstance(pr_review, dict) else None
+                )
                 all_threads.append({
                     "thread_id": thread_id,
                     "is_resolved": is_resolved,
@@ -885,6 +905,7 @@ def _walk_pagination_cursors(
                     "database_id": comment.get("databaseId"),
                     "url": comment.get("url") or "",
                     "author_login": author_login,
+                    "review_id": review_id,
                 })
         if not page_info.get("hasNextPage"):
             break
