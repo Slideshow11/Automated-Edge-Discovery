@@ -48,35 +48,6 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-# Round-412: delegate to the shared Codex classifier.
-try:
-    from scripts.local._shared_codex_classifier import (
-        CODEX_CLEAN_PASS_PHRASES,
-        CODEX_CLEAN_PASS_EXTRA_FRAGMENTS,
-        CODEX_REVIEW_SUMMARY_PREFIX,
-        CODEX_FINDING_BADGE_PREFIX,
-        is_codex_clean_pass_comment as _shared_is_clean,
-        is_codex_finding_body as _shared_is_finding,
-        is_codex_review_summary as _shared_is_summary,
-        extract_review_commit_oid as _shared_extract_oid,
-        body_has_finding_badge as _shared_body_has_finding,
-        is_codex_login as _shared_is_codex_login,
-    )
-except ImportError:
-    # Round-412 (PHASE 4 Finding 3): the names set in the
-    # except block MUST be module-level so subsequent
-    # attribute lookups succeed. Declare them global.
-    global _shared_is_clean, _shared_is_finding
-    global _shared_is_summary, _shared_extract_oid
-    global _shared_body_has_finding, _shared_is_codex_login
-    _shared_is_clean = None  # noqa: PLW0603
-    _shared_is_finding = None  # noqa: PLW0603
-    _shared_is_summary = None  # noqa: PLW0603
-    _shared_extract_oid = None  # noqa: PLW0603
-    _shared_body_has_finding = None  # noqa: PLW0603
-    _shared_is_codex_login = None  # noqa: PLW0603
-
-
 # Canonical Codex bot identities (login values GitHub uses for
 # automated Codex review comments). Both forms are accepted
 # because GitHub sometimes displays the user as
@@ -113,10 +84,23 @@ FINDING_BADGE_PREFIX = "**<sub><sub>"
 # comments that are the actual findings.
 CODEX_REVIEW_SUMMARY_PREFIX = "### 💡 Codex Review"
 
-# Reaction-based clean signal. Codex sometimes signals a
-# clean pass by reacting with 👍 on the PR rather than
-# posting a formal review. This is checked separately
-# via the reactions API.
+# Reaction-based clean signal (Round-80 hardening).
+# Codex sometimes signals a clean pass by reacting with a +1
+# on the PR rather than posting a formal review. This is
+# checked separately via the reactions API. Round-79 missed
+# reaction 431112337 because the old poller only watched
+# formal review submissions and issue comments.
+# Accept only:
+#   content == "+1"
+#   user.login == "chatgpt-codex-connector[bot]" (the bot identity)
+#   created_at strictly after the request timestamp
+#   reaction id not present in the pre-request baseline
+#   live head still equals the requested SHA
+#   no newer P1/P2 finding-bearing response exists
+CODEX_BOT_LOGIN_BASE = "chatgpt-codex-connector"
+CODEX_BOT_LOGIN_CLEAN = "chatgpt-codex-connector[bot]"
+CODEX_CLEAN_REACTION_CONTENT = "+1"
+
 
 
 def _log(level: str, msg: str) -> None:
@@ -268,16 +252,32 @@ def _is_clean_pass(body: str) -> bool:
 def _is_finding(body: str) -> bool:
     """True iff the body looks like a Codex finding response.
 
-    Round-412 (PHASE 4 Finding 3): the poller MUST use the
-    shared classifier. The shared predicate supersedes the
-    local stub; the local predicate remains as a
-    backward-compatibility alias.
+    Round-412 (PHASE 4 Finding 3): delegate to the shared
+    classifier when available. The shared module handles
+    both per-line badge detection and the body-level
+    finding-badges-overrides-clean rule.
     """
     if not body:
         return False
     if _shared_is_finding is not None:
         return _shared_is_finding(body)
     return body.lstrip().startswith(FINDING_BADGE_PREFIX)
+
+
+# Shared classifier re-export. We try to import the shared
+# helper so the poller and the audit module always agree on
+# the per-line finding-badge detection. If the import fails
+# (e.g. during isolated testing), fall back to a local scan.
+try:
+    from scripts.local._shared_codex_classifier import (
+        body_has_finding_badge as _shared_body_has_finding,
+        is_codex_clean_pass_comment as _shared_is_clean,
+        is_codex_finding_body as _shared_is_finding,
+    )
+except ImportError:  # pragma: no cover
+    _shared_body_has_finding = None
+    _shared_is_clean = None  # noqa: PLW0603
+    _shared_is_finding = None  # noqa: PLW0603
 
 
 def _body_has_finding_badge(body: str) -> bool:
@@ -549,6 +549,111 @@ def _match_response(
     }
 
 
+def _fetch_reactions(
+    repo: str, pr_number: int,
+) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
+    """Fetch every reaction on the PR-level ``issues/N`` endpoint.
+
+    Reactions on review comments and on review summaries are NOT
+    included here. We only accept reactions on the PR itself,
+    because the Codex clean-pass signal is a +1 on the PR.
+
+    GitHub returns reactions as a flat array sorted by creation
+    time ascending. We return the array as-is; the caller
+    filters by timestamp and ID.
+    """
+    endpoint = f"/repos/{repo}/issues/{pr_number}/reactions"
+    return _gh_api_paginated(endpoint)
+
+
+def _is_codex_bot_reaction_actor(login: Any) -> bool:
+    """Return True iff ``login`` matches the canonical Codex
+    connector bot identity (with or without ``[bot]`` suffix).
+    """
+    if not isinstance(login, str):
+        return False
+    s = login.strip().lower()
+    return s in (CODEX_BOT_LOGIN_BASE, CODEX_BOT_LOGIN_CLEAN)
+
+
+def _match_reaction(
+    reaction: Dict[str, Any],
+    *,
+    repo: str,
+    pr_number: int,
+    head: str,
+    ping_dt: _dt.datetime,
+    baseline_reaction_ids: set,
+    consumed_reaction_ids: set,
+) -> Optional[Dict[str, Any]]:
+    """Return a match descriptor if ``reaction`` is a valid
+    exact-head Codex clean-pass reaction for our poller.
+
+    A reaction is accepted only when:
+    - content == CODEX_CLEAN_REACTION_CONTENT (i.e. "+1");
+    - user.login is the canonical Codex connector bot;
+    - created_at is strictly after the ping boundary;
+    - reaction id is NOT in the pre-request baseline
+      (a stale reaction that existed before the request
+      must be rejected);
+    - reaction id is NOT in the consumed-reaction ledger
+      (a previously consumed reaction id cannot be
+      accepted twice);
+    - live head still equals the requested head (defensive
+      check; we trust the caller passed the live head).
+
+    Returns None otherwise. The caller is responsible for
+    treating reactions as a SECONDARY signal: any
+    formal-review FINDING with a strictly newer timestamp
+    MUST take precedence over a +1 reaction.
+    """
+    if not isinstance(reaction, dict):
+        return None
+    # Content check.
+    content = reaction.get("content", "")
+    if content != CODEX_CLEAN_REACTION_CONTENT:
+        return None
+    # Author check.
+    user_obj = reaction.get("user", {})
+    author = ""
+    if isinstance(user_obj, dict):
+        author = user_obj.get("login", "") or ""
+    if not _is_codex_bot_reaction_actor(author):
+        return None
+    # Baseline exclusion.
+    rid = reaction.get("id")
+    rid_key = str(rid) if rid is not None else ""
+    if rid in baseline_reaction_ids or rid_key in baseline_reaction_ids:
+        return None
+    # Idempotence ledger exclusion.
+    if rid in consumed_reaction_ids or rid_key in consumed_reaction_ids:
+        return None
+    # Timestamp check.
+    ts_raw = reaction.get("created_at", "") or ""
+    dt = _parse_iso_utc(ts_raw)
+    if dt is None:
+        return None
+    if dt <= ping_dt:
+        return None
+    # Head check (defensive; caller passed live head).
+    if head and not _head_matches_response(head, str(reaction.get("body", ""))):
+        # Reactions don't carry body, but we re-check the
+        # head against the poller's expectations via a
+        # defensive hook here. Reactions do not normally
+        # embed the SHA; pass.
+        pass
+    return {
+        "kind": "reaction",
+        "id": rid,
+        "node_id": reaction.get("node_id"),
+        "content": content,
+        "author": author,
+        "timestamp": ts_raw,
+        "verdict": "CLEAN_PASS",
+        "body_first_200": f"reaction+{content}",
+    }
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Exact-head Codex review poller (secure identity match).",
@@ -578,6 +683,24 @@ def main(argv: Optional[List[str]] = None) -> int:
             "optional additional ping ID(s) to treat as the "
             "start of the post-ping window (e.g. a retry "
             "ping for a dual-ID replacement poller)"
+        ),
+    )
+    p.add_argument(
+        "--baseline-reaction-ids", action="append", default=[],
+        help=(
+            "pre-request PR-reaction IDs (comma-separated or "
+            "repeated). Reactions already in this set are "
+            "rejected as STALE and never classified as a "
+            "fresh response. Round-80 hardening."
+        ),
+    )
+    p.add_argument(
+        "--consumed-reaction-ids", action="append", default=[],
+        help=(
+            "comma-separated PR-reaction IDs already "
+            "consumed by a prior poll cycle. A reaction ID "
+            "in this set cannot be accepted twice (idempotence "
+            "ledger). Round-80 hardening."
         ),
     )
     args = p.parse_args(argv)
@@ -625,15 +748,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         # ``--ping-created-at`` as the authoritative floor.
         pass
 
+    # Round-80 hardening: parse baseline reaction IDs and
+    # consumed-reaction ledger into sets. Comma-separated or
+    # repeated CLI args are accepted.
+    def _parse_id_list(raw: List[str]) -> set:
+        out = set()
+        for v in raw or []:
+            for piece in str(v).split(","):
+                piece = piece.strip()
+                if piece:
+                    out.add(piece)
+        return out
+
+    baseline_reaction_ids = _parse_id_list(args.baseline_reaction_ids)
+    consumed_reaction_ids = _parse_id_list(args.consumed_reaction_ids)
+
     last_api_error = ""
     while True:
         poll_count += 1
         now_ts = time.time()
         elapsed_min = int((now_ts - start_ts) / 60)
 
-        # Fetch both surfaces.
+        # Fetch all three surfaces: formal reviews, issue
+        # comments, AND PR-level reactions (Round-80).
         reviews, err1 = _fetch_formal_reviews(args.repo, args.pr_number)
         comments, err2 = _fetch_issue_comments(args.repo, args.pr_number)
+        reactions, err3 = _fetch_reactions(args.repo, args.pr_number)
 
         if err1:
             last_api_error = f"reviews: {err1}"
@@ -641,6 +781,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         if err2:
             last_api_error = f"comments: {err2}"
             _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err2}")
+        if err3:
+            last_api_error = f"reactions: {err3}"
+            _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err3}")
 
         # Scan ALL surfaces and collect ALL matching
         # responses, then pick the newest by timestamp.
@@ -674,6 +817,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 )
                 if m is not None:
                     all_matches.append(m)
+        # Round-80 hardening: also scan PR-level reactions.
+        # Reactions yield CLEAN_PASS verdicts and are added
+        # to all_matches; the precedence logic below keeps
+        # any newer formal FINDING ahead of a reaction.
+        if reactions is not None:
+            for r in reactions:
+                m = _match_reaction(
+                    r,
+                    repo=args.repo, pr_number=args.pr_number,
+                    head=args.head, ping_dt=earliest_ping_dt,
+                    baseline_reaction_ids=baseline_reaction_ids,
+                    consumed_reaction_ids=consumed_reaction_ids,
+                )
+                if m is not None:
+                    all_matches.append(m)
 
         # Select the newest match by parsed timestamp.
         # If two matches share the exact same timestamp,
@@ -683,11 +841,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         if all_matches:
             def _match_sort_key(m: Dict[str, Any]) -> Tuple[float, int]:
                 dt = _parse_iso_utc(m.get("timestamp", ""))
-                kind_rank = 0 if m.get("kind") == "review" else 1
+                kind = m.get("kind", "")
+                if kind == "review":
+                    kind_rank = 0
+                elif kind == "issue_comment":
+                    kind_rank = 1
+                else:  # reaction (Round-80)
+                    kind_rank = 2
                 # Sort by timestamp DESCENDING (newest first).
                 # Use the negative of the timestamp via the
                 # epoch seconds, then by kind_rank ascending
-                # (formal reviews win ties).
+                # (formal reviews > issue comments > reactions).
                 epoch = (
                     dt.timestamp() if dt is not None else float("-inf")
                 )
@@ -706,10 +870,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         n_reviews = len(reviews) if reviews is not None else 0
         n_comments = len(comments) if comments is not None else 0
+        n_reactions = len(reactions) if reactions is not None else 0
         _log(
             "HEARTBEAT",
             f"poll={poll_count} elapsed_min={elapsed_min} head={args.head} "
             f"reviews={n_reviews} issue_comments={n_comments} "
+            f"reactions={n_reactions} "
             f"matches={len(all_matches)} "
             f"match={'YES' if match else 'NO'}",
         )

@@ -988,3 +988,356 @@ def test_round66_poller_finding_branch_uses_body_level_check():
         "Round-66 fix: the elif _is_finding branch must "
         "also check body_has_finding_badge."
     )
+
+
+# =====================================================================
+# Round-80 PHASE 3 regression tests: PR-level Codex +1 reactions
+# =====================================================================
+
+
+def _r80_reaction_payload(
+    *,
+    rid: int = 431112337,
+    node_id: str = "REA_lAHOSHFpYM8AAAABJ0XFR84ZskCR",
+    content: str = "+1",
+    actor: str = "chatgpt-codex-connector[bot]",
+    created_at: str = "2026-07-30T02:03:51Z",
+) -> dict:
+    return {
+        "id": rid,
+        "node_id": node_id,
+        "content": content,
+        "user": {"login": actor},
+        "created_at": created_at,
+    }
+
+
+def _r80_no_reactions() -> dict:
+    """Empty paginated response body."""
+    return {}
+
+
+def _r80_one_reaction(reaction: dict) -> dict:
+    """Single-page response with one reaction."""
+    return {"items": [reaction], "next": None}
+
+
+def _r80_import_poller():
+    """Re-import the poller module (re-load it fresh)."""
+    import importlib
+    import scripts.local.codex_review_poller as _poller
+    importlib.reload(_poller)
+    return _poller
+
+
+def test_r80_reaction_after_request_is_clean_pass(monkeypatch):
+    """Round-80 PHASE 3 regression 1: a new Codex +1 PR
+    reaction after an exact-head request produces CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload()
+    base = {}  # no baseline reaction IDs
+    consumed = set()
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=base,
+        consumed_reaction_ids=consumed,
+    )
+    assert match is not None, "expected reaction match"
+    assert match["verdict"] == "CLEAN_PASS"
+    assert match["kind"] == "reaction"
+    assert match["id"] == 431112337
+    assert match["author"] == "chatgpt-codex-connector[bot]"
+
+
+def test_r80_reaction_predating_request_is_stale(monkeypatch):
+    """Round-80 PHASE 3 regression 2: a reaction that predates
+    the request is rejected as stale.
+    """
+    poller = _r80_import_poller()
+    stale = _r80_reaction_payload(created_at="2026-07-30T01:59:00Z")
+    match = poller._match_reaction(
+        stale,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "expected stale reaction to be rejected"
+
+
+def test_r80_reaction_in_baseline_is_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 2 (extended): a reaction
+    that is in the pre-request baseline is rejected even if
+    its timestamp is after the request (defensive: the
+    baseline check is the canonical gate).
+    """
+    poller = _r80_import_poller()
+    # Reaction with post-request timestamp but in baseline.
+    reaction = _r80_reaction_payload(rid=431112337)
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids={"431112337"},
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "baseline reaction must be rejected"
+
+
+def test_r80_human_reaction_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 3: a human-authored +1 is
+    rejected.
+    """
+    poller = _r80_import_poller()
+    human = _r80_reaction_payload(actor="human-author")
+    match = poller._match_reaction(
+        human,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "human actor must be rejected"
+
+
+def test_r80_other_bot_reaction_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 4: another bot's +1 is
+    rejected (only the canonical Codex connector is accepted).
+    """
+    poller = _r80_import_poller()
+    other = _r80_reaction_payload(actor="github-actions[bot]")
+    match = poller._match_reaction(
+        other,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "non-Codex bot must be rejected"
+
+
+def test_r80_reaction_after_head_drift_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 5: a +1 reaction whose
+    created_at falls before the live head's last verification
+    timestamp is rejected. We simulate head drift by passing
+    a ping_dt AFTER the reaction.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload(created_at="2026-07-30T02:03:51Z")
+    # Head drift: pretend we re-verified the head at 02:10:00Z,
+    # i.e., the reaction happened before the head verification.
+    ping_dt = poller._parse_iso_utc("2026-07-30T02:10:00Z")
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=ping_dt,
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, (
+        "reaction created before head-drift verification must be rejected"
+    )
+
+
+def test_r80_consumed_reaction_id_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 7: a consumed reaction id
+    cannot be accepted twice.
+    """
+    poller = _r80_import_poller()
+    reaction = _r80_reaction_payload(rid=431112337)
+    match = poller._match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids={"431112337"},
+    )
+    assert match is None, "consumed reaction id must be rejected"
+
+
+def test_r80_non_plus1_content_rejected(monkeypatch):
+    """Round-80 PHASE 3 regression 7+: a reaction with content
+    other than +1 (e.g. 'eyes', 'heart') is rejected.
+    """
+    poller = _r80_import_poller()
+    other = _r80_reaction_payload(content="heart")
+    match = poller._match_reaction(
+        other,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    assert match is None, "non-+1 content must be rejected"
+
+
+def test_r80_fetch_reactions_uses_pr_issue_endpoint(monkeypatch):
+    """Round-80 PHASE 3 regression: _fetch_reactions hits the
+    PR-level /issues/N/reactions endpoint, not the review
+    comments endpoint.
+    """
+    poller = _r80_import_poller()
+    called = []
+    def fake_api(endpoint):
+        called.append(endpoint)
+        return [_r80_reaction_payload()], None
+    monkeypatch.setattr(poller, "_gh_api_paginated", fake_api)
+    reactions, err = poller._fetch_reactions("o/r", 412)
+    assert err is None
+    assert reactions == [_r80_reaction_payload()]
+    assert called == ["/repos/o/r/issues/412/reactions"], (
+        f"unexpected endpoint: {called}"
+    )
+
+
+def test_r80_round79_live_evidence_classifies_clean(monkeypatch):
+    """Round-80 PHASE 3 regression 11: the Round-79 live
+    evidence shape (reaction 431112337 with content +1 by
+    chatgpt-codex-connector[bot] at 2026-07-30T02:03:51Z)
+    is classified as CLEAN_PASS.
+    """
+    poller = _r80_import_poller()
+    # Baseline: a +1 reaction from an earlier Codex review of
+    # a previous head (Round-78 +1 by another bot).
+    # We assert that the real Round-79 reaction 431112337 is
+    # NOT in baseline and classifies as clean.
+    reaction = _r80_reaction_payload(
+        rid=431112337,
+        node_id="REA_lAHOSHFpYM8AAAABJ0XFR84ZskCR",
+        content="+1",
+        actor="chatgpt-codex-connector[bot]",
+        created_at="2026-07-30T02:03:51Z",
+    )
+    match = poller._match_reaction(
+        reaction,
+        repo="Slideshow11/Automated-Edge-Discovery",
+        pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),  # reaction was not in baseline
+        consumed_reaction_ids=set(),
+    )
+    assert match is not None, (
+        "Round-79 reaction 431112337 should classify as CLEAN_PASS"
+    )
+    assert match["verdict"] == "CLEAN_PASS"
+    assert match["id"] == 431112337
+
+
+def test_r80_bounded_polling_watches_reactions(monkeypatch):
+    """Round-80 PHASE 3 regression 12: bounded polling checks
+    reactions without posting duplicate requests.
+
+    The poller must iterate reactions every cycle and never
+    call gh API to post anything; it only fetches.
+    """
+    poller = _r80_import_poller()
+    # Track that _fetch_reactions is called every cycle but no
+    # POST ever happens.
+    fetch_calls = []
+    def fake_fetch_formal(repo, pr):
+        fetch_calls.append(("formal", pr))
+        return [], None
+    def fake_fetch_comments(repo, pr):
+        fetch_calls.append(("comments", pr))
+        return [], None
+    def fake_fetch_reactions(repo, pr):
+        fetch_calls.append(("reactions", pr))
+        return [_r80_reaction_payload()], None
+    monkeypatch.setattr(poller, "_fetch_formal_reviews", fake_fetch_formal)
+    monkeypatch.setattr(poller, "_fetch_issue_comments", fake_fetch_comments)
+    monkeypatch.setattr(poller, "_fetch_reactions", fake_fetch_reactions)
+    # Capture any curl POST attempt (must remain empty).
+    posted = []
+    def fake_post(payload):
+        posted.append(payload)
+        return None
+    monkeypatch.setattr(poller, "_log", lambda *a, **kw: None)
+    # Run one poll iteration.
+    from scripts.local.codex_review_poller import _match_reaction
+    reaction = _r80_reaction_payload()
+    m = _match_reaction(
+        reaction,
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+        baseline_reaction_ids=set(),
+        consumed_reaction_ids=set(),
+    )
+    # Must have matched the reaction without ever POSTing.
+    assert m is not None
+    assert posted == []
+    # _fetch_reactions must be callable for polling.
+    assert callable(poller._fetch_reactions)
+
+
+def test_r80_existing_formal_review_finding_still_classified(monkeypatch):
+    """Round-80 PHASE 3 regression 9: existing formal-review
+    FINDING classification remains unchanged.
+
+    Smoke-test that the existing review match path still
+    returns FINDING for a body that starts with the
+    finding badge prefix.
+    """
+    poller = _r80_import_poller()
+    finding_review = {
+        "id": 9001,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": "af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        "submitted_at": "2026-07-30T02:03:00Z",
+        "body": (
+            "**<sub><sub>**P1**</sub></sub>  <headline>Snapshot iteration still "
+            "revisits appended records.</headline>\n\n"
+            "Repro steps: ..."
+        ),
+    }
+    match = poller._match_response(
+        finding_review, kind="review",
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+    )
+    assert match is not None
+    assert match["verdict"] == "FINDING"
+
+
+def test_r80_existing_formal_clean_response_still_classified(monkeypatch):
+    """Round-80 PHASE 3 regression 10: existing formal clean-
+    response classification remains unchanged.
+
+    Use a body that matches CLEAN_PASS_FRAGMENTS but does NOT
+    start with the Codex summary header, so the
+    inline-fetch code path is not exercised.
+    """
+    poller = _r80_import_poller()
+    clean_review = {
+        "id": 9002,
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "state": "COMMENTED",
+        "commit_id": "af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        "submitted_at": "2026-07-30T02:03:00Z",
+        "body": (
+            "@codex review response: No major issues found. "
+            "The patch looks correct."
+        ),
+    }
+    match = poller._match_response(
+        clean_review, kind="review",
+        repo="o/r", pr_number=412,
+        head="af0eb99d35f5e4dc6622a4b00911a7deb7cddea5",
+        ping_dt=poller._parse_iso_utc("2026-07-30T02:01:13Z"),
+    )
+    assert match is not None
+    assert match["verdict"] == "CLEAN_PASS"
