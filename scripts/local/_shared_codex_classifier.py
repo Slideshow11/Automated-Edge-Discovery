@@ -164,20 +164,33 @@ def is_codex_finding_comment(body: Any) -> bool:
 def extract_review_commit_oid(review: Dict[str, Any]) -> str:
     """Return the commit OID anchored to a formal review, or "".
 
-    Handles both GraphQL camelCase (commitId / commit.oid) and
-    REST snake_case (commit_id). Returns "" when no commit is
-    anchored (legacy / GitHub-emitted without commit anchor).
+    Handles every supported representation:
+      * GraphQL camelCase ``commitId``;
+      * REST snake_case ``commit_id``;
+      * legacy normalized ``commit_oid``;
+      * nested ``commit.oid`` selection.
+    Returns ``""`` when no commit is anchored (legacy /
+    GitHub-emitted without commit anchor).
     """
     if not isinstance(review, dict):
         return ""
-    direct = review.get("commit_id") or review.get("commitId")
+    direct = (
+        review.get("commit_id")
+        or review.get("commitId")
+        or review.get("commit_oid")
+    )
     if isinstance(direct, str) and direct:
         return direct
     commit_obj = review.get("commit")
     if isinstance(commit_obj, dict):
         oid = commit_obj.get("oid")
-        if isinstance(oid, str):
+        if isinstance(oid, str) and oid:
             return oid
+    # Defensive: some legacy callers emit a flat ``oid`` key
+    # alongside ``commit``. Accept it as a last-resort anchor.
+    legacy_oid = review.get("oid")
+    if isinstance(legacy_oid, str) and legacy_oid:
+        return legacy_oid
     return ""
 
 

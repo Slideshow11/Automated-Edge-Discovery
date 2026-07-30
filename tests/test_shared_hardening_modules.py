@@ -3859,3 +3859,53 @@ def test_r94_classifier_rejects_missing_timestamp_when_ping_dt_set():
         "Round-94 (VOxDo): missing timestamp MUST return None "
         "when ping_dt is supplied."
     )
+
+
+def test_r95_classifier_accepts_legacy_commit_oid_representation():
+    """Round-95 follow-up: ``extract_review_commit_oid`` MUST
+    accept the legacy normalized ``commit_oid`` representation.
+    The Round-94 canonicalization inadvertently regressed this
+    representation; ``commit_oid`` MUST continue to anchor the
+    commit just like ``commit_id`` and ``commitId``.
+    """
+    from datetime import datetime, timezone
+    from scripts.local._shared_codex_classifier import (
+        classify_codex_response,
+        extract_review_commit_oid,
+    )
+    ping_dt = datetime(2026, 7, 30, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Direct extractor test.
+    assert extract_review_commit_oid(
+        {"commit_oid": "expectedhead000000000000000000000000abcd"}
+    ) == "expectedhead000000000000000000000000abcd"
+    assert extract_review_commit_oid(
+        {"commit_id": "expectedhead000000000000000000000000abcd"}
+    ) == "expectedhead000000000000000000000000abcd"
+    assert extract_review_commit_oid(
+        {"commitId": "expectedhead000000000000000000000000abcd"}
+    ) == "expectedhead000000000000000000000000abcd"
+    assert extract_review_commit_oid(
+        {"commit": {"oid": "expectedhead000000000000000000000000abcd"}}
+    ) == "expectedhead000000000000000000000000abcd"
+
+    # End-to-end classifier test with the legacy commit_oid.
+    review_commit_oid = {
+        "user": {"login": "chatgpt-codex-connector[bot]"},
+        "body": "**<sub><sub>![P1 Badge](...) Test finding**",
+        "submitted_at": "2026-07-30T13:00:00Z",  # post-ping
+        "commit_oid": "expectedhead000000000000000000000000abcd",
+    }
+    verdict = classify_codex_response(
+        kind="review",
+        candidate=review_commit_oid,
+        head="expectedhead000000000000000000000000abcd",
+        expected_head_sha="expectedhead000000000000000000000000abcd",
+        ping_dt=ping_dt,
+        ping_dt_exclusive=True,
+    )
+    assert verdict == "FINDING", (
+        "Round-95: commit_oid representation MUST anchor the "
+        "review via extract_review_commit_oid and classify as "
+        "FINDING."
+    )
