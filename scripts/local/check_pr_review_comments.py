@@ -736,6 +736,104 @@ def gh_graphql_review_threads(
     return True, threads, ""
 
 
+def _walk_thread_comments(
+    *, owner: str, name: str, pr_number: int,
+    thread_id: str, timeout: int,
+    page_size: int = 50, safety_cap: int = 200,
+) -> tuple[bool, list[dict[str, Any]], str]:
+    """Round-90 follow-up: walk the nested ``comments(first:N)``
+    cursor for one review thread so that threads with more than
+    N initial comments produce a complete comment inventory.
+
+    Returns ``(ok, comments, error_msg)``.
+
+    The outer walker (``_walk_pagination_cursors``) used to
+    return ``nested_comments_not_paginated: thread=<id>``
+    whenever a thread's ``comments.pageInfo.hasNextPage=true``
+    because it had no logic to follow the nested cursor. That
+    failure mode meant the production review-comment gate
+    remained fail-closed indefinitely for any PR with a
+    long-running review thread. This helper performs the
+    nested cursor walk using ``subprocess.run(``gh api
+    graphql``)`` and returns the complete list of
+    ``(databaseId, url, author_login, review_id, raw_body)``
+    entries for the thread.
+    """
+    all_comments: list[dict[str, Any]] = []
+    cursor: Optional[str] = None
+    pages_fetched = 0
+    while True:
+        pages_fetched += 1
+        if pages_fetched > safety_cap:
+            return False, [], (
+                f"thread_comments_inventory_capped: "
+                f"thread={thread_id} pages={pages_fetched} "
+                f"safety_cap={safety_cap}"
+            )
+        after_clause = f', after: "{cursor}"' if cursor else ""
+        query_literal = (
+            "query {"
+            f'repository(owner:"{owner}", name:"{name}") {{'
+            f"node(id:\"{thread_id}\") {{"
+            "... on PullRequestReviewThread {"
+            f'comments(first:{page_size}{after_clause}) {{'
+            "pageInfo { hasNextPage endCursor }"
+            "nodes { databaseId url body path line "
+            "originalCommit { oid } "
+            "author { login } pullRequestReview { databaseId } } } } } }"
+        )
+        cmd = ["gh", "api", "graphql",
+               "--raw-field", f"query={query_literal}"]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True,
+                timeout=timeout, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return False, [], (
+                f"gh graphql invocation failed: {exc}"
+            )
+        if result.returncode != 0:
+            return False, [], (
+                f"gh graphql returned {result.returncode}: "
+                f"{result.stderr[:500]}"
+            )
+        if not result.stdout.strip():
+            return False, [], (
+                "gh graphql returned empty stdout"
+            )
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            return False, [], f"invalid GraphQL response: {exc}"
+        if not isinstance(data, dict):
+            return False, [], "GraphQL response is not a JSON object"
+        errors = data.get("errors")
+        if errors:
+            return False, [], f"GraphQL errors: {errors}"
+        data_obj = data.get("data")
+        if not isinstance(data_obj, dict):
+            return False, [], "GraphQL response missing data object"
+        node_obj = (data_obj.get("repository") or {}).get("node") or {}
+        if not isinstance(node_obj, dict):
+            return False, [], "GraphQL response missing node"
+        comments_obj = node_obj.get("comments") or {}
+        if not isinstance(comments_obj, dict):
+            return False, [], "GraphQL response missing comments container"
+        nested_page_info = comments_obj.get("pageInfo") or {}
+        for comment in (comments_obj.get("nodes") or []):
+            if isinstance(comment, dict):
+                all_comments.append(comment)
+        if not nested_page_info.get("hasNextPage"):
+            break
+        cursor = nested_page_info.get("endCursor")
+        if not cursor:
+            return False, [], (
+                "comments.pageInfo.hasNextPage=true with no endCursor"
+            )
+    return True, all_comments, ""
+
+
 def _walk_pagination_cursors(
     *, owner: str, name: str, pr_number: int,
     page_size: int, safety_cap: int, timeout: int,
@@ -875,30 +973,21 @@ def _walk_pagination_cursors(
             nested_incomplete = bool(
                 nested_page_info.get("hasNextPage")
             )
-            if nested_incomplete:
-                return False, [], (
-                    f"nested_comments_not_paginated: thread={thread_id}"
-                ), pages_fetched
-            for comment in (comments_obj.get("nodes") or []):
-                if not isinstance(comment, dict):
-                    continue
+            # Helper to flatten one comment record so the
+            # walker can emit it the same way the
+            # single-page helper does.
+            def _flatten_walked_comment(comment):
                 author_login = (
                     (comment.get("author") or {}).get("login", "")
                     if isinstance(comment.get("author"), dict)
                     else ""
                 )
-                # Round-83 follow-up: also carry
-                # ``pullRequestReview.databaseId`` so the
-                # pagination walker can populate
-                # ``thread_meta_by_review_id`` (used by the
-                # per-review-summary resolution-state
-                # fallback).
                 pr_review = comment.get("pullRequestReview") or {}
                 review_id = (
                     pr_review.get("databaseId")
                     if isinstance(pr_review, dict) else None
                 )
-                all_threads.append({
+                return {
                     "thread_id": thread_id,
                     "is_resolved": is_resolved,
                     "is_outdated": is_outdated,
@@ -906,7 +995,46 @@ def _walk_pagination_cursors(
                     "url": comment.get("url") or "",
                     "author_login": author_login,
                     "review_id": review_id,
-                })
+                }
+            for comment in (comments_obj.get("nodes") or []):
+                if isinstance(comment, dict):
+                    all_threads.append(_flatten_walked_comment(comment))
+            if nested_incomplete:
+                # Round-90 follow-up: follow the nested
+                # ``comments`` cursor instead of failing
+                # closed. The previous behavior returned
+                # ``nested_comments_not_paginated:
+                # thread=<id>`` whenever any thread's
+                # ``comments.pageInfo.hasNextPage=true``,
+                # leaving the production gate fail-closed
+                # indefinitely for PRs with long-running
+                # review threads.
+                ok_nested, nested_comments, nested_err = (
+                    _walk_thread_comments(
+                        owner=owner, name=name,
+                        pr_number=pr_number,
+                        thread_id=thread_id,
+                        timeout=timeout,
+                    )
+                )
+                if not ok_nested:
+                    return False, [], (
+                        f"nested_comments_walk_failed: "
+                        f"thread={thread_id} error={nested_err}"
+                    ), pages_fetched
+                # Append the walked comments. The earliest
+                # of these are duplicates of the first-page
+                # ``comments`` (the first ``page_size`` were
+                # already flattened above), but the walker
+                # returns the COMPLETE list — including the
+                # first page. The downstream flattening
+                # inventory treats ``database_id`` as the
+                # dedup key, so re-emitting them is harmless.
+                for comment in nested_comments:
+                    if isinstance(comment, dict):
+                        all_threads.append(
+                            _flatten_walked_comment(comment)
+                        )
         if not page_info.get("hasNextPage"):
             break
         cursor = page_info.get("endCursor")

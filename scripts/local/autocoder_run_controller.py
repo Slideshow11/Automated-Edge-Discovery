@@ -1199,21 +1199,30 @@ def _derive_changed_paths_from_state(
         if not head_sha:
             return derived
         validated = state.get("last_validated_changed_paths") or []
-        # The validated paths were only collected against the
-        # current head_sha on a Round-86+ transition; if there
-        # is no head alignment, do not promote them.
-        stored_head = state.get("last_validated_head_sha", "")
-        if stored_head and stored_head != head_sha:
-            return derived
         # Round-89 follow-up: align last_validated_attempt
-        # with the cycle binding. ``last_validated_attempt`` is
-        # the ``repair_attempt`` count of the controller's
-        # last validated event; if it does not match the cycle
-        # binding, do not promote the validated list.
+        # with the cycle binding. ``last_validated_attempt``
+        # is the ``repair_attempt`` count of the
+        # controller's last validated event; if it does
+        # not match the cycle binding, do not promote the
+        # validated list.
         stored_attempt = state.get("last_validated_attempt")
-        if stored_attempt is not None and stored_attempt != (
-            codex.get("repair_attempts", 0) + 1
-        ):
+        # Round-90 follow-up: legacy state may have
+        # ``last_validated_changed_paths`` set but no
+        # ``last_validated_head_sha`` / ``last_validated_attempt``
+        # fields. Require BOTH discriminators to be present
+        # and match the current cycle before promoting the
+        # validated list. Without this guard an existing
+        # controller state that was upgraded mid-run could
+        # silently re-use historical validated paths against
+        # a later cycle whose evidence is no longer
+        # available.
+        stored_head = state.get("last_validated_head_sha", "")
+        if (not stored_head
+                or stored_head != head_sha
+                or stored_attempt is None
+                or stored_attempt != (
+                    codex.get("repair_attempts", 0) + 1
+                )):
             return derived
         for p in validated:
             _add(p)
@@ -1337,14 +1346,21 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             # the current repair cycle so a flagless repaired
             # invocation does not silently reuse historical
             # ``changed_paths`` recorded on an earlier cycle.
-            # ``codex[\"repair_attempts\"]`` is the count of
-            # repair attempts already recorded; the upcoming
-            # repaired invocation will increment it on the
-            # event written below. Pass that count as the
-            # cycle binding.
+            # The repair event (written earlier in this same
+            # function) already carries
+            # ``repair_attempt = codex[\"repair_attempts\"] + 1``
+            # so the cycle binding MUST come from the event,
+            # not from re-incrementing the controller counter.
+            # Round-90 follow-up: ``codex[\"repair_attempts\"]``
+            # is incremented LATER in this function; passing
+            # ``codex[\"repair_attempts\"] + 1`` here would over-
+            # count by one and align the helper to a future
+            # cycle that the validated/recorded sources cannot
+            # reach. Use ``codex_repair_event[\"repair_attempt\"]``
+            # which is the just-recorded value.
             derived = _derive_changed_paths_from_state(
                 state, codex,
-                repair_cycle_id=codex.get("repair_attempts", 0) + 1,
+                repair_cycle_id=codex_repair_event.get("repair_attempt"),
             )
             if derived:
                 cleaned_paths = derived
