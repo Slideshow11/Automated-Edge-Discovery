@@ -2303,3 +2303,112 @@ def test_record_codex_repair_result_derivation_empty_when_nothing_to_derive(
     }
     derived = _derive_changed_paths_from_state(state, state["codex_review"])
     assert derived == []
+
+
+def test_record_codex_review_persists_findings_and_changed_paths(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-86 follow-up: ``_record_codex_review`` MUST persist
+    the parsed findings list (``codex[\"findings\"]``) and the
+    changed_paths list (``codex_repair_events[*].changed_paths``
+    + ``last_validated_changed_paths``) so the Round-85
+    ``_derive_changed_paths_from_state`` helper has sources
+    to fall back on. Without this persistence the documented
+    ``record-codex-repair-result --status repaired`` invocation
+    silently drops to ``no_changed_paths_supplied``.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r86-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r86-001",
+        "--output-state", str(state_path),
+    ])
+    findings_file = temp_workspace / "findings.json"
+    findings_file.write_text(json.dumps([
+        {
+            "finding_id": "F1",
+            "severity": "P2",
+            "path": "scripts/local/aed_pr.py",
+        },
+        {
+            "finding_id": "F2",
+            "severity": "P2",
+            "path": "scripts/local/audit_codex_response_for_pr.py",
+        },
+    ]))
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "2", "--highest-severity", "P2",
+        "--summary", "Two P2 findings",
+        "--findings-file", str(findings_file),
+        "--changed-path", "scripts/local/aed_pr.py",
+        "--changed-path", "scripts/local/audit_codex_response_for_pr.py",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    codex = state.get("codex_review", {})
+    assert codex.get("findings") == [
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/aed_pr.py"},
+        {"finding_id": "F2", "severity": "P2", "path": "scripts/local/audit_codex_response_for_pr.py"},
+    ]
+    # The repair event must carry the changed_paths list.
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/aed_pr.py",
+        "scripts/local/audit_codex_response_for_pr.py",
+    ]
+    # And the controller's last_validated_changed_paths must
+    # mirror the cumulative list.
+    assert state.get("last_validated_changed_paths") == [
+        "scripts/local/aed_pr.py",
+        "scripts/local/audit_codex_response_for_pr.py",
+    ]
+
+
+def test_record_codex_repair_result_derives_when_findings_persisted(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-86 follow-up: when ``_record_codex_review`` has
+    persisted findings, the Round-85
+    ``_derive_changed_paths_from_state`` helper returns the
+    persisted findings paths.
+
+    This test exercises the helper directly with state shaped
+    exactly as ``_record_codex_review`` produces after a
+    ``--status findings`` invocation. The handler integration
+    is covered by the failing-stale-blocker tests.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r86-002",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r86-002",
+        "--output-state", str(state_path),
+    ])
+    findings_file = temp_workspace / "findings.json"
+    findings_file.write_text(json.dumps([
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/x.py"},
+    ]))
+    run_controller([
+        "record-codex-review", "--state", str(state_path),
+        "--status", "findings", "--head-sha", "abc123",
+        "--findings-count", "1", "--highest-severity", "P2",
+        "--summary", "Single P2 finding",
+        "--findings-file", str(findings_file),
+    ])
+    state = json.loads(Path(state_path).read_text())
+    codex = state["codex_review"]
+    assert codex.get("findings") == [
+        {"finding_id": "F1", "severity": "P2", "path": "scripts/local/x.py"},
+    ]
+    # The derivation helper, given this state, returns the
+    # persisted findings path. The full repaired integration
+    # path is exercised by the integration suite.
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    derived = _derive_changed_paths_from_state(state, codex)
+    assert "scripts/local/x.py" in derived

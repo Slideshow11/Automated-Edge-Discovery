@@ -865,8 +865,24 @@ def _record_codex_review(args: argparse.Namespace) -> None:
         "repair_attempt": codex.get("repair_attempts", 0),
         "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
         "summary": args.summary or "",
+        # Round-86 follow-up: persist changed_paths on every
+        # repair event so the Round-85
+        # ``_derive_changed_paths_from_state`` helper has a
+        # reliable second-source after ``codex_review.findings``.
+        "changed_paths": list(getattr(args, "changed_path", []) or []),
     }
     state["codex_repair_events"].append(codex_repair_event)
+    if codex_repair_event["changed_paths"]:
+        # Update last_validated_changed_paths whenever the
+        # controller observes a non-empty changed-path list.
+        # This is the third derivation source for
+        # ``record-codex-repair-result --status repaired``
+        # when the documented invocation omits --changed-path.
+        existing = list(state.get("last_validated_changed_paths") or [])
+        for p in codex_repair_event["changed_paths"]:
+            if p not in existing:
+                existing.append(p)
+        state["last_validated_changed_paths"] = existing
 
     # Determine next action based on status
     if status == "clean":
@@ -943,6 +959,22 @@ def _record_codex_review(args: argparse.Namespace) -> None:
                                     valid = False
                                     break
                             if valid:
+                                # Round-86 follow-up: persist the
+                                # parsed findings list on the
+                                # controller state so the
+                                # Round-85 derivation helper
+                                # ``_derive_changed_paths_from_state``
+                                # has findings paths to fall back
+                                # on when ``record-codex-repair-result``
+                                # is invoked without
+                                # ``--changed-path``. Without
+                                # this, the derivation helper
+                                # returns ``[]`` and the
+                                # documented repaired transition
+                                # silently drops to
+                                # ``validation_failed_no_repair:
+                                # no_changed_paths_supplied``.
+                                codex["findings"] = list(findings_data)
                                 seam = _autonomous_repair_seam()
                                 plan_dir = (
                                     Path(str(args.state)).parent
@@ -1684,6 +1716,15 @@ def _build_parser() -> argparse.ArgumentParser:
                                    "Required when --status=findings to enable the "
                                    "autonomous repair plan path; otherwise the "
                                    "controller fails closed to a human-actionable state.")
+    # Round-86 follow-up: --changed-path on record-codex-review
+    # persists the impact evidence on every repair event so the
+    # Round-85 derivation helper has a second-source after
+    # ``codex_review.findings``. Optional for backward
+    # compatibility; the documented Round-70 PHASE 3-P1 caller
+    # does not supply it but may in future round-71 cycles.
+    p_codex_rev.add_argument("--changed-path", action="append",
+                              help="Changed path(s) for impact-selected "
+                                   "validation. Repeatable. Optional.")
 
     # record-codex-repair-result
     p_codex_rep = sub.add_parser("record-codex-repair-result",
