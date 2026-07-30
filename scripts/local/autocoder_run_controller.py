@@ -1162,6 +1162,17 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
 
     codex = state.get("codex_review", {})
 
+    # Compute the cleaned changed_paths list once so the
+    # event, the derivation fallback, and the validated-path
+    # state all observe the same input.
+    cleaned_paths_for_event = [
+        str(p or "").strip()
+        for p in (getattr(args, "changed_path", []) or [])
+    ]
+    cleaned_paths_for_event = [
+        p for p in cleaned_paths_for_event if p
+    ]
+
     # Append codex_repair_event
     codex_repair_event = {
         "timestamp": _utcnow(),
@@ -1174,8 +1185,31 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
         "repair_attempt": codex.get("repair_attempts", 0) + 1,
         "blocker_fingerprint": args.blocker_fingerprint or codex.get("last_blocker_fingerprint") or "",
         "summary": args.summary or "",
+        # Round-87 follow-up: persist the supplied
+        # --changed-path list on every repair-result event so
+        # the Round-85 derivation helper has a second-source
+        # after ``codex_review.findings`` and the
+        # ``record-codex-review`` events. Without this a
+        # caller that supplies impact evidence ONLY on
+        # ``record-codex-repair-result --changed-path`` still
+        # leaves subsequent derivations with no evidence.
+        "changed_paths": cleaned_paths_for_event,
     }
     state["codex_repair_events"].append(codex_repair_event)
+    if cleaned_paths_for_event:
+        # Round-87 follow-up: update last_validated_changed_paths
+        # whenever the controller observes a non-empty
+        # changed-path list on a repair-result event. The
+        # Round-86 fix only updated this on
+        # ``record-codex-review`` events; the validator
+        # handler in this same function must also persist
+        # the impact evidence so the documented flagless
+        # ``repaired`` invocation can derive from this state.
+        existing = list(state.get("last_validated_changed_paths") or [])
+        for p in cleaned_paths_for_event:
+            if p not in existing:
+                existing.append(p)
+        state["last_validated_changed_paths"] = existing
 
     codex["repair_attempts"] = codex.get("repair_attempts", 0) + 1
 
@@ -1189,11 +1223,14 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
         validation_log_path = ""
         validation_return_code = None
         validation_error = ""
-        cleaned_paths = [
-            str(p or "").strip()
-            for p in (getattr(args, "changed_path", []) or [])
-        ]
-        cleaned_paths = [p for p in cleaned_paths if p]
+        # Round-87 follow-up: reuse the cleaned paths list
+        # computed for the event so the validator observes the
+        # same input as the persisted event. The previous
+        # Round-85 code rebuilt the list here, which would
+        # have silently diverged from the event's cleaned_paths
+        # if the args env ever changed between computation
+        # points.
+        cleaned_paths = list(cleaned_paths_for_event)
         # Round-85 follow-up: when --changed-path is omitted,
         # derive impact evidence from the controller state
         # before failing closed. The previous behavior emitted

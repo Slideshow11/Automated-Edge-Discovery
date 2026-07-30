@@ -2412,3 +2412,65 @@ def test_record_codex_repair_result_derives_when_findings_persisted(
     )
     derived = _derive_changed_paths_from_state(state, codex)
     assert "scripts/local/x.py" in derived
+
+
+def test_record_codex_repair_result_persists_changed_paths_on_event(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-87 follow-up: when record-codex-repair-result is
+    invoked with --changed-path the controller MUST persist the
+    supplied paths on the resulting codex_repair_event AND
+    update last_validated_changed_paths so the Round-85
+    derivation helper has a reliable second-source.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r87-001",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r87-001",
+        "--output-state", str(state_path),
+    ])
+    rc, _, _ = run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "failed", "--summary", "Could not repair",
+        "--changed-path", "scripts/local/x.py",
+        "--changed-path", "scripts/local/y.py",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/x.py", "scripts/local/y.py",
+    ]
+    assert state.get("last_validated_changed_paths") == [
+        "scripts/local/x.py", "scripts/local/y.py",
+    ]
+
+
+def test_record_codex_repair_result_event_changed_paths_cleaned(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-87 follow-up: the cleaned paths list persisted on
+    the repair-result event must drop blank and whitespace
+    entries.
+    """
+    state_path = temp_workspace / "CONTROLLER_STATE.json"
+    run_controller([
+        "init", "--run-id", "aed-codex-rres-r87-002",
+        "--tasks-jsonl", str(sample_tasks_jsonl),
+        "--workspace", str(temp_workspace),
+        "--integration-branch", "int/codex-rres-r87-002",
+        "--output-state", str(state_path),
+    ])
+    run_controller([
+        "record-codex-repair-result", "--state", str(state_path),
+        "--status", "failed", "--summary", "Could not repair",
+        "--changed-path", "scripts/local/foo.py",
+        "--changed-path", "",
+        "--changed-path", "  ",
+    ])
+    state = json.loads(Path(state_path).read_text())
+    repair_event = state["codex_repair_events"][-1]
+    assert repair_event["changed_paths"] == [
+        "scripts/local/foo.py",
+    ]
