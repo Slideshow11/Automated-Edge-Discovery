@@ -734,7 +734,27 @@ query($threadId: ID!, $first: Int!, $after: String) {
                 if db_id in seen_databases:
                     continue
                 seen_databases.add(db_id)
+            # Round-101 follow-up (VQb5n): bound the in-loop
+            # batch against ``safety_cap``. The pre-loop
+            # ``pages >= safety_cap`` check only fires on the
+            # NEXT iteration, so a single page of 100 comments
+            # can exceed the operator's bound and a short
+            # terminal page returns ``complete=True,
+            # capped=False``. Apply the same cap-aware
+            # truncation the other paginators use.
+            if len(nodes) >= safety_cap:
+                # Already at the cap. The ``page_nodes`` loop
+                # above is a no-op, so we skip directly to
+                # the cap-break below.
+                break
             nodes.append(n)
+            if len(nodes) >= safety_cap:
+                # Cap reached exactly on this iteration.
+                # The next page would over-cap; mark
+                # ``capped=True`` and break immediately.
+                capped = True
+                error = "safety_cap_reached"
+                break
 
         page_info = comments_obj.get("pageInfo") or {}
         if not isinstance(page_info, dict):

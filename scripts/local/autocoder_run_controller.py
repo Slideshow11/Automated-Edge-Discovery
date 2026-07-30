@@ -1385,10 +1385,24 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             log_dir = (
                 Path(str(args.state)).parent / "validations"
             )
-            log_dir.mkdir(parents=True, exist_ok=True)
-            validation_log_path = str(
-                log_dir / f"validation-{int(time.time())}.json"
-            )
+            # Round-101 follow-up (VQb5p): wrap the
+            # ``log_dir.mkdir`` call in try/except so a
+            # directory-creation failure surfaces as
+            # ``validation_log_create_error`` rather than as
+            # an uncaught OSError that crashes the command
+            # before the controller state is saved. The
+            # previous shape raised OSError directly, leaving
+            # ``state`` unsaved and the operator without an
+            # actionable failure record.
+            try:
+                log_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                validation_error = f"validation_log_dir_error: {type(exc).__name__}: {exc}"
+                cleaned_paths = []  # bail out below
+            else:
+                validation_log_path = str(
+                    log_dir / f"validation-{int(time.time())}.json"
+                )
             seam = _autonomous_repair_seam()
             try:
                 result = seam["runner_call"](
