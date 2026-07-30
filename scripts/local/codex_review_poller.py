@@ -43,6 +43,7 @@ import argparse
 import datetime as _dt
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -101,6 +102,20 @@ CODEX_BOT_LOGIN_BASE = "chatgpt-codex-connector"
 CODEX_BOT_LOGIN_CLEAN = "chatgpt-codex-connector[bot]"
 CODEX_CLEAN_REACTION_CONTENT = "+1"
 
+# Round-81 hardening: live-head verification, surface
+# completeness, and HEAD_DRIFT verdict. A 40-char lowercase hex
+# SHA. The matcher accepts ONLY this canonical form.
+_HEAD_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Round-81 exit code for HEAD_DRIFT. Distinct from other exit
+# codes so downstream tooling can react.
+EXIT_HEAD_DRIFT = 4
+
+# Verdict string for a CLEAN signal that we cannot accept yet
+# because one of the finding-bearing surfaces is incomplete.
+# This is logged but never emitted as a terminal response.
+LOG_CLEAN_WITHHELD = "CLEAN_WITHHELD_INCOMPLETE_FINDING_SURFACES"
+
 
 
 def _log(level: str, msg: str) -> None:
@@ -109,6 +124,20 @@ def _log(level: str, msg: str) -> None:
         f" {level} {msg}\n"
     )
     sys.stdout.flush()
+
+
+def _is_valid_sha(s: Any) -> bool:
+    """Return True iff ``s`` is a canonical 40-character
+    lowercase hexadecimal SHA.
+
+    Round-81 hardening: a SHAs accepted for comparison must be
+    exactly 40 lowercase hex chars. Uppercase, short, or
+    non-hex strings are rejected so a malformed live-head
+    fetch cannot be mistaken for a real head.
+    """
+    if not isinstance(s, str):
+        return False
+    return bool(_HEAD_SHA_RE.match(s))
 
 
 def _gh_api(endpoint: str) -> Tuple[Optional[Any], Optional[str]]:
@@ -332,6 +361,37 @@ def _head_matches_response(head: str, body: str) -> bool:
     if all(c in "0123456789abcdef" for c in short) and short in body:
         return True
     return False
+
+
+def _fetch_pull_request_head(
+    repo: str, pr_number: int,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Fetch the live head SHA of the PR via
+    ``GET /repos/{owner}/{repo}/pulls/{pr_number}``.
+
+    Round-81 hardening: a PR's head may drift after the request
+    was made. The poller MUST compare its live ``head.sha``
+    against the requested head every poll cycle, because a
+    reaction body never carries the SHA. The returned value is
+    validated as a canonical 40-character lowercase hex SHA.
+    Returns ``(sha, None)`` on success or ``(None, error)`` on
+    failure. An empty list / non-dict / missing ``head.sha``
+    / non-canonical SHA counts as an error so the poller fails
+    closed.
+    """
+    endpoint = f"repos/{repo}/pulls/{pr_number}"
+    data, err = _gh_api(endpoint)
+    if err is not None:
+        return None, err
+    if not isinstance(data, dict):
+        return None, "pull request payload is not a JSON object"
+    head_obj = data.get("head", {})
+    if not isinstance(head_obj, dict):
+        return None, "pull request payload missing head object"
+    sha = head_obj.get("sha", "")
+    if not _is_valid_sha(sha):
+        return None, f"non-canonical head SHA: {sha!r}"
+    return sha, None
 
 
 def _fetch_formal_reviews(repo: str, pr_number: int) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
@@ -654,6 +714,354 @@ def _match_reaction(
     }
 
 
+# ---------------------------------------------------------------------
+# Round-81 helpers: surface-completeness tracking, response
+# precedence, structured output, single-cycle orchestrator.
+# ---------------------------------------------------------------------
+
+
+def _surface_status(
+    *,
+    head_sha: Optional[str],
+    head_err: Optional[str],
+    reviews: Optional[List[Any]],
+    reviews_err: Optional[str],
+    comments: Optional[List[Any]],
+    comments_err: Optional[str],
+    reactions: Optional[List[Any]],
+    reactions_err: Optional[str],
+) -> Dict[str, Any]:
+    """Return a structured description of every surface's
+    completion status for the current poll cycle.
+
+    Each ``complete`` flag is True iff the corresponding fetch
+    succeeded. An empty list returned by a successful fetch
+    counts as complete (the API just returned no items).
+
+    The two convenience flags ``all_finding_surfaces_complete``
+    and ``all_surfaces_complete`` are precomputed for callers:
+    the former requires head, reviews, and comments; the
+    latter additionally requires reactions.
+
+    Round-81 hardening: an empty list returned because of an
+    API failure must NOT count as complete; a None or an
+    explicit error string keeps the surface incomplete.
+    """
+    head_complete = head_err is None and _is_valid_sha(head_sha)
+    reviews_complete = reviews_err is None and reviews is not None
+    comments_complete = comments_err is None and comments is not None
+    reactions_complete = reactions_err is None and reactions is not None
+    finding_surfaces_complete = (
+        head_complete and reviews_complete and comments_complete
+    )
+    all_surfaces_complete = (
+        finding_surfaces_complete and reactions_complete
+    )
+    return {
+        "head": {"complete": head_complete, "error": head_err or ""},
+        "reviews": {
+            "complete": reviews_complete, "error": reviews_err or "",
+        },
+        "comments": {
+            "complete": comments_complete, "error": comments_err or "",
+        },
+        "reactions": {
+            "complete": reactions_complete, "error": reactions_err or "",
+        },
+        "all_finding_surfaces_complete": finding_surfaces_complete,
+        "all_surfaces_complete": all_surfaces_complete,
+    }
+
+
+def _select_response(
+    finding_matches: List[Dict[str, Any]],
+    clean_matches: List[Dict[str, Any]],
+    *,
+    surface_complete: bool,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Pick the response to act on, applying Round-81 precedence.
+
+    Rules:
+      1. If ``finding_matches`` is non-empty, the NEWEST
+         finding wins; all clean matches are ignored, regardless
+         of timestamp.
+      2. Otherwise, only when ``surface_complete`` is True, the
+         newest clean match wins.
+      3. Otherwise, return ``(None, LOG_CLEAN_WITHHELD)`` so the
+         caller can continue polling.
+
+    Within findings, the newest by parsed timestamp wins.
+    Within clean matches, the newest by parsed timestamp wins;
+    ties break by deterministic channel rank
+    (review > issue_comment > reaction).
+    """
+    if finding_matches:
+        def _key(m: Dict[str, Any]) -> float:
+            dt = _parse_iso_utc(m.get("timestamp", ""))
+            return dt.timestamp() if dt is not None else float("-inf")
+        return max(finding_matches, key=_key), None
+    if not surface_complete:
+        return None, LOG_CLEAN_WITHHELD
+    if not clean_matches:
+        return None, None
+    def _clean_key(m: Dict[str, Any]) -> Tuple[float, int]:
+        dt = _parse_iso_utc(m.get("timestamp", ""))
+        epoch = dt.timestamp() if dt is not None else float("-inf")
+        kind = m.get("kind", "")
+        if kind == "review":
+            kind_rank = 0
+        elif kind == "issue_comment":
+            kind_rank = 1
+        else:
+            kind_rank = 2
+        return (-epoch, kind_rank)
+    return min(clean_matches, key=_clean_key), None
+
+
+def _build_terminal_payload(
+    *,
+    verdict: str,
+    kind: str,
+    response_id: Any,
+    expected_head: str,
+    live_head: Optional[str],
+    surface: Dict[str, Any],
+    timestamp: str,
+    repo: str,
+    pr_number: int,
+) -> Dict[str, Any]:
+    """Build the structured response payload emitted on
+    stdout when the poller terminates (CLEAN_PASS, FINDING, or
+    HEAD_DRIFT).
+
+    Every required field is always present so downstream tools
+    can parse the payload uniformly. For HEAD_DRIFT the
+    ``response_accepted`` flag is False; for an observed
+    FINDING with incomplete surfaces, ``finding_surfaces_complete``
+    is False so the evidence stays truthful.
+    """
+    live_head_verified = (
+        surface.get("head", {}).get("complete", False)
+        and isinstance(live_head, str)
+        and _is_valid_sha(live_head)
+    )
+    reviews_complete = surface.get("reviews", {}).get("complete", False)
+    comments_complete = surface.get("comments", {}).get("complete", False)
+    reactions_complete = surface.get("reactions", {}).get("complete", False)
+    finding_surfaces_complete = surface.get(
+        "all_finding_surfaces_complete", False,
+    )
+    response_accepted = verdict != "HEAD_DRIFT"
+    return {
+        "verdict": verdict,
+        "kind": kind,
+        "id": response_id,
+        "expected_head": expected_head,
+        "live_head": live_head,
+        "live_head_verified": live_head_verified,
+        "finding_surfaces_complete": finding_surfaces_complete,
+        "reviews_surface_complete": reviews_complete,
+        "comments_surface_complete": comments_complete,
+        "reactions_surface_complete": reactions_complete,
+        "surface_errors": {
+            "head": surface.get("head", {}).get("error", ""),
+            "reviews": surface.get("reviews", {}).get("error", ""),
+            "comments": surface.get("comments", {}).get("error", ""),
+            "reactions": surface.get("reactions", {}).get("error", ""),
+        },
+        "response_accepted": response_accepted,
+        "timestamp": timestamp,
+        "repository": repo,
+        "pr_number": pr_number,
+    }
+
+
+def _post_pr_comment(repo: str, pr_number: int, body: str) -> Optional[str]:
+    """Stub for posting a Codex ping comment on the PR. The
+    current implementation does not post duplicate pings, but
+    Round-81 leaves a single hook here so tests can monkeypatch
+    it. ``main()`` does not invoke this directly; the existing
+    flow uses ``gh pr comment`` invoked outside this module.
+    Returns ``None`` on success or an error message on failure.
+    """
+    return None
+
+
+def _run_poll_cycle(
+    args: argparse.Namespace,
+    now_dt: _dt.datetime,
+) -> Dict[str, Any]:
+    """Run one poll cycle and return the structured response
+    payload to emit (or a REQUEST_PENDING payload if no
+    response should terminate the poller).
+
+    The cycle:
+      1. Fetch the live PR head via
+         ``_fetch_pull_request_head`` and compare to
+         ``args.head``. On mismatch, return HEAD_DRIFT.
+      2. Fetch reviews, comments, and reactions.
+      3. Compute surface-completeness.
+      4. Match responses on each surface.
+      5. Partition into findings and cleans; apply precedence.
+      6. If a clean candidate exists but finding-bearing
+         surfaces are incomplete, return REQUEST_PENDING and
+         do NOT post another Codex request.
+      7. Otherwise return the selected payload (CLEAN_PASS,
+         FINDING, or REQUEST_PENDING).
+    """
+    # 1. Live head.
+    live_head, head_err = _fetch_pull_request_head(args.repo, args.pr_number)
+    expected_head = args.head
+    if live_head is not None and live_head != expected_head:
+        # Fetch the rest of the surfaces so the payload can
+        # report them honestly, but do NOT classify any
+        # response — HEAD_DRIFT is terminal.
+        reviews, reviews_err = _fetch_formal_reviews(args.repo, args.pr_number)
+        comments, comments_err = _fetch_issue_comments(args.repo, args.pr_number)
+        reactions, reactions_err = _fetch_reactions(args.repo, args.pr_number)
+        surface = _surface_status(
+            head_sha=live_head, head_err=None,
+            reviews=reviews, reviews_err=reviews_err,
+            comments=comments, comments_err=comments_err,
+            reactions=reactions, reactions_err=reactions_err,
+        )
+        payload = _build_terminal_payload(
+            verdict="HEAD_DRIFT", kind="", response_id=None,
+            expected_head=expected_head, live_head=live_head,
+            surface=surface,
+            timestamp=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            repo=args.repo, pr_number=args.pr_number,
+        )
+        _log(
+            "HEAD_DRIFT",
+            f"HEAD_DRIFT expected={expected_head} live={live_head}",
+        )
+        return payload
+    # 2. Other surfaces.
+    reviews, reviews_err = _fetch_formal_reviews(args.repo, args.pr_number)
+    comments, comments_err = _fetch_issue_comments(args.repo, args.pr_number)
+    reactions, reactions_err = _fetch_reactions(args.repo, args.pr_number)
+    # 3. Surface completeness.
+    surface = _surface_status(
+        head_sha=live_head, head_err=head_err,
+        reviews=reviews, reviews_err=reviews_err,
+        comments=comments, comments_err=comments_err,
+        reactions=reactions, reactions_err=reactions_err,
+    )
+    finding_surfaces_complete = surface["all_finding_surfaces_complete"]
+    all_surfaces_complete = surface["all_surfaces_complete"]
+    # 4. Match responses.
+    finding_matches: List[Dict[str, Any]] = []
+    clean_matches: List[Dict[str, Any]] = []
+    baseline_reaction_ids = _parse_id_list(args.baseline_reaction_ids or [])
+    consumed_reaction_ids = _parse_id_list(args.consumed_reaction_ids or [])
+    # The post-ping boundary is the request's ping timestamp,
+    # NOT the real current time. Reactions and reviews must be
+    # after the request, which is the request's ping_created_at
+    # (or the earliest of the older ping ids if the caller
+    # supplied any).
+    ping_dt = _parse_iso_utc(args.ping_created_at) or now_dt
+    for older in (args.include_older_ping_id or []):
+        # ``--include-older-ping-id`` references earlier pings
+        # by ID only; the caller's authoritative floor is
+        # ``args.ping_created_at`` (already loaded). Nothing to
+        # do here.
+        del older
+    if reviews is not None:
+        for r in reviews:
+            m = _match_response(
+                r, kind="review",
+                repo=args.repo, pr_number=args.pr_number,
+                head=expected_head, ping_dt=ping_dt,
+            )
+            if m is None:
+                continue
+            if m["verdict"] == "FINDING":
+                finding_matches.append(m)
+            else:
+                clean_matches.append(m)
+    if comments is not None:
+        for c in comments:
+            m = _match_response(
+                c, kind="issue_comment",
+                repo=args.repo, pr_number=args.pr_number,
+                head=expected_head, ping_dt=ping_dt,
+            )
+            if m is None:
+                continue
+            if m["verdict"] == "FINDING":
+                finding_matches.append(m)
+            else:
+                clean_matches.append(m)
+    if reactions is not None:
+        for r in reactions:
+            m = _match_reaction(
+                r,
+                repo=args.repo, pr_number=args.pr_number,
+                head=expected_head, ping_dt=ping_dt,
+                baseline_reaction_ids=baseline_reaction_ids,
+                consumed_reaction_ids=consumed_reaction_ids,
+            )
+            if m is None:
+                continue
+            # Reactions only ever yield CLEAN_PASS.
+            clean_matches.append(m)
+    # 5. Apply precedence.
+    selected, withheld = _select_response(
+        finding_matches, clean_matches,
+        surface_complete=(
+            finding_surfaces_complete if not finding_matches
+            else finding_surfaces_complete
+        ),
+    )
+    if selected is not None:
+        # Build terminal payload for a real response.
+        payload = _build_terminal_payload(
+            verdict=selected["verdict"],
+            kind=selected.get("kind", ""),
+            response_id=selected.get("id"),
+            expected_head=expected_head, live_head=live_head,
+            surface=surface,
+            timestamp=selected.get("timestamp", ""),
+            repo=args.repo, pr_number=args.pr_number,
+        )
+        # If we observed a finding but a surface was incomplete,
+        # add an evidence-quality note (the payload already
+        # carries finding_surfaces_complete=False).
+        return payload
+    if withheld == LOG_CLEAN_WITHHELD:
+        # Clean signal existed but cannot be accepted yet.
+        _log(
+            "WARN",
+            f"{LOG_CLEAN_WITHHELD} reviews_err={reviews_err!r} "
+            f"comments_err={comments_err!r} head_err={head_err!r}",
+        )
+        # NOTE: do NOT post another Codex request. The request
+        # already exists upstream and the operator will resolve
+        # the surface failure independently.
+    return _build_terminal_payload(
+        verdict="REQUEST_PENDING", kind="", response_id=None,
+        expected_head=expected_head, live_head=live_head,
+        surface=surface,
+        timestamp=now_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        repo=args.repo, pr_number=args.pr_number,
+    )
+
+
+def _parse_id_list(raw: List[str]) -> set:
+    """Parse the comma-separated / repeated CLI args used for
+    ``--baseline-reaction-ids`` and ``--consumed-reaction-ids``
+    into a set of strings.
+    """
+    out: set = set()
+    for v in raw or []:
+        for piece in str(v).split(","):
+            piece = piece.strip()
+            if piece:
+                out.add(piece)
+    return out
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Exact-head Codex review poller (secure identity match).",
@@ -768,147 +1176,67 @@ def main(argv: Optional[List[str]] = None) -> int:
         poll_count += 1
         now_ts = time.time()
         elapsed_min = int((now_ts - start_ts) / 60)
+        now_dt = _dt.datetime.now(_dt.timezone.utc)
 
-        # Fetch all three surfaces: formal reviews, issue
-        # comments, AND PR-level reactions (Round-80).
-        reviews, err1 = _fetch_formal_reviews(args.repo, args.pr_number)
-        comments, err2 = _fetch_issue_comments(args.repo, args.pr_number)
-        reactions, err3 = _fetch_reactions(args.repo, args.pr_number)
+        # Round-81: delegate the entire cycle to _run_poll_cycle.
+        # The helper returns a structured payload (CLEAN_PASS /
+        # FINDING / REQUEST_PENDING / HEAD_DRIFT). HEAD_DRIFT
+        # is terminal with exit code 4; CLEAN_PASS / FINDING are
+        # terminal with exit code 0; REQUEST_PENDING keeps the
+        # bounded poller going.
+        result = _run_poll_cycle(args, now_dt)
+        verdict = result.get("verdict", "REQUEST_PENDING")
 
-        if err1:
-            last_api_error = f"reviews: {err1}"
-            _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err1}")
-        if err2:
-            last_api_error = f"comments: {err2}"
-            _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err2}")
-        if err3:
-            last_api_error = f"reactions: {err3}"
-            _log("WARN", f"poll={poll_count} elapsed_min={elapsed_min} api_error={err3}")
+        # Track last API error for timeout evidence.
+        for surf, info in (
+            result.get("surface_errors", {}).items()
+        ):
+            if info:
+                last_api_error = f"{surf}: {info}"
 
-        # Scan ALL surfaces and collect ALL matching
-        # responses, then pick the newest by timestamp.
-        # Round-51 fix: the previous implementation
-        # accepted the first matching formal review and
-        # skipped the issue-comment scan, so an older
-        # clean pass could be reported even if Codex
-        # posted a newer finding later. We must collect
-        # every matching review AND every matching
-        # issue comment, then select the one with the
-        # newest timestamp. This is critical because
-        # GitHub's list endpoints return items in
-        # chronological / ID order, not reverse-chrono.
-        all_matches: List[Dict[str, Any]] = []
-        match: Optional[Dict[str, Any]] = None
-        if reviews is not None:
-            for r in reviews:
-                m = _match_response(
-                    r, kind="review",
-                    repo=args.repo, pr_number=args.pr_number,
-                    head=args.head, ping_dt=earliest_ping_dt,
-                )
-                if m is not None:
-                    all_matches.append(m)
-        if comments is not None:
-            for c in comments:
-                m = _match_response(
-                    c, kind="issue_comment",
-                    repo=args.repo, pr_number=args.pr_number,
-                    head=args.head, ping_dt=earliest_ping_dt,
-                )
-                if m is not None:
-                    all_matches.append(m)
-        # Round-80 hardening: also scan PR-level reactions.
-        # Reactions yield CLEAN_PASS verdicts and are added
-        # to all_matches; the precedence logic below keeps
-        # any newer formal FINDING ahead of a reaction.
-        if reactions is not None:
-            for r in reactions:
-                m = _match_reaction(
-                    r,
-                    repo=args.repo, pr_number=args.pr_number,
-                    head=args.head, ping_dt=earliest_ping_dt,
-                    baseline_reaction_ids=baseline_reaction_ids,
-                    consumed_reaction_ids=consumed_reaction_ids,
-                )
-                if m is not None:
-                    all_matches.append(m)
-
-        # Select the newest match by parsed timestamp.
-        # If two matches share the exact same timestamp,
-        # prefer formal reviews over issue comments
-        # (formal reviews carry inline findings; issue
-        # comments may be echoes).
-        if all_matches:
-            def _match_sort_key(m: Dict[str, Any]) -> Tuple[float, int]:
-                dt = _parse_iso_utc(m.get("timestamp", ""))
-                kind = m.get("kind", "")
-                if kind == "review":
-                    kind_rank = 0
-                elif kind == "issue_comment":
-                    kind_rank = 1
-                else:  # reaction (Round-80)
-                    kind_rank = 2
-                # Sort by timestamp DESCENDING (newest first).
-                # Use the negative of the timestamp via the
-                # epoch seconds, then by kind_rank ascending
-                # (formal reviews > issue comments > reactions).
-                epoch = (
-                    dt.timestamp() if dt is not None else float("-inf")
-                )
-                return (-epoch, kind_rank)
-            all_matches.sort(key=_match_sort_key)
-            match = all_matches[0]
-            # Log the alternates for operator visibility.
-            if len(all_matches) > 1:
-                _log(
-                    "INFO",
-                    f"selected_newest match_id={match['id']} "
-                    f"kind={match['kind']} timestamp={match['timestamp']} "
-                    f"verdict={match['verdict']} "
-                    f"(alternates={len(all_matches)-1})",
-                )
-
-        n_reviews = len(reviews) if reviews is not None else 0
-        n_comments = len(comments) if comments is not None else 0
-        n_reactions = len(reactions) if reactions is not None else 0
+        # Heartbeat for operator visibility.
         _log(
             "HEARTBEAT",
-            f"poll={poll_count} elapsed_min={elapsed_min} head={args.head} "
-            f"reviews={n_reviews} issue_comments={n_comments} "
-            f"reactions={n_reactions} "
-            f"matches={len(all_matches)} "
-            f"match={'YES' if match else 'NO'}",
+            f"poll={poll_count} elapsed_min={elapsed_min} "
+            f"head={args.head} verdict={verdict} "
+            f"surfaces_complete="
+            f"head={result.get('live_head_verified')} "
+            f"reviews={result.get('reviews_surface_complete')} "
+            f"comments={result.get('comments_surface_complete')} "
+            f"reactions={result.get('reactions_surface_complete')}",
         )
 
-        if match is not None:
+        if verdict == "HEAD_DRIFT":
+            _log(
+                "HEAD_DRIFT",
+                f"CODEX_RESPONSE_HEAD_DRIFT expected={args.head} "
+                f"live={result.get('live_head')} repo={args.repo} "
+                f"pr_number={args.pr_number}",
+            )
+            sys.stdout.write("---CODEX_RESPONSE_JSON---\n")
+            sys.stdout.write(json.dumps(result) + "\n")
+            sys.stdout.flush()
+            return EXIT_HEAD_DRIFT
+
+        if verdict in ("CLEAN_PASS", "FINDING"):
             _log(
                 "FOUND",
-                f"CODEX_RESPONSE_FOUND kind={match['kind']} "
-                f"id={match['id']} author={match['author']} "
-                f"verdict={match['verdict']} timestamp={match['timestamp']} "
-                f"head={args.head} "
-                f"body_first_200={match['body_first_200']!r}",
+                f"CODEX_RESPONSE_FOUND verdict={verdict} "
+                f"kind={result.get('kind')} id={result.get('id')} "
+                f"head={args.head} expected_head={args.head} "
+                f"live_head={result.get('live_head')}",
             )
-            # Emit the match descriptor as a single-line JSON
-            # record on stdout for downstream tools.
             sys.stdout.write("---CODEX_RESPONSE_JSON---\n")
-            sys.stdout.write(json.dumps({
-                "verdict": match["verdict"],
-                "kind": match["kind"],
-                "id": match["id"],
-                "author": match["author"],
-                "timestamp": match["timestamp"],
-                "head": args.head,
-                "repo": args.repo,
-                "pr_number": args.pr_number,
-            }) + "\n")
+            sys.stdout.write(json.dumps(result) + "\n")
             sys.stdout.flush()
             return 0
 
+        # REQUEST_PENDING: keep polling within the bounded timeout.
         if elapsed_min >= args.timeout_min:
             _log(
                 "TIMEOUT",
-                f"EXTERNAL_REVIEW_TIMEOUT head={args.head} ping_id={args.ping_id} "
+                f"EXTERNAL_REVIEW_TIMEOUT head={args.head} "
+                f"ping_id={args.ping_id} "
                 f"elapsed_min={elapsed_min} last_api_error={last_api_error!r}",
             )
             return 1
