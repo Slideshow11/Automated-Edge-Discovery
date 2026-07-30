@@ -2561,3 +2561,45 @@ def test_derive_changed_paths_cycle_match_includes_cycle_paths(
         "Round-89: cycle binding MUST scope evidence to the "
         "matching cycle only, not earlier cycles."
     )
+
+
+def test_derive_changed_paths_stored_attempt_matches_cycle(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-91 follow-up: the validated-list guard compares
+    the stored ``last_validated_attempt`` against the
+    passed-in ``repair_cycle_id`` directly. The previous
+    shape ``codex[\"repair_attempts\"] + 1`` mis-aligned
+    with the cycle binding because ``codex[\"repair_attempts\"]``
+    is incremented AFTER the event is written.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": ["scripts/local/x.py"],
+        "last_validated_head_sha": "abcd",
+        # Cycle 2 has recorded the validated list.
+        "last_validated_attempt": 2,
+        "codex_review": {
+            "head_sha": "abcd",
+            "findings": [],
+            "repair_attempts": 2,
+        },
+    }
+    codex = state["codex_review"]
+    # With cycle binding 2 (matching the recorded attempt):
+    scoped = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=2
+    )
+    assert "scripts/local/x.py" in scoped, (
+        "Round-91: matching cycle MUST include the validated "
+        "list when the cycle binding equals the recorded "
+        "attempt."
+    )
+    # With cycle binding 3 (NOT matching): must not include.
+    scoped_3 = _derive_changed_paths_from_state(
+        state, codex, repair_cycle_id=3
+    )
+    assert "scripts/local/x.py" not in scoped_3

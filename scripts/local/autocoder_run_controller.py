@@ -1191,9 +1191,9 @@ def _derive_changed_paths_from_state(
     # 3. The controller's last-known validated paths. When
     # ``repair_cycle_id`` is supplied, only include paths whose
     # recorded head_sha matches the most-recent
-    # ``codex_review.head_sha`` AND whose last-validated
-    # ``repair_attempt`` matches the cycle binding. This keeps
-    # validated-path evidence scoped to the current cycle.
+    # ``codex_review.head_sha`` AND whose ``last_validated_attempt``
+    # matches the cycle binding exactly. This keeps validated-path
+    # evidence scoped to the current cycle.
     if repair_cycle_id is not None:
         head_sha = codex.get("head_sha") or ""
         if not head_sha:
@@ -1216,13 +1216,23 @@ def _derive_changed_paths_from_state(
         # silently re-use historical validated paths against
         # a later cycle whose evidence is no longer
         # available.
+        # Round-91 follow-up: compare the stored attempt
+        # against ``repair_cycle_id`` directly. The previous
+        # comparison ``codex[\"repair_attempts\"] + 1``
+        # mis-aligned with the stored value because the
+        # cycle binding comes from the just-recorded
+        # ``codex_repair_event[\"repair_attempt\"]`` (which
+        # is already the post-increment value), while the
+        # caller may have already mutated
+        # ``codex[\"repair_attempts\"]`` by the time this
+        # guard runs. Use ``repair_cycle_id`` directly so
+        # every place that produces ``last_validated_attempt``
+        # uses the same input.
         stored_head = state.get("last_validated_head_sha", "")
         if (not stored_head
                 or stored_head != head_sha
                 or stored_attempt is None
-                or stored_attempt != (
-                    codex.get("repair_attempts", 0) + 1
-                )):
+                or stored_attempt != repair_cycle_id):
             return derived
         for p in validated:
             _add(p)

@@ -773,14 +773,23 @@ def _walk_thread_comments(
         after_clause = f', after: "{cursor}"' if cursor else ""
         query_literal = (
             "query {"
-            f'repository(owner:"{owner}", name:"{name}") {{'
+            # Round-90 follow-up fixed the nested-comments
+            # walker but the previous query built an invalid
+            # GraphQL literal: ``node(id: ...)`` was a child
+            # of ``repository(...)`` (it MUST be a root
+            # field), and the brace count was unbalanced
+            # (10 opening / 9 closing). GitHub rejected every
+            # nested-comments request with a parse error and
+            # the walker returned ``nested_comments_walk_failed``.
+            # The fix below mirrors the root-level ``node(id:)``
+            # shape used by ``_shared_pagination.py``.
             f"node(id:\"{thread_id}\") {{"
             "... on PullRequestReviewThread {"
             f'comments(first:{page_size}{after_clause}) {{'
             "pageInfo { hasNextPage endCursor }"
             "nodes { databaseId url body path line "
             "originalCommit { oid } "
-            "author { login } pullRequestReview { databaseId } } } } } }"
+            "author { login } pullRequestReview { databaseId } } } } }"
         )
         cmd = ["gh", "api", "graphql",
                "--raw-field", f"query={query_literal}"]
@@ -814,7 +823,7 @@ def _walk_thread_comments(
         data_obj = data.get("data")
         if not isinstance(data_obj, dict):
             return False, [], "GraphQL response missing data object"
-        node_obj = (data_obj.get("repository") or {}).get("node") or {}
+        node_obj = data_obj.get("node") or {}
         if not isinstance(node_obj, dict):
             return False, [], "GraphQL response missing node"
         comments_obj = node_obj.get("comments") or {}
