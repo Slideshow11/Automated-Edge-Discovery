@@ -3983,3 +3983,55 @@ def test_r96_pagination_bounds_first_page_over_cap():
         "safety_cap. Got %d nodes with safety_cap=5 after "
         "a page of 10." % len(res["nodes"])
     )
+
+
+def test_r100_pagination_helper_keeps_permitted_prefix():
+    """Round-100 follow-up (VQNds): ``_enforce_cap_and_break``
+    MUST keep the PERMITTED prefix of the batch, not the tail.
+    The previous ``del batch[:overflow]`` discarded the
+    FIRST ``overflow`` items; the new ``del batch[remaining:]``
+    retains the first ``safety_cap - len(inventory)`` items.
+    """
+    from scripts.local._shared_pagination import (
+        _enforce_cap_and_break,
+    )
+    # Empty inventory, batch of 40, cap 30:
+    # remaining = 30, batch > 30, so we keep the FIRST 30.
+    inventory = []
+    batch = list(range(40))
+    capped_marker = [False]
+    result = _enforce_cap_and_break(
+        inventory=inventory, batch=batch,
+        safety_cap=30,
+    )
+    assert result is True
+    assert batch == list(range(30)), (
+        "Round-100 (VQNds): the helper MUST keep the FIRST "
+        "safety_cap items, not the last. Got %r" % (batch[:5],)
+    )
+
+
+def test_r100_pagination_helper_does_not_mutate_local_capped():
+    """Round-100 follow-up (VQNdu): the helper returns ``True``
+    when the cap is crossed; the caller flips its local
+    ``capped`` boolean. The previous ``[capped]`` list trick
+    mutated a throwaway list and did not propagate.
+    """
+    from scripts.local._shared_pagination import (
+        _enforce_cap_and_break,
+    )
+    capped = False
+    inventory = []
+    batch = list(range(50))
+    result = _enforce_cap_and_break(
+        inventory=inventory, batch=batch,
+        safety_cap=30,
+    )
+    assert result is True
+    # Apply the caller's pattern.
+    if result:
+        capped = True
+    assert capped is True, (
+        "Round-100 (VQNdu): the caller MUST flip its local "
+        "capped boolean when the helper returns True."
+    )

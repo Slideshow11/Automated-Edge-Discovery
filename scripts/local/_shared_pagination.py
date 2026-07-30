@@ -78,25 +78,42 @@ def _enforce_cap_and_break(
     inventory: List[Dict[str, Any]],
     batch: List[Any],
     safety_cap: int,
-    capped: List[bool],
 ) -> bool:
     """Round-98 follow-up: small helper that bounds an
     in-loop batch against ``safety_cap`` and signals the caller
-    to break. Returns ``True`` when the caller should ``break``.
+    to break. Returns ``True`` when the cap was crossed and
+    the caller should ``break``.
 
     Single-page-over-cap case: the loop's pre-fetch ``len(...)``
     check fires only on the NEXT iteration, so the FIRST page
     can carry more rows than ``safety_cap`` and exit cleanly
     with ``complete=True, capped=False``. Truncate ``batch``
-    in-place, set ``capped[0] = True``, and return ``True`` so
-    the caller exits the loop. Used by every REST paginator
-    in this module after Round-98.
+    in-place, signal the caller to break, and let the caller
+    flip its local ``capped`` boolean. Used by every REST
+    paginator in this module after Round-98.
+
+    Round-100 follow-up (VQNds): keep the PERMITTED prefix
+    (the first ``safety_cap - len(inventory)`` items), not
+    the tail. Truncating the tail of an over-cap batch would
+    return only the LAST records, which are the LEAST
+    likely to be the operator's intended evidence. Slice
+    ``batch[: remaining_capacity]`` to retain the permitted
+    prefix.
+
+    Round-100 follow-up (VQNdu): the helper returns ``True``
+    when the cap is crossed instead of mutating a
+    ``[capped]`` list. The previous approach created a NEW
+    list each call (``[capped]``) that did not propagate to
+    the caller's local boolean, so the caller's loop exited
+    with ``capped=False`` after the helper reported
+    truncation.
     """
-    if len(inventory) + len(batch) > safety_cap:
-        overflow = (len(inventory) + len(batch)) - safety_cap
-        if overflow > 0:
-            del batch[: max(0, len(batch) - overflow)]
-        capped[0] = True
+    remaining = safety_cap - len(inventory)
+    if remaining <= 0:
+        batch.clear()
+        return True
+    if len(batch) > remaining:
+        del batch[remaining:]
         return True
     return False
 
@@ -820,12 +837,17 @@ def paginate_workflow_runs(
         # checking the cap on the first page and returned
         # ``complete=True, capped=False`` once the terminal
         # page was short. Truncate the batch when the cap is
-        # crossed and break immediately.
+        # crossed and break immediately. Round-100 follow-up
+        # (VQNdu): the helper now returns a bool the caller
+        # uses to flip its local ``capped`` boolean; the
+        # previous ``[capped]`` list trick mutated a
+        # throwaway list and did not propagate.
         if _enforce_cap_and_break(
             inventory=all_runs, batch=matching,
-            safety_cap=safety_cap, capped=[capped],
+            safety_cap=safety_cap,
         ):
             all_runs.extend(matching)
+            capped = True
             break
         all_runs.extend(matching)
         # The filter is by head_sha, so we must keep paginating
@@ -895,11 +917,14 @@ def paginate_jobs_for_run(
         # Round-98 follow-up (VQBWU): see the matching note in
         # ``paginate_workflow_runs_for_repo`` above. Apply the
         # same cap-aware truncation to the jobs paginator.
+        # Round-100 follow-up (VQNdu): propagate the helper's
+        # return value to the local ``capped`` boolean.
         if _enforce_cap_and_break(
             inventory=all_jobs, batch=jobs,
-            safety_cap=safety_cap, capped=[capped],
+            safety_cap=safety_cap,
         ):
             all_jobs.extend(jobs)
+            capped = True
             break
         all_jobs.extend(jobs)
         if len(jobs) < page_size:

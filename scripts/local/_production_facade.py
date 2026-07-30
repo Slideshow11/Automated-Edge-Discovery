@@ -424,6 +424,16 @@ def run_selected_tests(
                 os.makedirs(_dir, exist_ok=True)
             with open(log_path, "w") as f:
                 json.dump(result, f, indent=2)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Round-100 follow-up (VQNdz): surface the log-write
+            # failure on the result so the runner CLI can
+            # detect a missing evidence artifact instead of
+            # reporting a clean pytest returncode. The previous
+            # bare ``except Exception: pass`` silently swallowed
+            # the failure and let the production CLI exit
+            # successfully even when its promised artifact was
+            # absent.
+            result["log_write_error"] = f"{type(exc).__name__}: {exc}"
+            result["log_write_path"] = str(log_path)
+            result["returncode"] = 2
     return result
