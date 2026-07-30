@@ -2213,3 +2213,93 @@ def test_r70_state_compatibility_existing_file(tmp_path):
     }))
     rc = controller_main(["status", "--state", str(state_path)])
     assert rc == 0, "old state should still be readable"
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_findings(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when --changed-path is omitted from
+    ``record-codex-repair-result --status repaired`` but the
+    controller state already records the findings paths,
+    the handler MUST derive impact evidence from those
+    findings instead of silently dropping to
+    ``validation_failed_no_repair:no_changed_paths_supplied``.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": [],
+        "codex_review": {
+            "findings": [
+                {"path": "scripts/local/aed_pr.py"},
+                {"path": "scripts/local/audit_codex_response_for_pr.py"},
+                {"file_path": "tests/test_round85.py"},
+            ],
+        },
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert "scripts/local/aed_pr.py" in derived
+    assert "scripts/local/audit_codex_response_for_pr.py" in derived
+    assert "tests/test_round85.py" in derived
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_repair_events(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when findings are empty but a prior
+    repair event recorded a changed_paths list, the handler
+    MUST derive impact evidence from that earlier event.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [
+            {"changed_paths": ["scripts/local/x.py"]},
+            {"changed_paths": ["scripts/local/y.py"]},
+        ],
+        "last_validated_changed_paths": [],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == ["scripts/local/x.py", "scripts/local/y.py"]
+
+
+def test_record_codex_repair_result_derives_changed_paths_from_last_validated(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when findings and prior repair events
+    are empty but ``last_validated_changed_paths`` is recorded,
+    the handler MUST derive impact evidence from there.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": ["scripts/local/z.py"],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == ["scripts/local/z.py"]
+
+
+def test_record_codex_repair_result_derivation_empty_when_nothing_to_derive(
+    temp_workspace, sample_tasks_jsonl
+):
+    """Round-85 follow-up: when no derivation source has any
+    paths the helper returns an empty list, signalling to
+    the caller that it MUST fail closed.
+    """
+    from scripts.local.autocoder_run_controller import (
+        _derive_changed_paths_from_state,
+    )
+    state = {
+        "codex_repair_events": [],
+        "last_validated_changed_paths": [],
+        "codex_review": {"findings": []},
+    }
+    derived = _derive_changed_paths_from_state(state, state["codex_review"])
+    assert derived == []

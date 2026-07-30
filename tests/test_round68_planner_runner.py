@@ -770,6 +770,33 @@ class SourceContractTests(unittest.TestCase):
             plan.classification_failures,
         )
 
+    def test_classify_path_scripts_local_autocoder_routes_to_autocoder(self):
+        """Round-85 follow-up: the autocoder paths under
+        ``scripts/local/`` (e.g. ``scripts/local/autocoder_run_controller.py``
+        and ``scripts/local/run_autocoder_*.py``) MUST be
+        classified as ``Component.AUTOCODER`` so impact-selected
+        validation runs the focused autocoder suite instead of
+        falling through to ``UNKNOWN`` and forcing
+        ``FULL_REPOSITORY_SUITE`` on every Tier-2 repair.
+        """
+        from scripts.local._shared_test_selection import (
+            classify_path, Component,
+        )
+        for path in (
+            "scripts/local/autocoder_run_controller.py",
+            "scripts/local/run_autocoder_x.py",
+            "scripts/local/build_autocoder_x.py",
+            "tests/test_autocoder_x.py",
+            "tests/test_run_autocoder_x.py",
+            "tests/test_build_autocoder_x.py",
+        ):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    classify_path(path), Component.AUTOCODER,
+                    f"{path} must classify as AUTOCODER, got "
+                    f"{classify_path(path)}",
+                )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

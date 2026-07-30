@@ -61,6 +61,21 @@ class Component(str, Enum):
 # AED globs that would otherwise match first.
 _COMPONENT_MANIFEST: List[tuple] = [
     # Autocoder (Tier 2 autocoder-focused suite).
+    # Round-85 follow-up: every autocoder path MUST also
+    # be matched under ``scripts/local/`` and ``tests/``
+    # BEFORE the bare ``autocoder_*.py`` glob. The bare
+    # glob does not contain a ``/`` separator so it only
+    # matches files at the repository root; without the
+    # repository-relative entries, any change under
+    # ``scripts/local/`` would fall through to ``UNKNOWN``
+    # and force ``FULL_REPOSITORY_SUITE`` on every
+    # Tier-2 autocoder repair.
+    ("scripts/local/autocoder_*.py", Component.AUTOCODER),
+    ("scripts/local/build_autocoder_*.py", Component.AUTOCODER),
+    ("scripts/local/run_autocoder_*.py", Component.AUTOCODER),
+    ("tests/test_autocoder_*.py", Component.AUTOCODER),
+    ("tests/test_build_autocoder_*.py", Component.AUTOCODER),
+    ("tests/test_run_autocoder_*.py", Component.AUTOCODER),
     ("autocoder_*.py", Component.AUTOCODER),
     ("build_autocoder_*.py", Component.AUTOCODER),
     ("run_autocoder_*.py", Component.AUTOCODER),

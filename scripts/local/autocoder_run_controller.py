@@ -1064,6 +1064,57 @@ def _record_codex_review(args: argparse.Namespace) -> None:
     print(f"  next action: {next_action['action']} — {next_action['reason']}")
 
 
+def _derive_changed_paths_from_state(
+    state: dict, codex: dict
+) -> list:
+    """Round-85 follow-up: derive the changed-paths list from
+    the controller state when ``record-codex-repair-result``
+    is invoked without ``--changed-path``.
+
+    The documented invocation
+    ``record-codex-repair-result --status repaired``
+    (docs/autocoder_run_controller_v0.md:598-602) does not
+    supply ``--changed-path``. Without derivation, the
+    handler emits ``validation_failed_no_repair:
+    no_changed_paths_supplied`` and the supported repair
+    workflow silently stops. The derivation order is:
+
+    1. The most-recent codex_review.findings[].path list.
+    2. The last-known changed_paths list from any prior
+       repair event recorded on this run.
+    3. The controller's ``last_validated_changed_paths``.
+
+    Returns a deduplicated, ordered list of strings. Empty
+    list means every derivation failed and the caller MUST
+    fail closed.
+    """
+    seen: set = set()
+    derived: list = []
+
+    def _add(p: Any) -> None:
+        s = str(p or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            derived.append(s)
+
+    # 1. Findings paths from the current codex review.
+    for finding in (codex.get("findings") or []):
+        if isinstance(finding, dict):
+            _add(finding.get("path") or finding.get("file_path") or "")
+        else:
+            _add(finding)
+    # 2. Paths from any prior repair event on this run.
+    for event in (state.get("codex_repair_events") or []):
+        if not isinstance(event, dict):
+            continue
+        for p in (event.get("changed_paths") or []):
+            _add(p)
+    # 3. The controller's last-known validated paths.
+    for p in (state.get("last_validated_changed_paths") or []):
+        _add(p)
+    return derived
+
+
 def _record_codex_repair_result(args: argparse.Namespace) -> None:
     """Record the result of a Codex repair attempt.
 
@@ -1111,9 +1162,33 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             for p in (getattr(args, "changed_path", []) or [])
         ]
         cleaned_paths = [p for p in cleaned_paths if p]
+        # Round-85 follow-up: when --changed-path is omitted,
+        # derive impact evidence from the controller state
+        # before failing closed. The previous behavior emitted
+        # ``no_changed_paths_supplied`` for the documented
+        # ``record-codex-repair-result --status repaired``
+        # invocation (docs/autocoder_run_controller_v0.md:598-602),
+        # silently stopping the supported repair workflow. The
+        # derivation order is:
+        #   1. The most-recent codex_review.findings[].path list.
+        #   2. The last-known changed_paths list from any prior
+        #      repair event recorded on this run.
+        #   3. The controller's last_validated_changed_paths.
+        # If every derivation is empty the documented command
+        # still fails closed, but only AFTER the controller has
+        # exhausted every reasonable impact-evidence source.
         if not cleaned_paths:
-            validation_error = "no_changed_paths_supplied"
+            derived = _derive_changed_paths_from_state(state, codex)
+            if derived:
+                cleaned_paths = derived
+                codex["changed_paths_derived"] = True
+                codex["changed_paths_derived_source"] = "state"
+            else:
+                validation_error = "no_changed_paths_supplied"
         else:
+            codex["changed_paths_derived"] = False
+            codex["changed_paths_derived_source"] = "cli"
+        if cleaned_paths:
             log_dir = (
                 Path(str(args.state)).parent / "validations"
             )
@@ -1619,9 +1694,22 @@ def _build_parser() -> argparse.ArgumentParser:
                              help="Repair outcome")
     p_codex_rep.add_argument("--summary", help="Brief description of what was done")
     p_codex_rep.add_argument("--blocker-fingerprint", help="Fingerprint matching the original blocker")
+    # Round-85 follow-up: --changed-path remains optional so the
+    # documented invocation
+    #   ``record-codex-repair-result --status repaired``
+    # (docs/autocoder_run_controller_v0.md:598-602) continues to
+    # work. The handler derives the changed paths from the
+    # controller state when --changed-path is omitted, falling
+    # back to ``codex_review.findings`` paths or the last-known
+    # changed-paths list. Round-69 Codex review (this finding's
+    # prompt) chose this option over argparse-required so the
+    # documented command never silently drops to
+    # ``validation_failed_no_repair:no_changed_paths_supplied``.
     p_codex_rep.add_argument("--changed-path", action="append",
                               help="Changed path(s) for impact-selected validation "
-                                   "(Round-70 PHASE 3-P1). Repeatable.")
+                                   "(Round-70 PHASE 3-P1). Repeatable. Optional "
+                                   "after Round-85: the controller derives "
+                                   "impact evidence from state when omitted.")
 
     # record-autonomous-repair-plan (Round-70 P1 wiring)
     p_arp = sub.add_parser(
