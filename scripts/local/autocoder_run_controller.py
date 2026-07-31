@@ -1291,6 +1291,16 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
         "changed_paths": cleaned_paths_for_event,
     }
     state["codex_repair_events"].append(codex_repair_event)
+    # Round-103 follow-up: defer the codex_repair_event status
+    # until after validation so the append-only history reflects
+    # the actual validation outcome. The previous shape appended
+    # ``status=repair_status`` (which is the CLI-supplied
+    # ``--status``) before the validator ran and never corrected
+    # the event when validation failed (e.g. the skip_runner
+    # path or a non-zero return code). The status is updated
+    # in place after validation below so the append-only
+    # history is consistent with ``last_validation_outcome``
+    # and ``next_action``.
     if cleaned_paths_for_event:
         # Round-89 follow-up: update last_validated_changed_paths
         # whenever the controller observes a non-empty
@@ -1468,6 +1478,23 @@ def _record_codex_repair_result(args: argparse.Namespace) -> None:
             )
         if validation_error:
             codex["last_validation_error"] = validation_error
+
+        # Round-103 follow-up: correct the codex_repair_event
+        # status in place to reflect the actual validation
+        # outcome. The event was appended above with
+        # ``status=repair_status`` (the CLI-supplied
+        # ``--status``); after validation we override it to
+        # ``failed`` so the append-only history is consistent
+        # with ``last_validation_outcome`` and ``next_action``.
+        # Only override when validation actually produced a
+        # terminal outcome (passed or failed); when the
+        # validator was not invoked (no changed-paths
+        # supplied) ``validation_outcome`` is still
+        # ``"pending"`` and we leave the event's CLI-supplied
+        # status alone.
+        if validation_outcome in ("passed", "failed"):
+            if validation_outcome != "passed":
+                codex_repair_event["status"] = "failed"
 
         if validation_outcome == "passed":
             # Validation succeeded: clear findings state and
