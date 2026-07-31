@@ -596,25 +596,46 @@ def _evaluate_ci_once(
         STATUS_ERROR_TOOLING        — gh command failed or output was not valid JSON
     """
     try:
-        # Use check=False because gh pr checks returns exit code 8 (checks
-        # pending) even when it successfully returns data — this is not an
-        # error and must not raise ERROR_TOOLING.
+        # Use check=False because gh pr checks can return non-zero exit codes
+        # that are NOT tool errors:
+        #   - exit 0: all checks passed (or mixed with successes)
+        #   - exit 1: at least one required check has a terminal non-success
+        #     state (failure/cancelled/skipped). The JSON output is still
+        #     valid and must be parsed so the classification path can report
+        #     HOLD_CI_FAILED with the actual failed-check names.
+        #   - exit 8: checks are still pending. The JSON output is still
+        #     valid and must be parsed so the pending-check list is reported.
+        # See https://cli.github.com/manual/gh_help_exit-codes and
+        # https://cli.github.com/manual/gh_pr_checks
+        #
+        # We treat ONLY non-{0,1,8} exit codes as ERROR_TOOLING. For exit 1
+        # and exit 8, we attempt to parse stdout below; if stdout is empty
+        # or malformed, we then escalate to ERROR_TOOLING.
         result = gh_run(
             ["pr", "checks", str(pr_number), "--json", "name,state,link"],
             check=False,
         )
-        if result.returncode not in (0, 8):
+        if result.returncode not in (0, 1, 8):
             return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"gh pr checks failed: {result.stderr.strip()}"}, f"exit code {result.returncode}"
     except RuntimeError as e:
         return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": str(e)}, str(e)
 
     raw = result.stdout.strip()
     if not raw:
-        checks: List[Dict] = []
+        # No JSON output from gh: this is a real tool failure (not "checks failed").
+        # For exit 8 (pending) and exit 0 (clean) we shouldn't reach here with empty stdout,
+        # but if we do, treat it as ERROR_TOOLING so the caller sees a structured report.
+        if result.returncode == 0:
+            # Empty stdout + exit 0 means no checks are configured at all — treat as
+            # an empty check list and let the classification path below decide.
+            checks: List[Dict] = []
+        else:
+            return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"gh pr checks returned no JSON (exit {result.returncode}): {result.stderr.strip()}"}, f"empty stdout, exit code {result.returncode}"
     else:
         try:
             checks = json.loads(raw)
         except json.JSONDecodeError as e:
+            # Got data but it's not parseable JSON — genuine tooling error.
             return STATUS_ERROR_TOOLING, {"checks": [], "polled_at": datetime.now(timezone.utc).isoformat(), "error": f"JSON parse failed: {e}"}, f"JSON parse failed: {e}"
 
     # Group checks by name to handle duplicate entries from parallel workflow runs.

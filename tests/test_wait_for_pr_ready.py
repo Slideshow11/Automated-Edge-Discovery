@@ -3185,7 +3185,13 @@ class TestOnceMode:
         )
 
     def test_once_returns_hold_ci_failed_when_ci_failed(self, output_dir, output_json):
-        """Under --once, if any CI check failed, status must be HOLD_CI_FAILED."""
+        """Under --once, if any CI check failed, status must be HOLD_CI_FAILED.
+
+        gh pr checks returns exit code 1 when any check has failed/cancelled/
+        skipped — NOT exit code 0. The waiter must accept and parse the JSON
+        output in that case so it can report HOLD_CI_FAILED (not ERROR_TOOLING).
+        See https://cli.github.com/manual/gh_help_exit-codes
+        """
         md_path = str(output_dir / "status.md")
         out_json = output_json
 
@@ -3195,7 +3201,7 @@ class TestOnceMode:
 
         def fake_gh_run(args, check=True):
             m = MagicMock()
-            m.returncode = 0
+            m.returncode = 1  # Real gh pr checks returns exit 1 when a check failed
             m.stdout = ""
             m.stderr = ""
             if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
@@ -3238,7 +3244,10 @@ class TestOnceMode:
 
         assert rc == mod.EXIT_FAILURE
         data = json.load(open(out_json))
-        assert data["status"] == mod.STATUS_HOLD_CI_FAILED
+        assert data["status"] == mod.STATUS_HOLD_CI_FAILED, (
+            f"Expected HOLD_CI_FAILED (not ERROR_TOOLING) under --once with "
+            f"gh pr checks exit 1; got {data['status']}"
+        )
         assert data["once_mode"] is True
 
     def test_once_writes_json_and_md_reports(self, output_dir, output_json):
@@ -3517,7 +3526,7 @@ class TestOnceMode:
         # Generous bound: tests have CI overhead, allow up to 2s
         assert elapsed < 2.0, f"--once took {elapsed:.3f}s — must be under 2s (no polling)"
 
-    def test_default_mode_without_once_calls_poll(self, output_dir, output_json):
+    def test_default_mode_without_once_uses_polling(self, output_dir, output_json):
         """Without --once, the waiter must use poll_ci_checks (sleep-based loop).
 
         This test ensures the default behavior is unchanged when --once is absent.
@@ -3586,4 +3595,70 @@ class TestOnceMode:
         data = json.load(open(out_json))
         assert data["once_mode"] is False, (
             "Default polling mode must have once_mode=False"
+        )
+
+    def test_default_mode_parses_failed_checks_when_gh_returns_exit_1(self, output_dir, output_json):
+        """Regression test: default polling mode must accept gh pr checks exit 1
+        when stdout contains a valid JSON with failed checks.
+
+        This is the same fix as the --once test: gh pr checks exits 1 when any
+        check has failed/cancelled/skipped, but stdout is valid JSON. The waiter
+        must parse stdout and report HOLD_CI_FAILED (not ERROR_TOOLING).
+        """
+        md_path = str(output_dir / "status.md")
+        out_json = output_json
+
+        mod = self._load_module()
+        mod.REPO_CONTEXT = ["--repo", "Slideshow11/Automated-Edge-Discovery"]
+        mod.REPO_ROOT = str(Path(__file__).parent.parent)
+
+        def fake_gh_run(args, check=True):
+            m = MagicMock()
+            m.returncode = 1  # gh pr checks exit 1 with failed checks present
+            m.stdout = ""
+            m.stderr = ""
+            if len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
+                m.stdout = json.dumps([
+                    {"name": "test (3.11)", "state": "failure", "link": ""},
+                    {"name": "review-comment-gate", "state": "success", "link": ""},
+                    {"name": "validator", "state": "success", "link": ""},
+                    {"name": "governance-validators", "state": "success", "link": ""},
+                    {"name": "pr-gate-live-smoke", "state": "success", "link": ""},
+                ])
+            elif "--jq" in args:
+                jq_idx = args.index("--jq")
+                jq_expr = args[jq_idx + 1] if jq_idx + 1 < len(args) else ""
+                if jq_expr == ".headRefOid":
+                    m.stdout = "test123abc"
+                elif "head" in jq_expr:
+                    m.stdout = '{"state":"open","head":"test123abc"}'
+            return m
+
+        def fake_subprocess_run(popenargs, **kwargs):
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        old_argv = sys.argv
+        sys.argv = [
+            "wait_for_pr_ready.py",
+            "--pr-number", "999",
+            "--poll-seconds", "0",
+            "--timeout-minutes", "1",
+            "--output-json", out_json,
+            "--output-md", md_path,
+        ]
+
+        with patch.object(mod, "gh_run", side_effect=fake_gh_run), \
+             patch.object(mod.subprocess, "run", side_effect=fake_subprocess_run):
+            try:
+                rc = mod.main()
+            except SystemExit as e:
+                rc = e.code
+            finally:
+                sys.argv = old_argv
+
+        # Must report HOLD_CI_FAILED, not ERROR_TOOLING
+        data = json.load(open(out_json))
+        assert data["status"] == mod.STATUS_HOLD_CI_FAILED, (
+            f"Expected HOLD_CI_FAILED with gh exit 1; got {data['status']}: "
+            f"{data.get('error_detail')}"
         )
